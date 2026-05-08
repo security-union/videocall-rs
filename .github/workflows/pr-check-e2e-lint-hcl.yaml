@@ -1,0 +1,33 @@
+name: E2E Lint (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'e2e/**'
+
+concurrency:
+  group: pr-check-e2e-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  lint:
+    name: ESLint + Prettier + TypeCheck
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: npm ci
+      - run: npm run ci:lint

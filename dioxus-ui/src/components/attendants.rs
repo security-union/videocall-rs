@@ -19,6 +19,7 @@
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    capability_check::{assess_capability, CapabilityVerdict},
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -52,7 +53,7 @@ use dioxus::web::WebEventExt;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
@@ -62,6 +63,8 @@ use videocall_client::{
     MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
     VideoCallClientOptions,
 };
+#[cfg(feature = "media-server-jwt-auth")]
+use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -174,6 +177,41 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
         .collect::<Vec<String>>();
 
     (websocket_urls, webtransport_urls)
+}
+
+/// Pure helper: combine the lobby URLs with the user's transport preference
+/// and the *current* server-side WebTransport-enabled flag.
+///
+/// Factored out so both component init AND `schedule_reconnect` go through
+/// exactly the same code path. Crucially, this means a reconnect happening
+/// after the runtime config finally loaded will see `server_wt_enabled ==
+/// true` even if the initial `use_hook` saw `false` — the previously empty
+/// WT URL list will populate, fixing the "stranded on a single server"
+/// regression from discussion 562 (Phase 7).
+///
+/// Returns `(effective_wt_enabled, websocket_urls, webtransport_urls)`.
+fn current_transport_urls(
+    token: &str,
+    user_id: &str,
+    id: &str,
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+) -> (bool, Vec<String>, Vec<String>) {
+    let (ws, wt) = build_lobby_urls(token, user_id, id);
+    current_transport_urls_from_lists(pref, server_wt_enabled, ws, wt)
+}
+
+/// Pure-logic core of [`current_transport_urls`] — takes already-built URL
+/// lists so it can be unit-tested without `window().__APP_CONFIG` being
+/// initialised. The wasm-only `current_transport_urls` is a thin wrapper
+/// that pairs `build_lobby_urls` with this function.
+fn current_transport_urls_from_lists(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    ws_urls: Vec<String>,
+    wt_urls: Vec<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    resolve_transport_config(pref, server_wt_enabled, ws_urls, wt_urls)
 }
 
 fn play_user_joined() {
@@ -290,15 +328,25 @@ fn schedule_reconnect(
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
                     let latest_display_name = current_display_name();
-                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
 
-                    // Apply the user's transport preference so the reconnection
-                    // honours the same protocol selection as the initial connection.
+                    // Re-evaluate `webtransport_enabled()` at reconnect time —
+                    // not just at component init. If runtime config hadn't
+                    // loaded when `use_hook` ran, the WT URL list would have
+                    // been empty and `total_server_count() == 1` would have
+                    // suppressed re-election (see discussion 562, Phase 7).
+                    // Going through the same `current_transport_urls` helper
+                    // here means a delayed runtime config load now flows back
+                    // into the manager via `update_server_urls`.
                     let pref = transport_pref_signal();
                     let server_wt_enabled =
                         crate::constants::webtransport_enabled().unwrap_or(false);
-                    let (_enable_wt, ws, wt) =
-                        resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                    let (_enable_wt, ws, wt) = current_transport_urls(
+                        &new_token,
+                        &latest_display_name,
+                        &meeting_id,
+                        pref,
+                        server_wt_enabled,
+                    );
 
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
@@ -678,6 +726,10 @@ pub fn AttendantsComponent(
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
+    // Phase 6 render-storm fix: shared "bump pending?" flag for the
+    // `peer_speaking` event handler. Lives on a `use_hook` so it survives
+    // across renders. See `schedule_throttled_bump`.
+    let peer_list_bump_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut screen_share_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
     let mic_error = use_signal(|| None::<MediaErrorState>);
@@ -703,11 +755,21 @@ pub fn AttendantsComponent(
     let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
+    // Pre-join capability verdict (Phase 9). Computed once at component mount —
+    // hardware concurrency / UA platform don't change while the page is open.
+    // Block / StrongWarn surfaces UI in the lobby below; Ok proceeds normally.
+    let capability_verdict = use_hook(assess_capability);
+    // Has the user explicitly dismissed the StrongWarn modal? Once true the
+    // join button (and the auto_join effect) proceeds normally for the rest
+    // of the lobby session.
+    let mut capability_acknowledged = use_signal(|| false);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let show_muted_toast: Signal<bool> = use_signal(|| false);
+    let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
     // Create the peer status map signal early so it can be captured by the
@@ -744,16 +806,21 @@ pub fn AttendantsComponent(
         let token = String::new();
 
         let initial_display_name = current_display_name();
-        let (websocket_urls, webtransport_urls) =
-            build_lobby_urls(&token, &initial_display_name, &id);
 
-        // Apply user's transport preference
+        // Apply user's transport preference. The `webtransport_enabled()`
+        // read here is the *initial* value — runtime config may not have
+        // loaded yet, in which case it returns `false` and `Auto` resolves
+        // to a WS-only URL list. The reconnect path goes through the same
+        // `current_transport_urls` helper so a later runtime-config load
+        // can repopulate the WT list and recover the user from the
+        // "stranded on a single server" state (discussion 562, Phase 7).
         let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
-        let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) = current_transport_urls(
+            &token,
+            &initial_display_name,
+            &id,
             transport_pref,
             server_wt_enabled,
-            websocket_urls,
-            webtransport_urls,
         );
 
         log::info!(
@@ -876,6 +943,12 @@ pub fn AttendantsComponent(
                 //
                 // Note: we rebind to a local `mut` copy so the closure stays
                 // `Fn` (Signal is Copy; only the local is mutated each call).
+                //
+                // Phase 6 (cc7tp 2026-05-06): the `peer_list_version` bump
+                // moved to `on_peers_removed_batch` below so that a 5-peer
+                // watchdog cascade fires one re-render instead of five.
+                // Per-peer cleanup of side-maps stays here — these are O(1)
+                // and observers may rely on the per-peer fan-out.
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
                 // Also remove the departed peer's signal history so the shared
@@ -889,8 +962,25 @@ pub fn AttendantsComponent(
                 let mut ct_map = cropped_tiles_signal;
                 ct_map.write().remove(&peer_id);
                 ct_map.write().remove(&format!("screen-share-{peer_id}"));
+            })),
+            on_peers_removed_batch: Some(VcCallback::from(move |peer_ids: Vec<String>| {
+                // Phase 6 fix: bump `peer_list_version` exactly once per
+                // removal pass, not once per dead peer. When the
+                // PeerDecodeManager watchdog times out N peers in a single
+                // tick (cc7tp incident: N=5), the per-peer
+                // `on_peer_removed` callback still fires N times for
+                // side-map cleanup, but the version-driven re-render
+                // happens only once.
+                if peer_ids.is_empty() {
+                    return;
+                }
+                log::info!(
+                    "Batched peer removal: {} peer(s) removed in one pass",
+                    peer_ids.len()
+                );
                 let mut v = peer_list_version;
-                v.set(v() + 1);
+                let next = *v.peek() + 1;
+                v.set(next);
             })),
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
@@ -968,6 +1058,28 @@ pub fn AttendantsComponent(
                     }
                 });
             })),
+            // The host's own client must NOT mute itself on mute-all — guard here
+            // by skipping the callback entirely when is_owner is true.
+            on_host_mute: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("HOST_MUTE: muting local microphone on host request");
+                    let mut mic_enabled = mic_enabled;
+                    let mut show_muted_toast = show_muted_toast;
+                    let mut toast_timer = toast_timer;
+                    mic_enabled.set(false);
+                    show_muted_toast.set(true);
+                    // Cancel any pending dismiss timer before scheduling a new one.
+                    toast_timer.set(None);
+                    toast_timer.set(Some(Timeout::new(6_000, move || {
+                        let mut show_muted_toast = show_muted_toast;
+                        let mut toast_timer = toast_timer;
+                        show_muted_toast.set(false);
+                        toast_timer.set(None);
+                    })));
+                }))
+            },
             on_peer_left: {
                 Some(VcCallback::from(
                     move |(display_name, user_id): (String, String)| {
@@ -1125,6 +1237,61 @@ pub fn AttendantsComponent(
             // automatic retry — the single-candidate state in those modes is
             // intentional, not a recoverable system condition.
             allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
+            // Phase 3 / AUTH-2 — discussion 562: let the connection
+            // manager preempt token expiry from inside its internal
+            // re-election. Without this, the manager re-uses the cached
+            // server URLs (with the original JWT in the query string) and
+            // every candidate gets rejected by the relay once the token
+            // has expired; only the UI-level `schedule_reconnect` path
+            // would eventually refresh — by which time the user has
+            // already perceived a disconnect.
+            //
+            // We supply this callback ONLY in the JWT-auth build, which is
+            // the build with token expiry at all. The non-JWT build keeps
+            // re-election simple (no refresh exists to perform).
+            #[cfg(feature = "media-server-jwt-auth")]
+            refresh_room_token_callback: {
+                let meeting_id_for_refresh = id.clone();
+                let display_name_signal = current_display_name;
+                let transport_pref_signal = transport_pref_ctx.0;
+                Some(RefreshRoomTokenCallback::from(move || {
+                    let meeting_id = meeting_id_for_refresh.clone();
+                    async move {
+                        match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                            Ok(new_token) => {
+                                let dn = display_name_signal();
+                                let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
+                                // Apply the user's transport preference so
+                                // the refreshed URL list matches what
+                                // the initial connection (and the existing
+                                // schedule_reconnect path) would build.
+                                let pref = transport_pref_signal();
+                                let server_wt_enabled =
+                                    crate::constants::webtransport_enabled().unwrap_or(false);
+                                let (_enable_wt, ws, wt) =
+                                    resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                                log::info!(
+                                    "DIOXUS-UI: refresh_room_token_callback succeeded — providing {} ws / {} wt URLs to ConnectionManager",
+                                    ws.len(),
+                                    wt.len(),
+                                );
+                                Some(RefreshedTokens {
+                                    websocket_urls: ws,
+                                    webtransport_urls: wt,
+                                })
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "DIOXUS-UI: refresh_room_token_callback failed ({e}); ConnectionManager will re-election with cached URLs"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }))
+            },
+            #[cfg(not(feature = "media-server-jwt-auth"))]
+            refresh_room_token_callback: None,
         };
 
         let client = VideoCallClient::new(opts);
@@ -1341,7 +1508,9 @@ pub fn AttendantsComponent(
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
     let mut diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let bump_pending_for_effect = peer_list_bump_pending.clone();
     use_effect(move || {
+        let bump_pending = bump_pending_for_effect.clone();
         let task = spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
             while let Ok(evt) = rx.recv().await {
@@ -1363,9 +1532,29 @@ pub fn AttendantsComponent(
                         };
                         if should_update {
                             peer_speech_priority.write().insert(peer_id, now);
-                            let mut v = peer_list_version;
-                            let next = *v.peek() + 1;
-                            v.set(next);
+                            // Phase 6 render-storm fix (cc7tp 2026-05-06):
+                            // coalesce bursty speaker activity into one
+                            // `peer_list_version` bump per 50 ms window
+                            // instead of per-event. Without this, multiple
+                            // active speakers triggered 3-5 full meeting-
+                            // view re-renders per second, which on 2-core
+                            // hardware compounded into 5 s main-thread
+                            // stalls.
+                            //
+                            // Signal<u32> is `Copy`, so we move a copy into
+                            // the throttled callback and re-bind it as
+                            // `mut` inside to satisfy the `Fn` bound on
+                            // the boxed closure.
+                            let v = peer_list_version;
+                            schedule_throttled_bump(
+                                bump_pending.clone(),
+                                PEER_LIST_VERSION_THROTTLE_MS,
+                                Rc::new(move || {
+                                    let mut v = v;
+                                    let next = *v.peek() + 1;
+                                    v.set(next);
+                                }),
+                            );
                         }
                     }
                     continue;
@@ -1435,12 +1624,26 @@ pub fn AttendantsComponent(
         }
     });
 
-    // Auto-join on first render if requested
+    // Auto-join on first render if requested.
+    // Gated by the Phase 9 capability verdict: a Block must surface its UI
+    // before media is acquired, and a StrongWarn must be acknowledged first.
     {
         let mda = mda.clone();
+        let verdict = capability_verdict.clone();
         use_effect(move || {
-            if auto_join {
-                mda.borrow().request();
+            if !auto_join {
+                return;
+            }
+            match &verdict {
+                CapabilityVerdict::Block(_) => {
+                    log::warn!("capability-check: auto_join suppressed by Block verdict");
+                }
+                CapabilityVerdict::StrongWarn(_) if !capability_acknowledged() => {
+                    log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
+                }
+                _ => {
+                    mda.borrow().request();
+                }
             }
         });
     }
@@ -1824,6 +2027,21 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
+        // Phase 9 capability gating. Snapshot the verdict for this render so we
+        // don't pay the navigator cost again — `assess_capability` already ran
+        // at component mount via `use_hook`.
+        let verdict = capability_verdict.clone();
+        let is_blocked = matches!(verdict, CapabilityVerdict::Block(_));
+        let strong_warn_msg = match &verdict {
+            CapabilityVerdict::StrongWarn(msg) => Some(msg.clone()),
+            _ => None,
+        };
+        let block_msg = match &verdict {
+            CapabilityVerdict::Block(msg) => Some(msg.clone()),
+            _ => None,
+        };
+        let show_strong_warn_modal = strong_warn_msg.is_some() && !capability_acknowledged();
+
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
@@ -1832,19 +2050,122 @@ pub fn AttendantsComponent(
                     div { class: "floating-element floating-element-2" }
                     div { class: "floating-element floating-element-3" }
                     div { class: "hero-content",
-                        PreJoinSettingsCard {
-                            is_owner,
-                            meeting_id: id.clone(),
-                            waiting_room_toggle,
-                            admitted_can_admit_toggle,
-                            end_on_host_leave_toggle,
-                            allow_guests_toggle,
-                            saving,
-                            toggle_error,
-                            connection_error,
-                            on_join: move |_| {
-                                mda.borrow().request();
-                            },
+                        if let Some(msg) = block_msg.clone() {
+                            // Hard-block: render an error card in place of the
+                            // join card. The user has to switch to a different
+                            // device — there is no override for this verdict.
+                            div { class: "settings-card",
+                                role: "alert",
+                                "aria-live": "assertive",
+                                div { class: "join-meeting-header",
+                                    h2 { class: "join-meeting-title",
+                                        span { class: "join-meeting-title-text",
+                                            "Device not supported"
+                                        }
+                                    }
+                                }
+                                p { class: "toggle-error", "{msg}" }
+                                div { class: "settings-action-row",
+                                    button {
+                                        class: "btn-apple btn-primary settings-action-btn",
+                                        disabled: true,
+                                        "aria-disabled": "true",
+                                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                                    }
+                                }
+                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
+                                    "Meeting join is disabled for this device."
+                                }
+                            }
+                        } else {
+                            PreJoinSettingsCard {
+                                is_owner,
+                                meeting_id: id.clone(),
+                                waiting_room_toggle,
+                                admitted_can_admit_toggle,
+                                end_on_host_leave_toggle,
+                                allow_guests_toggle,
+                                saving,
+                                toggle_error,
+                                connection_error,
+                                on_join: {
+                                    let mda = mda.clone();
+                                    let has_strong_warn = strong_warn_msg.is_some();
+                                    move |_| {
+                                        if is_blocked {
+                                            // Defensive: the card should not be
+                                            // rendered when blocked, but in case
+                                            // it ever is, ignore the click.
+                                            log::warn!(
+                                                "capability-check: join click ignored — Block verdict"
+                                            );
+                                            return;
+                                        }
+                                        if has_strong_warn && !capability_acknowledged() {
+                                            // Bring up the strong-warn modal
+                                            // instead of immediately requesting
+                                            // media. The modal's CTAs will set
+                                            // `capability_acknowledged` and
+                                            // re-fire the request.
+                                            log::info!(
+                                                "capability-check: showing StrongWarn modal"
+                                            );
+                                            return;
+                                        }
+                                        mda.borrow().request();
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+                if show_strong_warn_modal {
+                    {
+                        let msg = strong_warn_msg.clone().unwrap_or_default();
+                        let mda_continue = mda.clone();
+                        let mda_audio = mda.clone();
+                        rsx! {
+                            div {
+                                class: "modal-overlay",
+                                role: "dialog",
+                                "aria-modal": "true",
+                                "aria-labelledby": "capability-warn-title",
+                                div { class: "modal-window",
+                                    h3 { id: "capability-warn-title", "Performance warning" }
+                                    p { style: "margin-top: 0.5rem;", "{msg}" }
+                                    div { style: "display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap;",
+                                        button {
+                                            class: "btn-apple btn-secondary",
+                                            onclick: move |_| {
+                                                // Audio-only: camera defaults to
+                                                // off in this lobby, so we just
+                                                // acknowledge and request media.
+                                                // Mic/camera buttons in the
+                                                // post-join controls remain
+                                                // available if the user changes
+                                                // their mind.
+                                                log::info!(
+                                                    "capability-check: user chose Audio-only"
+                                                );
+                                                capability_acknowledged.set(true);
+                                                mda_audio.borrow().request();
+                                            },
+                                            "Switch to audio-only"
+                                        }
+                                        button {
+                                            class: "btn-apple btn-primary",
+                                            onclick: move |_| {
+                                                log::info!(
+                                                    "capability-check: user chose Continue anyway"
+                                                );
+                                                capability_acknowledged.set(true);
+                                                mda_continue.borrow().request();
+                                            },
+                                            "Continue anyway"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1949,8 +2270,34 @@ pub fn AttendantsComponent(
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() {
+                if !peer_toasts().is_empty() || show_muted_toast() {
                     div { class: "peer-toasts",
+                        if show_muted_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host muted your microphone" }
+                                    br {}
+                                    span { class: "toast-action", "Click the mic button to unmute." }
+                                }
+                            }
+                        }
                         for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
@@ -2126,6 +2473,8 @@ pub fn AttendantsComponent(
                                                         my_peer_id: user_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
                                                     }
                                                 }
                                             }
@@ -2171,6 +2520,8 @@ pub fn AttendantsComponent(
                                             my_peer_id: user_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 }
@@ -2831,6 +3182,53 @@ pub fn AttendantsComponent(
     }
 }
 
+/// Default 50 ms coalescing window for [`schedule_throttled_bump`].
+///
+/// Selected as a render-friendly upper bound: at 60 fps a frame is ~16 ms,
+/// so 50 ms guarantees at most one re-render per ~3 frames even under a
+/// sustained burst of speech events. See Phase 6 render-storm fix
+/// (cc7tp 2026-05-06).
+pub(crate) const PEER_LIST_VERSION_THROTTLE_MS: u32 = 50;
+
+/// Coalesce a burst of "something tiny changed" events into at most one
+/// invocation of `bump` per `delay_ms` window.
+///
+/// `pending` is an `Rc<Cell<bool>>` that survives across calls (typically
+/// stored via `use_hook`). When clear, this function sets it and schedules
+/// a [`Timeout`] of `delay_ms` that will:
+///   1. Invoke `bump` (the actual work — e.g. a `peer_list_version.set()`).
+///   2. Clear `pending` so the next call schedules a new window.
+///
+/// When `pending` is already set, this call is a no-op — the bump is
+/// already inbound. This is the kernel of the Phase 6 render-storm fix:
+/// `peer_speaking` events fire 3-5×/sec/speaker on a busy call, and
+/// without coalescing each one drove a full meeting-view re-render. With
+/// the throttle, bursty speech activity collapses into one re-render
+/// every 50 ms regardless of how many speakers are active.
+///
+/// Note: only "soft" bumps (the ones driven by speech activity, where
+/// the peer set is unchanged and the version bump exists purely to nudge
+/// memo-keyed children) should go through this throttle. Real peer
+/// add/remove events must bump immediately.
+pub(crate) fn schedule_throttled_bump(pending: Rc<Cell<bool>>, delay_ms: u32, bump: Rc<dyn Fn()>) {
+    if pending.get() {
+        return;
+    }
+    pending.set(true);
+    let pending_clone = pending.clone();
+    let bump_clone = bump.clone();
+    Timeout::new(delay_ms, move || {
+        // Clear the flag BEFORE running `bump` so any new event fired
+        // synchronously from inside `bump` (or from a subscriber that
+        // reacts to the version change) can re-arm the throttle for the
+        // next 50 ms window. Otherwise the next event would silently
+        // drop and we'd miss a coalescing boundary.
+        pending_clone.set(false);
+        bump_clone();
+    })
+    .forget();
+}
+
 /// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
 fn parse_peer_status_event(
     evt: &videocall_diagnostics::DiagEvent,
@@ -2976,5 +3374,236 @@ mod tests {
                 assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for current_transport_urls (Phase 7, discussion 562)
+    //
+    // These exercise the pure-logic core via `current_transport_urls_from_lists`
+    // so they don't require `window().__APP_CONFIG` to be set up. The full
+    // `current_transport_urls` (with `build_lobby_urls`) is a thin wrapper
+    // that just calls into this core.
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_auto_with_wt_enabled_returns_both_lists() {
+        // Auto pref + server says WT enabled: both lists must come through.
+        // This is the scenario the dioxus-ui hits on a normal reconnect once
+        // runtime config has loaded.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            true,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(enable_wt, "Auto+server-WT-enabled must enable WT");
+        assert_eq!(ws_out, ws, "WS list passed through unchanged");
+        assert_eq!(wt_out, wt, "WT list passed through unchanged");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_auto_with_wt_disabled_returns_only_ws() {
+        // Auto pref + runtime config hasn't loaded (or WT disabled): the WT
+        // list is dropped from the effective config, mirroring how `Auto`
+        // collapses to WS-only in this state. This is the *initial* shape
+        // that strands the user before the reconnect path re-evaluates.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(!enable_wt, "Auto+server-WT-disabled must disable WT");
+        assert_eq!(ws_out, ws, "WS list still populated");
+        assert_eq!(
+            wt_out, wt,
+            "Auto preserves the WT list shape (resolve_transport_config returns it as-is); \
+             the manager's enable_webtransport=false is what gates use of WT"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_websocket_only_drops_wt_list() {
+        // Explicit WebSocketOnly preference: WT list must always be empty,
+        // regardless of what the server-side flag says.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebSocketOnly,
+            true,
+            ws.clone(),
+            wt,
+        );
+        assert!(!enable_wt, "WebSocketOnly must report WT disabled");
+        assert_eq!(ws_out, ws);
+        assert!(wt_out.is_empty(), "WebSocketOnly must drop the WT list");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_webtransport_only_drops_ws_list() {
+        // Explicit WebTransportOnly preference: WS list must always be empty.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebTransportOnly,
+            false, // server says WT disabled, but user override wins
+            ws,
+            wt.clone(),
+        );
+        assert!(enable_wt, "WebTransportOnly must report WT enabled");
+        assert!(ws_out.is_empty(), "WebTransportOnly must drop the WS list");
+        assert_eq!(wt_out, wt);
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_recovery_path_repopulates_wt_after_runtime_load() {
+        // Regression for discussion 562: same input lists, but the user's
+        // initial `webtransport_enabled()` returned false (runtime config
+        // not loaded) and the reconnect's read returns true (loaded by
+        // then). The reconnect call must yield a richer URL set than the
+        // initial call — that's what flips `total_server_count() > 1` in
+        // the manager and lets the watchdog actually re-elect.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+
+        // Initial call (runtime config still loading)
+        let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
+            TransportPreference::Auto,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(!init_enable_wt);
+        assert_eq!(init_ws, ws);
+        // Note: `Auto` keeps the wt list value; it's the bool that gates use.
+        // The recovery story is that `init_enable_wt == false` makes the manager
+        // treat the WT list as unusable even though it's present in the vec —
+        // see `resolve_transport_config`. The bool is the real signal, not the
+        // list contents.
+
+        // Reconnect call (runtime config now loaded — WT enabled)
+        let (reconn_enable_wt, reconn_ws, reconn_wt) =
+            current_transport_urls_from_lists(TransportPreference::Auto, true, ws.clone(), wt);
+        assert!(reconn_enable_wt, "reconnect path now has WT enabled");
+        assert_eq!(reconn_ws, ws, "WS list still populated");
+        assert!(
+            !reconn_wt.is_empty(),
+            "reconnect path repopulates the WT list — this is the recovery \
+             from the single-server-stranding state"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6: schedule_throttled_bump tests
+    // -----------------------------------------------------------------
+
+    use gloo_timers::future::TimeoutFuture;
+
+    /// 5 calls to `schedule_throttled_bump` within the throttle window
+    /// should result in exactly **one** invocation of the bump callback.
+    /// Reproduces the cc7tp 2026-05-06 render-storm scenario where 5
+    /// `peer_speaking` events from different speakers all coalesce
+    /// into a single `peer_list_version` bump.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_coalesces_burst_into_single_invocation() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        // Use a 50 ms throttle window. We then issue 5 bumps within ~30
+        // ms (roughly back-to-back) and wait long enough for the timer
+        // to fire.
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Tiny await to make sure each call observes a real `await`
+            // boundary but stays inside the 50 ms window.
+            TimeoutFuture::new(5).await;
+        }
+
+        // Wait for the throttle window plus generous margin.
+        TimeoutFuture::new(120).await;
+
+        assert_eq!(
+            counter.get(),
+            1,
+            "5 bumps within the throttle window must coalesce into 1 invocation"
+        );
+        assert!(
+            !pending.get(),
+            "pending flag should be cleared after the bump fires"
+        );
+    }
+
+    /// 5 calls spaced 100 ms apart (well outside a 50 ms throttle
+    /// window) must each get their own bump — the throttle re-arms
+    /// between windows.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_does_not_drop_events_outside_window() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Wait > 50 ms so each call sees an empty `pending` flag and
+            // schedules a fresh window.
+            TimeoutFuture::new(100).await;
+        }
+
+        // Final tail wait so the last scheduled timeout has fired.
+        TimeoutFuture::new(100).await;
+
+        assert_eq!(
+            counter.get(),
+            5,
+            "5 bumps spaced > throttle window must each fire their own invocation"
+        );
+    }
+
+    /// Once the throttle window completes the flag must be clear so
+    /// the next event can schedule a new window. Equivalent to: bump,
+    /// wait for fire, bump again — both should fire.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_rearm_after_window_completes() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        assert!(pending.get(), "pending should be set after first schedule");
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(counter.get(), 1, "first bump should have fired");
+        assert!(!pending.get(), "pending should be cleared after fire");
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "second bump should have fired after re-arm"
+        );
     }
 }

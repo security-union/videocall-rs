@@ -592,14 +592,15 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
     assert_eq!(
         nav_buttons.length(),
-        3,
-        "should render exactly three nav buttons (Audio, Video, Network)"
+        4,
+        "should render exactly four nav buttons (Audio, Video, Network, Appearance)"
     );
 
     let text = mount.text_content().unwrap_or_default();
     assert!(text.contains("Audio"), "should render Audio nav");
     assert!(text.contains("Video"), "should render Video nav");
     assert!(text.contains("Network"), "should render Network nav");
+    assert!(text.contains("Appearance"), "should render Appearance nav");
     assert!(!text.contains("Devices"), "should not render Devices nav");
     assert!(!text.contains("Profile"), "should not render Profile nav");
     assert!(!text.contains("Advanced"), "should not render Advanced nav");

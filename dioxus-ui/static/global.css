@@ -1514,7 +1514,7 @@ html[data-theme="light"] #invite-overlay p {
   z-index: 9000;
   display: flex;
   gap: 1.2rem;
-  padding: 0.6rem 1.25rem;
+  padding: 0.85rem 1.5rem;
   background: rgba(28, 28, 30, 0.85);
   backdrop-filter: blur(14px);
   border-radius: 2.5rem;
@@ -1530,7 +1530,7 @@ html[data-theme="light"] #invite-overlay p {
 /* Bottom (default) */
 .video-controls-container.dock-bottom {
   left: 50%;
-  bottom: 16px;
+  bottom: 20px;
   transform: translateX(-50%);
   flex-direction: row;
 }
@@ -1720,7 +1720,6 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .video-control-button:hover {
-  transform: translateY(-2px);
   background-color: rgba(41, 51, 71, 0.95);
   box-shadow: 
     0 8px 20px -4px rgba(0, 0, 0, 0.5),
@@ -1733,7 +1732,6 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .video-control-button:active {
-  transform: translateY(1px);
   box-shadow: 
     0 4px 10px -4px rgba(0, 0, 0, 0.4),
     0 0 0 1px rgba(121, 40, 202, 0.2);
@@ -1744,10 +1742,6 @@ html[data-theme="light"] #invite-overlay p {
   width: 1.5rem;
   height: 1.5rem;
   transition: transform 0.2s ease;
-}
-
-.video-control-button:hover svg {
-  transform: scale(1.1);
 }
 
 .video-control-button.active {
@@ -1832,7 +1826,7 @@ html[data-theme="light"] #invite-overlay p {
     bottom: 1rem;
   }
   .video-controls-container {
-    padding: 0.5rem 1rem;
+    padding: 0.75rem 1.25rem;
     gap: 0.75rem;
   }
   

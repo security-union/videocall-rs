@@ -28,6 +28,7 @@ use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+use futures::future::LocalBoxFuture;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -80,6 +81,88 @@ fn generate_instance_id() -> String {
 
 const MAX_SESSION_ID_HISTORY: usize = 16;
 
+/// Result of refreshing a room token. Both URL lists carry the new token
+/// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
+/// ready to be plugged into the connection manager via
+/// [`crate::VideoCallClient::update_server_urls`].
+///
+/// Returned by the [`RefreshRoomTokenCallback`] that the dioxus-ui (or any
+/// other consumer) registers via
+/// [`VideoCallClientOptions::refresh_room_token_callback`]. See discussion
+/// #562 (AUTH-2) for the full Phase 3 design.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshedTokens {
+    /// Tokenized WebSocket URLs for the relay candidates.
+    pub websocket_urls: Vec<String>,
+    /// Tokenized WebTransport URLs for the relay candidates.
+    pub webtransport_urls: Vec<String>,
+}
+
+/// Async callback the client invokes when it needs a fresh room token,
+/// e.g. before a candidate-rebuilding re-election.
+///
+/// The callback returns `Some(RefreshedTokens)` on success (the new tokenized
+/// URLs for WS and WT will replace the cached ones before the manager spawns
+/// candidates) or `None` if the refresh failed (network error, server 5xx,
+/// meeting ended, etc.). On `None`, the manager logs a warning and proceeds
+/// with the cached URLs — re-election is never blocked entirely on a refresh
+/// failure, since that would be a worse failure mode than running with an
+/// expired token (which the relay will simply reject, triggering normal
+/// reconnect-with-refresh in the UI layer).
+///
+/// The callback is set by the dioxus-ui layer (where `refresh_room_token`
+/// already exists) and consumed by `ConnectionManager` during the
+/// timer-driven re-election entry path. See discussion #562 (AUTH-2).
+///
+/// Single-threaded (`LocalBoxFuture`) because the videocall-client targets
+/// `wasm32-unknown-unknown`, where everything runs on the JS main thread.
+pub struct RefreshRoomTokenCallback {
+    cb: Rc<dyn Fn() -> LocalBoxFuture<'static, Option<RefreshedTokens>>>,
+}
+
+impl RefreshRoomTokenCallback {
+    /// Build a `RefreshRoomTokenCallback` from any closure that returns a
+    /// future resolving to `Option<RefreshedTokens>`.
+    pub fn from<F, Fut>(func: F) -> Self
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = Option<RefreshedTokens>> + 'static,
+    {
+        Self {
+            cb: Rc::new(move || Box::pin(func())),
+        }
+    }
+
+    /// Invoke the callback. Returns the future the caller must drive to
+    /// completion (typically via `wasm_bindgen_futures::spawn_local`).
+    pub fn emit(&self) -> LocalBoxFuture<'static, Option<RefreshedTokens>> {
+        (self.cb)()
+    }
+}
+
+impl Clone for RefreshRoomTokenCallback {
+    fn clone(&self) -> Self {
+        Self {
+            cb: self.cb.clone(),
+        }
+    }
+}
+
+#[allow(ambiguous_wide_pointer_comparisons)]
+impl PartialEq for RefreshRoomTokenCallback {
+    fn eq(&self, other: &Self) -> bool {
+        // Mirror `videocall_types::Callback`'s identity-based equality so
+        // `VideoCallClientOptions` can stay `PartialEq`-derivable.
+        Rc::ptr_eq(&self.cb, &other.cb)
+    }
+}
+
+impl std::fmt::Debug for RefreshRoomTokenCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RefreshRoomTokenCallback<_>")
+    }
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -92,6 +175,14 @@ pub struct VideoCallClientOptions {
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
+    /// Batched companion of `on_peer_removed` fired once per
+    /// `PeerDecodeManager` removal pass with **all** peers removed in
+    /// that pass. Subscribers that only need a single notification (e.g.
+    /// to bump a UI version counter) should listen here so a 5-peer
+    /// watchdog timeout does not trigger 5 sequential UI re-renders.
+    /// `on_peer_removed` continues to fire per-peer for cleanup of
+    /// per-peer state. See Phase 6 watchdog-cascade fix.
+    pub on_peers_removed_batch: Option<Callback<Vec<String>>>,
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
@@ -141,6 +232,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when meeting settings are updated (optional)
     pub on_meeting_settings_updated: Option<Callback<()>>,
 
+    /// Callback triggered when the host requests this client mute its mic.
+    pub on_host_mute: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
@@ -183,12 +277,32 @@ pub struct VideoCallClientOptions {
     /// Defaults to `true`. The dioxus-ui derives the value from the user's
     /// `TransportPreference` context signal.
     pub allow_post_rebase_retry: bool,
+
+    /// Async callback the client invokes when it needs a fresh room token,
+    /// e.g. before a candidate-rebuilding re-election.
+    ///
+    /// When set, the connection manager calls this callback at the start of
+    /// every internal re-election triggered by the RTT-degradation watchdog
+    /// (1Hz timer) or post-rebase retry. On success the manager swaps in the
+    /// freshly-tokenized URLs before spawning candidates, so re-elections
+    /// after the original token's expiry no longer fail with all candidates
+    /// rejected by the relay (the failure mode AUTH-2 was filed against —
+    /// see discussion #562).
+    ///
+    /// On failure (`None`), the manager logs a warning and proceeds with
+    /// the cached URLs; the existing UI-level `schedule_reconnect` path
+    /// remains the safety net for terminal token expiry.
+    ///
+    /// Set to `None` for clients that don't have a refresh endpoint
+    /// (no-jwt builds, observers, tests).
+    pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
     user_id: String,
+    display_name: String,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -197,6 +311,7 @@ struct InnerOptions {
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
     on_meeting_settings_updated: Option<Callback<()>>,
+    on_host_mute: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
@@ -226,6 +341,12 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Recently processed host action events for deduplication across
+    /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
+    /// shorter window than `recent_peer_events` because host actions are
+    /// deliberate, repeatable commands — see `is_duplicate_host_action`.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_host_events: HashMap<(String, String), f64>,
     /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
     /// `CameraEncoder` checks this flag each frame and forces a keyframe.
     force_camera_keyframe: Arc<AtomicBool>,
@@ -238,6 +359,13 @@ struct Inner {
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Long Tasks API observer that emits `client_longtask_duration_ms` /
+    /// `client_longtask_count` to the diagnostic bus whenever the main
+    /// thread blocks for more than 50 ms. Held for its drop side-effect:
+    /// the underlying `PerformanceObserver` is disconnected automatically
+    /// when this field goes out of scope. May be `None` on browsers that
+    /// don't expose [`PerformanceObserver`] (Safari < 16.4 etc.).
+    _long_task_observer: Option<crate::long_tasks::LongTaskObserver>,
 }
 
 /// The main client handle for a video call session.
@@ -333,12 +461,28 @@ impl VideoCallClient {
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
+        // Phase 8a / TELEM-1: register a Long Tasks API observer once per
+        // VideoCallClient lifetime. Each main-thread stall > 50 ms is
+        // forwarded to the diagnostic bus as `client_longtask_duration_ms`
+        // and `client_longtask_count`. `start()` returns `None` on
+        // browsers that don't expose `PerformanceObserver` (Safari < 16.4,
+        // Web Worker globals, etc.); in that case we silently skip — long
+        // task telemetry is a nice-to-have, not a hard dependency.
+        let long_task_observer = crate::long_tasks::LongTaskObserver::start();
+        if long_task_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — Long Tasks API not available; \
+                 client_longtask_duration_ms metric will not be emitted"
+            );
+        }
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     user_id: options.user_id.clone(),
+                    display_name: options.display_name.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
@@ -347,6 +491,7 @@ impl VideoCallClient {
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_host_mute: options.on_host_mute.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -369,10 +514,12 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                recent_host_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
+                _long_task_observer: long_task_observer,
             })),
             connection_controller,
             aes,
@@ -555,6 +702,10 @@ impl VideoCallClient {
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
             allow_post_rebase_retry: self.options.allow_post_rebase_retry,
+            // Phase 3 / AUTH-2: forward the dioxus-ui's room-token refresh
+            // callback so the manager can preempt token expiry from inside
+            // re-election. See discussion #562.
+            refresh_room_token_callback: self.options.refresh_room_token_callback.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -651,6 +802,9 @@ impl VideoCallClient {
         peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
         if let Some(cb) = opts.on_peer_removed.as_ref() {
             peer_decode_manager.on_peer_removed = cb.clone();
+        }
+        if let Some(cb) = opts.on_peers_removed_batch.as_ref() {
+            peer_decode_manager.on_peers_removed_batch = cb.clone();
         }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager
@@ -805,12 +959,13 @@ impl VideoCallClient {
 
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .peer_decode_manager
-                .sorted_keys()
-                .iter()
-                .map(|k| k.to_string())
-                .collect(),
+            // Phase 6 fix: read from the cached `Rc<Vec<String>>` on the
+            // peer decode manager rather than re-walking the ordered key
+            // list and allocating a fresh `Vec<String>` on every call.
+            // The dioxus meeting view calls this on every render of every
+            // peer tile; with many peers this allocation cost was
+            // measurable on 2-core hardware.
+            Ok(inner) => (*inner.peer_decode_manager.sorted_string_keys()).clone(),
             Err(_) => Vec::<String>::new(),
         }
     }
@@ -1005,7 +1160,7 @@ impl VideoCallClient {
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
-        output_fps: Rc<AtomicU32>,
+        output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
@@ -1377,6 +1532,36 @@ impl Inner {
         }
     }
 
+    /// Returns `true` if this host action event was already seen within the
+    /// last 1 second.
+    ///
+    /// Like `is_duplicate_peer_event`, this exists to suppress duplicate
+    /// dispatches caused by both WebSocket and WebTransport delivering the
+    /// same NATS system message during dual-transport scenarios (election,
+    /// transport-switching, post-rebase retry).
+    ///
+    /// The window is intentionally short (1 s, vs 30 s for peer events)
+    /// because host actions like HOST_MUTE_PARTICIPANT are *deliberate,
+    /// repeatable* commands: a host must be able to re-mute a participant
+    /// who self-unmuted seconds later. A 30-second suppression window would
+    /// block legitimate re-mutes — a worse bug than the duplicate dispatch
+    /// we're fixing. Dual-transport delivery of the same message happens
+    /// within milliseconds, so 1 s is ample headroom.
+    fn is_duplicate_host_action(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 1 second).
+        self.recent_host_events.retain(|_, ts| now - *ts < 1_000.0);
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_host_events.entry(key) {
+            e.insert(now);
+            false // first occurrence
+        } else {
+            true // duplicate
+        }
+    }
+
     /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
     /// was a keyframe request and was handled, `false` otherwise.
     ///
@@ -1615,6 +1800,16 @@ impl Inner {
                         reporter.set_session_id(response.session_id.to_string());
                     }
                 }
+
+                // Seed the display name cache so the local user's tile
+                // shows their display name instead of their user_id/email.
+                // The host never receives a PARTICIPANT_JOINED for themselves.
+                if !self.options.display_name.is_empty() {
+                    self.peer_decode_manager.set_peer_display_name(
+                        response.session_id,
+                        self.options.display_name.clone(),
+                    );
+                }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
                 Ok(meeting_packet) => {
@@ -1787,6 +1982,33 @@ impl Inner {
                             );
                             if let Some(callback) = &self.options.on_meeting_settings_updated {
                                 callback.emit(());
+                            }
+                        }
+                        Ok(MeetingEventType::HOST_MUTE_PARTICIPANT) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_mute_all = target.is_empty();
+                            let is_targeted_at_self = !is_mute_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_MUTE_PARTICIPANT: room={}, target=\"{}\", is_mute_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_mute_all,
+                                is_targeted_at_self
+                            );
+                            if is_mute_all || is_targeted_at_self {
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_mute", &target_str) {
+                                    if let Some(cb) = &self.options.on_host_mute {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_MUTE_PARTICIPANT for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
@@ -1989,6 +2211,8 @@ mod disconnect_tests {
             on_peer_added: VcCallback::noop(),
             on_peer_first_frame: VcCallback::noop(),
             on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| id),
             on_connected: VcCallback::noop(),
@@ -2015,6 +2239,7 @@ mod disconnect_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_display_name_changed: None,
+            on_host_mute: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

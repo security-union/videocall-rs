@@ -31,6 +31,7 @@ pub fn PeerListItem(
     #[props(default = true)] muted: bool,
     #[props(default = false)] speaking: bool,
     #[props(default)] on_edit_name: EventHandler<()>,
+    #[props(default)] on_mute: Option<EventHandler<()>>,
 ) -> Element {
     let effective_tooltip = if tooltip.is_empty() {
         name.clone()
@@ -64,6 +65,8 @@ pub fn PeerListItem(
         (false, true) => Some("(Host)"),
         (false, false) => None,
     };
+
+    let mut peer_menu_open = use_signal(|| false);
 
     rsx! {
         div { class: "peer_item", title,
@@ -100,6 +103,62 @@ pub fn PeerListItem(
                                 stroke_linejoin: "round",
                                 path { d: "M12 20h9" }
                                 path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(on_mute) = on_mute {
+                div { class: "peer_item_menu_wrapper",
+                    button {
+                        class: "peer_item_menu_btn",
+                        title: "More options",
+                        aria_label: "More options",
+                        onclick: move |e: MouseEvent| {
+                            e.stop_propagation();
+                            peer_menu_open.set(!peer_menu_open());
+                        },
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            circle { cx: "12", cy: "12", r: "1" }
+                            circle { cx: "12", cy: "5", r: "1" }
+                            circle { cx: "12", cy: "19", r: "1" }
+                        }
+                    }
+                    if peer_menu_open() {
+                        div { class: "context-menu peer_item_context_menu",
+                            button {
+                                class: "context-menu-item",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    peer_menu_open.set(false);
+                                    on_mute.call(());
+                                },
+                                svg {
+                                    xmlns: "http://www.w3.org/2000/svg",
+                                    width: "16",
+                                    height: "16",
+                                    view_box: "0 0 24 24",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: "2",
+                                    stroke_linecap: "round",
+                                    stroke_linejoin: "round",
+                                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                    path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                    path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                    line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                    line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                }
+                                "Mute"
                             }
                         }
                     }

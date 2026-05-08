@@ -149,6 +149,13 @@ impl EkgRenderer {
     pub fn create_frame_buffer(&self) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
         ImageBuffer::from_pixel(self.width, self.height, Rgb(BG_COLOR))
     }
+
+    /// EKG stroke color. Exposed so the video producer can rebuild the
+    /// renderer at a different resolution when the adaptive-quality tier
+    /// changes.
+    pub fn color(&self) -> [u8; 3] {
+        self.color
+    }
 }
 
 /// Compute RMS energy per video frame from audio samples.

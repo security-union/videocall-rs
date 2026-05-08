@@ -177,6 +177,17 @@
       : (nav.language || "N/A");
     var dpr = window.devicePixelRatio || 1;
 
+    // Phase 8a / TELEM-2: capability_score is set by Rust right before
+    // calling setContext. It's the iteration count of a 100 ms f64
+    // multiply-add microbenchmark — a stable cross-machine signal we use
+    // to spot under-powered devices in production logs (e.g. an Intel
+    // 2014 MBP scoring ~5,000 vs an M2 scoring > 50,000). Falls back to
+    // "N/A" if the score wasn't computed (older WASM build).
+    var capabilityScore = window.__videocall_capability_score;
+    if (typeof capabilityScore !== "number" || !isFinite(capabilityScore)) {
+      capabilityScore = "N/A";
+    }
+
     var msg = "appVersion=" + (appVersion || "unknown")
       + "; displayName=" + (displayName || "unknown")
       + "; userAgent=" + (nav.userAgent || "N/A")
@@ -185,7 +196,8 @@
       + "; heap=" + heapUsed + "/" + heapTotal
       + "; screen=" + scr.width + "x" + scr.height + "@" + dpr + "x"
       + "; platform=" + platform
-      + "; languages=" + languages;
+      + "; languages=" + languages
+      + "; capability_score=" + capabilityScore;
 
     var entry = JSON.stringify({
       seq: nextSeq++,

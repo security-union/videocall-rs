@@ -24,9 +24,9 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
-    /// Room access token time-to-live in seconds (default: 60 = 1 minute).
-    /// Tokens are "single-burner": short-lived admission tickets that the UI
-    /// refreshes automatically on every reconnect.
+    /// Room access token time-to-live in seconds (default: 86400 = 24 hours).
+    /// Must cover the longest expected meeting plus any connection re-election —
+    /// see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
     pub session_ttl_secs: i64,
@@ -60,6 +60,15 @@ pub struct Config {
     /// explicitly off (or leave unset); only flip it for local development
     /// when running without an OAuth provider.
     pub allow_anonymous: bool,
+    /// Disable the per-user display-name rename rate limiter.  Controlled by
+    /// `DISPLAY_NAME_RATE_LIMIT_DISABLED=true`.  Default `false` — production
+    /// must keep the limiter active so that runaway clients can't churn
+    /// `display_name` updates and amplify NATS broadcasts to every meeting
+    /// participant.  The flag exists only for local development and the E2E
+    /// test harness, where the parallel Playwright workers legitimately
+    /// exceed the 5-renames-per-60s budget shared per `(user_id)` across
+    /// every test in a window.
+    pub display_name_rate_limit_disabled: bool,
     /// Dev-only auto-login user. `None` unless `DEV_USER` is set AND OAuth is
     /// disabled. See [`DevUser`] for format and security warnings.
     pub dev_user: Option<DevUser>,
@@ -172,7 +181,12 @@ impl Config {
     ///
     /// # Optional
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
-    /// - `TOKEN_TTL_SECS` (default: `"60"`)
+    /// - `TOKEN_TTL_SECS` (default: `"86400"`) — room access token lifetime in seconds.
+    ///   MUST be long enough to cover the duration of any meeting a client might join
+    ///   plus connection re-election. Setting this too short causes cached tokens in
+    ///   WT/WS URLs to expire before a re-election can complete, stranding users with
+    ///   "No valid connections". See
+    ///   [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
     /// - `COOKIE_DOMAIN`
     /// - `COOKIE_NAME` (default: `"session"`) — set to a unique value (e.g. `"pr-session"`)
     ///   in PR preview environments to avoid collision with the production cookie
@@ -190,6 +204,12 @@ impl Config {
     /// - `ALLOW_ANONYMOUS` (default: `false`) — set to `"true"` / `"1"` for local development
     ///   only. When enabled, unauthenticated requests resolve to a stable anonymous user
     ///   identity instead of returning 401.
+    /// - `DISPLAY_NAME_RATE_LIMIT_DISABLED` (default: `false`) — set to `"true"` / `"1"`
+    ///   for the E2E test harness only. When enabled, the per-user display-name rename
+    ///   rate limiter (5 renames per 60-second window) is bypassed entirely. Required
+    ///   for the Playwright suite, which runs many tests in parallel under the same
+    ///   `dev_user` identity and would otherwise hit
+    ///   `RATE_LIMIT_EXCEEDED` cascades on `POST /api/v1/meetings/{id}/join`.
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -197,8 +217,11 @@ impl Config {
             env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+        // Default: 24 hours. Must exceed both the longest expected meeting and
+        // the client's connection re-election window, or cached tokens in WT/WS
+        // URLs expire mid-meeting and re-election fails. See discussion #562.
         let token_ttl_secs = env::var("TOKEN_TTL_SECS")
-            .unwrap_or_else(|_| "60".to_string())
+            .unwrap_or_else(|_| "86400".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
         let session_ttl_secs = env::var("SESSION_TTL_SECS")
@@ -271,6 +294,25 @@ impl Config {
                 "ALLOW_ANONYMOUS=true — unauthenticated requests will resolve to \
                  anonymous identities. This is intended for local development only; \
                  do not enable in production."
+            );
+        }
+
+        // Display-name rate-limit bypass — opt-in via
+        // DISPLAY_NAME_RATE_LIMIT_DISABLED.  Same truthy-form parsing as
+        // ALLOW_ANONYMOUS so the two flags compose cleanly in dev/CI envs.
+        // Production MUST leave this off so a misbehaving client cannot churn
+        // rename requests and amplify NATS broadcasts to every participant.
+        let display_name_rate_limit_disabled = env::var("DISPLAY_NAME_RATE_LIMIT_DISABLED")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+        if display_name_rate_limit_disabled {
+            tracing::warn!(
+                "DISPLAY_NAME_RATE_LIMIT_DISABLED=true — display-name rename rate \
+                 limiter is bypassed.  This is intended for the E2E test harness \
+                 only; do not enable in production."
             );
         }
 
@@ -416,6 +458,7 @@ impl Config {
             service_version_urls,
             search,
             allow_anonymous,
+            display_name_rate_limit_disabled,
             dev_user,
         })
     }
@@ -469,5 +512,54 @@ impl Config {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Run `body` with `key` removed from the process environment, then restore
+    /// the prior value. Required because [`Config::from_env`] reads process env,
+    /// which is shared across the test binary's parallel runners.
+    fn with_env_unset<F: FnOnce()>(key: &str, body: F) {
+        let prior = std::env::var(key).ok();
+        std::env::remove_var(key);
+        body();
+        if let Some(v) = prior {
+            std::env::set_var(key, v);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn token_ttl_secs_defaults_to_86400_when_env_unset() {
+        // Regression test for discussion #562: the previous default of 60s
+        // caused production stranding when re-election fired more than 60s
+        // after a client joined, expiring the cached token in the WT/WS URL.
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        with_env_unset("TOKEN_TTL_SECS", || {
+            let cfg = Config::from_env().expect("from_env with TOKEN_TTL_SECS unset must succeed");
+            assert_eq!(
+                cfg.token_ttl_secs, 86400,
+                "default must be 24h — see discussion #562"
+            );
+        });
+
+        // Restore surrounding env so we don't pollute sibling tests.
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
     }
 }

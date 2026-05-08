@@ -1,0 +1,82 @@
+name: Backend Tests (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'actix-api/**'
+      - 'meeting-api/**'
+      - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
+      - 'protobuf/**'
+      - 'dbmate/**'
+      - 'docker/docker-compose.integration.yaml'
+      - 'docker/Dockerfile.actix.dev'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+      - '.github/workflows/pr-check-backend-hcl.yaml'
+
+concurrency:
+  group: pr-check-backend-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  test:
+    name: cargo tests
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Isolate this runner's docker compose project from the other 3 runners
+      # on the same host. Without this, parallel jobs share the same
+      # `docker_default` network and `docker-postgres-1`/`docker-nats-1`
+      # containers, which causes "network docker_default not found" and
+      # "container name already in use" races.
+      #
+      # Set via $GITHUB_ENV (not job-level `env:`) because `${{ runner.name }}`
+      # isn't resolved at job-level — only after runner assignment, i.e. at
+      # step time. A job-level reference causes a workflow startup_failure.
+      - name: Set compose project name
+        # Stable per-runner name (not per-run): a per-run unique name makes the
+        # pre-teardown below a no-op (new project doesn't exist yet), so volumes
+        # from every prior run accumulate on disk until the host fills up.
+        run: echo "COMPOSE_PROJECT_NAME=vc-${RUNNER_NAME}" >> "$GITHUB_ENV"
+
+      - name: Tear down any prior project state for this runner
+        # Scoped to this runner's project only — does NOT affect other runners'
+        # running containers or networks.
+        run: docker compose -f docker/docker-compose.integration.yaml down -v --remove-orphans || true
+
+      - name: Prune unused volumes
+        # Removes any volumes not attached to a running container (including
+        # stale volumes from prior runs). Safe: Docker refuses to remove
+        # in-use volumes regardless of this command.
+        run: sudo docker volume prune -f || true
+
+      - name: Pre-create target dirs to prevent Docker from initializing them as root
+        run: mkdir -p actix-api/target
+
+      - name: Run backend tests
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: make tests_run
+
+      - name: Teardown
+        if: always()
+        run: make tests_down
+
+      - name: Fix workspace ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" . || true

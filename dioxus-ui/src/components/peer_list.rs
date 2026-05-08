@@ -18,6 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
+use crate::constants::meeting_api_client;
 use crate::context::VideoCallClientCtx;
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
@@ -44,6 +45,8 @@ pub fn PeerList(
 ) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
+    let mut show_incall_menu = use_signal(|| false);
+    let mut is_muting_all = use_signal(|| false);
 
     // Track peer audio and speaking states from diagnostics
     let mut peer_audio_states = use_signal(HashMap::<String, bool>::new);
@@ -197,7 +200,83 @@ pub fn PeerList(
                 }
 
                 div { class: "attendants-section",
-                    h3 { "In call" }
+                    div { class: "in-call-header",
+                        h3 { "In call" }
+                        if is_current_user_host {
+                            {
+                                let room_id_for_mute = room_id.clone();
+                                rsx! {
+                                    div { class: "in-call-menu-wrapper",
+                                        button {
+                                            class: "menu-button",
+                                            title: "Host actions",
+                                            aria_label: "Host actions",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                show_incall_menu.set(!show_incall_menu());
+                                            },
+                                            svg {
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "1" }
+                                                circle { cx: "12", cy: "5", r: "1" }
+                                                circle { cx: "12", cy: "19", r: "1" }
+                                            }
+                                        }
+                                        if show_incall_menu() {
+                                            div { class: "context-menu",
+                                                button {
+                                                    class: "context-menu-item",
+                                                    disabled: is_muting_all(),
+                                                    onclick: move |_| {
+                                                        if is_muting_all() { return; }
+                                                        is_muting_all.set(true);
+                                                        show_incall_menu.set(false);
+                                                        let meeting_id = room_id_for_mute.clone();
+                                                        spawn(async move {
+                                                            match meeting_api_client() {
+                                                                Ok(client) => {
+                                                                    if let Err(e) = client.mute_all(&meeting_id).await {
+                                                                        log::warn!("mute_all failed: {e}");
+                                                                    }
+                                                                }
+                                                                Err(e) => log::warn!("meeting_api_client error: {e}"),
+                                                            }
+                                                            is_muting_all.set(false);
+                                                        });
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "16",
+                                                        height: "16",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                    }
+                                                    if is_muting_all() { "Muting..." } else { "Mute all" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
@@ -224,6 +303,40 @@ pub fn PeerList(
                                     let speaking = peer_session_id
                                         .and_then(|sid| speaking_states.get(sid).copied())
                                         .unwrap_or(false);
+                                    // Provide a mute callback when the local user is
+                                    // the host and the peer's mic is currently on.
+                                    let on_mute = if is_current_user_host && !muted {
+                                        let meeting_id = room_id.clone();
+                                        let peer_user_id = peer.clone();
+                                        Some(EventHandler::new(move |_| {
+                                            let meeting_id = meeting_id.clone();
+                                            let peer_user_id = peer_user_id.clone();
+                                            spawn(async move {
+                                                match meeting_api_client() {
+                                                    Ok(client) => {
+                                                        if let Err(e) = client
+                                                            .mute_participant(
+                                                                &meeting_id,
+                                                                &peer_user_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::warn!(
+                                                                "mute_participant failed: {e}"
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "meeting_api_client error: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }))
+                                    } else {
+                                        None
+                                    };
                                     rsx! {
                                         li {
                                             key: "{peer}",
@@ -234,6 +347,7 @@ pub fn PeerList(
                                                 is_guest: peer_is_guest,
                                                 muted: muted,
                                                 speaking: speaking,
+                                                on_mute: on_mute,
                                             }
                                         }
                                     }

@@ -21,6 +21,7 @@
 /// track of connection status.
 ///
 use super::task::Task;
+use super::url_log::strip_query_for_log;
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
@@ -267,7 +268,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        log::debug!("Dropping Connection to {}", self.url);
+        log::debug!("Dropping Connection to {}", strip_query_for_log(&self.url));
         self.stop_heartbeat();
     }
 }

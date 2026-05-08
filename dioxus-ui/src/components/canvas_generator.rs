@@ -298,6 +298,8 @@ pub fn generate_for_peer(
     my_peer_id: Option<&str>,
     signal_info: SignalInfo,
     mut show_signal_popup: Signal<bool>,
+    mut show_tile_menu: Signal<bool>,
+    on_mute: Option<EventHandler<()>>,
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
@@ -494,15 +496,6 @@ pub fn generate_for_peer(
                             onclick: move |_| show_signal_popup.toggle(),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
-                        // Pin (visible on hover only)
-                        button {
-                            onclick: move |_| {
-                                toggle_pinned_div(&div_id_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin_vo.clone());
-                            },
-                            class: "pin-icon",
-                            PushPinIcon {}
-                        }
                         // Crop (visible on hover only, hidden when video disabled)
                         if is_video_enabled_for_peer {
                             {
@@ -515,6 +508,78 @@ pub fn generate_for_peer(
                                     }
                                 }
                             }
+                        }
+                        // Three-dot host mute menu (visible on hover / when speaking, only for host)
+                        if on_mute.is_some() {
+                            {
+                                let on_mute_clone = on_mute;
+                                rsx! {
+                                    div { class: "tile-mute-menu-wrapper",
+                                        button {
+                                            class: "tile-mute-btn",
+                                            title: "Mute participant",
+                                            "aria-label": "Mute participant",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                show_tile_menu.set(!show_tile_menu());
+                                            },
+                                            svg {
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "1" }
+                                                circle { cx: "12", cy: "5", r: "1" }
+                                                circle { cx: "12", cy: "19", r: "1" }
+                                            }
+                                        }
+                                        if show_tile_menu() {
+                                            div { class: "tile-context-menu",
+                                                button {
+                                                    class: "tile-context-menu-item",
+                                                    onclick: move |_| {
+                                                        show_tile_menu.set(false);
+                                                        if let Some(ref cb) = on_mute_clone {
+                                                            cb.call(());
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "14",
+                                                        height: "14",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                    }
+                                                    "Mute"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Pin (visible on hover / when speaking)
+                        button {
+                            onclick: move |_| {
+                                toggle_pinned_div(&div_id_pin);
+                                on_toggle_pin.call(peer_user_id_for_pin_vo.clone());
+                            },
+                            class: "pin-icon",
+                            PushPinIcon {}
                         }
                     }
                     if show_signal_popup() {
@@ -615,15 +680,7 @@ pub fn generate_for_peer(
                             onclick: move |_| show_signal_popup.toggle(),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
-                        // Pin and Crop (visible on hover only)
-                        button {
-                            onclick: move |_| {
-                                toggle_pinned_div(&div_id_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin.clone());
-                            },
-                            class: "pin-icon",
-                            PushPinIcon {}
-                        }
+                        // Crop (visible on hover only)
                         if is_video_enabled_for_peer {
                             {
                                 let crop_class = canvas_id_crop.clone();
@@ -635,6 +692,78 @@ pub fn generate_for_peer(
                                     }
                                 }
                             }
+                        }
+                        // Three-dot host mute menu (visible on hover / when speaking, only for host)
+                        if on_mute.is_some() {
+                            {
+                                let on_mute_clone = on_mute;
+                                rsx! {
+                                    div { class: "tile-mute-menu-wrapper",
+                                        button {
+                                            class: "tile-mute-btn",
+                                            title: "Mute participant",
+                                            "aria-label": "Mute participant",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                show_tile_menu.set(!show_tile_menu());
+                                            },
+                                            svg {
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "1" }
+                                                circle { cx: "12", cy: "5", r: "1" }
+                                                circle { cx: "12", cy: "19", r: "1" }
+                                            }
+                                        }
+                                        if show_tile_menu() {
+                                            div { class: "tile-context-menu",
+                                                button {
+                                                    class: "tile-context-menu-item",
+                                                    onclick: move |_| {
+                                                        show_tile_menu.set(false);
+                                                        if let Some(ref cb) = on_mute_clone {
+                                                            cb.call(());
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "14",
+                                                        height: "14",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                    }
+                                                    "Mute"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Pin (leftmost via row-reverse, visible on hover / when speaking)
+                        button {
+                            onclick: move |_| {
+                                toggle_pinned_div(&div_id_pin);
+                                on_toggle_pin.call(peer_user_id_for_pin.clone());
+                            },
+                            class: "pin-icon",
+                            PushPinIcon {}
                         }
                     }
                     if show_signal_popup() {
@@ -797,15 +926,7 @@ pub fn generate_for_peer(
                                 onclick: move |_| show_signal_popup.toggle(),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
-                            // Pin and Crop (visible on hover only)
-                            button {
-                                onclick: move |_| {
-                                    toggle_pinned_div(&pv_div_pin);
-                                    on_toggle_pin.call(peer_user_id_for_pin.clone());
-                                },
-                                class: "pin-icon",
-                                PushPinIcon {}
-                            }
+                            // Crop (visible on hover only)
                             if is_video_enabled_for_peer {
                                 {
                                     let pv_crop_class = pv_canvas_crop.clone();
@@ -817,6 +938,78 @@ pub fn generate_for_peer(
                                         }
                                     }
                                 }
+                            }
+                            // Three-dot host mute menu (visible on hover / when speaking, only for host)
+                            if on_mute.is_some() {
+                                {
+                                    let on_mute_clone = on_mute;
+                                    rsx! {
+                                        div { class: "tile-mute-menu-wrapper",
+                                            button {
+                                                class: "tile-mute-btn",
+                                                title: "Mute participant",
+                                                "aria-label": "Mute participant",
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    show_tile_menu.set(!show_tile_menu());
+                                                },
+                                                svg {
+                                                    xmlns: "http://www.w3.org/2000/svg",
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    circle { cx: "12", cy: "12", r: "1" }
+                                                    circle { cx: "12", cy: "5", r: "1" }
+                                                    circle { cx: "12", cy: "19", r: "1" }
+                                                }
+                                            }
+                                            if show_tile_menu() {
+                                                div { class: "tile-context-menu",
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            if let Some(ref cb) = on_mute_clone {
+                                                                cb.call(());
+                                                            }
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                            path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                            line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                            line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                        }
+                                                        "Mute"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Pin (visible on hover / when speaking)
+                            button {
+                                onclick: move |_| {
+                                    toggle_pinned_div(&pv_div_pin);
+                                    on_toggle_pin.call(peer_user_id_for_pin.clone());
+                                },
+                                class: "pin-icon",
+                                PushPinIcon {}
                             }
                         }
                         if show_signal_popup() {

@@ -74,6 +74,7 @@ fn build_app_no_anonymous(pool: PgPool) -> Router {
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
         allow_anonymous: false,
+        display_name_rate_limit_disabled: false,
         dev_user: None,
     };
     routes::router().with_state(state)

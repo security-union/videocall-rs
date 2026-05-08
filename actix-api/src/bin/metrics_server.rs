@@ -1305,6 +1305,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -1584,6 +1585,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -1599,6 +1601,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -1615,6 +1618,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -1650,6 +1654,7 @@ mod tests {
             display_name: "test_user".to_string(),
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
+            client_info_labels: None,
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -1676,6 +1681,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -1823,6 +1829,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);
@@ -2096,6 +2103,7 @@ mod tests {
                     to_peer_display_names: HashMap::new(),
                     peer_ids: HashSet::new(),
                     active_servers: HashSet::new(),
+                    client_info_labels: None,
                 },
             );
         }

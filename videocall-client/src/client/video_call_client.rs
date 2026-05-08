@@ -79,6 +79,8 @@ fn generate_instance_id() -> String {
     )
 }
 
+const MAX_SESSION_ID_HISTORY: usize = 16;
+
 /// Result of refreshing a room token. Both URL lists carry the new token
 /// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
 /// ready to be plugged into the connection manager via
@@ -328,6 +330,15 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// Bounded set of session_ids this client has held in the current page load.
+    /// Used to match incoming CONGESTION signals — the server stamps the throttled
+    /// sender's session_id on the wire, and the client receives every CONGESTION
+    /// via wildcard NATS fan-out (`room.{room}.*` with per-session queue groups).
+    /// Without this match, antonio would step down video when jay is the throttled
+    /// sender. The history covers the reconnect race-window where SESSION_ASSIGNED
+    /// for a new session id may not have landed yet at the moment a CONGESTION
+    /// targeting it arrives. Bounded to `MAX_SESSION_ID_HISTORY`.
+    session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -496,6 +507,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -1766,6 +1778,12 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
+                if !self.session_id_history.contains(&response.session_id) {
+                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
+                        self.session_id_history.pop_front();
+                    }
+                    self.session_id_history.push_back(response.session_id);
+                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
@@ -2053,22 +2071,31 @@ impl Inner {
                 }
             },
             Ok(PacketType::CONGESTION) => {
-                // Server-side congestion feedback: a receiver's outbound queue
-                // is dropping our packets, so the server published a CONGESTION
-                // signal addressed to this sender's NATS subject. By the time
-                // the packet arrives at this client it has already been routed
-                // to us specifically. The prior session-id matching check
-                // dropped every signal in the 2026-05-08 production storm
-                // (718 ignored / 718 received) because the field can carry an
-                // ID we never saw assigned (e.g. when the dual-transport pair
-                // is mid-election). Trust the routing, always step down.
-                warn!(
-                    "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
-                    String::from_utf8_lossy(&response.user_id),
-                    response.session_id,
-                );
-                self.congestion_step_down_requested
-                    .store(true, Ordering::Release);
+                // Server-side congestion feedback. The server stamps the throttled
+                // sender's session_id onto the packet and publishes to that sender's
+                // NATS subject, but every session in the room subscribes via
+                // `room.{room}.*` with a distinct per-session queue group, so the
+                // server fans every CONGESTION packet out to every session. The
+                // embedded session_id therefore identifies WHICH sender is being
+                // throttled — match it against our own current and prior session
+                // ids. Only step down if we are the throttled one; cross-session
+                // signals are noise to us.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if is_self_targeted {
+                    warn!(
+                        "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
+                        response.session_id,
+                    );
+                    self.congestion_step_down_requested
+                        .store(true, Ordering::Release);
+                } else {
+                    debug!(
+                        "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(

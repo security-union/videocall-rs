@@ -218,6 +218,7 @@ pub struct ClientMetadata {
 }
 
 /// Normalize a raw GPU renderer string to a short family name.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn normalize_gpu_family(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -1654,7 +1655,10 @@ mod tests {
             normalize_gpu_family("ANGLE (NVIDIA GeForce RTX 3060 Direct3D11)"),
             "GeForce RTX 3060 Direct3"
         );
-        assert_eq!(normalize_gpu_family("AMD Radeon Pro 5500M"), "Radeon Pro 5500M");
+        assert_eq!(
+            normalize_gpu_family("AMD Radeon Pro 5500M"),
+            "Radeon Pro 5500M"
+        );
         assert_eq!(normalize_gpu_family(""), "");
     }
 

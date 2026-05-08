@@ -52,6 +52,7 @@
           if (ua.architecture) {
             highEntropyArchitecture = ua.architecture;
           }
+          updateClientMetadata();
         })
         .catch(function () {});
     } catch (_) {}
@@ -87,8 +88,23 @@
     try {
       navigator.getBattery().then(function (battery) {
         batteryInfo = { charging: battery.charging, level: battery.level };
+        updateClientMetadata();
       }).catch(function () {});
     } catch (_) {}
+  }
+
+  // Shared helper: (re)write window.__videocall_client_metadata from current state.
+  // Called from async callbacks (getHighEntropyValues, getBattery) and from writePreamble().
+  function updateClientMetadata() {
+    window.__videocall_client_metadata = {
+      architecture: highEntropyArchitecture || "",
+      gpu: gpuRenderer || "",
+      network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
+      network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
+      network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
+      battery_charging: batteryInfo ? batteryInfo.charging : null,
+      battery_level: batteryInfo ? batteryInfo.level : null
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -270,15 +286,7 @@
     bufferBytes += entry.length + 1;
 
     // Expose static metadata as window globals for the WASM health reporter (TELEM-7).
-    window.__videocall_client_metadata = {
-      architecture: highEntropyArchitecture || "",
-      gpu: gpuRenderer || "",
-      network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
-      network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
-      network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
-      battery_charging: batteryInfo ? batteryInfo.charging : null,
-      battery_level: batteryInfo ? batteryInfo.level : null
-    };
+    updateClientMetadata();
   }
 
   // ---------------------------------------------------------------------------

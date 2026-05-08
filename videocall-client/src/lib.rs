@@ -79,6 +79,7 @@
 //!     on_peer_left: None,    // Option<Callback<(String, String)>> -- (display_name, user_id)
 //!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
 //!     on_display_name_changed: None,
+//!     on_host_mute: None,
 //!     decode_media: true,
 //!     is_guest: false,
 //!     allow_post_rebase_retry: true,
@@ -118,6 +119,7 @@
 //! #     on_peer_left: None,
 //! #     on_peer_joined: None,
 //! #     on_display_name_changed: None,
+//! #     on_host_mute: None,
 //! #     decode_media: true,
 //! #     is_guest: false,
 //! #     allow_post_rebase_retry: true,

@@ -38,6 +38,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod host;
 pub mod meetings;
 pub mod participants;
 pub mod waiting_room;

@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # Build all test binaries once up front so Chrome is never launched during compilation.
       - name: Build test binaries

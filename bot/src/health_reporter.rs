@@ -350,12 +350,15 @@ fn build_health_packet(
         ps.can_listen = counters.audio_packets > 0;
         ps.can_see = counters.video_packets > 0;
 
-        // Video stats -- fps_received is the field senders use to decide
-        // quality tiers. Since we drain every ~1s, video_packets ~ fps.
+        // Video stats — fps_received is the field senders' AQ uses for
+        // tier decisions. Each inbound MediaPacket(VIDEO) is one encoded
+        // frame (transport reassembles fragments), so video_packets over
+        // the ~1s drain window ≈ frames/sec. This matches how the browser
+        // FPS tracker works (time-windowed frame count).
         let mut vs = PbVideoStats::new();
         vs.fps_received = counters.video_packets as f64;
         vs.bitrate_kbps = counters.video_bytes * 8 / 1000; // bytes/s -> kbps
-        vs.frames_decoded = counters.video_packets; // bot decodes every received frame
+        vs.frames_decoded = counters.video_packets;
         ps.video_stats = ::protobuf::MessageField::some(vs);
 
         // NetEQ stats -- bot does not use NetEQ but populate realistic values.

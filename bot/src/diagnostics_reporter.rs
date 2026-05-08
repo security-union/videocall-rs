@@ -207,7 +207,12 @@ fn build_wrapper(
     match media_type {
         MediaType::VIDEO => {
             let mut vm = VideoMetrics::new();
-            // Drain window is ~1s, so packet count ~ per-second rate.
+            // Each MediaPacket with media_type=VIDEO is one encoded frame
+            // (the transport layer reassembles fragmented payloads before
+            // InboundStats sees them). Drain window is ~1s, so packet
+            // count ≈ frames/sec. Timing jitter between drains can produce
+            // ±1-2 vs the true sender FPS but this matches the browser's
+            // approximation granularity.
             vm.fps_received = counters.video_packets as f32;
             vm.bitrate_kbps = bytes_to_kbps(counters.video_bytes);
             packet.video_metrics = MessageField::some(vm);

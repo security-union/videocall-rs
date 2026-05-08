@@ -90,17 +90,16 @@ impl KeyframeRequester {
             return;
         }
 
-        self.requested_peers.insert(peer_user_id.to_string());
-
         match build_keyframe_request(&self.self_user_id, peer_user_id) {
             Ok(bytes) => {
                 let frame = OutboundFrame::new(MediaTypeLabel::Other, bytes);
                 if self.packet_tx.try_send(frame).is_err() {
                     warn!(
-                        "[{}] Failed to send KEYFRAME_REQUEST to {} (channel full)",
+                        "[{}] Failed to send KEYFRAME_REQUEST to {} (channel full, will retry)",
                         self.self_user_id, peer_user_id
                     );
                 } else {
+                    self.requested_peers.insert(peer_user_id.to_string());
                     self.requests_sent.fetch_add(1, Ordering::Relaxed);
                     info!(
                         "[{}] Sent KEYFRAME_REQUEST to peer {}",

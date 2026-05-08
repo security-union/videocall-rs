@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: parse_meeting_console_logs.sh <log_dir> [--json|--verify]
+# Usage: parse_meeting_console_logs.sh <log_dir> [--json|--verify] [--relay-wt=PATH]
 #        parse_meeting_console_logs.sh -h | --help
 #
 # Produces a structured summary of a pulled console-log directory.
@@ -15,6 +15,12 @@
 #                   zero lines across the log dir. Use in CI or post-deploy
 #                   checks to catch silent breakage when client code renames
 #                   a log message.
+#   --relay-wt=P    optional: path to a videocall-webtransport relay pod
+#                   log file. When provided, emits a "Slow-drain Receivers"
+#                   section joining "Outbound channel full" drops per
+#                   session to the peer map from console logs. Useful for
+#                   identifying memory-pressured / slow clients (see
+#                   discussion #562, RELAY-2 pattern).
 #   -h | --help     show full usage and exit
 #
 # Dependencies: jq, zcat, date (GNU coreutils)
@@ -34,6 +40,7 @@
 # log entry so parsers can match on stable event names instead of phrases.
 # Until that lands, maintain the inventory below by hand.
 #
+# CONSOLE-LOG patterns:
 # | Phrase matched                              | Extracts         | Emitter (approximate)                                  |
 # |---------------------------------------------|------------------|--------------------------------------------------------|
 # | DIOXUS-UI: Creating VideoCallClient         | display_name    | dioxus-ui/src/components/attendants.rs                 |
@@ -46,7 +53,14 @@
 # | Connection lost / No valid connections      | connection_lost | videocall-client                                       |
 # | datagram dropped                            | datagram_drops | videocall-client (WT transport)                        |
 # | handshake failed / Opening handshake failed | handshake_failures | videocall-client (WT transport)                     |
+# | Speaking changed: false -> true             | speaking_transitions (VAD proxy for "actually spoke") | videocall-client mic/VAD        |
+# | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
+#
+# RELAY-POD patterns (when --relay-wt=PATH is provided):
+# | Phrase matched                              | Extracts                         | Emitter                                         |
+# |---------------------------------------------|----------------------------------|-------------------------------------------------|
+# | Outbound channel full for session <ID>      | drops_per_session (slow-drain)  | actix-api/src/actors/transports/wt_chat_session.rs |
 # ===========================================================================
 
 set -e
@@ -54,7 +68,7 @@ set -e
 # -h / --help — print usage and exit 0
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<EOF
-Usage: $(basename "$0") <log_dir> [--json|--verify]
+Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]
        $(basename "$0") -h | --help
 
 Produces a structured summary of a pulled console-log directory.
@@ -71,6 +85,13 @@ Modes:
                   pattern (meeting setup, election, preamble) has zero
                   matches — this usually means a client-side log message
                   was renamed in code and broke extraction.
+  --relay-wt=P    Optional path to a videocall-webtransport relay pod
+                  log file (plain text, kubectl logs output). When
+                  provided, emits a "Slow-drain Receivers" section
+                  showing per-session "Outbound channel full" drop
+                  counts joined to the peer map. Useful for spotting
+                  memory-pressured / slow clients (RELAY-2 pattern,
+                  see discussion #562).
   -h, --help      Show this help.
 
 Examples:
@@ -84,6 +105,10 @@ Examples:
   # Verify parser matches the current client's log format
   $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) --verify
 
+  # Cross-reference with relay pod backpressure
+  $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) \\
+    --relay-wt=/tmp/relay-webtransport.log
+
 See scripts/parse_meeting_console_logs.README.md for the full workflow
 (pulling logs from the pod, column reference, sample output).
 EOF
@@ -92,15 +117,28 @@ fi
 
 LOG_DIR="${1:-}"
 OUTPUT_FORMAT="markdown"
-case "${2:-}" in
-  --json)   OUTPUT_FORMAT="json" ;;
-  --verify) OUTPUT_FORMAT="verify" ;;
-  "")       ;;  # default markdown
-  *)        echo "Unknown option: $2" >&2; echo "Usage: $(basename "$0") <log_dir> [--json|--verify|-h]" >&2; exit 1 ;;
-esac
+RELAY_WT=""
+# Parse remaining args: $2..$N. --json / --verify set format; --relay-wt=PATH sets relay path.
+shift  # drop $1 (LOG_DIR)
+for arg in "$@"; do
+  case "$arg" in
+    --json)          OUTPUT_FORMAT="json" ;;
+    --verify)        OUTPUT_FORMAT="verify" ;;
+    --relay-wt=*)    RELAY_WT="${arg#--relay-wt=}" ;;
+    "")              ;;  # skip empty
+    *)               echo "Unknown option: $arg" >&2
+                     echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+                     exit 1 ;;
+  esac
+done
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $(basename "$0") <log_dir> [--json|--verify|-h]" >&2
+  echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+  exit 1
+fi
+
+if [[ -n "$RELAY_WT" && ! -f "$RELAY_WT" ]]; then
+  echo "--relay-wt: file not found: $RELAY_WT" >&2
   exit 1
 fi
 
@@ -189,6 +227,39 @@ for key in "${ALL_KEYS[@]}"; do
   error_count=$(zcat "${files[@]}" 2>/dev/null | \
     grep -c "$ERROR_GREP" 2>/dev/null || true)
 
+  # Pass 3b: speaking_transitions — count VAD false->true transitions.
+  # A good proxy for "did the user actually speak?" Low/zero means
+  # muted or listen-only; high (100+) means active speaker. Useful
+  # when triaging audio complaints: listeners with 0 transitions
+  # aren't contributing to the audio mix.
+  speaking_transitions=$(zcat "${files[@]}" 2>/dev/null | \
+    grep -cF "Speaking changed: false -> true" 2>/dev/null || true)
+
+  # Pass 3c: audio_buffer stats — NetEQ-reported per-peer buffer depth
+  # extracted from "audio health (buffer: Nms) for peer: X". Summarize
+  # n_samples, median (incl. zeros), median_nonzero (only samples >0ms),
+  # and n_nonzero (i.e., times this session was actually receiving audio
+  # from someone). median_nonzero is the useful crackling signal —
+  # medians-including-zero are dominated by muted peers reporting 0ms.
+  audio_buffer_stats=$(zcat "${files[@]}" 2>/dev/null | \
+    grep -oE 'audio health \(buffer: [0-9]+ms\)' | \
+    grep -oE '[0-9]+' | \
+    awk 'BEGIN {n=0; nz=0} {
+      a[n++]=$1
+      if ($1 > 0) b[nz++]=$1
+    } END {
+      if (n == 0) { print "{\"n\":0,\"median_ms\":null,\"n_nonzero\":0,\"median_nonzero_ms\":null}"; exit }
+      asort(a)
+      median = a[int(n/2)+1]
+      if (nz == 0) {
+        printf "{\"n\":%d,\"median_ms\":%d,\"n_nonzero\":0,\"median_nonzero_ms\":null}\n", n, median
+      } else {
+        asort(b)
+        median_nz = b[int(nz/2)+1]
+        printf "{\"n\":%d,\"median_ms\":%d,\"n_nonzero\":%d,\"median_nonzero_ms\":%d}\n", n, median, nz, median_nz
+      }
+    }' 2>/dev/null || echo '{"n":0,"median_ms":null,"n_nonzero":0,"median_nonzero_ms":null}')
+
   # Pass 4: preamble (client machine specs) — first chunk only, emits one
   # "level":"preamble" line near the top. Extract cores / memory / platform /
   # architecture / gpu. All fields are semicolon-delimited key=value pairs in
@@ -234,6 +305,8 @@ for key in "${ALL_KEYS[@]}"; do
     --arg last_ts "$last_ts" \
     --argjson implausible "$implausible" \
     --argjson error_count "$error_count" \
+    --argjson speaking_transitions "$speaking_transitions" \
+    --argjson audio_buffer "$audio_buffer_stats" \
     --arg pre_cores "$pre_cores" \
     --arg pre_memory "$pre_memory" \
     --arg pre_platform "$pre_platform" \
@@ -260,6 +333,8 @@ for key in "${ALL_KEYS[@]}"; do
       handshake_failures: .hfail,
       implausible_rtt_discards: $implausible,
       error_count: $error_count,
+      speaking_transitions: $speaking_transitions,
+      audio_buffer: $audio_buffer,
       first_ts: $first_ts,
       last_ts: $last_ts,
       preamble: {
@@ -301,6 +376,99 @@ mapfile -t session_jsons < <(
 )
 
 # ---------------------------------------------------------------------------
+# Step 4b: Concurrent-session overlap detection
+# ---------------------------------------------------------------------------
+# Two sessions belonging to the SAME email are "concurrent" if their active
+# windows overlap. Flag >1 = duplicate NetEQ / AudioWorkletNode risk on the
+# client (NETEQ-1 in discussion #562). Populates a map: session_ts → count
+# of overlapping sessions from the same email (including self).
+
+declare -A CONCURRENT_MAP  # "${email}::${session_ts}" → count
+if [[ ${#session_jsons[@]} -gt 0 ]]; then
+  # Dump all sessions into one JSON array then compute overlaps in jq.
+  all_sessions_json=$(printf '%s\n' "${session_jsons[@]}" | jq -s '.')
+  while IFS=$'\t' read -r key count; do
+    CONCURRENT_MAP["$key"]="$count"
+  done < <(echo "$all_sessions_json" | jq -r '
+    # Use session_ts (epoch ms from the filename) as start_ms — reliable
+    # session-start anchor. last_ts (last log ISO timestamp) is the end;
+    # strip ".NNN" fractional seconds before fromdateiso8601 (which does
+    # not accept them). A session log chunk may contain prior-page
+    # entries that predate session_ts, so first_ts is unreliable for
+    # this purpose and intentionally ignored.
+    def to_ms_iso:
+      if . == null or . == "" then null
+      else (. | sub("\\.[0-9]+Z$"; "Z")) | (fromdateiso8601 * 1000)
+      end;
+
+    # Pad window by CLIENT_NETEQ_LIFETIME_MS after last_ts: peer_decode_manager
+    # keeps the old Peer (and its NetEqAudioPeerDecoder + AudioWorkletNode)
+    # alive for up to 3 missed 5s heartbeats = 15s after last activity.
+    # During this window the old NetEQ is still mixing into master_gain,
+    # so for NETEQ-1 detection we extend the effective "end" by 15s.
+    15000 as $neteq_zombie_ms |
+
+    map(
+      . as $s |
+      ($s.last_ts | to_ms_iso) as $last_iso_ms |
+      ($s.session_ts | tonumber) as $start_ms |
+      (if $last_iso_ms == null then $start_ms else $last_iso_ms end) as $raw_end_ms |
+      {
+        email: $s.email,
+        session_ts: $s.session_ts,
+        start_ms: $start_ms,
+        end_ms: ($raw_end_ms + $neteq_zombie_ms)
+      }
+    ) as $all |
+
+    # For each session, count peers with same email whose window overlaps
+    # (inclusive on both ends). Result includes self (min count = 1).
+    $all[] |
+    . as $me |
+    [$all[] | select(.email == $me.email) |
+      select(
+        ($me.start_ms != null and $me.end_ms != null
+         and .start_ms != null and .end_ms != null
+         and $me.start_ms <= .end_ms
+         and .start_ms <= $me.end_ms)
+      )] | length as $count |
+    "\($me.email)::\($me.session_ts)\t\($count)"
+  ')
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4c: Relay-WT log ingest (--relay-wt=PATH)
+# ---------------------------------------------------------------------------
+# Count "Outbound channel full for session <id>" drops per session.
+# Filter to session_ids present in this meeting's console logs so noise
+# from other meetings in the same relay log is excluded.
+
+declare -A RELAY_DROPS  # session_id (uint64 string) → drop count
+RELAY_DROPS_TOTAL=0
+if [[ -n "$RELAY_WT" ]]; then
+  # Build set of in-meeting session_ids.
+  declare -A IN_MEETING_SIDS
+  for s in "${session_jsons[@]}"; do
+    sid=$(echo "$s" | jq -r '.session_id')
+    [[ -n "$sid" && "$sid" != "null" ]] && IN_MEETING_SIDS["$sid"]=1
+  done
+
+  # Parse drop lines. Format:
+  #   ERROR ... Outbound channel full for session 1311..., dropping message
+  while read -r count sid; do
+    [[ -z "$sid" ]] && continue
+    if [[ -n "${IN_MEETING_SIDS[$sid]:-}" ]]; then
+      RELAY_DROPS["$sid"]="$count"
+      RELAY_DROPS_TOTAL=$((RELAY_DROPS_TOTAL + count))
+    fi
+  done < <(grep -oE 'Outbound channel full for session [0-9]+' "$RELAY_WT" 2>/dev/null \
+           | awk '{print $NF}' \
+           | sort \
+           | uniq -c \
+           | awk '{print $1, $2}')
+fi
+
+# ---------------------------------------------------------------------------
 # Step 5: Output
 # ---------------------------------------------------------------------------
 
@@ -332,6 +500,8 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "Connection lost"
     "datagram dropped"
     "handshake failed"
+    "Speaking changed: false -> true"
+    "audio health (buffer:"
   )
 
   verify_failed=0
@@ -419,10 +589,10 @@ echo ""
 
 echo "### Sessions"
 echo ""
-echo "_Cores/Platform sourced from \`\"level\":\"preamble\"\` in first chunk. ⚠ flags clients likely to struggle in meetings ≥ 10 peers — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
+echo "_Cores/Platform sourced from \`\"level\":\"preamble\"\` in first chunk. ⚠ flags clients likely to struggle in meetings ≥ 10 peers (underpowered) or with concurrent duplicate sessions (NetEQ duplication — NETEQ-1) — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
 echo ""
-echo "| Email | Name | Start (UTC) | Transport | RTT Base | Reelect | Chunks | Implaus RTT | Errors | End | Cores | Platform |"
-echo "|-------|------|-------------|-----------|----------|---------|--------|-------------|--------|-----|-------|----------|"
+echo "| Email | Name | Start (UTC) | Transport | RTT Base | Reelect | Chunks | Implaus RTT | Speak | Buf med | Errors | End | Cores | Platform | Concurrent |"
+echo "|-------|------|-------------|-----------|----------|---------|--------|-------------|-------|---------|--------|-----|-------|----------|------------|"
 
 for s in "${session_jsons[@]}"; do
   email=$(echo "$s" | jq -r '.email')
@@ -435,6 +605,9 @@ for s in "${session_jsons[@]}"; do
   chunks=$(echo "$s" | jq -r '.chunk_count')
   impl=$(echo "$s" | jq -r '.implausible_rtt_discards')
   errs=$(echo "$s" | jq -r '.error_count')
+  speak=$(echo "$s" | jq -r '.speaking_transitions // 0')
+  buf_n_nonzero=$(echo "$s" | jq -r '.audio_buffer.n_nonzero // 0')
+  buf_median_nz=$(echo "$s" | jq -r '.audio_buffer.median_nonzero_ms // "—"')
   left=$(echo "$s" | jq -r '.left_clean // ""')
   clost=$(echo "$s" | jq -r '.connection_lost // ""')
   if [[ -n "$left" && "$left" != "null" ]]; then end_status="clean"
@@ -446,9 +619,23 @@ for s in "${session_jsons[@]}"; do
   underpowered=$(echo "$s" | jq -r '.preamble.underpowered')
   [[ -z "$cores" ]] && cores="?"
   [[ -z "$platform" ]] && platform="?"
-  flag=""
-  [[ "$underpowered" == "true" ]] && flag=" ⚠"
-  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${reelect} | ${chunks} | ${impl} | ${errs} | ${end_status} | ${cores}${flag} | ${platform} |"
+  cores_flag=""
+  [[ "$underpowered" == "true" ]] && cores_flag=" ⚠"
+  # Concurrent sessions (overlap with other sessions for same email)
+  session_ts=$(echo "$s" | jq -r '.session_ts')
+  concurrent="${CONCURRENT_MAP[${email}::${session_ts}]:-1}"
+  concurrent_flag=""
+  [[ "$concurrent" -gt 1 ]] && concurrent_flag=" ⚠"
+  # Buffer display: show median of NON-ZERO samples only. Buffer=0ms is
+  # reported for silent/muted peers (no arrivals) and would dominate
+  # the overall median. Meaningful signal is the buffer depth while
+  # audio was actually arriving.
+  if [[ "$buf_n_nonzero" == "0" || "$buf_n_nonzero" == "null" ]]; then
+    buf_display="—"
+  else
+    buf_display="${buf_median_nz}ms"
+  fi
+  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${reelect} | ${chunks} | ${impl} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
 done
 
 echo ""
@@ -513,6 +700,72 @@ for s in "${session_jsons[@]}"; do
 done
 [[ $has_uw -eq 0 ]] && echo "_None._"
 echo ""
+
+echo "### Concurrent Session Overlaps (NetEQ duplication risk)"
+echo ""
+echo "_Each user's sessions whose time windows overlap. >1 means the client has multiple \`Peer\` entries + \`NetEqAudioPeerDecoder\` + \`AudioWorkletNode\` instances simultaneously, each mixing into master_gain. See NETEQ-1 in [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
+echo ""
+# Group by email and show each user's overlap count
+declare -A EMAIL_MAX_CONCURRENT
+declare -A EMAIL_SESSIONS_LIST
+declare -A EMAIL_NAME
+for s in "${session_jsons[@]}"; do
+  email=$(echo "$s" | jq -r '.email')
+  session_ts=$(echo "$s" | jq -r '.session_ts')
+  name=$(echo "$s" | jq -r '.display_name')
+  start=$(echo "$s" | jq -r '.start_human')
+  ttype=$(echo "$s" | jq -r '.transport_type')
+  concurrent="${CONCURRENT_MAP[${email}::${session_ts}]:-1}"
+  EMAIL_SESSIONS_LIST[$email]+="${start}(${ttype},concurrent=${concurrent}) "
+  cur_max="${EMAIL_MAX_CONCURRENT[$email]:-0}"
+  if [[ "$concurrent" -gt "$cur_max" ]]; then
+    EMAIL_MAX_CONCURRENT[$email]="$concurrent"
+  fi
+  EMAIL_NAME[$email]="$name"
+done
+has_concurrent=0
+for email in "${!EMAIL_MAX_CONCURRENT[@]}"; do
+  max="${EMAIL_MAX_CONCURRENT[$email]}"
+  if [[ "$max" -gt 1 ]]; then
+    has_concurrent=1
+    name="${EMAIL_NAME[$email]:-$email}"
+    echo "- **${name} (${email})**: max ${max} concurrent sessions"
+    echo "  - Sessions: ${EMAIL_SESSIONS_LIST[$email]}"
+  fi
+done
+[[ $has_concurrent -eq 0 ]] && echo "_None._"
+echo ""
+
+if [[ -n "$RELAY_WT" ]]; then
+  echo "### Slow-drain Receivers (server-side backpressure from \`${RELAY_WT}\`)"
+  echo ""
+  echo "_Count of \`Outbound channel full for session X\` drops per session, filtered to sessions present in this meeting. See RELAY-2 / Yu-Guo pattern in [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
+  echo ""
+  if [[ $RELAY_DROPS_TOTAL -eq 0 ]]; then
+    echo "_No drops recorded for any in-meeting session._"
+  else
+    echo "| Session ID | Drops | Email | Display Name |"
+    echo "|------------|------:|-------|--------------|"
+    # Build session_id → (email, name) map
+    declare -A SID_EMAIL SID_NAME
+    for s in "${session_jsons[@]}"; do
+      sid=$(echo "$s" | jq -r '.session_id')
+      [[ -z "$sid" || "$sid" == "null" ]] && continue
+      SID_EMAIL[$sid]=$(echo "$s" | jq -r '.email')
+      SID_NAME[$sid]=$(echo "$s" | jq -r '.display_name')
+    done
+    # Emit sorted by drop count descending
+    for sid in $(for k in "${!RELAY_DROPS[@]}"; do echo "${RELAY_DROPS[$k]} $k"; done | sort -rn | awk '{print $2}'); do
+      count="${RELAY_DROPS[$sid]}"
+      email="${SID_EMAIL[$sid]:-?}"
+      name="${SID_NAME[$sid]:-?}"
+      echo "| \`${sid}\` | ${count} | ${email} | ${name} |"
+    done
+    echo ""
+    echo "**Total drops across in-meeting sessions:** ${RELAY_DROPS_TOTAL}"
+  fi
+  echo ""
+fi
 
 echo "### Peer ID → Email Map (for Prometheus)"
 echo ""

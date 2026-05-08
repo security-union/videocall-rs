@@ -15,6 +15,7 @@
 
 pub mod console_logs;
 pub mod dev;
+pub mod host;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -198,6 +199,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/mute",
+            post(host::mute_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/mute-all",
+            post(host::mute_all),
         )
         // Console log uploads
         .route(

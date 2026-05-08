@@ -336,7 +336,10 @@ async fn device_settings_modal_close_button_present() {
     render_into(&mount, wrapper);
     yield_now().await;
 
-    let btn = mount.query_selector(".close-button").unwrap().unwrap();
+    let btn = mount
+        .query_selector(".settings-modal-close")
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         btn.get_attribute("type").unwrap_or_default(),

@@ -232,6 +232,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when meeting settings are updated (optional)
     pub on_meeting_settings_updated: Option<Callback<()>>,
 
+    /// Callback triggered when the host requests this client mute its mic.
+    pub on_host_mute: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
@@ -308,6 +311,7 @@ struct InnerOptions {
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
     on_meeting_settings_updated: Option<Callback<()>>,
+    on_host_mute: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
@@ -337,6 +341,12 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Recently processed host action events for deduplication across
+    /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
+    /// shorter window than `recent_peer_events` because host actions are
+    /// deliberate, repeatable commands — see `is_duplicate_host_action`.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_host_events: HashMap<(String, String), f64>,
     /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
     /// `CameraEncoder` checks this flag each frame and forces a keyframe.
     force_camera_keyframe: Arc<AtomicBool>,
@@ -481,6 +491,7 @@ impl VideoCallClient {
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_host_mute: options.on_host_mute.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -503,6 +514,7 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                recent_host_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
@@ -1520,6 +1532,36 @@ impl Inner {
         }
     }
 
+    /// Returns `true` if this host action event was already seen within the
+    /// last 1 second.
+    ///
+    /// Like `is_duplicate_peer_event`, this exists to suppress duplicate
+    /// dispatches caused by both WebSocket and WebTransport delivering the
+    /// same NATS system message during dual-transport scenarios (election,
+    /// transport-switching, post-rebase retry).
+    ///
+    /// The window is intentionally short (1 s, vs 30 s for peer events)
+    /// because host actions like HOST_MUTE_PARTICIPANT are *deliberate,
+    /// repeatable* commands: a host must be able to re-mute a participant
+    /// who self-unmuted seconds later. A 30-second suppression window would
+    /// block legitimate re-mutes — a worse bug than the duplicate dispatch
+    /// we're fixing. Dual-transport delivery of the same message happens
+    /// within milliseconds, so 1 s is ample headroom.
+    fn is_duplicate_host_action(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 1 second).
+        self.recent_host_events.retain(|_, ts| now - *ts < 1_000.0);
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_host_events.entry(key) {
+            e.insert(now);
+            false // first occurrence
+        } else {
+            true // duplicate
+        }
+    }
+
     /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
     /// was a keyframe request and was handled, `false` otherwise.
     ///
@@ -1942,6 +1984,33 @@ impl Inner {
                                 callback.emit(());
                             }
                         }
+                        Ok(MeetingEventType::HOST_MUTE_PARTICIPANT) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_mute_all = target.is_empty();
+                            let is_targeted_at_self = !is_mute_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_MUTE_PARTICIPANT: room={}, target=\"{}\", is_mute_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_mute_all,
+                                is_targeted_at_self
+                            );
+                            if is_mute_all || is_targeted_at_self {
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_mute", &target_str) {
+                                    if let Some(cb) = &self.options.on_host_mute {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_MUTE_PARTICIPANT for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -2170,6 +2239,7 @@ mod disconnect_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_display_name_changed: None,
+            on_host_mute: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

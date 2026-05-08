@@ -1,4 +1,6 @@
 .DS_Store
+# Windows "Mark of the Web" Alternate Data Stream sidecars
+*:Zone.Identifier
 .cursor
 .vscode
 .mov

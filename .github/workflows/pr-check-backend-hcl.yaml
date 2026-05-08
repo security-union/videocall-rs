@@ -38,6 +38,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # Isolate this runner's docker compose project from the other 3 runners
       # on the same host. Without this, parallel jobs share the same
@@ -76,7 +78,3 @@ jobs:
       - name: Teardown
         if: always()
         run: make tests_down
-
-      - name: Fix workspace ownership
-        if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" . || true

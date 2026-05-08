@@ -36,9 +36,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 15
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - name: cargo fmt check
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
@@ -49,9 +49,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 15
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - name: clippy (native targets)
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
@@ -62,9 +62,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 15
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - name: cargo check videocall-client (default features)
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
@@ -83,9 +83,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 15
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
       - uses: actions/checkout@v4
+        with:
+          clean: false
       - name: wasm-pack test videocall-client
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}

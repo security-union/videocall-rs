@@ -16,19 +16,20 @@ jobs:
     name: Style token guardrails
     runs-on: [self-hosted, linux, x64, hcl-ci]
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          clean: false
           fetch-depth: 0
+          path: style-token-repo
 
       - name: Check for hardcoded color literals
+        working-directory: style-token-repo
         run: |
           git fetch origin "${{ github.base_ref }}"
           git reset --mixed "origin/${{ github.base_ref }}"
           bash scripts/check-hardcoded-colors.sh --unstaged
 
       - name: Check token drift
+        working-directory: style-token-repo
         run: bash scripts/check-token-drift.sh

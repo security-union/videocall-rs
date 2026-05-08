@@ -34,10 +34,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 15
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
-
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # Build all test binaries once up front so Chrome is never launched during compilation.
       - name: Build test binaries

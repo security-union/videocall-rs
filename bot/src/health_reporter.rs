@@ -33,7 +33,7 @@ use crate::transport::{MediaTypeLabel, OutboundFrame};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOpCounters, NetEqStats as PbNetEqStats,
-    PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+    PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -43,6 +43,11 @@ pub struct HealthReporterConfig {
     pub client_config: ClientConfig,
     pub transport: Transport,
     pub server_url: String,
+    /// Synthetic RTT to populate on every HealthPacket (ms). `None` leaves
+    /// the field unset so passthrough bots look like real browsers whose
+    /// WebRTC stats are absent. Set by main.rs to `2 × network_profile.latency_ms`
+    /// when a netsim profile is active.
+    pub simulated_rtt_ms: Option<f64>,
 }
 
 /// Spawn a health reporter task that sends HealthPacket protos every second.
@@ -150,6 +155,13 @@ fn build_health_packet(
         Transport::WebTransport => "webtransport".to_string(),
         Transport::WebSocket => "websocket".to_string(),
     };
+    // Ground-truth RTT derived from the netsim profile (2× one-way shim
+    // delay approximates RTT; jitter is not accounted for). When `None`
+    // (passthrough), leave the field at its default 0.0 — browsers leave it
+    // unset when WebRTC stats are unavailable and we match that shape.
+    if let Some(rtt) = config.simulated_rtt_ms {
+        hp.active_server_rtt_ms = rtt;
+    }
 
     // Tab state: bot is always active and never throttled
     hp.is_tab_visible = true;
@@ -182,6 +194,19 @@ fn build_health_packet(
     }
     if target_bitrate.is_finite() && target_bitrate > 0.0 {
         hp.encoder_target_bitrate_kbps = Some(target_bitrate as f64);
+    }
+
+    // Tier-transition events: drained once per heartbeat so the counter
+    // `videocall_tier_transition_total` increments per event, matching the
+    // browser's pattern in videocall-client/src/health_reporter.rs.
+    for t in aq.drain_tier_transitions() {
+        let mut pb_t = PbTierTransition::new();
+        pb_t.direction = t.direction.to_string();
+        pb_t.stream = t.stream.to_string();
+        pb_t.from_tier = t.from_tier.clone();
+        pb_t.to_tier = t.to_tier.clone();
+        pb_t.trigger = t.trigger.to_string();
+        hp.tier_transitions.push(pb_t);
     }
 
     // Overall inbound packet rate (all senders, all types)

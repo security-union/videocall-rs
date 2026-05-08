@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use videocall_aq::constants::{AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
-use videocall_aq::{default_clock, Clock, EncoderBitrateController};
+use videocall_aq::{default_clock, Clock, EncoderBitrateController, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
 #[cfg(feature = "metrics")]
@@ -311,6 +311,27 @@ impl BotAq {
                 audio.enable_dtx,
             );
         }
+    }
+
+    /// Drain buffered tier-transition events from the inner controller.
+    ///
+    /// Mirrors the browser's per-heartbeat drain in
+    /// `videocall-client/src/health_reporter.rs` so bot HealthPackets populate
+    /// `HealthPacket.tier_transitions` with the same shape as real browsers,
+    /// letting Prometheus counter `videocall_tier_transition_total` increment
+    /// for bot meetings. Returns an empty `Vec` if the mutex is poisoned
+    /// (non-critical path — log and continue, matching `process_diagnostics`).
+    pub fn drain_tier_transitions(&self) -> Vec<TierTransitionRecord> {
+        let mut ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "BotAq: controller mutex poisoned on drain_tier_transitions, recovering: {e}"
+                );
+                e.into_inner()
+            }
+        };
+        ctrl.drain_tier_transitions()
     }
 
     /// Push the latest AQ telemetry into the Prometheus gauges. No-op when

@@ -22,6 +22,7 @@ use bot::aq_controller::BotAq;
 use bot::audio_producer::AudioProducer;
 use bot::config::{self, BotConfig, ClientConfig, Manifest, Transport, VideoMode};
 use bot::costume_renderer::CostumeRenderer;
+use bot::diagnostics_reporter::{spawn_diagnostics_reporter, DiagnosticsReporterConfig};
 use bot::ekg_renderer::{self, EkgRenderer};
 use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use bot::inbound_stats::InboundStats;
@@ -605,16 +606,38 @@ async fn run_client(
         .next()
         .unwrap_or(lobby_url.as_str())
         .to_string();
+    // 2× one-way netsim delay approximates RTT; jitter is not accounted for.
+    let simulated_rtt_ms = if network_profile.is_passthrough() {
+        None
+    } else {
+        Some((network_profile.latency_ms as f64) * 2.0)
+    };
     spawn_health_reporter(
         HealthReporterConfig {
             client_config: client_config.clone(),
             transport: resolved_transport.clone(),
             server_url: server_url_display,
+            simulated_rtt_ms,
+        },
+        stats.clone(),
+        packet_tx.clone(),
+        quit.clone(),
+        aq.clone(),
+    );
+
+    // Spawn the per-peer diagnostics reporter. Real browsers emit one
+    // DiagnosticsPacket per observed remote peer per (audio, video) media
+    // type every heartbeat; bots must do the same or sender-side AQ
+    // controllers go blind in bot-heavy meetings. The reporter reads the
+    // same 1s window as the health reporter via a non-destructive snapshot,
+    // so counters are never double-drained.
+    spawn_diagnostics_reporter(
+        DiagnosticsReporterConfig {
+            client_config: client_config.clone(),
         },
         stats,
         packet_tx.clone(),
         quit.clone(),
-        aq.clone(),
     );
 
     // Wait for media start signal from main

@@ -28,6 +28,7 @@ pub mod aq_controller;
 pub mod audio_producer;
 pub mod config;
 pub mod costume_renderer;
+pub mod diagnostics_reporter;
 pub mod ekg_renderer;
 pub mod health_reporter;
 pub mod inbound_stats;

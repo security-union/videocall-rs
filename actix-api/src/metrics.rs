@@ -593,7 +593,8 @@ lazy_static! {
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
-    /// `kind` is one of `media`|`control`|`rtt`|`unknown`. ~8 series total.
+    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`.
+    /// ~14 series total.
     ///
     /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
     /// label — session IDs are unbounded and would explode storage. The existing
@@ -601,12 +602,24 @@ lazy_static! {
     /// new counter is the protocol-wide aggregate that backs alerting (rate()
     /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
     ///
-    /// `kind` values:
-    /// - `media`: derived from `PacketWrapper.packet_type == MEDIA` (already
-    ///   parsed by the caller in `wt_chat_session::Handler<Message>`)
+    /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
+    /// matching helper in `ws_chat_session`):
+    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`.
+    ///   Added 2026-05-08 to attribute congestion-storm drops to audio.
+    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`.
+    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`.
+    /// - `media`: legacy catch-all for MEDIA packets we could not refine —
+    ///   encrypted/unparseable inner payloads, HEARTBEAT, KEYFRAME_REQUEST,
+    ///   or any future MediaType not in the audio/video/screen set. Kept
+    ///   so existing alerts pivoting on `kind="media"` still see a series.
     /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
     /// - `rtt`: RTT echo path that drops on a full datagram queue
     /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    ///
+    /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
+    /// will only see the catch-all bucket after this change; audio/video/screen
+    /// drops now land on their own labels. Update saved Grafana queries with
+    /// `kind=~"audio|video|screen|media"` (or sum across) to preserve totals.
     pub static ref OUTBOUND_CHANNEL_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "videocall_outbound_channel_drops_total",
         "Total outbound channel drops (try_send full) by transport and packet kind",
@@ -637,7 +650,14 @@ mod tests {
     #[test]
     #[serial(outbound_channel_drops_metric)]
     fn outbound_channel_drops_increments_per_kind() {
-        let kinds = ["media", "control", "rtt", "unknown"];
+        // Cardinality contract: every documented `kind` must be an
+        // independent series. The audio/video/screen labels were added
+        // 2026-05-08 to refine the legacy `media` bucket; this test
+        // also acts as the regression guard against accidental label
+        // typos drifting between the helpers and the dashboards.
+        let kinds = [
+            "audio", "video", "screen", "media", "control", "rtt", "unknown",
+        ];
         let before: Vec<f64> = kinds
             .iter()
             .map(|k| snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]))

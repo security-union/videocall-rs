@@ -41,9 +41,44 @@ use protobuf::Message as ProtobufMessage;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
+
+/// Classify a dropped outbound packet for the
+/// `videocall_outbound_channel_drops_total{kind=...}` label.
+///
+/// Mirrors the WT helper at `wt_chat_session::drop_kind_label`. Refining
+/// the legacy `media` bucket into `audio`/`video`/`screen` lets operators
+/// attribute a congestion storm to a specific media stream — the
+/// 2026-05-08 production storm dropped 25,081 packets in 3 minutes and
+/// the metric had no way to tell audio from video.
+///
+/// * `parsed=false` → `"unknown"` — outer parse failed.
+/// * `parsed=true && !is_media` → `"control"`.
+/// * `parsed=true && is_media && Some(AUDIO)`  → `"audio"`.
+/// * `parsed=true && is_media && Some(VIDEO)`  → `"video"`.
+/// * `parsed=true && is_media && Some(SCREEN)` → `"screen"`.
+/// * `parsed=true && is_media && anything else (HEARTBEAT, KEYFRAME_REQUEST,
+///   encrypted/unparseable inner)` → `"media"` — the legacy catch-all so
+///   existing alerts pivoting on `kind="media"` still see a series.
+fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) -> &'static str {
+    if !parsed {
+        return "unknown";
+    }
+    if !is_media {
+        return "control";
+    }
+    match media_type {
+        Some(MediaType::AUDIO) => "audio",
+        Some(MediaType::VIDEO) => "video",
+        Some(MediaType::SCREEN) => "screen",
+        _ => "media",
+    }
+}
 
 /// WebSocket Chat Session Actor
 ///
@@ -240,21 +275,34 @@ impl Handler<Message> for WsChatSession {
                 // Phase 8b TELEM-8: derive `kind` from the same parse so the
                 // protocol-wide aggregate counter can distinguish media vs
                 // control drops without a second parse.
-                let kind = if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
-                    let sender_session_id = pw.session_id;
-                    if sender_session_id != 0 {
-                        self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
-                    }
-                    if pw.packet_type
-                        == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEDIA.into()
-                    {
-                        "media"
+                //
+                // 2026-05-08 audio-quality follow-up: when the wrapper says
+                // MEDIA, peek at the inner `MediaPacket.media_type` so we
+                // can emit `kind="audio" | "video" | "screen"` instead of
+                // the catch-all `kind="media"`. We do this only on the
+                // drop path — it is rare and cold relative to the hot
+                // success path. Encrypted / unparseable inner payloads
+                // fall through to the legacy `media` label, preserving
+                // backwards compatibility.
+                let (parsed, is_media, media_type) =
+                    if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
+                        let sender_session_id = pw.session_id;
+                        if sender_session_id != 0 {
+                            self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
+                        }
+                        let is_media = pw.packet_type == PacketType::MEDIA.into();
+                        let media_type = if is_media {
+                            MediaPacket::parse_from_bytes(&pw.data)
+                                .ok()
+                                .and_then(|mp| mp.media_type.enum_value().ok())
+                        } else {
+                            None
+                        };
+                        (true, is_media, media_type)
                     } else {
-                        "control"
-                    }
-                } else {
-                    "unknown"
-                };
+                        (false, false, None)
+                    };
+                let kind = drop_kind_label(parsed, is_media, media_type);
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["websocket", kind])
                     .inc();
@@ -411,6 +459,74 @@ mod tests {
     use serial_test::serial;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
+
+    // ----------------------------------------------------------------------
+    // Drop-kind label tests — mirror the WT helper tests so the WS site
+    // emits the same `audio` / `video` / `screen` / `media` / `control` /
+    // `unknown` set, and so the legacy `media` catch-all is preserved for
+    // packets we cannot classify (HEARTBEAT, KEYFRAME_REQUEST, encrypted
+    // inner). 2026-05-08 audio-quality follow-up.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn ws_drop_kind_unknown_when_parse_failed() {
+        assert_eq!(
+            super::drop_kind_label(/*parsed=*/ false, /*is_media=*/ false, None),
+            "unknown",
+        );
+        assert_eq!(
+            super::drop_kind_label(
+                /*parsed=*/ false,
+                /*is_media=*/ true,
+                Some(MediaType::AUDIO),
+            ),
+            "unknown",
+            "parse-fail must override stale is_media + media_type"
+        );
+    }
+
+    #[test]
+    fn ws_drop_kind_control_when_parsed_and_not_media() {
+        assert_eq!(
+            super::drop_kind_label(/*parsed=*/ true, /*is_media=*/ false, None,),
+            "control",
+        );
+    }
+
+    #[test]
+    fn ws_drop_kind_audio_video_screen() {
+        assert_eq!(
+            super::drop_kind_label(true, true, Some(MediaType::AUDIO)),
+            "audio",
+        );
+        assert_eq!(
+            super::drop_kind_label(true, true, Some(MediaType::VIDEO)),
+            "video",
+        );
+        assert_eq!(
+            super::drop_kind_label(true, true, Some(MediaType::SCREEN)),
+            "screen",
+        );
+    }
+
+    #[test]
+    fn ws_drop_kind_media_catchall_for_other_media_types() {
+        // Backwards compat: legacy `media` bucket for HEARTBEAT,
+        // KEYFRAME_REQUEST, and encrypted/unparseable inner payloads.
+        assert_eq!(
+            super::drop_kind_label(true, true, None),
+            "media",
+            "encrypted/unparseable inner must fall back to legacy `media`"
+        );
+        assert_eq!(
+            super::drop_kind_label(true, true, Some(MediaType::HEARTBEAT)),
+            "media",
+        );
+        assert_eq!(
+            super::drop_kind_label(true, true, Some(MediaType::KEYFRAME_REQUEST)),
+            "media",
+        );
+    }
 
     /// Test helper: create a database pool for future JWT flow integration tests.
     #[allow(dead_code)]

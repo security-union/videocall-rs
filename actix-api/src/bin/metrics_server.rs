@@ -347,64 +347,93 @@ fn process_health_packet_to_metrics_pb(
 
     // Process metrics for this session
     {
-        // Client-side active server info (optional)
-        if !health_packet.active_server_url.is_empty() {
-            // Strip JWT token from URL to prevent leaking credentials in Prometheus labels.
-            // Handles both ?token=... (only param) and &token=... (among other params).
-            let server_url_clean = if let Some(q_pos) = health_packet.active_server_url.find('?') {
-                let base = &health_packet.active_server_url[..q_pos];
-                let query = &health_packet.active_server_url[q_pos + 1..];
-                let filtered: Vec<&str> = query
-                    .split('&')
-                    .filter(|p| !p.starts_with("token="))
-                    .collect();
-                if filtered.is_empty() {
-                    base.to_string()
-                } else {
-                    format!("{}?{}", base, filtered.join("&"))
+        // Strip JWT token from URL to prevent leaking credentials in Prometheus labels.
+        // Handles both ?token=... (only param) and &token=... (among other params).
+        // Note: upstream scrubbing in `client_diagnostics.rs::scrub_client_supplied_urls`
+        // unconditionally zeroes `active_server_url` (defense-in-depth against JWT leakage
+        // to Prometheus labels), so in practice this branch only fires for legacy/test paths
+        // that bypass that scrub. We still compute the clean URL here for those paths.
+        let server_url_clean = if let Some(q_pos) = health_packet.active_server_url.find('?') {
+            let base = &health_packet.active_server_url[..q_pos];
+            let query = &health_packet.active_server_url[q_pos + 1..];
+            let filtered: Vec<&str> = query
+                .split('&')
+                .filter(|p| !p.starts_with("token="))
+                .collect();
+            if filtered.is_empty() {
+                base.to_string()
+            } else {
+                format!("{}?{}", base, filtered.join("&"))
+            }
+        } else {
+            health_packet.active_server_url.clone()
+        };
+        let server_url_clean = server_url_clean.as_str();
+
+        // For the RTT metric we allow the server_type label to be an empty string when
+        // unknown, because the URL scrub also zeroes active_server_type and dashboards
+        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
+        // below keeps its original "unknown" placeholder since it still requires a URL.
+        let server_type_for_rtt = health_packet.active_server_type.as_str();
+        let server_type_for_active = if health_packet.active_server_type.is_empty() {
+            "unknown"
+        } else {
+            &health_packet.active_server_type
+        };
+
+        // Publish RTT independently of active_server_url presence. The upstream scrub
+        // strips the URL to prevent JWT leakage, but the RTT value itself is meaningful
+        // on its own — gate only on rtt != 0.0 so passthrough clients that never
+        // measured an RTT don't emit a zero sample.
+        if health_packet.active_server_rtt_ms != 0.0 {
+            CLIENT_ACTIVE_SERVER_RTT_MS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    server_url_clean,
+                    server_type_for_rtt,
+                    reporter_display_name.as_str(),
+                ])
+                .set(health_packet.active_server_rtt_ms);
+
+            // Track the label set used for this RTT publish so cleanup can remove it
+            // later, including the scrubbed empty-URL / empty-type case.
+            {
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+                if let Some(info) = tracker.get_mut(&key) {
+                    info.active_servers.insert((
+                        server_url_clean.to_string(),
+                        server_type_for_rtt.to_string(),
+                    ));
                 }
-            } else {
-                health_packet.active_server_url.clone()
-            };
-            let server_url_clean = server_url_clean.as_str();
+            }
+        }
 
-            let server_type = if health_packet.active_server_type.is_empty() {
-                "unknown"
-            } else {
-                &health_packet.active_server_type
-            };
-
+        // Client-side active server info (optional) — requires a non-empty URL because
+        // the metric's semantic purpose is to identify *which* server the client picked.
+        if !health_packet.active_server_url.is_empty() {
             CLIENT_ACTIVE_SERVER
                 .with_label_values(&[
                     meeting_id,
                     session_id,
                     reporting_user_id,
                     server_url_clean,
-                    server_type,
+                    server_type_for_active,
                     reporter_display_name.as_str(),
                 ])
                 .set(1.0);
-
-            if health_packet.active_server_rtt_ms != 0.0 {
-                CLIENT_ACTIVE_SERVER_RTT_MS
-                    .with_label_values(&[
-                        meeting_id,
-                        session_id,
-                        reporting_user_id,
-                        server_url_clean,
-                        server_type,
-                        reporter_display_name.as_str(),
-                    ])
-                    .set(health_packet.active_server_rtt_ms);
-            }
 
             // Track server info used for cleanup
             {
                 let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
-                    info.active_servers
-                        .insert((server_url_clean.to_string(), server_type.to_string()));
+                    info.active_servers.insert((
+                        server_url_clean.to_string(),
+                        server_type_for_active.to_string(),
+                    ));
                 }
             }
         }
@@ -1788,6 +1817,85 @@ mod tests {
                 )]
             ),
             "Token param should be stripped, other params preserved"
+        );
+    }
+
+    /// After the NATS-path URL scrub in client_diagnostics.rs strips
+    /// `active_server_url` to an empty string, the RTT metric must still publish.
+    /// The `CLIENT_ACTIVE_SERVER` identity gauge, however, legitimately requires
+    /// a non-empty URL and must remain absent.
+    #[test]
+    fn test_rtt_publishes_when_server_url_scrubbed_empty() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Simulate the post-scrub state: URL + server_type both zeroed, RTT set.
+        let mut hp = create_test_health_packet("s_scrub", "m_scrub", "eve", HashMap::new());
+        hp.active_server_url = String::new();
+        hp.active_server_type = String::new();
+        hp.active_server_rtt_ms = 77.25;
+        let (peer_id, ps) = create_test_peer_stats("frank", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // RTT metric must be present with empty server_url / server_type labels.
+        assert!(
+            series_exists(
+                "videocall_client_active_server_rtt_ms",
+                &[
+                    ("meeting_id", "m_scrub"),
+                    ("session_id", "s_scrub"),
+                    ("peer_id", "eve"),
+                    ("server_url", ""),
+                    ("server_type", ""),
+                ]
+            ),
+            "RTT must publish even when active_server_url is empty post-scrub"
+        );
+
+        // Identity gauge must NOT be present — it requires a URL to be meaningful.
+        assert!(
+            !series_exists(
+                "videocall_client_active_server",
+                &[
+                    ("meeting_id", "m_scrub"),
+                    ("session_id", "s_scrub"),
+                    ("peer_id", "eve"),
+                ]
+            ),
+            "CLIENT_ACTIVE_SERVER should not publish without a non-empty URL"
+        );
+    }
+
+    /// When the RTT value is zero (passthrough clients that never measured RTT),
+    /// nothing is published even if server_url is also empty.
+    #[test]
+    fn test_rtt_not_published_when_zero_and_url_empty() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_zero", "m_zero", "gina", HashMap::new());
+        hp.active_server_url = String::new();
+        hp.active_server_type = String::new();
+        hp.active_server_rtt_ms = 0.0;
+        let (peer_id, ps) = create_test_peer_stats("hank", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            !series_exists(
+                "videocall_client_active_server_rtt_ms",
+                &[
+                    ("meeting_id", "m_zero"),
+                    ("session_id", "s_zero"),
+                    ("peer_id", "gina"),
+                ]
+            ),
+            "RTT must not publish when rtt_ms == 0.0 (passthrough client)"
         );
     }
 

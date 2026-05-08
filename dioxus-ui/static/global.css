@@ -165,7 +165,7 @@ html[data-theme="dark"] {
 
 html[data-theme="light"] {
   --bg: #f5f5f5;
-  --bg-image: url('/static/themes/theme_v4.png');
+  --bg-image: url('/static/themes/theme_light_v1.png');
   --surface: #ffffff;
   --surface-elevated: #f9f9fb;
   --surface-overlay: rgba(255, 255, 255, 0.95);

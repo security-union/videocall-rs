@@ -31,6 +31,7 @@ pub mod costume_renderer;
 pub mod diagnostics_reporter;
 pub mod ekg_renderer;
 pub mod health_reporter;
+pub mod i420_scale;
 pub mod inbound_stats;
 pub mod keyframe_requester;
 pub mod metrics_server;

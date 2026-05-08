@@ -19,6 +19,7 @@
 use crate::aq_controller::BotAq;
 use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
+use crate::i420_scale::scale_i420;
 use crate::transport::{MediaTypeLabel, OutboundFrame};
 use crate::video_encoder::VideoEncoderBuilder;
 use image::{ImageBuffer, Rgb};
@@ -429,22 +430,37 @@ impl VideoProducer {
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
-        let width = renderer.width();
-        let height = renderer.height();
-        // Costume path renders from a pre-baked 1280x720 I420 sprite sheet and
-        // cannot be rescaled at runtime. AQ bitrate + FPS changes are honored;
-        // resolution changes are logged-and-ignored (see below).
+        // The costume sprite sheet is always 1280x720. The encoder may run
+        // at a lower resolution when AQ requests a tier step-down; in that
+        // case we downscale each source frame into `i420_buf` before encoding.
+        let native_w = renderer.width();
+        let native_h = renderer.height();
+
         let mut v = aq.snapshot_video();
         let mut last_epoch: u64 = aq.tier_epoch();
+        // Encoder resolution — starts at native, may be lowered by AQ.
+        let mut enc_w: u32 = v.max_width.min(native_w);
+        let mut enc_h: u32 = v.max_height.min(native_h);
         let mut framerate: u32 = v.target_fps.max(1);
         let mut frames_per_keyframe: u32 = v.keyframe_interval.max(1);
         let mut frame_interval_us: u64 = 1_000_000 / framerate as u64;
 
+        // Whether we need to downscale (enc resolution < native).
+        let mut needs_scale = enc_w < native_w || enc_h < native_h;
+        // Reusable buffer for scaled frames. Allocated only when needed.
+        let mut i420_buf: Vec<u8> = if needs_scale {
+            vec![0u8; (enc_w * enc_h * 3 / 2) as usize]
+        } else {
+            Vec::new()
+        };
+
         info!(
-            "Costume video producer started for {} ({}x{} @ {}fps, bitrate={}kbps, AQ tier={})",
+            "Costume video producer started for {} (native={}x{}, enc={}x{} @ {}fps, bitrate={}kbps, AQ tier={})",
             user_id,
-            width,
-            height,
+            native_w,
+            native_h,
+            enc_w,
+            enc_h,
             framerate,
             v.bitrate_kbps,
             aq.video_tier_index(),
@@ -455,7 +471,7 @@ impl VideoProducer {
         encoder_output_fps.store(framerate, Ordering::Relaxed);
 
         let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
-            .set_resolution(width, height)
+            .set_resolution(enc_w, enc_h)
             .build()?;
         video_encoder.update_bitrate_kbps(v.bitrate_kbps)?;
 
@@ -471,9 +487,7 @@ impl VideoProducer {
         let mut global_sequence: u64 = 0;
         let user_id_bytes = user_id.clone().into_bytes();
 
-        // Warn at most once when AQ requests a resolution below costume's
-        // baked-in 1280x720. Subsequent resolution-change requests at this
-        // tier are silently ignored.
+        // Log once on first downscale activation.
         static COSTUME_RES_WARNED: AtomicBool = AtomicBool::new(false);
 
         loop {
@@ -483,7 +497,7 @@ impl VideoProducer {
             }
 
             // Cheap lock-free poll: only re-snapshot when AQ actually changed
-            // the tier. Costume path honors bitrate + FPS, ignores resolution.
+            // the tier. Costume path honors bitrate, FPS, and resolution.
             let current_epoch = aq.tier_epoch();
             if current_epoch != last_epoch {
                 let new_v = aq.snapshot_video();
@@ -499,48 +513,57 @@ impl VideoProducer {
                     }
                 }
 
-                // FPS change — rebuild the encoder (VP9 timebase is in cfg).
+                // Resolution or FPS change: rebuild the encoder.
+                // Cap requested resolution to native — upscaling would waste
+                // bits without improving quality.
+                let target_w = new_v.max_width.min(native_w);
+                let target_h = new_v.max_height.min(native_h);
                 let fps = new_v.target_fps.max(1);
-                if fps != framerate {
+
+                if target_w != enc_w || target_h != enc_h || fps != framerate {
                     info!(
-                        "[{}] AQ (costume): rebuilding encoder {}fps -> {}fps at fixed {}x{}",
-                        user_id, framerate, fps, width, height,
+                        "[{}] AQ (costume): rebuilding encoder {}x{}@{}fps -> {}x{}@{}fps",
+                        user_id, enc_w, enc_h, framerate, target_w, target_h, fps,
                     );
-                    framerate = fps;
-                    frame_interval_us = 1_000_000 / framerate as u64;
-                    match VideoEncoderBuilder::new(framerate, 5)
-                        .set_resolution(width, height)
+
+                    match VideoEncoderBuilder::new(fps, 5)
+                        .set_resolution(target_w, target_h)
                         .build()
                     {
                         Ok(mut enc) => {
                             let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
                             video_encoder = enc;
-                            prev_frame_index = None; // force keyframe on next iter
-                                                     // Update shared FPS for health reporter.
+                            enc_w = target_w;
+                            enc_h = target_h;
+                            framerate = fps;
+                            frame_interval_us = 1_000_000 / framerate as u64;
+                            needs_scale = enc_w < native_w || enc_h < native_h;
+
+                            // (Re)allocate the scale buffer if needed.
+                            if needs_scale {
+                                let buf_len = (enc_w * enc_h * 3 / 2) as usize;
+                                i420_buf.resize(buf_len, 0);
+
+                                // Info log on first downscale activation.
+                                if !COSTUME_RES_WARNED.swap(true, Ordering::Relaxed) {
+                                    info!(
+                                        "[{}] AQ (costume): downscale active — {}x{} source -> {}x{} encoder",
+                                        user_id, native_w, native_h, enc_w, enc_h,
+                                    );
+                                }
+                            }
+
+                            prev_frame_index = None; // force keyframe
                             encoder_output_fps.store(framerate, Ordering::Relaxed);
                         }
                         Err(e) => {
                             error!(
-                                "[{}] AQ (costume): failed to rebuild encoder at {}fps: {} — keeping old encoder",
-                                user_id, framerate, e
+                                "[{}] AQ (costume): failed to rebuild encoder at {}x{}@{}fps: {} — keeping old encoder",
+                                user_id, target_w, target_h, fps, e
                             );
-                            framerate = v.target_fps.max(1);
-                            frame_interval_us = 1_000_000 / framerate as u64;
+                            // Do not update enc_w/enc_h/framerate — keep old values.
                         }
                     }
-                }
-
-                // Resolution change request: log once, then ignore. Costumes
-                // are pre-baked I420 sprite sheets at 1280x720 and cannot be
-                // rescaled cheaply on the hot path. Lifting this is tracked
-                // as a follow-up (dynamic rescale of costume frames).
-                if (new_v.max_width != width || new_v.max_height != height)
-                    && !COSTUME_RES_WARNED.swap(true, Ordering::Relaxed)
-                {
-                    warn!(
-                        "[{}] AQ (costume): tier requested {}x{} but costume resolution is fixed at {}x{} in v1 — keeping native",
-                        user_id, new_v.max_width, new_v.max_height, width, height,
-                    );
                 }
 
                 frames_per_keyframe = new_v.keyframe_interval.max(1);
@@ -563,7 +586,7 @@ impl VideoProducer {
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
                 let loop_num = elapsed_us / loop_duration_us;
                 info!(
-                    "[{}] costume seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s, tier={}{}",
+                    "[{}] costume seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s, tier={}, enc={}x{}{}",
                     user_id,
                     global_sequence,
                     frame_in_loop,
@@ -571,13 +594,30 @@ impl VideoProducer {
                     position_in_loop_us as f64 / 1_000_000.0,
                     loop_duration_us as f64 / 1_000_000.0,
                     aq.video_tier_index(),
+                    enc_w,
+                    enc_h,
                     if force_keyframe { " KEYFRAME" } else { "" }
                 );
             }
 
-            // Read I420 frame directly from costume renderer
+            // Read native-resolution I420 frame from costume renderer.
             let speaking = is_speaking.load(Ordering::Relaxed);
-            let i420_data = renderer.frame_i420(speaking, frame_in_loop);
+            let source_frame = renderer.frame_i420(speaking, frame_in_loop);
+
+            // Downscale if encoder resolution is below native.
+            let encode_input: &[u8] = if needs_scale {
+                scale_i420(
+                    source_frame,
+                    native_w,
+                    native_h,
+                    &mut i420_buf,
+                    enc_w,
+                    enc_h,
+                );
+                &i420_buf[..]
+            } else {
+                source_frame
+            };
 
             // Encode to VP9
             let frames_result = if force_keyframe {
@@ -585,9 +625,9 @@ impl VideoProducer {
                     "Forcing keyframe for {} (costume seq={})",
                     user_id, global_sequence
                 );
-                video_encoder.encode_keyframe(global_sequence as i64, i420_data)
+                video_encoder.encode_keyframe(global_sequence as i64, encode_input)
             } else {
-                video_encoder.encode(global_sequence as i64, i420_data)
+                video_encoder.encode(global_sequence as i64, encode_input)
             };
 
             let frames = match frames_result {

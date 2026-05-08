@@ -55,10 +55,15 @@ jobs:
         run: echo "COMPOSE_PROJECT_NAME=vc-${RUNNER_NAME}" >> "$GITHUB_ENV"
 
       - name: Tear down any prior project state for this runner
-        # Scoped to this runner's project only — does NOT prune other runners'
-        # resources, which `docker system prune --volumes` used to do and which
-        # caused concurrent jobs to lose their networks mid-run.
+        # Scoped to this runner's project only — does NOT affect other runners'
+        # running containers or networks.
         run: docker compose -f docker/docker-compose.integration.yaml down -v --remove-orphans || true
+
+      - name: Prune unused volumes
+        # Removes any volumes not attached to a running container (including
+        # stale volumes from prior runs). Safe: Docker refuses to remove
+        # in-use volumes regardless of this command.
+        run: sudo docker volume prune -f || true
 
       - name: Pre-create target dirs to prevent Docker from initializing them as root
         run: mkdir -p actix-api/target

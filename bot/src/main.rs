@@ -707,6 +707,7 @@ async fn run_client(
             loop_duration,
             is_speaking.clone(),
             aq.clone(),
+            transport_drops_counter.clone(),
         )?);
         info!("Audio producer started for {}", user_id);
 
@@ -732,6 +733,7 @@ async fn run_client(
                     encoder_output_fps.clone(),
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
+                    transport_drops_counter.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -755,6 +757,7 @@ async fn run_client(
                     encoder_output_fps.clone(),
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
+                    transport_drops_counter.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -775,6 +778,7 @@ async fn run_client(
                 encoder_output_fps.clone(),
                 encoder_errors_generic.clone(),
                 encoder_frames_ok.clone(),
+                transport_drops_counter.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }

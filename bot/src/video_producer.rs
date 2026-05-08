@@ -60,6 +60,7 @@ impl VideoProducer {
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -79,6 +80,7 @@ impl VideoProducer {
                 encoder_output_fps,
                 encoder_errors_generic,
                 encoder_frames_ok,
+                transport_drops_counter,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -106,6 +108,7 @@ impl VideoProducer {
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -124,6 +127,7 @@ impl VideoProducer {
                 encoder_output_fps,
                 encoder_errors_generic,
                 encoder_frames_ok,
+                transport_drops_counter,
             ) {
                 error!("Costume video producer error: {}", e);
             }
@@ -150,6 +154,7 @@ impl VideoProducer {
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         // Seed encoder configuration from the AQ controller's current tier.
         // `framerate` is driven by AQ (browser client EKG was 15 FPS; we honor
@@ -378,6 +383,7 @@ impl VideoProducer {
                 if let Err(_e) = packet_sender.try_send(out_frame) {
                     static VIDEO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = VIDEO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    transport_drops_counter.fetch_add(1, Ordering::Relaxed);
                     if count % 100 == 1 {
                         warn!(
                             "Dropped video packets due to full send channel (total: {})",
@@ -429,6 +435,7 @@ impl VideoProducer {
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         // The costume sprite sheet is always 1280x720. The encoder may run
         // at a lower resolution when AQ requests a tier step-down; in that
@@ -686,6 +693,7 @@ impl VideoProducer {
                 if let Err(_e) = packet_sender.try_send(out_frame) {
                     static COSTUME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = COSTUME_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    transport_drops_counter.fetch_add(1, Ordering::Relaxed);
                     if count % 100 == 1 {
                         warn!(
                             "Dropped costume video packets due to full send channel (total: {})",

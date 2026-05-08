@@ -230,6 +230,12 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Recently processed host action events for deduplication across
+    /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
+    /// shorter window than `recent_peer_events` because host actions are
+    /// deliberate, repeatable commands — see `is_duplicate_host_action`.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_host_events: HashMap<(String, String), f64>,
     /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
     /// `CameraEncoder` checks this flag each frame and forces a keyframe.
     force_camera_keyframe: Arc<AtomicBool>,
@@ -374,6 +380,7 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                recent_host_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
@@ -1382,6 +1389,36 @@ impl Inner {
         }
     }
 
+    /// Returns `true` if this host action event was already seen within the
+    /// last 1 second.
+    ///
+    /// Like `is_duplicate_peer_event`, this exists to suppress duplicate
+    /// dispatches caused by both WebSocket and WebTransport delivering the
+    /// same NATS system message during dual-transport scenarios (election,
+    /// transport-switching, post-rebase retry).
+    ///
+    /// The window is intentionally short (1 s, vs 30 s for peer events)
+    /// because host actions like HOST_MUTE_PARTICIPANT are *deliberate,
+    /// repeatable* commands: a host must be able to re-mute a participant
+    /// who self-unmuted seconds later. A 30-second suppression window would
+    /// block legitimate re-mutes — a worse bug than the duplicate dispatch
+    /// we're fixing. Dual-transport delivery of the same message happens
+    /// within milliseconds, so 1 s is ample headroom.
+    fn is_duplicate_host_action(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 1 second).
+        self.recent_host_events.retain(|_, ts| now - *ts < 1_000.0);
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_host_events.entry(key) {
+            e.insert(now);
+            false // first occurrence
+        } else {
+            true // duplicate
+        }
+    }
+
     /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
     /// was a keyframe request and was handled, `false` otherwise.
     ///
@@ -1807,8 +1844,17 @@ impl Inner {
                                 is_targeted_at_self
                             );
                             if is_mute_all || is_targeted_at_self {
-                                if let Some(cb) = &self.options.on_host_mute {
-                                    cb.emit(());
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_mute", &target_str) {
+                                    if let Some(cb) = &self.options.on_host_mute {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_MUTE_PARTICIPANT for target=\"{}\"",
+                                        target_str
+                                    );
                                 }
                             }
                         }

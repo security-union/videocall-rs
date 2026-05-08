@@ -512,7 +512,7 @@ pub fn generate_for_peer(
                         // Three-dot host mute menu (visible on hover / when speaking, only for host)
                         if on_mute.is_some() {
                             {
-                                let on_mute_clone = on_mute.clone();
+                                let on_mute_clone = on_mute;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -696,7 +696,7 @@ pub fn generate_for_peer(
                         // Three-dot host mute menu (visible on hover / when speaking, only for host)
                         if on_mute.is_some() {
                             {
-                                let on_mute_clone = on_mute.clone();
+                                let on_mute_clone = on_mute;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -942,7 +942,7 @@ pub fn generate_for_peer(
                             // Three-dot host mute menu (visible on hover / when speaking, only for host)
                             if on_mute.is_some() {
                                 {
-                                    let on_mute_clone = on_mute.clone();
+                                    let on_mute_clone = on_mute;
                                     rsx! {
                                         div { class: "tile-mute-menu-wrapper",
                                             button {

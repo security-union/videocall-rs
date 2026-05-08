@@ -49,7 +49,10 @@ jobs:
       # isn't resolved at job-level — only after runner assignment, i.e. at
       # step time. A job-level reference causes a workflow startup_failure.
       - name: Set compose project name
-        run: echo "COMPOSE_PROJECT_NAME=vc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+        # Stable per-runner name (not per-run): a per-run unique name makes the
+        # pre-teardown below a no-op (new project doesn't exist yet), so volumes
+        # from every prior run accumulate on disk until the host fills up.
+        run: echo "COMPOSE_PROJECT_NAME=vc-${RUNNER_NAME}" >> "$GITHUB_ENV"
 
       - name: Tear down any prior project state for this runner
         # Scoped to this runner's project only — does NOT prune other runners'

@@ -99,18 +99,42 @@ async function enableMic(page: Page): Promise<void> {
 }
 
 /**
- * Open the participant sidebar by clicking the "Open Peers" tooltip button.
- * The PeerListButton is in the secondary controls section which expands on
- * hover; Playwright's click mechanism triggers that hover automatically.
+ * Mute a remote peer via the canvas tile's three-dot menu.
+ *
+ * The host-only mute control is rendered inside each remote peer's grid tile
+ * (see `canvas_generator.rs`). It only renders when the host viewer sees the
+ * peer with `audio_enabled=true`. The button is hidden via `visibility:
+ * hidden` until the parent `.grid-item` is hovered (or the tile is in the
+ * `.speaking-tile` state), so the test must hover before interacting.
+ *
+ * The flow is two-step:
+ *   1. Click the menu-toggle button (`title="Mute participant"`, an
+ *      `.tile-mute-btn`) to open the tile context menu.
+ *   2. Click the inner "Mute" item (`.tile-context-menu-item`) to actually
+ *      invoke `on_mute` and broadcast the host-mute via NATS.
+ *
+ * We scope to a `.grid-item` that contains a `.tile-mute-btn` to avoid
+ * matching the host's own tile, which never renders the mute button.
  */
-async function openPeerList(page: Page): Promise<void> {
-  const openPeersBtn = page.locator("button", {
-    has: page.locator("span.tooltip", { hasText: "Open Peers" }),
+async function hostMutePeerViaTile(page: Page): Promise<void> {
+  const guestTile = page.locator(".grid-item:has(.tile-mute-btn)").first();
+  await expect(guestTile).toBeVisible({ timeout: 15_000 });
+
+  // Hover to reveal `.tile-mute-btn` (CSS sets visibility:hidden until
+  // `.grid-item:hover` or `.grid-item.speaking-tile`).
+  await guestTile.hover();
+
+  const muteToggle = guestTile.getByTitle("Mute participant");
+  await expect(muteToggle).toBeVisible({ timeout: 15_000 });
+  await muteToggle.click();
+
+  // The inner "Mute" item only appears once the menu is open. It has no
+  // title attribute — match by text inside `.tile-context-menu-item`.
+  const muteMenuItem = guestTile.locator(".tile-context-menu-item", {
+    hasText: "Mute",
   });
-  await openPeersBtn.click();
-  await expect(page.locator("#peer-list-container.visible")).toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(muteMenuItem).toBeVisible({ timeout: 5_000 });
+  await muteMenuItem.click();
 }
 
 // ---------------------------------------------------------------------------
@@ -123,13 +147,14 @@ test.describe("Host mute controls", () => {
   });
 
   /**
-   * Test 1: Host mutes a single participant via the peer list item button.
+   * Test 1: Host mutes a single participant via the per-tile three-dot menu.
    *
-   * The `button.peer_item_mute_btn` appears only when:
+   * The tile mute menu (rendered in `canvas_generator.rs`) appears only when:
    *   - the viewer is the host (is_owner = true), AND
+   *   - the target peer is not the viewer themselves, AND
    *   - the peer's audio_enabled is reported as true by diagnostics.
    * Therefore the guest must have their mic on before the host can see the
-   * mute button in the sidebar.
+   * three-dot menu on the guest's tile.
    */
   test("host mutes a single participant", async ({ baseURL }) => {
     test.setTimeout(120_000);
@@ -173,21 +198,15 @@ test.describe("Host mute controls", () => {
         timeout: 30_000,
       });
 
-      // Guest enables their microphone so the host's peer-list diagnostics
-      // reflects audio_enabled=true and renders the mute button.
+      // Guest enables their microphone so the host's per-tile diagnostics
+      // reflect audio_enabled=true and the tile mute menu is rendered.
       await enableMic(guestPage);
 
-      // ---- Host opens the participant sidebar ----
-      await openPeerList(hostPage);
-
-      // Host waits for the "Mute participant" button to appear.
-      // The button only renders when diagnostics report the guest's mic is on
-      // (typically visible within 1–2 diagnostic cycles, ~1–2 s after open).
-      const mutePeerBtn = hostPage.getByTitle("Mute participant").first();
-      await expect(mutePeerBtn).toBeVisible({ timeout: 15_000 });
-
-      // ---- Host clicks the mute button ----
-      await mutePeerBtn.dispatchEvent("click");
+      // ---- Host opens the tile menu and clicks the inner "Mute" item ----
+      // The tile menu-toggle (`title="Mute participant"`) only opens the
+      // context menu — it does not call on_mute directly. The inner "Mute"
+      // menu item is what actually triggers the host-mute broadcast.
+      await hostMutePeerViaTile(hostPage);
 
       // ---- Guest receives the host-mute NATS event and sees the toast ----
       const guestMuteToast = guestPage.locator(".peer-toast .toast-name", {
@@ -195,9 +214,10 @@ test.describe("Host mute controls", () => {
       });
       await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
-      // ---- Mute button disappears from host's view (peer is now muted) ----
-      // Once the guest is muted the on_mute callback becomes None, so the
-      // button is no longer rendered in the peer list item.
+      // ---- Mute menu-toggle disappears from host's view (peer is now muted) ----
+      // Once the guest is muted, on_mute becomes None and the entire
+      // `.tile-mute-menu-wrapper` (and its `title="Mute participant"` button)
+      // is no longer rendered for that peer.
       await expect(hostPage.getByTitle("Mute participant")).toHaveCount(0, {
         timeout: 10_000,
       });
@@ -345,11 +365,8 @@ test.describe("Host mute controls", () => {
       const guestMuteBtn = guestPage.getByRole("button", { name: "Mute" }).first();
       await expect(guestMuteBtn).toBeVisible({ timeout: 5_000 });
 
-      // ---- Host mutes the guest via peer list ----
-      await openPeerList(hostPage);
-      const mutePeerBtn = hostPage.getByTitle("Mute participant").first();
-      await expect(mutePeerBtn).toBeVisible({ timeout: 15_000 });
-      await mutePeerBtn.dispatchEvent("click");
+      // ---- Host mutes the guest via the per-tile three-dot menu ----
+      await hostMutePeerViaTile(hostPage);
 
       // ---- Guest sees the mute toast ----
       const guestMuteToast = guestPage.locator(".peer-toast .toast-name", {

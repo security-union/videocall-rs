@@ -444,7 +444,7 @@ mod tests {
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
         publish_meeting_settings_updated(None, "room").await;
-        publish_host_mute(None, "room", "user@test.com").await;
-        publish_host_mute(None, "room", "").await;
+        let _ = publish_host_mute(None, "room", "user@test.com").await;
+        let _ = publish_host_mute(None, "room", "").await;
     }
 }

@@ -2067,27 +2067,22 @@ impl Inner {
                 }
             },
             Ok(PacketType::CONGESTION) => {
-                // Server-side congestion feedback: the server is dropping
-                // packets destined for a receiver because the outbound channel
-                // is full. Match on session_id history — the signal targets a
-                // specific session_id which may be our current or a previous
-                // one from before re-election. Using session_id history (not
-                // user_id) ensures multi-tab/multi-device sessions for the
-                // same account are independently targeted.
-                if self.session_id_history.contains(&response.session_id) {
-                    warn!(
-                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
-                        response.session_id,
-                    );
-                    self.congestion_step_down_requested
-                        .store(true, Ordering::Release);
-                } else {
-                    debug!(
-                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
-                        response.session_id, self.session_id_history,
-                    );
-                }
+                // Server-side congestion feedback: a receiver's outbound queue
+                // is dropping our packets, so the server published a CONGESTION
+                // signal addressed to this sender's NATS subject. By the time
+                // the packet arrives at this client it has already been routed
+                // to us specifically — the prior `session_id_history` check
+                // dropped every signal in the 2026-05-08 production storm
+                // (718 ignored / 718 received) because the field can carry an
+                // ID we never saw assigned (e.g. when the dual-transport pair
+                // is mid-election). Trust the routing, always step down.
+                warn!(
+                    "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
+                    String::from_utf8_lossy(&response.user_id),
+                    response.session_id,
+                );
+                self.congestion_step_down_requested
+                    .store(true, Ordering::Release);
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(

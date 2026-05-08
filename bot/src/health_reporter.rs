@@ -33,7 +33,8 @@ use crate::transport::{MediaTypeLabel, OutboundFrame};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOpCounters, NetEqStats as PbNetEqStats,
-    PeerStats as PbPeerStats, TierTransition as PbTierTransition, VideoStats as PbVideoStats,
+    PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
+    VideoStats as PbVideoStats,
 };
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -60,6 +61,12 @@ pub struct HealthReporterConfig {
     /// target framerate the encoder is configured at (bot always encodes at
     /// target — it does not drop frames).
     pub encoder_output_fps: Arc<AtomicU32>,
+    /// Cumulative count of generic encoder errors (vpx encode failures).
+    /// Incremented by the video producer on each failed encode call.
+    pub encoder_errors_generic: Arc<AtomicU64>,
+    /// Cumulative count of successfully encoded frames. Incremented by the
+    /// video producer on each successful encode call.
+    pub encoder_frames_ok: Arc<AtomicU64>,
 }
 
 /// Spawn a health reporter task that sends HealthPacket protos every second.
@@ -264,6 +271,57 @@ fn build_health_packet(
                 hp.datagram_drops_total = Some(drops);
             }
         }
+    }
+
+    // --- Fields 1 & 4: send_queue_bytes and keyframe_requests_sent_total ---
+    // Bot has no meaningful send backpressure (single machine, channel → transport)
+    // and does not decode for display so never requests keyframes. Setting these
+    // to 0 signals the bot is reporting (rather than leaving them None which
+    // would imply the field is unsupported).
+    hp.send_queue_bytes = Some(0);
+    hp.keyframe_requests_sent_total = Some(0);
+
+    // --- Field 2: Climb-rate limiter telemetry ---
+    let (
+        crash_ceiling_active,
+        crash_ceiling_tier_index,
+        crash_ceiling_decay_ms,
+        blocked_ceiling,
+        blocked_slowdown,
+        blocked_screen,
+    ) = aq.snapshot_climb_limiter();
+    hp.crash_ceiling_active = Some(crash_ceiling_active);
+    if crash_ceiling_active {
+        hp.crash_ceiling_tier_index = crash_ceiling_tier_index;
+        hp.crash_ceiling_decay_ms = crash_ceiling_decay_ms;
+    }
+    if blocked_ceiling > 0 {
+        hp.step_up_blocked_ceiling = Some(blocked_ceiling);
+    }
+    if blocked_slowdown > 0 {
+        hp.step_up_blocked_slowdown = Some(blocked_slowdown);
+    }
+    if blocked_screen > 0 {
+        hp.step_up_blocked_screen_share = Some(blocked_screen);
+    }
+
+    // Tier dwell samples: drained once per heartbeat so each sample appears
+    // in exactly one HealthPacket, matching the browser's drain pattern.
+    for (tier_label, dwell_ms) in aq.drain_dwell_samples() {
+        let mut pb_d = PbTierDwell::new();
+        pb_d.tier = tier_label.to_string();
+        pb_d.dwell_ms = dwell_ms;
+        hp.tier_dwells.push(pb_d);
+    }
+
+    // --- Field 3: Encoder error counters ---
+    let errors_generic = config.encoder_errors_generic.load(Ordering::Relaxed);
+    let frames_ok = config.encoder_frames_ok.load(Ordering::Relaxed);
+    if errors_generic > 0 {
+        hp.camera_encoder_errors_generic = Some(errors_generic);
+    }
+    if frames_ok > 0 {
+        hp.camera_encoder_frames_submitted_ok = Some(frames_ok);
     }
 
     // Per-sender peer stats -- this is the critical part for AQ.

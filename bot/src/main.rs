@@ -553,6 +553,8 @@ async fn run_client(
     let packets_sent_counter = Arc::new(AtomicU64::new(0));
     let transport_drops_counter = Arc::new(AtomicU64::new(0));
     let encoder_output_fps = Arc::new(AtomicU32::new(0));
+    let encoder_errors_generic = Arc::new(AtomicU64::new(0));
+    let encoder_frames_ok = Arc::new(AtomicU64::new(0));
 
     let outbound_shim_task = if network_profile.is_passthrough() {
         let user_id_out = user_id.clone();
@@ -630,6 +632,8 @@ async fn run_client(
             packets_sent_counter: packets_sent_counter.clone(),
             transport_drops_counter: transport_drops_counter.clone(),
             encoder_output_fps: encoder_output_fps.clone(),
+            encoder_errors_generic: encoder_errors_generic.clone(),
+            encoder_frames_ok: encoder_frames_ok.clone(),
         },
         stats.clone(),
         packet_tx.clone(),
@@ -699,6 +703,8 @@ async fn run_client(
                     is_speaking.clone(),
                     aq.clone(),
                     encoder_output_fps.clone(),
+                    encoder_errors_generic.clone(),
+                    encoder_frames_ok.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -720,6 +726,8 @@ async fn run_client(
                     loop_duration,
                     aq.clone(),
                     encoder_output_fps.clone(),
+                    encoder_errors_generic.clone(),
+                    encoder_frames_ok.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -738,6 +746,8 @@ async fn run_client(
                 loop_duration,
                 aq.clone(),
                 encoder_output_fps.clone(),
+                encoder_errors_generic.clone(),
+                encoder_frames_ok.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }

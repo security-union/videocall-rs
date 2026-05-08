@@ -57,6 +57,8 @@ impl VideoProducer {
         loop_duration: Duration,
         aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -74,6 +76,8 @@ impl VideoProducer {
                 loop_duration,
                 aq,
                 encoder_output_fps,
+                encoder_errors_generic,
+                encoder_frames_ok,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -99,6 +103,8 @@ impl VideoProducer {
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -115,6 +121,8 @@ impl VideoProducer {
                 is_speaking,
                 aq,
                 encoder_output_fps,
+                encoder_errors_generic,
+                encoder_frames_ok,
             ) {
                 error!("Costume video producer error: {}", e);
             }
@@ -139,6 +147,8 @@ impl VideoProducer {
         loop_duration: Duration,
         aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         // Seed encoder configuration from the AQ controller's current tier.
         // `framerate` is driven by AQ (browser client EKG was 15 FPS; we honor
@@ -306,12 +316,39 @@ impl VideoProducer {
             // Encode to VP9
             let frames_result = if force_keyframe {
                 info!("Forcing keyframe for {} (seq={})", user_id, global_sequence);
-                video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)?
+                video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)
             } else {
-                video_encoder.encode(global_sequence as i64, &i420_buf)?
+                video_encoder.encode(global_sequence as i64, &i420_buf)
             };
 
-            for frame in frames_result {
+            let frames = match frames_result {
+                Ok(f) => {
+                    encoder_frames_ok.fetch_add(1, Ordering::Relaxed);
+                    f
+                }
+                Err(e) => {
+                    encoder_errors_generic.fetch_add(1, Ordering::Relaxed);
+                    error!("Video producer encode error for {}: {}", user_id, e);
+                    global_sequence += 1;
+                    // Sleep until next frame deadline before continuing
+                    let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+                    let sleep_target_us = if next_frame_us >= loop_duration_us {
+                        loop_duration_us
+                    } else {
+                        next_frame_us
+                    };
+                    let loop_base_us = elapsed_us - position_in_loop_us;
+                    let absolute_target =
+                        media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+                    let now = Instant::now();
+                    if now < absolute_target {
+                        thread::sleep(absolute_target - now);
+                    }
+                    continue;
+                }
+            };
+
+            for frame in frames {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(),
@@ -389,6 +426,8 @@ impl VideoProducer {
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         let width = renderer.width();
         let height = renderer.height();
@@ -546,12 +585,39 @@ impl VideoProducer {
                     "Forcing keyframe for {} (costume seq={})",
                     user_id, global_sequence
                 );
-                video_encoder.encode_keyframe(global_sequence as i64, i420_data)?
+                video_encoder.encode_keyframe(global_sequence as i64, i420_data)
             } else {
-                video_encoder.encode(global_sequence as i64, i420_data)?
+                video_encoder.encode(global_sequence as i64, i420_data)
             };
 
-            for frame in frames_result {
+            let frames = match frames_result {
+                Ok(f) => {
+                    encoder_frames_ok.fetch_add(1, Ordering::Relaxed);
+                    f
+                }
+                Err(e) => {
+                    encoder_errors_generic.fetch_add(1, Ordering::Relaxed);
+                    error!("Costume video producer encode error for {}: {}", user_id, e);
+                    global_sequence += 1;
+                    // Sleep until next frame deadline before continuing
+                    let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+                    let sleep_target_us = if next_frame_us >= loop_duration_us {
+                        loop_duration_us
+                    } else {
+                        next_frame_us
+                    };
+                    let loop_base_us = elapsed_us - position_in_loop_us;
+                    let absolute_target =
+                        media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+                    let now = Instant::now();
+                    if now < absolute_target {
+                        thread::sleep(absolute_target - now);
+                    }
+                    continue;
+                }
+            };
+
+            for frame in frames {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(),

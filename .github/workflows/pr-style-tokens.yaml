@@ -16,6 +16,9 @@ jobs:
     name: Style token guardrails
     runs-on: [self-hosted, linux, x64, hcl-ci]
     steps:
+      - name: Fix workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" . || true
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

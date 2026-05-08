@@ -304,6 +304,83 @@ h3 {
   left: auto;
 }
 
+.tile-mute-menu-wrapper {
+  position: relative;
+}
+
+.tile-mute-btn {
+  visibility: hidden;
+  width: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  height: min(32px, calc(var(--tile-h, 240px) * 0.15));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--overlay-heavy);
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-primary, #fff);
+  transition: background-color 0.15s ease;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.tile-mute-btn svg {
+  width: min(16px, calc(var(--tile-h, 240px) * 0.08));
+  height: min(16px, calc(var(--tile-h, 240px) * 0.08));
+  flex-shrink: 0;
+}
+
+.tile-mute-btn:hover {
+  background-color: var(--overlay-opaque);
+}
+
+.grid-item:hover .tile-mute-btn,
+.split-peer-tile:hover .tile-mute-btn,
+.grid-item.speaking-tile .tile-mute-btn,
+.split-peer-tile.speaking-tile .tile-mute-btn {
+  visibility: visible;
+}
+
+.tile-context-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--surface-elevated, #1e2030);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  z-index: 100;
+  min-width: 130px;
+  padding: 4px 0;
+  overflow: visible;
+}
+
+.tile-context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  color: var(--text-primary, #fff);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: background 0.1s;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.tile-context-menu-item:hover {
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08));
+}
+
 #grid-container {
   position: absolute;
   inset: 0;
@@ -1473,12 +1550,11 @@ select {
 }
 
 .context-menu-item:hover {
-  background: rgba(50, 190, 254, 0.1);
-  color: #32beef;
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08));
 }
 
 .context-menu-item:active {
-  background: rgba(50, 190, 254, 0.2);
+  background: var(--surface-hover, rgba(255, 255, 255, 0.12));
 }
 
 .context-menu-item svg {

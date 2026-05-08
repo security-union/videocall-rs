@@ -2176,6 +2176,8 @@ pub fn AttendantsComponent(
                                                         my_peer_id: user_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
                                                     }
                                                 }
                                             }
@@ -2221,6 +2223,8 @@ pub fn AttendantsComponent(
                                             my_peer_id: user_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 }

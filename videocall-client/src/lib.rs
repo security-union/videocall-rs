@@ -223,6 +223,7 @@ pub mod encode;
 pub mod health_reporter;
 pub mod long_tasks;
 mod media_devices;
+pub mod render_fps;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;

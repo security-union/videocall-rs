@@ -35,10 +35,11 @@
   var nextChunkSeq = 1;
 
   var highEntropyPlatform = null;
+  var highEntropyArchitecture = null;
 
   if (navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === "function") {
     try {
-      navigator.userAgentData.getHighEntropyValues(["platform", "platformVersion"])
+      navigator.userAgentData.getHighEntropyValues(["platform", "platformVersion", "architecture", "model"])
         .then(function (ua) {
           var pv = ua.platformVersion || "";
           var major = parseInt(pv.split(".")[0], 10);
@@ -48,8 +49,45 @@
           } else if (ua.platform) {
             highEntropyPlatform = ua.platform + " " + pv;
           }
+          if (ua.architecture) {
+            highEntropyArchitecture = ua.architecture;
+          }
         })
         .catch(function () {});
+    } catch (_) {}
+  }
+
+  // TELEM-1: GPU renderer detection
+  var gpuRenderer = null;
+  try {
+    var _c = document.createElement("canvas");
+    var _gl = _c.getContext("webgl") || _c.getContext("experimental-webgl");
+    if (_gl) {
+      var _ext = _gl.getExtension("WEBGL_debug_renderer_info");
+      if (_ext) {
+        gpuRenderer = _gl.getParameter(_ext.UNMASKED_RENDERER_WEBGL);
+      }
+    }
+  } catch (_) {}
+
+  // TELEM-4: Network information
+  var networkInfo = null;
+  if (navigator.connection) {
+    networkInfo = {
+      effectiveType: navigator.connection.effectiveType || null,
+      downlink: navigator.connection.downlink || null,
+      rtt: navigator.connection.rtt || null,
+      saveData: navigator.connection.saveData || false
+    };
+  }
+
+  // TELEM-5: Battery status (async)
+  var batteryInfo = null;
+  if (navigator.getBattery) {
+    try {
+      navigator.getBattery().then(function (battery) {
+        batteryInfo = { charging: battery.charging, level: battery.level };
+      }).catch(function () {});
     } catch (_) {}
   }
 
@@ -188,6 +226,25 @@
       capabilityScore = "N/A";
     }
 
+    // TELEM-1: architecture
+    var architecture = highEntropyArchitecture || "N/A";
+
+    // TELEM-4: network summary
+    var networkSummary = "N/A";
+    if (networkInfo) {
+      networkSummary = (networkInfo.effectiveType || "?")
+        + "/" + (networkInfo.downlink != null ? networkInfo.downlink + "Mbps" : "?")
+        + "/rtt" + (networkInfo.rtt != null ? networkInfo.rtt + "ms" : "?");
+      if (networkInfo.saveData) networkSummary += "/saveData";
+    }
+
+    // TELEM-5: battery summary
+    var batterySummary = "N/A";
+    if (batteryInfo) {
+      batterySummary = (batteryInfo.charging ? "charging" : "discharging")
+        + "@" + Math.round(batteryInfo.level * 100) + "%";
+    }
+
     var msg = "appVersion=" + (appVersion || "unknown")
       + "; displayName=" + (displayName || "unknown")
       + "; userAgent=" + (nav.userAgent || "N/A")
@@ -197,7 +254,11 @@
       + "; screen=" + scr.width + "x" + scr.height + "@" + dpr + "x"
       + "; platform=" + platform
       + "; languages=" + languages
-      + "; capability_score=" + capabilityScore;
+      + "; capability_score=" + capabilityScore
+      + "; architecture=" + architecture
+      + "; gpu=" + (gpuRenderer || "N/A")
+      + "; network=" + networkSummary
+      + "; battery=" + batterySummary;
 
     var entry = JSON.stringify({
       seq: nextSeq++,
@@ -207,6 +268,17 @@
     });
     buffer.push(entry);
     bufferBytes += entry.length + 1;
+
+    // Expose static metadata as window globals for the WASM health reporter (TELEM-7).
+    window.__videocall_client_metadata = {
+      architecture: highEntropyArchitecture || "",
+      gpu: gpuRenderer || "",
+      network_effective_type: networkInfo ? (networkInfo.effectiveType || "") : "",
+      network_downlink: networkInfo ? (networkInfo.downlink || 0) : 0,
+      network_rtt: networkInfo ? (networkInfo.rtt || 0) : 0,
+      battery_charging: batteryInfo ? batteryInfo.charging : null,
+      battery_level: batteryInfo ? batteryInfo.level : null
+    };
   }
 
   // ---------------------------------------------------------------------------

@@ -21,8 +21,8 @@
 use actix_web::{HttpResponse, Responder};
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
-    CounterVec, Encoder, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec,
 };
 
 /// Shared Prometheus metrics HTTP handler for relay server binaries.
@@ -613,6 +613,35 @@ lazy_static! {
         &["transport", "kind"]
     )
     .expect("Failed to create videocall_outbound_channel_drops_total metric");
+
+    // ===== CLIENT TELEMETRY: TELEM-7, TELEM-8, TELEM-9 =====
+
+    /// TELEM-7: Static per-session client metadata (value always 1, info in labels)
+    pub static ref CLIENT_INFO: GaugeVec = register_gauge_vec!(
+        "videocall_client_info",
+        "Static per-session client metadata (value always 1, info in labels)",
+        &["meeting_id", "session_id", "display_name",
+          "cores", "architecture", "gpu_family",
+          "network_effective_type", "capability_score"]
+    )
+    .expect("Failed to create videocall_client_info metric");
+
+    /// TELEM-8: Long task duration histogram (main-thread stalls)
+    pub static ref CLIENT_LONGTASK_DURATION_MS: HistogramVec = register_histogram_vec!(
+        "videocall_client_longtask_duration_ms",
+        "Main-thread long task durations observed by the client (ms)",
+        &["meeting_id", "session_id", "display_name"],
+        vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0]
+    )
+    .expect("Failed to create videocall_client_longtask_duration_ms metric");
+
+    /// TELEM-9: Main-thread rAF cadence (frames per second)
+    pub static ref CLIENT_RENDER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_client_render_fps",
+        "Main-thread rAF cadence (fps)",
+        &["meeting_id", "session_id", "display_name"]
+    )
+    .expect("Failed to create videocall_client_render_fps metric");
 }
 
 // =============================================================================

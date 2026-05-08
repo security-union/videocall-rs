@@ -47,18 +47,19 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES,
-    CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
-    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS,
-    ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO,
+    ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS,
+    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -194,6 +195,18 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_BITRATE_RATIO.remove_label_values(&reporter_labels);
+
+    // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
+    let telem_labels: [&str; 3] = [
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.display_name,
+    ];
+    let _ = CLIENT_LONGTASK_DURATION_MS.remove_label_values(&telem_labels);
+    let _ = CLIENT_RENDER_FPS.remove_label_values(&telem_labels);
+    // CLIENT_INFO has different labels (includes cores/arch/gpu/net/score) that we
+    // cannot reconstruct at cleanup time. It will naturally stop being refreshed and
+    // become stale. Prometheus staleness handling (5min default) will drop it.
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
@@ -610,6 +623,50 @@ fn process_health_packet_to_metrics_pb(
                     &t.trigger,
                 ])
                 .inc();
+        }
+
+        // TELEM-7: client_info gauge (static metadata)
+        if health_packet.client_cores.is_some() || health_packet.client_architecture.is_some() {
+            let cores_str = health_packet
+                .client_cores
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let arch = health_packet.client_architecture.as_deref().unwrap_or("");
+            let gpu = health_packet.client_gpu_family.as_deref().unwrap_or("");
+            let net = health_packet
+                .client_network_effective_type
+                .as_deref()
+                .unwrap_or("");
+            let score = health_packet
+                .client_capability_score
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            CLIENT_INFO
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporter_display_name.as_str(),
+                    &cores_str,
+                    arch,
+                    gpu,
+                    net,
+                    &score,
+                ])
+                .set(1.0);
+        }
+
+        // TELEM-8: longtask histogram observations
+        for dur in &health_packet.longtask_durations_ms {
+            CLIENT_LONGTASK_DURATION_MS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .observe(*dur);
+        }
+
+        // TELEM-9: render FPS gauge
+        if let Some(fps) = health_packet.render_fps {
+            CLIENT_RENDER_FPS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .set(fps);
         }
 
         // Process peer health data

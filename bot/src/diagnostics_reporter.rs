@@ -56,6 +56,11 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 /// Configuration for the diagnostics reporter.
 pub struct DiagnosticsReporterConfig {
     pub client_config: ClientConfig,
+    /// Shared counter for transport-level drops. Incremented when `try_send`
+    /// fails on the outbound channel, contributing to the cumulative total
+    /// reported in `HealthPacket.websocket_drops_total` /
+    /// `datagram_drops_total`.
+    pub transport_drops_counter: Arc<AtomicU64>,
 }
 
 /// Spawn a diagnostics reporter task that emits per-peer
@@ -136,7 +141,7 @@ pub fn spawn_diagnostics_reporter(
                             continue;
                         }
                     };
-                    if try_emit(&packet_sender, bytes) {
+                    if try_emit(&packet_sender, bytes, &config.transport_drops_counter) {
                         emitted += 1;
                     }
                 }
@@ -159,7 +164,7 @@ pub fn spawn_diagnostics_reporter(
                             continue;
                         }
                     };
-                    if try_emit(&packet_sender, bytes) {
+                    if try_emit(&packet_sender, bytes, &config.transport_drops_counter) {
                         emitted += 1;
                     }
                 }
@@ -230,11 +235,18 @@ fn build_wrapper(
 
 /// `try_send` the serialized wrapper and log-throttle drops, mirroring the
 /// health reporter's dropped-send pattern.
-fn try_emit(packet_sender: &Sender<OutboundFrame>, bytes: Vec<u8>) -> bool {
+fn try_emit(
+    packet_sender: &Sender<OutboundFrame>,
+    bytes: Vec<u8>,
+    transport_drops: &AtomicU64,
+) -> bool {
     let frame = OutboundFrame::new(MediaTypeLabel::Diagnostics, bytes);
     if let Err(_e) = packet_sender.try_send(frame) {
         static DIAG_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
         let count = DIAG_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        // Also increment the shared transport drops counter so the
+        // cumulative total includes diagnostics packet drops.
+        transport_drops.fetch_add(1, Ordering::Relaxed);
         if count % 100 == 1 {
             warn!(
                 "Dropped diagnostics packets due to full send channel (total: {})",

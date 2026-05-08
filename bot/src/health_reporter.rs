@@ -19,7 +19,7 @@
 //! This makes the bot visible to senders' adaptive quality feedback loops.
 
 use protobuf::Message;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
@@ -42,12 +42,24 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 pub struct HealthReporterConfig {
     pub client_config: ClientConfig,
     pub transport: Transport,
-    pub server_url: String,
     /// Synthetic RTT to populate on every HealthPacket (ms). `None` leaves
     /// the field unset so passthrough bots look like real browsers whose
     /// WebRTC stats are absent. Set by main.rs to `2 × network_profile.latency_ms`
     /// when a netsim profile is active.
     pub simulated_rtt_ms: Option<f64>,
+    /// Shared counter incremented by the outbound shim/passthrough on every
+    /// successful transport send. The health reporter reads + resets this
+    /// every tick to derive packets_sent_per_sec.
+    pub packets_sent_counter: Arc<AtomicU64>,
+    /// Shared counter for transport-level drops (try_send failures on the
+    /// outbound channel from any producer). Populated as
+    /// `websocket_drops_total` or `datagram_drops_total` depending on
+    /// transport type.
+    pub transport_drops_counter: Arc<AtomicU64>,
+    /// Current encoder output FPS written by the video producer. Reports the
+    /// target framerate the encoder is configured at (bot always encodes at
+    /// target — it does not drop frames).
+    pub encoder_output_fps: Arc<AtomicU32>,
 }
 
 /// Spawn a health reporter task that sends HealthPacket protos every second.
@@ -86,23 +98,36 @@ pub fn spawn_health_reporter(
                 s.drain_health_counters()
             };
 
+            // Read + reset the packets-sent counter to derive per-second rate.
+            let packets_sent = config.packets_sent_counter.swap(0, Ordering::Relaxed);
+
             // Build HealthPacket proto.
-            let packet_bytes =
-                match build_health_packet(&config, &sender_counters, total_packets, &aq) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        warn!(
-                            "Failed to build health packet for {}: {}",
-                            config.client_config.user_id, e
-                        );
-                        continue;
-                    }
-                };
+            let packet_bytes = match build_health_packet(
+                &config,
+                &sender_counters,
+                total_packets,
+                packets_sent,
+                &aq,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(
+                        "Failed to build health packet for {}: {}",
+                        config.client_config.user_id, e
+                    );
+                    continue;
+                }
+            };
 
             let frame = OutboundFrame::new(MediaTypeLabel::Health, packet_bytes);
             if let Err(_e) = packet_sender.try_send(frame) {
                 static HEALTH_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                 let count = HEALTH_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                // Also increment the shared transport drops counter so the
+                // cumulative total includes health packet drops.
+                config
+                    .transport_drops_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 if count % 100 == 1 {
                     warn!(
                         "Dropped health packets due to full send channel (total: {})",
@@ -131,6 +156,7 @@ fn build_health_packet(
     config: &HealthReporterConfig,
     sender_counters: &std::collections::HashMap<String, crate::inbound_stats::SenderHealthCounters>,
     total_packets: u64,
+    packets_sent: u64,
     aq: &BotAq,
 ) -> anyhow::Result<Vec<u8>> {
     let now_ms = SystemTime::now()
@@ -149,8 +175,10 @@ fn build_health_packet(
     hp.reporting_video_enabled = config.client_config.enable_video;
     hp.display_name = Some(user_id.clone());
 
-    // Connection info
-    hp.active_server_url = config.server_url.clone();
+    // Connection info — active_server_url intentionally left empty because
+    // HealthPackets are republished on NATS in cleartext and the URL contains
+    // the JWT token. This matches the browser client behavior (see
+    // videocall-client/src/health_reporter.rs:881).
     hp.active_server_type = match config.transport {
         Transport::WebTransport => "webtransport".to_string(),
         Transport::WebSocket => "websocket".to_string(),
@@ -212,9 +240,31 @@ fn build_health_packet(
     // Overall inbound packet rate (all senders, all types)
     // The drain window is ~1 second, so count ~ rate.
     hp.packets_received_per_sec = Some(total_packets as f64);
-    // TODO(bot-aq): compute actual send rate instead of the 80 pkt/s
-    // approximation. Needs a counter incremented by the packet sender task.
-    hp.packets_sent_per_sec = Some(80.0);
+    // Actual send rate derived from the shared counter that the outbound
+    // shim/passthrough increments on every successful transport send.
+    hp.packets_sent_per_sec = Some(packets_sent as f64);
+
+    // Encoder output FPS — the target framerate the video encoder is
+    // configured at (bot always encodes at target; it does not drop frames).
+    let fps = config.encoder_output_fps.load(Ordering::Relaxed);
+    if fps > 0 {
+        hp.encoder_output_fps = Some(fps);
+    }
+
+    // Transport drop counters — cumulative count of try_send failures on the
+    // outbound channel. Reported as websocket or datagram depending on the
+    // active transport, matching the browser client's field semantics.
+    let drops = config.transport_drops_counter.load(Ordering::Relaxed);
+    if drops > 0 {
+        match config.transport {
+            Transport::WebSocket => {
+                hp.websocket_drops_total = Some(drops);
+            }
+            Transport::WebTransport => {
+                hp.datagram_drops_total = Some(drops);
+            }
+        }
+    }
 
     // Per-sender peer stats -- this is the critical part for AQ.
     // The drain window is ~1 second, so packet counts ~ per-second rates.

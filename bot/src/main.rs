@@ -34,7 +34,7 @@ use bot::video_producer::VideoProducer;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -542,9 +542,22 @@ async fn run_client(
     // enabled it also labels Prometheus counters using the pre-tagged
     // `frame.kind` — no protobuf re-parse on the hot path.
     let (packet_tx, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+
+    // Shared counters for HealthPacket telemetry:
+    // - packets_sent_counter: incremented by the outbound shim/passthrough on
+    //   every successful transport send; read+reset by health reporter each tick.
+    // - transport_drops_counter: cumulative try_send failures from any producer;
+    //   read (not reset) by health reporter for websocket/datagram_drops_total.
+    // - encoder_output_fps: written by the video producer with the current target
+    //   FPS the encoder is configured at.
+    let packets_sent_counter = Arc::new(AtomicU64::new(0));
+    let transport_drops_counter = Arc::new(AtomicU64::new(0));
+    let encoder_output_fps = Arc::new(AtomicU32::new(0));
+
     let outbound_shim_task = if network_profile.is_passthrough() {
         let user_id_out = user_id.clone();
         let transport_tx_inner = transport_tx.clone();
+        let psc = packets_sent_counter.clone();
         #[cfg(feature = "metrics")]
         let metrics_out = metrics.clone();
         #[cfg(feature = "metrics")]
@@ -553,6 +566,7 @@ async fn run_client(
             packet_rx,
             transport_tx_inner,
             user_id_out,
+            psc,
             #[cfg(feature = "metrics")]
             metrics_out,
             #[cfg(feature = "metrics")]
@@ -568,6 +582,7 @@ async fn run_client(
         };
         let shim = Arc::new(shim);
         let user_id_up = user_id.clone();
+        let psc = packets_sent_counter.clone();
         #[cfg(feature = "metrics")]
         let metrics_up = metrics.clone();
         #[cfg(feature = "metrics")]
@@ -577,6 +592,7 @@ async fn run_client(
             transport_tx,
             shim,
             user_id_up,
+            psc,
             #[cfg(feature = "metrics")]
             metrics_up,
             #[cfg(feature = "metrics")]
@@ -600,12 +616,6 @@ async fn run_client(
 
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.
-    let server_url_display = lobby_url
-        .as_str()
-        .split("?token=")
-        .next()
-        .unwrap_or(lobby_url.as_str())
-        .to_string();
     // 2× one-way netsim delay approximates RTT; jitter is not accounted for.
     let simulated_rtt_ms = if network_profile.is_passthrough() {
         None
@@ -616,8 +626,10 @@ async fn run_client(
         HealthReporterConfig {
             client_config: client_config.clone(),
             transport: resolved_transport.clone(),
-            server_url: server_url_display,
             simulated_rtt_ms,
+            packets_sent_counter: packets_sent_counter.clone(),
+            transport_drops_counter: transport_drops_counter.clone(),
+            encoder_output_fps: encoder_output_fps.clone(),
         },
         stats.clone(),
         packet_tx.clone(),
@@ -634,6 +646,7 @@ async fn run_client(
     spawn_diagnostics_reporter(
         DiagnosticsReporterConfig {
             client_config: client_config.clone(),
+            transport_drops_counter: transport_drops_counter.clone(),
         },
         stats,
         packet_tx.clone(),
@@ -685,6 +698,7 @@ async fn run_client(
                     loop_duration,
                     is_speaking.clone(),
                     aq.clone(),
+                    encoder_output_fps.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -705,6 +719,7 @@ async fn run_client(
                     media_start,
                     loop_duration,
                     aq.clone(),
+                    encoder_output_fps.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -722,6 +737,7 @@ async fn run_client(
                 media_start,
                 loop_duration,
                 aq.clone(),
+                encoder_output_fps.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }
@@ -776,6 +792,7 @@ async fn run_outbound_shim(
     tx: mpsc::Sender<Vec<u8>>,
     shim: Arc<NetSimShim>,
     user_id: String,
+    packets_sent_counter: Arc<AtomicU64>,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
     #[cfg(feature = "metrics")] meeting_id: String,
 ) {
@@ -793,34 +810,44 @@ async fn run_outbound_shim(
                 if tx.send(payload).await.is_err() {
                     break;
                 }
+                packets_sent_counter.fetch_add(1, Ordering::Relaxed);
             }
             Admission::Drop => {
                 debug!("[{}] netsim-up: dropped {}B", user_id, payload.len());
             }
             Admission::Delay(d) => {
                 let tx = tx.clone();
+                let psc = packets_sent_counter.clone();
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx.send(payload).await;
+                    if tx.send(payload).await.is_ok() {
+                        psc.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
             Admission::DelayAndDuplicate(d) => {
                 let tx_a = tx.clone();
                 let tx_b = tx.clone();
+                let psc_a = packets_sent_counter.clone();
+                let psc_b = packets_sent_counter.clone();
                 let p_copy = payload.clone();
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx_a.send(payload).await;
+                    if tx_a.send(payload).await.is_ok() {
+                        psc_a.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx_b.send(p_copy).await;
+                    if tx_b.send(p_copy).await.is_ok() {
+                        psc_b.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
         }
@@ -838,6 +865,7 @@ async fn run_outbound_passthrough(
     mut rx: mpsc::Receiver<OutboundFrame>,
     tx: mpsc::Sender<Vec<u8>>,
     user_id: String,
+    packets_sent_counter: Arc<AtomicU64>,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
     #[cfg(feature = "metrics")] meeting_id: String,
 ) {
@@ -853,6 +881,7 @@ async fn run_outbound_passthrough(
         if tx.send(frame.bytes).await.is_err() {
             break;
         }
+        packets_sent_counter.fetch_add(1, Ordering::Relaxed);
     }
     info!("Outbound passthrough stopped for {}", user_id);
 }

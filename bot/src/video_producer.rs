@@ -23,7 +23,7 @@ use crate::transport::{MediaTypeLabel, OutboundFrame};
 use crate::video_encoder::VideoEncoderBuilder;
 use image::{ImageBuffer, Rgb};
 use protobuf::Message;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -56,6 +56,7 @@ impl VideoProducer {
         media_start: Instant,
         loop_duration: Duration,
         aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -72,6 +73,7 @@ impl VideoProducer {
                 media_start,
                 loop_duration,
                 aq,
+                encoder_output_fps,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -96,6 +98,7 @@ impl VideoProducer {
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -111,6 +114,7 @@ impl VideoProducer {
                 loop_duration,
                 is_speaking,
                 aq,
+                encoder_output_fps,
             ) {
                 error!("Costume video producer error: {}", e);
             }
@@ -134,6 +138,7 @@ impl VideoProducer {
         media_start: Instant,
         loop_duration: Duration,
         aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
     ) -> anyhow::Result<()> {
         // Seed encoder configuration from the AQ controller's current tier.
         // `framerate` is driven by AQ (browser client EKG was 15 FPS; we honor
@@ -156,6 +161,10 @@ impl VideoProducer {
             frames_per_keyframe,
             aq.video_tier_index(),
         );
+
+        // Publish the initial encoder FPS to the shared atomic so the health
+        // reporter can include it in HealthPacket.encoder_output_fps.
+        encoder_output_fps.store(framerate, Ordering::Relaxed);
 
         let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
             .set_resolution(width, height)
@@ -235,6 +244,8 @@ impl VideoProducer {
                             // Force a keyframe on the next frame — the decoder
                             // must see the new resolution as a clean IDR.
                             prev_frame_index = None;
+                            // Update shared FPS for health reporter.
+                            encoder_output_fps.store(framerate, Ordering::Relaxed);
                         }
                         Err(e) => {
                             error!(
@@ -377,6 +388,7 @@ impl VideoProducer {
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
     ) -> anyhow::Result<()> {
         let width = renderer.width();
         let height = renderer.height();
@@ -398,6 +410,10 @@ impl VideoProducer {
             v.bitrate_kbps,
             aq.video_tier_index(),
         );
+
+        // Publish the initial encoder FPS to the shared atomic so the health
+        // reporter can include it in HealthPacket.encoder_output_fps.
+        encoder_output_fps.store(framerate, Ordering::Relaxed);
 
         let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
             .set_resolution(width, height)
@@ -461,6 +477,8 @@ impl VideoProducer {
                             let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
                             video_encoder = enc;
                             prev_frame_index = None; // force keyframe on next iter
+                                                     // Update shared FPS for health reporter.
+                            encoder_output_fps.store(framerate, Ordering::Relaxed);
                         }
                         Err(e) => {
                             error!(

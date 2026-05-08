@@ -79,8 +79,6 @@ fn generate_instance_id() -> String {
     )
 }
 
-const MAX_SESSION_ID_HISTORY: usize = 16;
-
 /// Result of refreshing a room token. Both URL lists carry the new token
 /// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
 /// ready to be plugged into the connection manager via
@@ -330,11 +328,6 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
-    /// All session_ids assigned to this client instance (current page load).
-    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
-    /// target a previous session_id from before re-election completed.
-    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
-    session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
     /// messages, so we deduplicate by (event_type, target_user_id) within a
@@ -503,7 +496,6 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
-                session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -1774,12 +1766,6 @@ impl Inner {
                     response.session_id
                 );
                 self.own_session_id = Some(response.session_id);
-                if !self.session_id_history.contains(&response.session_id) {
-                    if self.session_id_history.len() >= MAX_SESSION_ID_HISTORY {
-                        self.session_id_history.pop_front();
-                    }
-                    self.session_id_history.push_back(response.session_id);
-                }
 
                 if let Ok(cc) = self.connection_controller.try_borrow() {
                     if let Some(controller) = cc.as_ref() {
@@ -2071,7 +2057,7 @@ impl Inner {
                 // is dropping our packets, so the server published a CONGESTION
                 // signal addressed to this sender's NATS subject. By the time
                 // the packet arrives at this client it has already been routed
-                // to us specifically — the prior `session_id_history` check
+                // to us specifically. The prior session-id matching check
                 // dropped every signal in the 2026-05-08 production storm
                 // (718 ignored / 718 received) because the field can carry an
                 // ID we never saw assigned (e.g. when the dual-transport pair

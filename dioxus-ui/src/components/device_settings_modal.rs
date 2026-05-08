@@ -350,28 +350,22 @@ pub fn DeviceSettingsModal(
                     }
                 },
 
-                div { class: "device-settings-header settings-header",
-                    h2 {
-                        id: "device-settings-title",
-                        "Settings"
-                    }
-                    button {
-                        class: "close-button",
-                        r#type: "button",
-                        "aria-label": "Close settings",
-                        onclick: move |_| on_close.call(()),
+                button {
+                    class: "settings-modal-close",
+                    r#type: "button",
+                    "aria-label": "Close settings",
+                    onclick: move |_| on_close.call(()),
 
-                        svg {
-                            view_box: "0 0 24 24",
-                            width: "18",
-                            height: "18",
+                    svg {
+                        view_box: "0 0 24 24",
+                        width: "16",
+                        height: "16",
 
-                            path {
-                                d: "M6 6L18 18M18 6L6 18",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                stroke_linecap: "round"
-                            }
+                        path {
+                            d: "M6 6L18 18M18 6L6 18",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round"
                         }
                     }
                 }
@@ -381,6 +375,12 @@ pub fn DeviceSettingsModal(
                         class: "settings-sidebar",
                         role: "tablist",
                         "aria-label": "Settings sections",
+
+                        h2 {
+                            id: "device-settings-title",
+                            class: "settings-sidebar-title",
+                            "Settings"
+                        }
 
                         for section in SettingsSection::all() {
                             SettingsNavButton {
@@ -703,8 +703,86 @@ fn SettingsNavButton(
             "data-testid": section.test_id(),
             tabindex: if active { "0" } else { "-1" },
             onclick: move |evt| onclick.call(evt),
-            "{section.title()}"
+            {render_nav_icon(section)}
+            span { class: "settings-nav-label", "{section.title()}" }
         }
+    }
+}
+
+// Monochrome stroke-only icons for the settings sidebar. Rendered with
+// `currentColor` so they pick up the nav button's own text color in both
+// themes — no per-tab color, no glow, no fill.
+fn render_nav_icon(section: SettingsSection) -> Element {
+    match section {
+        SettingsSection::Audio => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M5 9v6h3l5 4V5L8 9H5z" }
+                path { d: "M16 8a5 5 0 0 1 0 8" }
+                path { d: "M19 5a9 9 0 0 1 0 14" }
+            }
+        },
+        SettingsSection::Video => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                rect { x: "3", y: "6", width: "13", height: "12", rx: "2" }
+                path { d: "M16 10l5-3v10l-5-3z" }
+            }
+        },
+        SettingsSection::Network => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M5 18h2v-4H5v4z" }
+                path { d: "M11 18h2v-7h-2v7z" }
+                path { d: "M17 18h2V7h-2v11z" }
+            }
+        },
+        SettingsSection::Appearance => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                // Sun: small disc on the upper-left with a few rays
+                circle { cx: "9", cy: "9", r: "3.2" }
+                path { d: "M9 3.4v1.6 M9 13v1.6 M3.4 9h1.6 M13 9h1.6 M5.1 5.1l1.1 1.1 M11.8 11.8l1.1 1.1 M12.9 5.1l-1.1 1.1 M6.2 11.8l-1.1 1.1" }
+                // Moon: crescent on the lower-right
+                path { d: "M20.5 14.2a6 6 0 1 1-6.7-6.7 4.6 4.6 0 0 0 6.7 6.7z" }
+            }
+        },
     }
 }
 

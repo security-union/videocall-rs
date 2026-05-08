@@ -214,6 +214,639 @@ html[data-theme="light"] {
   --hairline: rgba(100, 100, 120, 0.12);
 }
 
+/* ============================================================
+   v0.2 — extended cleanup tokens (style.css tokenization pass)
+   Theme-paired tokens covering recurring literals across the app.
+   ============================================================ */
+html:not([data-theme]),
+html[data-theme="dark"] {
+  /* Text-on-glass alpha scale (white tint over dark surface) */
+  --text-on-glass-strong:     rgba(255, 255, 255, 0.95);
+  --text-on-glass-strong-2:   rgba(255, 255, 255, 0.92);
+  --text-on-glass-high:       rgba(255, 255, 255, 0.85);
+  --text-on-glass:            rgba(255, 255, 255, 0.78);
+  --text-on-glass-soft:       rgba(255, 255, 255, 0.70);
+  --text-on-glass-muted:      rgba(255, 255, 255, 0.60);
+  --text-on-glass-faint:      rgba(255, 255, 255, 0.50);
+  --text-on-glass-fainter:    rgba(255, 255, 255, 0.45);
+  --text-on-glass-quaternary: rgba(255, 255, 255, 0.40);
+  --text-on-glass-ghost:      rgba(255, 255, 255, 0.30);
+
+  /* Generic scrollbar */
+  --scrollbar-track:        rgba(255, 255, 255, 0.08);
+  --scrollbar-thumb:        rgba(255, 255, 255, 0.18);
+  --scrollbar-thumb-hover:  rgba(255, 255, 255, 0.32);
+  --scrollbar-thumb-strong: rgba(255, 255, 255, 0.35);
+  --scrollbar-thumb-active: rgba(255, 255, 255, 0.50);
+
+  /* Meeting state pills (active / idle / ended) */
+  --state-active-bg:     rgba(48, 209, 88, 0.10);
+  --state-active-text:   rgba(48, 209, 88, 0.80);
+  --state-active-border: rgba(48, 209, 88, 0.22);
+  --state-idle-bg:       rgba(255, 159, 10, 0.10);
+  --state-idle-text:     rgba(255, 159, 10, 0.80);
+  --state-idle-border:   rgba(255, 159, 10, 0.22);
+  --state-ended-bg:      rgba(142, 142, 147, 0.10);
+  --state-ended-text:    rgba(142, 142, 147, 0.70);
+  --state-ended-border:  rgba(142, 142, 147, 0.18);
+  --state-ended-row-bg:  rgba(158, 158, 158, 0.05);
+
+  /* Brand gold (owner star, password warning) */
+  --brand-gold:        #FFB400;
+  --brand-gold-border: rgba(255, 180, 0, 0.18);
+  --brand-gold-soft:   rgba(255, 193, 7, 0.8);
+  --brand-gold-soft-2: rgba(255, 193, 7, 0.9);
+
+  /* Status soft tints (live indicators, focus rings, toast icon) */
+  --success-text-soft:     rgba(76, 175, 80, 0.9);
+  --success-glow:          rgba(76, 175, 80, 0.6);
+  --success-focus-ring:    rgba(76, 175, 80, 0.2);
+  --success-bg-soft:       rgba(76, 175, 80, 0.2);
+  --success-bg-soft-hover: rgba(76, 175, 80, 0.4);
+  --success-icon-bg:       rgba(52, 199, 89, 0.15);
+  --success-icon-text:     rgba(52, 199, 89, 0.9);
+  --success-border-vivid:  rgba(52, 199, 89, 0.85);
+  --success-glow-vivid:    rgba(52, 199, 89, 0.28);
+
+  /* Error/danger soft tints */
+  --error-bg-soft:          rgba(244, 67, 54, 0.2);
+  --error-bg-soft-hover:    rgba(244, 67, 54, 0.4);
+  --error-text-strong:      #f44336;
+  --error-text-vivid:       #ff6b6b;
+  --error-bg-faint:         rgba(255, 68, 68, 0.2);
+  --delete-bg-hover:        rgba(220, 53, 69, 0.15);
+  --delete-bg-hover-strong: rgba(220, 53, 69, 0.20);
+  --delete-text:            #dc3545;
+  --signout-bg-hover:       rgba(255, 107, 107, 0.1);
+
+  /* Connection LED */
+  --connection-warning:    #ff9800;
+  --connection-led-border: rgba(255, 255, 255, 0.3);
+  --connection-led-shadow: rgba(0, 0, 0, 0.3);
+
+  /* Toast (peer join/leave) */
+  --toast-bg:              rgba(30, 30, 30, 0.88);
+  --toast-shadow-color:    rgba(0, 0, 0, 0.4);
+  --toast-icon-neutral-bg: rgba(255, 255, 255, 0.08);
+  --toast-action-neutral:  rgba(255, 255, 255, 0.5);
+
+  /* Auth dropdown */
+  --auth-dropdown-bg:                    rgba(30, 30, 30, 0.95);
+  --auth-dropdown-trigger-bg:            rgba(255, 255, 255, 0.08);
+  --auth-dropdown-trigger-bg-hover:      rgba(255, 255, 255, 0.12);
+  --auth-dropdown-trigger-border:        rgba(255, 255, 255, 0.12);
+  --auth-dropdown-trigger-border-hover:  rgba(255, 255, 255, 0.20);
+  --auth-dropdown-divider:               rgba(255, 255, 255, 0.08);
+
+  /* Context menu items (cyan accent) */
+  --menu-item-hover-bg:   rgba(50, 190, 254, 0.1);
+  --menu-item-hover-text: #32beef;
+  --menu-item-active-bg:  rgba(50, 190, 254, 0.2);
+
+  /* Copy toast */
+  --copy-toast-bg:     rgba(44, 44, 46, 0.75);
+  --copy-toast-border: rgba(255, 255, 255, 0.18);
+
+  /* Sparkle (CTA confetti) */
+  --sparkle-color: #FFD60A;
+  --sparkle-glow:  rgba(255, 214, 10, 0.7);
+
+  /* CTA glow overlay */
+  --cta-glow-color: rgba(255, 255, 255, 0.6);
+
+  /* OAuth (generic blue) */
+  --oauth-blue-bg:           rgba(10, 132, 255, 0.25);
+  --oauth-blue-bg-hover:     rgba(10, 132, 255, 0.35);
+  --oauth-blue-bg-active:    rgba(10, 132, 255, 0.40);
+  --oauth-blue-border:       rgba(10, 132, 255, 0.35);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.50);
+  --back-btn-hover-bg:       rgba(10, 132, 255, 0.08);
+
+  /* Settings card (in-page settings — distinct from settings-modal-*) */
+  --settings-card-bg:           rgba(0, 0, 0, 0.20);
+  --settings-card-border:       rgba(255, 255, 255, 0.08);
+  --settings-card-border-hover: rgba(255, 255, 255, 0.12);
+  --settings-card-inset:        rgba(255, 255, 255, 0.04);
+  --join-meeting-divider:       rgba(255, 255, 255, 0.07);
+  --join-meeting-id-border:     rgba(255, 255, 255, 0.08);
+
+  /* Hero form (clear variant) */
+  --form-bg:               rgba(0, 0, 0, 0.20);
+  --form-border:           rgba(255, 255, 255, 0.08);
+  --form-border-hover:     rgba(255, 255, 255, 0.14);
+  --form-inset:            rgba(255, 255, 255, 0.04);
+  --form-input-bg:         rgba(255, 255, 255, 0.05);
+  --form-input-bg-hover:   rgba(255, 255, 255, 0.07);
+  --form-input-shadow:     rgba(0, 0, 0, 0.15);
+  --form-input-focus-ring: rgba(0, 122, 255, 0.3);
+  --form-separator:        rgba(255, 255, 255, 0.10);
+
+  /* Glass specular (bottom edge inset highlight) */
+  --glass-specular-bottom: rgba(255, 255, 255, 0.04);
+
+  /* Tooltip portal (meeting info hover) */
+  --tooltip-portal-bg:     rgba(20, 20, 24, 0.72);
+  --tooltip-portal-shadow: rgba(0, 0, 0, 0.4);
+
+  /* Diagnostics monospace (build info) */
+  --diag-mono-text: #4fc3f7;
+
+  /* Density popover */
+  --density-option-hover-bg:  #4a4b4c;
+  --density-option-active-bg: rgba(66, 133, 244, 0.15);
+
+  /* Custom-color (add swatch) */
+  --add-color-border:           rgba(255, 255, 255, 0.22);
+  --add-color-text:             rgba(255, 255, 255, 0.52);
+  --add-color-border-hover:     rgba(255, 255, 255, 0.42);
+  --add-color-text-hover:       rgba(255, 255, 255, 0.78);
+  --add-color-popover-bg:       rgba(30, 30, 34, 0.92);
+  --add-color-popover-border:   rgba(255, 255, 255, 0.18);
+  --add-color-btn-border:       rgba(255, 255, 255, 0.16);
+  --add-color-btn-bg-hover:     rgba(255, 255, 255, 0.16);
+  --add-color-btn-border-hover: rgba(255, 255, 255, 0.28);
+
+  /* Glow switch (decorative thumb shadows) */
+  --glow-switch-thumb-disabled:      rgba(255, 255, 255, 0.36);
+  --glow-switch-track-border:        rgba(255, 255, 255, 0.22);
+  --glow-switch-thumb-border:        rgba(255, 255, 255, 0.50);
+  --glow-switch-thumb-shadow-1:      rgba(0, 0, 0, 0.30);
+  --glow-switch-thumb-shadow-2:      rgba(255, 255, 255, 0.20);
+  --glow-switch-thumb-shadow-3:      rgba(255, 255, 255, 0.80);
+  --glow-switch-thumb-shadow-5:      rgba(255, 255, 255, 0.35);
+  --glow-switch-thumb-shadow-6:      rgba(255, 255, 255, 0.90);
+  --glow-switch-track-shadow:        rgba(0, 0, 0, 0.25);
+  --glow-switch-track-shadow-active: rgba(0, 0, 0, 0.15);
+
+  /* Resize handle drag/active */
+  --resize-handle-bg-active: rgba(100, 100, 100, 0.7);
+
+  /* Inline device selector (top of grid) */
+  --device-wrapper-bg:    rgba(30, 30, 30, 0.85);
+  --device-selector-text: #000000;
+  --device-selector-bg:   #FFFFFF;
+
+  /* Settings info-icon ::after tooltip */
+  --settings-tooltip-bg:     rgba(30, 30, 30, 0.95);
+  --settings-tooltip-border: rgba(255, 255, 255, 0.12);
+  --settings-tooltip-shadow: rgba(0, 0, 0, 0.4);
+
+  /* Field-label info hover ring */
+  --field-info-hover-bg:   rgba(255, 255, 255, 0.08);
+  --field-info-focus-ring: rgba(0, 122, 255, 0.45);
+
+  /* Field-label tooltip */
+  --field-tooltip-bg:     rgba(28, 28, 30, 0.96);
+  --field-tooltip-border: rgba(255, 255, 255, 0.12);
+  --field-tooltip-shadow: rgba(0, 0, 0, 0.45);
+  --field-tooltip-inset:  rgba(255, 255, 255, 0.04);
+  --field-tooltip-text:   rgba(255, 255, 255, 0.92);
+
+  /* Invalid input focus ring */
+  --input-invalid-focus-ring: rgba(255, 69, 58, 0.25);
+
+  /* Primary/secondary button specifics */
+  --btn-primary-border:             rgba(255, 255, 255, 0.12);
+  --btn-primary-shadow-1:           rgba(0, 122, 255, 0.25);
+  --btn-primary-shadow-inner:       rgba(255, 255, 255, 0.15);
+  --btn-primary-shadow-1-hover:     rgba(0, 122, 255, 0.35);
+  --btn-primary-shadow-inner-hover: rgba(255, 255, 255, 0.18);
+  --btn-secondary-inset:            rgba(255, 255, 255, 0.06);
+
+  /* Generic input shadows */
+  --input-inset-shadow: rgba(0, 0, 0, 0.15);
+  --input-focus-ring:   rgba(0, 122, 255, 0.3);
+
+  /* Modal full bleed */
+  --modal-fullscreen-bg: #000000;
+  --modal-content-bg:    #1C1C1E;
+  --modal-content-text:  #FFFFFF;
+
+  /* Error container */
+  --error-container-bg: rgba(0, 0, 0, 0.80);
+
+  /* Hero scrollbar (page scrollbar) */
+  --hero-scrollbar-track:       rgba(26, 35, 51, 0.1);
+  --hero-scrollbar-thumb:       rgba(255, 255, 255, 0.2);
+  --hero-scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
+  --text-shadow-color:          rgba(0, 0, 0, 0.3);
+
+  /* CTA button */
+  --cta-button-border: rgba(255, 255, 255, 0.12);
+  --cta-shadow:        rgba(0, 122, 255, 0.25);
+  --cta-shadow-hover:  rgba(0, 122, 255, 0.35);
+  --cta-inset-hover:   rgba(255, 255, 255, 0.18);
+
+  /* Video controls dock bar */
+  --controls-dock-bg:                  rgba(28, 28, 30, 0.85);
+  --controls-dock-shadow:              rgba(0, 0, 0, 0.6);
+  --controls-dock-inset:               rgba(255, 255, 255, 0.05);
+  --controls-dock-hover-shadow-1:      rgba(0, 0, 0, 0.5);
+  --controls-dock-hover-shadow-purple: rgba(121, 40, 202, 0.2);
+  --controls-dock-hover-inset:         rgba(255, 255, 255, 0.07);
+  --dock-position-menu-border:         rgba(70, 100, 140, 0.15);
+
+  /* Video control button (round dock button) */
+  --vcb-shadow:              rgba(0, 0, 0, 0.3);
+  --vcb-inset:               rgba(255, 255, 255, 0.05);
+  --vcb-purple:              rgba(121, 40, 202, 0.3);
+  --vcb-cyan:                rgba(56, 189, 248, 0.3);
+  --vcb-hover-bg:            rgba(41, 51, 71, 0.95);
+  --vcb-hover-shadow-1:      rgba(0, 0, 0, 0.5);
+  --vcb-hover-shadow-purple: rgba(121, 40, 202, 0.2);
+  --vcb-hover-inset:         rgba(255, 255, 255, 0.07);
+  --vcb-active-shadow:       rgba(0, 0, 0, 0.4);
+  --vcb-on-bg:               #0A84FF;
+  --vcb-on-shadow:           rgba(10, 132, 255, 0.45);
+  --vcb-on-inset:            rgba(255, 255, 255, 0.1);
+  --vcb-on-hover-grad-1:     #8938D8;
+  --vcb-on-hover-grad-2:     #7232b8;
+  --vcb-on-hover-shadow-1:   rgba(121, 40, 202, 0.5);
+  --vcb-on-hover-inset:      rgba(255, 255, 255, 0.15);
+  --vcb-warning-glow:        rgba(255, 69, 58, 0.6);
+  --vcb-danger-shadow:       rgba(255, 69, 58, 0.45);
+  --vcb-danger-hover-grad-1: #F87171;
+  --vcb-danger-hover-grad-2: #ef4444;
+  --vcb-danger-hover-shadow: rgba(239, 68, 68, 0.5);
+  --vcb-tooltip-bg:          rgba(13, 19, 31, 0.95);
+  --vcb-tooltip-shadow:      rgba(0, 0, 0, 0.3);
+  --vcb-tooltip-ring:        rgba(121, 40, 202, 0.1);
+  --vcb-tooltip-border:      rgba(255, 255, 255, 0.05);
+
+  /* Hero mesh gradient orbs */
+  --mesh-orb-blue:    rgba(10, 132, 255, 0.28);
+  --mesh-orb-purple:  rgba(191, 90, 242, 0.22);
+  --mesh-orb-green:   rgba(48, 209, 88, 0.12);
+  --mesh-orb-violet:  rgba(142, 102, 255, 0.24);
+  --mesh-orb-orange:  rgba(255, 159, 10, 0.14);
+  --float-orb-blue:   rgba(10, 132, 255, 0.35);
+  --float-orb-purple: rgba(191, 90, 242, 0.30);
+  --float-orb-green:  rgba(48, 209, 88, 0.20);
+
+  /* Pin/crop active hover */
+  --pin-active-bg-hover: rgba(0, 0, 0, 0.8);
+
+  /* Diag info border (peer-toast inner divider) */
+  --diag-info-border: rgba(255, 255, 255, 0.04);
+
+  /* Btn warning */
+  --btn-warning-bg:           rgba(255, 159, 10, 0.18);
+  --btn-warning-bg-hover:     rgba(255, 159, 10, 0.28);
+  --btn-warning-border:       rgba(255, 159, 10, 0.25);
+  --btn-warning-border-hover: rgba(255, 159, 10, 0.40);
+
+  /* Btn danger */
+  --btn-danger-bg:           rgba(255, 69, 58, 0.10);
+  --btn-danger-bg-hover:     rgba(255, 69, 58, 0.22);
+  --btn-danger-border:       rgba(255, 69, 58, 0.18);
+  --btn-danger-border-hover: rgba(255, 69, 58, 0.35);
+  --btn-danger-divider:      rgba(255, 69, 58, 0.20);
+  --btn-danger-label:        rgba(255, 69, 58, 0.6);
+
+  /* Crop active foreground */
+  --crop-active-color: rgb(91, 207, 159);
+
+  /* Floating-name hover overlay */
+  --floating-name-hover-bg: rgba(0, 0, 0, 0.44);
+
+  /* Simulation/debug accents */
+  --simulation-info-text: #ffcc00;
+  --debug-mono-text:      #00ff00;
+
+  /* Mock peers popover */
+  --mock-popover-bg:    rgba(30, 30, 30, 0.95);
+  --mock-input-bg:      rgba(255, 255, 255, 0.08);
+  --mock-input-border:  rgba(255, 255, 255, 0.20);
+
+  /* Loading spinner */
+  --spinner-track:      rgba(255, 255, 255, 0.2);
+  --spinner-foreground: rgba(255, 255, 255, 0.8);
+  --spinner-dot:        rgba(255, 255, 255, 0.6);
+
+  /* Signal popup close button hover */
+  --signal-popup-close-text: rgba(255, 255, 255, 0.5);
+
+  /* Legend help button border */
+  --legend-help-border:       rgba(255, 255, 255, 0.3);
+  --legend-help-text:         rgba(255, 255, 255, 0.5);
+  --legend-help-border-hover: rgba(255, 255, 255, 0.6);
+
+  /* Connection/transport badge (signal popup) */
+  --transport-badge-bg:     #1c1c1e;
+  --transport-badge-text:   #0a84ff;
+  --transport-badge-border: #38383a;
+
+  /* Generic context-menu inner divider */
+  --context-menu-shadow:        rgba(0, 0, 0, 0.5);
+  --context-menu-shadow-strong: rgba(0, 0, 0, 0.4);
+  --context-menu-shadow-deep:   rgba(0, 0, 0, 0.45);
+  --context-menu-shadow-card:   rgba(0, 0, 0, 0.6);
+  --shadow-card-deep:           rgba(0, 0, 0, 0.4);
+  --shadow-error:               rgba(0, 0, 0, 0.3);
+  --shadow-card-soft:           rgba(0, 0, 0, 0.25);
+
+  /* Settings-placeholder dashed card */
+  --settings-placeholder-border: rgba(255, 255, 255, 0.12);
+  --settings-placeholder-bg:     rgba(255, 255, 255, 0.03);
+
+  /* Glass-select (settings) blue-tinted focus/hover */
+  --glass-select-trigger-hover-border: rgba(80, 120, 170, 0.22);
+  --glass-select-focus-inset-1:        rgba(100, 140, 180, 0.10);
+  --glass-select-focus-ring:           rgba(70, 110, 160, 0.15);
+  --glass-select-focus-shadow:         rgba(30, 60, 110, 0.15);
+  --glass-select-menu-inset:           rgba(100, 140, 180, 0.06);
+  --glass-select-menu-shadow:          rgba(0, 0, 0, 0.40);
+  --glass-select-option-hover-bg:      rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="light"] {
+  --text-on-glass-strong:     rgba(0, 0, 0, 0.92);
+  --text-on-glass-strong-2:   rgba(0, 0, 0, 0.88);
+  --text-on-glass-high:       rgba(0, 0, 0, 0.85);
+  --text-on-glass:            rgba(0, 0, 0, 0.72);
+  --text-on-glass-soft:       rgba(0, 0, 0, 0.62);
+  --text-on-glass-muted:      rgba(0, 0, 0, 0.52);
+  --text-on-glass-faint:      rgba(0, 0, 0, 0.44);
+  --text-on-glass-fainter:    rgba(0, 0, 0, 0.40);
+  --text-on-glass-quaternary: rgba(0, 0, 0, 0.36);
+  --text-on-glass-ghost:      rgba(0, 0, 0, 0.24);
+
+  --scrollbar-track:        rgba(0, 0, 0, 0.06);
+  --scrollbar-thumb:        rgba(0, 0, 0, 0.18);
+  --scrollbar-thumb-hover:  rgba(0, 0, 0, 0.32);
+  --scrollbar-thumb-strong: rgba(0, 0, 0, 0.35);
+  --scrollbar-thumb-active: rgba(0, 0, 0, 0.50);
+
+  --state-active-bg:     rgba(48, 209, 88, 0.14);
+  --state-active-text:   rgba(20, 140, 50, 0.95);
+  --state-active-border: rgba(48, 209, 88, 0.30);
+  --state-idle-bg:       rgba(255, 149, 0, 0.14);
+  --state-idle-text:     rgba(180, 100, 0, 0.95);
+  --state-idle-border:   rgba(255, 149, 0, 0.30);
+  --state-ended-bg:      rgba(142, 142, 147, 0.12);
+  --state-ended-text:    rgba(99, 99, 102, 0.90);
+  --state-ended-border:  rgba(142, 142, 147, 0.24);
+  --state-ended-row-bg:  rgba(158, 158, 158, 0.08);
+
+  --brand-gold:        #B07A00;
+  --brand-gold-border: rgba(176, 122, 0, 0.30);
+  --brand-gold-soft:   rgba(176, 122, 0, 0.85);
+  --brand-gold-soft-2: rgba(176, 122, 0, 0.95);
+
+  --success-text-soft:     rgba(40, 140, 60, 0.95);
+  --success-glow:          rgba(40, 140, 60, 0.5);
+  --success-focus-ring:    rgba(40, 140, 60, 0.2);
+  --success-bg-soft:       rgba(76, 175, 80, 0.18);
+  --success-bg-soft-hover: rgba(76, 175, 80, 0.32);
+  --success-icon-bg:       rgba(52, 199, 89, 0.18);
+  --success-icon-text:     rgba(34, 158, 72, 0.95);
+  --success-border-vivid:  rgba(52, 199, 89, 0.85);
+  --success-glow-vivid:    rgba(52, 199, 89, 0.25);
+
+  --error-bg-soft:          rgba(244, 67, 54, 0.18);
+  --error-bg-soft-hover:    rgba(244, 67, 54, 0.32);
+  --error-text-strong:      #c62828;
+  --error-text-vivid:       #d32f2f;
+  --error-bg-faint:         rgba(244, 67, 54, 0.18);
+  --delete-bg-hover:        rgba(220, 53, 69, 0.18);
+  --delete-bg-hover-strong: rgba(220, 53, 69, 0.24);
+  --delete-text:            #b71c1c;
+  --signout-bg-hover:       rgba(211, 47, 47, 0.10);
+
+  --connection-warning:    #ef6c00;
+  --connection-led-border: rgba(0, 0, 0, 0.20);
+  --connection-led-shadow: rgba(0, 0, 0, 0.15);
+
+  --toast-bg:              rgba(245, 245, 247, 0.92);
+  --toast-shadow-color:    rgba(0, 0, 0, 0.10);
+  --toast-icon-neutral-bg: rgba(0, 0, 0, 0.06);
+  --toast-action-neutral:  rgba(0, 0, 0, 0.45);
+
+  --auth-dropdown-bg:                    rgba(255, 255, 255, 0.92);
+  --auth-dropdown-trigger-bg:            rgba(0, 0, 0, 0.06);
+  --auth-dropdown-trigger-bg-hover:      rgba(0, 0, 0, 0.10);
+  --auth-dropdown-trigger-border:        rgba(0, 0, 0, 0.10);
+  --auth-dropdown-trigger-border-hover:  rgba(0, 0, 0, 0.18);
+  --auth-dropdown-divider:               rgba(0, 0, 0, 0.06);
+
+  --menu-item-hover-bg:   rgba(0, 122, 255, 0.08);
+  --menu-item-hover-text: #007aff;
+  --menu-item-active-bg:  rgba(0, 122, 255, 0.16);
+
+  --copy-toast-bg:     rgba(245, 245, 247, 0.92);
+  --copy-toast-border: rgba(0, 0, 0, 0.12);
+
+  --sparkle-color: #F59E0B;
+  --sparkle-glow:  rgba(245, 158, 11, 0.6);
+
+  --cta-glow-color: rgba(255, 255, 255, 0.7);
+
+  --oauth-blue-bg:           rgba(10, 132, 255, 0.18);
+  --oauth-blue-bg-hover:     rgba(10, 132, 255, 0.26);
+  --oauth-blue-bg-active:    rgba(10, 132, 255, 0.30);
+  --oauth-blue-border:       rgba(10, 132, 255, 0.30);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.40);
+  --back-btn-hover-bg:       rgba(10, 132, 255, 0.10);
+
+  --settings-card-bg:           rgba(0, 0, 0, 0.04);
+  --settings-card-border:       rgba(0, 0, 0, 0.06);
+  --settings-card-border-hover: rgba(0, 0, 0, 0.10);
+  --settings-card-inset:        rgba(255, 255, 255, 0.50);
+  --join-meeting-divider:       rgba(0, 0, 0, 0.06);
+  --join-meeting-id-border:     rgba(0, 0, 0, 0.06);
+
+  --form-bg:               rgba(255, 255, 255, 0.30);
+  --form-border:           rgba(0, 0, 0, 0.06);
+  --form-border-hover:     rgba(0, 0, 0, 0.10);
+  --form-inset:            rgba(255, 255, 255, 0.40);
+  --form-input-bg:         rgba(0, 0, 0, 0.04);
+  --form-input-bg-hover:   rgba(0, 0, 0, 0.06);
+  --form-input-shadow:     rgba(0, 0, 0, 0.06);
+  --form-input-focus-ring: rgba(0, 122, 255, 0.25);
+  --form-separator:        rgba(0, 0, 0, 0.08);
+
+  --glass-specular-bottom: rgba(255, 255, 255, 0.30);
+
+  --tooltip-portal-bg:     rgba(245, 245, 247, 0.96);
+  --tooltip-portal-shadow: rgba(0, 0, 0, 0.10);
+
+  --diag-mono-text: #1976d2;
+
+  --density-option-hover-bg:  #d0d0d4;
+  --density-option-active-bg: rgba(66, 133, 244, 0.12);
+
+  --add-color-border:           rgba(0, 0, 0, 0.18);
+  --add-color-text:             rgba(0, 0, 0, 0.45);
+  --add-color-border-hover:     rgba(0, 0, 0, 0.32);
+  --add-color-text-hover:       rgba(0, 0, 0, 0.70);
+  --add-color-popover-bg:       rgba(245, 245, 247, 0.96);
+  --add-color-popover-border:   rgba(0, 0, 0, 0.14);
+  --add-color-btn-border:       rgba(0, 0, 0, 0.12);
+  --add-color-btn-bg-hover:     rgba(0, 0, 0, 0.10);
+  --add-color-btn-border-hover: rgba(0, 0, 0, 0.20);
+
+  --glow-switch-thumb-disabled:      rgba(0, 0, 0, 0.32);
+  --glow-switch-track-border:        rgba(0, 0, 0, 0.18);
+  --glow-switch-thumb-border:        rgba(0, 0, 0, 0.40);
+  --glow-switch-thumb-shadow-1:      rgba(0, 0, 0, 0.15);
+  --glow-switch-thumb-shadow-2:      rgba(255, 255, 255, 0.50);
+  --glow-switch-thumb-shadow-3:      rgba(255, 255, 255, 0.95);
+  --glow-switch-thumb-shadow-5:      rgba(255, 255, 255, 0.50);
+  --glow-switch-thumb-shadow-6:      rgba(255, 255, 255, 0.95);
+  --glow-switch-track-shadow:        rgba(0, 0, 0, 0.10);
+  --glow-switch-track-shadow-active: rgba(0, 0, 0, 0.08);
+
+  --resize-handle-bg-active: rgba(100, 100, 100, 0.5);
+
+  --device-wrapper-bg:    rgba(245, 245, 247, 0.92);
+  --device-selector-text: #1a1a1a;
+  --device-selector-bg:   #ffffff;
+
+  --settings-tooltip-bg:     rgba(255, 255, 255, 0.95);
+  --settings-tooltip-border: rgba(0, 0, 0, 0.10);
+  --settings-tooltip-shadow: rgba(0, 0, 0, 0.12);
+
+  --field-info-hover-bg:   rgba(0, 0, 0, 0.06);
+  --field-info-focus-ring: rgba(0, 122, 255, 0.35);
+
+  --field-tooltip-bg:     rgba(245, 245, 247, 0.96);
+  --field-tooltip-border: rgba(0, 0, 0, 0.10);
+  --field-tooltip-shadow: rgba(0, 0, 0, 0.12);
+  --field-tooltip-inset:  rgba(255, 255, 255, 0.50);
+  --field-tooltip-text:   rgba(20, 20, 20, 0.92);
+
+  --input-invalid-focus-ring: rgba(255, 59, 48, 0.20);
+
+  --btn-primary-border:             rgba(0, 0, 0, 0.08);
+  --btn-primary-shadow-1:           rgba(0, 122, 255, 0.18);
+  --btn-primary-shadow-inner:       rgba(255, 255, 255, 0.50);
+  --btn-primary-shadow-1-hover:     rgba(0, 122, 255, 0.25);
+  --btn-primary-shadow-inner-hover: rgba(255, 255, 255, 0.55);
+  --btn-secondary-inset:            rgba(255, 255, 255, 0.30);
+
+  --input-inset-shadow: rgba(0, 0, 0, 0.06);
+  --input-focus-ring:   rgba(0, 122, 255, 0.25);
+
+  --modal-fullscreen-bg: #f5f5f5;
+  --modal-content-bg:    #ffffff;
+  --modal-content-text:  #1a1a1a;
+
+  --error-container-bg: rgba(255, 255, 255, 0.92);
+
+  --hero-scrollbar-track:       rgba(0, 0, 0, 0.06);
+  --hero-scrollbar-thumb:       rgba(0, 0, 0, 0.18);
+  --hero-scrollbar-thumb-hover: rgba(0, 0, 0, 0.32);
+  --text-shadow-color:          rgba(0, 0, 0, 0.12);
+
+  --cta-button-border: rgba(255, 255, 255, 0.30);
+  --cta-shadow:        rgba(0, 122, 255, 0.18);
+  --cta-shadow-hover:  rgba(0, 122, 255, 0.25);
+  --cta-inset-hover:   rgba(255, 255, 255, 0.55);
+
+  --controls-dock-bg:                  rgba(245, 245, 247, 0.92);
+  --controls-dock-shadow:              rgba(0, 0, 0, 0.10);
+  --controls-dock-inset:               rgba(255, 255, 255, 0.50);
+  --controls-dock-hover-shadow-1:      rgba(0, 0, 0, 0.08);
+  --controls-dock-hover-shadow-purple: rgba(121, 40, 202, 0.18);
+  --controls-dock-hover-inset:         rgba(255, 255, 255, 0.55);
+  --dock-position-menu-border:         rgba(70, 100, 140, 0.20);
+
+  --vcb-shadow:              rgba(0, 0, 0, 0.12);
+  --vcb-inset:               rgba(255, 255, 255, 0.50);
+  --vcb-purple:              rgba(121, 40, 202, 0.25);
+  --vcb-cyan:                rgba(56, 189, 248, 0.25);
+  --vcb-hover-bg:            rgba(232, 238, 250, 0.95);
+  --vcb-hover-shadow-1:      rgba(0, 0, 0, 0.08);
+  --vcb-hover-shadow-purple: rgba(121, 40, 202, 0.18);
+  --vcb-hover-inset:         rgba(255, 255, 255, 0.55);
+  --vcb-active-shadow:       rgba(0, 0, 0, 0.10);
+  --vcb-on-bg:               #0A84FF;
+  --vcb-on-shadow:           rgba(10, 132, 255, 0.35);
+  --vcb-on-inset:            rgba(255, 255, 255, 0.45);
+  --vcb-on-hover-grad-1:     #6E2CB0;
+  --vcb-on-hover-grad-2:     #58238E;
+  --vcb-on-hover-shadow-1:   rgba(121, 40, 202, 0.4);
+  --vcb-on-hover-inset:      rgba(255, 255, 255, 0.50);
+  --vcb-warning-glow:        rgba(255, 59, 48, 0.5);
+  --vcb-danger-shadow:       rgba(255, 59, 48, 0.35);
+  --vcb-danger-hover-grad-1: #E53935;
+  --vcb-danger-hover-grad-2: #C62828;
+  --vcb-danger-hover-shadow: rgba(229, 57, 53, 0.4);
+  --vcb-tooltip-bg:          rgba(245, 245, 247, 0.96);
+  --vcb-tooltip-shadow:      rgba(0, 0, 0, 0.12);
+  --vcb-tooltip-ring:        rgba(121, 40, 202, 0.08);
+  --vcb-tooltip-border:      rgba(0, 0, 0, 0.06);
+
+  --mesh-orb-blue:    rgba(10, 132, 255, 0.18);
+  --mesh-orb-purple:  rgba(191, 90, 242, 0.14);
+  --mesh-orb-green:   rgba(48, 209, 88, 0.10);
+  --mesh-orb-violet:  rgba(142, 102, 255, 0.16);
+  --mesh-orb-orange:  rgba(255, 149, 0, 0.10);
+  --float-orb-blue:   rgba(10, 132, 255, 0.20);
+  --float-orb-purple: rgba(191, 90, 242, 0.18);
+  --float-orb-green:  rgba(48, 209, 88, 0.14);
+
+  --pin-active-bg-hover: rgba(0, 0, 0, 0.6);
+
+  --diag-info-border: rgba(0, 0, 0, 0.04);
+
+  --btn-warning-bg:           rgba(255, 149, 0, 0.14);
+  --btn-warning-bg-hover:     rgba(255, 149, 0, 0.22);
+  --btn-warning-border:       rgba(255, 149, 0, 0.20);
+  --btn-warning-border-hover: rgba(255, 149, 0, 0.32);
+
+  --btn-danger-bg:           rgba(255, 59, 48, 0.08);
+  --btn-danger-bg-hover:     rgba(255, 59, 48, 0.16);
+  --btn-danger-border:       rgba(255, 59, 48, 0.14);
+  --btn-danger-border-hover: rgba(255, 59, 48, 0.28);
+  --btn-danger-divider:      rgba(255, 59, 48, 0.16);
+  --btn-danger-label:        rgba(215, 0, 21, 0.85);
+
+  --crop-active-color: rgb(48, 160, 100);
+
+  --floating-name-hover-bg: rgba(0, 0, 0, 0.30);
+
+  --simulation-info-text: #b07a00;
+  --debug-mono-text:      #006600;
+
+  --mock-popover-bg:    rgba(245, 245, 247, 0.92);
+  --mock-input-bg:      rgba(0, 0, 0, 0.06);
+  --mock-input-border:  rgba(0, 0, 0, 0.16);
+
+  --spinner-track:      rgba(0, 0, 0, 0.16);
+  --spinner-foreground: rgba(0, 0, 0, 0.65);
+  --spinner-dot:        rgba(0, 0, 0, 0.50);
+
+  --signal-popup-close-text: rgba(0, 0, 0, 0.45);
+
+  --legend-help-border:       rgba(0, 0, 0, 0.20);
+  --legend-help-text:         rgba(0, 0, 0, 0.45);
+  --legend-help-border-hover: rgba(0, 0, 0, 0.45);
+
+  --transport-badge-bg:     #f0f0f2;
+  --transport-badge-text:   #0a84ff;
+  --transport-badge-border: #e0e0e2;
+
+  --context-menu-shadow:        rgba(0, 0, 0, 0.18);
+  --context-menu-shadow-strong: rgba(0, 0, 0, 0.14);
+  --context-menu-shadow-deep:   rgba(0, 0, 0, 0.16);
+  --context-menu-shadow-card:   rgba(0, 0, 0, 0.18);
+  --shadow-card-deep:           rgba(0, 0, 0, 0.14);
+  --shadow-error:               rgba(0, 0, 0, 0.10);
+  --shadow-card-soft:           rgba(0, 0, 0, 0.08);
+
+  --settings-placeholder-border: rgba(0, 0, 0, 0.10);
+  --settings-placeholder-bg:     rgba(0, 0, 0, 0.03);
+
+  --glass-select-trigger-hover-border: rgba(40, 90, 150, 0.30);
+  --glass-select-focus-inset-1:        rgba(60, 110, 170, 0.10);
+  --glass-select-focus-ring:           rgba(40, 90, 150, 0.20);
+  --glass-select-focus-shadow:         rgba(20, 60, 120, 0.14);
+  --glass-select-menu-inset:           rgba(60, 110, 170, 0.06);
+  --glass-select-menu-shadow:          rgba(0, 0, 0, 0.18);
+  --glass-select-option-hover-bg:      rgba(0, 0, 0, 0.06);
+}
+
 /* Settings-specific tokens — dark theme (default) */
 html:not([data-theme]),
 html[data-theme="dark"] {
@@ -258,6 +891,63 @@ html[data-theme="dark"] {
   --settings-error-shadow: rgba(255, 80, 80, 0.10);
   --settings-overlay-z-back: 99;
   --settings-overlay-z-front: 100;
+
+  /* Settings shell — surfaces & ghost-button overlays (dark) */
+  --settings-sidebar-bg: rgba(0, 0, 0, 0.10);
+  --settings-info-panel-bg: rgba(255, 255, 255, 0.025);
+  --settings-segmented-track-bg: rgba(255, 255, 255, 0.03);
+  --settings-ghost-bg-hover: rgba(255, 255, 255, 0.04);
+  --settings-ghost-bg-pressed: rgba(255, 255, 255, 0.06);
+  --settings-ghost-bg-selected: rgba(255, 255, 255, 0.10);
+
+  /* Settings shell — filled button (dark) */
+  --settings-button-bg: rgba(255, 255, 255, 0.10);
+  --settings-button-bg-hover: rgba(255, 255, 255, 0.16);
+  --settings-button-bg-pressed: rgba(255, 255, 255, 0.20);
+  --settings-button-border-hover: rgba(255, 255, 255, 0.20);
+
+  /* Settings modal — floating close button (dark) */
+  --settings-modal-close-bg: rgba(255, 255, 255, 0.06);
+  --settings-modal-close-bg-hover: rgba(255, 255, 255, 0.12);
+  --settings-modal-close-text: rgba(230, 238, 255, 0.85);
+
+  /* Device-settings overlay backdrop (composite gradient, dark) */
+  --device-settings-overlay-bg-image:
+    radial-gradient(125% 125% at 50% 18%, rgba(58, 90, 142, 0.07), transparent 56%),
+    linear-gradient(180deg, rgba(4, 8, 16, 0.76) 0%, rgba(4, 7, 14, 0.84) 100%);
+
+  /* Glass-select trigger open/active border (dark) */
+  --glass-select-trigger-open-border: rgba(95, 130, 180, 0.30);
+
+  /* Modal rim conic gradient (theme-agnostic warm tones) */
+  --modal-rim-gradient: conic-gradient(
+    from 220deg,
+    rgba(180, 160, 150, 0.05),
+    rgba(200, 150, 160, 0.04),
+    rgba(140, 170, 160, 0.03),
+    rgba(120, 140, 160, 0.03),
+    rgba(180, 160, 150, 0.05)
+  );
+
+  /* Theme-icon toggle — active tile surface (dark) */
+  --theme-icon-active-bg-image:
+    radial-gradient(200px 140px at 80% 80%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(180deg,
+      rgba(80, 120, 170, 0.18) 0%,
+      rgba(60, 100, 150, 0.06) 100%
+    );
+  --theme-icon-active-border: rgba(95, 130, 180, 0.30);
+  --theme-icon-active-shadow:
+    inset 0 1px 0 rgba(120, 160, 210, 0.12),
+    0 2px 8px rgba(20, 40, 80, 0.18);
+
+  /* Settings modal — scoped text overrides (dark) */
+  --settings-modal-text-primary: rgba(255, 255, 255, 0.96);
+  --settings-modal-text-secondary: rgba(230, 238, 255, 0.78);
+  --settings-modal-text-tertiary: rgba(210, 220, 240, 0.60);
+
+  /* Appearance section heading text (dark) */
+  --appearance-section-text-dark: rgba(255, 255, 255, 0.92);
 }
 
 /* Settings-specific tokens — light theme */
@@ -303,6 +993,25 @@ html[data-theme="light"] {
   --settings-error-shadow: rgba(200, 100, 100, 0.15);
   --settings-overlay-z-back: 99;
   --settings-overlay-z-front: 100;
+
+  /* Settings shell — surfaces & ghost-button overlays (light) */
+  --settings-sidebar-bg: rgba(0, 0, 0, 0.03);
+  --settings-info-panel-bg: rgba(0, 0, 0, 0.025);
+  --settings-segmented-track-bg: rgba(0, 0, 0, 0.03);
+  --settings-ghost-bg-hover: rgba(0, 0, 0, 0.04);
+  --settings-ghost-bg-pressed: rgba(0, 0, 0, 0.05);
+  --settings-ghost-bg-selected: rgba(0, 0, 0, 0.05);
+
+  /* Settings shell — filled button (light) */
+  --settings-button-bg: rgba(0, 0, 0, 0.06);
+  --settings-button-bg-hover: rgba(0, 0, 0, 0.10);
+  --settings-button-bg-pressed: rgba(0, 0, 0, 0.14);
+  --settings-button-border-hover: rgba(0, 0, 0, 0.12);
+
+  /* Settings modal — floating close button (light) */
+  --settings-modal-close-bg: rgba(20, 30, 60, 0.06);
+  --settings-modal-close-bg-hover: rgba(20, 30, 60, 0.12);
+  --settings-modal-close-text: rgba(20, 30, 60, 0.70);
   
   /* Appearance panel — light theme specific */
   --appearance-header-close-bg: rgba(200, 190, 180, 0.32);
@@ -338,6 +1047,8 @@ html[data-theme="light"] {
   --appearance-glow-switch-shadow-1: rgba(50, 40, 30, 0.20);
   --appearance-glow-switch-shadow-2: rgba(200, 190, 180, 0.15);
   --appearance-glow-switch-checked-shadow-3: rgba(100, 200, 100, 0.25);
+  --appearance-glow-switch-thumb-highlight: rgba(255, 255, 255, 0.50);
+  --appearance-glow-switch-thumb-highlight-checked: rgba(255, 255, 255, 0.60);
 }
 
 /* Light theme invite window text — override for dark text readability */
@@ -349,6 +1060,19 @@ html[data-theme="light"] #invite-overlay p {
 :root {
   --glass-blur: 20px;
   --glass-saturate: 180%;
+
+  /* v0 core base palette — literal defaults so theme-agnostic resolution works.
+     Theme-specific overrides live under html[data-theme="dark|light"] blocks. */
+  --bg: #000000;
+  --surface: #1C1C1E;
+  --surface-elevated: #2C2C2E;
+  --text-primary: #FFFFFF;
+  --text-secondary: #AEAEB2;
+  --border: #38383A;
+  --border-emphasis: #48484A;
+  --success: #30D158;
+  --warning: #FF9F0A;
+  --error: #FF453A;
 
   /* v0 frozen core token aliases */
   --color-bg: var(--bg);
@@ -383,6 +1107,22 @@ html[data-theme="light"] #invite-overlay p {
   --effect-blur-sm: 4px;
   --effect-blur-md: 14px;
   --effect-blur-lg: var(--glass-blur);
+
+  /* v0.1 component-extension defaults — theme-agnostic baseline.
+     Per-theme blocks override these where appropriate. */
+  --overlay-backdrop: rgba(0, 0, 0, 0.35);
+  --overlay-strong: rgba(0, 0, 0, 0.5);
+  --overlay-heavy: rgba(0, 0, 0, 0.6);
+  --overlay-opaque: rgba(0, 0, 0, 0.8);
+  --field-bg: rgba(255, 255, 255, 0.05);
+  --field-bg-hover: rgba(255, 255, 255, 0.07);
+  --signal-popup-bg: rgba(26, 26, 46, 0.97);
+  --signal-popup-border: rgba(255, 255, 255, 0.12);
+  --tooltip-bg: rgba(0, 0, 0, 0.92);
+  --tooltip-border: rgba(255, 255, 255, 0.15);
+  --search-badge-active-text: #4ade80;
+  --search-badge-ended-text: #9ca3af;
+  --search-badge-idle-text: #facc15;
   /* Concentric radius scale */
   --radius-outer: 24px;
   --radius-card: 16px;

@@ -758,3 +758,52 @@ pub fn apply_and_save_theme(theme: Theme) {
     LocalStorage::set(THEME_STORAGE_KEY.to_string(), &theme.as_str().to_string());
     apply_theme_to_dom(theme);
 }
+
+/// Handle to a `(prefers-color-scheme: dark)` MediaQueryList `change` listener.
+///
+/// Keeping the [`Closure`] alive as a field is what prevents JS from
+/// reclaiming the underlying callback while the listener is still
+/// registered.  `remove()` detaches the listener — call it on app unmount
+/// so we never accumulate dangling listeners across hot reloads.
+pub struct PrefersColorSchemeHandle {
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
+    mql: web_sys::MediaQueryList,
+}
+
+impl PrefersColorSchemeHandle {
+    pub fn remove(&self) {
+        use wasm_bindgen::JsCast;
+        let _ = self
+            .mql
+            .remove_event_listener_with_callback("change", self.closure.as_ref().unchecked_ref());
+    }
+}
+
+/// Subscribe to OS-level `prefers-color-scheme` changes.
+///
+/// While [`Theme::System`] is the active preference, an OS dark↔light
+/// switch (e.g. macOS sunset, manual iOS toggle) re-runs
+/// [`apply_theme_to_dom`] so the page follows the OS without a reload.
+/// For [`Theme::Dark`] / [`Theme::Light`] the change is ignored — the user
+/// has expressed an explicit preference.
+pub fn register_prefers_color_scheme_listener(
+    theme: Signal<Theme>,
+) -> Option<std::rc::Rc<PrefersColorSchemeHandle>> {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let mql = web_sys::window()
+        .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())?;
+
+    let theme_signal = theme;
+    let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |_evt: web_sys::Event| {
+        if matches!(*theme_signal.peek(), Theme::System) {
+            apply_theme_to_dom(Theme::System);
+        }
+    });
+
+    mql.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
+        .ok()?;
+
+    Some(std::rc::Rc::new(PrefersColorSchemeHandle { closure, mql }))
+}

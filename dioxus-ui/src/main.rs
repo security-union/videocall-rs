@@ -20,8 +20,9 @@ use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;
 use context::{
     apply_and_save_theme, apply_theme_to_dom, load_display_name_from_storage,
-    load_theme_from_storage, load_transport_preference, migrate_legacy_storage, DisplayNameCtx,
-    ThemePreferenceCtx, TransportPreferenceCtx,
+    load_theme_from_storage, load_transport_preference, migrate_legacy_storage,
+    register_prefers_color_scheme_listener, DisplayNameCtx, ThemePreferenceCtx,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::*;
 
@@ -95,6 +96,21 @@ fn App() -> Element {
         let cmd_k_handle = cmd_k_handle.clone();
         move || {
             cmd_k_handle.remove();
+        }
+    });
+
+    // Subscribe to OS-level prefers-color-scheme changes so that, while the
+    // user has Theme::System selected, an OS dark↔light flip propagates to
+    // html[data-theme] without requiring a reload.  For Theme::Dark /
+    // Theme::Light the listener intentionally ignores the event — the user
+    // has expressed an explicit preference.
+    let prefers_handle = use_hook(|| register_prefers_color_scheme_listener(theme));
+    use_drop({
+        let prefers_handle = prefers_handle.clone();
+        move || {
+            if let Some(h) = prefers_handle.as_ref() {
+                h.remove();
+            }
         }
     });
 

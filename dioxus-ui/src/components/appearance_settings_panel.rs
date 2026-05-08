@@ -51,14 +51,17 @@ pub fn AppearanceSettingsPanel() -> Element {
         div {
             class: if appearance.glow_enabled { "appearance-settings-panel" } else { "appearance-settings-panel glow-disabled" },
 
-            div { class: "appearance-controls",
-                div { class: "appearance-card appearance-theme-card",
-                    // ── Section 1: Theme ─────────────────────────────────────
-                    div { class: "appearance-section theme-picker-section",
-                        div { class: "slider-header",
-                            label { "Theme" }
-                        }
-                        div { class: "theme-icon-toggle",
+            div { class: "appearance-content-column",
+
+            // ── Section 1: Theme ─────────────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Theme" }
+                }
+                p { class: "appearance-section-helper",
+                    "Choose how the application looks on your device."
+                }
+                div { class: "theme-icon-toggle",
                             for variant in [Theme::Dark, Theme::System, Theme::Light] {
                                 {
                                     let is_active = theme_ctx.0() == variant;
@@ -66,7 +69,6 @@ pub fn AppearanceSettingsPanel() -> Element {
                                         button {
                                             r#type: "button",
                                             class: if is_active { "theme-icon-button theme-icon-button--active" } else { "theme-icon-button" },
-                                            aria_label: variant.label(),
                                             title: variant.label(),
                                             aria_pressed: if is_active { "true" } else { "false" },
                                             onclick: move |_| theme_ctx.0.set(variant),
@@ -123,43 +125,43 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                     line { x1: "18.36", y1: "5.64", x2: "19.78", y2: "4.22" }
                                                 }
                                             }
+                                            span { class: "theme-icon-button-label", "{variant.label()}" }
                                         }
                                     }
                                 }
                             }
                         }
-                        p { class: "theme-coming-soon", "Custom theme file: coming soon" }
+                    }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 2: Speaker Highlight ─────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Speaker Highlight" }
+                    label {
+                        class: "glow-switch",
+                        input {
+                            r#type: "checkbox",
+                            "aria-label": "Toggle speaker highlight",
+                            checked: appearance.glow_enabled,
+                            onchange: move |evt: Event<FormData>| {
+                                let enabled = evt.checked();
+                                appearance_ctx.0.set(AppearanceSettings {
+                                    glow_enabled: enabled,
+                                    ..appearance_ctx.0()
+                                });
+                            },
+                        }
+                        span { class: "glow-switch-track" }
                     }
                 }
+                p { class: "appearance-section-helper",
+                    "Visual glow around the active speaker."
+                }
 
-                div { class: "appearance-card appearance-speaker-card",
-                    // ── Section 2: Speaker Highlight ─────────────────────────
-                    div { class: "appearance-section glow-toggle-section",
-                        div { class: "slider-header",
-                            label { "Speaker Highlight" }
-                            label {
-                                class: "glow-switch",
-                                "aria-label": "Toggle speaker highlight",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: appearance.glow_enabled,
-                                    onchange: move |evt: Event<FormData>| {
-                                        let enabled = evt.checked();
-                                        appearance_ctx.0.set(AppearanceSettings {
-                                            glow_enabled: enabled,
-                                            ..appearance_ctx.0()
-                                        });
-                                    },
-                                }
-                                span { class: "glow-switch-track" }
-                            }
-                        }
-                    }
-
-                    div { class: "appearance-divider" }
-
-                    div { class: "appearance-section glow-palette-section",
-                        h4 { "Highlight Color" }
+                    div { class: "appearance-control-group glow-palette-section",
+                        span { class: "appearance-control-label", "Highlight Color" }
                         div { class: "color-swatches",
                         // Preset swatches
                         for color in preset_colors {
@@ -230,6 +232,10 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                     });
                                                 }
                                                 show_picker.set(false);
+                                                // Restore keyboard focus to the add-custom-color
+                                                // button so users navigating with the keyboard do
+                                                // not lose context to <body> after deleting a swatch.
+                                                focus_add_btn();
                                             },
                                             svg {
                                                 xmlns: "http://www.w3.org/2000/svg",
@@ -365,15 +371,8 @@ pub fn AppearanceSettingsPanel() -> Element {
                     }
                     }
 
-                    div { class: "appearance-divider" }
-
-                    div { class: "appearance-section brightness-section",
-                        div { class: "slider-header",
-                            label { "Brightness" }
-                            span { class: "slider-value",
-                                "{(appearance.glow_brightness * 100.0) as i32}%"
-                            }
-                        }
+                    div { class: "appearance-slider-row",
+                        label { class: "appearance-slider-label", "Brightness" }
                         input {
                             r#type: "range",
                             class: "appearance-slider",
@@ -390,17 +389,13 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 }
                             },
                         }
+                        span { class: "appearance-slider-value",
+                            "{(appearance.glow_brightness * 100.0) as i32}%"
+                        }
                     }
 
-                    div { class: "appearance-divider" }
-
-                    div { class: "appearance-section inner-glow-section",
-                        div { class: "slider-header",
-                            label { "Inner Glow Strength" }
-                            span { class: "slider-value",
-                                "{(appearance.inner_glow_strength * 100.0) as i32}%"
-                            }
-                        }
+                    div { class: "appearance-slider-row",
+                        label { class: "appearance-slider-label", "Inner Glow" }
                         input {
                             r#type: "range",
                             class: "appearance-slider",
@@ -417,13 +412,13 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 }
                             },
                         }
+                        span { class: "appearance-slider-value",
+                            "{(appearance.inner_glow_strength * 100.0) as i32}%"
+                        }
                     }
 
-                    div { class: "appearance-divider" }
-
-                    // ── Inline preview ────────────────────────────────────────
-                    div { class: "appearance-section appearance-preview-area",
-                        div { class: "preview-label", "Preview" }
+                    div { class: "appearance-preview-block",
+                        span { class: "appearance-control-label", "Preview" }
                         div {
                             class: "preview-tile preview-tile-pulsing",
                             style: "{preview_style}",
@@ -442,16 +437,17 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                         }
                     }
-                }
+            }
             }
         }
     }
 }
 
-fn slider_fill_style(_value: f32, color: GlowColor) -> String {
+fn slider_fill_style(value: f32, color: GlowColor) -> String {
     let (red, green, blue) = color.to_rgb();
+    let fill_pct = (value.clamp(0.0, 1.0) * 100.0) as i32;
     format!(
-        "--thumb-glow: rgba({red},{green},{blue},0.92); --thumb-halo: rgba({red},{green},{blue},0.38);"
+        "--thumb-glow: rgb({red},{green},{blue}); --thumb-halo: rgba({red},{green},{blue},0.38); --fill: {fill_pct}%;" // @token-exempt: dynamic per-glow-color rgba composed at runtime
     )
 }
 

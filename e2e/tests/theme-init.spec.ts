@@ -37,13 +37,16 @@ test.describe("Theme initialization from localStorage", () => {
     await page.goto("/");
     await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBe("dark");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("dark");
 
     const darkBgImage = await page.evaluate(
       () => window.getComputedStyle(document.documentElement).backgroundImage,
     );
-    expect(darkBgImage).not.toContain("theme_v2.png");
+    expect(darkBgImage).not.toContain("theme_light_v1.png");
   });
 
   // 2. Plain non-CBOR string in storage → not decoded by SDK → falls back to "dark".
@@ -53,8 +56,11 @@ test.describe("Theme initialization from localStorage", () => {
     await page.evaluate(() => localStorage.setItem("ui-theme", "dark"));
     await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBe("dark");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("dark");
   });
 
   // (Test 3 removed: "light" cannot be seeded via a plain localStorage.setItem
@@ -68,8 +74,11 @@ test.describe("Theme initialization from localStorage", () => {
     await page.evaluate(() => localStorage.setItem("ui-theme", ""));
     await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBe("dark");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("dark");
   });
 
   // 5. Unknown / non-allowlisted value → falls back to "dark"
@@ -80,8 +89,11 @@ test.describe("Theme initialization from localStorage", () => {
     await page.evaluate(() => localStorage.setItem("ui-theme", "light"));
     await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBe("dark");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("dark");
   });
 
   test("falls back to dark theme when ui-theme is a whitespace-padded unknown value", async ({
@@ -91,7 +103,10 @@ test.describe("Theme initialization from localStorage", () => {
     await page.evaluate(() => localStorage.setItem("ui-theme", "  system  "));
     await page.reload();
 
-    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-    expect(theme).toBe("dark");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("dark");
   });
 });

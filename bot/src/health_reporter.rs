@@ -48,6 +48,11 @@ pub struct HealthReporterConfig {
     /// WebRTC stats are absent. Set by main.rs to `2 × network_profile.latency_ms`
     /// when a netsim profile is active.
     pub simulated_rtt_ms: Option<f64>,
+    /// Real measured RTT from RTT probes (f64 bits stored in AtomicU64).
+    /// Used for passthrough bots that send actual RTT probes to the relay.
+    /// Takes priority over `simulated_rtt_ms` when both are `None` for
+    /// simulated but this field is set and non-zero.
+    pub measured_rtt_ms: Option<Arc<AtomicU64>>,
     /// Shared counter incremented by the outbound shim/passthrough on every
     /// successful transport send. The health reporter reads + resets this
     /// every tick to derive packets_sent_per_sec.
@@ -67,6 +72,10 @@ pub struct HealthReporterConfig {
     /// Cumulative count of successfully encoded frames. Incremented by the
     /// video producer on each successful encode call.
     pub encoder_frames_ok: Arc<AtomicU64>,
+    /// Shared counter for keyframe requests sent. Incremented by the
+    /// `KeyframeRequester` each time it sends a request. Reports as
+    /// `keyframe_requests_sent_total` in the HealthPacket.
+    pub keyframe_requests_sent: Option<Arc<AtomicU64>>,
 }
 
 /// Spawn a health reporter task that sends HealthPacket protos every second.
@@ -190,12 +199,17 @@ fn build_health_packet(
         Transport::WebTransport => "webtransport".to_string(),
         Transport::WebSocket => "websocket".to_string(),
     };
-    // Ground-truth RTT derived from the netsim profile (2× one-way shim
-    // delay approximates RTT; jitter is not accounted for). When `None`
-    // (passthrough), leave the field at its default 0.0 — browsers leave it
-    // unset when WebRTC stats are unavailable and we match that shape.
+    // RTT: prefer simulated (netsim profile), then measured (RTT probe),
+    // otherwise leave at default 0.0 (matching browser behavior when WebRTC
+    // stats are unavailable).
     if let Some(rtt) = config.simulated_rtt_ms {
         hp.active_server_rtt_ms = rtt;
+    } else if let Some(ref measured) = config.measured_rtt_ms {
+        let bits = measured.load(Ordering::Relaxed);
+        let rtt = f64::from_bits(bits);
+        if rtt > 0.0 && rtt.is_finite() {
+            hp.active_server_rtt_ms = rtt;
+        }
     }
 
     // Tab state: bot is always active and never throttled
@@ -274,12 +288,16 @@ fn build_health_packet(
     }
 
     // --- Fields 1 & 4: send_queue_bytes and keyframe_requests_sent_total ---
-    // Bot has no meaningful send backpressure (single machine, channel → transport)
-    // and does not decode for display so never requests keyframes. Setting these
-    // to 0 signals the bot is reporting (rather than leaving them None which
-    // would imply the field is unsupported).
+    // Bot has no meaningful send backpressure (single machine, channel → transport).
     hp.send_queue_bytes = Some(0);
-    hp.keyframe_requests_sent_total = Some(0);
+    // Report actual keyframe requests sent if the requester is active,
+    // otherwise report 0 to indicate the field is supported.
+    let kf_sent = config
+        .keyframe_requests_sent
+        .as_ref()
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    hp.keyframe_requests_sent_total = Some(kf_sent);
 
     // --- Field 2: Climb-rate limiter telemetry ---
     let (

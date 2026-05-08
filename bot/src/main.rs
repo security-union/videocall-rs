@@ -26,9 +26,11 @@ use bot::diagnostics_reporter::{spawn_diagnostics_reporter, DiagnosticsReporterC
 use bot::ekg_renderer::{self, EkgRenderer};
 use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use bot::inbound_stats::InboundStats;
+use bot::keyframe_requester::KeyframeRequester;
 #[cfg(feature = "metrics")]
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
+use bot::rtt_probe::spawn_rtt_probe;
 use bot::transport::{self, OutboundFrame, TransportClient};
 use bot::video_producer::VideoProducer;
 use bot::websocket_client::spawn_heartbeat_producer;
@@ -616,24 +618,49 @@ async fn run_client(
         );
     }
 
+    // --- RTT probe (passthrough bots only) ---
+    // Impaired bots use simulated RTT (2× netsim latency); passthrough bots
+    // send actual RTT probe packets to the relay and measure real round-trip.
+    let (simulated_rtt_ms, measured_rtt_ms) = if network_profile.is_passthrough() {
+        let rtt_state = spawn_rtt_probe(user_id.clone(), packet_tx.clone(), quit.clone());
+        // Install the RTT probe state in InboundStats so echoed packets
+        // are routed to record_echo instead of counted as media.
+        {
+            let mut s = stats.lock().unwrap();
+            s.set_rtt_probe(Arc::clone(&rtt_state));
+        }
+        (None, Some(rtt_state.rtt_atomic()))
+    } else {
+        (Some((network_profile.latency_ms as f64) * 2.0), None)
+    };
+
+    // --- Keyframe requester ---
+    // Send KEYFRAME_REQUEST to each newly discovered peer, mimicking browser
+    // behavior on join.
+    let keyframe_requests_sent = {
+        let kr = KeyframeRequester::new(user_id.clone(), packet_tx.clone());
+        let counter = kr.requests_sent_counter();
+        {
+            let mut s = stats.lock().unwrap();
+            s.set_keyframe_requester(kr);
+        }
+        counter
+    };
+
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.
-    // 2× one-way netsim delay approximates RTT; jitter is not accounted for.
-    let simulated_rtt_ms = if network_profile.is_passthrough() {
-        None
-    } else {
-        Some((network_profile.latency_ms as f64) * 2.0)
-    };
     spawn_health_reporter(
         HealthReporterConfig {
             client_config: client_config.clone(),
             transport: resolved_transport.clone(),
             simulated_rtt_ms,
+            measured_rtt_ms,
             packets_sent_counter: packets_sent_counter.clone(),
             transport_drops_counter: transport_drops_counter.clone(),
             encoder_output_fps: encoder_output_fps.clone(),
             encoder_errors_generic: encoder_errors_generic.clone(),
             encoder_frames_ok: encoder_frames_ok.clone(),
+            keyframe_requests_sent: Some(keyframe_requests_sent),
         },
         stats.clone(),
         packet_tx.clone(),

@@ -21,7 +21,7 @@ use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -29,6 +29,8 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::aq_controller::BotAq;
+use crate::keyframe_requester::KeyframeRequester;
+use crate::rtt_probe::RttProbeState;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -81,6 +83,12 @@ pub struct InboundStats {
     aq: Option<Arc<BotAq>>,
     /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
     diagnostics_parse_errors: u64,
+    /// Optional RTT probe state. When set, echoed RTT packets are routed here
+    /// to compute real round-trip time instead of being counted as media.
+    rtt_probe: Option<Arc<RttProbeState>>,
+    /// Optional keyframe requester. When set, new peers trigger a
+    /// KEYFRAME_REQUEST for VIDEO the first time they are observed.
+    keyframe_requester: Option<KeyframeRequester>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -101,6 +109,19 @@ impl InboundStats {
     /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
     pub fn set_aq(&mut self, aq: Arc<BotAq>) {
         self.aq = Some(aq);
+    }
+
+    /// Attach an RTT probe state. When set, echoed RTT packets from the relay
+    /// are routed to `RttProbeState::record_echo` instead of being counted as
+    /// generic media.
+    pub fn set_rtt_probe(&mut self, state: Arc<RttProbeState>) {
+        self.rtt_probe = Some(state);
+    }
+
+    /// Attach a keyframe requester. When set, newly discovered peers trigger
+    /// a KEYFRAME_REQUEST for VIDEO.
+    pub fn set_keyframe_requester(&mut self, requester: KeyframeRequester) {
+        self.keyframe_requester = Some(requester);
     }
 
     /// Install (or replace) the Prometheus metrics handle. Calls made before
@@ -205,12 +226,32 @@ impl InboundStats {
             return;
         };
 
+        // Intercept echoed RTT packets BEFORE normal media accounting.
+        // The relay echoes the entire PacketWrapper back verbatim when
+        // media_type == RTT, so our own probe comes back with our user_id
+        // in wrapper.user_id. Route to the RTT probe state for RTT calc.
+        if media.media_type.enum_value() == Ok(MediaType::RTT) {
+            if let Some(ref rtt_state) = self.rtt_probe {
+                rtt_state.record_echo(media.timestamp);
+                debug!("RTT echo received, timestamp={:.1}", media.timestamp);
+            }
+            #[cfg(feature = "metrics")]
+            self.bump_received("rtt");
+            self.other_packets += 1;
+            return;
+        }
+
         // The relay populates wrapper.user_id but strips media.user_id,
         // so use the wrapper-level user_id for per-sender tracking.
         let sender = self.intern_sender(&wrapper.user_id).to_owned();
 
         // Update last-seen time for stale entry eviction.
         self.last_seen.insert(sender.clone(), Instant::now());
+
+        // Notify keyframe requester about newly seen peers.
+        if let Some(ref mut kr) = self.keyframe_requester {
+            kr.on_peer_seen(&sender);
+        }
 
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {
@@ -339,6 +380,8 @@ impl InboundStats {
         let max_video_seq = std::mem::take(&mut self.max_video_seq);
         let sender_names = std::mem::take(&mut self.sender_names);
         let aq = self.aq.take();
+        let rtt_probe = self.rtt_probe.take();
+        let keyframe_requester = self.keyframe_requester.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         *self = Self::default();
@@ -350,6 +393,8 @@ impl InboundStats {
         self.max_video_seq = max_video_seq;
         self.sender_names = sender_names;
         self.aq = aq;
+        self.rtt_probe = rtt_probe;
+        self.keyframe_requester = keyframe_requester;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;

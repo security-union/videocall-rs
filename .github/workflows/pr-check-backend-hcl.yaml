@@ -37,10 +37,9 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 20
     steps:
-      - name: Fix workspace ownership
-        run: sudo chown -R "$(id -u):$(id -g)" . || true
-
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # Isolate this runner's docker compose project from the other 3 runners
       # on the same host. Without this, parallel jobs share the same
@@ -79,7 +78,3 @@ jobs:
       - name: Teardown
         if: always()
         run: make tests_down
-
-      - name: Fix workspace ownership
-        if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" . || true

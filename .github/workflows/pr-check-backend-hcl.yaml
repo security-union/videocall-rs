@@ -57,6 +57,9 @@ jobs:
         # caused concurrent jobs to lose their networks mid-run.
         run: docker compose -f docker/docker-compose.integration.yaml down -v --remove-orphans || true
 
+      - name: Pre-create target dirs to prevent Docker from initializing them as root
+        run: mkdir -p actix-api/target
+
       - name: Run backend tests
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}

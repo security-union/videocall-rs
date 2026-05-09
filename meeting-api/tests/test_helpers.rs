@@ -71,9 +71,6 @@ pub fn build_app(pool: PgPool) -> Router {
         )),
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
-        // Match production default: anonymous access is NOT allowed.
-        // Tests that need authenticated access use `request_with_cookie`.
-        allow_anonymous: false,
         display_name_rate_limit_disabled: false,
         dev_user: None,
     };

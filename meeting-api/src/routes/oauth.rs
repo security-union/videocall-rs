@@ -1227,9 +1227,6 @@ mod tests {
                 0,
             )),
             search: None,
-            // OAuth handler tests exercise the OAuth-configured path; make
-            // sure the anonymous fallback is off so behaviour matches prod.
-            allow_anonymous: false,
             display_name_rate_limit_disabled: false,
             dev_user: None,
         }

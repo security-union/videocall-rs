@@ -62,6 +62,29 @@ The session JWT is obtained after a successful OAuth login via `GET /login`. The
 
 > **Browser note**: The web UI (`dioxus-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
+### Local development (no OAuth)
+
+For local development without an OAuth provider, set `DEV_USER=email:display_name` in your `.env` file (e.g. `DEV_USER=dev@test.local:Dev User`). When OAuth is disabled and `DEV_USER` is set, the meeting-api exposes:
+
+```
+GET /api/v1/dev/auto-login
+```
+
+This endpoint issues a signed session JWT in a `Set-Cookie` header and 302-redirects to `/`. The browser UI calls it automatically, but for curl / Postman you can fetch it once and extract the cookie:
+
+```bash
+# Get a session token via dev auto-login (no OAuth required).
+# -s -o /dev/null silences the redirect body; -c saves cookies.
+curl -s -o /dev/null -c /tmp/cookies.txt http://localhost:8081/api/v1/dev/auto-login
+
+# Extract the JWT value from the Netscape-format cookie file.
+# The default cookie name is "session"; substitute your COOKIE_NAME if customized.
+SESSION=$(awk '$6 == "session" {print $7}' /tmp/cookies.txt)
+curl -H "Authorization: Bearer $SESSION" http://localhost:8081/api/v1/meetings
+```
+
+> **Safety**: The `/api/v1/dev/auto-login` endpoint returns `404 Not Found` when OAuth is enabled (`OAUTH_CLIENT_ID` set) or when `DEV_USER` is unset. It is inert in production.
+
 ### Session JWT Claims
 
 The session JWT contains these claims:

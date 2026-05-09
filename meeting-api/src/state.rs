@@ -59,9 +59,6 @@ pub struct AppState {
     /// SearchV2 integration config. `None` disables the push path entirely;
     /// every [`crate::search`] call becomes a no-op. See [`SearchConfig`].
     pub search: Option<SearchConfig>,
-    /// Opt-in anonymous-auth fallback flag (mirrors [`crate::config::Config::allow_anonymous`]).
-    /// Only intended for local development; guards path 3 in the auth extractor.
-    pub allow_anonymous: bool,
     /// Opt-in display-name rate-limit bypass (mirrors
     /// [`crate::config::Config::display_name_rate_limit_disabled`]).  When
     /// `true`, the per-user rename rate-limit check inside the join /
@@ -111,7 +108,6 @@ impl AppState {
             display_name_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             display_name_rate_limiter_ops: Arc::new(AtomicU64::new(0)),
             search: config.search.clone(),
-            allow_anonymous: config.allow_anonymous,
             display_name_rate_limit_disabled: config.display_name_rate_limit_disabled,
             dev_user: config.dev_user.clone(),
         }

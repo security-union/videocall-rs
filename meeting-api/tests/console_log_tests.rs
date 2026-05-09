@@ -22,6 +22,8 @@
 mod test_helpers;
 
 use axum::body::Body;
+use axum::http::header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, ORIGIN};
+use axum::http::Method;
 use axum::http::StatusCode;
 use serial_test::serial;
 use test_helpers::*;
@@ -540,6 +542,49 @@ async fn test_non_numeric_session_timestamp_rejected() {
     assert_eq!(body.result.code, "INVALID_PARAMETER");
 
     disable_console_logs(&log_dir);
+}
+
+// ── Test: CORS preflight includes all custom console-log headers ───────────
+
+#[tokio::test]
+#[serial]
+async fn test_console_log_cors_preflight_allows_custom_headers() {
+    let pool = get_test_pool().await;
+    let app = build_app_with_cors(pool);
+    let req = axum::http::Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/v1/meetings/test-room/console-logs")
+        .header(ORIGIN, "https://example.test")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            ACCESS_CONTROL_REQUEST_HEADERS,
+            "x-user-id, x-session-timestamp, x-chunk-seq, content-type",
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let allowed = resp
+        .headers()
+        .get(ACCESS_CONTROL_ALLOW_HEADERS)
+        .expect("CORS preflight should include access-control-allow-headers")
+        .to_str()
+        .expect("allow-headers value should be valid ASCII")
+        .to_lowercase();
+
+    for expected in [
+        "x-user-id",
+        "x-session-timestamp",
+        "x-chunk-seq",
+        "content-type",
+    ] {
+        assert!(
+            allowed.contains(expected),
+            "CORS allow-headers missing '{expected}' (got: {allowed})"
+        );
+    }
 }
 
 // ── Utility: recursively collect all file paths under a directory ───────────

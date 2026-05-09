@@ -330,10 +330,14 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
-    /// All session_ids assigned to this client instance (current page load).
-    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
-    /// target a previous session_id from before re-election completed.
-    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    /// Bounded set of session_ids this client has held in the current page load.
+    /// Used to match incoming CONGESTION signals — the server stamps the throttled
+    /// sender's session_id on the wire, and the client receives every CONGESTION
+    /// via wildcard NATS fan-out (`room.{room}.*` with per-session queue groups).
+    /// Without this match, antonio would step down video when jay is the throttled
+    /// sender. The history covers the reconnect race-window where SESSION_ASSIGNED
+    /// for a new session id may not have landed yet at the moment a CONGESTION
+    /// targeting it arrives. Bounded to `MAX_SESSION_ID_HISTORY`.
     session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
@@ -2077,25 +2081,29 @@ impl Inner {
                 }
             },
             Ok(PacketType::CONGESTION) => {
-                // Server-side congestion feedback: the server is dropping
-                // packets destined for a receiver because the outbound channel
-                // is full. Match on session_id history — the signal targets a
-                // specific session_id which may be our current or a previous
-                // one from before re-election. Using session_id history (not
-                // user_id) ensures multi-tab/multi-device sessions for the
-                // same account are independently targeted.
-                if self.session_id_history.contains(&response.session_id) {
+                // Server-side congestion feedback. The server stamps the throttled
+                // sender's session_id onto the packet and publishes to that sender's
+                // NATS subject, but every session in the room subscribes via
+                // `room.{room}.*` with a distinct per-session queue group, so the
+                // server fans every CONGESTION packet out to every session. The
+                // embedded session_id therefore identifies WHICH sender is being
+                // throttled — match it against our own current and prior session
+                // ids. Only step down if we are the throttled one; cross-session
+                // signals are noise to us.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if is_self_targeted {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
+                        "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
-                        response.session_id, self.session_id_history,
+                        "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
                     );
                 }
             }

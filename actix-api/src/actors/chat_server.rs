@@ -1850,16 +1850,48 @@ fn handle_msg(
     observer: bool,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
-            // Self-skip prevents echo of our own broadcasts. However,
-            // CONGESTION signals published on our subject by a congested
-            // receiver must still be delivered — they are not echo.
-            let is_congestion = PacketWrapper::parse_from_bytes(&msg.payload)
-                .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
-                .unwrap_or(false);
-            if !is_congestion {
-                return Ok(());
-            }
+        // Parse the PacketWrapper once and reuse the result for every
+        // payload-aware decision below (self-skip carve-out, observer
+        // allowlist). Unparseable payloads fall through with `None`, which
+        // every downstream check treats as the "fail-closed" default.
+        let parsed = PacketWrapper::parse_from_bytes(&msg.payload).ok();
+
+        let is_congestion = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+            .unwrap_or(false);
+
+        // Self-skip prevents echo of our own broadcasts. We treat a packet
+        // as "from this session" if EITHER:
+        //
+        //   (a) the NATS subject equals our own publish subject, or
+        //   (b) the embedded `PacketWrapper.session_id` matches our session.
+        //
+        // (a) catches the common in-actor echo where the publish subject
+        // and the receiver's session line up exactly.
+        //
+        // (b) catches the post-reconnect window where a stale subscription
+        // can deliver a packet whose subject differs from the receiver's
+        // current session but whose embedded `session_id` (stamped by
+        // `Handler<ClientMessage>`) still belongs to this connection.
+        // This was the leak that surfaced in the 2026-05-08 production
+        // meeting — the reporter received 5224 self-DIAGNOSTICS packets
+        // back from the relay despite the subject-only filter being in
+        // place. Applying the filter uniformly to every packet type
+        // (with the CONGESTION carve-out below) closes the leak.
+        //
+        // CONGESTION signals are intentionally exempted: a congested
+        // receiver publishes them onto the throttled sender's own subject
+        // with the sender's session_id embedded, and they MUST still
+        // reach the sender so the client can step down its quality tier.
+        let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
+        let inner_session_self = parsed
+            .as_ref()
+            .map(|pw| pw.session_id != 0 && pw.session_id == session)
+            .unwrap_or(false);
+
+        if (subject_self || inner_session_self) && !is_congestion {
+            return Ok(());
         }
 
         // Observer sessions (waiting room) only need meeting-control packets.
@@ -1872,7 +1904,8 @@ fn handle_msg(
         // This is fail-closed by default: new PacketTypes must be explicitly
         // added here to reach observer sessions.
         if observer {
-            let allowed = PacketWrapper::parse_from_bytes(&msg.payload)
+            let allowed = parsed
+                .as_ref()
                 .map(|pw| {
                     matches!(
                         pw.packet_type.enum_value(),
@@ -3381,6 +3414,19 @@ mod tests {
             .expect("PacketWrapper serialization should succeed")
     }
 
+    /// Serialize a `PacketWrapper` with an explicit `session_id`. Used by the
+    /// post-reconnect self-skip tests to reproduce the leak where the NATS
+    /// subject differs from the receiver's current session but the embedded
+    /// `session_id` still belongs to this connection.
+    fn make_packet_bytes_with_session(packet_type: PacketType, session_id: u64) -> Vec<u8> {
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = packet_type.into();
+        pw.user_id = b"test-user".to_vec();
+        pw.session_id = session_id;
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_observer_drops_media_packet() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -3611,6 +3657,210 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "Non-observer MUST receive MEDIA packets"
+        );
+    }
+
+    // ======================================================================
+    // Self-skip filter — uniform across packet types (issue: 2026-05-08
+    // production meeting saw 5224 self-DIAGNOSTICS leak back to the
+    // reporter despite the subject-only filter being in place).
+    //
+    // Self-skip fires when EITHER the NATS subject matches the receiver's
+    // own publish subject OR the embedded `PacketWrapper.session_id` matches
+    // the receiver's current session. CONGESTION is the only carve-out.
+    // ======================================================================
+
+    #[actix_rt::test]
+    async fn test_handle_msg_skips_self_diagnostics_via_subject() {
+        // The simple in-actor echo: NATS subject for THIS receiver's own
+        // publishes lands back on its subscription. DIAGNOSTICS is a
+        // non-CONGESTION packet type and must be filtered uniformly with
+        // MEDIA — the leak that triggered this test was DIAGNOSTICS-specific.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "selfskip-room".to_string(),
+            7777,
+            false, // not an observer
+        );
+
+        let nats_msg = make_nats_message(
+            "room.selfskip-room.7777",
+            make_packet_bytes(PacketType::DIAGNOSTICS),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-published DIAGNOSTICS on receiver's own subject must be skipped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_skips_self_diagnostics_via_inner_session_id() {
+        // Post-reconnect leak window: the publish subject differs from the
+        // receiver's current session (e.g., a stale subscription survives a
+        // reconnect briefly), but the embedded `session_id` still belongs to
+        // this connection. The subject-only filter would let this pass; the
+        // inner-session-id check closes the leak.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(actor.recipient(), "reconnect-room".to_string(), 8888, false);
+
+        // Subject points at a DIFFERENT session id; payload session_id is
+        // ours. Pre-fix, this packet was forwarded.
+        let nats_msg = make_nats_message(
+            "room.reconnect-room.999999",
+            make_packet_bytes_with_session(PacketType::DIAGNOSTICS, 8888),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-DIAGNOSTICS identified by inner session_id must be skipped \
+             even when the NATS subject points at a different session"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_congestion_passes_self_filter_via_subject() {
+        // CONGESTION carve-out: a congested receiver publishes onto the
+        // throttled sender's own subject so the sender can step down its
+        // quality tier. The subject match must NOT block CONGESTION.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "congestion-room".to_string(),
+            5555,
+            false,
+        );
+
+        let nats_msg = make_nats_message(
+            "room.congestion-room.5555",
+            make_packet_bytes(PacketType::CONGESTION),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "CONGESTION must pass the subject-self filter (existing behaviour)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_congestion_passes_self_filter_via_inner_session_id() {
+        // CONGESTION carve-out applied to the new inner-session check too.
+        // session_logic.rs:488-494 stamps `session_id = sender_sid` (the
+        // throttled sender's session) onto the CONGESTION packet so the
+        // receiver can correlate it. The inner-session self-skip must NOT
+        // suppress CONGESTION just because the inner session_id matches.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "congestion-inner-room".to_string(),
+            6666,
+            false,
+        );
+
+        let nats_msg = make_nats_message(
+            "room.congestion-inner-room.99",
+            make_packet_bytes_with_session(PacketType::CONGESTION, 6666),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "CONGESTION must pass the inner-session-id self-filter so the \
+             throttle signal still reaches the sender after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_skips_self_media_via_inner_session_id() {
+        // Apply the same uniform check to MEDIA. Pre-fix, MEDIA was filtered
+        // by subject only; this lock-in test guarantees that future churn in
+        // the filter cannot regress MEDIA back to subject-only matching.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "media-self-room".to_string(),
+            4242,
+            false,
+        );
+
+        let nats_msg = make_nats_message(
+            "room.media-self-room.999999",
+            make_packet_bytes_with_session(PacketType::MEDIA, 4242),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-MEDIA identified by inner session_id must be skipped \
+             (parity with self-DIAGNOSTICS)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_zero_inner_session_id_does_not_match() {
+        // Defensive: `session_id == 0` is the unstamped/default case
+        // (`Handler<ClientMessage>` stamps it to the sender's session before
+        // publishing, but a malformed/raw packet may land with 0). A 0 must
+        // NOT match an arbitrary receiver session — that would erroneously
+        // suppress every packet from any anonymous publish path.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(actor.recipient(), "zero-session-room".to_string(), 0, false);
+
+        let nats_msg = make_nats_message(
+            "room.zero-session-room.peer",
+            make_packet_bytes_with_session(PacketType::MEDIA, 0),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "Zero session_id must NOT trigger the inner-session self-filter"
         );
     }
     /// Returns all RoomMemberInfo entries for a given room.

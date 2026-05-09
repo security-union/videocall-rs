@@ -147,18 +147,29 @@ fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
 ///   failed, so we cannot trust `is_media`. Emit the same fallback the
 ///   WS path uses so alerts tuned on `kind` behave consistently across
 ///   transports (issue #610).
-/// * `parsed=true && is_media`  → `"media"`.
 /// * `parsed=true && !is_media` → `"control"`.
+/// * `parsed=true && is_media && media_type == Some(AUDIO)`  → `"audio"`.
+/// * `parsed=true && is_media && media_type == Some(VIDEO)`  → `"video"`.
+/// * `parsed=true && is_media && media_type == Some(SCREEN)` → `"screen"`.
+/// * `parsed=true && is_media && media_type` is anything else (HEARTBEAT,
+///   KEYFRAME_REQUEST, encrypted/unparseable inner) → `"media"`. This is
+///   the legacy catch-all so existing alerts that pivot on `kind="media"`
+///   still see a series.
 ///
 /// Extracted as a free function so the mapping can be unit-tested
 /// without spinning up a real `WtChatSession`.
-fn drop_kind_label(parsed: bool, is_media: bool) -> &'static str {
+fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) -> &'static str {
     if !parsed {
-        "unknown"
-    } else if is_media {
-        "media"
-    } else {
-        "control"
+        return "unknown";
+    }
+    if !is_media {
+        return "control";
+    }
+    match media_type {
+        Some(MediaType::AUDIO) => "audio",
+        Some(MediaType::VIDEO) => "video",
+        Some(MediaType::SCREEN) => "screen",
+        _ => "media",
     }
 }
 
@@ -266,12 +277,21 @@ impl WtChatSession {
     /// fallback (`false`). This is used only for the drop-counter `kind`
     /// label so it matches the WS site's `unknown` fallback — routing
     /// continues to honour the same safe default it always has.
+    ///
+    /// `media_type` is the inner `MediaPacket.media_type` when it could be
+    /// extracted (the inner parse succeeded). It is used solely to refine
+    /// the drop-counter `kind` label into `audio`/`video`/`screen` — the
+    /// 2026-05-08 production storm dropped 25,081 packets to one slow
+    /// receiver and the metric had no way to tell audio from video. This
+    /// hint does NOT influence routing; routing is decided by `is_audio`,
+    /// which preserves the original behaviour for encrypted inner payloads.
     fn send_auto(
         &self,
         data: Vec<u8>,
         is_media: bool,
         is_audio: bool,
         parsed: bool,
+        media_type: Option<MediaType>,
     ) -> WtSendResult {
         let outbound = build_outbound(data, is_media, is_audio);
 
@@ -291,8 +311,8 @@ impl WtChatSession {
                 // RELAY_PACKET_DROPS_TOTAL (for per-room investigation) and
                 // the protocol-wide OUTBOUND_CHANNEL_DROPS_TOTAL (for
                 // alerting). `kind` is derived from the already-parsed
-                // `is_media` hint — we explicitly avoid an extra protobuf
-                // parse on the drop hot path.
+                // `is_media` hint plus the inner `MediaType` — we explicitly
+                // avoid an extra protobuf parse on the drop hot path.
                 //
                 // Issue #610: when the upstream parse failed (`parsed=false`)
                 // we cannot trust `is_media`, so emit `kind="unknown"` to
@@ -300,10 +320,17 @@ impl WtChatSession {
                 // wire-bytes would silently inflate WT's `control` series
                 // while WS would distinguish them as `unknown`, breaking
                 // alerts tuned on the same label across transports.
+                //
+                // 2026-05-08 audio-quality follow-up: when the inner
+                // `MediaType` is known, the label is refined into
+                // `audio`/`video`/`screen` so operators can attribute a
+                // congestion storm to the specific media stream. Anything
+                // else (HEARTBEAT, KEYFRAME_REQUEST, encrypted inner)
+                // continues to use the legacy `media` catch-all.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
-                let kind = drop_kind_label(parsed, is_media);
+                let kind = drop_kind_label(parsed, is_media, media_type);
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["webtransport", kind])
                     .inc();
@@ -480,20 +507,29 @@ impl Handler<Message> for WtChatSession {
             .map(|pw| pw.packet_type == PacketType::MEDIA.into())
             .unwrap_or(false);
 
-        // For MEDIA packets, peek at the inner MediaType to decide if this is
-        // audio (datagram-eligible). Encrypted payloads will fail to parse and
-        // therefore route via the reliable stream — the safer default.
-        let is_audio = if is_media {
+        // For MEDIA packets, peek at the inner MediaType. We use the
+        // resolved `MediaType` enum twice:
+        //   * `is_audio` controls per-frame routing (audio uses datagrams).
+        //   * `media_type` (Some/None) refines the drop-counter `kind`
+        //     label into `audio`/`video`/`screen` so a storm can be
+        //     attributed to a specific media stream. The 2026-05-08
+        //     production storm dropped 25,081 packets in 3 minutes and
+        //     we had no metric-level way to tell audio from video.
+        //
+        // Encrypted payloads fail to parse and therefore (a) route via
+        // the reliable stream — the safer default — and (b) fall through
+        // to the `media` catch-all label, preserving the legacy series.
+        let inner_media_type = if is_media {
             parsed
                 .as_ref()
                 .and_then(|pw| MediaPacket::parse_from_bytes(&pw.data).ok())
-                .map(|mp| mp.media_type == MediaType::AUDIO.into())
-                .unwrap_or(false)
+                .and_then(|mp| mp.media_type.enum_value().ok())
         } else {
-            false
+            None
         };
+        let is_audio = matches!(inner_media_type, Some(MediaType::AUDIO));
 
-        match self.send_auto(bytes, is_media, is_audio, parse_succeeded) {
+        match self.send_auto(bytes, is_media, is_audio, parse_succeeded, inner_media_type) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();
@@ -799,6 +835,11 @@ mod tests {
     // drop counter. These tests lock in the new tri-state mapping so a
     // future revert to the old `if is_media { "media" } else { "control" }`
     // branch fails CI.
+    //
+    // 2026-05-08 audio-quality follow-up: extended the helper to refine
+    // the `media` bucket into `audio`/`video`/`screen` based on the
+    // inner `MediaPacket.media_type`. Tests in the next block lock in
+    // that mapping.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -807,48 +848,147 @@ mod tests {
         // we cannot trust `is_media`, so the counter must record this
         // drop as `kind="unknown"` to match the WS site.
         assert_eq!(
-            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false),
+            drop_kind_label(/*parsed=*/ false, /*is_media=*/ false, None),
             "unknown",
             "parse-fail must map to `unknown` regardless of is_media"
         );
-        // Even if a stale `is_media=true` somehow propagates, parse-fail
-        // wins — we never want to attribute a malformed packet to `media`
-        // since we did not actually classify it.
+        // Even if a stale `is_media=true` and a stale `media_type` somehow
+        // propagate, parse-fail wins — we never want to attribute a
+        // malformed packet to a media kind we did not actually classify.
         assert_eq!(
-            drop_kind_label(/*parsed=*/ false, /*is_media=*/ true),
+            drop_kind_label(
+                /*parsed=*/ false,
+                /*is_media=*/ true,
+                Some(MediaType::AUDIO),
+            ),
             "unknown",
-            "parse-fail must override stale is_media=true"
+            "parse-fail must override stale is_media + media_type"
         );
     }
 
     #[test]
-    fn drop_kind_media_when_parsed_and_is_media() {
+    fn drop_kind_media_when_parsed_and_is_media_no_inner_type() {
+        // Backwards-compat: when the inner MediaPacket couldn't be
+        // classified (encrypted payload, parse failure, future MediaType
+        // not in our enum), fall back to the legacy `media` bucket so
+        // existing alerts pivoting on `kind="media"` still see a series.
         assert_eq!(
-            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true),
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ true, None,),
             "media",
         );
     }
 
     #[test]
     fn drop_kind_control_when_parsed_and_not_media() {
+        // media_type is meaningful only for media packets. Even if a
+        // caller incorrectly threads a `Some(...)` while `is_media=false`,
+        // the label MUST stay `control` — `is_media` is the gate.
         assert_eq!(
-            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false),
+            drop_kind_label(/*parsed=*/ true, /*is_media=*/ false, None,),
             "control",
+        );
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ false,
+                Some(MediaType::AUDIO),
+            ),
+            "control",
+            "is_media=false must map to control even with a Some(MediaType)"
+        );
+    }
+
+    #[test]
+    fn drop_kind_audio_when_inner_is_audio() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::AUDIO),
+            ),
+            "audio",
+        );
+    }
+
+    #[test]
+    fn drop_kind_video_when_inner_is_video() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::VIDEO),
+            ),
+            "video",
+        );
+    }
+
+    #[test]
+    fn drop_kind_screen_when_inner_is_screen() {
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::SCREEN),
+            ),
+            "screen",
+        );
+    }
+
+    #[test]
+    fn drop_kind_falls_back_to_media_for_uncommon_media_types() {
+        // HEARTBEAT and KEYFRAME_REQUEST are MEDIA packet types that
+        // are NOT audio/video/screen. They should stay in the legacy
+        // `media` bucket so we don't pollute the new fine-grained
+        // labels with bookkeeping traffic.
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::HEARTBEAT),
+            ),
+            "media",
+            "HEARTBEAT must fall through to the legacy `media` catch-all"
+        );
+        assert_eq!(
+            drop_kind_label(
+                /*parsed=*/ true,
+                /*is_media=*/ true,
+                Some(MediaType::KEYFRAME_REQUEST),
+            ),
+            "media",
+            "KEYFRAME_REQUEST must fall through to the legacy `media` catch-all"
         );
     }
 
     #[test]
     fn drop_kind_label_emits_only_documented_values() {
         // Guard against typos / future drift: the only kinds this mapping
-        // ever returns are the three documented in metrics.rs (`media`,
-        // `control`, `unknown`). The fourth documented value, `rtt`, is
-        // emitted by the inbound-echo path, not by this helper.
-        for (parsed, is_media) in [(false, false), (false, true), (true, false), (true, true)] {
-            let kind = drop_kind_label(parsed, is_media);
-            assert!(
-                matches!(kind, "media" | "control" | "unknown"),
-                "drop_kind_label returned unexpected kind={kind} for (parsed={parsed}, is_media={is_media})"
-            );
+        // ever returns are the six documented in metrics.rs
+        // (`audio`, `video`, `screen`, `media`, `control`, `unknown`). The
+        // seventh documented value, `rtt`, is emitted by the inbound-echo
+        // path, not by this helper.
+        let media_types = [
+            None,
+            Some(MediaType::AUDIO),
+            Some(MediaType::VIDEO),
+            Some(MediaType::SCREEN),
+            Some(MediaType::HEARTBEAT),
+            Some(MediaType::KEYFRAME_REQUEST),
+        ];
+        for parsed in [false, true] {
+            for is_media in [false, true] {
+                for mt in media_types {
+                    let kind = drop_kind_label(parsed, is_media, mt);
+                    assert!(
+                        matches!(
+                            kind,
+                            "audio" | "video" | "screen" | "media" | "control" | "unknown"
+                        ),
+                        "drop_kind_label returned unexpected kind={kind} for \
+                         (parsed={parsed}, is_media={is_media}, media_type={mt:?})"
+                    );
+                }
+            }
         }
     }
 }

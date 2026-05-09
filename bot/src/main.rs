@@ -511,7 +511,12 @@ async fn run_client(
         (Some(hook), Some(handle))
     };
 
-    let mut client = TransportClient::new(&resolved_transport, client_config.clone());
+    let mut client = TransportClient::new(
+        &resolved_transport,
+        client_config.clone(),
+        #[cfg(feature = "metrics")]
+        metrics.clone(),
+    );
     client
         .connect(
             &lobby_url,

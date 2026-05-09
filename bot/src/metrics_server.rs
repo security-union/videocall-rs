@@ -34,6 +34,7 @@
 //! - `bot_netsim_dropped_total`, `bot_netsim_delay_ms`
 //! - `bot_packets_sent_total`, `bot_packets_received_total`
 //! - `bot_packets_parsed_error_total`
+//! - `bot_websocket_pong_drops_total`
 //!
 //! All series are labeled `bot=<user_id>` and `meeting=<meeting_id>`; some
 //! additionally carry `direction` (up/down), `media_type`
@@ -130,6 +131,7 @@ pub struct BotMetrics {
     pub packets_sent_total: IntCounterVec,
     pub packets_received_total: IntCounterVec,
     pub packets_parsed_error_total: IntCounterVec,
+    pub websocket_pong_drops_total: IntCounterVec,
 }
 
 #[cfg(feature = "metrics")]
@@ -220,6 +222,13 @@ impl BotMetrics {
             registry
         )?;
 
+        let websocket_pong_drops_total = register_int_counter_vec_with_registry!(
+            "bot_websocket_pong_drops_total",
+            "Total WebSocket pong responses the bot dropped before they reached the writer task",
+            &["bot", "meeting", "reason"],
+            registry
+        )?;
+
         Ok(Arc::new(Self {
             registry,
             aq_video_tier_index,
@@ -233,6 +242,7 @@ impl BotMetrics {
             packets_sent_total,
             packets_received_total,
             packets_parsed_error_total,
+            websocket_pong_drops_total,
         }))
     }
 

@@ -61,6 +61,7 @@ impl AudioProducer {
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -76,6 +77,7 @@ impl AudioProducer {
                 loop_duration,
                 is_speaking,
                 aq,
+                transport_drops_counter,
             ) {
                 error!("Audio producer error: {}", e);
             }
@@ -98,6 +100,7 @@ impl AudioProducer {
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -150,6 +153,7 @@ impl AudioProducer {
             loop_duration,
             is_speaking,
             aq,
+            transport_drops_counter,
         )
     }
 
@@ -163,6 +167,7 @@ impl AudioProducer {
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
         aq: Arc<BotAq>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
         if audio_data.is_empty() {
             warn!("Audio producer for {} has no audio data, exiting", user_id);
@@ -342,6 +347,7 @@ impl AudioProducer {
                     if let Err(_e) = packet_sender.try_send(frame) {
                         static AUDIO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                         let count = AUDIO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        transport_drops_counter.fetch_add(1, Ordering::Relaxed);
                         if count % 100 == 1 {
                             warn!(
                                 "Dropped audio packets due to full send channel (total: {})",

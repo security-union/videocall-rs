@@ -132,6 +132,18 @@ Strip all of the following from the posted output:
 
 Those belong in your private reasoning. The posted review contains conclusions only.
 
+#### Category → output section mapping
+
+| Step 3 category | Output section |
+|-----------------|----------------|
+| Critical Issues | **Critical Issues** (if Confirmed) |
+| Performance Issues | **Critical Issues** (if Confirmed + hot-path) or **Code Quality Suggestions** |
+| Formatting & Consistency | **Code Quality Suggestions** |
+| Code Quality Issues | **Code Quality Suggestions** |
+| Architectural Conformity | **Critical Issues** (if Confirmed + breaks a contract) or **Code Quality Suggestions** |
+
+Only Confirmed findings may appear in Critical Issues regardless of which Step 3 category they originated from.
+
 #### Output template
 
 ```

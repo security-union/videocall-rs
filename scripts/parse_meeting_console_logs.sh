@@ -151,7 +151,9 @@ if [[ -n "$RELAY_WT" && ! -f "$RELAY_WT" ]]; then
 fi
 
 if ! command -v gawk &>/dev/null; then
-  echo "Warning: gawk not found — median sort output may be incorrect (asort is gawk-only)" >&2
+  echo "Error: this script requires gawk (asort is a gawk extension)" >&2
+  echo "       Install gawk and re-run; otherwise buffer medians silently degrade." >&2
+  exit 1
 fi
 
 ts_to_human() { date -u -d "@$(( ${1} / 1000 ))" '+%H:%M:%S' 2>/dev/null || echo "?"; }

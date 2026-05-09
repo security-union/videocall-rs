@@ -587,7 +587,10 @@ mod tests {
         std::env::remove_var("OAUTH_ISSUER");
 
         let cfg = Config::from_env().expect("DEV_USER + SearchV2 should parse successfully");
-        assert!(cfg.dev_user.is_some(), "DEV_USER should be active when OAuth is disabled");
+        assert!(
+            cfg.dev_user.is_some(),
+            "DEV_USER should be active when OAuth is disabled"
+        );
         assert!(cfg.search.is_some(), "SearchV2 config should be enabled");
 
         match prior_db {

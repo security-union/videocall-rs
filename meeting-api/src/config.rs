@@ -411,6 +411,20 @@ impl Config {
             })
             .transpose()?;
 
+        // Warn when DEV_USER and SearchV2 are both active — SearchV2 pushes
+        // will attribute data to the synthetic dev identity, which is confusing
+        // in shared environments.
+        if search.is_some()
+            && env::var("DEV_USER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+        {
+            tracing::warn!(
+                "DEV_USER and SearchV2 are both enabled — search pushes will use the dev identity"
+            );
+        }
+
         // DEV_USER: only active when OAuth is disabled.
         let dev_user = if oauth.is_none() {
             env::var("DEV_USER")

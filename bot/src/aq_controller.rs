@@ -234,7 +234,7 @@ impl BotAq {
         // Always publish the latest PID-derived telemetry — these are useful
         // for health reporting even when the tier has not changed.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
-        let worst_fps = ctrl.last_worst_peer_fps() as f32;
+        let worst_fps = ctrl.last_p75_peer_fps() as f32;
         let fps_ratio = ctrl.last_fps_ratio() as f32;
         let bitrate_ratio = ctrl.last_bitrate_ratio() as f32;
         self.last_target_bitrate_kbps_bits

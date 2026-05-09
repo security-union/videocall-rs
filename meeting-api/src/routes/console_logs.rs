@@ -301,7 +301,12 @@ pub async fn upload_console_logs(
             if (1..=99999).contains(&n) {
                 true
             } else {
-                tracing::warn!("X-Chunk-Seq out of range (got {n}, expected 1..=99999) — ignoring");
+                tracing::warn!(
+                    chunk_seq = n,
+                    meeting_id = %meeting_id,
+                    user_id = user_id.as_deref().unwrap_or("<unknown>"),
+                    "X-Chunk-Seq out of accepted range 1..=99999; falling back to UUIDv7 suffix"
+                );
                 false
             }
         });

@@ -413,15 +413,21 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Peer FPS signal driving encoder decisions.
-    /// NOTE: As of PR-A (#312), this reports p75 aggregated FPS, not worst-peer FPS.
-    /// TODO(PR-G): rename metric to `videocall_encoder_p75_peer_fps`.
+    /// Deprecated compatibility metric for the old worst-peer name.
     pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_worst_peer_fps",
-        "FPS from the worst-performing receiver driving encoder decisions",
+        "Deprecated compatibility metric; now carries the encoder p75 peer FPS",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create encoder_worst_peer_fps metric");
+
+    /// p75 peer FPS signal driving encoder decisions.
+    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_p75_peer_fps",
+        "p75 peer FPS driving adaptive quality decisions",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_p75_peer_fps metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(

@@ -1155,7 +1155,7 @@ impl VideoCallClient {
     pub fn set_encoder_metric_sources(
         &self,
         fps_ratio: Rc<AtomicU32>,
-        worst_peer_fps: Rc<AtomicU32>,
+        p75_peer_fps: Rc<AtomicU32>,
         bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
@@ -1171,7 +1171,7 @@ impl VideoCallClient {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
                         fps_ratio,
-                        worst_peer_fps,
+                        p75_peer_fps,
                         bitrate_ratio,
                         target_bitrate_kbps,
                         screen_tier,

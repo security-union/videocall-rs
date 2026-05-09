@@ -165,8 +165,8 @@ pub struct HealthReporter {
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
     encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder worst peer FPS (f32 bits in AtomicU32).
-    encoder_worst_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder p75 peer FPS (f32 bits in AtomicU32).
+    encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder bitrate_ratio (f32 bits in AtomicU32).
     encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
@@ -219,7 +219,7 @@ impl HealthReporter {
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
-            encoder_worst_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
                 f32::NAN.to_bits(),
             )))),
@@ -326,7 +326,7 @@ impl HealthReporter {
     pub fn set_encoder_metric_sources(
         &mut self,
         fps_ratio: Rc<AtomicU32>,
-        worst_peer_fps: Rc<AtomicU32>,
+        p75_peer_fps: Rc<AtomicU32>,
         bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
@@ -338,7 +338,7 @@ impl HealthReporter {
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
     ) {
         *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
-        *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
+        *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
         *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
@@ -641,7 +641,7 @@ impl HealthReporter {
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
         let encoder_fps_ratio = self.encoder_fps_ratio.clone();
-        let encoder_worst_peer_fps = self.encoder_worst_peer_fps.clone();
+        let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
         let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
@@ -723,8 +723,8 @@ impl HealthReporter {
                         let fps_ratio_val =
                             f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
                                 as f64;
-                        let worst_peer_fps_val =
-                            f32::from_bits(encoder_worst_peer_fps.borrow().load(Ordering::Relaxed))
+                        let p75_peer_fps_val =
+                            f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
                                 as f64;
                         let bitrate_ratio_val =
                             f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
@@ -786,7 +786,7 @@ impl HealthReporter {
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
                             fps_ratio_val,
-                            worst_peer_fps_val,
+                            p75_peer_fps_val,
                             bitrate_ratio_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
@@ -834,7 +834,7 @@ impl HealthReporter {
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
         encoder_fps_ratio: f64,
-        encoder_worst_peer_fps: f64,
+        encoder_p75_peer_fps: f64,
         encoder_bitrate_ratio: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
@@ -902,8 +902,11 @@ impl HealthReporter {
         if encoder_fps_ratio.is_finite() {
             pb.encoder_fps_ratio = Some(encoder_fps_ratio);
         }
-        if encoder_worst_peer_fps.is_finite() {
-            pb.encoder_worst_peer_fps = Some(encoder_worst_peer_fps);
+        if encoder_p75_peer_fps.is_finite() {
+            // Keep the old field populated for one release so existing
+            // dashboards/consumers do not break during the rename window.
+            pb.encoder_worst_peer_fps = Some(encoder_p75_peer_fps);
+            pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);
         pb.screen_sharing_active = Some(screen_sharing_active);

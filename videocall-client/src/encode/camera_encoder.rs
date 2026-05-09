@@ -676,6 +676,8 @@ impl CameraEncoder {
             let mut sequence_number: u64 = 0;
 
             let mut restart_count: u32 = 0;
+            // 5 attempts with exponential backoff covers transient codec failures
+            // (device reconfiguration, permission revocation) without looping forever.
             const MAX_RESTARTS: u32 = 5;
 
             'restart: loop {

@@ -750,6 +750,8 @@ impl ScreenEncoder {
         });
 
         let mut restart_count: u32 = 0;
+        // 5 attempts with exponential backoff covers transient codec failures
+        // (device reconfiguration, permission revocation) without looping forever.
         const MAX_RESTARTS: u32 = 5;
         let mut media_acquired = true; // true because we already have a stream
 

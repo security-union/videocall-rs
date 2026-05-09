@@ -297,7 +297,14 @@ pub async fn upload_console_logs(
         .get("X-Chunk-Seq")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| (1..=99999).contains(&n));
+        .filter(|&n| {
+            if (1..=99999).contains(&n) {
+                true
+            } else {
+                tracing::warn!("X-Chunk-Seq out of range (got {n}, expected 1..=99999) — ignoring");
+                false
+            }
+        });
 
     // --- Validate meeting_id path-safety ---
     validate_id(&meeting_id, "meeting_id", &SAFE_MEETING_ID_RE)?;

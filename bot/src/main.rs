@@ -247,11 +247,19 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(avail_kb) = kb_str.parse::<u64>() {
                             let avail_bytes = avail_kb * 1024;
                             if total_costume_bytes > avail_bytes * 80 / 100 {
-                                warn!(
-                                    "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM",
-                                    total_gb,
-                                    avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                                );
+                                let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                                if config.strict_memory {
+                                    error!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — aborting (--strict-memory)",
+                                        total_gb, avail_gb
+                                    );
+                                    std::process::exit(1);
+                                } else {
+                                    warn!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM (pass --strict-memory to abort)",
+                                        total_gb, avail_gb
+                                    );
+                                }
                             }
                         }
                     }

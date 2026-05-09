@@ -101,6 +101,9 @@ pub struct BotConfig {
     /// when the crate is built with `--features metrics`.
     #[serde(default, skip)]
     pub metrics_bind: Option<std::net::IpAddr>,
+    /// CLI-only: exit immediately if costume memory exceeds 80% of available RAM.
+    #[serde(default, skip)]
+    pub strict_memory: bool,
 }
 
 /// Minimal client identity -- used only by the transport layer.
@@ -143,6 +146,7 @@ impl BotConfig {
         let mut no_impair = false;
         let mut metrics_port: Option<u16> = None;
         let mut metrics_bind: Option<std::net::IpAddr> = None;
+        let mut strict_memory = false;
 
         let mut i = 1; // skip argv[0]
         while i < args.len() {
@@ -228,6 +232,10 @@ impl BotConfig {
                         return Err(anyhow!("--metrics-bind requires an IP address argument"));
                     }
                 }
+                "--strict-memory" => {
+                    strict_memory = true;
+                    i += 1;
+                }
                 "--help" | "-h" => {
                     println!("{}", help_text());
                     std::process::exit(0);
@@ -255,6 +263,7 @@ impl BotConfig {
         config.no_impair = no_impair;
         config.metrics_port = metrics_port;
         config.metrics_bind = metrics_bind;
+        config.strict_memory = strict_memory;
 
         Ok((config, num_users))
     }
@@ -533,6 +542,10 @@ fn help_text() -> String {
          \x20 --impair-name <name>=<preset> Strict override of one participant's network\n\
          \x20                               settings. Repeatable.\n\
          \x20 --no-impair                   Force-disable all impairment. Highest precedence.\n\
+         \n\
+         Safety:\n\
+         \x20 --strict-memory               Exit with code 1 if costume frames exceed 80%% of\n\
+         \x20                               available RAM (default: warn only).\n\
          \n\
          Observability (requires `--features metrics` at build time):\n\
          \x20 --metrics-port <port>         Start a Prometheus `/metrics` HTTP endpoint on the\n\

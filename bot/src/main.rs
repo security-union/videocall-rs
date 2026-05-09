@@ -246,6 +246,14 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(kb_str) = avail_line.split_whitespace().nth(1) {
                         if let Ok(avail_kb) = kb_str.parse::<u64>() {
                             let avail_bytes = avail_kb * 1024;
+                            if total_costume_bytes > avail_bytes {
+                                let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                                error!(
+                                    "Costume frames ({:.1} GiB) exceed available memory ({:.1} GiB) — aborting",
+                                    total_gb, avail_gb
+                                );
+                                std::process::exit(1);
+                            }
                             if total_costume_bytes > avail_bytes * 80 / 100 {
                                 let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                                 if config.strict_memory {

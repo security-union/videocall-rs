@@ -253,8 +253,12 @@ pub fn Home() -> Element {
                 // No valid session — try the dev auto-login endpoint.
                 if let Ok(base_url) = meeting_api_base_url() {
                     let url = format!("{}/api/v1/dev/auto-login", base_url);
-                    if let Some(window) = web_sys::window() {
-                        let _ = window.location().set_href(&url);
+                    if let Ok(resp) = reqwest::Client::new().get(&url).send().await {
+                        if resp.status().is_success() || resp.status().is_redirection() {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.location().set_href(&url);
+                            }
+                        }
                     }
                 }
             });

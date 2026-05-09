@@ -122,8 +122,16 @@ RELAY_WT=""
 shift  # drop $1 (LOG_DIR)
 for arg in "$@"; do
   case "$arg" in
-    --json)          OUTPUT_FORMAT="json" ;;
-    --verify)        OUTPUT_FORMAT="verify" ;;
+    --json)
+      if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
+        echo "Error: --json and --verify are mutually exclusive" >&2; exit 1
+      fi
+      OUTPUT_FORMAT="json" ;;
+    --verify)
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        echo "Error: --json and --verify are mutually exclusive" >&2; exit 1
+      fi
+      OUTPUT_FORMAT="verify" ;;
     --relay-wt=*)    RELAY_WT="${arg#--relay-wt=}" ;;
     "")              ;;  # skip empty
     *)               echo "Unknown option: $arg" >&2
@@ -140,6 +148,10 @@ fi
 if [[ -n "$RELAY_WT" && ! -f "$RELAY_WT" ]]; then
   echo "--relay-wt: file not found: $RELAY_WT" >&2
   exit 1
+fi
+
+if ! command -v gawk &>/dev/null; then
+  echo "Warning: gawk not found — median sort output may be incorrect (asort is gawk-only)" >&2
 fi
 
 ts_to_human() { date -u -d "@$(( ${1} / 1000 ))" '+%H:%M:%S' 2>/dev/null || echo "?"; }
@@ -413,11 +425,12 @@ if [[ ${#session_jsons[@]} -gt 0 ]]; then
       ($s.last_ts | to_ms_iso) as $last_iso_ms |
       ($s.session_ts | tonumber) as $start_ms |
       (if $last_iso_ms == null then $start_ms else $last_iso_ms end) as $raw_end_ms |
+      ([$raw_end_ms, $start_ms] | max) as $clamped_end_ms |
       {
         email: $s.email,
         session_ts: $s.session_ts,
         start_ms: $start_ms,
-        end_ms: ($raw_end_ms + $neteq_zombie_ms)
+        end_ms: ($clamped_end_ms + $neteq_zombie_ms)
       }
     ) as $all |
 

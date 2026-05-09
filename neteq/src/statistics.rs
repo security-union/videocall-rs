@@ -293,12 +293,9 @@ pub struct OperationStatistics {
 /// Number of `Operation` enum variants (Normal through Undefined).
 /// Derived from the canonical source: `Operation::VARIANT_COUNT`.
 const OPERATION_VARIANT_COUNT: usize = Operation::VARIANT_COUNT;
-// Compile-time guard: if someone adds a variant to Operation but forgets to
-// bump VARIANT_COUNT, this will fire.
-const _: () = assert!(
-    OPERATION_VARIANT_COUNT == 12,
-    "Operation::VARIANT_COUNT changed — update the index mapping in record_decode_operation"
-);
+// Compile-time guard: the array size must match the highest enum discriminant
+// used by record_decode_operation's index mapping.
+const _: [(); OPERATION_VARIANT_COUNT] = [(); Operation::Undefined as usize + 1];
 
 /// Statistics calculator and tracker
 #[derive(Debug)]

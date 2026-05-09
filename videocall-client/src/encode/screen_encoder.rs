@@ -750,8 +750,12 @@ impl ScreenEncoder {
         });
 
         let mut restart_count: u32 = 0;
-        // 5 attempts with exponential backoff covers transient codec failures
-        // (device reconfiguration, permission revocation) without looping forever.
+        // Maximum restart attempts before surfacing on_error. Sized for the
+        // narrow fatal signatures matched by is_fatal_encoder_error_message:
+        // the closed-codec InvalidStateError and the VPX allocation failure.
+        // Those usually clear within 1-2 retries; 5 gives headroom for a
+        // short cascade without spinning forever if the browser is wedged.
+        // Revisit this cap if the fatal-error classifier is broadened.
         const MAX_RESTARTS: u32 = 5;
         let mut media_acquired = true; // true because we already have a stream
 

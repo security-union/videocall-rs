@@ -64,7 +64,7 @@ The session JWT is obtained after a successful OAuth login via `GET /login`. The
 
 ### Local development (no OAuth)
 
-For local development without an OAuth provider, set `DEV_USER=email:display_name` in your `.env` file (e.g. `DEV_USER=dev@test.local:Dev User`). When OAuth is disabled and `DEV_USER` is set, the meeting-api exposes:
+For local development without an OAuth provider, the meeting-api auto-logs in a synthetic user via `DEV_USER`. Both `docker-compose.yaml` and `start_dev.sh` ship a default `DEV_USER=dev@local.test:Dev User`, so this works out of the box; override the env var if you need a different identity (format: `email:display_name`). When OAuth is disabled and `DEV_USER` is set, the meeting-api exposes:
 
 ```
 GET /api/v1/dev/auto-login

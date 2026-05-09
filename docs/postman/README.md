@@ -32,7 +32,7 @@ This directory contains Postman collection and environment files for testing the
 
    **Option A — Dev auto-login (no OAuth required, recommended for local testing)**
 
-   Requires OAuth disabled (`OAUTH_CLIENT_ID` unset) and `DEV_USER=dev@test.local:Dev User` set in your `.env` file. Then run:
+   Requires OAuth disabled (`OAUTH_CLIENT_ID` unset). `DEV_USER` defaults to `dev@local.test:Dev User` in `docker-compose.yaml` — no `.env` editing needed unless you want a different identity. Then run:
    ```bash
    curl -s -o /dev/null -c /tmp/cookies.txt http://localhost:8081/api/v1/dev/auto-login
    awk '$6 == "session" {print $7}' /tmp/cookies.txt

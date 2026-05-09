@@ -142,11 +142,15 @@
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
 //! );
+//! use std::sync::atomic::AtomicBool;
+//! use std::rc::Rc;
+//! let screen_sharing_active = Rc::new(AtomicBool::new(false));
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
 //!     Callback::noop(),
-//!     Callback::noop() // on_state_change callback for screen share events
+//!     Callback::noop(), // on_state_change callback for screen share events
+//!     screen_sharing_active,
 //! );
 //!
 //! // Select devices and start/stop encoding

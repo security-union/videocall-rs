@@ -366,6 +366,7 @@ struct Inner {
     /// when this field goes out of scope. May be `None` on browsers that
     /// don't expose [`PerformanceObserver`] (Safari < 16.4 etc.).
     _long_task_observer: Option<crate::long_tasks::LongTaskObserver>,
+    _render_fps_observer: Option<crate::render_fps::RenderFpsObserver>,
 }
 
 /// The main client handle for a video call session.
@@ -476,6 +477,14 @@ impl VideoCallClient {
             );
         }
 
+        let render_fps_observer = crate::render_fps::RenderFpsObserver::start();
+        if render_fps_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — rAF observer not available; \
+                 client_render_fps metric will not be emitted"
+            );
+        }
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -520,6 +529,7 @@ impl VideoCallClient {
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 _long_task_observer: long_task_observer,
+                _render_fps_observer: render_fps_observer,
             })),
             connection_controller,
             aes,

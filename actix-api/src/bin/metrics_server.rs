@@ -34,6 +34,8 @@ struct SessionInfo {
     peer_ids: HashSet<String>,
     // Server info we have published active server metrics for (server_url, server_type)
     active_servers: HashSet<(String, String)>,
+    // TELEM-7: last CLIENT_INFO label values (cores, arch, gpu, net, score) for cleanup
+    client_info_labels: Option<[String; 5]>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -47,18 +49,19 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES,
-    CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
-    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS,
-    ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO,
+    ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS,
+    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -195,6 +198,28 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_BITRATE_RATIO.remove_label_values(&reporter_labels);
 
+    // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
+    let telem_labels: [&str; 3] = [
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.display_name,
+    ];
+    let _ = CLIENT_LONGTASK_DURATION_MS.remove_label_values(&telem_labels);
+    let _ = CLIENT_RENDER_FPS.remove_label_values(&telem_labels);
+    // TELEM-7: remove CLIENT_INFO using stored label values
+    if let Some(ref info_labels) = session_info.client_info_labels {
+        let _ = CLIENT_INFO.remove_label_values(&[
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.display_name,
+            &info_labels[0],
+            &info_labels[1],
+            &info_labels[2],
+            &info_labels[3],
+            &info_labels[4],
+        ]);
+    }
+
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
         let server_labels = [
@@ -327,20 +352,23 @@ fn process_health_packet_to_metrics_pb(
     // Using entry().or_insert_with() preserves accumulated to_peers/peer_ids/active_servers
     // across packets. The previous tracker.insert() reset them every packet, causing a leak
     // where peers that left mid-session had their Prometheus labels written but never cleaned up.
+    let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
     {
         let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-        let info = tracker.entry(session_key).or_insert_with(|| SessionInfo {
-            session_id: session_id.to_string(),
-            meeting_id: meeting_id.to_string(),
-            reporting_user_id: reporting_user_id.to_string(),
-            display_name: reporter_display_name.clone(),
-            last_seen: Instant::now(),
-            to_peers: HashSet::new(),
-            to_peer_display_names: HashMap::new(),
-            peer_ids: HashSet::new(),
-            active_servers: HashSet::new(),
-        });
+        let info = tracker
+            .entry(session_key.clone())
+            .or_insert_with(|| SessionInfo {
+                session_id: session_id.to_string(),
+                meeting_id: meeting_id.to_string(),
+                reporting_user_id: reporting_user_id.to_string(),
+                display_name: reporter_display_name.clone(),
+                last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                to_peer_display_names: HashMap::new(),
+                peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
+                client_info_labels: None,
+            });
         info.last_seen = Instant::now();
         info.display_name = reporter_display_name.clone();
     }
@@ -639,6 +667,89 @@ fn process_health_packet_to_metrics_pb(
                     &t.trigger,
                 ])
                 .inc();
+        }
+
+        // TELEM-7: client_info gauge (static metadata)
+        if health_packet.client_cores.is_some() || health_packet.client_architecture.is_some() {
+            let cores_str = health_packet
+                .client_cores
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let arch = health_packet
+                .client_architecture
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let gpu = health_packet
+                .client_gpu_family
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let net = health_packet
+                .client_network_effective_type
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let score = health_packet
+                .client_capability_score
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            // Store labels in session tracker for cleanup; remove stale series on label change.
+            {
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(info) = tracker.get_mut(&session_key) {
+                    let new_labels = [
+                        cores_str.clone(),
+                        arch.clone(),
+                        gpu.clone(),
+                        net.clone(),
+                        score.clone(),
+                    ];
+                    if let Some(ref prev) = info.client_info_labels {
+                        if *prev != new_labels {
+                            let _ = CLIENT_INFO.remove_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporter_display_name.as_str(),
+                                &prev[0],
+                                &prev[1],
+                                &prev[2],
+                                &prev[3],
+                                &prev[4],
+                            ]);
+                        }
+                    }
+                    info.client_info_labels = Some(new_labels);
+                }
+            }
+
+            CLIENT_INFO
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporter_display_name.as_str(),
+                    &cores_str,
+                    &arch,
+                    &gpu,
+                    &net,
+                    &score,
+                ])
+                .set(1.0);
+        }
+
+        // TELEM-8: longtask histogram observations
+        for dur in &health_packet.longtask_durations_ms {
+            CLIENT_LONGTASK_DURATION_MS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .observe(*dur);
+        }
+
+        // TELEM-9: render FPS gauge
+        if let Some(fps) = health_packet.render_fps {
+            CLIENT_RENDER_FPS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .set(fps);
         }
 
         // Process peer health data
@@ -1132,6 +1243,7 @@ mod tests {
             display_name: "test_user".to_string(),
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
+            client_info_labels: None,
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -1158,6 +1270,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -1202,6 +1315,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -1220,6 +1334,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -1499,6 +1614,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -1514,6 +1630,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -1530,6 +1647,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -1565,6 +1683,7 @@ mod tests {
             display_name: "test_user".to_string(),
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
+            client_info_labels: None,
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -1591,6 +1710,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -1738,6 +1858,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);
@@ -2090,6 +2211,7 @@ mod tests {
                     to_peer_display_names: HashMap::new(),
                     peer_ids: HashSet::new(),
                     active_servers: HashSet::new(),
+                    client_info_labels: None,
                 },
             );
         }

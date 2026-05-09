@@ -395,6 +395,18 @@ impl PartialEq for VideoCallClient {
     }
 }
 
+fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
+    if packet.display_name.is_empty() {
+        warn!(
+            "{}: empty display_name for session={} user={}, falling back to user_id",
+            event, packet.session_id, user_id
+        );
+        user_id.to_string()
+    } else {
+        String::from_utf8_lossy(&packet.display_name).to_string()
+    }
+}
+
 impl VideoCallClient {
     /// Create a new `VideoCallClient` from the given options.
     ///
@@ -1865,12 +1877,11 @@ impl Inner {
                         Ok(MeetingEventType::PARTICIPANT_JOINED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let display_name = resolve_display_name(
+                                "PARTICIPANT_JOINED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager.set_peer_display_name(
@@ -1932,13 +1943,11 @@ impl Inner {
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
-                                    let display_name = if meeting_packet.display_name.is_empty() {
-                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                        target_str.clone()
-                                    } else {
-                                        String::from_utf8_lossy(&meeting_packet.display_name)
-                                            .to_string()
-                                    };
+                                    let display_name = resolve_display_name(
+                                        "PARTICIPANT_LEFT",
+                                        &meeting_packet,
+                                        &target_str,
+                                    );
                                     cb.emit((display_name, target_str));
                                 }
                             }
@@ -2028,12 +2037,11 @@ impl Inner {
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let new_display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let new_display_name = resolve_display_name(
+                                "DISPLAY_NAME_CHANGED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             info!(
                                 "Received PARTICIPANT_DISPLAY_NAME_CHANGED: user={} new_name=\"{}\" (local_user={})",

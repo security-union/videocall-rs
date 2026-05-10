@@ -1478,12 +1478,12 @@ impl ScreenEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::is_fatal_encoder_error_message;
-    use super::ScreenEncoder;
     use super::should_reacquire_screen_capture;
+    use super::ScreenEncoder;
     use crate::{ScreenShareEvent, VideoCallClient};
     use dioxus::prelude::Callback;
 

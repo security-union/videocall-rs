@@ -1484,8 +1484,52 @@ mod tests {
     use super::is_fatal_encoder_error_message;
     use super::should_reacquire_screen_capture;
     use super::ScreenEncoder;
-    use crate::{ScreenShareEvent, VideoCallClient};
-    use dioxus::prelude::Callback;
+    use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
 
     #[test]
     fn screen_capture_is_reacquired_after_any_restart() {
@@ -1509,22 +1553,13 @@ mod tests {
 
     #[test]
     fn screen_encoder_uses_shared_reelection_signal() {
-        let client = VideoCallClient::new(
-            "test-meeting".into(),
-            vec![],
-            vec![],
-            "test-user".into(),
-            false,
-            false,
-            "test".into(),
-            false,
-            false,
-        );
+        let client = build_test_client();
         let mut encoder = ScreenEncoder::new(
             client,
             500,
-            Callback::new(|_: String| {}),
-            Callback::new(|_: ScreenShareEvent| {}),
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
         );
         let shared_signal = Rc::new(AtomicBool::new(false));
         encoder.set_reelection_completed_signal(shared_signal.clone());

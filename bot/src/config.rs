@@ -139,6 +139,14 @@ impl BotConfig {
     /// > passthrough.
     pub fn from_args() -> anyhow::Result<(Self, usize)> {
         let args: Vec<String> = std::env::args().collect();
+        let env_config_path = std::env::var("BOT_CONFIG_PATH").ok();
+        Self::from_args_inner(&args, env_config_path)
+    }
+
+    fn from_args_inner(
+        args: &[String],
+        env_config_path: Option<String>,
+    ) -> anyhow::Result<(Self, usize)> {
         let mut config_path: Option<String> = None;
         let mut num_users: usize = 0;
         let mut impair_all: Option<String> = None;
@@ -249,8 +257,7 @@ impl BotConfig {
         let mut config = match config_path {
             Some(p) => Self::from_file(&p)?,
             None => {
-                // Try BOT_CONFIG_PATH env var
-                if let Ok(env_path) = std::env::var("BOT_CONFIG_PATH") {
+                if let Some(env_path) = env_config_path {
                     Self::from_file(&env_path)?
                 } else {
                     return Err(anyhow!("{}", help_text()));
@@ -388,6 +395,32 @@ impl BotConfig {
 
     pub fn broadcasters(&self) -> usize {
         self.broadcasters.unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostumeMemoryDecision {
+    Ok,
+    Warn,
+    AbortExceedsAvailable,
+    AbortStrictThreshold,
+}
+
+pub fn evaluate_costume_memory(
+    total_costume_bytes: u64,
+    available_bytes: u64,
+    strict_memory: bool,
+) -> CostumeMemoryDecision {
+    if total_costume_bytes > available_bytes {
+        CostumeMemoryDecision::AbortExceedsAvailable
+    } else if total_costume_bytes > available_bytes.saturating_mul(80) / 100 {
+        if strict_memory {
+            CostumeMemoryDecision::AbortStrictThreshold
+        } else {
+            CostumeMemoryDecision::Warn
+        }
+    } else {
+        CostumeMemoryDecision::Ok
     }
 }
 
@@ -560,4 +593,93 @@ fn help_text() -> String {
          Known presets: {}\n",
         list_profiles().join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{evaluate_costume_memory, help_text, BotConfig, CostumeMemoryDecision};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_config() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bot-config-{unique}.yaml"));
+        fs::write(
+            &path,
+            "meeting_id: test-room\nws_url: wss://example.invalid/lobby\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn strict_memory_flag_defaults_to_false() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let (config, users) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(!config.strict_memory);
+        assert_eq!(users, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn strict_memory_flag_parses_from_args() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--strict-memory".to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(config.strict_memory);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn help_text_mentions_strict_memory() {
+        let help = help_text();
+        assert!(help.contains("Safety:"));
+        assert!(help.contains("--strict-memory"));
+    }
+
+    #[test]
+    fn costume_memory_abort_when_frames_exceed_available_memory() {
+        assert_eq!(
+            evaluate_costume_memory(101, 100, false),
+            CostumeMemoryDecision::AbortExceedsAvailable
+        );
+    }
+
+    #[test]
+    fn costume_memory_abort_strict_when_frames_exceed_threshold() {
+        assert_eq!(
+            evaluate_costume_memory(85, 100, true),
+            CostumeMemoryDecision::AbortStrictThreshold
+        );
+    }
+
+    #[test]
+    fn costume_memory_warn_without_strict_flag() {
+        assert_eq!(
+            evaluate_costume_memory(85, 100, false),
+            CostumeMemoryDecision::Warn
+        );
+    }
+
+    #[test]
+    fn costume_memory_ok_below_threshold() {
+        assert_eq!(
+            evaluate_costume_memory(50, 100, false),
+            CostumeMemoryDecision::Ok
+        );
+    }
 }

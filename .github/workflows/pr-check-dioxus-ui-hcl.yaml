@@ -35,10 +35,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+          path: dioxus-ui-repo
 
       # Build all test binaries once up front so Chrome is never launched during compilation.
       - name: Build test binaries
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test --target wasm32-unknown-unknown --no-run
@@ -48,7 +51,7 @@ jobs:
       # the 5-minute "Timed out receiving message from renderer" flake.
 
       - name: test lib (unit tests)
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -56,7 +59,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test context_unit
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -64,7 +67,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test device_selector
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -72,7 +75,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test device_integration
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -80,7 +83,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test home_integration
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -88,7 +91,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test login_provider_logo
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -96,7 +99,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test meeting_ended_overlay
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -104,7 +107,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test meetings_list_owner_gating
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -112,7 +115,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test screen_share_state
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -120,7 +123,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test speaking_indicators
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: |
@@ -128,7 +131,7 @@ jobs:
           pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
 
       - name: test video_control_buttons
-        working-directory: dioxus-ui
+        working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test --target wasm32-unknown-unknown --test video_control_buttons

@@ -1441,20 +1441,33 @@ impl ConnectionManager {
                         );
                         *self.own_session_id.borrow_mut() = Some(sid);
 
-                        if let Some(connection) = self.connections.get(&connection_id) {
-                            connection.set_session_id(sid);
-                        }
-
                         // Emit a synthetic SESSION_ASSIGNED packet so that the
                         // VideoCallClient (and HealthReporter) learn the real
                         // session_id.  The normal path (line 317) only fires
                         // when SESSION_ASSIGNED arrives *after* election; in the
-                        // common case the packet arrives during RTT-testing and is
-                        // buffered here, so we must re-emit it now.
+                        // common case the packet arrives during RTT-testing and
+                        // is buffered here, so we must re-emit it now.
+                        //
+                        // Order matters: emit *before* enabling outbound
+                        // stamping on the connection. The emit synchronously
+                        // updates VideoCallClient::own_session_id and populates
+                        // session_id_history, so when the connection
+                        // subsequently stamps outbound packets with `sid` and
+                        // the server loops back a CONGESTION carrying that
+                        // sid, VideoCallClient's is-self-targeted match will
+                        // already see it in history. (Today the wasm32
+                        // single-threaded event loop guarantees this ordering
+                        // anyway, but the explicit reorder makes the invariant
+                        // structural against future refactors that might
+                        // insert a yield between these two calls.)
                         let mut session_pkt = PacketWrapper::new();
                         session_pkt.packet_type = PacketType::SESSION_ASSIGNED.into();
                         session_pkt.session_id = sid;
                         self.options.on_inbound_media.emit(session_pkt);
+
+                        if let Some(connection) = self.connections.get(&connection_id) {
+                            connection.set_session_id(sid);
+                        }
                     }
                 }
                 self.pending_session_ids.borrow_mut().clear();

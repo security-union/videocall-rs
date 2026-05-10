@@ -232,6 +232,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when meeting settings are updated (optional)
     pub on_meeting_settings_updated: Option<Callback<()>>,
 
+    /// Callback triggered when the host requests this client mute its mic.
+    pub on_host_mute: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
     pub on_peer_left: Option<Callback<(String, String)>>,
@@ -308,6 +311,7 @@ struct InnerOptions {
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
     on_meeting_settings_updated: Option<Callback<()>>,
+    on_host_mute: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String)>>,
     on_peer_joined: Option<Callback<(String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
@@ -326,10 +330,14 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
-    /// All session_ids assigned to this client instance (current page load).
-    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
-    /// target a previous session_id from before re-election completed.
-    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    /// Bounded set of session_ids this client has held in the current page load.
+    /// Used to match incoming CONGESTION signals — the server stamps the throttled
+    /// sender's session_id on the wire, and the client receives every CONGESTION
+    /// via wildcard NATS fan-out (`room.{room}.*` with per-session queue groups).
+    /// Without this match, antonio would step down video when jay is the throttled
+    /// sender. The history covers the reconnect race-window where SESSION_ASSIGNED
+    /// for a new session id may not have landed yet at the moment a CONGESTION
+    /// targeting it arrives. Bounded to `MAX_SESSION_ID_HISTORY`.
     session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
@@ -337,6 +345,12 @@ struct Inner {
     /// short time window to avoid firing duplicate toast notifications.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
     recent_peer_events: HashMap<(String, String), f64>,
+    /// Recently processed host action events for deduplication across
+    /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
+    /// shorter window than `recent_peer_events` because host actions are
+    /// deliberate, repeatable commands — see `is_duplicate_host_action`.
+    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
+    recent_host_events: HashMap<(String, String), f64>,
     /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
     /// `CameraEncoder` checks this flag each frame and forces a keyframe.
     force_camera_keyframe: Arc<AtomicBool>,
@@ -356,6 +370,7 @@ struct Inner {
     /// when this field goes out of scope. May be `None` on browsers that
     /// don't expose [`PerformanceObserver`] (Safari < 16.4 etc.).
     _long_task_observer: Option<crate::long_tasks::LongTaskObserver>,
+    _render_fps_observer: Option<crate::render_fps::RenderFpsObserver>,
 }
 
 /// The main client handle for a video call session.
@@ -377,6 +392,18 @@ impl PartialEq for VideoCallClient {
         Rc::ptr_eq(&self.inner, &other.inner)
             && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
             && self.options == other.options
+    }
+}
+
+fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
+    if packet.display_name.is_empty() {
+        warn!(
+            "{}: empty display_name for session={} user={}, falling back to user_id",
+            event, packet.session_id, user_id
+        );
+        user_id.to_string()
+    } else {
+        String::from_utf8_lossy(&packet.display_name).to_string()
     }
 }
 
@@ -466,6 +493,14 @@ impl VideoCallClient {
             );
         }
 
+        let render_fps_observer = crate::render_fps::RenderFpsObserver::start();
+        if render_fps_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — rAF observer not available; \
+                 client_render_fps metric will not be emitted"
+            );
+        }
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -481,6 +516,7 @@ impl VideoCallClient {
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_host_mute: options.on_host_mute.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -503,11 +539,13 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                recent_host_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 _long_task_observer: long_task_observer,
+                _render_fps_observer: render_fps_observer,
             })),
             connection_controller,
             aes,
@@ -1520,6 +1558,36 @@ impl Inner {
         }
     }
 
+    /// Returns `true` if this host action event was already seen within the
+    /// last 1 second.
+    ///
+    /// Like `is_duplicate_peer_event`, this exists to suppress duplicate
+    /// dispatches caused by both WebSocket and WebTransport delivering the
+    /// same NATS system message during dual-transport scenarios (election,
+    /// transport-switching, post-rebase retry).
+    ///
+    /// The window is intentionally short (1 s, vs 30 s for peer events)
+    /// because host actions like HOST_MUTE_PARTICIPANT are *deliberate,
+    /// repeatable* commands: a host must be able to re-mute a participant
+    /// who self-unmuted seconds later. A 30-second suppression window would
+    /// block legitimate re-mutes — a worse bug than the duplicate dispatch
+    /// we're fixing. Dual-transport delivery of the same message happens
+    /// within milliseconds, so 1 s is ample headroom.
+    fn is_duplicate_host_action(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 1 second).
+        self.recent_host_events.retain(|_, ts| now - *ts < 1_000.0);
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_host_events.entry(key) {
+            e.insert(now);
+            false // first occurrence
+        } else {
+            true // duplicate
+        }
+    }
+
     /// Try to handle the packet as a KEYFRAME_REQUEST. Returns `true` if it
     /// was a keyframe request and was handled, `false` otherwise.
     ///
@@ -1809,12 +1877,11 @@ impl Inner {
                         Ok(MeetingEventType::PARTICIPANT_JOINED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let display_name = resolve_display_name(
+                                "PARTICIPANT_JOINED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager.set_peer_display_name(
@@ -1876,13 +1943,11 @@ impl Inner {
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
-                                    let display_name = if meeting_packet.display_name.is_empty() {
-                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                        target_str.clone()
-                                    } else {
-                                        String::from_utf8_lossy(&meeting_packet.display_name)
-                                            .to_string()
-                                    };
+                                    let display_name = resolve_display_name(
+                                        "PARTICIPANT_LEFT",
+                                        &meeting_packet,
+                                        &target_str,
+                                    );
                                     cb.emit((display_name, target_str));
                                 }
                             }
@@ -1942,15 +2007,41 @@ impl Inner {
                                 callback.emit(());
                             }
                         }
+                        Ok(MeetingEventType::HOST_MUTE_PARTICIPANT) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_mute_all = target.is_empty();
+                            let is_targeted_at_self = !is_mute_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_MUTE_PARTICIPANT: room={}, target=\"{}\", is_mute_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_mute_all,
+                                is_targeted_at_self
+                            );
+                            if is_mute_all || is_targeted_at_self {
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_mute", &target_str) {
+                                    if let Some(cb) = &self.options.on_host_mute {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_MUTE_PARTICIPANT for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let new_display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let new_display_name = resolve_display_name(
+                                "DISPLAY_NAME_CHANGED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             info!(
                                 "Received PARTICIPANT_DISPLAY_NAME_CHANGED: user={} new_name=\"{}\" (local_user={})",
@@ -1998,25 +2089,29 @@ impl Inner {
                 }
             },
             Ok(PacketType::CONGESTION) => {
-                // Server-side congestion feedback: the server is dropping
-                // packets destined for a receiver because the outbound channel
-                // is full. Match on session_id history — the signal targets a
-                // specific session_id which may be our current or a previous
-                // one from before re-election. Using session_id history (not
-                // user_id) ensures multi-tab/multi-device sessions for the
-                // same account are independently targeted.
-                if self.session_id_history.contains(&response.session_id) {
+                // Server-side congestion feedback. The server stamps the throttled
+                // sender's session_id onto the packet and publishes to that sender's
+                // NATS subject, but every session in the room subscribes via
+                // `room.{room}.*` with a distinct per-session queue group, so the
+                // server fans every CONGESTION packet out to every session. The
+                // embedded session_id therefore identifies WHICH sender is being
+                // throttled — match it against our own current and prior session
+                // ids. Only step down if we are the throttled one; cross-session
+                // signals are noise to us.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if is_self_targeted {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
+                        "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
-                        response.session_id, self.session_id_history,
+                        "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
                     );
                 }
             }
@@ -2170,6 +2265,7 @@ mod disconnect_tests {
             on_peer_left: None,
             on_peer_joined: None,
             on_display_name_changed: None,
+            on_host_mute: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

@@ -210,6 +210,62 @@ async fn test_guest_participant_can_upload_console_logs() {
     disable_console_logs(&log_dir);
 }
 
+#[tokio::test]
+#[serial]
+async fn test_out_of_range_chunk_seq_falls_back_to_uuid_suffix() {
+    let pool = get_test_pool().await;
+    let room_id = "test-clog-chunk-overflow";
+    let log_dir = enable_console_logs();
+
+    setup_active_meeting(&pool, room_id).await;
+    guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
+    host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
+
+    let app = build_app(pool.clone());
+    let req = console_log_request_with_seq(room_id, GUEST_EMAIL, "100000")
+        .body(Body::from(LOG_BODY))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let meeting_dir = log_dir.join(room_id);
+    let mut found = None;
+    for entry in walkdir(&meeting_dir) {
+        let name = entry.file_name().unwrap().to_str().unwrap().to_string();
+        if name.ends_with(".log.gz") {
+            found = Some(name);
+            break;
+        }
+    }
+
+    let filename = found.expect("console-log upload should create a .log.gz file");
+    assert!(
+        !filename.contains("_100000.log.gz"),
+        "out-of-range chunk seq must not be used as the numbered suffix: {filename}"
+    );
+    assert!(
+        filename.contains('_'),
+        "fallback filename should still include a suffix separator: {filename}"
+    );
+
+    let suffix = filename
+        .strip_suffix(".log.gz")
+        .and_then(|s| s.rsplit('_').next())
+        .expect("filename should have a suffix before .log.gz");
+    assert_eq!(
+        suffix.len(),
+        16,
+        "UUIDv7 fallback suffix should be 16 hex chars, got {suffix}"
+    );
+    assert!(
+        suffix.chars().all(|c| c.is_ascii_hexdigit()),
+        "UUIDv7 fallback suffix should be hex, got {suffix}"
+    );
+
+    disable_console_logs(&log_dir);
+}
+
 // ── Test: non-participant gets 403 ─────────────────────────────────────────
 
 #[tokio::test]

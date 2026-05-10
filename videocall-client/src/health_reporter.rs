@@ -197,6 +197,148 @@ pub struct HealthReporter {
     /// the server eventually tore down its WebTransport session — the bug
     /// reproduced in the cc7tp meeting incident on 2026-05-01.
     shutdown: Rc<AtomicBool>,
+    /// TELEM-8: Accumulated long-task durations (ms) since last health packet.
+    longtask_buffer: Rc<RefCell<Vec<f64>>>,
+    /// TELEM-9: Latest render FPS reading from the rAF cadence observer.
+    render_fps: Rc<RefCell<Option<f64>>>,
+}
+
+/// Static client metadata read from JS globals (TELEM-7).
+#[derive(Debug, Clone, Default)]
+pub struct ClientMetadata {
+    pub cores: u32,
+    pub architecture: String,
+    pub gpu_family: String,
+    pub network_effective_type: String,
+    pub network_downlink: f64,
+    pub network_rtt: u32,
+    pub battery_charging: Option<bool>,
+    pub battery_level: Option<f64>,
+    pub capability_score: u32,
+}
+
+/// Normalize a raw GPU renderer string to a short family name.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn normalize_gpu_family(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.contains("Apple") {
+        return "Apple GPU".to_string();
+    }
+    if raw.contains("NVIDIA") || raw.contains("GeForce") {
+        if let Some(pos) = raw.find("GeForce") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+        if let Some(pos) = raw.find("NVIDIA") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+    }
+    if raw.contains("AMD") || raw.contains("Radeon") {
+        if let Some(pos) = raw.find("Radeon") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+        return "AMD GPU".to_string();
+    }
+    if raw.contains("Intel") {
+        if let Some(pos) = raw.find("Intel") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(32).collect();
+            return family.trim().to_string();
+        }
+    }
+    raw.chars().take(32).collect::<String>().trim().to_string()
+}
+
+/// Read client metadata from `window.__videocall_client_metadata` and
+/// `navigator.hardwareConcurrency`.
+#[cfg(target_arch = "wasm32")]
+fn read_client_metadata() -> ClientMetadata {
+    use js_sys::Reflect;
+    use wasm_bindgen::JsValue;
+
+    let mut meta = ClientMetadata::default();
+
+    let Some(window) = web_sys::window() else {
+        return meta;
+    };
+
+    // Cores from navigator
+    meta.cores = {
+        let cores_f64 = window.navigator().hardware_concurrency();
+        if cores_f64.is_finite() && cores_f64 >= 1.0 {
+            cores_f64.min(u32::MAX as f64) as u32
+        } else {
+            0
+        }
+    };
+
+    // Capability score from window.__videocall_capability_score
+    if let Ok(score_val) = Reflect::get(&window, &JsValue::from_str("__videocall_capability_score"))
+    {
+        if let Some(score) = score_val.as_f64() {
+            if score.is_finite() && score > 0.0 {
+                meta.capability_score = score.min(u32::MAX as f64) as u32;
+            }
+        }
+    }
+
+    // Read __videocall_client_metadata object
+    let Ok(obj) = Reflect::get(&window, &JsValue::from_str("__videocall_client_metadata")) else {
+        return meta;
+    };
+    if obj.is_undefined() || obj.is_null() {
+        return meta;
+    }
+
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("architecture")) {
+        if let Some(s) = v.as_string() {
+            meta.architecture = s;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("gpu")) {
+        if let Some(s) = v.as_string() {
+            meta.gpu_family = normalize_gpu_family(&s);
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_effective_type")) {
+        if let Some(s) = v.as_string() {
+            meta.network_effective_type = s;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_downlink")) {
+        if let Some(f) = v.as_f64() {
+            meta.network_downlink = f;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_rtt")) {
+        if let Some(f) = v.as_f64() {
+            meta.network_rtt = f as u32;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("battery_charging")) {
+        if let Some(b) = v.as_bool() {
+            meta.battery_charging = Some(b);
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("battery_level")) {
+        if let Some(f) = v.as_f64() {
+            meta.battery_level = Some(f);
+        }
+    }
+
+    meta
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_client_metadata() -> ClientMetadata {
+    ClientMetadata::default()
 }
 
 impl HealthReporter {
@@ -233,6 +375,8 @@ impl HealthReporter {
             )))),
             dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
             shutdown: Rc::new(AtomicBool::new(false)),
+            longtask_buffer: Rc::new(RefCell::new(Vec::new())),
+            render_fps: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -357,6 +501,8 @@ impl HealthReporter {
         let active_server_url = Rc::downgrade(&self.active_server_url);
         let active_server_type = Rc::downgrade(&self.active_server_type);
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
+        let longtask_buffer = Rc::downgrade(&self.longtask_buffer);
+        let render_fps_state = Rc::downgrade(&self.render_fps);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -412,6 +558,32 @@ impl HealthReporter {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+                    // TELEM-8/9: capture client_perf subsystem events
+                    if event.subsystem == "client_perf" {
+                        for m in &event.metrics {
+                            match m.name {
+                                "client_longtask_duration_ms" => {
+                                    if let MetricValue::F64(duration) = &m.value {
+                                        if let Some(buf) = Weak::upgrade(&longtask_buffer) {
+                                            if let Ok(mut v) = buf.try_borrow_mut() {
+                                                v.push(*duration);
+                                            }
+                                        }
+                                    }
+                                }
+                                "client_render_fps" => {
+                                    if let MetricValue::F64(fps) = &m.value {
+                                        if let Some(fps_rc) = Weak::upgrade(&render_fps_state) {
+                                            if let Ok(mut f) = fps_rc.try_borrow_mut() {
+                                                *f = Some(*fps);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -650,6 +822,8 @@ impl HealthReporter {
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
+        let longtask_buffer = self.longtask_buffer.clone();
+        let render_fps_cell = self.render_fps.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -766,6 +940,19 @@ impl HealthReporter {
                             })
                             .unwrap_or_default();
 
+                        // TELEM-8: drain accumulated long-task durations
+                        let drained_longtasks: Vec<f64> = longtask_buffer
+                            .try_borrow_mut()
+                            .ok()
+                            .map(|mut v| std::mem::take(&mut *v))
+                            .unwrap_or_default();
+
+                        // TELEM-9: read latest render FPS
+                        let current_render_fps = render_fps_cell.try_borrow().ok().and_then(|v| *v);
+
+                        // TELEM-7: read client metadata from JS globals
+                        let client_meta = read_client_metadata();
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -797,6 +984,9 @@ impl HealthReporter {
                             drained_dwells,
                             connection_handshake_failures(),
                             connection_session_drops(),
+                            drained_longtasks,
+                            current_render_fps,
+                            client_meta,
                         );
 
                         if let Some(packet) = health_packet {
@@ -845,6 +1035,9 @@ impl HealthReporter {
         dwell_samples: Vec<(String, f64)>,
         handshake_failures_total: u64,
         session_drops_total: u64,
+        longtask_durations: Vec<f64>,
+        render_fps: Option<f64>,
+        client_metadata: ClientMetadata,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -1007,6 +1200,37 @@ impl HealthReporter {
         if session_drops_total > 0 {
             pb.connection_session_drops_total = Some(session_drops_total);
         }
+
+        // TELEM-7: Static client metadata
+        if client_metadata.cores > 0 {
+            pb.client_cores = Some(client_metadata.cores);
+        }
+        if !client_metadata.architecture.is_empty() {
+            pb.client_architecture = Some(client_metadata.architecture.clone());
+        }
+        if !client_metadata.gpu_family.is_empty() {
+            pb.client_gpu_family = Some(client_metadata.gpu_family.clone());
+        }
+        if !client_metadata.network_effective_type.is_empty() {
+            pb.client_network_effective_type = Some(client_metadata.network_effective_type.clone());
+        }
+        if client_metadata.network_downlink > 0.0 {
+            pb.client_network_downlink = Some(client_metadata.network_downlink);
+        }
+        if client_metadata.network_rtt > 0 {
+            pb.client_network_rtt = Some(client_metadata.network_rtt);
+        }
+        pb.client_battery_charging = client_metadata.battery_charging;
+        pb.client_battery_level = client_metadata.battery_level;
+        if client_metadata.capability_score > 0 {
+            pb.client_capability_score = Some(client_metadata.capability_score);
+        }
+
+        // TELEM-8: Long task durations since last packet
+        pb.longtask_durations_ms = longtask_durations;
+
+        // TELEM-9: Render FPS
+        pb.render_fps = render_fps;
 
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
@@ -1385,6 +1609,9 @@ mod tests {
             Vec::new(),
             0,
             0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -1412,5 +1639,33 @@ mod tests {
         // transport identity and RTT.
         assert_eq!(pb.active_server_type, "webtransport");
         assert_eq!(pb.active_server_rtt_ms, 42.0);
+    }
+
+    #[test]
+    fn normalize_gpu_family_known_vendors() {
+        assert_eq!(normalize_gpu_family("Apple M1 Pro"), "Apple GPU");
+        assert_eq!(normalize_gpu_family("Apple GPU"), "Apple GPU");
+        assert_eq!(
+            normalize_gpu_family(
+                "ANGLE (Intel(R) Iris(R) Plus Graphics 645 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            ),
+            "Intel(R) Iris(R) Plus Graphics 6"
+        );
+        assert_eq!(
+            normalize_gpu_family("ANGLE (NVIDIA GeForce RTX 3060 Direct3D11)"),
+            "GeForce RTX 3060 Direct3"
+        );
+        assert_eq!(
+            normalize_gpu_family("AMD Radeon Pro 5500M"),
+            "Radeon Pro 5500M"
+        );
+        assert_eq!(normalize_gpu_family(""), "");
+    }
+
+    #[test]
+    fn normalize_gpu_family_unknown_truncates() {
+        let long = "SomeUnknownVendor With A Very Long Renderer String That Exceeds 32 Chars";
+        let result = normalize_gpu_family(long);
+        assert!(result.len() <= 32);
     }
 }

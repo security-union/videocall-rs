@@ -37,7 +37,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+          path: rust-repo
       - name: cargo fmt check
+        working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo fmt --all -- --check
@@ -48,7 +52,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+          path: rust-repo
       - name: clippy (native targets)
+        working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo clippy --all -- -D warnings
@@ -59,15 +67,21 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+          path: rust-repo
       - name: cargo check videocall-client (default features)
+        working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo check --target wasm32-unknown-unknown -p videocall-client
       - name: cargo check videocall-client (no-default-features)
+        working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo check --target wasm32-unknown-unknown --no-default-features -p videocall-client
       - name: cargo check dioxus-ui
+        working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo check --target wasm32-unknown-unknown -p videocall-ui
@@ -78,15 +92,21 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+          path: rust-repo
       - name: wasm-pack test videocall-client
+        working-directory: rust-repo/videocall-client
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: cd videocall-client && wasm-pack test --node
+        run: wasm-pack test --node
       - name: cargo test videocall-codecs
+        working-directory: rust-repo/videocall-codecs
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: cd videocall-codecs && cargo test
+        run: cargo test
       - name: cargo test neteq
+        working-directory: rust-repo/neteq
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: cd neteq && cargo test --no-default-features --features web
+        run: cargo test --no-default-features --features web

@@ -21,6 +21,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       - uses: actions/setup-node@v4
         with:
@@ -49,7 +51,3 @@ jobs:
       - name: Teardown (preserve volumes for cache)
         if: always()
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down
-
-      - name: Fix workspace ownership
-        if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" . || true

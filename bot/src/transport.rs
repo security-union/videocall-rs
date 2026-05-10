@@ -180,3 +180,63 @@ impl TransportClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TransportClient;
+    use crate::config::Transport;
+    use url::Url;
+
+    #[test]
+    fn build_lobby_url_uses_ws_scheme_and_trims_trailing_slash() {
+        let server_url = Url::parse("https://relay.example.com/").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebSocket,
+            &server_url,
+            None,
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(url.as_str(), "wss://relay.example.com/lobby/bot-1/meeting-1");
+    }
+
+    #[test]
+    fn build_lobby_url_preserves_webtransport_scheme_and_port() {
+        let server_url = Url::parse("https://relay.example.com:4443/base").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebTransport,
+            &server_url,
+            None,
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://relay.example.com:4443/base/lobby/bot-1/meeting-1"
+        );
+    }
+
+    #[test]
+    fn build_lobby_url_mints_token_for_authenticated_path() {
+        let server_url = Url::parse("https://relay.example.com").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebSocket,
+            &server_url,
+            Some("secret"),
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.path(), "/lobby");
+        assert!(url.query().unwrap_or_default().starts_with("token="));
+    }
+}

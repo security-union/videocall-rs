@@ -370,7 +370,7 @@ mod tests {
             .with_label_values(&["b", "m"])
             .set(500.0);
         metrics
-            .aq_worst_peer_fps
+            .aq_p75_peer_fps
             .with_label_values(&["b", "m"])
             .set(25.0);
         metrics
@@ -411,7 +411,8 @@ mod tests {
         let body = String::from_utf8(buf).expect("utf8");
         assert!(
             body.contains("bot_aq_video_tier_index"),
-            "metrics body: {body}"
+            "metrics body: {}",
+            body
         );
         assert!(body.contains("bot_netsim_dropped_total"));
     }

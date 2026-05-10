@@ -34,6 +34,17 @@ use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
+const RMS_SPEAKING_ENTER: f32 = 0.012;
+const RMS_SPEAKING_EXIT: f32 = 0.008;
+
+fn next_speaking_state(is_speaking: bool, rms: f32) -> bool {
+    if is_speaking {
+        rms > RMS_SPEAKING_EXIT
+    } else {
+        rms > RMS_SPEAKING_ENTER
+    }
+}
+
 pub struct AudioProducer {
     #[allow(dead_code)]
     user_id: String,
@@ -287,7 +298,8 @@ impl AudioProducer {
             let rms = (packet_samples.iter().map(|s| s * s).sum::<f32>()
                 / packet_samples.len() as f32)
                 .sqrt();
-            is_speaking.store(rms > 0.01, Ordering::Relaxed);
+            let speaking_now = next_speaking_state(is_speaking.load(Ordering::Relaxed), rms);
+            is_speaking.store(speaking_now, Ordering::Relaxed);
 
             // Skip encode/send for near-silence packets
             if rms < 0.005 {
@@ -388,6 +400,23 @@ impl AudioProducer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_speaking_state, RMS_SPEAKING_ENTER, RMS_SPEAKING_EXIT};
+
+    #[test]
+    fn entering_speaking_requires_upper_threshold() {
+        assert!(!next_speaking_state(false, RMS_SPEAKING_EXIT + 0.0005));
+        assert!(next_speaking_state(false, RMS_SPEAKING_ENTER + 0.0005));
+    }
+
+    #[test]
+    fn staying_speaking_uses_lower_threshold() {
+        assert!(next_speaking_state(true, RMS_SPEAKING_ENTER - 0.0005));
+        assert!(!next_speaking_state(true, RMS_SPEAKING_EXIT - 0.0005));
     }
 }
 

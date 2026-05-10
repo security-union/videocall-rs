@@ -175,6 +175,7 @@ pub fn Host(
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
+        screen.set_reelection_completed_signal(client.reelection_completed_signal());
 
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(

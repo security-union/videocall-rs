@@ -21,7 +21,7 @@ use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -29,6 +29,8 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::aq_controller::BotAq;
+use crate::keyframe_requester::KeyframeRequester;
+use crate::rtt_probe::RttProbeState;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -61,15 +63,17 @@ pub struct InboundStats {
     /// Arrival times for inter-arrival variability calculation.
     video_arrivals: Vec<f64>,
     audio_arrivals: Vec<f64>,
-    /// Last audio and video timestamps per sender for A/V sync measurement.
-    last_audio_ts: HashMap<String, f64>,
-    last_video_ts: HashMap<String, f64>,
-    av_sync_deltas: Vec<f64>,
+    // A/V sync dropped: browser audio uses Date.now() ms, video uses EncodedVideoChunk µs — cross-unit delta is meaningless. Re-add when browser wire format is unified.
     parse_errors: u64,
     /// Per-sender counters for health reporting (accumulated between drains).
     health_counters: HashMap<String, SenderHealthCounters>,
     /// Total inbound packets since last health drain (all types).
     health_total_packets: u64,
+    /// Snapshot of the most recently drained health-counter window, kept so
+    /// secondary consumers (e.g. the diagnostics reporter) can read the same
+    /// window the health reporter emitted without double-draining and zeroing
+    /// the live counters between producers.
+    last_drain_snapshot: HashMap<String, SenderHealthCounters>,
     /// Last time each sender was seen — used to evict stale entries.
     last_seen: HashMap<String, Instant>,
     /// Intern map: raw user_id bytes → owned String to avoid per-packet allocation.
@@ -79,6 +83,12 @@ pub struct InboundStats {
     aq: Option<Arc<BotAq>>,
     /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
     diagnostics_parse_errors: u64,
+    /// Optional RTT probe state. When set, echoed RTT packets are routed here
+    /// to compute real round-trip time instead of being counted as media.
+    rtt_probe: Option<Arc<RttProbeState>>,
+    /// Optional keyframe requester. When set, new peers trigger a
+    /// KEYFRAME_REQUEST for VIDEO the first time they are observed.
+    keyframe_requester: Option<KeyframeRequester>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -99,6 +109,19 @@ impl InboundStats {
     /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
     pub fn set_aq(&mut self, aq: Arc<BotAq>) {
         self.aq = Some(aq);
+    }
+
+    /// Attach an RTT probe state. When set, echoed RTT packets from the relay
+    /// are routed to `RttProbeState::record_echo` instead of being counted as
+    /// generic media.
+    pub fn set_rtt_probe(&mut self, state: Arc<RttProbeState>) {
+        self.rtt_probe = Some(state);
+    }
+
+    /// Attach a keyframe requester. When set, newly discovered peers trigger
+    /// a KEYFRAME_REQUEST for VIDEO.
+    pub fn set_keyframe_requester(&mut self, requester: KeyframeRequester) {
+        self.keyframe_requester = Some(requester);
     }
 
     /// Install (or replace) the Prometheus metrics handle. Calls made before
@@ -136,7 +159,7 @@ impl InboundStats {
         }
     }
 
-    pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
+    pub fn record_packet(&mut self, my_user_id: &str, data: &[u8]) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -155,11 +178,19 @@ impl InboundStats {
         // react to downstream quality signals like a real browser client.
         // We deliberately intercept this before the MEDIA early-return so the
         // relay's diagnostic broadcasts stop being silently dropped.
+        //
+        // Only forward packets about *this bot's* own stream — match the
+        // browser's `SenderDiagnosticManager` which filters on
+        // `sender_id == self.userid` before feeding the encoder. Without this
+        // filter, unrelated peer→peer reports would be mixed into this bot's
+        // AQ controller's per-reporter window.
         if wrapper.packet_type.enum_value() == Ok(PacketType::DIAGNOSTICS) {
             match DiagnosticsPacket::parse_from_bytes(&wrapper.data) {
                 Ok(diag) => {
-                    if let Some(ref aq) = self.aq {
-                        aq.process_diagnostics(diag);
+                    if diag.sender_id == my_user_id {
+                        if let Some(ref aq) = self.aq {
+                            aq.process_diagnostics(diag);
+                        }
                     }
                 }
                 Err(e) => {
@@ -195,12 +226,32 @@ impl InboundStats {
             return;
         };
 
+        // Intercept echoed RTT packets BEFORE normal media accounting.
+        // The relay echoes the entire PacketWrapper back verbatim when
+        // media_type == RTT, so our own probe comes back with our user_id
+        // in wrapper.user_id. Route to the RTT probe state for RTT calc.
+        if media.media_type.enum_value() == Ok(MediaType::RTT) {
+            if let Some(ref rtt_state) = self.rtt_probe {
+                rtt_state.record_echo(media.timestamp);
+                debug!("RTT echo received, timestamp={:.1}", media.timestamp);
+            }
+            #[cfg(feature = "metrics")]
+            self.bump_received("rtt");
+            self.other_packets += 1;
+            return;
+        }
+
         // The relay populates wrapper.user_id but strips media.user_id,
         // so use the wrapper-level user_id for per-sender tracking.
         let sender = self.intern_sender(&wrapper.user_id).to_owned();
 
         // Update last-seen time for stale entry eviction.
         self.last_seen.insert(sender.clone(), Instant::now());
+
+        // Notify keyframe requester about newly seen peers.
+        if let Some(ref mut kr) = self.keyframe_requester {
+            kr.on_peer_seen(&sender);
+        }
 
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {
@@ -209,7 +260,6 @@ impl InboundStats {
                 self.audio_packets += 1;
                 self.audio_bytes += media.data.len() as u64;
                 self.audio_arrivals.push(now_ms);
-                self.last_audio_ts.insert(sender.clone(), media.timestamp);
 
                 // Accumulate health counters for this sender
                 let hc = self.health_counters.entry(sender.clone()).or_default();
@@ -233,11 +283,6 @@ impl InboundStats {
                         self.max_audio_seq.insert(sender.clone(), seq);
                     }
                 }
-
-                // A/V sync: compare against same sender's last video timestamp
-                if let Some(vts) = self.last_video_ts.get(&sender) {
-                    self.av_sync_deltas.push(media.timestamp - vts);
-                }
             }
             Ok(MediaType::VIDEO) => {
                 #[cfg(feature = "metrics")]
@@ -245,7 +290,6 @@ impl InboundStats {
                 self.video_packets += 1;
                 self.video_bytes += media.data.len() as u64;
                 self.video_arrivals.push(now_ms);
-                self.last_video_ts.insert(sender.clone(), media.timestamp);
 
                 // Accumulate health counters for this sender
                 let hc = self.health_counters.entry(sender.clone()).or_default();
@@ -272,11 +316,6 @@ impl InboundStats {
                         // First packet from this sender
                         self.max_video_seq.insert(sender.clone(), seq);
                     }
-                }
-
-                // A/V sync: also compute when a video packet arrives
-                if let Some(ats) = self.last_audio_ts.get(&sender) {
-                    self.av_sync_deltas.push(media.timestamp - ats);
                 }
             }
             Ok(MediaType::HEARTBEAT) => {
@@ -309,16 +348,10 @@ impl InboundStats {
         let audio_iastddev = Self::interarrival_stddev_ms(&self.audio_arrivals);
         let video_iastddev = Self::interarrival_stddev_ms(&self.video_arrivals);
 
-        let avg_av_sync = if self.av_sync_deltas.is_empty() {
-            0.0
-        } else {
-            self.av_sync_deltas.iter().sum::<f64>() / self.av_sync_deltas.len() as f64
-        };
-
         info!(
             "[{}] RX STATS (10s): audio={} pkts ({:.0} KB, ia_stddev={:.1}ms, gaps={}), \
              video={} pkts ({} key, {:.0} KB, ia_stddev={:.1}ms, gaps={}), \
-             heartbeat={}, A/V sync={:.0}ms, errors={}",
+             heartbeat={}, errors={}",
             user_id,
             self.audio_packets,
             self.audio_bytes as f64 / 1024.0,
@@ -330,7 +363,6 @@ impl InboundStats {
             video_iastddev,
             self.video_seq_gaps,
             self.heartbeat_packets,
-            avg_av_sync,
             self.parse_errors,
         );
     }
@@ -342,25 +374,27 @@ impl InboundStats {
         // since they track cross-window state. They are evicted by evict_stale().
         let health_counters = std::mem::take(&mut self.health_counters);
         let health_total = self.health_total_packets;
+        let last_drain_snapshot = std::mem::take(&mut self.last_drain_snapshot);
         let last_seen = std::mem::take(&mut self.last_seen);
         let max_audio_seq = std::mem::take(&mut self.max_audio_seq);
         let max_video_seq = std::mem::take(&mut self.max_video_seq);
-        let last_audio_ts = std::mem::take(&mut self.last_audio_ts);
-        let last_video_ts = std::mem::take(&mut self.last_video_ts);
         let sender_names = std::mem::take(&mut self.sender_names);
         let aq = self.aq.take();
+        let rtt_probe = self.rtt_probe.take();
+        let keyframe_requester = self.keyframe_requester.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         *self = Self::default();
         self.health_counters = health_counters;
         self.health_total_packets = health_total;
+        self.last_drain_snapshot = last_drain_snapshot;
         self.last_seen = last_seen;
         self.max_audio_seq = max_audio_seq;
         self.max_video_seq = max_video_seq;
-        self.last_audio_ts = last_audio_ts;
-        self.last_video_ts = last_video_ts;
         self.sender_names = sender_names;
         self.aq = aq;
+        self.rtt_probe = rtt_probe;
+        self.keyframe_requester = keyframe_requester;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;
@@ -382,9 +416,8 @@ impl InboundStats {
             self.last_seen.remove(sender);
             self.max_audio_seq.remove(sender);
             self.max_video_seq.remove(sender);
-            self.last_audio_ts.remove(sender);
-            self.last_video_ts.remove(sender);
             self.health_counters.remove(sender);
+            self.last_drain_snapshot.remove(sender);
         }
 
         // Also evict from the intern map — find Vec<u8> keys whose String value
@@ -396,11 +429,26 @@ impl InboundStats {
 
     /// Drain per-sender health counters accumulated since the last drain.
     /// Returns `(per_sender_counters, total_packets)` and resets both to zero.
+    ///
+    /// Before clearing, the drained per-sender map is cloned into
+    /// `last_drain_snapshot` so secondary consumers (e.g. the diagnostics
+    /// reporter) can read the *same* one-second window the health reporter
+    /// emitted — a single source of truth for per-sender rate counters.
     pub fn drain_health_counters(&mut self) -> (HashMap<String, SenderHealthCounters>, u64) {
         let counters = std::mem::take(&mut self.health_counters);
         let total = self.health_total_packets;
         self.health_total_packets = 0;
+        self.last_drain_snapshot = counters.clone();
         (counters, total)
+    }
+
+    /// Non-destructive snapshot of the last drained health-counter window.
+    ///
+    /// The diagnostics reporter calls this each tick to emit
+    /// `DiagnosticsPacket`s over the same ~1-second window the health reporter
+    /// already observed. Returns an empty map before the first drain.
+    pub fn snapshot_diagnostics_counters(&self) -> HashMap<String, SenderHealthCounters> {
+        self.last_drain_snapshot.clone()
     }
 
     /// Convert raw user_id bytes to a String, reusing previous conversions
@@ -571,7 +619,6 @@ mod tests {
             "alice should be evicted"
         );
         assert!(!stats.max_audio_seq.contains_key("alice"));
-        assert!(!stats.last_audio_ts.contains_key("alice"));
         assert!(!stats.health_counters.contains_key("alice"));
 
         assert!(stats.last_seen.contains_key("bob"), "bob should remain");

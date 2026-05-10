@@ -121,6 +121,12 @@ pub enum Operation {
     Undefined,
 }
 
+impl Operation {
+    /// Total number of variants. Keep in sync with the enum definition above —
+    /// `statistics.rs` uses this to size its per-operation counter array.
+    pub const VARIANT_COUNT: usize = 12;
+}
+
 /// NetEQ statistics summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetEqStats {

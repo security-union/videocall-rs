@@ -24,6 +24,8 @@ use url::Url;
 
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
 use crate::token;
 use crate::websocket_client::WebSocketClient;
 use crate::webtransport_client::WebTransportClient;
@@ -95,9 +97,17 @@ pub enum TransportClient {
 }
 
 impl TransportClient {
-    pub fn new(transport: &Transport, config: ClientConfig) -> Self {
+    pub fn new(
+        transport: &Transport,
+        config: ClientConfig,
+        #[cfg(feature = "metrics")] metrics: Option<std::sync::Arc<BotMetrics>>,
+    ) -> Self {
         match transport {
-            Transport::WebSocket => TransportClient::WebSocket(WebSocketClient::new(config)),
+            Transport::WebSocket => TransportClient::WebSocket(WebSocketClient::new(
+                config,
+                #[cfg(feature = "metrics")]
+                metrics,
+            )),
             Transport::WebTransport => {
                 TransportClient::WebTransport(WebTransportClient::new(config))
             }

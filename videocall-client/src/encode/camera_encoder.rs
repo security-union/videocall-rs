@@ -676,6 +676,12 @@ impl CameraEncoder {
             let mut sequence_number: u64 = 0;
 
             let mut restart_count: u32 = 0;
+            // Maximum restart attempts before surfacing on_error. Sized for the
+            // narrow fatal signatures matched by is_fatal_encoder_error_message:
+            // the closed-codec InvalidStateError and the VPX allocation failure.
+            // Those usually clear within 1-2 retries; 5 gives headroom for a
+            // short cascade without spinning forever if the browser is wedged.
+            // Revisit this cap if the fatal-error classifier is broadened.
             const MAX_RESTARTS: u32 = 5;
 
             'restart: loop {

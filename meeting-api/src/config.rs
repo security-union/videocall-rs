@@ -443,6 +443,12 @@ impl Config {
             None
         };
 
+        if search.is_some() && dev_user.is_some() {
+            tracing::warn!(
+                "DEV_USER auto-login is active and SearchV2 is enabled — search pushes will use the synthetic dev identity"
+            );
+        }
+
         Ok(Self {
             listen_addr,
             database_url,
@@ -560,6 +566,56 @@ mod tests {
         match prior_jwt {
             Some(v) => std::env::set_var("JWT_SECRET", v),
             None => std::env::remove_var("JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn dev_user_and_search_can_be_enabled_together() {
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_dev_user = std::env::var("DEV_USER").ok();
+        let prior_search_url = std::env::var("SEARCH_API_URL").ok();
+        let prior_search_token = std::env::var("SEARCH_API_TOKEN").ok();
+        let prior_oauth_issuer = std::env::var("OAUTH_ISSUER").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("DEV_USER", "dev@test.local:Dev User");
+        std::env::set_var("SEARCH_API_URL", "https://search.example.test");
+        std::env::set_var("SEARCH_API_TOKEN", "test-token");
+        std::env::remove_var("OAUTH_ISSUER");
+
+        let cfg = Config::from_env().expect("DEV_USER + SearchV2 should parse successfully");
+        assert!(
+            cfg.dev_user.is_some(),
+            "DEV_USER should be active when OAuth is disabled"
+        );
+        assert!(cfg.search.is_some(), "SearchV2 config should be enabled");
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_dev_user {
+            Some(v) => std::env::set_var("DEV_USER", v),
+            None => std::env::remove_var("DEV_USER"),
+        }
+        match prior_search_url {
+            Some(v) => std::env::set_var("SEARCH_API_URL", v),
+            None => std::env::remove_var("SEARCH_API_URL"),
+        }
+        match prior_search_token {
+            Some(v) => std::env::set_var("SEARCH_API_TOKEN", v),
+            None => std::env::remove_var("SEARCH_API_TOKEN"),
+        }
+        match prior_oauth_issuer {
+            Some(v) => std::env::set_var("OAUTH_ISSUER", v),
+            None => std::env::remove_var("OAUTH_ISSUER"),
         }
     }
 }

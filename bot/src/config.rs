@@ -59,6 +59,9 @@ pub struct BotConfig {
     /// WebTransport relay URL (new-style). Mutually exclusive with `server_url`.
     pub wt_url: Option<String>,
     /// Fraction of bots (0.0..=1.0) assigned to WebTransport when both URLs are set.
+    /// Uses `f64::round()` on `ratio * total_bots` to decide how many bots get WT;
+    /// e.g. `wt_ratio=0.33` with `total_bots=10` yields 3 WT bots. The first N
+    /// bots by index are assigned WT, and the remainder use WS.
     pub wt_ratio: Option<f64>,
     pub jwt_secret: Option<String>,
     pub token_ttl_secs: Option<u64>,

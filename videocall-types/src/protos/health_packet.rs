@@ -1277,6 +1277,31 @@ pub struct HealthPacket {
     pub connection_handshake_failures_total: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.connection_session_drops_total)
     pub connection_session_drops_total: ::std::option::Option<u64>,
+    ///  TELEM-7: Static client metadata (re-sent every packet for late-joining observers)
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_cores)
+    pub client_cores: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_architecture)
+    pub client_architecture: ::std::option::Option<::std::string::String>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_gpu_family)
+    pub client_gpu_family: ::std::option::Option<::std::string::String>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_network_effective_type)
+    pub client_network_effective_type: ::std::option::Option<::std::string::String>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_network_downlink)
+    pub client_network_downlink: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_network_rtt)
+    pub client_network_rtt: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_battery_charging)
+    pub client_battery_charging: ::std::option::Option<bool>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_battery_level)
+    pub client_battery_level: ::std::option::Option<f64>,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.client_capability_score)
+    pub client_capability_score: ::std::option::Option<u32>,
+    ///  TELEM-8: Long task durations accumulated since last health packet (ms)
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.longtask_durations_ms)
+    pub longtask_durations_ms: ::std::vec::Vec<f64>,
+    ///  TELEM-9: Main-thread rAF cadence (frames per second)
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.render_fps)
+    pub render_fps: ::std::option::Option<f64>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1294,7 +1319,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(51);
+        let mut fields = ::std::vec::Vec::with_capacity(62);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1551,6 +1576,61 @@ impl HealthPacket {
             |m: &HealthPacket| { &m.connection_session_drops_total },
             |m: &mut HealthPacket| { &mut m.connection_session_drops_total },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_cores",
+            |m: &HealthPacket| { &m.client_cores },
+            |m: &mut HealthPacket| { &mut m.client_cores },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_architecture",
+            |m: &HealthPacket| { &m.client_architecture },
+            |m: &mut HealthPacket| { &mut m.client_architecture },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_gpu_family",
+            |m: &HealthPacket| { &m.client_gpu_family },
+            |m: &mut HealthPacket| { &mut m.client_gpu_family },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_network_effective_type",
+            |m: &HealthPacket| { &m.client_network_effective_type },
+            |m: &mut HealthPacket| { &mut m.client_network_effective_type },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_network_downlink",
+            |m: &HealthPacket| { &m.client_network_downlink },
+            |m: &mut HealthPacket| { &mut m.client_network_downlink },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_network_rtt",
+            |m: &HealthPacket| { &m.client_network_rtt },
+            |m: &mut HealthPacket| { &mut m.client_network_rtt },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_battery_charging",
+            |m: &HealthPacket| { &m.client_battery_charging },
+            |m: &mut HealthPacket| { &mut m.client_battery_charging },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_battery_level",
+            |m: &HealthPacket| { &m.client_battery_level },
+            |m: &mut HealthPacket| { &mut m.client_battery_level },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_capability_score",
+            |m: &HealthPacket| { &m.client_capability_score },
+            |m: &mut HealthPacket| { &mut m.client_capability_score },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "longtask_durations_ms",
+            |m: &HealthPacket| { &m.longtask_durations_ms },
+            |m: &mut HealthPacket| { &mut m.longtask_durations_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "render_fps",
+            |m: &HealthPacket| { &m.render_fps },
+            |m: &mut HealthPacket| { &mut m.render_fps },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
             fields,
@@ -1734,6 +1814,42 @@ impl ::protobuf::Message for HealthPacket {
                 440 => {
                     self.connection_session_drops_total = ::std::option::Option::Some(is.read_uint64()?);
                 },
+                448 => {
+                    self.client_cores = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                458 => {
+                    self.client_architecture = ::std::option::Option::Some(is.read_string()?);
+                },
+                466 => {
+                    self.client_gpu_family = ::std::option::Option::Some(is.read_string()?);
+                },
+                474 => {
+                    self.client_network_effective_type = ::std::option::Option::Some(is.read_string()?);
+                },
+                481 => {
+                    self.client_network_downlink = ::std::option::Option::Some(is.read_double()?);
+                },
+                488 => {
+                    self.client_network_rtt = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                496 => {
+                    self.client_battery_charging = ::std::option::Option::Some(is.read_bool()?);
+                },
+                505 => {
+                    self.client_battery_level = ::std::option::Option::Some(is.read_double()?);
+                },
+                512 => {
+                    self.client_capability_score = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                522 => {
+                    is.read_repeated_packed_double_into(&mut self.longtask_durations_ms)?;
+                },
+                521 => {
+                    self.longtask_durations_ms.push(is.read_double()?);
+                },
+                529 => {
+                    self.render_fps = ::std::option::Option::Some(is.read_double()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1905,6 +2021,37 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.connection_session_drops_total {
             my_size += ::protobuf::rt::uint64_size(55, v);
         }
+        if let Some(v) = self.client_cores {
+            my_size += ::protobuf::rt::uint32_size(56, v);
+        }
+        if let Some(v) = self.client_architecture.as_ref() {
+            my_size += ::protobuf::rt::string_size(57, &v);
+        }
+        if let Some(v) = self.client_gpu_family.as_ref() {
+            my_size += ::protobuf::rt::string_size(58, &v);
+        }
+        if let Some(v) = self.client_network_effective_type.as_ref() {
+            my_size += ::protobuf::rt::string_size(59, &v);
+        }
+        if let Some(v) = self.client_network_downlink {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.client_network_rtt {
+            my_size += ::protobuf::rt::uint32_size(61, v);
+        }
+        if let Some(v) = self.client_battery_charging {
+            my_size += 2 + 1;
+        }
+        if let Some(v) = self.client_battery_level {
+            my_size += 2 + 8;
+        }
+        if let Some(v) = self.client_capability_score {
+            my_size += ::protobuf::rt::uint32_size(64, v);
+        }
+        my_size += ::protobuf::rt::vec_packed_double_size(65, &self.longtask_durations_ms);
+        if let Some(v) = self.render_fps {
+            my_size += 2 + 8;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2071,6 +2218,37 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.connection_session_drops_total {
             os.write_uint64(55, v)?;
         }
+        if let Some(v) = self.client_cores {
+            os.write_uint32(56, v)?;
+        }
+        if let Some(v) = self.client_architecture.as_ref() {
+            os.write_string(57, v)?;
+        }
+        if let Some(v) = self.client_gpu_family.as_ref() {
+            os.write_string(58, v)?;
+        }
+        if let Some(v) = self.client_network_effective_type.as_ref() {
+            os.write_string(59, v)?;
+        }
+        if let Some(v) = self.client_network_downlink {
+            os.write_double(60, v)?;
+        }
+        if let Some(v) = self.client_network_rtt {
+            os.write_uint32(61, v)?;
+        }
+        if let Some(v) = self.client_battery_charging {
+            os.write_bool(62, v)?;
+        }
+        if let Some(v) = self.client_battery_level {
+            os.write_double(63, v)?;
+        }
+        if let Some(v) = self.client_capability_score {
+            os.write_uint32(64, v)?;
+        }
+        os.write_repeated_packed_double(65, &self.longtask_durations_ms)?;
+        if let Some(v) = self.render_fps {
+            os.write_double(66, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -2139,6 +2317,17 @@ impl ::protobuf::Message for HealthPacket {
         self.screen_encoder_frames_submitted_ok = ::std::option::Option::None;
         self.connection_handshake_failures_total = ::std::option::Option::None;
         self.connection_session_drops_total = ::std::option::Option::None;
+        self.client_cores = ::std::option::Option::None;
+        self.client_architecture = ::std::option::Option::None;
+        self.client_gpu_family = ::std::option::Option::None;
+        self.client_network_effective_type = ::std::option::Option::None;
+        self.client_network_downlink = ::std::option::Option::None;
+        self.client_network_rtt = ::std::option::Option::None;
+        self.client_battery_charging = ::std::option::Option::None;
+        self.client_battery_level = ::std::option::Option::None;
+        self.client_capability_score = ::std::option::Option::None;
+        self.longtask_durations_ms.clear();
+        self.render_fps = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -2539,9 +2728,9 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20\x01(\x0b2\x19.health_packet.VideoStatsR\x10screenVideoStatsB\x18\n\
     \x16_avg_decode_latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\x14_vid\
     eo_quality_scoreB\x15\n\x13_call_quality_scoreB\x17\n\x15_decoder_errors\
-    _total\"\x88\"\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
-    \tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12*\
-    \n\x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\
+    _total\"\xcc(\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\x01(\t\
+    R\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\x12*\n\
+    \x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\x12!\n\
     \x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17reportin\
     g_audio_enabled\x18\x05\x20\x01(\x08R\x15reportingAudioEnabled\x126\n\
     \x17reporting_video_enabled\x18\x06\x20\x01(\x08R\x15reportingVideoEnabl\
@@ -2604,50 +2793,67 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     rFramesSubmittedOk\x88\x01\x01\x12R\n#connection_handshake_failures_tota\
     l\x186\x20\x01(\x04H#R\x20connectionHandshakeFailuresTotal\x88\x01\x01\
     \x12H\n\x1econnection_session_drops_total\x187\x20\x01(\x04H$R\x1bconnec\
-    tionSessionDropsTotal\x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03\
-    key\x18\x01\x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18\
-    .health_packet.PeerStatsR\x05value:\x028\x01B\x14\n\x12_memory_used_byte\
-    sB\x15\n\x13_memory_total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\
-    \x11_send_queue_bytesB\x1b\n\x19_packets_received_per_secB\x17\n\x15_pac\
-    kets_sent_per_secB\x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\
-    \x16\n\x14_adaptive_audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\
-    \x1d_keyframe_requests_sent_totalB\x18\n\x16_websocket_drops_totalB\x14\
-    \n\x12_encoder_fps_ratioB\x19\n\x17_encoder_worst_peer_fpsB\x17\n\x15_ad\
-    aptive_screen_tierB\x18\n\x16_screen_sharing_activeB\x15\n\x13_encoder_o\
-    utput_fpsB\x1e\n\x1c_encoder_target_bitrate_kbpsB\x18\n\x16_encoder_bitr\
-    ate_ratioB\x17\n\x15_crash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_\
-    indexB\x19\n\x17_crash_ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceili\
-    ngB\x1b\n\x19_step_up_blocked_slowdownB\x1f\n\x1d_step_up_blocked_screen\
-    _shareB%\n#_camera_encoder_errors_closed_codecB&\n$_camera_encoder_error\
-    s_vpx_mem_allocB(\n&_camera_encoder_errors_configure_fatalB\x20\n\x1e_ca\
-    mera_encoder_errors_genericB%\n#_camera_encoder_frames_submitted_okB%\n#\
-    _screen_encoder_errors_closed_codecB&\n$_screen_encoder_errors_vpx_mem_a\
-    llocB(\n&_screen_encoder_errors_configure_fatalB\x20\n\x1e_screen_encode\
-    r_errors_genericB%\n#_screen_encoder_frames_submitted_okB&\n$_connection\
-    _handshake_failures_totalB!\n\x1f_connection_session_drops_totalJ\x04\
-    \x08!\x10\"J\x04\x08\"\x10#J\x04\x08#\x10$J\x04\x08$\x10%R\x13join_bandw\
-    idth_kbpsR\x0bjoin_rtt_msR\x0ejoin_jitter_msR\x14join_packet_loss_pct\"\
-    \x96\x01\n\x0eTierTransition\x12\x1c\n\tdirection\x18\x01\x20\x01(\tR\td\
-    irection\x12\x16\n\x06stream\x18\x02\x20\x01(\tR\x06stream\x12\x1b\n\tfr\
-    om_tier\x18\x03\x20\x01(\tR\x08fromTier\x12\x17\n\x07to_tier\x18\x04\x20\
-    \x01(\tR\x06toTier\x12\x18\n\x07trigger\x18\x05\x20\x01(\tR\x07trigger\"\
-    :\n\tTierDwell\x12\x12\n\x04tier\x18\x01\x20\x01(\tR\x04tier\x12\x19\n\
-    \x08dwell_ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\xb7M\n\x07\x12\x05\0\0\
-    \xa6\x01\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\
-    \0\x16\n\n\n\x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\
-    \x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\
-    \0\x02\0\x05\x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x05\
-    \t\x17\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\
-    \x02\x01\x12\x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x06\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x06\t\x17\n\x0c\n\x05\x04\
-    \0\x02\x01\x03\x12\x03\x06\x1a\x1b\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x07\
-    \x02\x20\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\
-    \x04\0\x02\x02\x01\x12\x03\x07\t\x1b\n\x0c\n\x05\x04\0\x02\x02\x03\x12\
-    \x03\x07\x1e\x1f\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x08\x02%\n\x0c\n\x05\
-    \x04\0\x02\x03\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\
-    \x03\x08\t\x20\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x08#$\n\x0b\n\x04\
-    \x04\0\x02\x04\x12\x03\t\x02'\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\t\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\t\t\"\n\x0c\n\x05\x04\0\
+    tionSessionDropsTotal\x88\x01\x01\x12&\n\x0cclient_cores\x188\x20\x01(\r\
+    H%R\x0bclientCores\x88\x01\x01\x124\n\x13client_architecture\x189\x20\
+    \x01(\tH&R\x12clientArchitecture\x88\x01\x01\x12/\n\x11client_gpu_family\
+    \x18:\x20\x01(\tH'R\x0fclientGpuFamily\x88\x01\x01\x12F\n\x1dclient_netw\
+    ork_effective_type\x18;\x20\x01(\tH(R\x1aclientNetworkEffectiveType\x88\
+    \x01\x01\x12;\n\x17client_network_downlink\x18<\x20\x01(\x01H)R\x15clien\
+    tNetworkDownlink\x88\x01\x01\x121\n\x12client_network_rtt\x18=\x20\x01(\
+    \rH*R\x10clientNetworkRtt\x88\x01\x01\x12;\n\x17client_battery_charging\
+    \x18>\x20\x01(\x08H+R\x15clientBatteryCharging\x88\x01\x01\x125\n\x14cli\
+    ent_battery_level\x18?\x20\x01(\x01H,R\x12clientBatteryLevel\x88\x01\x01\
+    \x12;\n\x17client_capability_score\x18@\x20\x01(\rH-R\x15clientCapabilit\
+    yScore\x88\x01\x01\x122\n\x15longtask_durations_ms\x18A\x20\x03(\x01R\
+    \x13longtaskDurationsMs\x12\"\n\nrender_fps\x18B\x20\x01(\x01H.R\trender\
+    Fps\x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\
+    \x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_packet.\
+    PeerStatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytesB\x15\n\x13_me\
+    mory_total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\x11_send_queue_\
+    bytesB\x1b\n\x19_packets_received_per_secB\x17\n\x15_packets_sent_per_se\
+    cB\x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\x16\n\x14_adapti\
+    ve_audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\x1d_keyframe_reques\
+    ts_sent_totalB\x18\n\x16_websocket_drops_totalB\x14\n\x12_encoder_fps_ra\
+    tioB\x19\n\x17_encoder_worst_peer_fpsB\x17\n\x15_adaptive_screen_tierB\
+    \x18\n\x16_screen_sharing_activeB\x15\n\x13_encoder_output_fpsB\x1e\n\
+    \x1c_encoder_target_bitrate_kbpsB\x18\n\x16_encoder_bitrate_ratioB\x17\n\
+    \x15_crash_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17\
+    _crash_ceiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_st\
+    ep_up_blocked_slowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_came\
+    ra_encoder_errors_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB\
+    (\n&_camera_encoder_errors_configure_fatalB\x20\n\x1e_camera_encoder_err\
+    ors_genericB%\n#_camera_encoder_frames_submitted_okB%\n#_screen_encoder_\
+    errors_closed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen\
+    _encoder_errors_configure_fatalB\x20\n\x1e_screen_encoder_errors_generic\
+    B%\n#_screen_encoder_frames_submitted_okB&\n$_connection_handshake_failu\
+    res_totalB!\n\x1f_connection_session_drops_totalB\x0f\n\r_client_coresB\
+    \x16\n\x14_client_architectureB\x14\n\x12_client_gpu_familyB\x20\n\x1e_c\
+    lient_network_effective_typeB\x1a\n\x18_client_network_downlinkB\x15\n\
+    \x13_client_network_rttB\x1a\n\x18_client_battery_chargingB\x17\n\x15_cl\
+    ient_battery_levelB\x1a\n\x18_client_capability_scoreB\r\n\x0b_render_fp\
+    sJ\x04\x08!\x10\"J\x04\x08\"\x10#J\x04\x08#\x10$J\x04\x08$\x10%R\x13join\
+    _bandwidth_kbpsR\x0bjoin_rtt_msR\x0ejoin_jitter_msR\x14join_packet_loss_\
+    pct\"\x96\x01\n\x0eTierTransition\x12\x1c\n\tdirection\x18\x01\x20\x01(\
+    \tR\tdirection\x12\x16\n\x06stream\x18\x02\x20\x01(\tR\x06stream\x12\x1b\
+    \n\tfrom_tier\x18\x03\x20\x01(\tR\x08fromTier\x12\x17\n\x07to_tier\x18\
+    \x04\x20\x01(\tR\x06toTier\x12\x18\n\x07trigger\x18\x05\x20\x01(\tR\x07t\
+    rigger\":\n\tTierDwell\x12\x12\n\x04tier\x18\x01\x20\x01(\tR\x04tier\x12\
+    \x19\n\x08dwell_ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\xd6W\n\x07\x12\x05\
+    \0\0\xb7\x01\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\
+    \x02\0\x16\n\n\n\x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\
+    \x03\x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\
+    \x04\0\x02\0\x05\x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\
+    \x05\t\x17\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x05\x1a\x1b\n\x0b\n\x04\
+    \x04\0\x02\x01\x12\x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\
+    \x06\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x06\t\x17\n\x0c\n\x05\
+    \x04\0\x02\x01\x03\x12\x03\x06\x1a\x1b\n\x0b\n\x04\x04\0\x02\x02\x12\x03\
+    \x07\x02\x20\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x07\x02\x08\n\x0c\n\
+    \x05\x04\0\x02\x02\x01\x12\x03\x07\t\x1b\n\x0c\n\x05\x04\0\x02\x02\x03\
+    \x12\x03\x07\x1e\x1f\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x08\x02%\n\x0c\n\
+    \x05\x04\0\x02\x03\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\
+    \x12\x03\x08\t\x20\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x08#$\n\x0b\n\
+    \x04\x04\0\x02\x04\x12\x03\t\x02'\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\
+    \t\x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\t\t\"\n\x0c\n\x05\x04\0\
     \x02\x04\x03\x12\x03\t%&\n\x0b\n\x04\x04\0\x02\x05\x12\x03\n\x02\x1b\n\
     \x0c\n\x05\x04\0\x02\x05\x05\x12\x03\n\x02\x08\n\x0c\n\x05\x04\0\x02\x05\
     \x01\x12\x03\n\t\x16\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\n\x19\x1a\n\
@@ -2756,7 +2962,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     een\x20share\x20video\x20stats\x20(separate\x20from\x20camera\x20video_s\
     tats\x20field\x206)\n\n\x0c\n\x05\x04\x04\x02\r\x06\x12\x03D\x02\x0c\n\
     \x0c\n\x05\x04\x04\x02\r\x01\x12\x03D\r\x1f\n\x0c\n\x05\x04\x04\x02\r\
-    \x03\x12\x03D\"$\n\x0b\n\x02\x04\x05\x12\x05G\0\x99\x01\x01\n\n\n\x03\
+    \x03\x12\x03D\"$\n\x0b\n\x02\x04\x05\x12\x05G\0\xaa\x01\x01\n\n\n\x03\
     \x04\x05\x01\x12\x03G\x08\x14\n\x0b\n\x04\x04\x05\x02\0\x12\x03H\x02\x18\
     \n\x0c\n\x05\x04\x05\x02\0\x05\x12\x03H\x02\x08\n\x0c\n\x05\x04\x05\x02\
     \0\x01\x12\x03H\t\x13\n\x0c\n\x05\x04\x05\x02\0\x03\x12\x03H\x16\x17\n\
@@ -2971,36 +3177,83 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x05\x04\x05\x021\x03\x12\x04\x97\x018:\n\x0c\n\x04\x04\x05\x022\x12\
     \x04\x98\x01\x026\n\r\n\x05\x04\x05\x022\x04\x12\x04\x98\x01\x02\n\n\r\n\
     \x05\x04\x05\x022\x05\x12\x04\x98\x01\x0b\x11\n\r\n\x05\x04\x05\x022\x01\
-    \x12\x04\x98\x01\x120\n\r\n\x05\x04\x05\x022\x03\x12\x04\x98\x0135\n\x0c\
-    \n\x02\x04\x06\x12\x06\x9b\x01\0\xa1\x01\x01\n\x0b\n\x03\x04\x06\x01\x12\
-    \x04\x9b\x01\x08\x16\n\x1e\n\x04\x04\x06\x02\0\x12\x04\x9c\x01\x02\x17\"\
-    \x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\
-    \x9c\x01\x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\x9c\x01\t\x12\n\r\n\
-    \x05\x04\x06\x02\0\x03\x12\x04\x9c\x01\x15\x16\n*\n\x04\x04\x06\x02\x01\
-    \x12\x04\x9d\x01\x02\x14\"\x1c\x20\"video\",\x20\"audio\",\x20\"screen\"\
-    \n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\x9d\x01\x02\x08\n\r\n\x05\x04\
-    \x06\x02\x01\x01\x12\x04\x9d\x01\t\x0f\n\r\n\x05\x04\x06\x02\x01\x03\x12\
-    \x04\x9d\x01\x12\x13\n9\n\x04\x04\x06\x02\x02\x12\x04\x9e\x01\x02\x17\"+\
-    \x20tier\x20label\x20e.g.\x20\"hd_1080p\",\x20\"medium_480p\"\n\n\r\n\
-    \x05\x04\x06\x02\x02\x05\x12\x04\x9e\x01\x02\x08\n\r\n\x05\x04\x06\x02\
-    \x02\x01\x12\x04\x9e\x01\t\x12\n\r\n\x05\x04\x06\x02\x02\x03\x12\x04\x9e\
-    \x01\x15\x16\n\x1a\n\x04\x04\x06\x02\x03\x12\x04\x9f\x01\x02\x15\"\x0c\
-    \x20tier\x20label\n\n\r\n\x05\x04\x06\x02\x03\x05\x12\x04\x9f\x01\x02\
-    \x08\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\x9f\x01\t\x10\n\r\n\x05\x04\
-    \x06\x02\x03\x03\x12\x04\x9f\x01\x13\x14\n>\n\x04\x04\x06\x02\x04\x12\
-    \x04\xa0\x01\x02\x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"congestion\",\
-    \x20\"coordination\"\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\xa0\x01\x02\
-    \x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\xa0\x01\t\x10\n\r\n\x05\x04\
-    \x06\x02\x04\x03\x12\x04\xa0\x01\x13\x14\n\x0c\n\x02\x04\x07\x12\x06\xa3\
-    \x01\0\xa6\x01\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\xa3\x01\x08\x11\n,\n\
-    \x04\x04\x07\x02\0\x12\x04\xa4\x01\x02\x12\"\x1e\x20Tier\x20label\x20(e.\
-    g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x07\x02\0\x05\x12\x04\xa4\x01\x02\
-    \x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\xa4\x01\t\r\n\r\n\x05\x04\x07\
-    \x02\0\x03\x12\x04\xa4\x01\x10\x11\n<\n\x04\x04\x07\x02\x01\x12\x04\xa5\
-    \x01\x02\x16\".\x20Time\x20spent\x20in\x20this\x20tier\x20before\x20tran\
-    sitioning\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\x04\xa5\x01\x02\x08\n\r\n\
-    \x05\x04\x07\x02\x01\x01\x12\x04\xa5\x01\t\x11\n\r\n\x05\x04\x07\x02\x01\
-    \x03\x12\x04\xa5\x01\x14\x15b\x06proto3\
+    \x12\x04\x98\x01\x120\n\r\n\x05\x04\x05\x022\x03\x12\x04\x98\x0135\n\x82\
+    \x01\n\x04\x04\x05\x023\x12\x04\x9b\x01\x02$\x1aS\x20TELEM-7:\x20Static\
+    \x20client\x20metadata\x20(re-sent\x20every\x20packet\x20for\x20late-joi\
+    ning\x20observers)\n\"\x1f\x20navigator.hardwareConcurrency\n\n\r\n\x05\
+    \x04\x05\x023\x04\x12\x04\x9b\x01\x02\n\n\r\n\x05\x04\x05\x023\x05\x12\
+    \x04\x9b\x01\x0b\x11\n\r\n\x05\x04\x05\x023\x01\x12\x04\x9b\x01\x12\x1e\
+    \n\r\n\x05\x04\x05\x023\x03\x12\x04\x9b\x01!#\n\"\n\x04\x04\x05\x024\x12\
+    \x04\x9c\x01\x02+\"\x14\x20\"x86\"\x20|\x20\"arm\"\x20|\x20\"\"\n\n\r\n\
+    \x05\x04\x05\x024\x04\x12\x04\x9c\x01\x02\n\n\r\n\x05\x04\x05\x024\x05\
+    \x12\x04\x9c\x01\x0b\x11\n\r\n\x05\x04\x05\x024\x01\x12\x04\x9c\x01\x12%\
+    \n\r\n\x05\x04\x05\x024\x03\x12\x04\x9c\x01(*\n*\n\x04\x04\x05\x025\x12\
+    \x04\x9d\x01\x02)\"\x1c\x20Normalized\x20GPU\x20family\x20name\n\n\r\n\
+    \x05\x04\x05\x025\x04\x12\x04\x9d\x01\x02\n\n\r\n\x05\x04\x05\x025\x05\
+    \x12\x04\x9d\x01\x0b\x11\n\r\n\x05\x04\x05\x025\x01\x12\x04\x9d\x01\x12#\
+    \n\r\n\x05\x04\x05\x025\x03\x12\x04\x9d\x01&(\n.\n\x04\x04\x05\x026\x12\
+    \x04\x9e\x01\x025\"\x20\x20\"4g\"\x20|\x20\"3g\"\x20|\x20\"2g\"\x20|\x20\
+    \"slow-2g\"\n\n\r\n\x05\x04\x05\x026\x04\x12\x04\x9e\x01\x02\n\n\r\n\x05\
+    \x04\x05\x026\x05\x12\x04\x9e\x01\x0b\x11\n\r\n\x05\x04\x05\x026\x01\x12\
+    \x04\x9e\x01\x12/\n\r\n\x05\x04\x05\x026\x03\x12\x04\x9e\x0124\n.\n\x04\
+    \x04\x05\x027\x12\x04\x9f\x01\x02/\"\x20\x20Mbps\x20from\x20navigator.co\
+    nnection\n\n\r\n\x05\x04\x05\x027\x04\x12\x04\x9f\x01\x02\n\n\r\n\x05\
+    \x04\x05\x027\x05\x12\x04\x9f\x01\x0b\x11\n\r\n\x05\x04\x05\x027\x01\x12\
+    \x04\x9f\x01\x12)\n\r\n\x05\x04\x05\x027\x03\x12\x04\x9f\x01,.\n,\n\x04\
+    \x04\x05\x028\x12\x04\xa0\x01\x02*\"\x1e\x20ms\x20from\x20navigator.conn\
+    ection\n\n\r\n\x05\x04\x05\x028\x04\x12\x04\xa0\x01\x02\n\n\r\n\x05\x04\
+    \x05\x028\x05\x12\x04\xa0\x01\x0b\x11\n\r\n\x05\x04\x05\x028\x01\x12\x04\
+    \xa0\x01\x12$\n\r\n\x05\x04\x05\x028\x03\x12\x04\xa0\x01')\n*\n\x04\x04\
+    \x05\x029\x12\x04\xa1\x01\x02-\"\x1c\x20Battery\x20API\x20charging\x20st\
+    ate\n\n\r\n\x05\x04\x05\x029\x04\x12\x04\xa1\x01\x02\n\n\r\n\x05\x04\x05\
+    \x029\x05\x12\x04\xa1\x01\x0b\x0f\n\r\n\x05\x04\x05\x029\x01\x12\x04\xa1\
+    \x01\x10'\n\r\n\x05\x04\x05\x029\x03\x12\x04\xa1\x01*,\n)\n\x04\x04\x05\
+    \x02:\x12\x04\xa2\x01\x02,\"\x1b\x20Battery\x20API\x20level\x200.0-1.0\n\
+    \n\r\n\x05\x04\x05\x02:\x04\x12\x04\xa2\x01\x02\n\n\r\n\x05\x04\x05\x02:\
+    \x05\x12\x04\xa2\x01\x0b\x11\n\r\n\x05\x04\x05\x02:\x01\x12\x04\xa2\x01\
+    \x12&\n\r\n\x05\x04\x05\x02:\x03\x12\x04\xa2\x01)+\n1\n\x04\x04\x05\x02;\
+    \x12\x04\xa3\x01\x02/\"#\x20TELEM-6\x20benchmark\x20iteration\x20count\n\
+    \n\r\n\x05\x04\x05\x02;\x04\x12\x04\xa3\x01\x02\n\n\r\n\x05\x04\x05\x02;\
+    \x05\x12\x04\xa3\x01\x0b\x11\n\r\n\x05\x04\x05\x02;\x01\x12\x04\xa3\x01\
+    \x12)\n\r\n\x05\x04\x05\x02;\x03\x12\x04\xa3\x01,.\nV\n\x04\x04\x05\x02<\
+    \x12\x04\xa6\x01\x02-\x1aH\x20TELEM-8:\x20Long\x20task\x20durations\x20a\
+    ccumulated\x20since\x20last\x20health\x20packet\x20(ms)\n\n\r\n\x05\x04\
+    \x05\x02<\x04\x12\x04\xa6\x01\x02\n\n\r\n\x05\x04\x05\x02<\x05\x12\x04\
+    \xa6\x01\x0b\x11\n\r\n\x05\x04\x05\x02<\x01\x12\x04\xa6\x01\x12'\n\r\n\
+    \x05\x04\x05\x02<\x03\x12\x04\xa6\x01*,\nD\n\x04\x04\x05\x02=\x12\x04\
+    \xa9\x01\x02\"\x1a6\x20TELEM-9:\x20Main-thread\x20rAF\x20cadence\x20(fra\
+    mes\x20per\x20second)\n\n\r\n\x05\x04\x05\x02=\x04\x12\x04\xa9\x01\x02\n\
+    \n\r\n\x05\x04\x05\x02=\x05\x12\x04\xa9\x01\x0b\x11\n\r\n\x05\x04\x05\
+    \x02=\x01\x12\x04\xa9\x01\x12\x1c\n\r\n\x05\x04\x05\x02=\x03\x12\x04\xa9\
+    \x01\x1f!\n\x0c\n\x02\x04\x06\x12\x06\xac\x01\0\xb2\x01\x01\n\x0b\n\x03\
+    \x04\x06\x01\x12\x04\xac\x01\x08\x16\n\x1e\n\x04\x04\x06\x02\0\x12\x04\
+    \xad\x01\x02\x17\"\x10\x20\"up\"\x20or\x20\"down\"\n\n\r\n\x05\x04\x06\
+    \x02\0\x05\x12\x04\xad\x01\x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\
+    \xad\x01\t\x12\n\r\n\x05\x04\x06\x02\0\x03\x12\x04\xad\x01\x15\x16\n*\n\
+    \x04\x04\x06\x02\x01\x12\x04\xae\x01\x02\x14\"\x1c\x20\"video\",\x20\"au\
+    dio\",\x20\"screen\"\n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\xae\x01\x02\
+    \x08\n\r\n\x05\x04\x06\x02\x01\x01\x12\x04\xae\x01\t\x0f\n\r\n\x05\x04\
+    \x06\x02\x01\x03\x12\x04\xae\x01\x12\x13\n9\n\x04\x04\x06\x02\x02\x12\
+    \x04\xaf\x01\x02\x17\"+\x20tier\x20label\x20e.g.\x20\"hd_1080p\",\x20\"m\
+    edium_480p\"\n\n\r\n\x05\x04\x06\x02\x02\x05\x12\x04\xaf\x01\x02\x08\n\r\
+    \n\x05\x04\x06\x02\x02\x01\x12\x04\xaf\x01\t\x12\n\r\n\x05\x04\x06\x02\
+    \x02\x03\x12\x04\xaf\x01\x15\x16\n\x1a\n\x04\x04\x06\x02\x03\x12\x04\xb0\
+    \x01\x02\x15\"\x0c\x20tier\x20label\n\n\r\n\x05\x04\x06\x02\x03\x05\x12\
+    \x04\xb0\x01\x02\x08\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\xb0\x01\t\x10\
+    \n\r\n\x05\x04\x06\x02\x03\x03\x12\x04\xb0\x01\x13\x14\n>\n\x04\x04\x06\
+    \x02\x04\x12\x04\xb1\x01\x02\x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"con\
+    gestion\",\x20\"coordination\"\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\
+    \xb1\x01\x02\x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\xb1\x01\t\x10\n\r\
+    \n\x05\x04\x06\x02\x04\x03\x12\x04\xb1\x01\x13\x14\n\x0c\n\x02\x04\x07\
+    \x12\x06\xb4\x01\0\xb7\x01\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\xb4\x01\
+    \x08\x11\n,\n\x04\x04\x07\x02\0\x12\x04\xb5\x01\x02\x12\"\x1e\x20Tier\
+    \x20label\x20(e.g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x07\x02\0\x05\x12\
+    \x04\xb5\x01\x02\x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\xb5\x01\t\r\n\r\
+    \n\x05\x04\x07\x02\0\x03\x12\x04\xb5\x01\x10\x11\n<\n\x04\x04\x07\x02\
+    \x01\x12\x04\xb6\x01\x02\x16\".\x20Time\x20spent\x20in\x20this\x20tier\
+    \x20before\x20transitioning\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\x04\xb6\
+    \x01\x02\x08\n\r\n\x05\x04\x07\x02\x01\x01\x12\x04\xb6\x01\t\x11\n\r\n\
+    \x05\x04\x07\x02\x01\x03\x12\x04\xb6\x01\x14\x15b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

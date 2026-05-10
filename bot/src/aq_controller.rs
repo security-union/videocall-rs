@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use videocall_aq::constants::{AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
-use videocall_aq::{default_clock, Clock, EncoderBitrateController};
+use videocall_aq::{default_clock, Clock, EncoderBitrateController, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
 #[cfg(feature = "metrics")]
@@ -313,6 +313,27 @@ impl BotAq {
         }
     }
 
+    /// Drain buffered tier-transition events from the inner controller.
+    ///
+    /// Mirrors the browser's per-heartbeat drain in
+    /// `videocall-client/src/health_reporter.rs` so bot HealthPackets populate
+    /// `HealthPacket.tier_transitions` with the same shape as real browsers,
+    /// letting Prometheus counter `videocall_tier_transition_total` increment
+    /// for bot meetings. Returns an empty `Vec` if the mutex is poisoned
+    /// (non-critical path — log and continue, matching `process_diagnostics`).
+    pub fn drain_tier_transitions(&self) -> Vec<TierTransitionRecord> {
+        let mut ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "BotAq: controller mutex poisoned on drain_tier_transitions, recovering: {e}"
+                );
+                e.into_inner()
+            }
+        };
+        ctrl.drain_tier_transitions()
+    }
+
     /// Push the latest AQ telemetry into the Prometheus gauges. No-op when
     /// no metrics handle has been installed.
     #[cfg(feature = "metrics")]
@@ -424,6 +445,57 @@ impl BotAq {
     /// Last bitrate_ratio (pid_clamped / tier_ideal) for health reporting.
     pub fn last_bitrate_ratio(&self) -> f32 {
         f32::from_bits(self.last_bitrate_ratio_bits.load(Ordering::Relaxed))
+    }
+
+    /// Snapshot the climb-rate limiter state for health reporting.
+    ///
+    /// Returns `(crash_ceiling_active, crash_ceiling_tier_index, crash_ceiling_decay_ms,
+    /// step_up_blocked_ceiling, step_up_blocked_slowdown, step_up_blocked_screen_share)`.
+    pub fn snapshot_climb_limiter(&self) -> (bool, Option<u32>, Option<f64>, u64, u64, u64) {
+        let ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "BotAq: controller mutex poisoned on snapshot_climb_limiter, recovering: {e}"
+                );
+                e.into_inner()
+            }
+        };
+        let (blocked_ceiling, blocked_slowdown, blocked_screen) = ctrl.step_up_blocked_counts();
+        match ctrl.crash_ceiling_info() {
+            Some((idx, _label, decay_ms)) => (
+                true,
+                Some(idx as u32),
+                Some(decay_ms),
+                blocked_ceiling,
+                blocked_slowdown,
+                blocked_screen,
+            ),
+            None => (
+                false,
+                None,
+                None,
+                blocked_ceiling,
+                blocked_slowdown,
+                blocked_screen,
+            ),
+        }
+    }
+
+    /// Drain accumulated tier dwell-time samples for health reporting.
+    ///
+    /// Returns `Vec<(tier_label, dwell_ms)>`. The inner controller accumulates
+    /// dwell samples on every tier transition; draining once per health tick
+    /// matches the browser's pattern.
+    pub fn drain_dwell_samples(&self) -> Vec<(&'static str, f64)> {
+        let mut ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("BotAq: controller mutex poisoned on drain_dwell_samples, recovering: {e}");
+                e.into_inner()
+            }
+        };
+        ctrl.drain_dwell_samples()
     }
 
     /// Access the target-FPS atomic — the PID uses this as its setpoint.

@@ -142,11 +142,15 @@
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
 //! );
+//! use std::sync::atomic::AtomicBool;
+//! use std::rc::Rc;
+//! let screen_sharing_active = Rc::new(AtomicBool::new(false));
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
 //!     Callback::noop(),
-//!     Callback::noop() // on_state_change callback for screen share events
+//!     Callback::noop(), // on_state_change callback for screen share events
+//!     screen_sharing_active,
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -223,6 +227,7 @@ pub mod encode;
 pub mod health_reporter;
 pub mod long_tasks;
 mod media_devices;
+pub mod render_fps;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;

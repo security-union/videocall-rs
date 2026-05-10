@@ -40,6 +40,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           clean: false
+          path: backend-repo
 
       # Isolate this runner's docker compose project from the other 3 runners
       # on the same host. Without this, parallel jobs share the same
@@ -54,27 +55,33 @@ jobs:
         # Stable per-runner name (not per-run): a per-run unique name makes the
         # pre-teardown below a no-op (new project doesn't exist yet), so volumes
         # from every prior run accumulate on disk until the host fills up.
+        working-directory: backend-repo
         run: echo "COMPOSE_PROJECT_NAME=vc-${RUNNER_NAME}" >> "$GITHUB_ENV"
 
       - name: Tear down any prior project state for this runner
         # Scoped to this runner's project only — does NOT affect other runners'
         # running containers or networks.
+        working-directory: backend-repo
         run: docker compose -f docker/docker-compose.integration.yaml down -v --remove-orphans || true
 
       - name: Prune unused volumes
         # Removes any volumes not attached to a running container (including
         # stale volumes from prior runs). Safe: Docker refuses to remove
         # in-use volumes regardless of this command.
+        working-directory: backend-repo
         run: sudo docker volume prune -f || true
 
       - name: Pre-create target dirs to prevent Docker from initializing them as root
+        working-directory: backend-repo
         run: mkdir -p actix-api/target
 
       - name: Run backend tests
+        working-directory: backend-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: make tests_run
 
       - name: Teardown
         if: always()
+        working-directory: backend-repo
         run: make tests_down

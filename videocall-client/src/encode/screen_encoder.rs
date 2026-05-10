@@ -181,7 +181,7 @@ pub struct ScreenEncoder {
     /// Shared flag for cross-stream bandwidth coordination. Set to `true` when
     /// screen capture starts, `false` when it stops. The `CameraEncoder` reads
     /// this to drop its quality tier and prevent bandwidth contention.
-    screen_sharing_active: Option<Rc<AtomicBool>>,
+    screen_sharing_active: Rc<AtomicBool>,
     /// Signal set by ConnectionManager when a server re-election completes.
     /// Consumed by the screen encoder control loop to suppress false crash
     /// ceiling arming during the transient.
@@ -199,6 +199,7 @@ impl ScreenEncoder {
     /// * `bitrate_kbps` - initial bitrate in kilobits per second
     /// * `on_encoder_settings_update` - callback for encoder settings updates (e.g., bitrate changes)
     /// * `on_state_change` - callback for screen share state changes (started, cancelled, stopped)
+    /// * `screen_sharing_active` - shared coordination flag; obtain from [`CameraEncoder::screen_sharing_flag()`](crate::CameraEncoder::screen_sharing_flag)
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     pub fn new(
@@ -206,6 +207,7 @@ impl ScreenEncoder {
         bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
         on_state_change: Callback<ScreenShareEvent>,
+        screen_sharing_active: Rc<AtomicBool>,
     ) -> Self {
         let default_tier = &SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX];
         Self {
@@ -221,26 +223,17 @@ impl ScreenEncoder {
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
-            screen_sharing_active: None,
+            screen_sharing_active,
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             shared_screen_tier_index: Rc::new(AtomicU32::new(DEFAULT_SCREEN_TIER_INDEX as u32)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    /// Set the shared screen-sharing-active flag for cross-stream coordination.
-    ///
-    /// This flag is read by the `CameraEncoder` to drop its quality tier when
-    /// screen share is active, preventing bandwidth contention.
-    pub fn set_screen_sharing_flag(&mut self, flag: Rc<AtomicBool>) {
-        self.screen_sharing_active = Some(flag);
-    }
-
     /// Replace the internal re-election completed signal with an externally-owned one.
     pub fn set_reelection_completed_signal(&mut self, signal: Rc<AtomicBool>) {
         self.reelection_completed_signal = signal;
     }
-
     /// Returns the current screen share quality tier index (0=high, 1=medium, 2=low).
     pub fn shared_screen_tier_index(&self) -> Rc<AtomicU32> {
         self.shared_screen_tier_index.clone()
@@ -380,9 +373,7 @@ impl ScreenEncoder {
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
         // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        if let Some(ref flag) = self.screen_sharing_active {
-            flag.store(false, Ordering::Release);
-        }
+        self.screen_sharing_active.store(false, Ordering::Release);
 
         // Signal the encoding loop to exit
         self.state.stop();
@@ -718,19 +709,11 @@ impl ScreenEncoder {
         tier_keyframe_interval: Rc<AtomicU32>,
         force_keyframe: Arc<AtomicBool>,
         active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
-        screen_sharing_active: Option<Rc<AtomicBool>>,
+        screen_sharing_active: Rc<AtomicBool>,
     ) {
         // Signal camera encoder ASAP after capture is confirmed so it begins
         // stepping down during encoder setup, not after encoding starts.
-        if let Some(ref flag) = screen_sharing_active {
-            flag.store(true, Ordering::Release);
-        } else {
-            log::warn!(
-                "ScreenEncoder: screen_sharing_active flag not wired — \
-                 camera bandwidth coordination will not engage. \
-                 Ensure host.rs calls screen.set_screen_sharing_flag(camera.screen_sharing_flag())"
-            );
-        }
+        screen_sharing_active.store(true, Ordering::Release);
 
         screen_stream.borrow_mut().replace(screen_to_share.clone());
 
@@ -750,9 +733,7 @@ impl ScreenEncoder {
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
             // Clear screen-sharing flag so camera drops its ceiling
-            if let Some(ref flag) = screen_sharing_active {
-                flag.store(false, Ordering::Release);
-            }
+            screen_sharing_active.store(false, Ordering::Release);
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -766,6 +747,12 @@ impl ScreenEncoder {
         });
 
         let mut restart_count: u32 = 0;
+        // Maximum restart attempts before surfacing on_error. Sized for the
+        // narrow fatal signatures matched by is_fatal_encoder_error_message:
+        // the closed-codec InvalidStateError and the VPX allocation failure.
+        // Those usually clear within 1-2 retries; 5 gives headroom for a
+        // short cascade without spinning forever if the browser is wedged.
+        // Revisit this cap if the fatal-error classifier is broadened.
         const MAX_RESTARTS: u32 = 5;
         let mut media_acquired = true; // true because we already have a stream
 
@@ -967,9 +954,7 @@ impl ScreenEncoder {
 
                 // Signal camera encoder ASAP after capture is confirmed so it begins
                 // stepping down during encoder setup, not after encoding starts.
-                if let Some(ref flag) = screen_sharing_active {
-                    flag.store(true, Ordering::Release);
-                }
+                screen_sharing_active.store(true, Ordering::Release);
 
                 screen_stream.borrow_mut().replace(acquired_stream.clone());
 
@@ -1004,9 +989,7 @@ impl ScreenEncoder {
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
                         enabled_clone.store(false, Ordering::Release);
-                        if let Some(ref flag) = screen_sharing_flag_clone {
-                            flag.store(false, Ordering::Release);
-                        }
+                        screen_sharing_flag_clone.store(false, Ordering::Release);
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -1059,9 +1042,7 @@ impl ScreenEncoder {
                     let handler = Closure::wrap(Box::new(move || {
                         log::info!("Screen share track ended (user stopped sharing)");
                         enabled_clone.store(false, Ordering::Release);
-                        if let Some(ref flag) = screen_sharing_flag_clone {
-                            flag.store(false, Ordering::Release);
-                        }
+                        screen_sharing_flag_clone.store(false, Ordering::Release);
                         client_onended.set_screen_enabled(false);
                         if let Some(ref callback) = on_state_change_clone {
                             callback.emit(ScreenShareEvent::Stopped);
@@ -1482,9 +1463,7 @@ impl ScreenEncoder {
         }
 
         // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        if let Some(ref flag) = screen_sharing_active {
-            flag.store(false, Ordering::Release);
-        }
+        screen_sharing_active.store(false, Ordering::Release);
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet

@@ -348,10 +348,22 @@ impl MicrophoneEncoder {
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
 
+            // Always request browser audio processing as "ideal" hints. AEC
+            // is what stops a peer's speakers feeding back into their mic;
+            // without it, every peer becomes a self-feedback path for the
+            // talker. Confirmed in the 2026-05-08 production logs: the mic
+            // stream went through the explicit-deviceId branch with none of
+            // these flags set, and the user heard themselves via peers'
+            // failing AEC. Use plain `true` (ideal) rather than
+            // `{ exact: true }` so the browser may downgrade silently on
+            // virtual audio devices instead of failing the stream.
+            media_info.set_echo_cancellation(&JsValue::TRUE);
+            media_info.set_noise_suppression(&JsValue::TRUE);
+            media_info.set_auto_gain_control(&JsValue::TRUE);
+
             // Force exact deviceId match (avoids falling back to the default mic).
             if device_id.is_empty() {
                 log::warn!("Microphone device_id is empty, using default constraint");
-                constraints.set_audio(&JsValue::TRUE);
             } else {
                 let exact = js_sys::Object::new();
                 js_sys::Reflect::set(
@@ -363,8 +375,8 @@ impl MicrophoneEncoder {
 
                 log::info!("MicrophoneEncoder: deviceId.exact = {}", device_id);
                 media_info.set_device_id(&exact.into());
-                constraints.set_audio(&media_info.into());
             }
+            constraints.set_audio(&media_info.into());
 
             constraints.set_video(&Boolean::from(false));
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
@@ -432,6 +444,41 @@ impl MicrophoneEncoder {
             };
 
             log::info!("Microphone input sample rate: {input_rate} Hz");
+
+            // Diagnostic: log what the browser actually applied for AEC/NS/AGC
+            // (and the other fields we asked for). We request these as "ideal"
+            // hints — the browser may silently downgrade depending on driver,
+            // OS audio profile, or virtual device. If we hit another self-echo
+            // report, we want to be able to confirm from logs whether the
+            // browser honored the request, before chasing other suspects.
+            {
+                let read = |key: &str| -> String {
+                    match js_sys::Reflect::get(&track_settings, &JsValue::from_str(key)) {
+                        Ok(v) if v.is_undefined() || v.is_null() => "<unset>".to_string(),
+                        Ok(v) => {
+                            if let Some(b) = v.as_bool() {
+                                b.to_string()
+                            } else if let Some(f) = v.as_f64() {
+                                f.to_string()
+                            } else if let Some(s) = v.as_string() {
+                                s
+                            } else {
+                                format!("{v:?}")
+                            }
+                        }
+                        Err(_) => "<error>".to_string(),
+                    }
+                };
+                log::info!(
+                    "Microphone applied settings: echoCancellation={}, noiseSuppression={}, autoGainControl={}, sampleRate={}, channelCount={}, deviceId={}",
+                    read("echoCancellation"),
+                    read("noiseSuppression"),
+                    read("autoGainControl"),
+                    read("sampleRate"),
+                    read("channelCount"),
+                    read("deviceId"),
+                );
+            }
 
             // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
             let options = AudioContextOptions::new();

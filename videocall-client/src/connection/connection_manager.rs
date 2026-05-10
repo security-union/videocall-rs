@@ -6045,7 +6045,9 @@ mod tests {
         mgr.start_reelection().unwrap();
 
         assert_eq!(
-            mgr.old_active_rtt_measurement.as_ref().map(|m| m.is_webtransport),
+            mgr.old_active_rtt_measurement
+                .as_ref()
+                .map(|m| m.is_webtransport),
             Some(false),
             "measurement snapshot should preserve transport type"
         );

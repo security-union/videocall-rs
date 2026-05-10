@@ -91,7 +91,10 @@ mod tests {
 
     #[test]
     fn mint_token_applies_ttl_to_expiry() {
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let token = mint_token("secret", "bot-1", "room-123", 120).unwrap();
         let decoded = decode::<RoomAccessTokenClaims>(
             &token,
@@ -99,7 +102,10 @@ mod tests {
             &Validation::default(),
         )
         .unwrap();
-        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
         assert!(decoded.claims.exp >= before + 120);
         assert!(decoded.claims.exp <= after + 120);

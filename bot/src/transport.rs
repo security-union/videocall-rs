@@ -200,7 +200,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(url.as_str(), "wss://relay.example.com/lobby/bot-1/meeting-1");
+        assert_eq!(
+            url.as_str(),
+            "wss://relay.example.com/lobby/bot-1/meeting-1"
+        );
     }
 
     #[test]

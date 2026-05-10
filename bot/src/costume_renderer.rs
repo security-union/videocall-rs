@@ -40,8 +40,8 @@ impl CostumeRenderer {
         let idle_path = costume_dir.join("idle.i420");
         let talking_path = costume_dir.join("talking.i420");
 
-        let idle_file =
-            File::open(&idle_path).with_context(|| format!("Failed to open {}", idle_path.display()))?;
+        let idle_file = File::open(&idle_path)
+            .with_context(|| format!("Failed to open {}", idle_path.display()))?;
         let talking_file = File::open(&talking_path)
             .with_context(|| format!("Failed to open {}", talking_path.display()))?;
 

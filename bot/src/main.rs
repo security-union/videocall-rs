@@ -20,7 +20,10 @@
 // can share code with the binary. The binary only pulls in what it needs.
 use bot::aq_controller::BotAq;
 use bot::audio_producer::AudioProducer;
-use bot::config::{self, BotConfig, ClientConfig, Manifest, Transport, VideoMode};
+use bot::config::{
+    self, evaluate_costume_memory, BotConfig, ClientConfig, CostumeMemoryDecision, Manifest,
+    Transport, VideoMode,
+};
 use bot::costume_renderer::CostumeRenderer;
 use bot::diagnostics_reporter::{spawn_diagnostics_reporter, DiagnosticsReporterConfig};
 use bot::ekg_renderer::{self, EkgRenderer};
@@ -249,12 +252,33 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(kb_str) = avail_line.split_whitespace().nth(1) {
                         if let Ok(avail_kb) = kb_str.parse::<u64>() {
                             let avail_bytes = avail_kb * 1024;
-                            if total_costume_bytes > avail_bytes * 80 / 100 {
-                                warn!(
-                                    "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM",
-                                    total_gb,
-                                    avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                                );
+                            let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                            match evaluate_costume_memory(
+                                total_costume_bytes,
+                                avail_bytes,
+                                config.strict_memory,
+                            ) {
+                                CostumeMemoryDecision::AbortExceedsAvailable => {
+                                    error!(
+                                        "Costume frames ({:.1} GiB) exceed available memory ({:.1} GiB) — aborting",
+                                        total_gb, avail_gb
+                                    );
+                                    std::process::exit(1);
+                                }
+                                CostumeMemoryDecision::AbortStrictThreshold => {
+                                    error!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — aborting (--strict-memory)",
+                                        total_gb, avail_gb
+                                    );
+                                    std::process::exit(1);
+                                }
+                                CostumeMemoryDecision::Warn => {
+                                    warn!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM (pass --strict-memory to abort)",
+                                        total_gb, avail_gb
+                                    );
+                                }
+                                CostumeMemoryDecision::Ok => {}
                             }
                         }
                     }

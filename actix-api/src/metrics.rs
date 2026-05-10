@@ -379,10 +379,10 @@ lazy_static! {
     )
     .expect("Failed to create adaptive_audio_tier metric");
 
-    /// Datagram drops observed in the latest health snapshot.
+    /// Cumulative datagrams dropped as of the latest client health snapshot.
     pub static ref DATAGRAM_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_datagram_drops",
-        "Datagrams dropped due to locked writable stream in the latest client snapshot",
+        "Cumulative datagrams dropped due to locked writable stream as of the latest client health snapshot",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create datagram_drops metric");
@@ -396,10 +396,10 @@ lazy_static! {
     )
     .expect("Failed to create datagram_drops_total metric");
 
-    /// WebSocket packet drops observed in the latest health snapshot.
+    /// Cumulative WebSocket packet drops as of the latest client health snapshot.
     pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
         "videocall_websocket_drops",
-        "WebSocket packets dropped due to send buffer backpressure in the latest client snapshot",
+        "Cumulative WebSocket packets dropped due to send buffer backpressure as of the latest client health snapshot",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create websocket_drops metric");

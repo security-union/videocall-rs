@@ -124,6 +124,7 @@ impl WebSocketClient {
         inbound_hook: Option<InboundHook>,
     ) -> JoinHandle<()> {
         let user_id = self.config.user_id.clone();
+        #[cfg(feature = "metrics")]
         let meeting_id = self.config.meeting_id.clone();
         let quit = self.quit.clone();
         let pong_tx = self.pong_tx.clone();

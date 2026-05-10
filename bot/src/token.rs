@@ -17,11 +17,11 @@
 //! validator (HMAC-SHA256, issuer = "videocall-meeting-backend").
 
 use jsonwebtoken::{encode, EncodingKey, Header};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// JWT claims matching `RoomAccessTokenClaims` in videocall-meeting-types.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RoomAccessTokenClaims {
     pub sub: String,
     pub room: String,
@@ -62,4 +62,46 @@ pub fn mint_token(
     )?;
 
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mint_token, RoomAccessTokenClaims};
+    use jsonwebtoken::{decode, DecodingKey, Validation};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mint_token_sets_expected_claims() {
+        let token = mint_token("secret", "bot-1", "room-123", 300).unwrap();
+        let decoded = decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(b"secret"),
+            &Validation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(decoded.claims.sub, "bot-1");
+        assert_eq!(decoded.claims.room, "room-123");
+        assert!(decoded.claims.room_join);
+        assert!(!decoded.claims.is_host);
+        assert_eq!(decoded.claims.display_name, "bot-1");
+        assert!(!decoded.claims.observer);
+        assert_eq!(decoded.claims.iss, "videocall-meeting-backend");
+    }
+
+    #[test]
+    fn mint_token_applies_ttl_to_expiry() {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let token = mint_token("secret", "bot-1", "room-123", 120).unwrap();
+        let decoded = decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(b"secret"),
+            &Validation::default(),
+        )
+        .unwrap();
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        assert!(decoded.claims.exp >= before + 120);
+        assert!(decoded.claims.exp <= after + 120);
+    }
 }

@@ -19,7 +19,7 @@ use axum::http;
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
-use meeting_api::{routes, state::AppState, token::generate_session_token};
+use meeting_api::{config::DevUser, routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 
@@ -52,7 +52,19 @@ pub async fn cleanup_test_data(pool: &PgPool, room_id: &str) {
 }
 
 /// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
+/// `dev_user` is `None` — the auto-login endpoint returns 404.
 pub fn build_app(pool: PgPool) -> Router {
+    build_app_inner(pool, None)
+}
+
+/// Build the Axum router with a specific `DEV_USER` identity configured.
+/// Allows integration tests to exercise the auto-login happy path without
+/// setting an environment variable.
+pub fn build_app_with_dev_user(pool: PgPool, dev_user: DevUser) -> Router {
+    build_app_inner(pool, Some(dev_user))
+}
+
+fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
     let state = AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
@@ -72,7 +84,7 @@ pub fn build_app(pool: PgPool) -> Router {
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
         display_name_rate_limit_disabled: false,
-        dev_user: None,
+        dev_user,
     };
     routes::router().with_state(state)
 }

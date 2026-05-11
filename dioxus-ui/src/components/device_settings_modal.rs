@@ -305,24 +305,17 @@ pub fn DeviceSettingsModal(
     #[props(default)] initial_section: Option<String>,
 ) -> Element {
     let is_ios_safari = is_ios();
-    let mut active_section = use_signal(|| SettingsSection::Audio);
+    // The parent uses a `key` (generation counter) to recreate this component
+    // each time the modal opens, so `use_signal`'s initializer runs fresh with
+    // the correct starting section.  No render-body signal mutations needed.
+    let initial = match initial_section.as_deref() {
+        Some("appearance") => SettingsSection::Appearance,
+        Some("network") => SettingsSection::Network,
+        Some("video") => SettingsSection::Video,
+        _ => SettingsSection::Audio,
+    };
+    let mut active_section = use_signal(move || initial);
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
-
-    // When the modal opens with an initial_section hint, jump to that tab.
-    let mut prev_visible = use_signal(|| false);
-    if visible && !prev_visible() {
-        if let Some(ref section) = initial_section {
-            match section.as_str() {
-                "appearance" => active_section.set(SettingsSection::Appearance),
-                "network" => active_section.set(SettingsSection::Network),
-                "video" => active_section.set(SettingsSection::Video),
-                _ => active_section.set(SettingsSection::Audio),
-            }
-        } else {
-            active_section.set(SettingsSection::Audio);
-        }
-    }
-    prev_visible.set(visible);
     let mut sticky_transport = use_signal(load_transport_sticky);
     let mut pending_protocol = use_signal(|| transport_preference);
 

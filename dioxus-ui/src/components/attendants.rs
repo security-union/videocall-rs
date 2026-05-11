@@ -708,6 +708,7 @@ pub fn AttendantsComponent(
 
     let mut device_settings_open = use_signal(|| false);
     let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
+    let mut device_settings_generation = use_signal(|| 0u32);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -2859,8 +2860,11 @@ pub fn AttendantsComponent(
                                             open: device_settings_open(),
                                             onclick: move |_| {
                                                 device_settings_initial_section.set(None);
+                                                let was_closed = !device_settings_open();
                                                 device_settings_open.set(!device_settings_open());
-                                                if device_settings_open() {
+                                                if was_closed {
+                                                    device_settings_generation
+                                                        .set(device_settings_generation() + 1);
                                                     peer_list_open.set(false);
                                                     diagnostics_open.set(false);
                                                 }
@@ -2955,7 +2959,10 @@ pub fn AttendantsComponent(
                                                         role: "option",
                                                         onclick: move |e: MouseEvent| {
                                                             e.stop_propagation();
-                                                            device_settings_initial_section.set(Some("appearance".to_string()));
+                                                            device_settings_initial_section
+                                                                .set(Some("appearance".to_string()));
+                                                            device_settings_generation
+                                                                .set(device_settings_generation() + 1);
                                                             device_settings_open.set(true);
                                                             dock_menu_open.set(false);
                                                         },
@@ -3041,6 +3048,7 @@ pub fn AttendantsComponent(
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
                                     device_settings_initial_section: device_settings_initial_section(),
+                                    device_settings_generation: device_settings_generation(),
                                     on_device_settings_toggle: move |_| {
                                         device_settings_initial_section.set(None);
                                         device_settings_open.set(!device_settings_open());

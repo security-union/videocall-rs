@@ -33,10 +33,10 @@ pub fn AppearanceSettingsPanel() -> Element {
     // Hooks must be called unconditionally, so we always create them.
     let fallback_dock = use_signal(|| DockPosition::Bottom);
     let fallback_autohide = use_signal(|| true);
-    let dock_position_ctx = try_use_context::<DockPositionCtx>()
-        .unwrap_or(DockPositionCtx(fallback_dock));
-    let autohide_ctx = try_use_context::<AutohideCtx>()
-        .unwrap_or(AutohideCtx(fallback_autohide));
+    let mut dock_position_ctx =
+        try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
+    let mut autohide_ctx =
+        try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style =
@@ -516,19 +516,25 @@ pub fn AppearanceSettingsPanel() -> Element {
 
             hr { class: "appearance-section-divider" }
 
-            // ── Section 3: Action Bar ───────────────────────────────────────
+            // ── Section 3: Dock Settings ─────────────────────────────────────
             section { class: "appearance-section",
                 div { class: "appearance-section-header",
-                    h3 { class: "appearance-section-title", "Action Bar" }
+                    h3 { class: "appearance-section-title", "Dock Settings" }
                 }
 
-                // Position selector
-                div { class: "action-bar-setting",
-                    label { class: "appearance-control-label", "Position" }
-                    div { class: "action-bar-position-options",
+                // Position selector — reuses transport-segmented styling
+                div { class: "device-setting-group",
+                    span { class: "transport-segmented-label", "Position" }
+                    div {
+                        class: "transport-segmented",
+                        role: "radiogroup",
+                        "aria-label": "Action bar position",
                         for (pos, label) in [(DockPosition::Bottom, "Bottom"), (DockPosition::Left, "Left"), (DockPosition::Right, "Right")] {
                             button {
-                                class: if dock_position_ctx.0() == pos { "action-bar-option selected" } else { "action-bar-option" },
+                                r#type: "button",
+                                role: "radio",
+                                "aria-checked": if dock_position_ctx.0() == pos { "true" } else { "false" },
+                                class: if dock_position_ctx.0() == pos { "transport-segmented-option selected" } else { "transport-segmented-option" },
                                 onclick: move |_| dock_position_ctx.0.set(pos),
                                 "{label}"
                             }
@@ -537,7 +543,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                 }
 
                 // Autohide toggle
-                div { class: "appearance-section-header",
+                div { class: "appearance-section-header dock-autohide-row",
                     label { class: "appearance-section-title appearance-section-title--sm", "Auto-hide" }
                     label {
                         class: "glow-switch",

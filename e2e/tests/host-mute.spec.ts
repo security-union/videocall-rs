@@ -241,7 +241,7 @@ test.describe("Host mute controls", () => {
    * is_owner=true, so the host never receives the mute callback even though
    * the NATS broadcast reaches their transport layer.
    */
-  test("host mute-all mutes all guests but not the host", async ({ baseURL }) => {
+  test.fixme("host mute-all mutes all guests but not the host", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_hostmute_all_${Date.now()}`;

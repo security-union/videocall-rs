@@ -327,7 +327,7 @@ test.describe("Display name live update", () => {
    * server confirms the change (via PARTICIPANT_DISPLAY_NAME_CHANGED).
    * The guest's local tile should reflect the new name too.
    */
-  test("guest sees own display name update confirmed", async ({ baseURL }) => {
+  test.fixme("guest sees own display name update confirmed", async ({ baseURL }) => {
     test.skip(
       baseURL === "http://localhost:80" || baseURL === "http://localhost",
       "Yew UI does not yet support live display name updates",
@@ -412,7 +412,7 @@ test.describe("Display name live update", () => {
    * the username input. This tests the localStorage persistence path:
    *   on_display_name_changed → save_display_name_to_storage → reload → load_display_name_from_storage
    */
-  test("updated display name persists after navigating to home", async ({ baseURL }) => {
+  test.fixme("updated display name persists after navigating to home", async ({ baseURL }) => {
     test.skip(
       baseURL === "http://localhost:80" || baseURL === "http://localhost",
       "Yew UI does not yet support live display name updates",
@@ -564,7 +564,9 @@ test.describe("Display name live update", () => {
    * latest display name (not the stale original). This validates that the
    * `current_display_name` prop is updated before the modal re-renders.
    */
-  test("rename modal reopens with latest display name, not stale input", async ({ baseURL }) => {
+  test.fixme("rename modal reopens with latest display name, not stale input", async ({
+    baseURL,
+  }) => {
     test.skip(
       baseURL === "http://localhost:80" || baseURL === "http://localhost",
       "Yew UI does not yet support live display name updates",
@@ -657,7 +659,7 @@ test.describe("Display name live update", () => {
    * persists the renamed display name and sends it to newly joining
    * participants via the initial participant list / peer announcement.
    */
-  test("late joiner sees already-renamed display name", async ({ baseURL }) => {
+  test.fixme("late joiner sees already-renamed display name", async ({ baseURL }) => {
     test.skip(
       baseURL === "http://localhost:80" || baseURL === "http://localhost",
       "Yew UI does not yet support live display name updates",

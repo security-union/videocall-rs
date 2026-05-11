@@ -74,7 +74,7 @@ async function joinMeetingAs(
  * `tests/two-users-meeting.spec.ts` for the admit flow.
  */
 async function clickJoinAndEnterGrid(page: Page): Promise<void> {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(1000);
   await joinButton.click();
@@ -149,7 +149,9 @@ test.describe("Diagnostics popup — per-peer transport badge", () => {
       for (let i = 1; i < 3; i++) {
         members[i].page = await joinMeetingAs(members[i].context, meetingId, profiles[i].name);
 
-        const joinButton = members[i].page.getByText(/Start Meeting|Join Meeting/);
+        const joinButton = members[i].page.getByRole("button", {
+          name: /Start Meeting|Join Meeting/,
+        });
         const waitingRoom = members[i].page.getByText("Waiting to be admitted");
 
         const result = await Promise.race([

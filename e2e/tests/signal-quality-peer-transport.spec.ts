@@ -63,7 +63,7 @@ async function joinMeetingAs(
  * grid to appear. Mirrors `tests/diagnostics-peer-transport.spec.ts`.
  */
 async function clickJoinAndEnterGrid(page: Page): Promise<void> {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(1000);
   await joinButton.click();
@@ -118,7 +118,9 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
       // Guest joins. Handle either direct-join or waiting-room admit flow.
       members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name);
 
-      const joinButton = members[1].page.getByText(/Start Meeting|Join Meeting/);
+      const joinButton = members[1].page.getByRole("button", {
+        name: /Start Meeting|Join Meeting/,
+      });
       const waitingRoom = members[1].page.getByText("Waiting to be admitted");
 
       const result = await Promise.race([

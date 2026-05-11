@@ -4,6 +4,7 @@
  */
 
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
+use crate::components::color_picker::HsvColorPicker;
 use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
     AppearanceSettingsCtx, GlowColor, Theme, ThemePreferenceCtx, MAX_CUSTOM_COLORS,
@@ -268,7 +269,10 @@ pub fn AppearanceSettingsPanel() -> Element {
                                     let open = !show_picker();
                                     show_picker.set(open);
                                     if open {
-                                        color_input.set(String::new());
+                                        // Seed the hex input with the currently selected
+                                        // glow color so the picker opens on a sensible spot
+                                        // instead of jumping to red.
+                                        color_input.set(appearance.glow_color.to_hex());
                                         input_error.set(false);
                                     }
                                 },
@@ -287,82 +291,144 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                         }
                     }
-                    // Inline custom color popover
+                    // Custom color modal dialog (centered overlay with backdrop)
                     if show_picker() {
-                        // Click-outside overlay (behind the popover)
                         div {
-                            class: "settings-overlay-backdrop",
+                            class: "custom-color-modal-overlay",
+                            role: "presentation",
                             onmousedown: move |_| {
+                                // Backdrop click closes the modal
                                 show_picker.set(false);
+                                color_input.set(String::new());
+                                input_error.set(false);
                                 focus_add_btn();
                             },
-                        }
-                        div {
-                            class: "custom-color-popover settings-popover-surface",
-                            onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
-                            {
-                                let preview_color = GlowColor::from_hex(&color_input());
-                                rsx! {
-                                    div { class: "custom-color-popover-row",
-                                        if let Some(c) = preview_color {
-                                            div {
-                                                class: "custom-color-preview",
-                                                style: format!("--glow-color: {}", c.to_hex()),
-                                            }
-                                        }
-                                        input {
-                                            class: if input_error() {
-                                                "custom-color-input error"
-                                            } else {
-                                                "custom-color-input"
-                                            },
-                                            r#type: "text",
-                                            placeholder: "#RRGGBB",
-                                            maxlength: "7",
-                                            spellcheck: "false",
-                                            autocomplete: "off",
-                                            value: "{color_input}",
-                                            oninput: move |evt: Event<FormData>| {
-                                                color_input.set(evt.value());
-                                                input_error.set(false);
-                                            },
-                                            onkeydown: move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::Escape {
-                                                    show_picker.set(false);
-                                                    focus_add_btn();
+                            onkeydown: move |evt: KeyboardEvent| {
+                                if evt.key() == Key::Escape {
+                                    show_picker.set(false);
+                                    color_input.set(String::new());
+                                    input_error.set(false);
+                                    focus_add_btn();
+                                }
+                            },
+                            div {
+                                class: "custom-color-popover custom-color-modal",
+                                role: "dialog",
+                                "aria-modal": "true",
+                                "aria-labelledby": "custom-color-modal-title",
+                                onmousedown: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                onkeydown: move |evt: KeyboardEvent| {
+                                    if evt.key() == Key::Escape {
+                                        show_picker.set(false);
+                                        color_input.set(String::new());
+                                        input_error.set(false);
+                                        focus_add_btn();
+                                    }
+                                },
+                                {
+                                    // Seed the picker's HSV state from whichever color was
+                                    // selected when the modal opened. Once mounted the
+                                    // picker owns the marker positions and writes back into
+                                    // `color_input` directly.
+                                    let initial_rgb = appearance.glow_color.to_rgb();
+                                    rsx! {
+                                        div { class: "custom-color-modal-header",
+                                            div { class: "custom-color-modal-heading",
+                                                h3 {
+                                                    id: "custom-color-modal-title",
+                                                    class: "custom-color-modal-title",
+                                                    "Choose Custom Color"
                                                 }
-                                            },
-                                        }
-                                        button {
-                                            class: "custom-color-add-btn",
-                                            onclick: move |evt: Event<MouseData>| {
-                                                evt.stop_propagation();
-                                                if let Some(new_color) = GlowColor::from_hex(&color_input()) {
-                                                    let colors = custom_colors();
-                                                    if !colors.contains(&new_color) {
-                                                        let mut colors = colors;
-                                                        colors.push(new_color);
-                                                        save_custom_colors_to_storage(&colors);
-                                                        custom_colors.set(colors);
-                                                    }
-                                                    appearance_ctx.0.set(AppearanceSettings {
-                                                        glow_color: new_color,
-                                                        ..appearance_ctx.0()
-                                                    });
+                                                p { class: "custom-color-modal-subtitle",
+                                                    "Select a color for the glow highlight."
+                                                }
+                                            }
+                                            button {
+                                                class: "custom-color-modal-close",
+                                                r#type: "button",
+                                                "aria-label": "Close",
+                                                onclick: move |evt: Event<MouseData>| {
+                                                    evt.stop_propagation();
                                                     show_picker.set(false);
                                                     color_input.set(String::new());
                                                     input_error.set(false);
-                                                } else {
-                                                    input_error.set(true);
+                                                    focus_add_btn();
+                                                },
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    width: "16",
+                                                    height: "16",
+                                                    "aria-hidden": "true",
+                                                    path {
+                                                        d: "M6 6L18 18M18 6L6 18",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                    }
                                                 }
-                                            },
-                                            "Add"
+                                            }
                                         }
-                                    }
-                                    if input_error() {
-                                        p {
-                                            class: "input-error-message",
-                                            "Invalid format - use #RRGGBB (e.g. #FF5500)"
+                                        div { class: "custom-color-modal-body",
+                                            HsvColorPicker {
+                                                initial_rgb,
+                                                hex_input: color_input,
+                                                input_error,
+                                            }
+                                            // Reserved 18px error slot — keep the height
+                                            // even when no error to avoid layout shift.
+                                            div {
+                                                id: "color-picker-hex-error",
+                                                class: "input-error-slot",
+                                                if input_error() {
+                                                    p {
+                                                        class: "input-error-message",
+                                                        "Invalid format - use #RRGGBB (e.g. #FF5500)" // @token-exempt: example hex in format hint
+                                                    }
+                                                }
+                                            }
+                                            div { class: "custom-color-modal-actions",
+                                                button {
+                                                    class: "custom-color-cancel-btn",
+                                                    r#type: "button",
+                                                    onclick: move |evt: Event<MouseData>| {
+                                                        evt.stop_propagation();
+                                                        show_picker.set(false);
+                                                        color_input.set(String::new());
+                                                        input_error.set(false);
+                                                        focus_add_btn();
+                                                    },
+                                                    "Cancel"
+                                                }
+                                                button {
+                                                    class: "custom-color-add-btn",
+                                                    r#type: "button",
+                                                    disabled: GlowColor::from_hex(&color_input()).is_none(),
+                                                    onclick: move |evt: Event<MouseData>| {
+                                                        evt.stop_propagation();
+                                                        if let Some(new_color) = GlowColor::from_hex(&color_input()) {
+                                                            let colors = custom_colors();
+                                                            if !colors.contains(&new_color) {
+                                                                let mut colors = colors;
+                                                                colors.push(new_color);
+                                                                save_custom_colors_to_storage(&colors);
+                                                                custom_colors.set(colors);
+                                                            }
+                                                            appearance_ctx.0.set(AppearanceSettings {
+                                                                glow_color: new_color,
+                                                                ..appearance_ctx.0()
+                                                            });
+                                                            show_picker.set(false);
+                                                            color_input.set(String::new());
+                                                            input_error.set(false);
+                                                            focus_add_btn();
+                                                        } else {
+                                                            input_error.set(true);
+                                                        }
+                                                    },
+                                                    "Add"
+                                                }
+                                            }
                                         }
                                     }
                                 }

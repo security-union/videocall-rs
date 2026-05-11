@@ -295,8 +295,10 @@ impl WtChatSession {
         media_type: Option<MediaType>,
     ) -> WtSendResult {
         // Priority shedding: when buffer is nearly full, drop video/screen
-        // to protect audio from collateral starvation.
-        if is_media && !is_audio {
+        // to protect audio from collateral starvation. Only shed positively
+        // identified video/screen — encrypted media (unparseable inner) has
+        // media_type=None and must NOT be shed since it could be audio.
+        if matches!(media_type, Some(MediaType::VIDEO) | Some(MediaType::SCREEN)) {
             let remaining = self.outbound_tx.capacity();
             if remaining < crate::constants::wt_outbound_shedding_threshold() {
                 let kind = drop_kind_label(parsed, is_media, media_type);

@@ -135,42 +135,46 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
 /// provides ~6.4MB max queue depth.
 pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
-/// Default shedding threshold for WebTransport outbound queue.
+/// Fraction of outbound channel capacity used as the shedding threshold.
 ///
-/// When remaining channel capacity drops below this value, video and
-/// screen packets are proactively dropped ("shed") while audio and
-/// control packets continue flowing. This protects audio from being
-/// collateral damage during video-induced congestion storms.
+/// When remaining channel capacity drops below `capacity / DIVISOR`,
+/// video and screen packets are proactively dropped ("shed") while
+/// audio and control packets continue flowing. This protects audio
+/// from being collateral damage during video-induced congestion storms.
 ///
-/// Default 512 = 12.5% of the recommended 4096 capacity, providing
-/// roughly 2 seconds of audio-only headroom at typical packet rates
-/// before the buffer is fully exhausted.
-pub const WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT: usize = 512;
+/// Divisor of 8 = 12.5% of capacity. At the default 1024 that is 128
+/// slots; at the recommended 4096 that is 512 slots (~2 seconds of
+/// audio-only headroom at typical packet rates).
+const WT_OUTBOUND_SHEDDING_DIVISOR: usize = 8;
 
 /// Resolve the shedding threshold from `WT_OUTBOUND_SHEDDING_THRESHOLD`
-/// env var, falling back to [`WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT`].
+/// env var, falling back to `wt_outbound_channel_capacity() / 8` (12.5%).
 pub fn wt_outbound_shedding_threshold() -> usize {
     use std::sync::OnceLock;
     static THRESH: OnceLock<usize> = OnceLock::new();
     *THRESH.get_or_init(|| {
-        match std::env::var("WT_OUTBOUND_SHEDDING_THRESHOLD").ok().as_deref() {
+        match std::env::var("WT_OUTBOUND_SHEDDING_THRESHOLD")
+            .ok()
+            .as_deref()
+        {
             Some(value) => match value.parse::<usize>() {
                 Ok(0) => {
-                    tracing::warn!(
-                        "WT_OUTBOUND_SHEDDING_THRESHOLD=0 disables shedding"
-                    );
+                    tracing::warn!("WT_OUTBOUND_SHEDDING_THRESHOLD=0 disables shedding");
                     0
                 }
                 Ok(n) => n,
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to parse WT_OUTBOUND_SHEDDING_THRESHOLD={:?} as usize ({}); falling back to default {}",
-                        value, e, WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT
+                        "Failed to parse WT_OUTBOUND_SHEDDING_THRESHOLD={:?} as usize ({}); \
+                         falling back to capacity/{}",
+                        value,
+                        e,
+                        WT_OUTBOUND_SHEDDING_DIVISOR
                     );
-                    WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT
+                    wt_outbound_channel_capacity() / WT_OUTBOUND_SHEDDING_DIVISOR
                 }
             },
-            None => WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT,
+            None => wt_outbound_channel_capacity() / WT_OUTBOUND_SHEDDING_DIVISOR,
         }
     })
 }

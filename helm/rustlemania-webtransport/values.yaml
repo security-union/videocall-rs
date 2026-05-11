@@ -45,11 +45,14 @@ env:
     value: "4"
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
-  # WT outbound mpsc capacity per session. Default in code is 1024 (up
-  # from 256 to absorb 17-peer fan-out bursts). Override here only for
-  # exceptionally large meetings.
+  # WT outbound mpsc capacity per session. Default in code is 4096 (up
+  # from 1024 to absorb 17+ peer fan-out bursts; codifies the value Jay
+  # applied manually on the HCL daily deployment after the 2026-05-11
+  # incident, per Discussion #699). Stopgap until priority-aware
+  # dropping (Issue 1) lands. Override here only for exceptionally
+  # large meetings.
   # - name: WT_OUTBOUND_CHANNEL_CAPACITY
-  #   value: "2048"
+  #   value: "8192"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET
@@ -62,9 +65,12 @@ resources:
   # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
   # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
   # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
-  # ~8x headroom for the larger 1024-slot queue plus per-session
-  # buffers under burst while keeping the customer-facing default
-  # right-sized rather than over-inflated.
+  # ample headroom for the 4096-slot per-session queue (each slot is a
+  # `WtOutbound` enum holding at most one ~1200-byte datagram or a
+  # bounded stream message, so worst-case per-session queue ~5 MiB and
+  # the dominant memory line item remains the codec/session state, not
+  # the queue) while keeping the customer-facing default right-sized
+  # rather than over-inflated.
   limits:
     cpu: "1500m"
     memory: "512Mi"

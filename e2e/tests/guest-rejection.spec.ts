@@ -65,11 +65,20 @@ async function hostStartsMeeting(
   await hostPage.waitForTimeout(1500);
 
   const joinButton = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-  await joinButton.waitFor({ timeout: 20_000 });
-  await hostPage.waitForTimeout(1000);
-  await joinButton.click();
-  await hostPage.waitForTimeout(3000);
-  await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+  const grid = hostPage.locator("#grid-container");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
+  ]);
+
+  if (result === "join") {
+    await hostPage.waitForTimeout(1000);
+    await joinButton.click();
+    await hostPage.waitForTimeout(3000);
+  }
+
+  await expect(grid).toBeVisible({ timeout: 15_000 });
 
   return { hostPage };
 }
@@ -78,20 +87,13 @@ async function hostStartsMeeting(
  * Fetch the participant status for a given user directly from the API.
  * Used to assert the DB-level rejection without relying solely on UI state.
  */
-async function getParticipantStatus(
-  hostEmail: string,
-  hostName: string,
-  meetingId: string,
-  userId: string,
-): Promise<string | null> {
-  const token = generateSessionToken(hostEmail, hostName);
-  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/participants`, {
-    headers: { Cookie: `${COOKIE_NAME}=${token}` },
+async function getGuestStatus(meetingId: string, observerToken: string): Promise<string | null> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/guest-status`, {
+    headers: { Authorization: `Bearer ${observerToken}` },
   });
   if (!res.ok) return null;
   const json = await res.json();
-  const participants: Array<{ user_id: string; status: string }> = json?.result?.participants ?? [];
-  return participants.find((p) => p.user_id === userId)?.status ?? null;
+  return json?.result?.status ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +203,7 @@ test.describe("Guest rejection flow", () => {
    * It verifies the backend enforces rejection and does not allow a rejected
    * user to re-appear as admitted.
    */
-  test.fixme("rejected guest participant record has status=rejected, not admitted (API guard)", async () => {
+  test("rejected guest participant record has status=rejected, not admitted (API guard)", async () => {
     test.setTimeout(60_000);
 
     const meetingId = `e2e_wr_reject_api_${Date.now()}`;
@@ -235,6 +237,7 @@ test.describe("Guest rejection flow", () => {
     expect(guestJoinRes.ok, "guest join should succeed").toBe(true);
     const guestJoinJson = await guestJoinRes.json();
     const guestUserId: string = guestJoinJson.result.user_id;
+    const guestObserverToken: string = guestJoinJson.result.observer_token;
     expect(guestJoinJson.result.status, "guest should be in waiting state").toBe("waiting");
 
     // 4. Host rejects the guest via the API.
@@ -249,12 +252,7 @@ test.describe("Guest rejection flow", () => {
     expect(rejectRes.ok, "reject should succeed").toBe(true);
 
     // 5. Verify the participant record is "rejected", not "admitted".
-    const participantStatus = await getParticipantStatus(
-      hostEmail,
-      hostName,
-      meetingId,
-      guestUserId,
-    );
+    const participantStatus = await getGuestStatus(meetingId, guestObserverToken);
     expect(participantStatus, "rejected participant must have status=rejected").toBe("rejected");
 
     // 6. A second join attempt by the same guest session must land back in

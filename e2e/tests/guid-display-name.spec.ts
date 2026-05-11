@@ -84,7 +84,7 @@ test.describe("GUID display name handling", () => {
     await expect(page.locator("text=Invalid character")).not.toBeVisible();
   });
 
-  test.fixme("GUID-format name is shown on the meeting page after joining", async ({ page }) => {
+  test("GUID-format name is shown on the meeting page after joining", async ({ page }) => {
     // When a user enters a GUID as their display name and joins a meeting,
     // the meeting page should show that name.  In the non-OAuth flow, there
     // is no GUID filtering -- the user's chosen name is respected as-is.
@@ -102,17 +102,9 @@ test.describe("GUID display name handling", () => {
 
     await page.locator("#username").press("Enter");
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-    await page.waitForTimeout(2000);
 
-    // Click Start/Join Meeting to enter the grid.
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await page.waitForTimeout(1000);
-    await joinButton.click();
-    await page.waitForTimeout(3000);
-
-    // The grid should be visible with the user's self-view tile.
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    // Auto-join fires immediately (username already set). Wait for the grid.
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 30_000 });
 
     // The GUID display name should appear on the user's own tile.
     const selfName = page.locator(".floating-name", { hasText: SAMPLE_GUID });

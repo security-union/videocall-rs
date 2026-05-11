@@ -80,12 +80,13 @@ test.describe("Auth-based display name handling", () => {
     await expect(page.locator("#username")).toHaveValue("StoredUser");
   });
 
-  test.fixme("navigating directly to /meeting/<id> picks up display name from localStorage", async ({
+  test("navigating directly to /meeting/<id> picks up display name from localStorage", async ({
     page,
   }) => {
     // When a user navigates directly to a /meeting/<id> URL without going through
     // the home page first, the meeting page should pick up the stored display name
-    // and skip the entry form, going straight to the auto-join loading state.
+    // and skip the entry form. The auto-join fires, and since the meeting
+    // doesn't exist yet, the user lands in "Waiting for meeting to start".
     // Use addInitScript so the value is present before the app's own scripts run.
     await page.addInitScript(() => {
       localStorage.setItem("vc_display_name", "DirectNavUser");
@@ -93,11 +94,11 @@ test.describe("Auth-based display name handling", () => {
 
     const meetingId = `e2e_direct_nav_${Date.now()}`;
     await page.goto(`/meeting/${meetingId}`);
-    await page.waitForTimeout(2000);
 
-    // The meeting page skips the name-entry form when a stored name is present
-    // and shows the "Joining as <name>..." loading state instead.
-    await expect(page.getByText("DirectNavUser")).toBeVisible({ timeout: 8_000 });
+    // The name was picked up from localStorage — the user should NOT see
+    // the name entry form. Instead, they proceed to the join flow which
+    // resolves to "Waiting for meeting to start" (meeting not yet active).
+    await expect(page.getByText("Waiting for meeting to start")).toBeVisible({ timeout: 15_000 });
     // The form input should NOT be visible because the name was already set.
     await expect(page.locator('input[placeholder="Enter your display name"]')).not.toBeVisible();
   });

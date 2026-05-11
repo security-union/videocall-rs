@@ -30,6 +30,7 @@ protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
 url = "2.3.1"
+percent-encoding = "2"
 
 # Transports
 web-transport-quinn = { workspace = true }

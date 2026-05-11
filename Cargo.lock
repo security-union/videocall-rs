@@ -1047,6 +1047,7 @@ dependencies = [
  "jsonwebtoken",
  "memmap2",
  "opus",
+ "percent-encoding",
  "prometheus",
  "protobuf 3.7.1",
  "rand 0.8.5",

@@ -1607,6 +1607,9 @@ impl ConnectionManager {
         // time via the `old_active_connection` fallback path; this just
         // returns it to the canonical location.
         if let Some((id, conn)) = self.old_active_connection.take() {
+            // Capture URL and transport type BEFORE moving conn into the map.
+            let conn_url = conn.url().to_string();
+            let conn_is_webtransport = conn.is_webtransport();
             self.connections.insert(id.clone(), conn);
 
             // Restore the RTT measurement entry (same approach as the
@@ -1616,11 +1619,7 @@ impl ConnectionManager {
                 restored.connected = true;
                 self.rtt_measurements.insert(id.clone(), restored);
             } else if let Some(snapshot_rtt) = self.old_active_rtt {
-                let (restored_url, is_webtransport) = self
-                    .old_active_connection
-                    .as_ref()
-                    .map(|(_, conn)| (conn.url().to_string(), conn.is_webtransport()))
-                    .unwrap_or_else(|| (format!("(restored) {id}"), false));
+                let (restored_url, is_webtransport) = (conn_url, conn_is_webtransport);
                 self.rtt_measurements.insert(
                     id.clone(),
                     ServerRttMeasurement {

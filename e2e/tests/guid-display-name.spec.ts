@@ -105,7 +105,7 @@ test.describe("GUID display name handling", () => {
     await page.waitForTimeout(2000);
 
     // Click Start/Join Meeting to enter the grid.
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await page.waitForTimeout(1000);
     await joinButton.click();

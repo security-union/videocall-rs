@@ -76,7 +76,7 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 async function joinMeetingFromPage(
   page: Page,
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = page.getByText("Waiting to be admitted");
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
 
@@ -173,7 +173,7 @@ test.describe("Waiting for meeting (push notifications)", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
       // Guest receives on_meeting_activated via WebSocket and transitions
-      const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+      const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const guestWaiting = guestPage.getByText("Waiting to be admitted");
       const guestGrid = guestPage.locator("#grid-container");
 

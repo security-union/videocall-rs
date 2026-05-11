@@ -92,7 +92,11 @@ pub fn build_app_with_cors(pool: PgPool) -> Router {
             ALLOWED_HEADERS
                 .iter()
                 .cloned()
-                .chain(ALLOWED_CUSTOM_HEADERS.iter().map(|h| HeaderName::from_static(h)))
+                .chain(
+                    ALLOWED_CUSTOM_HEADERS
+                        .iter()
+                        .map(|h| HeaderName::from_static(h)),
+                )
                 .collect::<Vec<_>>(),
         )
         .allow_credentials(true);

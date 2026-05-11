@@ -32,11 +32,7 @@ pub const ALLOWED_HEADERS: &[HeaderName] = &[
 /// These are defined as string slices because `HeaderName::from_static` is not
 /// const-callable in array context. Callers should map these via
 /// `HeaderName::from_static` when building the CORS layer.
-pub const ALLOWED_CUSTOM_HEADERS: &[&str] = &[
-    "x-user-id",
-    "x-session-timestamp",
-    "x-chunk-seq",
-];
+pub const ALLOWED_CUSTOM_HEADERS: &[&str] = &["x-user-id", "x-session-timestamp", "x-chunk-seq"];
 
 /// The set of HTTP methods allowed in CORS requests.
 pub const ALLOWED_METHODS: &[http::Method] = &[

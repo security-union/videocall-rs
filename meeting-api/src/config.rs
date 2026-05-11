@@ -819,7 +819,9 @@ mod tests {
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
 
-        for invalid_value in &["yes", "on", "YES", "ON", "Yes", "TRUE", "", " true ", "enabled"] {
+        for invalid_value in &[
+            "yes", "on", "YES", "ON", "Yes", "TRUE", "", " true ", "enabled",
+        ] {
             std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
             let cfg = Config::from_env().unwrap_or_else(|e| {
                 panic!(

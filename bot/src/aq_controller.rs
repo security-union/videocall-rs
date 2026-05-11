@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use videocall_aq::constants::{AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
-use videocall_aq::{default_clock, Clock, EncoderBitrateController};
+use videocall_aq::{default_clock, Clock, EncoderBitrateController, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
 #[cfg(feature = "metrics")]
@@ -113,8 +113,8 @@ pub struct BotAq {
     // --- PID-derived telemetry for health reporting ---
     /// PID-adjusted target bitrate in kbps, f32 bits packed into u32.
     last_target_bitrate_kbps_bits: AtomicU32,
-    /// Last worst-peer (p75) FPS as observed by the PID, f32 bits.
-    last_worst_peer_fps_bits: AtomicU32,
+    /// Last p75 received FPS as observed by the PID, f32 bits.
+    last_p75_peer_fps_bits: AtomicU32,
     /// fps_ratio = received / target, f32 bits.
     last_fps_ratio_bits: AtomicU32,
     /// bitrate_ratio = pid_clamped / tier_ideal, f32 bits.
@@ -182,7 +182,7 @@ impl BotAq {
             last_target_bitrate_kbps_bits: AtomicU32::new(
                 (initial_video.ideal_bitrate_kbps as f32).to_bits(),
             ),
-            last_worst_peer_fps_bits: AtomicU32::new(0),
+            last_p75_peer_fps_bits: AtomicU32::new(0),
             last_fps_ratio_bits: AtomicU32::new(0),
             last_bitrate_ratio_bits: AtomicU32::new(0),
             #[cfg(feature = "metrics")]
@@ -234,13 +234,13 @@ impl BotAq {
         // Always publish the latest PID-derived telemetry — these are useful
         // for health reporting even when the tier has not changed.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
-        let worst_fps = ctrl.last_worst_peer_fps() as f32;
+        let p75_peer_fps = ctrl.last_p75_peer_fps() as f32;
         let fps_ratio = ctrl.last_fps_ratio() as f32;
         let bitrate_ratio = ctrl.last_bitrate_ratio() as f32;
         self.last_target_bitrate_kbps_bits
             .store(target_bitrate.to_bits(), Ordering::Relaxed);
-        self.last_worst_peer_fps_bits
-            .store(worst_fps.to_bits(), Ordering::Relaxed);
+        self.last_p75_peer_fps_bits
+            .store(p75_peer_fps.to_bits(), Ordering::Relaxed);
         self.last_fps_ratio_bits
             .store(fps_ratio.to_bits(), Ordering::Relaxed);
         self.last_bitrate_ratio_bits
@@ -252,7 +252,7 @@ impl BotAq {
         #[cfg(feature = "metrics")]
         self.publish_live_metrics(
             target_bitrate,
-            worst_fps,
+            p75_peer_fps,
             fps_ratio,
             bitrate_ratio,
             ctrl.video_tier_index() as i64,
@@ -313,13 +313,34 @@ impl BotAq {
         }
     }
 
+    /// Drain buffered tier-transition events from the inner controller.
+    ///
+    /// Mirrors the browser's per-heartbeat drain in
+    /// `videocall-client/src/health_reporter.rs` so bot HealthPackets populate
+    /// `HealthPacket.tier_transitions` with the same shape as real browsers,
+    /// letting Prometheus counter `videocall_tier_transition_total` increment
+    /// for bot meetings. Returns an empty `Vec` if the mutex is poisoned
+    /// (non-critical path — log and continue, matching `process_diagnostics`).
+    pub fn drain_tier_transitions(&self) -> Vec<TierTransitionRecord> {
+        let mut ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "BotAq: controller mutex poisoned on drain_tier_transitions, recovering: {e}"
+                );
+                e.into_inner()
+            }
+        };
+        ctrl.drain_tier_transitions()
+    }
+
     /// Push the latest AQ telemetry into the Prometheus gauges. No-op when
     /// no metrics handle has been installed.
     #[cfg(feature = "metrics")]
     fn publish_live_metrics(
         &self,
         target_bitrate_kbps: f32,
-        worst_peer_fps: f32,
+        p75_peer_fps: f32,
         fps_ratio: f32,
         bitrate_ratio: f32,
         video_tier_index: i64,
@@ -339,9 +360,9 @@ impl BotAq {
             .set(target_bitrate_kbps as f64);
         binding
             .metrics
-            .aq_worst_peer_fps
+            .aq_p75_peer_fps
             .with_label_values(&labels)
-            .set(worst_peer_fps as f64);
+            .set(p75_peer_fps as f64);
         binding
             .metrics
             .aq_fps_ratio
@@ -411,9 +432,9 @@ impl BotAq {
         f32::from_bits(self.last_target_bitrate_kbps_bits.load(Ordering::Relaxed))
     }
 
-    /// Last observed worst-peer (p75) FPS as seen by the PID (for health reporting).
-    pub fn last_worst_peer_fps(&self) -> f32 {
-        f32::from_bits(self.last_worst_peer_fps_bits.load(Ordering::Relaxed))
+    /// Last observed p75 received FPS as seen by the PID (for health reporting).
+    pub fn last_p75_peer_fps(&self) -> f32 {
+        f32::from_bits(self.last_p75_peer_fps_bits.load(Ordering::Relaxed))
     }
 
     /// Last fps_ratio (received / target) for health reporting.
@@ -424,6 +445,57 @@ impl BotAq {
     /// Last bitrate_ratio (pid_clamped / tier_ideal) for health reporting.
     pub fn last_bitrate_ratio(&self) -> f32 {
         f32::from_bits(self.last_bitrate_ratio_bits.load(Ordering::Relaxed))
+    }
+
+    /// Snapshot the climb-rate limiter state for health reporting.
+    ///
+    /// Returns `(crash_ceiling_active, crash_ceiling_tier_index, crash_ceiling_decay_ms,
+    /// step_up_blocked_ceiling, step_up_blocked_slowdown, step_up_blocked_screen_share)`.
+    pub fn snapshot_climb_limiter(&self) -> (bool, Option<u32>, Option<f64>, u64, u64, u64) {
+        let ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "BotAq: controller mutex poisoned on snapshot_climb_limiter, recovering: {e}"
+                );
+                e.into_inner()
+            }
+        };
+        let (blocked_ceiling, blocked_slowdown, blocked_screen) = ctrl.step_up_blocked_counts();
+        match ctrl.crash_ceiling_info() {
+            Some((idx, _label, decay_ms)) => (
+                true,
+                Some(idx as u32),
+                Some(decay_ms),
+                blocked_ceiling,
+                blocked_slowdown,
+                blocked_screen,
+            ),
+            None => (
+                false,
+                None,
+                None,
+                blocked_ceiling,
+                blocked_slowdown,
+                blocked_screen,
+            ),
+        }
+    }
+
+    /// Drain accumulated tier dwell-time samples for health reporting.
+    ///
+    /// Returns `Vec<(tier_label, dwell_ms)>`. The inner controller accumulates
+    /// dwell samples on every tier transition; draining once per health tick
+    /// matches the browser's pattern.
+    pub fn drain_dwell_samples(&self) -> Vec<(&'static str, f64)> {
+        let mut ctrl = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("BotAq: controller mutex poisoned on drain_dwell_samples, recovering: {e}");
+                e.into_inner()
+            }
+        };
+        ctrl.drain_dwell_samples()
     }
 
     /// Access the target-FPS atomic — the PID uses this as its setpoint.

@@ -183,3 +183,11 @@ impl Default for ListFeedQuery {
         }
     }
 }
+
+/// Query parameters for `POST /api/v1/meetings/{meeting_id}/mute`
+/// and `POST /api/v1/meetings/{meeting_id}/mute-all`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MuteParticipantRequest {
+    /// User ID of the participant to ask to mute.
+    pub user_id: String,
+}

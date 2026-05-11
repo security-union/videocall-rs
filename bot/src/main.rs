@@ -20,20 +20,26 @@
 // can share code with the binary. The binary only pulls in what it needs.
 use bot::aq_controller::BotAq;
 use bot::audio_producer::AudioProducer;
-use bot::config::{self, BotConfig, ClientConfig, Manifest, Transport, VideoMode};
+use bot::config::{
+    self, evaluate_costume_memory, BotConfig, ClientConfig, CostumeMemoryDecision, Manifest,
+    Transport, VideoMode,
+};
 use bot::costume_renderer::CostumeRenderer;
+use bot::diagnostics_reporter::{spawn_diagnostics_reporter, DiagnosticsReporterConfig};
 use bot::ekg_renderer::{self, EkgRenderer};
 use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use bot::inbound_stats::InboundStats;
+use bot::keyframe_requester::KeyframeRequester;
 #[cfg(feature = "metrics")]
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
+use bot::rtt_probe::spawn_rtt_probe;
 use bot::transport::{self, OutboundFrame, TransportClient};
 use bot::video_producer::VideoProducer;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -246,12 +252,33 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(kb_str) = avail_line.split_whitespace().nth(1) {
                         if let Ok(avail_kb) = kb_str.parse::<u64>() {
                             let avail_bytes = avail_kb * 1024;
-                            if total_costume_bytes > avail_bytes * 80 / 100 {
-                                warn!(
-                                    "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM",
-                                    total_gb,
-                                    avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                                );
+                            let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                            match evaluate_costume_memory(
+                                total_costume_bytes,
+                                avail_bytes,
+                                config.strict_memory,
+                            ) {
+                                CostumeMemoryDecision::AbortExceedsAvailable => {
+                                    error!(
+                                        "Costume frames ({:.1} GiB) exceed available memory ({:.1} GiB) — aborting",
+                                        total_gb, avail_gb
+                                    );
+                                    std::process::exit(1);
+                                }
+                                CostumeMemoryDecision::AbortStrictThreshold => {
+                                    error!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — aborting (--strict-memory)",
+                                        total_gb, avail_gb
+                                    );
+                                    std::process::exit(1);
+                                }
+                                CostumeMemoryDecision::Warn => {
+                                    warn!(
+                                        "Costume frames ({:.1} GiB) exceed 80% of available memory ({:.1} GiB) — risk of OOM (pass --strict-memory to abort)",
+                                        total_gb, avail_gb
+                                    );
+                                }
+                                CostumeMemoryDecision::Ok => {}
                             }
                         }
                     }
@@ -511,7 +538,12 @@ async fn run_client(
         (Some(hook), Some(handle))
     };
 
-    let mut client = TransportClient::new(&resolved_transport, client_config.clone());
+    let mut client = TransportClient::new(
+        &resolved_transport,
+        client_config.clone(),
+        #[cfg(feature = "metrics")]
+        metrics.clone(),
+    );
     client
         .connect(
             &lobby_url,
@@ -541,9 +573,24 @@ async fn run_client(
     // enabled it also labels Prometheus counters using the pre-tagged
     // `frame.kind` — no protobuf re-parse on the hot path.
     let (packet_tx, packet_rx) = mpsc::channel::<OutboundFrame>(500);
+
+    // Shared counters for HealthPacket telemetry:
+    // - packets_sent_counter: incremented by the outbound shim/passthrough on
+    //   every successful transport send; read+reset by health reporter each tick.
+    // - transport_drops_counter: cumulative try_send failures from any producer;
+    //   read (not reset) by health reporter for websocket/datagram_drops_total.
+    // - encoder_output_fps: written by the video producer with the current target
+    //   FPS the encoder is configured at.
+    let packets_sent_counter = Arc::new(AtomicU64::new(0));
+    let transport_drops_counter = Arc::new(AtomicU64::new(0));
+    let encoder_output_fps = Arc::new(AtomicU32::new(0));
+    let encoder_errors_generic = Arc::new(AtomicU64::new(0));
+    let encoder_frames_ok = Arc::new(AtomicU64::new(0));
+
     let outbound_shim_task = if network_profile.is_passthrough() {
         let user_id_out = user_id.clone();
         let transport_tx_inner = transport_tx.clone();
+        let psc = packets_sent_counter.clone();
         #[cfg(feature = "metrics")]
         let metrics_out = metrics.clone();
         #[cfg(feature = "metrics")]
@@ -552,6 +599,7 @@ async fn run_client(
             packet_rx,
             transport_tx_inner,
             user_id_out,
+            psc,
             #[cfg(feature = "metrics")]
             metrics_out,
             #[cfg(feature = "metrics")]
@@ -567,6 +615,7 @@ async fn run_client(
         };
         let shim = Arc::new(shim);
         let user_id_up = user_id.clone();
+        let psc = packets_sent_counter.clone();
         #[cfg(feature = "metrics")]
         let metrics_up = metrics.clone();
         #[cfg(feature = "metrics")]
@@ -576,6 +625,7 @@ async fn run_client(
             transport_tx,
             shim,
             user_id_up,
+            psc,
             #[cfg(feature = "metrics")]
             metrics_up,
             #[cfg(feature = "metrics")]
@@ -597,24 +647,70 @@ async fn run_client(
         );
     }
 
+    // --- RTT probe (passthrough bots only) ---
+    // Impaired bots use simulated RTT (2× netsim latency); passthrough bots
+    // send actual RTT probe packets to the relay and measure real round-trip.
+    let (simulated_rtt_ms, measured_rtt_ms) = if network_profile.is_passthrough() {
+        let rtt_state = spawn_rtt_probe(user_id.clone(), packet_tx.clone(), quit.clone());
+        // Install the RTT probe state in InboundStats so echoed packets
+        // are routed to record_echo instead of counted as media.
+        {
+            let mut s = stats.lock().unwrap();
+            s.set_rtt_probe(Arc::clone(&rtt_state));
+        }
+        (None, Some(rtt_state.rtt_atomic()))
+    } else {
+        (Some((network_profile.latency_ms as f64) * 2.0), None)
+    };
+
+    // --- Keyframe requester ---
+    // Send KEYFRAME_REQUEST to each newly discovered peer, mimicking browser
+    // behavior on join.
+    let keyframe_requests_sent = {
+        let kr = KeyframeRequester::new(user_id.clone(), packet_tx.clone());
+        let counter = kr.requests_sent_counter();
+        {
+            let mut s = stats.lock().unwrap();
+            s.set_keyframe_requester(kr);
+        }
+        counter
+    };
+
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.
-    let server_url_display = lobby_url
-        .as_str()
-        .split("?token=")
-        .next()
-        .unwrap_or(lobby_url.as_str())
-        .to_string();
     spawn_health_reporter(
         HealthReporterConfig {
             client_config: client_config.clone(),
             transport: resolved_transport.clone(),
-            server_url: server_url_display,
+            simulated_rtt_ms,
+            measured_rtt_ms,
+            packets_sent_counter: packets_sent_counter.clone(),
+            transport_drops_counter: transport_drops_counter.clone(),
+            encoder_output_fps: encoder_output_fps.clone(),
+            encoder_errors_generic: encoder_errors_generic.clone(),
+            encoder_frames_ok: encoder_frames_ok.clone(),
+            keyframe_requests_sent: Some(keyframe_requests_sent),
+        },
+        stats.clone(),
+        packet_tx.clone(),
+        quit.clone(),
+        aq.clone(),
+    );
+
+    // Spawn the per-peer diagnostics reporter. Real browsers emit one
+    // DiagnosticsPacket per observed remote peer per (audio, video) media
+    // type every heartbeat; bots must do the same or sender-side AQ
+    // controllers go blind in bot-heavy meetings. The reporter reads the
+    // same 1s window as the health reporter via a non-destructive snapshot,
+    // so counters are never double-drained.
+    spawn_diagnostics_reporter(
+        DiagnosticsReporterConfig {
+            client_config: client_config.clone(),
+            transport_drops_counter: transport_drops_counter.clone(),
         },
         stats,
         packet_tx.clone(),
         quit.clone(),
-        aq.clone(),
     );
 
     // Wait for media start signal from main
@@ -640,6 +736,7 @@ async fn run_client(
             loop_duration,
             is_speaking.clone(),
             aq.clone(),
+            transport_drops_counter.clone(),
         )?);
         info!("Audio producer started for {}", user_id);
 
@@ -662,6 +759,10 @@ async fn run_client(
                     loop_duration,
                     is_speaking.clone(),
                     aq.clone(),
+                    encoder_output_fps.clone(),
+                    encoder_errors_generic.clone(),
+                    encoder_frames_ok.clone(),
+                    transport_drops_counter.clone(),
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -682,6 +783,10 @@ async fn run_client(
                     media_start,
                     loop_duration,
                     aq.clone(),
+                    encoder_output_fps.clone(),
+                    encoder_errors_generic.clone(),
+                    encoder_frames_ok.clone(),
+                    transport_drops_counter.clone(),
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -699,6 +804,10 @@ async fn run_client(
                 media_start,
                 loop_duration,
                 aq.clone(),
+                encoder_output_fps.clone(),
+                encoder_errors_generic.clone(),
+                encoder_frames_ok.clone(),
+                transport_drops_counter.clone(),
             )?);
             info!("EKG video producer started for {}", user_id);
         }
@@ -753,6 +862,7 @@ async fn run_outbound_shim(
     tx: mpsc::Sender<Vec<u8>>,
     shim: Arc<NetSimShim>,
     user_id: String,
+    packets_sent_counter: Arc<AtomicU64>,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
     #[cfg(feature = "metrics")] meeting_id: String,
 ) {
@@ -770,34 +880,44 @@ async fn run_outbound_shim(
                 if tx.send(payload).await.is_err() {
                     break;
                 }
+                packets_sent_counter.fetch_add(1, Ordering::Relaxed);
             }
             Admission::Drop => {
                 debug!("[{}] netsim-up: dropped {}B", user_id, payload.len());
             }
             Admission::Delay(d) => {
                 let tx = tx.clone();
+                let psc = packets_sent_counter.clone();
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx.send(payload).await;
+                    if tx.send(payload).await.is_ok() {
+                        psc.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
             Admission::DelayAndDuplicate(d) => {
                 let tx_a = tx.clone();
                 let tx_b = tx.clone();
+                let psc_a = packets_sent_counter.clone();
+                let psc_b = packets_sent_counter.clone();
                 let p_copy = payload.clone();
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx_a.send(payload).await;
+                    if tx_a.send(payload).await.is_ok() {
+                        psc_a.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
                 tokio::spawn(async move {
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
-                    let _ = tx_b.send(p_copy).await;
+                    if tx_b.send(p_copy).await.is_ok() {
+                        psc_b.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
         }
@@ -815,6 +935,7 @@ async fn run_outbound_passthrough(
     mut rx: mpsc::Receiver<OutboundFrame>,
     tx: mpsc::Sender<Vec<u8>>,
     user_id: String,
+    packets_sent_counter: Arc<AtomicU64>,
     #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
     #[cfg(feature = "metrics")] meeting_id: String,
 ) {
@@ -830,6 +951,7 @@ async fn run_outbound_passthrough(
         if tx.send(frame.bytes).await.is_err() {
             break;
         }
+        packets_sent_counter.fetch_add(1, Ordering::Relaxed);
     }
     info!("Outbound passthrough stopped for {}", user_id);
 }

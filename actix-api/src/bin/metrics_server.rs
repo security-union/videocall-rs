@@ -34,6 +34,8 @@ struct SessionInfo {
     peer_ids: HashSet<String>,
     // Server info we have published active server metrics for (server_url, server_type)
     active_servers: HashSet<(String, String)>,
+    // TELEM-7: last CLIENT_INFO label values (cores, arch, gpu, net, score) for cleanup
+    client_info_labels: Option<[String; 5]>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -47,18 +49,19 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_SEND_QUEUE_BYTES,
-    CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
-    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS,
-    ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS_TOTAL,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
+    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
+    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS,
+    ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS, WEBSOCKET_DROPS_TOTAL,
 };
 
 async fn metrics_handler(
@@ -184,16 +187,41 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = CLIENT_TAB_THROTTLED.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
+    let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
     let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_FPS_RATIO.remove_label_values(&reporter_labels);
     let _ = ENCODER_WORST_PEER_FPS.remove_label_values(&reporter_labels);
+    let _ = ENCODER_P75_PEER_FPS.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_BITRATE_RATIO.remove_label_values(&reporter_labels);
+
+    // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
+    let telem_labels: [&str; 3] = [
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.display_name,
+    ];
+    let _ = CLIENT_LONGTASK_DURATION_MS.remove_label_values(&telem_labels);
+    let _ = CLIENT_RENDER_FPS.remove_label_values(&telem_labels);
+    // TELEM-7: remove CLIENT_INFO using stored label values
+    if let Some(ref info_labels) = session_info.client_info_labels {
+        let _ = CLIENT_INFO.remove_label_values(&[
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.display_name,
+            &info_labels[0],
+            &info_labels[1],
+            &info_labels[2],
+            &info_labels[3],
+            &info_labels[4],
+        ]);
+    }
 
     // Remove active server metrics for this session
     for (server_url, server_type) in &session_info.active_servers {
@@ -327,84 +355,116 @@ fn process_health_packet_to_metrics_pb(
     // Using entry().or_insert_with() preserves accumulated to_peers/peer_ids/active_servers
     // across packets. The previous tracker.insert() reset them every packet, causing a leak
     // where peers that left mid-session had their Prometheus labels written but never cleaned up.
+    let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
     {
         let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
-        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
-        let info = tracker.entry(session_key).or_insert_with(|| SessionInfo {
-            session_id: session_id.to_string(),
-            meeting_id: meeting_id.to_string(),
-            reporting_user_id: reporting_user_id.to_string(),
-            display_name: reporter_display_name.clone(),
-            last_seen: Instant::now(),
-            to_peers: HashSet::new(),
-            to_peer_display_names: HashMap::new(),
-            peer_ids: HashSet::new(),
-            active_servers: HashSet::new(),
-        });
+        let info = tracker
+            .entry(session_key.clone())
+            .or_insert_with(|| SessionInfo {
+                session_id: session_id.to_string(),
+                meeting_id: meeting_id.to_string(),
+                reporting_user_id: reporting_user_id.to_string(),
+                display_name: reporter_display_name.clone(),
+                last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                to_peer_display_names: HashMap::new(),
+                peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
+                client_info_labels: None,
+            });
         info.last_seen = Instant::now();
         info.display_name = reporter_display_name.clone();
     }
 
     // Process metrics for this session
     {
-        // Client-side active server info (optional)
-        if !health_packet.active_server_url.is_empty() {
-            // Strip JWT token from URL to prevent leaking credentials in Prometheus labels.
-            // Handles both ?token=... (only param) and &token=... (among other params).
-            let server_url_clean = if let Some(q_pos) = health_packet.active_server_url.find('?') {
-                let base = &health_packet.active_server_url[..q_pos];
-                let query = &health_packet.active_server_url[q_pos + 1..];
-                let filtered: Vec<&str> = query
-                    .split('&')
-                    .filter(|p| !p.starts_with("token="))
-                    .collect();
-                if filtered.is_empty() {
-                    base.to_string()
-                } else {
-                    format!("{}?{}", base, filtered.join("&"))
+        // Strip JWT token from URL to prevent leaking credentials in Prometheus labels.
+        // Handles both ?token=... (only param) and &token=... (among other params).
+        // Note: upstream scrubbing in `client_diagnostics.rs::scrub_client_supplied_urls`
+        // unconditionally zeroes `active_server_url` (defense-in-depth against JWT leakage
+        // to Prometheus labels), so in practice this branch only fires for legacy/test paths
+        // that bypass that scrub. We still compute the clean URL here for those paths.
+        let server_url_clean = if let Some(q_pos) = health_packet.active_server_url.find('?') {
+            let base = &health_packet.active_server_url[..q_pos];
+            let query = &health_packet.active_server_url[q_pos + 1..];
+            let filtered: Vec<&str> = query
+                .split('&')
+                .filter(|p| !p.starts_with("token="))
+                .collect();
+            if filtered.is_empty() {
+                base.to_string()
+            } else {
+                format!("{}?{}", base, filtered.join("&"))
+            }
+        } else {
+            health_packet.active_server_url.clone()
+        };
+        let server_url_clean = server_url_clean.as_str();
+
+        // For the RTT metric we allow the server_type label to be an empty string when
+        // unknown, because the URL scrub also zeroes active_server_type and dashboards
+        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
+        // below keeps its original "unknown" placeholder since it still requires a URL.
+        let server_type_for_rtt = health_packet.active_server_type.as_str();
+        let server_type_for_active = if health_packet.active_server_type.is_empty() {
+            "unknown"
+        } else {
+            &health_packet.active_server_type
+        };
+
+        // Publish RTT independently of active_server_url presence. The upstream scrub
+        // strips the URL to prevent JWT leakage, but the RTT value itself is meaningful
+        // on its own — gate only on rtt != 0.0 so passthrough clients that never
+        // measured an RTT don't emit a zero sample.
+        if health_packet.active_server_rtt_ms != 0.0 {
+            CLIENT_ACTIVE_SERVER_RTT_MS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    server_url_clean,
+                    server_type_for_rtt,
+                    reporter_display_name.as_str(),
+                ])
+                .set(health_packet.active_server_rtt_ms);
+
+            // Track the label set used for this RTT publish so cleanup can remove it
+            // later, including the scrubbed empty-URL / empty-type case.
+            {
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+                if let Some(info) = tracker.get_mut(&key) {
+                    info.active_servers.insert((
+                        server_url_clean.to_string(),
+                        server_type_for_rtt.to_string(),
+                    ));
                 }
-            } else {
-                health_packet.active_server_url.clone()
-            };
-            let server_url_clean = server_url_clean.as_str();
+            }
+        }
 
-            let server_type = if health_packet.active_server_type.is_empty() {
-                "unknown"
-            } else {
-                &health_packet.active_server_type
-            };
-
+        // Client-side active server info (optional) — requires a non-empty URL because
+        // the metric's semantic purpose is to identify *which* server the client picked.
+        if !health_packet.active_server_url.is_empty() {
             CLIENT_ACTIVE_SERVER
                 .with_label_values(&[
                     meeting_id,
                     session_id,
                     reporting_user_id,
                     server_url_clean,
-                    server_type,
+                    server_type_for_active,
                     reporter_display_name.as_str(),
                 ])
                 .set(1.0);
-
-            if health_packet.active_server_rtt_ms != 0.0 {
-                CLIENT_ACTIVE_SERVER_RTT_MS
-                    .with_label_values(&[
-                        meeting_id,
-                        session_id,
-                        reporting_user_id,
-                        server_url_clean,
-                        server_type,
-                        reporter_display_name.as_str(),
-                    ])
-                    .set(health_packet.active_server_rtt_ms);
-            }
 
             // Track server info used for cleanup
             {
                 let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 let key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
                 if let Some(info) = tracker.get_mut(&key) {
-                    info.active_servers
-                        .insert((server_url_clean.to_string(), server_type.to_string()));
+                    info.active_servers.insert((
+                        server_url_clean.to_string(),
+                        server_type_for_active.to_string(),
+                    ));
                 }
             }
         }
@@ -541,11 +601,17 @@ fn process_health_packet_to_metrics_pb(
                 .set(tier as f64);
         }
         if let Some(drops) = health_packet.datagram_drops_total {
+            DATAGRAM_DROPS
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
             DATAGRAM_DROPS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
         if let Some(drops) = health_packet.websocket_drops_total {
+            WEBSOCKET_DROPS
+                .with_label_values(&reporter_labels)
+                .set(drops as f64);
             WEBSOCKET_DROPS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
@@ -562,8 +628,14 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&reporter_labels)
                 .set(ratio);
         }
-        if let Some(fps) = health_packet.encoder_worst_peer_fps {
+        if let Some(fps) = health_packet
+            .encoder_p75_peer_fps
+            .or(health_packet.encoder_worst_peer_fps)
+        {
             ENCODER_WORST_PEER_FPS
+                .with_label_values(&reporter_labels)
+                .set(fps);
+            ENCODER_P75_PEER_FPS
                 .with_label_values(&reporter_labels)
                 .set(fps);
         }
@@ -610,6 +682,89 @@ fn process_health_packet_to_metrics_pb(
                     &t.trigger,
                 ])
                 .inc();
+        }
+
+        // TELEM-7: client_info gauge (static metadata)
+        if health_packet.client_cores.is_some() || health_packet.client_architecture.is_some() {
+            let cores_str = health_packet
+                .client_cores
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let arch = health_packet
+                .client_architecture
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let gpu = health_packet
+                .client_gpu_family
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let net = health_packet
+                .client_network_effective_type
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let score = health_packet
+                .client_capability_score
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            // Store labels in session tracker for cleanup; remove stale series on label change.
+            {
+                let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(info) = tracker.get_mut(&session_key) {
+                    let new_labels = [
+                        cores_str.clone(),
+                        arch.clone(),
+                        gpu.clone(),
+                        net.clone(),
+                        score.clone(),
+                    ];
+                    if let Some(ref prev) = info.client_info_labels {
+                        if *prev != new_labels {
+                            let _ = CLIENT_INFO.remove_label_values(&[
+                                meeting_id,
+                                session_id,
+                                reporter_display_name.as_str(),
+                                &prev[0],
+                                &prev[1],
+                                &prev[2],
+                                &prev[3],
+                                &prev[4],
+                            ]);
+                        }
+                    }
+                    info.client_info_labels = Some(new_labels);
+                }
+            }
+
+            CLIENT_INFO
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporter_display_name.as_str(),
+                    &cores_str,
+                    &arch,
+                    &gpu,
+                    &net,
+                    &score,
+                ])
+                .set(1.0);
+        }
+
+        // TELEM-8: longtask histogram observations
+        for dur in &health_packet.longtask_durations_ms {
+            CLIENT_LONGTASK_DURATION_MS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .observe(*dur);
+        }
+
+        // TELEM-9: render FPS gauge
+        if let Some(fps) = health_packet.render_fps {
+            CLIENT_RENDER_FPS
+                .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
+                .set(fps);
         }
 
         // Process peer health data
@@ -1103,6 +1258,7 @@ mod tests {
             display_name: "test_user".to_string(),
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
+            client_info_labels: None,
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -1129,6 +1285,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -1173,6 +1330,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -1191,6 +1349,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen -= Duration::from_secs(40);
@@ -1470,6 +1629,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -1485,6 +1645,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -1501,6 +1662,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -1536,6 +1698,7 @@ mod tests {
             display_name: "test_user".to_string(),
             to_peer_display_names: HashMap::new(),
             active_servers: HashSet::new(),
+            client_info_labels: None,
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -1562,6 +1725,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -1709,6 +1873,7 @@ mod tests {
                 display_name: "test_user".to_string(),
                 to_peer_display_names: HashMap::new(),
                 active_servers: HashSet::new(),
+                client_info_labels: None,
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen -= Duration::from_secs(30);
@@ -1788,6 +1953,85 @@ mod tests {
                 )]
             ),
             "Token param should be stripped, other params preserved"
+        );
+    }
+
+    /// After the NATS-path URL scrub in client_diagnostics.rs strips
+    /// `active_server_url` to an empty string, the RTT metric must still publish.
+    /// The `CLIENT_ACTIVE_SERVER` identity gauge, however, legitimately requires
+    /// a non-empty URL and must remain absent.
+    #[test]
+    fn test_rtt_publishes_when_server_url_scrubbed_empty() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Simulate the post-scrub state: URL + server_type both zeroed, RTT set.
+        let mut hp = create_test_health_packet("s_scrub", "m_scrub", "eve", HashMap::new());
+        hp.active_server_url = String::new();
+        hp.active_server_type = String::new();
+        hp.active_server_rtt_ms = 77.25;
+        let (peer_id, ps) = create_test_peer_stats("frank", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // RTT metric must be present with empty server_url / server_type labels.
+        assert!(
+            series_exists(
+                "videocall_client_active_server_rtt_ms",
+                &[
+                    ("meeting_id", "m_scrub"),
+                    ("session_id", "s_scrub"),
+                    ("peer_id", "eve"),
+                    ("server_url", ""),
+                    ("server_type", ""),
+                ]
+            ),
+            "RTT must publish even when active_server_url is empty post-scrub"
+        );
+
+        // Identity gauge must NOT be present — it requires a URL to be meaningful.
+        assert!(
+            !series_exists(
+                "videocall_client_active_server",
+                &[
+                    ("meeting_id", "m_scrub"),
+                    ("session_id", "s_scrub"),
+                    ("peer_id", "eve"),
+                ]
+            ),
+            "CLIENT_ACTIVE_SERVER should not publish without a non-empty URL"
+        );
+    }
+
+    /// When the RTT value is zero (passthrough clients that never measured RTT),
+    /// nothing is published even if server_url is also empty.
+    #[test]
+    fn test_rtt_not_published_when_zero_and_url_empty() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_zero", "m_zero", "gina", HashMap::new());
+        hp.active_server_url = String::new();
+        hp.active_server_type = String::new();
+        hp.active_server_rtt_ms = 0.0;
+        let (peer_id, ps) = create_test_peer_stats("hank", true, true, 50.0, 2.0);
+        hp.peer_stats.insert(peer_id, ps);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            !series_exists(
+                "videocall_client_active_server_rtt_ms",
+                &[
+                    ("meeting_id", "m_zero"),
+                    ("session_id", "s_zero"),
+                    ("peer_id", "gina"),
+                ]
+            ),
+            "RTT must not publish when rtt_ms == 0.0 (passthrough client)"
         );
     }
 
@@ -1982,6 +2226,7 @@ mod tests {
                     to_peer_display_names: HashMap::new(),
                     peer_ids: HashSet::new(),
                     active_servers: HashSet::new(),
+                    client_info_labels: None,
                 },
             );
         }

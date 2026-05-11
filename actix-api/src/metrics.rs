@@ -21,8 +21,8 @@
 use actix_web::{HttpResponse, Responder};
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
-    CounterVec, Encoder, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec,
 };
 
 /// Shared Prometheus metrics HTTP handler for relay server binaries.
@@ -379,7 +379,16 @@ lazy_static! {
     )
     .expect("Failed to create adaptive_audio_tier metric");
 
-    /// Cumulative datagram drops (writable stream locked)
+    /// Cumulative datagrams dropped as of the latest client health snapshot.
+    pub static ref DATAGRAM_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_datagram_drops",
+        "Cumulative datagrams dropped due to locked writable stream as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create datagram_drops metric");
+
+    /// Deprecated compatibility mirror for dashboards still querying the old
+    /// counter-shaped gauge name.
     pub static ref DATAGRAM_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_datagram_drops_total",
         "Cumulative datagrams dropped due to locked writable stream",
@@ -387,7 +396,16 @@ lazy_static! {
     )
     .expect("Failed to create datagram_drops_total metric");
 
-    /// Cumulative WebSocket packets dropped (backpressure)
+    /// Cumulative WebSocket packet drops as of the latest client health snapshot.
+    pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_drops",
+        "Cumulative WebSocket packets dropped due to send buffer backpressure as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create websocket_drops metric");
+
+    /// Deprecated compatibility mirror for dashboards still querying the old
+    /// counter-shaped gauge name.
     pub static ref WEBSOCKET_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_websocket_drops_total",
         "Cumulative WebSocket packets dropped due to send buffer backpressure",
@@ -413,15 +431,21 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Peer FPS signal driving encoder decisions.
-    /// NOTE: As of PR-A (#312), this reports p75 aggregated FPS, not worst-peer FPS.
-    /// TODO(PR-G): rename metric to `videocall_encoder_p75_peer_fps`.
+    /// Deprecated compatibility metric for the old worst-peer name.
     pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_worst_peer_fps",
-        "FPS from the worst-performing receiver driving encoder decisions",
+        "Deprecated compatibility metric; now carries the encoder p75 peer FPS",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create encoder_worst_peer_fps metric");
+
+    /// p75 peer FPS signal driving encoder decisions.
+    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_p75_peer_fps",
+        "p75 peer FPS driving adaptive quality decisions",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create encoder_p75_peer_fps metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
@@ -593,7 +617,8 @@ lazy_static! {
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
-    /// `kind` is one of `media`|`control`|`rtt`|`unknown`. ~8 series total.
+    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`.
+    /// ~14 series total.
     ///
     /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
     /// label — session IDs are unbounded and would explode storage. The existing
@@ -601,18 +626,59 @@ lazy_static! {
     /// new counter is the protocol-wide aggregate that backs alerting (rate()
     /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
     ///
-    /// `kind` values:
-    /// - `media`: derived from `PacketWrapper.packet_type == MEDIA` (already
-    ///   parsed by the caller in `wt_chat_session::Handler<Message>`)
+    /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
+    /// matching helper in `ws_chat_session`):
+    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`.
+    ///   Added 2026-05-08 to attribute congestion-storm drops to audio.
+    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`.
+    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`.
+    /// - `media`: legacy catch-all for MEDIA packets we could not refine —
+    ///   encrypted/unparseable inner payloads, HEARTBEAT, KEYFRAME_REQUEST,
+    ///   or any future MediaType not in the audio/video/screen set. Kept
+    ///   so existing alerts pivoting on `kind="media"` still see a series.
     /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
     /// - `rtt`: RTT echo path that drops on a full datagram queue
     /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    ///
+    /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
+    /// will only see the catch-all bucket after this change; audio/video/screen
+    /// drops now land on their own labels. Update saved Grafana queries with
+    /// `kind=~"audio|video|screen|media"` (or sum across) to preserve totals.
     pub static ref OUTBOUND_CHANNEL_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "videocall_outbound_channel_drops_total",
         "Total outbound channel drops (try_send full) by transport and packet kind",
         &["transport", "kind"]
     )
     .expect("Failed to create videocall_outbound_channel_drops_total metric");
+
+    // ===== CLIENT TELEMETRY: TELEM-7, TELEM-8, TELEM-9 =====
+
+    /// TELEM-7: Static per-session client metadata (value always 1, info in labels)
+    pub static ref CLIENT_INFO: GaugeVec = register_gauge_vec!(
+        "videocall_client_info",
+        "Static per-session client metadata (value always 1, info in labels)",
+        &["meeting_id", "session_id", "display_name",
+          "cores", "architecture", "gpu_family",
+          "network_effective_type", "capability_score"]
+    )
+    .expect("Failed to create videocall_client_info metric");
+
+    /// TELEM-8: Long task duration histogram (main-thread stalls)
+    pub static ref CLIENT_LONGTASK_DURATION_MS: HistogramVec = register_histogram_vec!(
+        "videocall_client_longtask_duration_ms",
+        "Main-thread long task durations observed by the client (ms)",
+        &["meeting_id", "session_id", "display_name"],
+        vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0]
+    )
+    .expect("Failed to create videocall_client_longtask_duration_ms metric");
+
+    /// TELEM-9: Main-thread rAF cadence (frames per second)
+    pub static ref CLIENT_RENDER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_client_render_fps",
+        "Main-thread rAF cadence (fps)",
+        &["meeting_id", "session_id", "display_name"]
+    )
+    .expect("Failed to create videocall_client_render_fps metric");
 }
 
 // =============================================================================
@@ -637,7 +703,14 @@ mod tests {
     #[test]
     #[serial(outbound_channel_drops_metric)]
     fn outbound_channel_drops_increments_per_kind() {
-        let kinds = ["media", "control", "rtt", "unknown"];
+        // Cardinality contract: every documented `kind` must be an
+        // independent series. The audio/video/screen labels were added
+        // 2026-05-08 to refine the legacy `media` bucket; this test
+        // also acts as the regression guard against accidental label
+        // typos drifting between the helpers and the dashboards.
+        let kinds = [
+            "audio", "video", "screen", "media", "control", "rtt", "unknown",
+        ];
         let before: Vec<f64> = kinds
             .iter()
             .map(|k| snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]))

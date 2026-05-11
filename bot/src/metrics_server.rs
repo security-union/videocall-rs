@@ -29,11 +29,12 @@
 //! without a new data model:
 //!
 //! - `bot_aq_video_tier_index`, `bot_aq_audio_tier_index`
-//! - `bot_aq_target_bitrate_kbps`, `bot_aq_worst_peer_fps`
+//! - `bot_aq_target_bitrate_kbps`, `bot_aq_p75_peer_fps`
 //! - `bot_aq_fps_ratio`, `bot_aq_bitrate_ratio`
 //! - `bot_netsim_dropped_total`, `bot_netsim_delay_ms`
 //! - `bot_packets_sent_total`, `bot_packets_received_total`
 //! - `bot_packets_parsed_error_total`
+//! - `bot_websocket_pong_drops_total`
 //!
 //! All series are labeled `bot=<user_id>` and `meeting=<meeting_id>`; some
 //! additionally carry `direction` (up/down), `media_type`
@@ -106,7 +107,7 @@ pub struct BotMetrics {
     pub aq_video_tier_index: IntGaugeVec,
     pub aq_audio_tier_index: IntGaugeVec,
     pub aq_target_bitrate_kbps: GaugeVec,
-    pub aq_worst_peer_fps: GaugeVec,
+    pub aq_p75_peer_fps: GaugeVec,
     pub aq_fps_ratio: GaugeVec,
     pub aq_bitrate_ratio: GaugeVec,
 
@@ -130,6 +131,7 @@ pub struct BotMetrics {
     pub packets_sent_total: IntCounterVec,
     pub packets_received_total: IntCounterVec,
     pub packets_parsed_error_total: IntCounterVec,
+    pub websocket_pong_drops_total: IntCounterVec,
 }
 
 #[cfg(feature = "metrics")]
@@ -160,9 +162,9 @@ impl BotMetrics {
             registry
         )?;
 
-        let aq_worst_peer_fps = register_gauge_vec_with_registry!(
-            "bot_aq_worst_peer_fps",
-            "Bot p75 received FPS across reporting peers (historically 'worst peer')",
+        let aq_p75_peer_fps = register_gauge_vec_with_registry!(
+            "bot_aq_p75_peer_fps",
+            "Bot p75 received FPS across reporting peers",
             &["bot", "meeting"],
             registry
         )?;
@@ -220,12 +222,19 @@ impl BotMetrics {
             registry
         )?;
 
+        let websocket_pong_drops_total = register_int_counter_vec_with_registry!(
+            "bot_websocket_pong_drops_total",
+            "Total WebSocket pong responses the bot dropped before they reached the writer task",
+            &["bot", "meeting", "reason"],
+            registry
+        )?;
+
         Ok(Arc::new(Self {
             registry,
             aq_video_tier_index,
             aq_audio_tier_index,
             aq_target_bitrate_kbps,
-            aq_worst_peer_fps,
+            aq_p75_peer_fps,
             aq_fps_ratio,
             aq_bitrate_ratio,
             netsim_dropped_total,
@@ -233,6 +242,7 @@ impl BotMetrics {
             packets_sent_total,
             packets_received_total,
             packets_parsed_error_total,
+            websocket_pong_drops_total,
         }))
     }
 
@@ -360,7 +370,7 @@ mod tests {
             .with_label_values(&["b", "m"])
             .set(500.0);
         metrics
-            .aq_worst_peer_fps
+            .aq_p75_peer_fps
             .with_label_values(&["b", "m"])
             .set(25.0);
         metrics
@@ -401,7 +411,8 @@ mod tests {
         let body = String::from_utf8(buf).expect("utf8");
         assert!(
             body.contains("bot_aq_video_tier_index"),
-            "metrics body: {body}"
+            "metrics body: {}",
+            body
         );
         assert!(body.contains("bot_netsim_dropped_total"));
     }

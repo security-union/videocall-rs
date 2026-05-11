@@ -256,6 +256,14 @@ impl Connection {
         }
     }
 
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn is_webtransport(&self) -> bool {
+        self.transport_type == TransportType::TRANSPORT_WEBTRANSPORT
+    }
+
     pub fn set_session_id(&self, session_id: u64) {
         *self.session_id.borrow_mut() = Some(session_id);
     }

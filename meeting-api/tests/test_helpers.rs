@@ -22,6 +22,7 @@ use http_body_util::BodyExt;
 use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -78,6 +79,32 @@ pub fn build_app(pool: PgPool) -> Router {
         dev_user: None,
     };
     routes::router().with_state(state)
+}
+
+/// Build the Axum router with the production CORS layer attached.
+pub fn build_app_with_cors(pool: PgPool) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::PATCH,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::COOKIE,
+            http::header::ACCEPT,
+            http::HeaderName::from_static("x-user-id"),
+            http::HeaderName::from_static("x-session-timestamp"),
+            http::HeaderName::from_static("x-chunk-seq"),
+        ])
+        .allow_credentials(true);
+
+    build_app(pool).layer(cors)
 }
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.

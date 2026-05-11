@@ -1045,6 +1045,7 @@ dependencies = [
  "hyper 0.14.32",
  "image 0.25.9",
  "jsonwebtoken",
+ "memmap2",
  "opus",
  "prometheus",
  "protobuf 3.7.1",

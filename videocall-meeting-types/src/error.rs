@@ -110,6 +110,14 @@ impl APIError {
         }
     }
 
+    pub fn bad_request(detail: impl Into<String>) -> Self {
+        Self {
+            code: "BAD_REQUEST".to_string(),
+            message: detail.into(),
+            engineering_error: None,
+        }
+    }
+
     pub fn not_owner() -> Self {
         Self {
             code: "NOT_OWNER".to_string(),

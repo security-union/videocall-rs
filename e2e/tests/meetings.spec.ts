@@ -68,9 +68,9 @@ test.describe("Meetings", () => {
     await expect(page.locator("#username")).toBeVisible();
     await expect(page.locator("#meeting-id")).toBeVisible();
     // With an empty meeting-id field, only the Generate button is rendered.
-    await expect(page.getByText("Generate a New Meeting ID")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Generate a New Meeting ID" })).toBeVisible();
     // The Start/Join button is NOT in the DOM until the user types into #meeting-id.
-    await expect(page.getByText("Start or Join Meeting")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Start or Join Meeting" })).toHaveCount(0);
     await page.waitForTimeout(1500);
   });
 
@@ -99,8 +99,8 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(1000);
     // Once the meeting-id field has content, the button-swap kicks in:
     // Start/Join is rendered, Generate is removed from the DOM.
-    await expect(page.getByText("Start or Join Meeting")).toBeVisible();
-    await expect(page.getByText("Generate a New Meeting ID")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Start or Join Meeting" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Generate a New Meeting ID" })).toHaveCount(0);
     // The display name is a controlled input (value bound to signal).
     // Clear it first in case any pre-fill occurred, then type our value.
     await page.locator("#username").click();
@@ -130,18 +130,18 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(500);
 
     // Click Generate. Stay on home page, wait for the input to populate.
-    await page.getByText("Generate a New Meeting ID").click();
+    await page.getByRole("button", { name: "Generate a New Meeting ID" }).click();
     await expect(page.locator("#meeting-id")).not.toHaveValue("", { timeout: 10_000 });
 
     // Sanity-check the URL did NOT change to /meeting/<id>.
     await expect(page).toHaveURL(/\/$/);
 
     // Button-swap should have happened: Generate gone, Start/Join visible.
-    await expect(page.getByText("Generate a New Meeting ID")).toHaveCount(0);
-    await expect(page.getByText("Start or Join Meeting")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Generate a New Meeting ID" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Start or Join Meeting" })).toBeVisible();
 
     // Click Start/Join to actually enter the meeting.
-    await page.getByText("Start or Join Meeting").click();
+    await page.getByRole("button", { name: "Start or Join Meeting" }).click();
     await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
     await page.waitForTimeout(2000);
   });
@@ -183,7 +183,9 @@ test.describe("Meetings", () => {
     // The inline prompt should be visible with input and join button
     await expect(page.getByText("Enter your display name")).toBeVisible({ timeout: 5_000 });
     await expect(page.locator("input.input-apple")).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByText("Join Meeting")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("button", { name: "Join Meeting" })).toBeVisible({
+      timeout: 5_000,
+    });
   });
 
   test("display name is saved to localStorage on Generate, then on Start/Join navigation", async ({
@@ -202,12 +204,12 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(500);
 
     // Step 1: Generate populates the field but does not navigate.
-    await page.getByText("Generate a New Meeting ID").click();
+    await page.getByRole("button", { name: "Generate a New Meeting ID" }).click();
     await expect(page.locator("#meeting-id")).not.toHaveValue("", { timeout: 10_000 });
     await expect(page).toHaveURL(/\/$/);
 
     // Step 2: Click Start/Join to enter the meeting.
-    await page.getByText("Start or Join Meeting").click();
+    await page.getByRole("button", { name: "Start or Join Meeting" }).click();
     await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
 
     // Navigate back to home page and confirm display name was persisted.

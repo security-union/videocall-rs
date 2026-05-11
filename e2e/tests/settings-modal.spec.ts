@@ -31,7 +31,7 @@ test.describe("Device settings modal", () => {
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
     // Enter the meeting
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -79,7 +79,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -122,7 +122,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -181,7 +181,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -253,7 +253,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -309,7 +309,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -339,7 +339,7 @@ test.describe("Device settings modal", () => {
 
     await page.reload();
 
-    const joinAgain = page.getByText(/Start Meeting|Join Meeting/);
+    const joinAgain = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     if (await joinAgain.isVisible({ timeout: 5_000 }).catch(() => false)) {
       await joinAgain.click();
     }
@@ -376,7 +376,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -426,7 +426,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -471,7 +471,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -538,7 +538,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -610,7 +610,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -675,7 +675,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -718,7 +718,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -766,7 +766,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -816,7 +816,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -864,7 +864,7 @@ test.describe("Device settings modal", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     await expect(joinButton).toBeVisible({ timeout: 20_000 });
     await joinButton.click();
 
@@ -933,7 +933,7 @@ test.describe("Device settings modal", () => {
     // Reload page and verify cap is still enforced
     await page.reload();
 
-    const joinAgain = page.getByText(/Start Meeting|Join Meeting/);
+    const joinAgain = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     if (await joinAgain.isVisible({ timeout: 5_000 }).catch(() => false)) {
       await joinAgain.click();
     }

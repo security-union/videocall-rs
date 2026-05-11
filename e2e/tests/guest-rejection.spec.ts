@@ -64,7 +64,7 @@ async function hostStartsMeeting(
   });
   await hostPage.waitForTimeout(1500);
 
-  const joinButton = hostPage.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await joinButton.waitFor({ timeout: 20_000 });
   await hostPage.waitForTimeout(1000);
   await joinButton.click();

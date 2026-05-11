@@ -24,7 +24,7 @@ async function joinMeeting(page: Page, meetingId: string, username: string): Pro
 
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await joinButton.click();
 

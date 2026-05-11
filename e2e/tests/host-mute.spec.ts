@@ -97,10 +97,11 @@ async function admitGuestIfNeeded(
  * getByRole("button", { name: "Unmute" }) reliably targets it.
  */
 async function enableMic(page: Page): Promise<void> {
-  const unmuteBtn = page.getByRole("button", { name: "Unmute" }).first();
+  const unmuteBtn = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Unmute" }),
+  });
   await expect(unmuteBtn).toBeVisible({ timeout: 10_000 });
   await unmuteBtn.click();
-  // Brief settle so the state propagates before the next action.
   await page.waitForTimeout(500);
 }
 
@@ -282,7 +283,9 @@ test.describe("Host mute controls", () => {
       await enableMic(hostPage);
 
       // Confirm host mic is currently on — "Mute" tooltip means it's active.
-      const hostActiveMicBtn = hostPage.getByRole("button", { name: "Mute" }).first();
+      const hostActiveMicBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Mute" }),
+      });
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
 
       // ---- Host clicks "Mute all" ----
@@ -368,7 +371,9 @@ test.describe("Host mute controls", () => {
       await enableMic(guestPage);
 
       // Confirm guest mic is active ("Mute" tooltip visible = mic on).
-      const guestMuteBtn = guestPage.getByRole("button", { name: "Mute" }).first();
+      const guestMuteBtn = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator("span.tooltip", { hasText: "Mute" }),
+      });
       await expect(guestMuteBtn).toBeVisible({ timeout: 5_000 });
 
       // ---- Host mutes the guest via the per-tile three-dot menu ----
@@ -381,16 +386,20 @@ test.describe("Host mute controls", () => {
       await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
       // ---- Guest's mic button now shows "Unmute" (mic is off) ----
-      const guestUnmuteBtn = guestPage.getByRole("button", { name: "Unmute" }).first();
+      const guestUnmuteBtn = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator("span.tooltip", { hasText: "Unmute" }),
+      });
       await expect(guestUnmuteBtn).toBeVisible({ timeout: 10_000 });
 
       // ---- Guest self-unmutes ----
       await guestUnmuteBtn.click();
 
       // ---- Guest's mic is active again — "Mute" button reappears ----
-      await expect(guestPage.getByRole("button", { name: "Mute" }).first()).toBeVisible({
-        timeout: 10_000,
-      });
+      await expect(
+        guestPage.locator("button.video-control-button", {
+          has: guestPage.locator("span.tooltip", { hasText: "Mute" }),
+        }),
+      ).toBeVisible({ timeout: 10_000 });
     } finally {
       await browser1.close();
       await browser2.close();

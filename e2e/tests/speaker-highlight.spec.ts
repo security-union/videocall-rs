@@ -99,7 +99,9 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 }
 
 async function ensureMicrophoneEnabled(page: Page) {
-  const unmuteButton = page.getByRole("button", { name: "Unmute" });
+  const unmuteButton = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Unmute" }),
+  });
   if (await unmuteButton.count()) {
     await unmuteButton.first().click();
     await page.waitForTimeout(1_000);
@@ -107,7 +109,9 @@ async function ensureMicrophoneEnabled(page: Page) {
 }
 
 async function muteMicrophone(page: Page) {
-  const muteButton = page.getByRole("button", { name: "Mute" });
+  const muteButton = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Mute" }),
+  });
   await expect(muteButton.first()).toBeVisible({ timeout: 10_000 });
   await muteButton.first().click();
   await page.waitForTimeout(1_000);

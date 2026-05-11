@@ -29,8 +29,14 @@ fn focus_add_btn() {
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
     let mut appearance_ctx = use_context::<AppearanceSettingsCtx>();
-    let mut dock_position_ctx = use_context::<DockPositionCtx>();
-    let mut autohide_ctx = use_context::<AutohideCtx>();
+    // Fallback signals for when contexts are not provided (e.g. in tests).
+    // Hooks must be called unconditionally, so we always create them.
+    let fallback_dock = use_signal(|| DockPosition::Bottom);
+    let fallback_autohide = use_signal(|| true);
+    let dock_position_ctx = try_use_context::<DockPositionCtx>()
+        .unwrap_or(DockPositionCtx(fallback_dock));
+    let autohide_ctx = try_use_context::<AutohideCtx>()
+        .unwrap_or(AutohideCtx(fallback_autohide));
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style =

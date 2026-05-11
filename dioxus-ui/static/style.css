@@ -3903,7 +3903,7 @@ select {
 
 .action-bar-option.selected {
   background: var(--accent);
-  color: #fff;
+  color: var(--text-primary);
   border-color: var(--accent);
 }
 
@@ -5383,30 +5383,15 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background:
-    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
-    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
-    linear-gradient(
-      180deg,
-      rgba(70, 100, 140, 0.06) 0%,
-      rgba(50, 80, 120, 0.02) 100%
-    ),
-    linear-gradient(
-      135deg,
-      rgba(15, 20, 35, 0.92) 0%,
-      rgba(12, 18, 35, 0.94) 50%,
-      rgba(10, 15, 32, 0.96) 100%
-    );
-  border: 1px solid rgba(70, 100, 140, 0.15);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
   z-index: 1000000;
   min-width: 200px;
   backdrop-filter: blur(16px) saturate(1.1);
   -webkit-backdrop-filter: blur(16px) saturate(1.1);
-  box-shadow:
-    inset 0 1px 0 rgba(100, 140, 180, 0.06),
-    0 8px 24px rgba(0, 0, 0, 0.40);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .mock-peers-popover-header {
@@ -5474,21 +5459,8 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background:
-    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
-    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
-    linear-gradient(
-      180deg,
-      rgba(70, 100, 140, 0.06) 0%,
-      rgba(50, 80, 120, 0.02) 100%
-    ),
-    linear-gradient(
-      135deg,
-      rgba(15, 20, 35, 0.92) 0%,
-      rgba(12, 18, 35, 0.94) 50%,
-      rgba(10, 15, 32, 0.96) 100%
-    );
-  border: 1px solid rgba(70, 100, 140, 0.15);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 12px;
   display: flex;
@@ -5496,9 +5468,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   z-index: 30;
   backdrop-filter: blur(16px) saturate(1.1);
   -webkit-backdrop-filter: blur(16px) saturate(1.1);
-  box-shadow:
-    inset 0 1px 0 rgba(100, 140, 180, 0.06),
-    0 8px 24px rgba(0, 0, 0, 0.40);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .density-option {

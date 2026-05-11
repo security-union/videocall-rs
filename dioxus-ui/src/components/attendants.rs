@@ -584,7 +584,9 @@ pub fn AttendantsComponent(
             let nt_inner = nt1.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                if autohide_enabled() { controls_expanded.set(false); }
+                if autohide_enabled() {
+                    controls_expanded.set(false);
+                }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -598,7 +600,9 @@ pub fn AttendantsComponent(
             let ht_inner = ht1.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                if autohide_enabled() { controls_visible.set(false); }
+                if autohide_enabled() {
+                    controls_visible.set(false);
+                }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -629,7 +633,9 @@ pub fn AttendantsComponent(
             let nt_inner = nt2.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                if autohide_enabled() { controls_expanded.set(false); }
+                if autohide_enabled() {
+                    controls_expanded.set(false);
+                }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -642,7 +648,9 @@ pub fn AttendantsComponent(
             let ht_inner = ht2.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                if autohide_enabled() { controls_visible.set(false); }
+                if autohide_enabled() {
+                    controls_visible.set(false);
+                }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -661,7 +669,9 @@ pub fn AttendantsComponent(
         let nt_init = narrow_timer.clone();
         let narrow_init = Closure::<dyn FnMut()>::once(move || {
             nt_init.borrow_mut().take();
-            if autohide_enabled() { controls_expanded.set(false); }
+            if autohide_enabled() {
+                controls_expanded.set(false);
+            }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -675,7 +685,9 @@ pub fn AttendantsComponent(
         let ht_init = hide_timer.clone();
         let hide_init = Closure::<dyn FnMut()>::once(move || {
             ht_init.borrow_mut().take();
-            if autohide_enabled() { controls_visible.set(false); }
+            if autohide_enabled() {
+                controls_visible.set(false);
+            }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(

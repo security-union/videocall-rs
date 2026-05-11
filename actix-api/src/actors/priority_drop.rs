@@ -38,10 +38,13 @@
 //!    counter still fires (with the new `overflow_critical` label so the
 //!    new policy can be distinguished from the legacy uniform drops).
 //!    A subset of control packets — `SESSION_ASSIGNED`, `CONGESTION`,
-//!    `RSA_PUB_KEY`, `MEETING` — are extra-critical to session
-//!    lifecycle (reconnection, key exchange, host transitions) and
-//!    *must* still be attempted on overflow even if the policy were
-//!    later tightened.
+//!    `RSA_PUB_KEY`, `AES_KEY`, `MEETING` — are extra-critical to
+//!    session lifecycle (reconnection, E2EE handshake, host
+//!    transitions) and *must* still be attempted on overflow even if
+//!    the policy were later tightened. Both halves of the E2EE
+//!    handshake (RSA_PUB_KEY + AES_KEY) are Critical because dropping
+//!    either silently breaks encrypted communication for the affected
+//!    peer pair with no page-able alert.
 //!
 //! The decision is per-session: no global state is introduced, and the
 //! drop policy is identical for the WebTransport and WebSocket transports.
@@ -86,13 +89,13 @@ pub const PRIORITY_DROP_AUDIO_FILL_RATIO: f32 = 0.95;
 pub enum OutboundPriority {
     /// Critical lifecycle / key-exchange packet that must never be
     /// preemptively dropped: `SESSION_ASSIGNED`, `CONGESTION`,
-    /// `RSA_PUB_KEY`, `MEETING`. These ride the outbound channel like
-    /// any other packet, but the priority policy will admit them
-    /// regardless of channel fill.
+    /// `RSA_PUB_KEY`, `AES_KEY`, `MEETING`. These ride the outbound
+    /// channel like any other packet, but the priority policy will
+    /// admit them regardless of channel fill.
     Critical,
-    /// Generic control / non-media packet (AES_KEY, DIAGNOSTICS,
-    /// HEALTH, KEYFRAME_REQUEST relayed back to senders, …).
-    /// Not preemptively dropped; only fails on actual channel overflow.
+    /// Generic control / non-media packet (DIAGNOSTICS, HEALTH,
+    /// KEYFRAME_REQUEST relayed back to senders, …). Not preemptively
+    /// dropped; only fails on actual channel overflow.
     Control,
     /// Audio media frame. Dropped when fill ratio reaches
     /// [`PRIORITY_DROP_AUDIO_FILL_RATIO`].
@@ -128,10 +131,16 @@ impl OutboundPriority {
             // (the receiver is congested precisely because the sender
             // does not yet know to slow down).
             PacketType::CONGESTION => OutboundPriority::Critical,
-            // RSA_PUB_KEY initiates the asymmetric handshake. Without
-            // it the receiver cannot decrypt subsequent AES_KEY, so we
-            // never drop it preemptively.
+            // RSA_PUB_KEY and AES_KEY are both halves of the E2EE
+            // handshake — RSA_PUB_KEY initiates the asymmetric step and
+            // AES_KEY delivers the symmetric session key encrypted under
+            // it. Dropping either one silently breaks encrypted
+            // communication for the affected peer pair, with no
+            // page-able label surfaced to operators. They are small and
+            // infrequent, so the cost of always admitting them is
+            // negligible, and the cost of losing one is catastrophic.
             PacketType::RSA_PUB_KEY => OutboundPriority::Critical,
+            PacketType::AES_KEY => OutboundPriority::Critical,
             // MEETING packets carry server-authoritative events
             // (MEETING_STARTED, MEETING_ENDED, PARTICIPANT_LEFT,
             // HOST_MUTE_PARTICIPANT, …). Losing them desyncs the
@@ -151,15 +160,10 @@ impl OutboundPriority {
                 // ever reused on that hot path.)
                 _ => OutboundPriority::Control,
             },
-            // Remaining wrappers: AES_KEY, CONNECTION, DIAGNOSTICS,
-            // HEALTH, PACKET_TYPE_UNKNOWN. AES_KEY in particular is
-            // critical-ish (key exchange) but is small and infrequent,
-            // and the existing transport does not have a way to attempt
-            // a "force admit" past a full channel — treating it as
-            // Control is the same as the prior uniform behaviour for
-            // these types. We could promote AES_KEY to Critical, but
-            // doing so changes no current behaviour (Control never
-            // preemptively drops either).
+            // Remaining wrappers: CONNECTION, DIAGNOSTICS, HEALTH,
+            // PACKET_TYPE_UNKNOWN. Treated as Control: never preemptively
+            // dropped, only fail on actual channel overflow. This matches
+            // the prior uniform behaviour for these types.
             _ => OutboundPriority::Control,
         }
     }
@@ -356,12 +360,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_aes_key_is_control() {
-        // AES_KEY is small & valuable but not in the explicit Critical
-        // set; behaviour matches the prior uniform policy for it.
+    fn classify_aes_key_is_critical() {
+        // AES_KEY is the symmetric half of the E2EE handshake — it
+        // delivers the session key encrypted under RSA_PUB_KEY. Losing
+        // it silently breaks encrypted communication between the
+        // affected peer pair with no `overflow_critical` label, so it
+        // is classified Critical alongside RSA_PUB_KEY.
         assert_eq!(
             OutboundPriority::classify(true, PacketType::AES_KEY, None),
-            OutboundPriority::Control,
+            OutboundPriority::Critical,
         );
     }
 
@@ -737,11 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn spec_critical_set_is_session_congestion_rsa_meeting() {
-        // "preserve SESSION_*, CONGESTION, RSA_PUB_KEY, MEETING_*"
+    fn spec_critical_set_is_session_congestion_rsa_aes_meeting() {
+        // "preserve SESSION_*, CONGESTION, RSA_PUB_KEY, AES_KEY,
+        //  MEETING_*"
         //
         // Lock in the Critical set so a future change can't silently
-        // demote one of them into the Control bucket.
+        // demote one of them into the Control bucket. AES_KEY is the
+        // symmetric half of the E2EE handshake and is paired with
+        // RSA_PUB_KEY — dropping either silently breaks encryption for
+        // the affected peer pair.
         assert_eq!(
             OutboundPriority::classify(true, PacketType::SESSION_ASSIGNED, None),
             OutboundPriority::Critical,
@@ -752,6 +763,10 @@ mod tests {
         );
         assert_eq!(
             OutboundPriority::classify(true, PacketType::RSA_PUB_KEY, None),
+            OutboundPriority::Critical,
+        );
+        assert_eq!(
+            OutboundPriority::classify(true, PacketType::AES_KEY, None),
             OutboundPriority::Critical,
         );
         assert_eq!(
@@ -851,11 +866,12 @@ mod tests {
 
     #[test]
     fn realchannel_critical_admit_even_at_99_percent_fill() {
-        // The Critical bucket guards lifecycle packets (SESSION_ASSIGNED,
-        // CONGESTION, RSA_PUB_KEY, MEETING). Even when the channel is
-        // 99% full, the policy must admit. The real try_send may then
-        // succeed (1 slot left) or fail (raced to fill) — the policy
-        // itself is not the gating layer here.
+        // The Critical bucket guards lifecycle and E2EE-handshake
+        // packets (SESSION_ASSIGNED, CONGESTION, RSA_PUB_KEY, AES_KEY,
+        // MEETING). Even when the channel is 99% full, the policy must
+        // admit. The real try_send may then succeed (1 slot left) or
+        // fail (raced to fill) — the policy itself is not the gating
+        // layer here.
         let total = 100;
         let used = 99;
         let (tx, _rx) = channel_at_fill(total, used);
@@ -865,6 +881,7 @@ mod tests {
             PacketType::SESSION_ASSIGNED,
             PacketType::CONGESTION,
             PacketType::RSA_PUB_KEY,
+            PacketType::AES_KEY,
             PacketType::MEETING,
         ] {
             let priority = OutboundPriority::classify(true, packet_type, None);
@@ -877,6 +894,34 @@ mod tests {
                 evaluate(priority, free, total),
                 PriorityDropDecision::Admit,
                 "Critical {packet_type:?} must be admitted at 99% fill",
+            );
+        }
+    }
+
+    #[test]
+    fn aes_key_is_critical_and_never_dropped() {
+        // AES_KEY symmetry with RSA_PUB_KEY: both halves of the E2EE
+        // handshake must survive the priority policy at every fill
+        // level. Dropping AES_KEY silently breaks encrypted
+        // communication for the affected peer pair with no
+        // `overflow_critical` label surfaced to operators — exactly the
+        // failure mode the priority policy is supposed to prevent for
+        // RSA_PUB_KEY. The two packet types must be treated
+        // symmetrically.
+        let priority = OutboundPriority::classify(true, PacketType::AES_KEY, None);
+        assert_eq!(
+            priority,
+            OutboundPriority::Critical,
+            "AES_KEY must classify as Critical, mirroring RSA_PUB_KEY",
+        );
+
+        let total = 100usize;
+        for fill_pct in [0, 50, 80, 90, 95, 99] {
+            let free = total - fill_pct;
+            assert_eq!(
+                evaluate(priority, free, total),
+                PriorityDropDecision::Admit,
+                "AES_KEY must be admitted at {fill_pct}% fill (no preemptive drop)",
             );
         }
     }

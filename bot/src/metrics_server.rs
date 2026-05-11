@@ -29,7 +29,7 @@
 //! without a new data model:
 //!
 //! - `bot_aq_video_tier_index`, `bot_aq_audio_tier_index`
-//! - `bot_aq_target_bitrate_kbps`, `bot_aq_worst_peer_fps`
+//! - `bot_aq_target_bitrate_kbps`, `bot_aq_p75_peer_fps`
 //! - `bot_aq_fps_ratio`, `bot_aq_bitrate_ratio`
 //! - `bot_netsim_dropped_total`, `bot_netsim_delay_ms`
 //! - `bot_packets_sent_total`, `bot_packets_received_total`
@@ -107,7 +107,7 @@ pub struct BotMetrics {
     pub aq_video_tier_index: IntGaugeVec,
     pub aq_audio_tier_index: IntGaugeVec,
     pub aq_target_bitrate_kbps: GaugeVec,
-    pub aq_worst_peer_fps: GaugeVec,
+    pub aq_p75_peer_fps: GaugeVec,
     pub aq_fps_ratio: GaugeVec,
     pub aq_bitrate_ratio: GaugeVec,
 
@@ -162,9 +162,9 @@ impl BotMetrics {
             registry
         )?;
 
-        let aq_worst_peer_fps = register_gauge_vec_with_registry!(
-            "bot_aq_worst_peer_fps",
-            "Bot p75 received FPS across reporting peers (historically 'worst peer')",
+        let aq_p75_peer_fps = register_gauge_vec_with_registry!(
+            "bot_aq_p75_peer_fps",
+            "Bot p75 received FPS across reporting peers",
             &["bot", "meeting"],
             registry
         )?;
@@ -234,7 +234,7 @@ impl BotMetrics {
             aq_video_tier_index,
             aq_audio_tier_index,
             aq_target_bitrate_kbps,
-            aq_worst_peer_fps,
+            aq_p75_peer_fps,
             aq_fps_ratio,
             aq_bitrate_ratio,
             netsim_dropped_total,
@@ -370,7 +370,7 @@ mod tests {
             .with_label_values(&["b", "m"])
             .set(500.0);
         metrics
-            .aq_worst_peer_fps
+            .aq_p75_peer_fps
             .with_label_values(&["b", "m"])
             .set(25.0);
         metrics
@@ -411,7 +411,8 @@ mod tests {
         let body = String::from_utf8(buf).expect("utf8");
         assert!(
             body.contains("bot_aq_video_tier_index"),
-            "metrics body: {body}"
+            "metrics body: {}",
+            body
         );
         assert!(body.contains("bot_netsim_dropped_total"));
     }

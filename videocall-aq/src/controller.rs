@@ -279,9 +279,8 @@ pub struct EncoderBitrateController {
     tier_changed: bool,
     /// Last computed fps_ratio for external observation.
     last_fps_ratio: f64,
-    /// Last worst-peer FPS for external observation.
-    /// TODO(PR-G): rename to `last_p75_fps`; update proto field, Prometheus metric, and Grafana panel.
-    last_worst_peer_fps: f64,
+    /// Last p75 peer FPS for external observation.
+    last_p75_peer_fps: f64,
     /// Last computed bitrate_ratio for external observation.
     last_bitrate_ratio: f64,
     /// Last PID target bitrate for external observation.
@@ -390,7 +389,7 @@ impl EncoderBitrateController {
             quality_manager,
             tier_changed: false,
             last_fps_ratio: 0.0,
-            last_worst_peer_fps: 0.0,
+            last_p75_peer_fps: 0.0,
             last_bitrate_ratio: 0.0,
             last_target_bitrate_kbps: 0.0,
             last_aq_summary_ms: 0.0,
@@ -438,13 +437,11 @@ impl EncoderBitrateController {
             return None; // Too soon since last correction, don't emit a new one
         }
 
-        // Get the p75 FPS across all reporting peers.
-        // Semantically this is now the p75 aggregate, but the field name is kept
-        // as `last_worst_peer_fps` for proto/metric compatibility (rename in PR-G).
-        // effective_peer_count is the number of peers that contributed FPS data,
+        // Get the p75 FPS across all reporting peers. effective_peer_count is
+        // the number of peers that contributed FPS data,
         // which may be less than peer_windows.len() (some peers may lack metrics).
         let (worst_fps, effective_peer_count) = self.diagnostic_packets.get_p75_fps()?;
-        self.last_worst_peer_fps = worst_fps;
+        self.last_p75_peer_fps = worst_fps;
 
         let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
@@ -661,9 +658,9 @@ impl EncoderBitrateController {
         self.last_fps_ratio
     }
 
-    /// Last worst-peer FPS for health reporting.
-    pub fn last_worst_peer_fps(&self) -> f64 {
-        self.last_worst_peer_fps
+    /// Last p75 peer FPS for health reporting.
+    pub fn last_p75_peer_fps(&self) -> f64 {
+        self.last_p75_peer_fps
     }
 
     /// Last computed bitrate_ratio (tier_clamped / ideal_for_tier) for health reporting.

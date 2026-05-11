@@ -186,7 +186,7 @@ pub fn Host(
         // Wire encoder decision inputs + screen tier to health reporter for metrics
         client.set_encoder_metric_sources(
             camera.shared_encoder_fps_ratio(),
-            camera.shared_encoder_worst_peer_fps(),
+            camera.shared_encoder_p75_peer_fps(),
             camera.shared_encoder_bitrate_ratio(),
             camera.shared_encoder_target_bitrate_kbps(),
             screen.shared_screen_tier_index(),

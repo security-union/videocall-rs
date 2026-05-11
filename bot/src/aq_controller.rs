@@ -113,8 +113,8 @@ pub struct BotAq {
     // --- PID-derived telemetry for health reporting ---
     /// PID-adjusted target bitrate in kbps, f32 bits packed into u32.
     last_target_bitrate_kbps_bits: AtomicU32,
-    /// Last worst-peer (p75) FPS as observed by the PID, f32 bits.
-    last_worst_peer_fps_bits: AtomicU32,
+    /// Last p75 received FPS as observed by the PID, f32 bits.
+    last_p75_peer_fps_bits: AtomicU32,
     /// fps_ratio = received / target, f32 bits.
     last_fps_ratio_bits: AtomicU32,
     /// bitrate_ratio = pid_clamped / tier_ideal, f32 bits.
@@ -182,7 +182,7 @@ impl BotAq {
             last_target_bitrate_kbps_bits: AtomicU32::new(
                 (initial_video.ideal_bitrate_kbps as f32).to_bits(),
             ),
-            last_worst_peer_fps_bits: AtomicU32::new(0),
+            last_p75_peer_fps_bits: AtomicU32::new(0),
             last_fps_ratio_bits: AtomicU32::new(0),
             last_bitrate_ratio_bits: AtomicU32::new(0),
             #[cfg(feature = "metrics")]
@@ -234,13 +234,13 @@ impl BotAq {
         // Always publish the latest PID-derived telemetry — these are useful
         // for health reporting even when the tier has not changed.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
-        let worst_fps = ctrl.last_worst_peer_fps() as f32;
+        let p75_peer_fps = ctrl.last_p75_peer_fps() as f32;
         let fps_ratio = ctrl.last_fps_ratio() as f32;
         let bitrate_ratio = ctrl.last_bitrate_ratio() as f32;
         self.last_target_bitrate_kbps_bits
             .store(target_bitrate.to_bits(), Ordering::Relaxed);
-        self.last_worst_peer_fps_bits
-            .store(worst_fps.to_bits(), Ordering::Relaxed);
+        self.last_p75_peer_fps_bits
+            .store(p75_peer_fps.to_bits(), Ordering::Relaxed);
         self.last_fps_ratio_bits
             .store(fps_ratio.to_bits(), Ordering::Relaxed);
         self.last_bitrate_ratio_bits
@@ -252,7 +252,7 @@ impl BotAq {
         #[cfg(feature = "metrics")]
         self.publish_live_metrics(
             target_bitrate,
-            worst_fps,
+            p75_peer_fps,
             fps_ratio,
             bitrate_ratio,
             ctrl.video_tier_index() as i64,
@@ -340,7 +340,7 @@ impl BotAq {
     fn publish_live_metrics(
         &self,
         target_bitrate_kbps: f32,
-        worst_peer_fps: f32,
+        p75_peer_fps: f32,
         fps_ratio: f32,
         bitrate_ratio: f32,
         video_tier_index: i64,
@@ -360,9 +360,9 @@ impl BotAq {
             .set(target_bitrate_kbps as f64);
         binding
             .metrics
-            .aq_worst_peer_fps
+            .aq_p75_peer_fps
             .with_label_values(&labels)
-            .set(worst_peer_fps as f64);
+            .set(p75_peer_fps as f64);
         binding
             .metrics
             .aq_fps_ratio
@@ -432,9 +432,9 @@ impl BotAq {
         f32::from_bits(self.last_target_bitrate_kbps_bits.load(Ordering::Relaxed))
     }
 
-    /// Last observed worst-peer (p75) FPS as seen by the PID (for health reporting).
-    pub fn last_worst_peer_fps(&self) -> f32 {
-        f32::from_bits(self.last_worst_peer_fps_bits.load(Ordering::Relaxed))
+    /// Last observed p75 received FPS as seen by the PID (for health reporting).
+    pub fn last_p75_peer_fps(&self) -> f32 {
+        f32::from_bits(self.last_p75_peer_fps_bits.load(Ordering::Relaxed))
     }
 
     /// Last fps_ratio (received / target) for health reporting.

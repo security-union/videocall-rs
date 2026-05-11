@@ -173,7 +173,7 @@ pub struct CameraEncoder {
     /// Last fps_ratio from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_fps_ratio: Rc<AtomicU32>,
     /// Worst peer FPS from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_worst_peer_fps: Rc<AtomicU32>,
+    shared_encoder_p75_peer_fps: Rc<AtomicU32>,
     /// Last bitrate_ratio from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_bitrate_ratio: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
@@ -232,7 +232,7 @@ impl CameraEncoder {
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
             shared_encoder_fps_ratio: Rc::new(AtomicU32::new(0)),
-            shared_encoder_worst_peer_fps: Rc::new(AtomicU32::new(0)),
+            shared_encoder_p75_peer_fps: Rc::new(AtomicU32::new(0)),
             shared_encoder_bitrate_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
@@ -260,7 +260,7 @@ impl CameraEncoder {
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
         let shared_encoder_fps_ratio = self.shared_encoder_fps_ratio.clone();
-        let shared_encoder_worst_peer_fps = self.shared_encoder_worst_peer_fps.clone();
+        let shared_encoder_p75_peer_fps = self.shared_encoder_p75_peer_fps.clone();
         let shared_encoder_bitrate_ratio = self.shared_encoder_bitrate_ratio.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
@@ -337,8 +337,8 @@ impl CameraEncoder {
                     (encoder_control.last_fps_ratio() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
-                shared_encoder_worst_peer_fps.store(
-                    (encoder_control.last_worst_peer_fps() as f32).to_bits(),
+                shared_encoder_p75_peer_fps.store(
+                    (encoder_control.last_p75_peer_fps() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
                 shared_encoder_bitrate_ratio.store(
@@ -501,8 +501,8 @@ impl CameraEncoder {
     }
 
     /// Returns the encoder worst peer FPS atomic (f32 bits).
-    pub fn shared_encoder_worst_peer_fps(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_worst_peer_fps.clone()
+    pub fn shared_encoder_p75_peer_fps(&self) -> Rc<AtomicU32> {
+        self.shared_encoder_p75_peer_fps.clone()
     }
 
     /// Returns the encoder bitrate_ratio atomic (f32 bits).

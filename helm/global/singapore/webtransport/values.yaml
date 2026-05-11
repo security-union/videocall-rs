@@ -44,6 +44,10 @@ rustlemania-webtransport:
       value: "1"  # Optimal for 1000m CPU (WebTransport + crypto operations)
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
+    - name: WT_OUTBOUND_CHANNEL_CAPACITY
+      value: "4096"
+    - name: WT_OUTBOUND_SHEDDING_THRESHOLD
+      value: "512"
 
   resources:
     limits:

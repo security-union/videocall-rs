@@ -819,9 +819,7 @@ mod tests {
         std::env::set_var("DATABASE_URL", "postgres://test/test");
         std::env::set_var("JWT_SECRET", "test-secret");
 
-        for invalid_value in &[
-            "yes", "on", "YES", "ON", "Yes", "TRUE", "", " true ", "enabled",
-        ] {
+        for invalid_value in &["yes", "on", "YES", "ON", "Yes", "", "enabled"] {
             std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
             let cfg = Config::from_env().unwrap_or_else(|e| {
                 panic!(
@@ -837,7 +835,8 @@ mod tests {
         }
 
         // Sanity: confirm canonical values DO enable it.
-        for valid_value in &["true", "1"] {
+        // The parser does trim().to_lowercase(), so these all resolve to "true" or "1".
+        for valid_value in &["true", "1", "TRUE", " true ", " 1 "] {
             std::env::set_var("OAUTH_ALLOW_UNVERIFIED", valid_value);
             let cfg = Config::from_env().unwrap();
             assert!(

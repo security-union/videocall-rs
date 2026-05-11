@@ -22,7 +22,8 @@ jobs:
     steps:
       - name: Clean workspace (root-owned files from Docker)
         run: |
-          sudo rm -rf dioxus-ui/dist e2e/test-results e2e/playwright-report || true
+          sudo find . -mindepth 1 -delete 2>/dev/null || true
+          sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
 
       - uses: actions/checkout@v4
         with:

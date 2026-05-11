@@ -842,3 +842,29 @@ pub fn register_prefers_color_scheme_listener(
 
     Some(std::rc::Rc::new(PrefersColorSchemeHandle { closure, mql }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_position_css_class() {
+        assert_eq!(DockPosition::Bottom.css_class(), "dock-bottom");
+        assert_eq!(DockPosition::Left.css_class(), "dock-left");
+        assert_eq!(DockPosition::Right.css_class(), "dock-right");
+    }
+
+    #[test]
+    fn dock_position_next_cycles() {
+        assert_eq!(DockPosition::Bottom.next(), DockPosition::Left);
+        assert_eq!(DockPosition::Left.next(), DockPosition::Right);
+        assert_eq!(DockPosition::Right.next(), DockPosition::Bottom);
+    }
+
+    #[test]
+    fn dock_position_next_full_roundtrip() {
+        let start = DockPosition::Bottom;
+        let result = start.next().next().next();
+        assert_eq!(result, start);
+    }
+}

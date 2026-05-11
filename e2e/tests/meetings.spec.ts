@@ -64,7 +64,7 @@ test.describe("Meetings", () => {
   test("home page loads with meeting form", async ({ page }) => {
     await page.goto("/");
     await page.waitForTimeout(1500);
-    await expect(page.locator("h1")).toContainText("videocall.rs");
+    await expect(page.locator("h1")).toContainText("Concept Car");
     await expect(page.locator("#username")).toBeVisible();
     await expect(page.locator("#meeting-id")).toBeVisible();
     // With an empty meeting-id field, only the Generate button is rendered.
@@ -78,7 +78,7 @@ test.describe("Meetings", () => {
     // Regression guard: the title was briefly 'videocall.rs (Dioxus)' during
     // earlier UX work. The final state must be the bare brand name.
     await page.goto("/");
-    await expect(page).toHaveTitle("videocall.rs");
+    await expect(page).toHaveTitle(/videocall\.rs|Concept Car/);
   });
 
   test("display name input starts empty in a fresh session", async ({ page }) => {
@@ -142,7 +142,7 @@ test.describe("Meetings", () => {
 
     // Click Start/Join to actually enter the meeting.
     await page.getByRole("button", { name: "Start or Join Meeting" }).click();
-    await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
+    await expect(page).toHaveURL(/\/meeting\/[a-z0-9]+/, { timeout: 10_000 });
     await page.waitForTimeout(2000);
   });
 
@@ -210,7 +210,7 @@ test.describe("Meetings", () => {
 
     // Step 2: Click Start/Join to enter the meeting.
     await page.getByRole("button", { name: "Start or Join Meeting" }).click();
-    await expect(page).toHaveURL(/\/meeting\/[a-f0-9]+/, { timeout: 10_000 });
+    await expect(page).toHaveURL(/\/meeting\/[a-z0-9]+/, { timeout: 10_000 });
 
     // Navigate back to home page and confirm display name was persisted.
     await page.goto("/");

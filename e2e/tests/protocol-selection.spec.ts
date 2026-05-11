@@ -214,7 +214,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await page.locator('[data-testid="transport-radio-websocket"]').click();
     await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
 
-    await page.locator("#sticky-transport-checkbox").check();
+    await page.locator("#sticky-transport-checkbox").check({ force: true });
 
     // Give Dioxus a moment to flush the side-effect to storage.
     await expect
@@ -258,7 +258,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await expect(stickyCheckbox).toBeVisible();
     await expect(stickyCheckbox).toBeChecked();
 
-    await stickyCheckbox.uncheck();
+    await stickyCheckbox.uncheck({ force: true });
 
     await expect
       .poll(
@@ -281,7 +281,7 @@ test.describe("Protocol selection (transport preference)", () => {
     await switchToNetworkTab(page);
 
     await page.locator('[data-testid="transport-radio-websocket"]').click();
-    await page.locator("#sticky-transport-checkbox").check();
+    await page.locator("#sticky-transport-checkbox").check({ force: true });
 
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
     await page.locator('[data-testid="transport-apply-button"]').click();

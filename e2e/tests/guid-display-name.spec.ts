@@ -103,12 +103,17 @@ test.describe("GUID display name handling", () => {
     await page.locator("#username").press("Enter");
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    // Auto-join fires immediately (username already set). Wait for the grid.
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 30_000 });
+    // Auto-join fires → admitted → pre-join settings card shown.
+    // Click "Start Meeting" to enter the grid.
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+    await expect(joinButton).toBeVisible({ timeout: 30_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 60_000 });
 
     // The GUID display name should appear on the user's own tile.
     const selfName = page.locator(".floating-name", { hasText: SAMPLE_GUID });
-    await expect(selfName.first()).toBeVisible({ timeout: 10_000 });
+    await expect(selfName.first()).toBeVisible({ timeout: 15_000 });
   });
 
   test("GUID-format name persists in localStorage across page navigations", async ({ page }) => {

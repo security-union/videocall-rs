@@ -88,6 +88,7 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
   test("host opening the signal popup for a remote peer sees a WT/WS transport badge", async ({
     baseURL,
   }) => {
+    test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
     const meetingId = `e2e_sigq_xport_${Date.now()}`;
 

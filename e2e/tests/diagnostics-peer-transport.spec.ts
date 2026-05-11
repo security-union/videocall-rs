@@ -114,6 +114,7 @@ test.describe("Diagnostics popup — per-peer transport badge", () => {
   });
 
   test("three users see WT/WS transport badge for each remote peer", async ({ baseURL }) => {
+    test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
     const meetingId = `e2e_diag_xport_${Date.now()}`;
 

@@ -390,11 +390,8 @@ test.describe("Meetings", () => {
   test("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
     page,
   }) => {
-    // Keyboard accessibility parity with the Display Name tooltip: the
-    // Meeting ID info trigger has tabindex=0, so keyboard-only and
-    // touch-AT users must be able to read the tooltip without hovering.
-    // Use evaluate-based focus + dispatchEvent to reliably trigger
-    // :focus-visible/:focus-within CSS state in headless Chrome.
+    // Keyboard accessibility: Tab-navigate to the Meeting ID info trigger
+    // so that :focus-visible CSS state activates and the tooltip appears.
     await page.goto("/");
     await page.waitForTimeout(1500);
 
@@ -404,17 +401,20 @@ test.describe("Meetings", () => {
     await expect(trigger).toBeVisible({ timeout: 5000 });
     await expect(tooltip).toBeHidden();
 
-    // Use evaluate to focus and dispatch a focusin event — this reliably
-    // triggers :focus-within in Chromium even without real keyboard input.
-    await trigger.evaluate((el) => {
-      el.focus();
-      el.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
-    });
+    // Tab through focusable elements until the trigger receives focus.
+    // The trigger has tabindex=0 so it's in the natural tab order.
+    for (let i = 0; i < 20; i++) {
+      await page.keyboard.press("Tab");
+      const focused = await trigger.evaluate(
+        (el) => el === document.activeElement || el.contains(document.activeElement),
+      );
+      if (focused) break;
+    }
     await expect(tooltip).toBeVisible({ timeout: 3000 });
     await expect(tooltip).toContainText("Allowed: letters, numbers, and underscores");
     await expect(tooltip).toContainText("Generate a New Meeting ID");
 
-    await trigger.blur();
+    await page.keyboard.press("Tab");
     await expect(tooltip).toBeHidden({ timeout: 3000 });
   });
 

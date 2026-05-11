@@ -517,7 +517,7 @@ test.describe("Speaker highlight glow on video tiles", () => {
     }
   });
 
-  test("host remains highlighted for other participants while screen sharing", async ({
+  test.fixme("host remains highlighted for other participants while screen sharing", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);

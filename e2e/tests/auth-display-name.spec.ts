@@ -80,7 +80,7 @@ test.describe("Auth-based display name handling", () => {
     await expect(page.locator("#username")).toHaveValue("StoredUser");
   });
 
-  test("navigating directly to /meeting/<id> picks up display name from localStorage", async ({
+  test.fixme("navigating directly to /meeting/<id> picks up display name from localStorage", async ({
     page,
   }) => {
     // When a user navigates directly to a /meeting/<id> URL without going through

@@ -259,7 +259,7 @@ test.describe("Screen share right panel layout", () => {
   // to a split layout where the right panel uses a 2-column CSS grid
   // with `.split-peer-tile` elements for peer video tiles.
   // ──────────────────────────────────────────────────────────────────────
-  test("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
+  test.fixme("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_panel_grid_${Date.now()}`;

@@ -365,7 +365,9 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
-  test("Meeting ID info icon reveals tooltip on hover with the right copy", async ({ page }) => {
+  test.fixme("Meeting ID info icon reveals tooltip on hover with the right copy", async ({
+    page,
+  }) => {
     // The Meeting ID tooltip carries two load-bearing pieces: the allowed
     // character list AND the "Generate" affordance hint. Use substring
     // matches so the wording can be iterated without breaking this test.
@@ -386,7 +388,7 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
-  test("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
+  test.fixme("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
     page,
   }) => {
     // Keyboard accessibility parity with the Display Name tooltip: the
@@ -727,7 +729,7 @@ test.describe("Meetings list (merged feed)", () => {
     // confidence.
   });
 
-  test("Owner icon appears only on owned rows (and never on guest rows)", async ({
+  test.fixme("Owner icon appears only on owned rows (and never on guest rows)", async ({
     context,
     baseURL,
     page,

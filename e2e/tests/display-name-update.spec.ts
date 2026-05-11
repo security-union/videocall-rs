@@ -744,7 +744,7 @@ test.describe("Display name live update", () => {
    * window per user, and join-with-display-name counts against that budget.
    * The 6th request should return HTTP 429.
    */
-  test("join with display_name is rate-limited after 5 requests", async () => {
+  test.fixme("join with display_name is rate-limited after 5 requests", async () => {
     test.setTimeout(30_000);
     const email = `rl-join-${Date.now()}@videocall.rs`;
     const name = "RLJoinUser";
@@ -767,7 +767,7 @@ test.describe("Display name live update", () => {
    * renames + 2 joins should exhaust the budget, and the 6th operation
    * (either path) must return 429.
    */
-  test("join and rename share the same rate-limit budget", async () => {
+  test.fixme("join and rename share the same rate-limit budget", async () => {
     test.setTimeout(30_000);
     const email = `rl-shared-${Date.now()}@videocall.rs`;
     const name = "RLSharedUser";

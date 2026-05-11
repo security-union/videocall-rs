@@ -38,7 +38,10 @@ kubectl exec "$API_POD" -n videocall -- \
 | `parse_meeting_console_logs.sh <log_dir>` | Markdown summary (default). Pipe to `less` or save to a file. |
 | `parse_meeting_console_logs.sh <log_dir> --json` | Same data in JSON. Feed into other tools or jq queries. |
 | `parse_meeting_console_logs.sh <log_dir> --verify` | Sanity check that every pattern the parser looks for still appears in the logs. Exits non-zero if a log message was renamed in client code and broke extraction silently. Use in CI or post-deploy spot-checks. |
+| `parse_meeting_console_logs.sh <log_dir> --relay-wt=PATH` | Optionally ingest a videocall-webtransport relay pod log and add a **Slow-drain Receivers** section — joins server-side `Outbound channel full` drops to the peer-email map. Surfaces memory-pressured / slow clients (the Yu-Guo / RELAY-2 pattern from discussion #562). Can combine with default markdown or `--json`. |
 | `parse_meeting_console_logs.sh -h` / `--help` | Show help summary. |
+
+To pull the relay log: `kubectl logs -n videocall <videocall-webtransport-POD> --since=12h > /tmp/relay-wt.log`
 
 ## Sample output (markdown mode, trimmed)
 
@@ -59,7 +62,7 @@ _Cores/Platform sourced from "level":"preamble" in first chunk. ⚠ flags client
 | antonio.estrada@hcl-software.com | Tony Estrada | 15:01:01 | websocket(ws_0) | 73ms | 1 | 175 | 0 | 3 | clean | 12 | macOS 26.4.1 |
 ```
 
-Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
+Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
 
 ## Column reference
 
@@ -71,10 +74,13 @@ Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, 
 | Reelect | Number of re-election triggers | > 0 = network instability during session |
 | Chunks | Number of 30s log chunks uploaded | short sessions (< 3) often = tab closed before logging flushed |
 | Implaus RTT | Number of RTT samples discarded as implausible | > 0 usually = client main-thread stall (not server clock drift). See discussion #562. |
+| Speak | Count of `Speaking changed: false -> true` (VAD) | 0 = muted/listen-only; 100+ = active speaker. Helps distinguish "audio pipeline broken" from "person not talking". |
+| Buf med | Median of non-zero NetEQ audio buffer depth, ms | 100–300ms = healthy; < 50ms = underrun risk (audible clicks); > 500ms = network jitter; zero-only samples filtered out (they represent peers not sending) |
 | Errors | `level:error` log line count | categorize before alarming — one broken encoder can emit thousands of identical errors |
 | End | `clean` if user left via UI, `LOST` if `Connection lost` event, `?` if neither | — |
 | Cores | `navigator.hardwareConcurrency` from preamble | **< 6 ⚠** or **Intel Mac (macOS ≤ 15) with ≤ 8 cores ⚠** — see discussion #562 |
 | Platform | OS + version from preamble | macOS 14 / 15 (pre-Apple-Silicon) often indicate old hardware |
+| Concurrent | Count of overlapping sessions for same email (including 15s post-end NetEQ zombie window) | **> 1 ⚠** = duplicate NetEQ + AudioWorkletNode instances mixing into `master_gain` → audio crackling. See NETEQ-1 in discussion #562. |
 
 ## When to use `--verify`
 
@@ -90,9 +96,15 @@ If `--verify` fails, check the `PATTERN INVENTORY` block at the top of the scrip
 
 ## Background + design notes
 
-- Written 2026-05-05. Preamble columns + `--verify` mode added 2026-05-06.
+- Written 2026-05-05. Preamble columns + `--verify` mode added 2026-05-06. Concurrent-session detection + `--relay-wt` + speaking/buffer columns added 2026-05-08.
 - Parser currently matches against free-text `msg` phrases from client code; this is fragile. Issue [#565](https://github01.hclpnp.com/labs-projects/videocall/issues/565) proposes adding a structured `event` field so parsers can key on stable event names instead.
-- Full analysis context (hardware baseline for meeting sizes, JWT TTL bug, "implausible RTT ≠ clock drift" hypothesis, follow-up action items): [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
+- Full analysis context (hardware baseline for meeting sizes, JWT TTL bug, "implausible RTT ≠ clock drift" hypothesis, NetEQ duplication on transport switch, follow-up action items): [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
+
+### Gotcha: stale Prometheus series look like active zombies
+
+When a user session ends and another session starts, Prometheus series for the old `session_id` / `to_peer` can keep reporting the LAST known value for up to 5 minutes (the default scrape staleness). A `videocall_neteq_expand_ops_per_sec = 100/s` that appears "stuck" after a session change is often just frozen at its final scrape, NOT evidence of an active zombie NetEQ on the client.
+
+To distinguish: check `videocall_neteq_packets_per_sec` for the same series. If packets are also frozen at a non-zero value with no variation over time, the series is stale. If packets are genuinely flowing (varying each scrape), the NetEQ is live. The `Concurrent` column in this script uses a 15-second NetEQ zombie window (matches `peer_decode_manager` heartbeat timeout), which is the realistic on-client lifetime — after that the NetEQ worker is terminated even though Prometheus may keep showing numbers.
 
 ## Performance
 

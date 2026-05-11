@@ -110,7 +110,7 @@ message HealthPacket {
 
   // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
   optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
-  optional double encoder_worst_peer_fps = 26;     // FPS from the worst-performing receiver
+  optional double encoder_worst_peer_fps = 26;     // Deprecated compatibility field; now carries the p75 peer FPS.
   optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
   optional bool screen_sharing_active = 28;        // Whether screen share is currently active
 
@@ -151,6 +151,26 @@ message HealthPacket {
   // Connection-loss reason counters (cumulative since process start)
   optional uint64 connection_handshake_failures_total = 54;
   optional uint64 connection_session_drops_total = 55;
+
+  // TELEM-7: Static client metadata (re-sent every packet for late-joining observers)
+  optional uint32 client_cores = 56;                    // navigator.hardwareConcurrency
+  optional string client_architecture = 57;             // "x86" | "arm" | ""
+  optional string client_gpu_family = 58;               // Normalized GPU family name
+  optional string client_network_effective_type = 59;   // "4g" | "3g" | "2g" | "slow-2g"
+  optional double client_network_downlink = 60;         // Mbps from navigator.connection
+  optional uint32 client_network_rtt = 61;              // ms from navigator.connection
+  optional bool client_battery_charging = 62;           // Battery API charging state
+  optional double client_battery_level = 63;            // Battery API level 0.0-1.0
+  optional uint32 client_capability_score = 64;         // TELEM-6 benchmark iteration count
+
+  // TELEM-8: Long task durations accumulated since last health packet (ms)
+  repeated double longtask_durations_ms = 65;
+
+  // TELEM-9: Main-thread rAF cadence (frames per second)
+  optional double render_fps = 66;
+
+  // Compatibility field added after TELEM-7/8/9 consumed 56-66.
+  optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
 }
 
 message TierTransition {
@@ -165,4 +185,3 @@ message TierDwell {
   string tier = 1;       // Tier label (e.g. "hd_1080p")
   double dwell_ms = 2;   // Time spent in this tier before transitioning
 }
-

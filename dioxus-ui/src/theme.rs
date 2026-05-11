@@ -25,8 +25,6 @@ pub mod color {
     pub const SIGNAL_GRID_MINOR: &str = "rgba(255,255,255,0.07)";
     pub const TOOLTIP_DIVIDER: &str = "rgba(255,255,255,0.15)";
 
-    /// Error foreground for input validation messages — matches --error-text (WCAG AA).
-    pub const INPUT_ERROR: &str = ERROR_TEXT;
     pub const PREVIEW_AVATAR_BG: &str = "#3a3a3a";
     pub const PREVIEW_AVATAR_RING: &str = "rgba(0,0,0,0.62)";
 

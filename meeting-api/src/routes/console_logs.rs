@@ -297,7 +297,19 @@ pub async fn upload_console_logs(
         .get("X-Chunk-Seq")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| (1..=99999).contains(&n));
+        .filter(|&n| {
+            if (1..=99999).contains(&n) {
+                true
+            } else {
+                tracing::warn!(
+                    chunk_seq = n,
+                    meeting_id = %meeting_id,
+                    user_id = user_id.as_deref().unwrap_or("<unknown>"),
+                    "X-Chunk-Seq out of accepted range 1..=99999; falling back to UUIDv7 suffix"
+                );
+                false
+            }
+        });
 
     // --- Validate meeting_id path-safety ---
     validate_id(&meeting_id, "meeting_id", &SAFE_MEETING_ID_RE)?;

@@ -37,11 +37,20 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use crate::inbound_stats::InboundStats;
 
 use crate::config::ClientConfig;
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
 use crate::transport::{InboundHook, MediaTypeLabel, OutboundFrame};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, WsMessage>;
+
+/// Small burst buffer for Ping -> Pong forwarding.
+///
+/// A bounded queue prevents the read half from ever blocking on the writer
+/// task, while 32 slots easily covers transient scheduler hiccups without
+/// retaining unbounded Ping payloads.
+const PONG_QUEUE_CAPACITY: usize = 32;
 
 pub struct WebSocketClient {
     config: ClientConfig,
@@ -52,20 +61,27 @@ pub struct WebSocketClient {
     /// Channel for forwarding Pong responses from the read half to the write half.
     pong_rx: Option<tokio_mpsc::Receiver<Vec<u8>>>,
     pong_tx: tokio_mpsc::Sender<Vec<u8>>,
+    #[cfg(feature = "metrics")]
+    metrics: Option<Arc<BotMetrics>>,
     quit: Arc<AtomicBool>,
     /// Handles for spawned tasks so stop() can join them.
     task_handles: Vec<JoinHandle<()>>,
 }
 
 impl WebSocketClient {
-    pub fn new(config: ClientConfig) -> Self {
-        let (pong_tx, pong_rx) = tokio_mpsc::channel(4);
+    pub fn new(
+        config: ClientConfig,
+        #[cfg(feature = "metrics")] metrics: Option<Arc<BotMetrics>>,
+    ) -> Self {
+        let (pong_tx, pong_rx) = tokio_mpsc::channel(PONG_QUEUE_CAPACITY);
         Self {
             config,
             write: None,
             shared_sink: Arc::new(tokio::sync::Mutex::new(None)),
             pong_rx: Some(pong_rx),
             pong_tx,
+            #[cfg(feature = "metrics")]
+            metrics,
             quit: Arc::new(AtomicBool::new(false)),
             task_handles: Vec::new(),
         }
@@ -108,8 +124,12 @@ impl WebSocketClient {
         inbound_hook: Option<InboundHook>,
     ) -> JoinHandle<()> {
         let user_id = self.config.user_id.clone();
+        #[cfg(feature = "metrics")]
+        let meeting_id = self.config.meeting_id.clone();
         let quit = self.quit.clone();
         let pong_tx = self.pong_tx.clone();
+        #[cfg(feature = "metrics")]
+        let metrics = self.metrics.clone();
 
         tokio::spawn(async move {
             loop {
@@ -127,7 +147,34 @@ impl WebSocketClient {
                     },
                     Some(Ok(WsMessage::Ping(data))) => {
                         debug!("Received WS ping for {}", user_id);
-                        let _ = pong_tx.try_send(data);
+                        if let Err(e) = pong_tx.try_send(data) {
+                            static PONG_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+                            let count = PONG_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            debug!(
+                                "[{}] dropping queued WS pong response (count={}): {}",
+                                user_id, count, e
+                            );
+                            if count.is_multiple_of(100) || count == 1 {
+                                warn!(
+                                    "[{}] WS pong queue overflow/backpressure; dropped {} queued pong responses so far",
+                                    user_id, count
+                                );
+                            }
+                            #[cfg(feature = "metrics")]
+                            if let Some(ref m) = metrics {
+                                let reason = match e {
+                                    tokio_mpsc::error::TrySendError::Full(_) => "queue_full",
+                                    tokio_mpsc::error::TrySendError::Closed(_) => "channel_closed",
+                                };
+                                m.websocket_pong_drops_total
+                                    .with_label_values(&[
+                                        user_id.as_str(),
+                                        meeting_id.as_str(),
+                                        reason,
+                                    ])
+                                    .inc();
+                            }
+                        }
                     }
                     Some(Ok(WsMessage::Pong(_))) => {}
                     Some(Ok(WsMessage::Close(_))) => {

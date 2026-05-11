@@ -38,6 +38,9 @@ async fn main() {
         .resolve_discovery()
         .await
         .expect("OIDC discovery failed");
+    config
+        .validate_oauth_security()
+        .expect("invalid OAuth/JWKS security configuration");
 
     let pool = PgPoolOptions::new()
         .max_connections(20)

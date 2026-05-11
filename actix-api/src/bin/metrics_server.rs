@@ -685,7 +685,13 @@ fn process_health_packet_to_metrics_pb(
         }
 
         // TELEM-7: client_info gauge (static metadata)
-        if health_packet.client_cores.is_some() || health_packet.client_architecture.is_some() {
+        // Publish when ANY client metadata field is present (not just cores/arch).
+        if health_packet.client_cores.is_some()
+            || health_packet.client_architecture.is_some()
+            || health_packet.client_gpu_family.is_some()
+            || health_packet.client_network_effective_type.is_some()
+            || health_packet.client_capability_score.is_some()
+        {
             let cores_str = health_packet
                 .client_cores
                 .map(|c| c.to_string())

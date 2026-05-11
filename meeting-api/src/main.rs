@@ -17,7 +17,9 @@
 //! and issues JWT room access tokens for the Media Server.
 
 use axum::http;
+use axum::http::HeaderName;
 use meeting_api::config::Config;
+use meeting_api::cors::{ALLOWED_CUSTOM_HEADERS, ALLOWED_HEADERS, ALLOWED_METHODS};
 use meeting_api::nats_consumers;
 use meeting_api::routes;
 use meeting_api::state::AppState;
@@ -89,24 +91,14 @@ async fn main() {
                 AllowOrigin::list(hvs)
             }
         })
-        .allow_methods([
-            http::Method::GET,
-            http::Method::POST,
-            http::Method::PUT,
-            http::Method::DELETE,
-            http::Method::PATCH,
-            http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::COOKIE,
-            http::header::ACCEPT,
-            // Console log upload custom headers
-            http::HeaderName::from_static("x-user-id"),
-            http::HeaderName::from_static("x-session-timestamp"),
-            http::HeaderName::from_static("x-chunk-seq"),
-        ])
+        .allow_methods(ALLOWED_METHODS.to_vec())
+        .allow_headers(
+            ALLOWED_HEADERS
+                .iter()
+                .cloned()
+                .chain(ALLOWED_CUSTOM_HEADERS.iter().map(|h| HeaderName::from_static(h)))
+                .collect::<Vec<_>>(),
+        )
         .allow_credentials(true);
 
     // Warn loudly at startup if DEV_USER auto-login is active.

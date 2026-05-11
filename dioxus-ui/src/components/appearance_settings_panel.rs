@@ -7,7 +7,8 @@ use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BO
 use crate::components::color_picker::HsvColorPicker;
 use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
-    AppearanceSettingsCtx, GlowColor, Theme, ThemePreferenceCtx, MAX_CUSTOM_COLORS,
+    AppearanceSettingsCtx, AutohideCtx, DockPosition, DockPositionCtx, GlowColor, Theme,
+    ThemePreferenceCtx, MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
@@ -28,6 +29,8 @@ fn focus_add_btn() {
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
     let mut appearance_ctx = use_context::<AppearanceSettingsCtx>();
+    let mut dock_position_ctx = use_context::<DockPositionCtx>();
+    let mut autohide_ctx = use_context::<AutohideCtx>();
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style =
@@ -503,6 +506,46 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                         }
                     }
+            }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 3: Action Bar ───────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Action Bar" }
+                }
+
+                // Position selector
+                div { class: "action-bar-setting",
+                    label { class: "appearance-control-label", "Position" }
+                    div { class: "action-bar-position-options",
+                        for (pos, label) in [(DockPosition::Bottom, "Bottom"), (DockPosition::Left, "Left"), (DockPosition::Right, "Right")] {
+                            button {
+                                class: if dock_position_ctx.0() == pos { "action-bar-option selected" } else { "action-bar-option" },
+                                onclick: move |_| dock_position_ctx.0.set(pos),
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+
+                // Autohide toggle
+                div { class: "appearance-section-header",
+                    label { class: "appearance-section-title appearance-section-title--sm", "Auto-hide" }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle action bar auto-hide",
+                        input {
+                            r#type: "checkbox",
+                            checked: autohide_ctx.0(),
+                            onchange: move |evt: Event<FormData>| {
+                                autohide_ctx.0.set(evt.checked());
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
             }
             }
         }

@@ -17,6 +17,41 @@ use videocall_client::VideoCallClient;
 #[derive(Clone, Copy)]
 pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
 
+/// Action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPosition {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            DockPosition::Bottom => "dock-bottom",
+            DockPosition::Left => "dock-left",
+            DockPosition::Right => "dock-right",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            DockPosition::Bottom => DockPosition::Left,
+            DockPosition::Left => DockPosition::Right,
+            DockPosition::Right => DockPosition::Bottom,
+        }
+    }
+}
+
+/// Context for the action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy)]
+pub struct DockPositionCtx(pub Signal<DockPosition>);
+
+/// Context for the action bar autohide setting.
+#[derive(Clone, Copy)]
+pub struct AutohideCtx(pub Signal<bool>);
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);

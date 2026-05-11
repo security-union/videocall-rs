@@ -71,6 +71,7 @@ pub fn Host(
     on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
+    #[props(default)] device_settings_initial_section: Option<String>,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
 ) -> Element {
@@ -641,6 +642,7 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
+                    initial_section: device_settings_initial_section.clone(),
                 }
             }
         }

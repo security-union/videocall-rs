@@ -43,9 +43,9 @@ use crate::constants::{
 use crate::context::{
     load_appearance_settings_from_storage, resolve_transport_config,
     save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, CroppedTilesCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime,
-    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, TransportPreference,
-    TransportPreferenceCtx,
+    AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DisplayNameCtx, DockPosition,
+    DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap,
+    PeerStatusMap, TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -89,32 +89,6 @@ pub enum ScreenShareState {
 /// here; the `Host` component takes it out and passes it to
 /// `ScreenEncoder::start_with_stream()`.
 pub type PreAcquiredScreenStream = Rc<RefCell<Option<web_sys::MediaStream>>>;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DockPosition {
-    Bottom,
-    Left,
-    Right,
-}
-
-impl DockPosition {
-    fn css_class(self) -> &'static str {
-        match self {
-            DockPosition::Bottom => "dock-bottom",
-            DockPosition::Left => "dock-left",
-            DockPosition::Right => "dock-right",
-        }
-    }
-
-    #[allow(dead_code)]
-    fn next(self) -> Self {
-        match self {
-            DockPosition::Bottom => DockPosition::Left,
-            DockPosition::Left => DockPosition::Right,
-            DockPosition::Right => DockPosition::Bottom,
-        }
-    }
-}
 
 pub enum MediaErrorState {
     NoDevice,
@@ -558,6 +532,7 @@ pub fn AttendantsComponent(
     let mut controls_expanded = use_signal(|| true);
     let mut dock_position: Signal<DockPosition> = use_signal(|| DockPosition::Bottom);
     let mut dock_menu_open = use_signal(|| false);
+    let mut autohide_enabled = use_signal(|| true);
     let encoder_settings = use_signal(|| None::<String>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
@@ -609,7 +584,7 @@ pub fn AttendantsComponent(
             let nt_inner = nt1.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                controls_expanded.set(false);
+                if autohide_enabled() { controls_expanded.set(false); }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -623,7 +598,7 @@ pub fn AttendantsComponent(
             let ht_inner = ht1.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                controls_visible.set(false);
+                if autohide_enabled() { controls_visible.set(false); }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -654,7 +629,7 @@ pub fn AttendantsComponent(
             let nt_inner = nt2.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                controls_expanded.set(false);
+                if autohide_enabled() { controls_expanded.set(false); }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -667,7 +642,7 @@ pub fn AttendantsComponent(
             let ht_inner = ht2.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                controls_visible.set(false);
+                if autohide_enabled() { controls_visible.set(false); }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -686,7 +661,7 @@ pub fn AttendantsComponent(
         let nt_init = narrow_timer.clone();
         let narrow_init = Closure::<dyn FnMut()>::once(move || {
             nt_init.borrow_mut().take();
-            controls_expanded.set(false);
+            if autohide_enabled() { controls_expanded.set(false); }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -700,7 +675,7 @@ pub fn AttendantsComponent(
         let ht_init = hide_timer.clone();
         let hide_init = Closure::<dyn FnMut()>::once(move || {
             ht_init.borrow_mut().take();
-            controls_visible.set(false);
+            if autohide_enabled() { controls_visible.set(false); }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -712,7 +687,15 @@ pub fn AttendantsComponent(
         hide_init.forget();
     });
 
+    use_effect(move || {
+        if !autohide_enabled() {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+        }
+    });
+
     let mut device_settings_open = use_signal(|| false);
+    let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -1504,6 +1487,11 @@ pub fn AttendantsComponent(
     // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
 
+    // Action bar dock position and autohide — exposed via context so that
+    // the AppearanceSettingsPanel can read/write them.
+    use_context_provider(|| DockPositionCtx(dock_position));
+    use_context_provider(|| AutohideCtx(autohide_enabled));
+
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
@@ -1700,10 +1688,33 @@ pub fn AttendantsComponent(
         .unwrap_or(768.0);
     // Gap/padding must match #grid-container in style.css.
     // Breakpoint (568px) must match @media (max-width: 568px) in style.css.
-    let (gap, pad_top, pad_right, pad_bottom, pad_left) = if vw < 568.0 {
-        (8.0, 8.0, 8.0, 72.0, 8.0)
-    } else {
-        (16.0, 20.0, 20.0, 84.0, 20.0)
+    // pad_top: breathing room above top tile row.
+    // pad_bottom: pad_top + action-bar zone so tiles are visually centred
+    //             in the space ABOVE the action bar (Google Meet style).
+    //   Desktop action-bar zone ≈ 99px (79px bar + 20px offset).
+    //   Mobile  action-bar zone ≈ 73px (57px bar + 16px offset).
+    let (gap, pad_top, pad_right, pad_bottom, pad_left) = match dock_position() {
+        DockPosition::Bottom => {
+            if vw < 568.0 {
+                (8.0, 8.0, 8.0, 80.0, 8.0)
+            } else {
+                (16.0, 20.0, 20.0, 120.0, 20.0)
+            }
+        }
+        DockPosition::Left => {
+            if vw < 568.0 {
+                (8.0, 8.0, 8.0, 8.0, 80.0)
+            } else {
+                (16.0, 20.0, 20.0, 20.0, 120.0)
+            }
+        }
+        DockPosition::Right => {
+            if vw < 568.0 {
+                (8.0, 8.0, 80.0, 8.0, 8.0)
+            } else {
+                (16.0, 20.0, 120.0, 20.0, 20.0)
+            }
+        }
     };
     let avail_w = (vw - pad_left - pad_right).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
@@ -2835,6 +2846,7 @@ pub fn AttendantsComponent(
                                         DeviceSettingsButton {
                                             open: device_settings_open(),
                                             onclick: move |_| {
+                                                device_settings_initial_section.set(None);
                                                 device_settings_open.set(!device_settings_open());
                                                 if device_settings_open() {
                                                     peer_list_open.set(false);
@@ -2866,10 +2878,12 @@ pub fn AttendantsComponent(
                                                     stroke_width: "2",
                                                     stroke_linecap: "round",
                                                     stroke_linejoin: "round",
-                                                    rect { x: "3", y: "3", width: "7", height: "7" }
-                                                    rect { x: "14", y: "3", width: "7", height: "7" }
-                                                    rect { x: "3", y: "14", width: "7", height: "7" }
-                                                    rect { x: "14", y: "14", width: "7", height: "7" }
+                                                    // Horizontal bar outline
+                                                    rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                    // Three dots inside the bar
+                                                    circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
                                                 }
                                             }
                                             if dock_menu_open() {
@@ -2906,6 +2920,34 @@ pub fn AttendantsComponent(
                                                             dock_menu_open.set(false);
                                                         },
                                                         "Right"
+                                                    }
+                                                    // Separator
+                                                    div { class: "glass-select-separator" }
+                                                    div {
+                                                        class: "glass-select-option",
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            autohide_enabled.set(!autohide_enabled());
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        if autohide_enabled() {
+                                                            "Turn Hiding Off"
+                                                        } else {
+                                                            "Turn Hiding On"
+                                                        }
+                                                    }
+                                                    div { class: "glass-select-separator" }
+                                                    div {
+                                                        class: "glass-select-option",
+                                                        role: "option",
+                                                        onclick: move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            device_settings_initial_section.set(Some("appearance".to_string()));
+                                                            device_settings_open.set(true);
+                                                            dock_menu_open.set(false);
+                                                        },
+                                                        "Dock Settings\u{2026}"
                                                     }
                                                 }
                                             }
@@ -2986,7 +3028,9 @@ pub fn AttendantsComponent(
                                     video_enabled: video_enabled(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
+                                    device_settings_initial_section: device_settings_initial_section(),
                                     on_device_settings_toggle: move |_| {
+                                        device_settings_initial_section.set(None);
                                         device_settings_open.set(!device_settings_open());
                                     },
                                     on_microphone_error: move |err: String| {
@@ -3054,6 +3098,7 @@ pub fn AttendantsComponent(
                                 if meeting_info_open() {
                                     diagnostics_open.set(false);
                                     device_settings_open.set(false);
+                                    device_settings_initial_section.set(None);
                                 }
                             },
                             host_display_name: host_display_name.clone(),

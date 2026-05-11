@@ -3485,6 +3485,12 @@ select {
   opacity: 0.6;
 }
 
+.glass-select-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--glass-border);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .glass-select-trigger {
     transition: none;
@@ -3859,6 +3865,46 @@ select {
   letter-spacing: -0.03em;
   line-height: 1.2;
   color: var(--text-primary);
+}
+
+.appearance-section-title--sm {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+/* Action Bar settings inside Appearance panel */
+.action-bar-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.action-bar-position-options {
+  display: flex;
+  gap: 0.375rem;
+}
+
+.action-bar-option {
+  padding: 0.375rem 1rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--glass-border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.action-bar-option:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.action-bar-option.selected {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 .appearance-section-helper {
@@ -5334,16 +5380,33 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .mock-peers-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--mock-popover-bg) /* @token-exempt: dark near-opaque, themed via token */;
-  border: 1px solid var(--glass-border);
+  background:
+    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
+    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(
+      180deg,
+      rgba(70, 100, 140, 0.06) 0%,
+      rgba(50, 80, 120, 0.02) 100%
+    ),
+    linear-gradient(
+      135deg,
+      rgba(15, 20, 35, 0.92) 0%,
+      rgba(12, 18, 35, 0.94) 50%,
+      rgba(10, 15, 32, 0.96) 100%
+    );
+  border: 1px solid rgba(70, 100, 140, 0.15);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
   z-index: 1000000;
   min-width: 200px;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow:
+    inset 0 1px 0 rgba(100, 140, 180, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.40);
 }
 
 .mock-peers-popover-header {
@@ -5408,16 +5471,34 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .density-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--surface-elevated);
+  background:
+    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
+    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(
+      180deg,
+      rgba(70, 100, 140, 0.06) 0%,
+      rgba(50, 80, 120, 0.02) 100%
+    ),
+    linear-gradient(
+      135deg,
+      rgba(15, 20, 35, 0.92) 0%,
+      rgba(12, 18, 35, 0.94) 50%,
+      rgba(10, 15, 32, 0.96) 100%
+    );
+  border: 1px solid rgba(70, 100, 140, 0.15);
   border-radius: var(--radius-lg);
   padding: 12px;
   display: flex;
   gap: 8px;
   z-index: 30;
-  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow:
+    inset 0 1px 0 rgba(100, 140, 180, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.40);
 }
 
 .density-option {

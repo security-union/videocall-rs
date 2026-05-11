@@ -805,4 +805,57 @@ mod tests {
             None => std::env::remove_var("OAUTH_ISSUER"),
         }
     }
+
+    #[test]
+    #[serial]
+    fn oauth_allow_unverified_rejects_non_canonical_true_values() {
+        // Negative-case test: only "true" and "1" should enable the bypass.
+        // Values like "yes", "on", "YES", empty string, etc. must NOT enable it.
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_val = std::env::var("OAUTH_ALLOW_UNVERIFIED").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        for invalid_value in &["yes", "on", "YES", "ON", "Yes", "TRUE", "", " true ", "enabled"] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
+            let cfg = Config::from_env().unwrap_or_else(|e| {
+                panic!(
+                    "from_env should not fail for OAUTH_ALLOW_UNVERIFIED={:?}: {e}",
+                    invalid_value
+                )
+            });
+            assert!(
+                !cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to false (only \"true\" and \"1\" are accepted)",
+                invalid_value
+            );
+        }
+
+        // Sanity: confirm canonical values DO enable it.
+        for valid_value in &["true", "1"] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", valid_value);
+            let cfg = Config::from_env().unwrap();
+            assert!(
+                cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to true",
+                valid_value
+            );
+        }
+
+        match prior_val {
+            Some(v) => std::env::set_var("OAUTH_ALLOW_UNVERIFIED", v),
+            None => std::env::remove_var("OAUTH_ALLOW_UNVERIFIED"),
+        }
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+    }
 }

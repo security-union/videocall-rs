@@ -28,7 +28,8 @@ use crate::constants::{wt_outbound_channel_capacity, CLIENT_TIMEOUT};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
-    OUTBOUND_CHANNEL_DROPS_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH, RELAY_PACKET_DROPS_TOTAL,
+    OUTBOUND_CHANNEL_DROPS_TOTAL, OUTBOUND_CHANNEL_SHED_TOTAL, RELAY_OUTBOUND_QUEUE_DEPTH,
+    RELAY_PACKET_DROPS_TOTAL,
 };
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -293,6 +294,22 @@ impl WtChatSession {
         parsed: bool,
         media_type: Option<MediaType>,
     ) -> WtSendResult {
+        // Priority shedding: when buffer is nearly full, drop video/screen
+        // to protect audio from collateral starvation.
+        if is_media && !is_audio {
+            let remaining = self.outbound_tx.capacity();
+            if remaining < crate::constants::wt_outbound_shedding_threshold() {
+                let kind = drop_kind_label(parsed, is_media, media_type);
+                OUTBOUND_CHANNEL_SHED_TOTAL
+                    .with_label_values(&["webtransport", kind])
+                    .inc();
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&self.logic.room, "webtransport", "shed"])
+                    .inc();
+                return WtSendResult::Dropped;
+            }
+        }
+
         let outbound = build_outbound(data, is_media, is_audio);
 
         match self.outbound_tx.try_send(outbound) {

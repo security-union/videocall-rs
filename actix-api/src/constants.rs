@@ -135,6 +135,46 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
 /// provides ~6.4MB max queue depth.
 pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
+/// Default shedding threshold for WebTransport outbound queue.
+///
+/// When remaining channel capacity drops below this value, video and
+/// screen packets are proactively dropped ("shed") while audio and
+/// control packets continue flowing. This protects audio from being
+/// collateral damage during video-induced congestion storms.
+///
+/// Default 512 = 12.5% of the recommended 4096 capacity, providing
+/// roughly 2 seconds of audio-only headroom at typical packet rates
+/// before the buffer is fully exhausted.
+pub const WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT: usize = 512;
+
+/// Resolve the shedding threshold from `WT_OUTBOUND_SHEDDING_THRESHOLD`
+/// env var, falling back to [`WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT`].
+pub fn wt_outbound_shedding_threshold() -> usize {
+    use std::sync::OnceLock;
+    static THRESH: OnceLock<usize> = OnceLock::new();
+    *THRESH.get_or_init(|| {
+        match std::env::var("WT_OUTBOUND_SHEDDING_THRESHOLD").ok().as_deref() {
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        "WT_OUTBOUND_SHEDDING_THRESHOLD=0 disables shedding"
+                    );
+                    0
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse WT_OUTBOUND_SHEDDING_THRESHOLD={:?} as usize ({}); falling back to default {}",
+                        value, e, WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT
+                    );
+                    WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT
+                }
+            },
+            None => WT_OUTBOUND_SHEDDING_THRESHOLD_DEFAULT,
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------

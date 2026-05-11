@@ -156,6 +156,10 @@ if ! command -v gawk &>/dev/null; then
   exit 1
 fi
 
+# Use gawk explicitly — bare `awk` may resolve to BSD awk on macOS even
+# when gawk is installed separately.
+AWK=gawk
+
 ts_to_human() { date -u -d "@$(( ${1} / 1000 ))" '+%H:%M:%S' 2>/dev/null || echo "?"; }
 epoch_to_prom() { echo "$(( ${1} / 1000 ))"; }
 
@@ -258,7 +262,7 @@ for key in "${ALL_KEYS[@]}"; do
   audio_buffer_stats=$(zcat "${files[@]}" 2>/dev/null | \
     grep -oE 'audio health \(buffer: [0-9]+ms\)' | \
     grep -oE '[0-9]+' | \
-    awk 'BEGIN {n=0; nz=0} {
+    $AWK 'BEGIN {n=0; nz=0} {
       a[n++]=$1
       if ($1 > 0) b[nz++]=$1
     } END {
@@ -477,10 +481,10 @@ if [[ -n "$RELAY_WT" ]]; then
       RELAY_DROPS_TOTAL=$((RELAY_DROPS_TOTAL + count))
     fi
   done < <(grep -oE 'Outbound channel full for session [0-9]+' "$RELAY_WT" 2>/dev/null \
-           | awk '{print $NF}' \
+           | $AWK '{print $NF}' \
            | sort \
            | uniq -c \
-           | awk '{print $1, $2}')
+           | $AWK '{print $1, $2}')
 fi
 
 # ---------------------------------------------------------------------------
@@ -770,7 +774,7 @@ if [[ -n "$RELAY_WT" ]]; then
       SID_NAME[$sid]=$(echo "$s" | jq -r '.display_name')
     done
     # Emit sorted by drop count descending
-    for sid in $(for k in "${!RELAY_DROPS[@]}"; do echo "${RELAY_DROPS[$k]} $k"; done | sort -rn | awk '{print $2}'); do
+    for sid in $(for k in "${!RELAY_DROPS[@]}"; do echo "${RELAY_DROPS[$k]} $k"; done | sort -rn | $AWK '{print $2}'); do
       count="${RELAY_DROPS[$sid]}"
       email="${SID_EMAIL[$sid]:-?}"
       name="${SID_NAME[$sid]:-?}"

@@ -1504,12 +1504,12 @@
       },
       "targets": [
         {
-          "expr": "rate(videocall_datagram_drops_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "expr": "rate(videocall_datagram_drops{meeting_id=~\"$meeting\"}[$__rate_interval])",
           "legendFormat": "WT {{display_name}}",
           "refId": ""
         },
         {
-          "expr": "rate(videocall_websocket_drops_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "expr": "rate(videocall_websocket_drops{meeting_id=~\"$meeting\"}[$__rate_interval])",
           "legendFormat": "WS {{display_name}}",
           "refId": ""
         }
@@ -2410,7 +2410,7 @@
             }
           ],
           "title": "Encoder Decision Inputs",
-          "description": "FPS ratio = worst_peer_fps / encoder_output_fps. Bitrate ratio = actual / target. When fps_ratio drops below 0.50 the system degrades; when it recovers above 0.70 (sustained) the system steps up.",
+          "description": "FPS ratio = p75_peer_fps / encoder_output_fps. Bitrate ratio = actual / target. When fps_ratio drops below 0.50 the system degrades; when it recovers above 0.70 (sustained) the system steps up.",
           "type": "timeseries"
         },
         {
@@ -2466,8 +2466,8 @@
           },
           "targets": [
             {
-              "expr": "videocall_encoder_worst_peer_fps{meeting_id=~\"$meeting\"}",
-              "legendFormat": "{{display_name}} worst_peer",
+              "expr": "videocall_encoder_p75_peer_fps{meeting_id=~\"$meeting\"} or videocall_encoder_worst_peer_fps{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} p75_peer",
               "refId": "A"
             },
             {
@@ -2476,8 +2476,8 @@
               "refId": "B"
             }
           ],
-          "title": "Worst Peer FPS (Encoder Input)",
-          "description": "The FPS the worst-performing receiver reports vs what the encoder actually produces. A 0 FPS worst_peer drives the adaptive system to degrade for ALL receivers.",
+          "title": "p75 Peer FPS (Encoder Input)",
+          "description": "The p75 receiver FPS vs what the encoder actually produces. A low p75 means degradation is widespread enough to justify stepping down quality for the sender.",
           "type": "timeseries"
         },
         {
@@ -2543,7 +2543,7 @@
             }
           ],
           "title": "Decoder Errors (per receiver)",
-          "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and worst_peer_fps to find the receiver dragging down quality for everyone.",
+          "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread.",
           "type": "timeseries"
         }
       ]

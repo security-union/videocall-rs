@@ -182,6 +182,10 @@ pub struct ScreenEncoder {
     /// screen capture starts, `false` when it stops. The `CameraEncoder` reads
     /// this to drop its quality tier and prevent bandwidth contention.
     screen_sharing_active: Rc<AtomicBool>,
+    /// Signal set by ConnectionManager when a server re-election completes.
+    /// Consumed by the screen encoder control loop to suppress false crash
+    /// ceiling arming during the transient.
+    reelection_completed_signal: Rc<AtomicBool>,
     /// Current screen share quality tier index (0=high, 1=medium, 2=low).
     shared_screen_tier_index: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter.
@@ -220,11 +224,16 @@ impl ScreenEncoder {
             force_keyframe: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
             screen_sharing_active,
+            reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             shared_screen_tier_index: Rc::new(AtomicU32::new(DEFAULT_SCREEN_TIER_INDEX as u32)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
+    /// Replace the internal re-election completed signal with an externally-owned one.
+    pub fn set_reelection_completed_signal(&mut self, signal: Rc<AtomicBool>) {
+        self.reelection_completed_signal = signal;
+    }
     /// Returns the current screen share quality tier index (0=high, 1=medium, 2=low).
     pub fn shared_screen_tier_index(&self) -> Rc<AtomicU32> {
         self.shared_screen_tier_index.clone()
@@ -248,6 +257,7 @@ impl ScreenEncoder {
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let shared_screen_tier_idx = self.shared_screen_tier_index.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
+        let reelection_completed_signal = self.reelection_completed_signal.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
@@ -296,6 +306,11 @@ impl ScreenEncoder {
                 }
                 if !transitions.is_empty() {
                     shared_tier_transitions.borrow_mut().extend(transitions);
+                }
+
+                if reelection_completed_signal.swap(false, Ordering::AcqRel) {
+                    log::info!("ScreenEncoder: re-election completed, notifying quality manager");
+                    encoder_control.notify_reelection_completed();
                 }
             }
         });
@@ -1463,8 +1478,58 @@ impl ScreenEncoder {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::is_fatal_encoder_error_message;
     use super::should_reacquire_screen_capture;
+    use super::ScreenEncoder;
+    use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
 
     #[test]
     fn screen_capture_is_reacquired_after_any_restart() {
@@ -1484,5 +1549,27 @@ mod tests {
         assert!(!is_fatal_encoder_error_message(
             "EncodingError: transient frame drop"
         ));
+    }
+
+    #[test]
+    fn screen_encoder_uses_shared_reelection_signal() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+        );
+        let shared_signal = Rc::new(AtomicBool::new(false));
+        encoder.set_reelection_completed_signal(shared_signal.clone());
+
+        shared_signal.store(true, Ordering::Release);
+        assert!(
+            encoder
+                .reelection_completed_signal
+                .swap(false, Ordering::AcqRel),
+            "screen encoder should read the externally owned re-election signal"
+        );
     }
 }

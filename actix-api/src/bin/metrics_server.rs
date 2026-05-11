@@ -52,16 +52,16 @@ use sec_api::metrics::{
     CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
     CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
     CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO,
-    ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
-    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
-    WEBSOCKET_DROPS_TOTAL,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO,
+    ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS,
+    ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL,
+    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
+    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -187,11 +187,12 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = CLIENT_TAB_THROTTLED.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
-    let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
-    let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
+    let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
+    let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_FPS_RATIO.remove_label_values(&reporter_labels);
     let _ = ENCODER_WORST_PEER_FPS.remove_label_values(&reporter_labels);
+    let _ = ENCODER_P75_PEER_FPS.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
@@ -598,12 +599,12 @@ fn process_health_packet_to_metrics_pb(
                 .set(tier as f64);
         }
         if let Some(drops) = health_packet.datagram_drops_total {
-            DATAGRAM_DROPS_TOTAL
+            DATAGRAM_DROPS
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
         if let Some(drops) = health_packet.websocket_drops_total {
-            WEBSOCKET_DROPS_TOTAL
+            WEBSOCKET_DROPS
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }
@@ -619,8 +620,14 @@ fn process_health_packet_to_metrics_pb(
                 .with_label_values(&reporter_labels)
                 .set(ratio);
         }
-        if let Some(fps) = health_packet.encoder_worst_peer_fps {
+        if let Some(fps) = health_packet
+            .encoder_p75_peer_fps
+            .or(health_packet.encoder_worst_peer_fps)
+        {
             ENCODER_WORST_PEER_FPS
+                .with_label_values(&reporter_labels)
+                .set(fps);
+            ENCODER_P75_PEER_FPS
                 .with_label_values(&reporter_labels)
                 .set(fps);
         }
@@ -670,7 +677,13 @@ fn process_health_packet_to_metrics_pb(
         }
 
         // TELEM-7: client_info gauge (static metadata)
-        if health_packet.client_cores.is_some() || health_packet.client_architecture.is_some() {
+        // Publish when ANY client metadata field is present (not just cores/arch).
+        if health_packet.client_cores.is_some()
+            || health_packet.client_architecture.is_some()
+            || health_packet.client_gpu_family.is_some()
+            || health_packet.client_network_effective_type.is_some()
+            || health_packet.client_capability_score.is_some()
+        {
             let cores_str = health_packet
                 .client_cores
                 .map(|c| c.to_string())

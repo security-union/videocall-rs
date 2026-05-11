@@ -411,20 +411,11 @@ pub struct ConnectionManager {
     /// RTT (not the election-time baseline), because the decision to switch
     /// should be based on present conditions, not historical ones.
     old_active_rtt: Option<f64>,
-    /// The server URL of the old active connection, captured alongside
-    /// `old_active_rtt` during `start_reelection`. Used when aborting a
-    /// re-election to restore the RTT measurement entry with the real URL
-    /// instead of a synthetic placeholder.
-    old_active_url: Option<String>,
     /// Full RTT measurement snapshot of the old active connection, cloned at
     /// re-election start. Used to restore the complete measurement history
     /// (not just a single synthetic sample) when a re-election is aborted,
     /// so that subsequent elections still satisfy `ELECTION_MIN_RTT_SAMPLES`.
     old_active_rtt_measurement: Option<ServerRttMeasurement>,
-    /// Transport type of the old active connection, captured from the
-    /// measurement entry at re-election start. Used during abort-restoration
-    /// instead of inferring from the connection ID prefix (which is brittle).
-    old_active_is_webtransport: Option<bool>,
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
@@ -574,9 +565,7 @@ impl ConnectionManager {
             reelection_generation: 0,
             old_active_connection: None,
             old_active_rtt: None,
-            old_active_url: None,
             old_active_rtt_measurement: None,
-            old_active_is_webtransport: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
@@ -670,9 +659,7 @@ impl ConnectionManager {
         // (generation 0) without risk of ID collision.
         self.reelection_generation = 0;
         self.old_active_rtt = None;
-        self.old_active_url = None;
         self.old_active_rtt_measurement = None;
-        self.old_active_is_webtransport = None;
         // Reset the candidate-failure preservation guard. Any pending retry
         // timer detects the cancellation via `reelection_retry_pending` and
         // bails out without re-entering the manager.
@@ -1299,16 +1286,9 @@ impl ConnectionManager {
                             // so that send_packet / heartbeat / RTT probes resume
                             // normally.
                             if let Some((old_id, old_conn)) = self.old_active_connection.take() {
+                                let restored_url = old_conn.url().to_string();
+                                let restored_is_webtransport = old_conn.is_webtransport();
                                 self.connections.insert(old_id.clone(), old_conn);
-                                // Restore the full RTT measurement snapshot so
-                                // that subsequent elections still satisfy
-                                // ELECTION_MIN_RTT_SAMPLES. Use the stored
-                                // transport type instead of inferring from the
-                                // connection ID prefix.
-                                let is_wt = self
-                                    .old_active_is_webtransport
-                                    .take()
-                                    .unwrap_or_else(|| old_id.starts_with("wt"));
                                 if let Some(mut restored) = self.old_active_rtt_measurement.take() {
                                     // Update the restored measurement to reflect
                                     // current state (active + connected).
@@ -1318,15 +1298,11 @@ impl ConnectionManager {
                                 } else {
                                     // Fallback: no snapshot available (should not
                                     // happen, but be defensive).
-                                    let restored_url = self
-                                        .old_active_url
-                                        .take()
-                                        .unwrap_or_else(|| format!("(restored) {old_id}"));
                                     self.rtt_measurements.insert(
                                         old_id.clone(),
                                         ServerRttMeasurement {
                                             url: restored_url,
-                                            is_webtransport: is_wt,
+                                            is_webtransport: restored_is_webtransport,
                                             measurements: VecDeque::from(vec![comparison_rtt]),
                                             average_rtt: Some(comparison_rtt),
                                             connection_id: old_id.clone(),
@@ -1361,9 +1337,7 @@ impl ConnectionManager {
                             self.degradation_counter = 0;
                             self.reelection_in_progress = false;
                             self.old_active_rtt = None;
-                            self.old_active_url = None;
                             self.old_active_rtt_measurement = None;
-                            self.old_active_is_webtransport = None;
                             // The cycle reached an orderly conclusion — clear
                             // the preservation guard so a subsequent
                             // candidate-failure event can preserve again. Also
@@ -1485,9 +1459,7 @@ impl ConnectionManager {
                 // Successful election — restore the full post-rebase retry budget.
                 self.post_rebase_retry_count = 0;
                 self.old_active_rtt = None;
-                self.old_active_url = None;
                 self.old_active_rtt_measurement = None;
-                self.old_active_is_webtransport = None;
                 // A clean Elected outcome closes out the cycle. Reset the
                 // preservation guard so the *next* re-election cycle can
                 // preserve once if its candidates flame out. Also cancel any
@@ -1552,9 +1524,7 @@ impl ConnectionManager {
                     failed_at: monotonic_now_ms(),
                 };
                 self.old_active_rtt = None;
-                self.old_active_url = None;
                 self.old_active_rtt_measurement = None;
-                self.old_active_is_webtransport = None;
                 self.reelection_preserved_once = false;
                 self.report_state();
             }
@@ -1637,28 +1607,24 @@ impl ConnectionManager {
         // time via the `old_active_connection` fallback path; this just
         // returns it to the canonical location.
         if let Some((id, conn)) = self.old_active_connection.take() {
+            // Capture URL and transport type BEFORE moving conn into the map.
+            let conn_url = conn.url().to_string();
+            let conn_is_webtransport = conn.is_webtransport();
             self.connections.insert(id.clone(), conn);
 
             // Restore the RTT measurement entry (same approach as the
             // existing abort-on-no-improvement path).
-            let is_wt = self
-                .old_active_is_webtransport
-                .take()
-                .unwrap_or_else(|| id.starts_with("wt"));
             if let Some(mut restored) = self.old_active_rtt_measurement.take() {
                 restored.active = true;
                 restored.connected = true;
                 self.rtt_measurements.insert(id.clone(), restored);
             } else if let Some(snapshot_rtt) = self.old_active_rtt {
-                let restored_url = self
-                    .old_active_url
-                    .take()
-                    .unwrap_or_else(|| format!("(restored) {id}"));
+                let (restored_url, is_webtransport) = (conn_url, conn_is_webtransport);
                 self.rtt_measurements.insert(
                     id.clone(),
                     ServerRttMeasurement {
                         url: restored_url,
-                        is_webtransport: is_wt,
+                        is_webtransport,
                         measurements: VecDeque::from(vec![snapshot_rtt]),
                         average_rtt: Some(snapshot_rtt),
                         connection_id: id.clone(),
@@ -1695,8 +1661,7 @@ impl ConnectionManager {
 
         // Clear stale candidate state.
         self.old_active_rtt = None;
-        self.old_active_url = None;
-        self.old_active_is_webtransport = None;
+        self.old_active_rtt_measurement = None;
         self.pending_session_ids.borrow_mut().clear();
 
         // Mark the cycle as preserved-once so a subsequent failure inside
@@ -2405,9 +2370,7 @@ impl ConnectionManager {
             .as_ref()
             .and_then(|id| self.rtt_measurements.get(id));
         self.old_active_rtt = old_measurement.and_then(|m| m.average_rtt);
-        self.old_active_url = old_measurement.map(|m| m.url.clone());
         self.old_active_rtt_measurement = old_measurement.cloned();
-        self.old_active_is_webtransport = old_measurement.map(|m| m.is_webtransport);
         if let Some(rtt) = self.old_active_rtt {
             info!("Re-election: captured old active connection RTT: {rtt:.1}ms");
         }
@@ -3739,9 +3702,7 @@ mod tests {
             reelection_generation: 0,
             old_active_connection: None,
             old_active_rtt: None,
-            old_active_url: None,
             old_active_rtt_measurement: None,
-            old_active_is_webtransport: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
@@ -5669,9 +5630,7 @@ mod tests {
         // election cycle).
         mgr.reelection_in_progress = false;
         mgr.old_active_rtt = None;
-        mgr.old_active_url = None;
         mgr.old_active_rtt_measurement = None;
-        mgr.old_active_is_webtransport = None;
 
         // Second re-election: active is still "wt_0" (no winner picked
         // because URL lists are empty in the test), so re-arm.
@@ -6090,7 +6049,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "wasm32")]
-    fn start_reelection_captures_transport_type() {
+    fn start_reelection_captures_transport_type_in_measurement_snapshot() {
         let mut mgr = make_test_manager();
         *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
         insert_measurement(&mut mgr, "ws_0", false, Some(80.0), vec![80.0]);
@@ -6098,9 +6057,11 @@ mod tests {
         mgr.start_reelection().unwrap();
 
         assert_eq!(
-            mgr.old_active_is_webtransport,
+            mgr.old_active_rtt_measurement
+                .as_ref()
+                .map(|m| m.is_webtransport),
             Some(false),
-            "should capture transport type from measurement entry"
+            "measurement snapshot should preserve transport type"
         );
     }
 
@@ -6117,10 +6078,6 @@ mod tests {
             mgr.old_active_rtt_measurement.is_none(),
             "should be None when no measurement exists"
         );
-        assert!(
-            mgr.old_active_is_webtransport.is_none(),
-            "should be None when no measurement exists"
-        );
     }
 
     #[test]
@@ -6132,7 +6089,6 @@ mod tests {
 
         mgr.reelection_in_progress = true;
         mgr.old_active_rtt = Some(100.0);
-        mgr.old_active_url = Some("https://test/wt_old".to_string());
         mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
             url: "https://test/wt_old".to_string(),
             is_webtransport: true,
@@ -6143,7 +6099,6 @@ mod tests {
             connected: true,
             consecutive_implausible_discards: 0,
         });
-        mgr.old_active_is_webtransport = Some(true);
         // old_active_connection is None (no real Connection object).
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
 
@@ -6154,14 +6109,9 @@ mod tests {
 
         // All old_active_* fields should be cleared after abort.
         assert_eq!(mgr.old_active_rtt, None, "old_active_rtt should be cleared");
-        assert_eq!(mgr.old_active_url, None, "old_active_url should be cleared");
         assert!(
             mgr.old_active_rtt_measurement.is_none(),
             "old_active_rtt_measurement should be cleared"
-        );
-        assert!(
-            mgr.old_active_is_webtransport.is_none(),
-            "old_active_is_webtransport should be cleared"
         );
         assert!(!mgr.reelection_in_progress);
     }
@@ -6183,7 +6133,6 @@ mod tests {
 
         mgr.reelection_in_progress = true;
         mgr.old_active_rtt = Some(100.0);
-        mgr.old_active_url = Some("https://test/wt_old".to_string());
         // old_active_connection is None — the connection won't be restored,
         // but the state cleanup must still run correctly.
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
@@ -6205,17 +6154,11 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "wasm32")]
-    fn complete_election_abort_uses_stored_transport_type() {
-        // When old_active_is_webtransport is set, abort should use it
-        // instead of inferring from the connection ID prefix.
+    fn complete_election_abort_uses_snapshot_transport_type() {
         let mut mgr = make_test_manager();
 
         mgr.reelection_in_progress = true;
         mgr.old_active_rtt = Some(100.0);
-        mgr.old_active_url = Some("https://test/custom_id".to_string());
-        // Transport type stored explicitly — even though ID doesn't start
-        // with "wt", it should be recognized as WebTransport.
-        mgr.old_active_is_webtransport = Some(true);
         mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
             url: "https://test/custom_id".to_string(),
             is_webtransport: true,
@@ -6232,12 +6175,9 @@ mod tests {
 
         mgr.complete_election();
 
-        // Verify state was cleaned up. The measurement restoration doesn't
-        // happen without a real Connection, but old_active_is_webtransport
-        // should be consumed (taken).
         assert!(
-            mgr.old_active_is_webtransport.is_none(),
-            "old_active_is_webtransport should be consumed on abort"
+            mgr.old_active_rtt_measurement.is_none(),
+            "snapshot should be consumed on abort"
         );
     }
 
@@ -6255,17 +6195,12 @@ mod tests {
             connected: false,
             consecutive_implausible_discards: 0,
         });
-        mgr.old_active_is_webtransport = Some(true);
 
         mgr.reset_and_start_election().unwrap();
 
         assert!(
             mgr.old_active_rtt_measurement.is_none(),
             "reset_and_start_election should clear old_active_rtt_measurement"
-        );
-        assert!(
-            mgr.old_active_is_webtransport.is_none(),
-            "reset_and_start_election should clear old_active_is_webtransport"
         );
     }
 
@@ -6387,8 +6322,6 @@ mod tests {
     ) {
         mgr.reelection_in_progress = true;
         mgr.old_active_rtt = Some(80.0);
-        mgr.old_active_url = Some(format!("https://test/{old_id}"));
-        mgr.old_active_is_webtransport = Some(true);
         mgr.old_active_rtt_measurement = Some(ServerRttMeasurement {
             url: format!("https://test/{old_id}"),
             is_webtransport: true,

@@ -23,6 +23,9 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
+use crate::actors::priority_drop::{
+    evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
+};
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{wt_outbound_channel_capacity, CLIENT_TIMEOUT};
 use crate::messages::server::{ActivateConnection, Packet};
@@ -67,10 +70,22 @@ pub enum WtOutbound {
 enum WtSendResult {
     /// Message sent successfully.
     Sent,
-    /// Channel is full; message was dropped.
+    /// Channel is full at the time of `try_send`; message was dropped.
+    /// The transport-agnostic drop counters and the legacy media-kind
+    /// labels (`audio`/`video`/`screen`/`media`/`control`/`unknown`,
+    /// or `overflow_critical` for Critical packets) are bumped at the
+    /// call site.
     Dropped,
     /// Channel is closed; connection is dead.
     Dead,
+    /// Packet was *preemptively* dropped before `try_send` by the
+    /// priority-drop policy because the channel was approaching
+    /// saturation. Distinct from `Dropped` so callers can keep both
+    /// semantic paths in pattern matches even if today they take the
+    /// same action (fire CONGESTION feedback). The drop metric is
+    /// already incremented inside `send_auto` with the policy-
+    /// specific label (`priority_drop_video` / `priority_drop_audio`).
+    PriorityDropped,
 }
 
 /// Source of inbound data
@@ -216,6 +231,16 @@ impl WtChatSession {
 
     /// Send outbound message via the channel (reliable unidirectional stream).
     /// Returns false if the channel is closed (connection dead).
+    ///
+    /// `send()` is used for server-originated control packets that are
+    /// part of the session lifecycle: `SESSION_ASSIGNED`,
+    /// `MEETING_STARTED`, `MEETING_ENDED`. These are *Critical* under
+    /// the priority-drop policy — they are never preemptively dropped
+    /// and only fail when the channel is genuinely full. When that
+    /// happens we record `kind="overflow_critical"` on the protocol-
+    /// wide counter so saturation severe enough to drop lifecycle
+    /// packets is alertable on its own (separate from the much higher-
+    /// volume media drops).
     fn send(&self, data: Vec<u8>) -> bool {
         match self
             .outbound_tx
@@ -233,15 +258,16 @@ impl WtChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
-                // Phase 8b TELEM-8: Protocol-wide aggregate counter that backs
-                // alerting (rate(...)[5m]) without high-cardinality `room`.
-                // `send()` is used for non-media control packets (heartbeats,
-                // session-assigned, meeting-started), hence kind="control".
+                // Lifecycle control packet dropped on real overflow.
+                // The priority-drop policy guarantees these are never
+                // preempted by media saturation; a drop here means the
+                // channel is so full even the highest-priority packets
+                // cannot be admitted. Pages on this should be loud.
                 OUTBOUND_CHANNEL_DROPS_TOTAL
-                    .with_label_values(&["webtransport", "control"])
+                    .with_label_values(&["webtransport", "overflow_critical"])
                     .inc();
                 error!(
-                    "Outbound channel full for session {}, dropping message",
+                    "Outbound channel full for session {} on Critical control packet, dropping (overflow_critical)",
                     self.logic.id
                 );
                 true // Channel still open, just full
@@ -291,8 +317,48 @@ impl WtChatSession {
         is_media: bool,
         is_audio: bool,
         parsed: bool,
+        packet_type: PacketType,
         media_type: Option<MediaType>,
     ) -> WtSendResult {
+        // Priority-drop pre-check: before paying the `try_send` cost we
+        // ask the per-session policy whether this packet should be
+        // preempted given the current channel fill. Video / screen are
+        // shed at ~80% fill, audio at ~95% fill, control / critical
+        // never preempt. See `actors::priority_drop` for the policy.
+        //
+        // Lifecycle note: this branch fires PURELY based on channel
+        // depth — it does NOT distinguish reconnection storms from
+        // steady-state saturation. The Critical packet set
+        // (SESSION_ASSIGNED, CONGESTION, RSA_PUB_KEY, MEETING) is
+        // *never* preempted here, so a reconnection wave that needs
+        // to deliver SESSION_ASSIGNED + MEETING_STARTED still goes
+        // through. Media drops during the storm are exactly the
+        // intended behaviour — they free queue slots for the lifecycle
+        // traffic that the new participant actually needs.
+        let priority = OutboundPriority::classify(parsed, packet_type, media_type);
+        let total_capacity = wt_outbound_channel_capacity();
+        let free_capacity = self.outbound_tx.capacity();
+        if let PriorityDropDecision::Drop { reason } =
+            evaluate_priority_drop(priority, free_capacity, total_capacity)
+        {
+            // Mirror the legacy drop-counter pair so per-room and
+            // protocol-wide series both observe the preempt. The
+            // protocol-wide counter uses the priority-specific reason
+            // label so dashboards can distinguish a policy-driven drop
+            // from a genuine channel-overflow drop.
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[&self.logic.room, "webtransport", reason])
+                .inc();
+            OUTBOUND_CHANNEL_DROPS_TOTAL
+                .with_label_values(&["webtransport", reason])
+                .inc();
+            trace!(
+                "Priority-drop {reason} on WT session {}: free={free_capacity}/{total_capacity}",
+                self.logic.id,
+            );
+            return WtSendResult::PriorityDropped;
+        }
+
         let outbound = build_outbound(data, is_media, is_audio);
 
         match self.outbound_tx.try_send(outbound) {
@@ -327,15 +393,26 @@ impl WtChatSession {
                 // congestion storm to the specific media stream. Anything
                 // else (HEARTBEAT, KEYFRAME_REQUEST, encrypted inner)
                 // continues to use the legacy `media` catch-all.
+                //
+                // 2026-05-11 priority-drop policy (discussion #699): if
+                // the priority is Critical (SESSION_ASSIGNED,
+                // CONGESTION, RSA_PUB_KEY, MEETING) and try_send still
+                // fails, emit `kind="overflow_critical"` so the
+                // exceptional case of a lifecycle packet dropped is
+                // alertable independently of normal media drops.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "webtransport", "channel_full"])
                     .inc();
-                let kind = drop_kind_label(parsed, is_media, media_type);
+                let kind = if priority == OutboundPriority::Critical {
+                    "overflow_critical"
+                } else {
+                    drop_kind_label(parsed, is_media, media_type)
+                };
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["webtransport", kind])
                     .inc();
                 error!(
-                    "Outbound channel full for session {}, dropping message",
+                    "Outbound channel full for session {}, dropping message (kind={kind})",
                     self.logic.id
                 );
                 WtSendResult::Dropped
@@ -502,10 +579,15 @@ impl Handler<Message> for WtChatSession {
             .as_ref()
             .map(|pw| pw.user_id.clone())
             .unwrap_or_default();
-        let is_media = parsed
+        // Resolve the outer PacketType for the priority-drop classifier.
+        // `enum_value().ok()` falls back to `PACKET_TYPE_UNKNOWN` when
+        // the wire bytes carry a value not in our enum — Control class
+        // under the priority policy, i.e. never preemptively dropped.
+        let packet_type = parsed
             .as_ref()
-            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
-            .unwrap_or(false);
+            .and_then(|pw| pw.packet_type.enum_value().ok())
+            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN);
+        let is_media = packet_type == PacketType::MEDIA;
 
         // For MEDIA packets, peek at the inner MediaType. We use the
         // resolved `MediaType` enum twice:
@@ -515,6 +597,8 @@ impl Handler<Message> for WtChatSession {
         //     attributed to a specific media stream. The 2026-05-08
         //     production storm dropped 25,081 packets in 3 minutes and
         //     we had no metric-level way to tell audio from video.
+        //   * priority-drop classifier consumes both `packet_type` and
+        //     `media_type` to decide whether to preempt the enqueue.
         //
         // Encrypted payloads fail to parse and therefore (a) route via
         // the reliable stream — the safer default — and (b) fall through
@@ -529,14 +613,26 @@ impl Handler<Message> for WtChatSession {
         };
         let is_audio = matches!(inner_media_type, Some(MediaType::AUDIO));
 
-        match self.send_auto(bytes, is_media, is_audio, parse_succeeded, inner_media_type) {
+        match self.send_auto(
+            bytes,
+            is_media,
+            is_audio,
+            parse_succeeded,
+            packet_type,
+            inner_media_type,
+        ) {
             WtSendResult::Sent => {}
             WtSendResult::Dead => {
                 ctx.stop();
             }
-            WtSendResult::Dropped => {
-                // Outbound channel full -- record the drop for the actual sender
-                // so we can send CONGESTION feedback when the threshold is exceeded.
+            WtSendResult::Dropped | WtSendResult::PriorityDropped => {
+                // Either real channel-full or priority preempt — both
+                // are drops from the sender's perspective. Record the
+                // drop for the actual sender so we can fire CONGESTION
+                // feedback when the threshold is exceeded. This is what
+                // tells the offending sender to step its quality tier
+                // down; without it, the sender keeps sending the same
+                // volume of video and the receiver keeps shedding it.
                 if sender_session_id != 0 {
                     self.logic
                         .on_outbound_drop(sender_session_id, &sender_user_id);

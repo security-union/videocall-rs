@@ -229,14 +229,15 @@ fn build_health_packet(
     // feed the Grafana AQ dashboards so bot-populated calls show the same
     // diagnostics as browser-populated ones.
     let fps_ratio = aq.last_fps_ratio();
-    let worst_peer_fps = aq.last_worst_peer_fps();
+    let p75_peer_fps = aq.last_p75_peer_fps();
     let bitrate_ratio = aq.last_bitrate_ratio();
     let target_bitrate = aq.last_target_bitrate_kbps();
     if fps_ratio.is_finite() && fps_ratio > 0.0 {
         hp.encoder_fps_ratio = Some(fps_ratio as f64);
     }
-    if worst_peer_fps.is_finite() && worst_peer_fps > 0.0 {
-        hp.encoder_worst_peer_fps = Some(worst_peer_fps as f64);
+    if p75_peer_fps.is_finite() && p75_peer_fps > 0.0 {
+        hp.encoder_worst_peer_fps = Some(p75_peer_fps as f64);
+        hp.encoder_p75_peer_fps = Some(p75_peer_fps as f64);
     }
     if bitrate_ratio.is_finite() && bitrate_ratio > 0.0 {
         hp.encoder_bitrate_ratio = Some(bitrate_ratio as f64);

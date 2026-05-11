@@ -22,6 +22,9 @@
 //! to `SessionLogic`. It handles WebSocket-specific I/O via `WebsocketContext`.
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::priority_drop::{
+    evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
+};
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY};
 use crate::messages::server::{ActivateConnection, Packet};
@@ -258,11 +261,94 @@ impl Actor for WsChatSession {
 /// the channel on the actor event loop. When the channel is full, the packet
 /// is dropped and `on_outbound_drop()` fires CONGESTION feedback to the
 /// sender via NATS — mirroring the WebTransport relay pattern.
+///
+/// **Priority-drop policy (discussion #699)**: before `try_send`, the
+/// per-session `actors::priority_drop` evaluator decides whether to
+/// preempt the enqueue based on packet priority and channel fill:
+///
+/// * Video / screen frames are shed at ~80% channel fill so audio
+///   gets the headroom (one 1-2 Mbps video frame buffer is worth
+///   ~200 audio frames at ~50 kbps).
+/// * Audio frames preserved until ~95% fill.
+/// * Control packets are never preempted by the policy. Critical
+///   lifecycle packets (`SESSION_ASSIGNED`, `CONGESTION`,
+///   `RSA_PUB_KEY`, `MEETING`) also use the `overflow_critical` kind
+///   label when they fail on real channel overflow, so a saturation
+///   severe enough to drop lifecycle traffic is alertable on its own.
+///
+/// On any drop (preempted or real overflow), the sender's
+/// `on_outbound_drop` still fires so CONGESTION feedback reaches the
+/// upstream sender that caused the saturation. Without that callback
+/// the offending sender keeps sending at the same rate and the
+/// receiver keeps shedding their traffic.
 impl Handler<Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
+        // Lazily compute the parsed metadata for the priority-drop
+        // classifier. We parse the outer wrapper unconditionally
+        // because the policy needs the `packet_type`; the inner
+        // `MediaPacket` parse only happens for MEDIA packets. The hot
+        // path is media (~99%), so the inner parse cost would be
+        // paid almost every call regardless of the saturation state.
+        //
+        // We pull out sender_session_id / user_id here so a drop can
+        // still feed `on_outbound_drop` (the CONGESTION trigger).
+        let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
+        let parse_succeeded = parsed.is_some();
+        let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
+        let sender_user_id = parsed
+            .as_ref()
+            .map(|pw| pw.user_id.clone())
+            .unwrap_or_default();
+        let packet_type = parsed
+            .as_ref()
+            .and_then(|pw| pw.packet_type.enum_value().ok())
+            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN);
+        let is_media = packet_type == PacketType::MEDIA;
+        let media_type = if is_media {
+            parsed
+                .as_ref()
+                .and_then(|pw| MediaPacket::parse_from_bytes(&pw.data).ok())
+                .and_then(|mp| mp.media_type.enum_value().ok())
+        } else {
+            None
+        };
+
+        // Call `handle_outbound` BEFORE the priority-drop check so the
+        // per-room outbound bytes counter and DataTracker still see
+        // every packet — this matches WT's accounting and avoids a
+        // counter discontinuity if a deploy moves the call site.
+        // The drop path discards `bytes` without sending it.
         let bytes = self.logic.handle_outbound(&msg);
+
+        let priority = OutboundPriority::classify(parse_succeeded, packet_type, media_type);
+        let free_capacity = self.outbound_tx.capacity();
+        if let PriorityDropDecision::Drop { reason } =
+            evaluate_priority_drop(priority, free_capacity, WS_OUTBOUND_CHANNEL_CAPACITY)
+        {
+            // Priority-driven preempt: record both the per-room and
+            // protocol-wide counters with the policy-specific label,
+            // and fire `on_outbound_drop` so the offending sender
+            // gets CONGESTION feedback.
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[&self.logic.room, "websocket", reason])
+                .inc();
+            OUTBOUND_CHANNEL_DROPS_TOTAL
+                .with_label_values(&["websocket", reason])
+                .inc();
+            trace!(
+                "Priority-drop {reason} on WS session {}: free={free_capacity}/{}",
+                self.logic.id,
+                WS_OUTBOUND_CHANNEL_CAPACITY,
+            );
+            if sender_session_id != 0 {
+                self.logic
+                    .on_outbound_drop(sender_session_id, &sender_user_id);
+            }
+            drop(bytes);
+            return;
+        }
 
         match self.outbound_tx.try_send(bytes) {
             Ok(()) => {}
@@ -270,39 +356,34 @@ impl Handler<Message> for WsChatSession {
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[&self.logic.room, "websocket", "channel_full"])
                     .inc();
-                // Parse sender session_id only on drops (not on every packet)
-                // to avoid a protobuf parse + heap alloc on the hot path.
-                // Phase 8b TELEM-8: derive `kind` from the same parse so the
-                // protocol-wide aggregate counter can distinguish media vs
-                // control drops without a second parse.
+                // Real channel-full drop (priority policy already
+                // admitted this packet — it's Control or Critical,
+                // or the priority bands did not preempt). Fire
+                // CONGESTION feedback for the upstream sender. The
+                // metric `kind` label distinguishes Critical (loud)
+                // from other channel-full drops.
                 //
                 // 2026-05-08 audio-quality follow-up: when the wrapper says
                 // MEDIA, peek at the inner `MediaPacket.media_type` so we
                 // can emit `kind="audio" | "video" | "screen"` instead of
-                // the catch-all `kind="media"`. We do this only on the
-                // drop path — it is rare and cold relative to the hot
-                // success path. Encrypted / unparseable inner payloads
-                // fall through to the legacy `media` label, preserving
-                // backwards compatibility.
-                let (parsed, is_media, media_type) =
-                    if let Ok(pw) = PacketWrapper::parse_from_bytes(&msg.msg) {
-                        let sender_session_id = pw.session_id;
-                        if sender_session_id != 0 {
-                            self.logic.on_outbound_drop(sender_session_id, &pw.user_id);
-                        }
-                        let is_media = pw.packet_type == PacketType::MEDIA.into();
-                        let media_type = if is_media {
-                            MediaPacket::parse_from_bytes(&pw.data)
-                                .ok()
-                                .and_then(|mp| mp.media_type.enum_value().ok())
-                        } else {
-                            None
-                        };
-                        (true, is_media, media_type)
-                    } else {
-                        (false, false, None)
-                    };
-                let kind = drop_kind_label(parsed, is_media, media_type);
+                // the catch-all `kind="media"`. Encrypted / unparseable
+                // inner payloads fall through to the legacy `media` label,
+                // preserving backwards compatibility.
+                //
+                // 2026-05-11 priority-drop policy (discussion #699):
+                // a Critical packet that still fails try_send goes to
+                // `overflow_critical` so an alerting rule can pivot on
+                // it directly. Anything else uses the existing label
+                // helper.
+                if sender_session_id != 0 {
+                    self.logic
+                        .on_outbound_drop(sender_session_id, &sender_user_id);
+                }
+                let kind = if priority == OutboundPriority::Critical {
+                    "overflow_critical"
+                } else {
+                    drop_kind_label(parse_succeeded, is_media, media_type)
+                };
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["websocket", kind])
                     .inc();

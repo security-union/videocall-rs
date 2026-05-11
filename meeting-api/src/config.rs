@@ -66,6 +66,14 @@ pub struct Config {
     /// Dev-only auto-login user. `None` unless `DEV_USER` is set AND OAuth is
     /// disabled. See [`DevUser`] for format and security warnings.
     pub dev_user: Option<DevUser>,
+    /// Explicit opt-in for running OAuth without JWKS-backed ID token
+    /// verification. Controlled by `OAUTH_ALLOW_UNVERIFIED=true`.
+    ///
+    /// Default `false`. When `true`, startup logs an unmistakable error banner
+    /// and the OAuth callback falls back to
+    /// `decode_id_token_claims_unverified(...)`. Production should never rely
+    /// on this except as a deliberately reviewed break-glass mode.
+    pub oauth_allow_unverified: bool,
 }
 
 /// SearchV2 / opensearch-middleware integration configuration.
@@ -188,7 +196,9 @@ impl Config {
     ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
     ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
     ///   `AFTER_LOGIN_URL`, `OAUTH_BROWSER_PKCE` (default: `false`),
-    ///   `OAUTH_RESOURCE_SERVER_AUDIENCE` (optional; restricts per-request `aud`)
+    ///   `OAUTH_RESOURCE_SERVER_AUDIENCE` (optional; restricts per-request `aud`),
+    ///   `OAUTH_ALLOW_UNVERIFIED` (default: `false`; required to explicitly opt
+    ///   into insecure unsigned-ID-token acceptance when no JWKS URL is available)
     /// - OIDC logout: `OAUTH_END_SESSION_URL` (manual override; auto-discovered
     ///   from `OAUTH_ISSUER` when not set), `AFTER_LOGOUT_URL` (sent as
     ///   `post_logout_redirect_uri` to the provider's end-session endpoint)
@@ -206,6 +216,13 @@ impl Config {
             .map_err(|_| "DATABASE_URL environment variable is required")?;
         let jwt_secret =
             env::var("JWT_SECRET").map_err(|_| "JWT_SECRET environment variable is required")?;
+
+        let oauth_allow_unverified = env::var("OAUTH_ALLOW_UNVERIFIED")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
         // Default: 24 hours. Must exceed both the longest expected meeting and
@@ -438,6 +455,7 @@ impl Config {
             search,
             display_name_rate_limit_disabled,
             dev_user,
+            oauth_allow_unverified,
         })
     }
 
@@ -491,12 +509,52 @@ impl Config {
 
         Ok(())
     }
+
+    /// Enforce the OAuth/JWKS security contract after discovery has had a
+    /// chance to populate any missing provider endpoints.
+    pub fn validate_oauth_security(&self) -> Result<(), String> {
+        let Some(oauth) = &self.oauth else {
+            return Ok(());
+        };
+
+        if oauth.jwks_url.is_some() {
+            return Ok(());
+        }
+
+        if self.oauth_allow_unverified {
+            tracing::error!(
+                "\n\
+                 ================================================================\n\
+                 OAUTH_ALLOW_UNVERIFIED=true and no JWKS URL is configured.\n\
+                 meeting-api will accept ID tokens without signature verification.\n\
+                 This mode is insecure and must only be used as an explicit,\n\
+                 temporary break-glass override for development or controlled\n\
+                 triage. Configure OAUTH_JWKS_URL or OAUTH_ISSUER to restore\n\
+                 signed-token verification.\n\
+                 ================================================================"
+            );
+            return Ok(());
+        }
+
+        Err(
+            "OAuth is enabled but no JWKS URL is configured. Set OAUTH_ISSUER \
+             or OAUTH_JWKS_URL so ID tokens can be verified, or explicitly opt \
+             in to insecure startup with OAUTH_ALLOW_UNVERIFIED=true."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Run `body` with `key` removed from the process environment, then restore
     /// the prior value. Required because [`Config::from_env`] reads process env,
@@ -507,6 +565,27 @@ mod tests {
         body();
         if let Some(v) = prior {
             std::env::set_var(key, v);
+        }
+    }
+
+    fn base_config() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:8081".to_string(),
+            database_url: "postgres://test/test".to_string(),
+            jwt_secret: "secret".to_string(),
+            token_ttl_secs: 86400,
+            session_ttl_secs: 315360000,
+            oauth: None,
+            cookie_domain: None,
+            cookie_name: "session".to_string(),
+            cookie_secure: true,
+            cors_allowed_origin: Vec::new(),
+            nats_url: None,
+            service_version_urls: Vec::new(),
+            search: None,
+            display_name_rate_limit_disabled: false,
+            dev_user: None,
+            oauth_allow_unverified: false,
         }
     }
 
@@ -531,6 +610,113 @@ mod tests {
         });
 
         // Restore surrounding env so we don't pollute sibling tests.
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    fn validate_oauth_security_allows_non_oauth_mode() {
+        let cfg = base_config();
+        assert!(cfg.validate_oauth_security().is_ok());
+    }
+
+    #[test]
+    fn validate_oauth_security_allows_verified_oauth_mode() {
+        let mut cfg = base_config();
+        cfg.oauth = Some(OAuthConfig {
+            client_id: "client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example/callback".to_string(),
+            issuer: Some("https://issuer.example".to_string()),
+            auth_url: "https://issuer.example/auth".to_string(),
+            token_url: "https://issuer.example/token".to_string(),
+            jwks_url: Some("https://issuer.example/jwks".to_string()),
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "/".to_string(),
+            allowed_redirect_urls: Vec::new(),
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        });
+
+        assert!(cfg.validate_oauth_security().is_ok());
+    }
+
+    #[test]
+    fn validate_oauth_security_rejects_unverified_oauth_without_opt_in() {
+        let mut cfg = base_config();
+        cfg.oauth = Some(OAuthConfig {
+            client_id: "client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example/callback".to_string(),
+            issuer: None,
+            auth_url: "https://issuer.example/auth".to_string(),
+            token_url: "https://issuer.example/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "/".to_string(),
+            allowed_redirect_urls: Vec::new(),
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        });
+
+        let err = cfg.validate_oauth_security().unwrap_err();
+        assert!(err.contains("OAuth is enabled but no JWKS URL is configured"));
+    }
+
+    #[test]
+    fn validate_oauth_security_allows_unverified_oauth_with_opt_in() {
+        let mut cfg = base_config();
+        cfg.oauth_allow_unverified = true;
+        cfg.oauth = Some(OAuthConfig {
+            client_id: "client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example/callback".to_string(),
+            issuer: None,
+            auth_url: "https://issuer.example/auth".to_string(),
+            token_url: "https://issuer.example/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "/".to_string(),
+            allowed_redirect_urls: Vec::new(),
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        });
+
+        assert!(cfg.validate_oauth_security().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn oauth_allow_unverified_defaults_to_false() {
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        with_env_unset("OAUTH_ALLOW_UNVERIFIED", || {
+            let cfg = Config::from_env().expect("from_env with OAUTH_ALLOW_UNVERIFIED unset");
+            assert!(
+                !cfg.oauth_allow_unverified,
+                "default must be false so unverified OAuth is never implicit"
+            );
+        });
         match prior_db {
             Some(v) => std::env::set_var("DATABASE_URL", v),
             None => std::env::remove_var("DATABASE_URL"),
@@ -588,6 +774,60 @@ mod tests {
         match prior_oauth_issuer {
             Some(v) => std::env::set_var("OAUTH_ISSUER", v),
             None => std::env::remove_var("OAUTH_ISSUER"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn oauth_allow_unverified_rejects_non_canonical_true_values() {
+        // Negative-case test: only "true" and "1" should enable the bypass.
+        // Values like "yes", "on", "YES", empty string, etc. must NOT enable it.
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_val = std::env::var("OAUTH_ALLOW_UNVERIFIED").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        for invalid_value in &["yes", "on", "YES", "ON", "Yes", "", "enabled"] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
+            let cfg = Config::from_env().unwrap_or_else(|e| {
+                panic!(
+                    "from_env should not fail for OAUTH_ALLOW_UNVERIFIED={:?}: {e}",
+                    invalid_value
+                )
+            });
+            assert!(
+                !cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to false (only \"true\" and \"1\" are accepted)",
+                invalid_value
+            );
+        }
+
+        // Sanity: confirm canonical values DO enable it.
+        // The parser does trim().to_lowercase(), so these all resolve to "true" or "1".
+        for valid_value in &["true", "1", "TRUE", " true ", " 1 "] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", valid_value);
+            let cfg = Config::from_env().unwrap();
+            assert!(
+                cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to true",
+                valid_value
+            );
+        }
+
+        match prior_val {
+            Some(v) => std::env::set_var("OAUTH_ALLOW_UNVERIFIED", v),
+            None => std::env::remove_var("OAUTH_ALLOW_UNVERIFIED"),
+        }
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
         }
     }
 }

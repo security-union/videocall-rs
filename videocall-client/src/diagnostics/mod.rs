@@ -26,6 +26,7 @@ pub mod adaptive_quality_manager {
 }
 
 pub mod diagnostics_manager;
+pub mod heartbeat;
 
 /// Re-export shim for [`videocall_aq::controller`].
 pub mod encoder_bitrate_controller {

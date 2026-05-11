@@ -331,7 +331,7 @@ pub const STEP_DOWN_REACTION_TIME_MS: u64 = 1500;
 
 /// Minimum time between any two tier transitions (milliseconds).
 /// Prevents rapid toggling even if thresholds are crossed quickly.
-pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 3000;
+pub const MIN_TIER_TRANSITION_INTERVAL_MS: u64 = 1500;
 
 /// Warmup grace period after the quality manager is created (milliseconds).
 ///

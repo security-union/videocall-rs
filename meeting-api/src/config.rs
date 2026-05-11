@@ -54,12 +54,6 @@ pub struct Config {
     /// (both `SEARCH_API_URL` and `SEARCH_API_TOKEN` must be set); search push
     /// becomes a no-op in that case. See [`crate::search`].
     pub search: Option<SearchConfig>,
-    /// Allow unauthenticated requests to resolve to a stable "anonymous" user
-    /// identity (path 3 in [`crate::auth::AuthUser`]).  Controlled by
-    /// `ALLOW_ANONYMOUS=true`.  Default `false` — production must set this
-    /// explicitly off (or leave unset); only flip it for local development
-    /// when running without an OAuth provider.
-    pub allow_anonymous: bool,
     /// Disable the per-user display-name rename rate limiter.  Controlled by
     /// `DISPLAY_NAME_RATE_LIMIT_DISABLED=true`.  Default `false` — production
     /// must keep the limiter active so that runaway clients can't churn
@@ -211,9 +205,6 @@ impl Config {
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     /// - `SEARCH_API_URL` + `SEARCH_API_TOKEN` (both required together to enable SearchV2 push;
     ///   either missing → push is silently disabled). See [`SearchConfig`].
-    /// - `ALLOW_ANONYMOUS` (default: `false`) — set to `"true"` / `"1"` for local development
-    ///   only. When enabled, unauthenticated requests resolve to a stable anonymous user
-    ///   identity instead of returning 401.
     /// - `DISPLAY_NAME_RATE_LIMIT_DISABLED` (default: `false`) — set to `"true"` / `"1"`
     ///   for the E2E test harness only. When enabled, the per-user display-name rename
     ///   rate limiter (5 renames per 60-second window) is bypassed entirely. Required
@@ -297,26 +288,8 @@ impl Config {
             }
         };
 
-        // Anonymous auth fallback — opt-in via ALLOW_ANONYMOUS.  Accept the
-        // common truthy forms ("true"/"1", case-insensitive) and default to
-        // false so production deployments never allow anonymous by accident.
-        let allow_anonymous = env::var("ALLOW_ANONYMOUS")
-            .map(|v| {
-                let v = v.trim().to_lowercase();
-                v == "true" || v == "1"
-            })
-            .unwrap_or(false);
-        if allow_anonymous {
-            tracing::warn!(
-                "ALLOW_ANONYMOUS=true — unauthenticated requests will resolve to \
-                 anonymous identities. This is intended for local development only; \
-                 do not enable in production."
-            );
-        }
-
         // Display-name rate-limit bypass — opt-in via
-        // DISPLAY_NAME_RATE_LIMIT_DISABLED.  Same truthy-form parsing as
-        // ALLOW_ANONYMOUS so the two flags compose cleanly in dev/CI envs.
+        // DISPLAY_NAME_RATE_LIMIT_DISABLED.
         // Production MUST leave this off so a misbehaving client cannot churn
         // rename requests and amplify NATS broadcasts to every participant.
         let display_name_rate_limit_disabled = env::var("DISPLAY_NAME_RATE_LIMIT_DISABLED")
@@ -480,7 +453,6 @@ impl Config {
             nats_url,
             service_version_urls,
             search,
-            allow_anonymous,
             display_name_rate_limit_disabled,
             dev_user,
             oauth_allow_unverified,
@@ -611,7 +583,6 @@ mod tests {
             nats_url: None,
             service_version_urls: Vec::new(),
             search: None,
-            allow_anonymous: false,
             display_name_rate_limit_disabled: false,
             dev_user: None,
             oauth_allow_unverified: false,

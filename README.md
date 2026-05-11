@@ -163,9 +163,11 @@ The quickest way to get started is with our Docker-based setup:
    cp docker/.env-sample .env
    ```
 
-   **No OAuth credentials are required for local development.** The default config disables OAuth and uses a dev auto-login that issues a session cookie automatically. To enable the auto-login, uncomment `DEV_USER` in your `.env`:
+   **No OAuth credentials are required for local development.** The default config disables OAuth, and `docker-compose.yaml` ships a default `DEV_USER=dev@local.test:Dev User` that triggers the dev auto-login flow — `make dev` works with zero `.env` editing.
+
+   To use a different identity (e.g. to simulate two users), override `DEV_USER` in your `.env`:
    ```
-   DEV_USER=dev@test.local:Dev User
+   DEV_USER=alice@test.local:Alice
    ```
 
    To enable OAuth (optional), see [Configuring OAuth](#configuring-oauth) below.
@@ -198,10 +200,12 @@ The quickest way to get started is with our Docker-based setup:
 
 For local development, you can skip OAuth entirely. When OAuth is disabled (the default in `docker-compose.yaml`) and `DEV_USER` is set, the meeting-api exposes a `GET /api/v1/dev/auto-login` endpoint that issues a signed session cookie and redirects to `/`. The dioxus-ui frontend automatically calls this endpoint when no session cookie exists, making local development completely frictionless.
 
-**Setup:**
+**Setup:** none — `docker-compose.yaml` and `start_dev.sh` ship a default `DEV_USER=dev@local.test:Dev User` so the auto-login is active out of the box.
+
+To override (e.g. to simulate a second user in a separate browser profile):
 ```
 # In your .env file:
-DEV_USER=dev@test.local:Dev User
+DEV_USER=alice@test.local:Alice
 ```
 
 Format is `email:display_name`. The email becomes the user ID for meetings and the display name appears in the participant list.

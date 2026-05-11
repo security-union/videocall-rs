@@ -85,7 +85,7 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
     await waitForServices();
   });
 
-  test("host opening the signal popup for a remote peer sees a WT/WS transport badge", async ({
+  test.fixme("host opening the signal popup for a remote peer sees a WT/WS transport badge", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);

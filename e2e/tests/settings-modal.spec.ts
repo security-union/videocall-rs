@@ -397,18 +397,227 @@ test.describe("Device settings modal", () => {
     // The + button renders an inline SVG icon (not a text glyph)
     await expect(addBtn.locator("svg")).toBeVisible();
 
-    // Popover is not yet visible
+    // Modal and backdrop are not yet visible
     await expect(page.locator(".custom-color-popover")).toHaveCount(0);
+    await expect(page.locator(".custom-color-modal-overlay")).toHaveCount(0);
 
-    // Click + opens the popover with input and Add button
+    // Click + opens the modal with input, color picker, Cancel, and Add button
     await addBtn.click();
+
+    // Backdrop overlay is rendered behind the modal
+    await expect(page.locator(".custom-color-modal-overlay")).toBeVisible();
 
     const popover = page.locator(".custom-color-popover");
     await expect(popover).toBeVisible();
+
+    // Modal accessibility attributes
+    await expect(popover).toHaveAttribute("role", "dialog");
+    await expect(popover).toHaveAttribute("aria-modal", "true");
+    await expect(popover).toHaveAttribute("aria-labelledby", "custom-color-modal-title");
+    const title = popover.locator("#custom-color-modal-title");
+    await expect(title).toBeVisible();
+    await expect(title).toHaveText("Choose Custom Color");
+
+    // Custom HSV picker: saturation/value square with proper ARIA
+    const svSquare = popover.locator(".color-picker-sv");
+    await expect(svSquare).toBeVisible();
+    await expect(svSquare).toHaveAttribute("role", "application");
+    await expect(svSquare).toHaveAttribute("tabindex", "0");
+    await expect(svSquare.locator(".color-picker-sv-marker")).toBeVisible();
+
+    // Hue slider with proper ARIA
+    const hueTrack = popover.locator(".color-picker-hue-track");
+    await expect(hueTrack).toBeVisible();
+    await expect(hueTrack).toHaveAttribute("role", "slider");
+    await expect(hueTrack).toHaveAttribute("aria-label", "Hue");
+    await expect(hueTrack).toHaveAttribute("aria-valuemin", "0");
+    await expect(hueTrack).toHaveAttribute("aria-valuemax", "360");
+    await expect(hueTrack).toHaveAttribute("tabindex", "0");
+    await expect(hueTrack.locator(".color-picker-hue-thumb")).toBeVisible();
+
+    // Preview swatch is rendered alongside the picker
+    await expect(popover.locator(".color-picker-preview")).toBeVisible();
+
+    // Hex text input
     await expect(popover.locator(".custom-color-input")).toBeVisible();
     await expect(popover.locator(".custom-color-input")).toHaveAttribute("placeholder", "#RRGGBB");
+
+    // Cancel and Add buttons
+    await expect(popover.locator(".custom-color-cancel-btn")).toBeVisible();
+    await expect(popover.locator(".custom-color-cancel-btn")).toHaveText("Cancel");
     await expect(popover.locator(".custom-color-add-btn")).toBeVisible();
     await expect(popover.locator(".custom-color-add-btn")).toHaveText("Add");
+  });
+
+  test("typing a valid hex in the text input updates the hue slider value", async ({ page }) => {
+    const meetingId = `e2e_custom_color_picker_sync_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("picker-sync-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    const colorInput = popover.locator(".custom-color-input");
+    const hueTrack = popover.locator(".color-picker-hue-track");
+
+    // #12ABEF -> hue ~198 degrees
+    await colorInput.fill("#12ABEF");
+    await expect
+      .poll(
+        async () => {
+          const v = await hueTrack.getAttribute("aria-valuenow");
+          return v === null ? NaN : Number(v);
+        },
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThanOrEqual(196);
+    expect(Number(await hueTrack.getAttribute("aria-valuenow"))).toBeLessThanOrEqual(200);
+
+    // #ff5500 -> hue ~20 degrees
+    await colorInput.fill("#ff5500");
+    await expect
+      .poll(
+        async () => {
+          const v = await hueTrack.getAttribute("aria-valuenow");
+          return v === null ? NaN : Number(v);
+        },
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThanOrEqual(18);
+    expect(Number(await hueTrack.getAttribute("aria-valuenow"))).toBeLessThanOrEqual(22);
+  });
+
+  test("hue slider supports keyboard navigation (ArrowDown increases hue)", async ({ page }) => {
+    const meetingId = `e2e_custom_color_hue_kbd_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("hue-kbd-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    // Seed a known hue via the hex input so the test is deterministic.
+    await popover.locator(".custom-color-input").fill("#ff5500");
+
+    const hueTrack = popover.locator(".color-picker-hue-track");
+    await expect(hueTrack).toHaveAttribute("aria-orientation", "vertical");
+    await expect
+      .poll(async () => Number(await hueTrack.getAttribute("aria-valuenow")), { timeout: 5_000 })
+      .toBeGreaterThanOrEqual(18);
+
+    const before = Number(await hueTrack.getAttribute("aria-valuenow"));
+
+    await hueTrack.focus();
+    await hueTrack.press("ArrowDown");
+
+    await expect
+      .poll(async () => Number(await hueTrack.getAttribute("aria-valuenow")), { timeout: 5_000 })
+      .toBeGreaterThan(before);
+
+    const after = Number(await hueTrack.getAttribute("aria-valuenow"));
+    // ArrowDown should bump hue by ~1 degree on the vertical hue slider.
+    expect(after - before).toBeGreaterThanOrEqual(1);
+    expect(after - before).toBeLessThanOrEqual(3);
+  });
+
+  test("Cancel button closes the modal without adding a swatch", async ({ page }) => {
+    const meetingId = `e2e_custom_color_cancel_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("cancel-modal-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    const swatchCountBefore = await page.locator(".color-swatches .color-swatch").count();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    // Type a syntactically valid hex but cancel before adding
+    await popover.locator(".custom-color-input").fill("#ABCDEF");
+
+    await popover.locator(".custom-color-cancel-btn").click();
+
+    // Modal and backdrop are dismissed
+    await expect(popover).toHaveCount(0);
+    await expect(page.locator(".custom-color-modal-overlay")).toHaveCount(0);
+
+    // No swatch was added
+    const swatchCountAfter = await page.locator(".color-swatches .color-swatch").count();
+    expect(swatchCountAfter).toBe(swatchCountBefore);
+    await expect(page.locator('[aria-label*="Select custom glow #ABCDEF"]')).toHaveCount(0);
+
+    // Focus returns to the add button
+    const focusedElementId = await page.evaluate(() => document.activeElement?.id);
+    expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
   test.fixme("custom color popover closes when clicking outside and focus returns to add button", async ({
@@ -447,8 +656,9 @@ test.describe("Device settings modal", () => {
     const popover = page.locator(".custom-color-popover");
     await expect(popover).toBeVisible();
 
-    // Click outside the popover — the modal title is a safe target above the popover
-    await page.locator(".device-settings-modal h2").first().click();
+    // Click outside the dialog — clicking on the modal backdrop (away from the
+    // dialog content) should dismiss the popover.
+    await page.locator(".custom-color-modal-overlay").click({ position: { x: 5, y: 5 } });
 
     // Popover should be dismissed
     await expect(popover).toHaveCount(0);

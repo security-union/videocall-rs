@@ -45,11 +45,14 @@ env:
     value: "4"
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
-  # WT outbound mpsc capacity per session. Default in code is 1024 (up
-  # from 256 to absorb 17-peer fan-out bursts). Override here only for
-  # exceptionally large meetings.
-  # - name: WT_OUTBOUND_CHANNEL_CAPACITY
-  #   value: "2048"
+  # WT outbound mpsc capacity per session (code default: 1024). Set to
+  # 4096 to provide headroom for 8+ peer meetings and give priority-
+  # shedding logic (~512-slot threshold) 2+ seconds of audio-only
+  # runway before total buffer exhaustion.
+  - name: WT_OUTBOUND_CHANNEL_CAPACITY
+    value: "4096"
+  - name: WT_OUTBOUND_SHEDDING_THRESHOLD
+    value: "512"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET

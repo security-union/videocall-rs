@@ -44,6 +44,10 @@ rustlemania-webtransport:
       value: "4"
     - name: TOKIO_BLOCKING_THREADS
       value: "2"
+    - name: WT_OUTBOUND_CHANNEL_CAPACITY
+      value: "4096"
+    - name: WT_OUTBOUND_SHEDDING_THRESHOLD
+      value: "512"
     - name: JWT_SECRET
       valueFrom:
         secretKeyRef:

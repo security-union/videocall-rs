@@ -617,8 +617,9 @@ lazy_static! {
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
-    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`.
-    /// ~14 series total.
+    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`|
+    /// `priority_drop_video`|`priority_drop_audio`|`overflow_critical`.
+    /// ~20 series total.
     ///
     /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
     /// label — session IDs are unbounded and would explode storage. The existing
@@ -628,17 +629,41 @@ lazy_static! {
     ///
     /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
     /// matching helper in `ws_chat_session`):
-    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`.
+    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`,
+    ///   dropped on a real channel-full event (NOT the new priority policy —
+    ///   audio at >=95% goes to `priority_drop_audio` instead).
     ///   Added 2026-05-08 to attribute congestion-storm drops to audio.
-    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`.
-    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`.
+    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`,
+    ///   dropped on a real channel-full event.
+    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`,
+    ///   dropped on a real channel-full event.
     /// - `media`: legacy catch-all for MEDIA packets we could not refine —
     ///   encrypted/unparseable inner payloads, HEARTBEAT, KEYFRAME_REQUEST,
     ///   or any future MediaType not in the audio/video/screen set. Kept
     ///   so existing alerts pivoting on `kind="media"` still see a series.
     /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
+    ///   dropped on a real channel-full event (rare: control should never
+    ///   be preempted by the priority policy — see `overflow_critical`).
     /// - `rtt`: RTT echo path that drops on a full datagram queue
     /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    /// - `priority_drop_video`: MEDIA video or screen frame *preemptively*
+    ///   dropped at the enqueue site because the per-session outbound
+    ///   channel reached the video-drop fill ratio (~80% by default).
+    ///   See `actors::priority_drop` for the policy.
+    ///   Added 2026-05-11 (discussion #699): under saturation we drop
+    ///   video first because audio loss is far worse for UX.
+    /// - `priority_drop_audio`: MEDIA audio frame *preemptively* dropped
+    ///   because the per-session outbound channel reached the audio-drop
+    ///   fill ratio (~95% by default). Should be rare; surfacing this
+    ///   non-zero in production means audio is being lost despite the
+    ///   priority cushion. Treat as an alerting trigger.
+    ///   Added 2026-05-11 (discussion #699).
+    /// - `overflow_critical`: a Critical-class control packet
+    ///   (SESSION_ASSIGNED, CONGESTION, RSA_PUB_KEY, MEETING) was
+    ///   dropped on a real channel-full event. Should be exceptional;
+    ///   indicates the channel is so saturated that even the highest-
+    ///   priority lifecycle packets cannot be admitted. Page on this.
+    ///   Added 2026-05-11 (discussion #699).
     ///
     /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
     /// will only see the catch-all bucket after this change; audio/video/screen
@@ -705,11 +730,23 @@ mod tests {
     fn outbound_channel_drops_increments_per_kind() {
         // Cardinality contract: every documented `kind` must be an
         // independent series. The audio/video/screen labels were added
-        // 2026-05-08 to refine the legacy `media` bucket; this test
-        // also acts as the regression guard against accidental label
-        // typos drifting between the helpers and the dashboards.
+        // 2026-05-08 to refine the legacy `media` bucket; the
+        // priority_drop_video/priority_drop_audio/overflow_critical
+        // labels were added 2026-05-11 for the priority drop policy
+        // (discussion #699). This test also acts as the regression
+        // guard against accidental label typos drifting between the
+        // helpers and the dashboards.
         let kinds = [
-            "audio", "video", "screen", "media", "control", "rtt", "unknown",
+            "audio",
+            "video",
+            "screen",
+            "media",
+            "control",
+            "rtt",
+            "unknown",
+            "priority_drop_video",
+            "priority_drop_audio",
+            "overflow_critical",
         ];
         let before: Vec<f64> = kinds
             .iter()

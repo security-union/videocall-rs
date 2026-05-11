@@ -52,7 +52,7 @@ use sec_api::metrics::{
     CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
     CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
     CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DATAGRAM_DROPS_TOTAL, DECODER_ERRORS_TOTAL,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
     ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS,
     ENCODER_TARGET_BITRATE_KBPS, ENCODER_WORST_PEER_FPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
@@ -61,7 +61,7 @@ use sec_api::metrics::{
     PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
     SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
     SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS, WEBSOCKET_DROPS_TOTAL,
+    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -188,9 +188,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ADAPTIVE_VIDEO_TIER.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_AUDIO_TIER.remove_label_values(&reporter_labels);
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
-    let _ = DATAGRAM_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
-    let _ = WEBSOCKET_DROPS_TOTAL.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_FPS_RATIO.remove_label_values(&reporter_labels);
     let _ = ENCODER_WORST_PEER_FPS.remove_label_values(&reporter_labels);
@@ -604,15 +602,9 @@ fn process_health_packet_to_metrics_pb(
             DATAGRAM_DROPS
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
-            DATAGRAM_DROPS_TOTAL
-                .with_label_values(&reporter_labels)
-                .set(drops as f64);
         }
         if let Some(drops) = health_packet.websocket_drops_total {
             WEBSOCKET_DROPS
-                .with_label_values(&reporter_labels)
-                .set(drops as f64);
-            WEBSOCKET_DROPS_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(drops as f64);
         }

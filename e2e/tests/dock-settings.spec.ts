@@ -12,7 +12,13 @@ test.describe("Dock settings", () => {
   });
 
   async function joinMeeting(page: Page, testLabel: string): Promise<void> {
-    const meetingId = `dock-test-${testLabel}-${Date.now()}`;
+    // Meeting IDs only allow ASCII alphanumerics + underscores (see
+    // `is_valid_meeting_id` in videocall-types/src/validation.rs). The home
+    // form's onsubmit rejects hyphens and returns early without navigating,
+    // which is what previously caused all dock-settings tests to time out at
+    // toHaveURL: the URL stayed at "/". Replace hyphens with underscores.
+    const safeLabel = testLabel.replace(/-/g, "_");
+    const meetingId = `dock_test_${safeLabel}_${Date.now()}`;
 
     await page.goto("/");
     await page.waitForTimeout(1500);
@@ -28,11 +34,29 @@ test.describe("Dock settings", () => {
 
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
+    // Dioxus auto-joins when a display name is already set (the home form
+    // sets `display_name_ctx` before navigating), so the "Start Meeting"
+    // button may flash and disappear before we can click it. Race the
+    // button against `#grid-container` and skip the click if the auto-join
+    // has already landed us in the meeting. Mirrors the pattern PR #741
+    // applied across the other 14 specs.
     const joinButton = page.getByText(/Start Meeting|Join Meeting/);
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await joinButton.click();
-
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    const grid = page.locator("#grid-container");
+    const which = await Promise.race([
+      joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+      grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+    ]);
+    if (which === "join") {
+      // Only click if the button is still attached — auto-join may resolve
+      // between waitFor() resolving and the click landing.
+      if ((await joinButton.count()) > 0 && (await joinButton.first().isVisible())) {
+        await joinButton.click().catch(() => {
+          // Swallow click-after-detach: the auto-join effect has already
+          // transitioned past NotJoined and unmounted the button.
+        });
+      }
+    }
+    await expect(grid).toBeVisible({ timeout: 15_000 });
   }
 
   async function openDockMenu(page: Page): Promise<void> {

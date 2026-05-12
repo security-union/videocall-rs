@@ -120,6 +120,54 @@ services:
     depends_on:
       - nats
 
+  # WebTransport / QUIC media server. Required for the WT regression spec
+  # `wt-persistent-streams-freeze-regression.spec.ts` (issue #777). The
+  # wasm client at `dioxus-ui/src/context.rs::resolve_transport_config`
+  # forces connections to `https://127.0.0.1:4433` when sticky
+  # `vc_transport_preference=webtransport` is set in localStorage; without
+  # this service in the e2e stack, the connection has nowhere to land and
+  # the spec must be marked `test.fixme`. Mirrors the production
+  # `webtransport-api` block in `docker-compose.yaml`.
+  webtransport-api:
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/actix-api
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo run -r --bin webtransport_server"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - RUST_LOG=info
+      - NATS_URL=nats:4222
+      - REGION=us-east
+      - SERVER_ID=server-1
+      - SERVICE_TYPE=webtransport
+      - LISTEN_URL=0.0.0.0:4433
+      - HEALTH_LISTEN_URL=0.0.0.0:5321
+      - CERT_PATH=certs/localhost.pem
+      - KEY_PATH=certs/localhost.key
+      - FEATURE_MEETING_MANAGEMENT=true
+      - JWT_SECRET=dev-jwt-secret-change-me
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+    ports:
+      # UDP — WebTransport runs over HTTP/3 / QUIC. The Playwright Chrome
+      # launch flags include `--origin-to-force-quic-on=127.0.0.1:4433`
+      # (see e2e/playwright.config.ts) so the browser resolves the wasm
+      # client's `https://127.0.0.1:4433` target to this UDP listener.
+      - "4433:4433/udp"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-e2e-webtransport-api:/nix
+      - e2e-webtransport-api-registry:/root/.cargo/registry
+      - e2e-webtransport-api-git:/root/.cargo/git
+      - e2e-webtransport-api-target:/app/actix-api/target
+    depends_on:
+      - nats
+
   dioxus-ui:
     build:
       dockerfile: docker/Dockerfile.dioxus.dev
@@ -166,6 +214,10 @@ volumes:
   e2e-websocket-api-registry:
   e2e-websocket-api-git:
   e2e-websocket-api-target:
+  nix-store-e2e-webtransport-api:
+  e2e-webtransport-api-registry:
+  e2e-webtransport-api-git:
+  e2e-webtransport-api-target:
   nix-store-e2e-dioxus-ui:
   e2e-dioxus-ui-registry:
   e2e-dioxus-ui-git:

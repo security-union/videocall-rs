@@ -155,9 +155,8 @@ export async function endMeeting(
  */
 export async function deleteAllOwnedMeetings(email: string, name: string): Promise<void> {
   const cookie = authCookie(email, name);
+  const undeletable = new Set<string>();
 
-  // Fetch up to 100 owned meetings at a time. The list endpoint clamps
-  // limit to [1, 100] so larger values are silently capped.
   while (true) {
     const res = await fetch(`${API_URL}/api/v1/meetings?limit=100&offset=0`, {
       method: "GET",
@@ -170,7 +169,7 @@ export async function deleteAllOwnedMeetings(email: string, name: string): Promi
     const json = (await res.json()) as {
       result: { meetings: Array<{ meeting_id: string }> };
     };
-    const rows = json.result.meetings;
+    const rows = json.result.meetings.filter((r) => !undeletable.has(r.meeting_id));
     if (rows.length === 0) return;
 
     for (const row of rows) {
@@ -178,9 +177,11 @@ export async function deleteAllOwnedMeetings(email: string, name: string): Promi
         method: "DELETE",
         headers: { Cookie: cookie },
       });
-      // 404 = already gone; treat as success. Other failures are swallowed
-      // with a console warning so a single bad row doesn't abort the loop.
-      if (!del.ok && del.status !== 404) {
+      if (del.ok || del.status === 404) continue;
+      // 403 = not the owner; skip on future iterations to avoid infinite loop.
+      if (del.status === 403) {
+        undeletable.add(row.meeting_id);
+      } else {
         console.warn(
           `DELETE /api/v1/meetings/${row.meeting_id} returned ${del.status}; continuing`,
         );

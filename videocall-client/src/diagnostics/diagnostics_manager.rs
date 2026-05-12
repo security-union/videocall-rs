@@ -27,15 +27,20 @@ use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
 use videocall_types::Callback;
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use web_sys::window;
 
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
 
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
+
+use super::heartbeat::HeartbeatTimer;
+
+/// Heartbeat cadence used by both [`DiagnosticManager`] and
+/// [`SenderDiagnosticManager`]. 500ms drives the AQ feedback loop and
+/// per-peer health reporting; do not change without updating the AQ-side
+/// step-down thresholds that assume ~2 ticks/sec.
+const HEARTBEAT_PERIOD_MS: u32 = 500;
 
 // Basic structure for diagnostics events
 #[derive(Debug, Clone)]
@@ -192,37 +197,19 @@ impl FpsTracker {
     }
 }
 
-// Define a struct to hold the JavaScript timer resources
-struct JsTimer {
-    #[allow(dead_code)]
-    closure: Closure<dyn FnMut()>,
-    interval_id: i32,
-}
-
-impl Drop for JsTimer {
-    fn drop(&mut self) {
-        // This ensures the interval is cleared when the timer is dropped
-        if let Some(window) = window() {
-            log::info!("Cleaning up diagnostics heartbeat interval");
-            window.clear_interval_with_handle(self.interval_id);
-        }
-    }
-}
-
-impl std::fmt::Debug for JsTimer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsTimer")
-            .field("interval_id", &self.interval_id)
-            .finish()
-    }
-}
-
 // The DiagnosticManager manages the collection and reporting of diagnostic information
 pub struct DiagnosticManager {
     sender: Sender<DiagnosticEvent>,
     frames_decoded: Arc<AtomicU32>,
     report_interval_ms: u64,
-    timer: Option<Rc<JsTimer>>,
+    /// Drives the periodic `HeartbeatTick` event.
+    ///
+    /// Backed by a Worker (when available) so that background-tab throttling
+    /// on the main thread does not starve adaptive-quality feedback or
+    /// diagnostics reporting. Dropping the manager terminates the worker.
+    /// Wrapped in `Rc` to be cheap to clone and to keep the existing field
+    /// shape; the inner `HeartbeatTimer`'s `Drop` impl handles teardown.
+    timer: Option<Rc<HeartbeatTimer>>,
 }
 
 unsafe impl Sync for DiagnosticManager {}
@@ -278,34 +265,17 @@ impl DiagnosticManager {
         manager
     }
 
-    // Start a JavaScript interval timer that sends heartbeat events
+    // Start a worker-driven heartbeat timer that dispatches `HeartbeatTick`
+    // events on the main thread. The Worker is immune to background-tab
+    // throttling so the AQ feedback loop and diagnostics reporting keep
+    // running at the configured cadence even when the tab is hidden.
     fn setup_heartbeat(&mut self, sender: Sender<DiagnosticEvent>) {
-        let sender_clone = sender.clone();
-
-        // Create a closure that sends a heartbeat event through the channel
-        let callback = Closure::wrap(Box::new(move || {
-            if let Err(e) = sender_clone
-                .clone()
-                .try_send(DiagnosticEvent::HeartbeatTick)
-            {
-                log::info!("Failed to send heartbeat: {e:?}");
+        let timer = HeartbeatTimer::start(HEARTBEAT_PERIOD_MS, move || {
+            if let Err(e) = sender.clone().try_send(DiagnosticEvent::HeartbeatTick) {
+                log::debug!("Failed to enqueue heartbeat event: {e:?}");
             }
-        }) as Box<dyn FnMut()>);
-
-        // Set up the interval to run every 500ms
-        let interval_id = window()
-            .expect("Failed to get window")
-            .set_interval_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                500,
-            )
-            .expect("Failed to set interval");
-
-        // Create and store the timer in an Rc
-        self.timer = Some(Rc::new(JsTimer {
-            closure: callback,
-            interval_id,
-        }));
+        });
+        self.timer = Some(Rc::new(timer));
     }
 
     // Set the callback for UI updates
@@ -705,7 +675,9 @@ impl StreamStats {
 #[derive(Debug, Clone)]
 pub struct SenderDiagnosticManager {
     sender: Sender<SenderDiagnosticEvent>,
-    timer: Option<Rc<JsTimer>>,
+    /// See [`DiagnosticManager::timer`] for the rationale behind the
+    /// worker-backed heartbeat.
+    timer: Option<Rc<HeartbeatTimer>>,
     _report_interval_ms: u64,
 }
 
@@ -750,29 +722,15 @@ impl SenderDiagnosticManager {
     }
 
     fn setup_heartbeat(&mut self, sender: Sender<SenderDiagnosticEvent>) {
-        let sender_clone = sender.clone();
-
-        let callback = Closure::wrap(Box::new(move || {
-            if let Err(e) = sender_clone
+        let timer = HeartbeatTimer::start(HEARTBEAT_PERIOD_MS, move || {
+            if let Err(e) = sender
                 .clone()
                 .try_send(SenderDiagnosticEvent::HeartbeatTick)
             {
-                log::info!("Failed to send sender heartbeat: {e:?}");
+                log::debug!("Failed to enqueue sender heartbeat event: {e:?}");
             }
-        }) as Box<dyn FnMut()>);
-
-        let interval_id = window()
-            .expect("Failed to get window")
-            .set_interval_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                500,
-            )
-            .expect("Failed to set interval");
-
-        self.timer = Some(Rc::new(JsTimer {
-            closure: callback,
-            interval_id,
-        }));
+        });
+        self.timer = Some(Rc::new(timer));
     }
 
     pub fn set_stats_callback(&self, callback: Callback<String>) {

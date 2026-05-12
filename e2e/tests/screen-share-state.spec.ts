@@ -23,6 +23,8 @@ const BROWSER_ARGS = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
 ];
 
 /**
@@ -96,7 +98,7 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 }
 
 async function joinMeeting(page: Page) {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await joinButton.waitFor({ timeout: 20_000 });
   await page.waitForTimeout(1000);
   await joinButton.click();

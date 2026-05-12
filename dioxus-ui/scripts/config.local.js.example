@@ -23,7 +23,7 @@ if (window.__APP_CONFIG) {
     // --- Common dev overrides ---
 
     // Skip OAuth login locally for faster iteration. Requires the meeting-api
-    // to be started with ALLOW_ANONYMOUS=true.
+    // to be started with DEV_USER set (e.g. DEV_USER=dev@local:Dev User).
     // oauthEnabled: "false",
 
     // Point at a local SearchV2 / opensearch-middleware instance, or leave empty

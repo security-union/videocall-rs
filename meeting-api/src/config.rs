@@ -54,12 +54,6 @@ pub struct Config {
     /// (both `SEARCH_API_URL` and `SEARCH_API_TOKEN` must be set); search push
     /// becomes a no-op in that case. See [`crate::search`].
     pub search: Option<SearchConfig>,
-    /// Allow unauthenticated requests to resolve to a stable "anonymous" user
-    /// identity (path 3 in [`crate::auth::AuthUser`]).  Controlled by
-    /// `ALLOW_ANONYMOUS=true`.  Default `false` — production must set this
-    /// explicitly off (or leave unset); only flip it for local development
-    /// when running without an OAuth provider.
-    pub allow_anonymous: bool,
     /// Disable the per-user display-name rename rate limiter.  Controlled by
     /// `DISPLAY_NAME_RATE_LIMIT_DISABLED=true`.  Default `false` — production
     /// must keep the limiter active so that runaway clients can't churn
@@ -211,9 +205,6 @@ impl Config {
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"` or comma-separated for multiple origins)
     /// - `SEARCH_API_URL` + `SEARCH_API_TOKEN` (both required together to enable SearchV2 push;
     ///   either missing → push is silently disabled). See [`SearchConfig`].
-    /// - `ALLOW_ANONYMOUS` (default: `false`) — set to `"true"` / `"1"` for local development
-    ///   only. When enabled, unauthenticated requests resolve to a stable anonymous user
-    ///   identity instead of returning 401.
     /// - `DISPLAY_NAME_RATE_LIMIT_DISABLED` (default: `false`) — set to `"true"` / `"1"`
     ///   for the E2E test harness only. When enabled, the per-user display-name rename
     ///   rate limiter (5 renames per 60-second window) is bypassed entirely. Required
@@ -297,26 +288,8 @@ impl Config {
             }
         };
 
-        // Anonymous auth fallback — opt-in via ALLOW_ANONYMOUS.  Accept the
-        // common truthy forms ("true"/"1", case-insensitive) and default to
-        // false so production deployments never allow anonymous by accident.
-        let allow_anonymous = env::var("ALLOW_ANONYMOUS")
-            .map(|v| {
-                let v = v.trim().to_lowercase();
-                v == "true" || v == "1"
-            })
-            .unwrap_or(false);
-        if allow_anonymous {
-            tracing::warn!(
-                "ALLOW_ANONYMOUS=true — unauthenticated requests will resolve to \
-                 anonymous identities. This is intended for local development only; \
-                 do not enable in production."
-            );
-        }
-
         // Display-name rate-limit bypass — opt-in via
-        // DISPLAY_NAME_RATE_LIMIT_DISABLED.  Same truthy-form parsing as
-        // ALLOW_ANONYMOUS so the two flags compose cleanly in dev/CI envs.
+        // DISPLAY_NAME_RATE_LIMIT_DISABLED.
         // Production MUST leave this off so a misbehaving client cannot churn
         // rename requests and amplify NATS broadcasts to every participant.
         let display_name_rate_limit_disabled = env::var("DISPLAY_NAME_RATE_LIMIT_DISABLED")
@@ -460,6 +433,16 @@ impl Config {
             None
         };
 
+        if dev_user.is_some() {
+            tracing::warn!(
+                "DEV_USER auto-login is ENABLED — server is accepting unauthenticated \
+                 session minting via GET /api/v1/dev/auto-login. This is intended for \
+                 local development only. Production deployments MUST set OAUTH_CLIENT_ID \
+                 so this gate is automatically disabled. Visit /api/v1/dev/auto-login \
+                 to mint a session for the configured dev identity."
+            );
+        }
+
         if search.is_some() && dev_user.is_some() {
             tracing::warn!(
                 "DEV_USER auto-login is active and SearchV2 is enabled — search pushes will use the synthetic dev identity"
@@ -480,7 +463,6 @@ impl Config {
             nats_url,
             service_version_urls,
             search,
-            allow_anonymous,
             display_name_rate_limit_disabled,
             dev_user,
             oauth_allow_unverified,
@@ -578,6 +560,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
+    use tracing_test::traced_test;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -611,7 +594,6 @@ mod tests {
             nats_url: None,
             service_version_urls: Vec::new(),
             search: None,
-            allow_anonymous: false,
             display_name_rate_limit_disabled: false,
             dev_user: None,
             oauth_allow_unverified: false,
@@ -756,6 +738,95 @@ mod tests {
         }
     }
 
+    /// When `dev_user` is `Some` at startup, a `WARN`-level log must fire naming
+    /// the endpoint and identifying it as dev-only.
+    #[test]
+    #[serial]
+    #[traced_test]
+    fn dev_user_active_emits_startup_warning() {
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_dev_user = std::env::var("DEV_USER").ok();
+        let prior_oauth = std::env::var("OAUTH_CLIENT_ID").ok();
+        let prior_search = std::env::var("SEARCH_API_URL").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::set_var("DEV_USER", "dev@test.local:Dev User");
+        std::env::remove_var("OAUTH_CLIENT_ID");
+        std::env::remove_var("SEARCH_API_URL");
+
+        let cfg = Config::from_env().expect("from_env with DEV_USER set must succeed");
+        assert!(
+            cfg.dev_user.is_some(),
+            "dev_user must be Some when DEV_USER is set"
+        );
+        assert!(
+            logs_contain("DEV_USER auto-login is ENABLED"),
+            "startup warning must fire when dev_user is active"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_dev_user {
+            Some(v) => std::env::set_var("DEV_USER", v),
+            None => std::env::remove_var("DEV_USER"),
+        }
+        match prior_oauth {
+            Some(v) => std::env::set_var("OAUTH_CLIENT_ID", v),
+            None => std::env::remove_var("OAUTH_CLIENT_ID"),
+        }
+        match prior_search {
+            Some(v) => std::env::set_var("SEARCH_API_URL", v),
+            None => std::env::remove_var("SEARCH_API_URL"),
+        }
+    }
+
+    /// When `dev_user` is `None` at startup, no startup warning must fire.
+    #[test]
+    #[serial]
+    #[traced_test]
+    fn dev_user_none_emits_no_startup_warning() {
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_dev_user = std::env::var("DEV_USER").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+        std::env::remove_var("DEV_USER");
+
+        let cfg = Config::from_env().expect("from_env without DEV_USER must succeed");
+        assert!(
+            cfg.dev_user.is_none(),
+            "dev_user must be None when DEV_USER is unset"
+        );
+        assert!(
+            !logs_contain("DEV_USER auto-login is ENABLED"),
+            "startup warning must NOT fire when dev_user is None"
+        );
+
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
+        }
+        match prior_dev_user {
+            Some(v) => std::env::set_var("DEV_USER", v),
+            None => std::env::remove_var("DEV_USER"),
+        }
+    }
+
     #[test]
     #[serial]
     fn dev_user_and_search_can_be_enabled_together() {
@@ -803,6 +874,60 @@ mod tests {
         match prior_oauth_issuer {
             Some(v) => std::env::set_var("OAUTH_ISSUER", v),
             None => std::env::remove_var("OAUTH_ISSUER"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn oauth_allow_unverified_rejects_non_canonical_true_values() {
+        // Negative-case test: only "true" and "1" should enable the bypass.
+        // Values like "yes", "on", "YES", empty string, etc. must NOT enable it.
+        let _guard = env_lock().lock().unwrap();
+        let prior_db = std::env::var("DATABASE_URL").ok();
+        let prior_jwt = std::env::var("JWT_SECRET").ok();
+        let prior_val = std::env::var("OAUTH_ALLOW_UNVERIFIED").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://test/test");
+        std::env::set_var("JWT_SECRET", "test-secret");
+
+        for invalid_value in &["yes", "on", "YES", "ON", "Yes", "", "enabled"] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", invalid_value);
+            let cfg = Config::from_env().unwrap_or_else(|e| {
+                panic!(
+                    "from_env should not fail for OAUTH_ALLOW_UNVERIFIED={:?}: {e}",
+                    invalid_value
+                )
+            });
+            assert!(
+                !cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to false (only \"true\" and \"1\" are accepted)",
+                invalid_value
+            );
+        }
+
+        // Sanity: confirm canonical values DO enable it.
+        // The parser does trim().to_lowercase(), so these all resolve to "true" or "1".
+        for valid_value in &["true", "1", "TRUE", " true ", " 1 "] {
+            std::env::set_var("OAUTH_ALLOW_UNVERIFIED", valid_value);
+            let cfg = Config::from_env().unwrap();
+            assert!(
+                cfg.oauth_allow_unverified,
+                "OAUTH_ALLOW_UNVERIFIED={:?} must parse to true",
+                valid_value
+            );
+        }
+
+        match prior_val {
+            Some(v) => std::env::set_var("OAUTH_ALLOW_UNVERIFIED", v),
+            None => std::env::remove_var("OAUTH_ALLOW_UNVERIFIED"),
+        }
+        match prior_db {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match prior_jwt {
+            Some(v) => std::env::set_var("JWT_SECRET", v),
+            None => std::env::remove_var("JWT_SECRET"),
         }
     }
 }

@@ -30,8 +30,6 @@ mod test_helpers;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use meeting_api::{routes, state::AppState};
 use serial_test::serial;
 use sqlx::PgPool;
 use test_helpers::*;
@@ -49,36 +47,6 @@ use videocall_meeting_types::{
 const MS_LOWER_BOUND: i64 = 1_000_000_000_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Build an Axum router with `allow_anonymous = false` so missing credentials
-/// resolve to 401 instead of falling through to the synthetic anonymous user.
-/// Required for the unauthenticated scenario; the default [`build_app`] helper
-/// has anonymous auth enabled to make other suites simpler.
-fn build_app_no_anonymous(pool: PgPool) -> Router {
-    let state = AppState {
-        db: pool,
-        jwt_secret: TEST_JWT_SECRET.to_string(),
-        token_ttl_secs: 600,
-        session_ttl_secs: 3600,
-        oauth: None,
-        jwks_cache: None,
-        cookie_domain: None,
-        cookie_name: "session".to_string(),
-        cookie_secure: false,
-        nats: None,
-        service_version_urls: Vec::new(),
-        http_client: reqwest::Client::new(),
-        display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
-        display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        search: None,
-        allow_anonymous: false,
-        display_name_rate_limit_disabled: false,
-        dev_user: None,
-    };
-    routes::router().with_state(state)
-}
 
 /// Create a meeting owned by `host_email` with the waiting room disabled
 /// (so non-host joiners are auto-admitted, matching what tests typically want).
@@ -401,9 +369,7 @@ async fn test_list_joined_respects_limit_returning_most_recent() {
 #[serial]
 async fn test_list_joined_unauthenticated_returns_401() {
     let pool = get_test_pool().await;
-    // Use a router with anonymous auth disabled — the default test app allows
-    // anonymous fallback, which would otherwise satisfy the request.
-    let app = build_app_no_anonymous(pool.clone());
+    let app = build_app(pool.clone());
 
     let req = Request::builder()
         .method("GET")

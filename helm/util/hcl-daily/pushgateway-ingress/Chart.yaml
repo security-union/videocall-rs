@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pushgateway-ingress
+description: Ingress for Prometheus Pushgateway (exposes to CI runner)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -18,6 +18,7 @@
 
 pub mod chat_server;
 pub mod packet_handler;
+pub mod priority_drop;
 pub mod session_logic;
 pub mod transports;
 

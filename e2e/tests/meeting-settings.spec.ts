@@ -37,7 +37,7 @@ test.describe("Meeting settings – Options toggles", () => {
     await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
       timeout: 10_000,
     });
-    await expect(page.getByText(/Start Meeting|Join Meeting/)).toBeVisible({
+    await expect(page.getByRole("button", { name: /Start Meeting|Join Meeting/ })).toBeVisible({
       timeout: 20_000,
     });
 
@@ -230,6 +230,8 @@ const BROWSER_ARGS = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
 ];
 
 async function createAuthenticatedContext(
@@ -302,7 +304,7 @@ async function hostJoinAndConfigureEohl(
   await hostPage.waitForTimeout(1500);
 
   // Click Join/Start Meeting
-  const joinButton = hostPage.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await joinButton.click();
   await hostPage.waitForTimeout(3000);
@@ -326,7 +328,7 @@ async function guestJoinMeeting(guestPage: Page, hostPage: Page, meetingId: stri
   await expect(guestPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
   await guestPage.waitForTimeout(1500);
 
-  const joinButton = guestPage.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = guestPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = guestPage.getByText("Waiting to be admitted");
 
   const result = await Promise.race([
@@ -342,7 +344,7 @@ async function guestJoinMeeting(guestPage: Page, hostPage: Page, meetingId: stri
     await admitButton.dispatchEvent("click");
     await hostPage.waitForTimeout(3000);
 
-    const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+    const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
     const guestGrid = guestPage.locator("#grid-container");
     const postAdmit = await Promise.race([
       guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
@@ -481,13 +483,17 @@ async function navigateToMeetingFromHome(
   await page.locator("#username").pressSequentially(username, { delay: 50 });
   await page.locator("#username").press("Enter");
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-  await expect(page.getByText(/Start Meeting|Join Meeting|Waiting to be admitted/)).toBeVisible({
+  await expect(
+    page
+      .getByRole("button", { name: /Start Meeting|Join Meeting/ })
+      .or(page.getByText("Waiting to be admitted")),
+  ).toBeVisible({
     timeout: 20_000,
   });
 }
 
 async function joinMeetingWhenReady(page: Page): Promise<"in-meeting" | "waiting"> {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = page.getByText("Waiting to be admitted");
 
   const result = await Promise.race([
@@ -587,7 +593,9 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
         await expect(hostAdmitParticipant).toBeVisible({ timeout: 20_000 });
         await hostAdmitParticipant.dispatchEvent("click");
 
-        const participantJoinButton = participantPage.getByText(/Start Meeting|Join Meeting/);
+        const participantJoinButton = participantPage.getByRole("button", {
+          name: /Start Meeting|Join Meeting/,
+        });
         const participantGrid = participantPage.locator("#grid-container");
         const participantTransition = await Promise.race([
           participantJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
@@ -630,7 +638,9 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
       // Server remains source of truth: participant can now admit the waiting user.
       await participantAdmitButton.dispatchEvent("click");
 
-      const waitingGuestJoinButton = waitingGuestPage.getByText(/Start Meeting|Join Meeting/);
+      const waitingGuestJoinButton = waitingGuestPage.getByRole("button", {
+        name: /Start Meeting|Join Meeting/,
+      });
       const waitingGuestGrid = waitingGuestPage.locator("#grid-container");
       const waitingGuestTransition = await Promise.race([
         waitingGuestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),

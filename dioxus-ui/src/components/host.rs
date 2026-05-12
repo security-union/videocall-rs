@@ -71,6 +71,8 @@ pub fn Host(
     on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
+    #[props(default)] device_settings_initial_section: Option<String>,
+    #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
 ) -> Element {
@@ -629,6 +631,7 @@ pub fn Host(
             let on_spk = on_speaker_change.clone();
             rsx! {
                 DeviceSettingsModal {
+                    key: "{device_settings_generation}",
                     microphones: microphones,
                     cameras: cameras,
                     speakers: speakers,
@@ -641,6 +644,7 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
+                    initial_section: device_settings_initial_section.clone(),
                 }
             }
         }

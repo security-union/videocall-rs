@@ -45,7 +45,7 @@ async function openAppearanceTab(
     timeout: 10_000,
   });
 
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await joinButton.click();
 

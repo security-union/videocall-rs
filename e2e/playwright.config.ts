@@ -6,12 +6,17 @@ const CHROME_ARGS = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
 ];
+
+process.env.DISPLAY_NAME_RATE_LIMIT_DISABLED ??= "true";
 
 export default defineConfig({
   globalSetup: "./global-setup.ts",
   testDir: "./tests",
   fullyParallel: false,
+  workers: 2,
   retries: 0,
   timeout: 60_000,
   expect: { timeout: 10_000 },

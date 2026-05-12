@@ -25,6 +25,7 @@ use crate::audio_constants::{
 };
 use crate::audio_worklet_codec::EncoderInitOptions;
 use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
+use crate::connection::MediaStreamKey;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
@@ -313,7 +314,10 @@ impl MicrophoneEncoder {
                         aes.clone(),
                         red_ref,
                     );
-                    client_for_send.send_media_packet(packet);
+                    // Phase 2 of WT freeze fix: route audio on its dedicated
+                    // persistent QUIC stream so it can never be HOL-blocked by
+                    // a stalled video write.
+                    client_for_send.send_media_packet(packet, MediaStreamKey::Audio);
 
                     // Store current frame as the previous frame for the next
                     // iteration's redundancy payload.

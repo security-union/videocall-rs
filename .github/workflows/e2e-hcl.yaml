@@ -1,0 +1,395 @@
+name: E2E Tests (HCL)
+
+on:
+  push:
+    branches: [hcl-main, PR-staging]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test'
+        required: true
+        default: 'PR-staging'
+      grep:
+        description: 'Playwright --grep filter (optional, e.g. @smoke)'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  check-permissions:
+    name: Check permissions
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/run-e2e'
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
+      pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
+    steps:
+      - name: Get PR details
+        id: get-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('pr_sha', pr.data.head.sha);
+            core.setOutput('pr_ref', pr.data.head.ref);
+
+      - name: Check if user has write access
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = context.payload.comment.user.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: user
+            });
+            const permission = data.permission;
+            console.log(`User ${user} has permission: ${permission}`);
+            if (['admin', 'write'].includes(permission)) {
+              console.log('✅ User is authorized');
+              core.setOutput('authorized', 'true');
+            } else {
+              console.log('❌ User is not authorized');
+              core.setOutput('authorized', 'false');
+            }
+
+      - name: React to comment
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Deny unauthorized user
+        if: steps.check.outputs.authorized != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '-1'
+            });
+            core.setFailed('User does not have write access');
+
+  e2e:
+    name: Playwright E2E
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 60
+    concurrency:
+      group: hcl-ci-heavy-workload
+      cancel-in-progress: false
+    needs: [check-permissions]
+    if: |
+      always() && (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        (needs.check-permissions.result == 'success' &&
+         needs.check-permissions.outputs.authorized == 'true')
+      )
+
+    outputs:
+      tests_passed: ${{ steps.results.outputs.passed }}
+      tests_failed: ${{ steps.results.outputs.failed }}
+      tests_skipped: ${{ steps.results.outputs.skipped }}
+      duration: ${{ steps.results.outputs.duration }}
+      status: ${{ steps.results.outputs.status }}
+      branch: ${{ steps.setup.outputs.branch }}
+
+    steps:
+      - name: Determine ref
+        id: setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ inputs.branch }}"
+            REF="${BRANCH}"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            BRANCH="${{ needs.check-permissions.outputs.pr_ref }}"
+            REF="${{ needs.check-permissions.outputs.pr_sha }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+            REF="${{ github.sha }}"
+          fi
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "ref=${REF}" >> $GITHUB_OUTPUT
+          echo "Testing branch: ${BRANCH} (ref: ${REF})"
+
+      - name: Clean workspace (root-owned files from Docker)
+        run: |
+          sudo find . -mindepth 1 -delete 2>/dev/null || true
+          sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.setup.outputs.ref }}
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies and Playwright browser
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install chromium
+
+      - name: Build E2E stack images
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
+
+      - name: Start E2E stack
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          wait_for_service() {
+            local name="$1" url="$2" timeout="$3"
+            echo "Waiting for ${name}..."
+            for i in $(seq 1 "${timeout}"); do
+              if curl -sf "${url}" > /dev/null 2>&1 || \
+                 curl -so /dev/null -w '%{http_code}' "${url}" 2>/dev/null | grep -qE '2[0-9][0-9]|4[0-9][0-9]'; then
+                echo "${name} ready after ${i}s"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "ERROR: ${name} failed to become ready within ${timeout}s"
+            return 1
+          }
+
+          wait_for_service "dioxus-ui" "http://localhost:3001" 120
+          wait_for_service "meeting-api" "http://localhost:8081/session" 60
+          wait_for_service "websocket-api" "http://localhost:8080" 60
+
+      - name: Start resource monitor
+        run: |
+          vmstat 5 > /tmp/e2e-vmstat.log &
+          echo $! > /tmp/vmstat-pid
+          echo "Resource monitoring started (vmstat every 5s)"
+
+      - name: Run Playwright tests
+        id: playwright
+        working-directory: e2e
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
+          E2E_GREP: ${{ inputs.grep }}
+        run: |
+          ARGS=(--reporter=list,json)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${E2E_GREP}" ]; then
+            ARGS+=(--grep "${E2E_GREP}")
+          fi
+
+          START_TIME=$(date +%s)
+          set +e
+          npx playwright test "${ARGS[@]}"
+          EXIT_CODE=$?
+          set -e
+          END_TIME=$(date +%s)
+
+          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+          echo "start_time=${START_TIME}" >> $GITHUB_OUTPUT
+          echo "end_time=${END_TIME}" >> $GITHUB_OUTPUT
+
+      - name: Stop resource monitor and report
+        if: always()
+        run: |
+          kill "$(cat /tmp/vmstat-pid)" 2>/dev/null || true
+          echo "=== Resource usage during E2E tests ==="
+          echo "Columns: r=runnable procs, b=blocked, us=user%, sy=system%, id=idle%, wa=iowait%"
+          cat /tmp/e2e-vmstat.log
+          echo ""
+          echo "=== Peak usage summary ==="
+          awk 'NR>2 {if($13<min_idle || min_idle==""){min_idle=$13; peak_line=NR": "$0}} END{print "Lowest idle%: "min_idle"% (line "peak_line")"}' /tmp/e2e-vmstat.log || true
+          echo "=== Docker container resource snapshot ==="
+          docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null || true
+
+      - name: Parse test results
+        id: results
+        working-directory: e2e
+        run: |
+          DURATION=$(( ${{ steps.playwright.outputs.end_time }} - ${{ steps.playwright.outputs.start_time }} ))
+
+          if [ -f playwright-results.json ] && jq -e '.stats' playwright-results.json >/dev/null 2>&1; then
+            PASSED=$(jq '(.stats.expected // 0) + (.stats.flaky // 0)' playwright-results.json)
+            FAILED=$(jq '.stats.unexpected // 0' playwright-results.json)
+            SKIPPED=$(jq '.stats.skipped // 0' playwright-results.json)
+          else
+            PASSED=0
+            FAILED=0
+            SKIPPED=0
+            if [ "${{ steps.playwright.outputs.exit_code }}" = "0" ]; then
+              PASSED=1
+            else
+              FAILED=1
+            fi
+          fi
+
+          STATUS=0
+          if [ "${{ steps.playwright.outputs.exit_code }}" = "0" ]; then
+            STATUS=1
+          fi
+
+          echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "failed=${FAILED}" >> $GITHUB_OUTPUT
+          echo "skipped=${SKIPPED}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}" >> $GITHUB_OUTPUT
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+          echo "Results: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped (${DURATION}s)"
+
+      - name: Push metrics to Pushgateway
+        if: always() && steps.results.outputs.status != ''
+        run: |
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          STATUS="${{ steps.results.outputs.status }}"
+          TIMESTAMP=$(date +%s)
+
+          PUSHGATEWAY_URL="https://pushgateway.videocall.fnxlabs.com"
+          # Sanitize branch for pushgateway URL path (slashes break label parsing)
+          SAFE_BRANCH="${BRANCH//\//_}"
+
+          METRICS_PAYLOAD="# HELP e2e_tests_passed Number of passing E2E tests
+          # TYPE e2e_tests_passed gauge
+          e2e_tests_passed ${PASSED}
+          # HELP e2e_tests_failed Number of failing E2E tests
+          # TYPE e2e_tests_failed gauge
+          e2e_tests_failed ${FAILED}
+          # HELP e2e_tests_skipped Number of skipped E2E tests
+          # TYPE e2e_tests_skipped gauge
+          e2e_tests_skipped ${SKIPPED}
+          # HELP e2e_run_duration_seconds E2E suite wall-clock duration
+          # TYPE e2e_run_duration_seconds gauge
+          e2e_run_duration_seconds ${DURATION}
+          # HELP e2e_run_status E2E run pass (1) or fail (0)
+          # TYPE e2e_run_status gauge
+          e2e_run_status ${STATUS}
+          # HELP e2e_run_timestamp Unix timestamp of the E2E run
+          # TYPE e2e_run_timestamp gauge
+          e2e_run_timestamp ${TIMESTAMP}"
+
+          echo "${METRICS_PAYLOAD}" | curl --fail-with-body --data-binary @- \
+            "${PUSHGATEWAY_URL}/metrics/job/e2e/branch/${SAFE_BRANCH}" || \
+          echo "Pushgateway push failed (non-fatal)"
+
+          echo "Metrics pushed for branch=${SAFE_BRANCH}"
+
+      - name: Post results to PR comment
+        if: always() && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          STATUS="${{ steps.results.outputs.status }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${STATUS}" = "1" ]; then
+            EMOJI="✅"
+            VERDICT="PASSED"
+          else
+            EMOJI="❌"
+            VERDICT="FAILED"
+          fi
+
+          BODY="${EMOJI} **E2E ${VERDICT}** on \`${BRANCH}\`
+
+          | Passed | Failed | Skipped | Duration |
+          |--------|--------|---------|----------|
+          | ${PASSED} | ${FAILED} | ${SKIPPED} | ${DURATION}s |
+
+          [Workflow run](${RUN_URL})"
+
+          curl -sf -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg body "${BODY}" '{body: $body}')" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments"
+
+      - name: Notify Google Chat on failure
+        if: always() && steps.results.outputs.status == '0' && github.event_name == 'push'
+        env:
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GCHAT_WEBHOOK_URL}" ]; then
+            echo "GCHAT_WEBHOOK_URL secret not set, skipping notification"
+            exit 0
+          fi
+
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          PR_INFO=""
+          PR_JSON=$(curl -sf \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" 2>/dev/null | \
+            jq -r '.[0] | "\(.number) \(.title)"' 2>/dev/null || true)
+          if [ -n "${PR_JSON}" ] && [ "${PR_JSON}" != "null null" ]; then
+            PR_NUM=$(echo "${PR_JSON}" | cut -d' ' -f1)
+            PR_TITLE=$(echo "${PR_JSON}" | cut -d' ' -f2-)
+            PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
+            PR_INFO="\n🔀 PR #${PR_NUM}: ${PR_TITLE}\n    ${PR_URL}"
+          fi
+
+          DASHBOARD_URL="https://grafana.videocall.fnxlabs.com/public-dashboards/2dd04ba37cf144f1862941620daa6349?orgId=1&from=now-24h&to=now"
+
+          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\` (\`${SHORT_SHA}\`)\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s${PR_INFO}\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
+
+          curl -X POST "${GCHAT_WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${MESSAGE}\"}" || echo "Google Chat notification failed (non-fatal)"
+
+      - name: Dump docker logs on failure
+        if: failure()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs
+
+      - name: Teardown (preserve volumes for cache)
+        if: always()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down
+
+      - name: Fail job if tests failed
+        if: steps.playwright.outputs.exit_code != '0'
+        run: exit 1

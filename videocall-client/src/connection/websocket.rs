@@ -21,7 +21,7 @@
 //
 use super::connection_lost_reason::ConnectionLostReason;
 use super::url_log::strip_query_for_log;
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 use log::debug;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -94,7 +94,9 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
         Ok(task)
     }
 
-    fn send_bytes(&self, bytes: Vec<u8>) {
+    /// WebSocket has a single TCP stream — there is no per-media-type
+    /// routing.  The `stream_key` argument is intentionally ignored.
+    fn send_bytes(&self, bytes: Vec<u8>, _stream_key: MediaStreamKey) {
         self.send_binary(bytes);
     }
 }

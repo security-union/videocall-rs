@@ -192,6 +192,22 @@ pub async fn start(
         *QUIC_KEEP_ALIVE_INTERVAL_SECS,
     )));
 
+    // Cap the number of concurrent peer-initiated unidirectional streams per
+    // session. The bridge spawns one reader task per accepted uni stream
+    // (see `bridge::read_framed_packets_loop`), and each reader can hold a
+    // payload buffer up to `MAX_FRAME_SIZE` (4 MB). Together these bound
+    // transient memory per malicious session to roughly
+    // `MAX_CONCURRENT_UNI_STREAMS * MAX_FRAME_SIZE` ≈ 400 MB worst case;
+    // QUIC connection-level flow control caps it much lower in practice.
+    //
+    // This is intentionally pinned to quinn's current default (100). The
+    // explicit setting protects the invariant against a future quinn
+    // upgrade that changes the default, or against an operator who raises
+    // the limit without re-evaluating the worst-case memory footprint.
+    // If you raise this value, also re-evaluate `MAX_FRAME_SIZE` and the
+    // reader-task spawn pattern in `bridge.rs`.
+    transport_config.max_concurrent_uni_streams(100u32.into());
+
     server_config.transport_config(std::sync::Arc::new(transport_config));
 
     // Create Quinn endpoint with our custom config

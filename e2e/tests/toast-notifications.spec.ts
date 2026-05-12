@@ -63,7 +63,7 @@ async function navigateToMeeting(page: Page, meetingId: string, username: string
 async function joinMeetingFromPage(
   page: Page,
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = page.getByText("Waiting to be admitted");
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
 
@@ -109,7 +109,7 @@ async function admitGuestIfNeeded(
     await admitButton.dispatchEvent("click");
     await hostPage.waitForTimeout(3000);
 
-    const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+    const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
     const guestGrid = guestPage.locator("#grid-container");
 
     const postAdmit = await Promise.race([
@@ -436,7 +436,7 @@ test.describe("Toast notifications for participant join/leave", () => {
       await admitButton.dispatchEvent("click");
 
       // Wait for guest to finish joining
-      const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+      const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const guestGrid = guestPage.locator("#grid-container");
       const postAdmit = await Promise.race([
         guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),

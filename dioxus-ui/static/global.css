@@ -557,6 +557,17 @@ html[data-theme="dark"] {
   --glass-select-menu-inset:           rgba(100, 140, 180, 0.06);
   --glass-select-menu-shadow:          rgba(0, 0, 0, 0.40);
   --glass-select-option-hover-bg:      rgba(255, 255, 255, 0.08);
+
+  /* Glass popover background — shared by dock menu, mock-peers, density popovers */
+  --glass-popover-bg:
+    radial-gradient(600px 400px at 50% -20%, rgba(70, 110, 160, 0.06), transparent 70%),
+    radial-gradient(350px 250px at 85% 90%, rgba(210, 60, 80, 0.06), transparent 65%),
+    linear-gradient(180deg, rgba(70, 100, 140, 0.06) 0%, rgba(50, 80, 120, 0.02) 100%),
+    linear-gradient(135deg, rgba(15, 20, 35, 0.92) 0%, rgba(12, 18, 35, 0.94) 50%, rgba(10, 15, 32, 0.96) 100%);
+  --glass-popover-border:  rgba(70, 100, 140, 0.15);
+  --glass-popover-shadow:
+    inset 0 1px 0 rgba(100, 140, 180, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.40);
 }
 
 html[data-theme="light"] {
@@ -1655,15 +1666,19 @@ html[data-theme="light"] #invite-overlay p {
 
 .dock-position-wrapper .glass-select-menu {
   position: absolute;
-  bottom: calc(100% + 8px);
+  bottom: calc(100% + 20px);
   top: auto;
   left: 50%;
   right: auto;
   transform: translateX(-50%);
-  min-width: 140px;
-  border: 1px solid rgba(70, 100, 140, 0.15);
+  min-width: 160px;
+  border: 1px solid var(--glass-popover-border);
   border-radius: 10px;
-  border-top: 1px solid rgba(70, 100, 140, 0.15);
+  border-top: 1px solid var(--glass-popover-border);
+  background: var(--glass-popover-bg);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 /* Side dock: menu opens to the side */

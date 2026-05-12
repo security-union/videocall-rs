@@ -16,10 +16,10 @@ export LISTEN_URL=${LISTEN_URL:-0.0.0.0:4433}
 export DATABASE_URL=${DATABASE_URL:-postgresql://$USER@localhost/actix-api-db}
 export JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
 export COOKIE_SECURE=${COOKIE_SECURE:-false}
-# Local dev fallback: let meeting-api resolve unauthenticated requests to a
-# stable anonymous identity so you can exercise the API without an OAuth
-# provider. Production must leave this unset (or "false").
-export ALLOW_ANONYMOUS=${ALLOW_ANONYMOUS:-false}
+# Local dev only: synthetic auto-login user. Production deployments set
+# OAUTH_CLIENT_ID, which gates /api/v1/dev/auto-login to 404 and ignores
+# DEV_USER entirely, so this default is safe.
+export DEV_USER=${DEV_USER:-dev@local.test:Dev User}
 
 server_command="$( ((WEBTRANSPORT_ENABLED)) && echo webtransport_server || echo websocket_server )"
 

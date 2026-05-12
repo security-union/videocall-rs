@@ -60,7 +60,7 @@ async function joinMeetingFromPage(
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
   // We could be on "Ready to join?", "Waiting to be admitted", or "Waiting for meeting"
   // Race between the possible states
-  const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = page.getByText("Waiting to be admitted");
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
 
@@ -168,7 +168,9 @@ test.describe("Two users in a meeting", () => {
 
         // After admission, guest may auto-join (grid appears directly) or
         // may see a "Join Meeting" button — handle both scenarios.
-        const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+        const guestJoinButton = guestPage.getByRole("button", {
+          name: /Join Meeting|Start Meeting/,
+        });
         const guestGrid = guestPage.locator("#grid-container");
 
         const postAdmit = await Promise.race([

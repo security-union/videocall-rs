@@ -340,11 +340,11 @@ test.describe("WebTransport persistent-streams + split-writer freeze regression"
     await waitForServices();
   });
 
-  // `test.fixme` because the current e2e docker-compose stack does not
-  // run a WebTransport server (no `webtransport-api` service, UDP 4433
-  // not bound). See "Infrastructure gap" in the file-level doc-comment
-  // above for the steps needed to flip this to a live test.
-  test.fixme("audio+video on WT survives a 60s 2-peer call without freeze signatures", async ({
+  // The e2e docker-compose stack now runs a `webtransport-api` service on
+  // UDP 4433 with WEBTRANSPORT_ENABLED=true on dioxus-ui (issue #777).
+  // The four steps documented in the "Infrastructure gap" section above
+  // are all in place; this test is live.
+  test("audio+video on WT survives a 60s 2-peer call without freeze signatures", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);

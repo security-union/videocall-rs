@@ -296,8 +296,7 @@ async fn test_admitted_session_receives_media_normally() {
 
     // Alice sends a MEDIA packet
     let media_bytes = make_media_packet("alice@test.com");
-    ws_a
-        .send(Message::Binary(media_bytes.into()))
+    ws_a.send(Message::Binary(media_bytes.into()))
         .await
         .expect("Alice should be able to send media");
 
@@ -417,10 +416,7 @@ async fn test_observer_cannot_publish_media() {
     let packets = collect_packets_for(&mut ws_admitted, Duration::from_secs(2)).await;
     let observer_media: Vec<_> = packets
         .iter()
-        .filter(|p| {
-            p.packet_type == PacketType::MEDIA.into()
-                && p.user_id == b"observer@test.com"
-        })
+        .filter(|p| p.packet_type == PacketType::MEDIA.into() && p.user_id == b"observer@test.com")
         .collect();
 
     assert!(

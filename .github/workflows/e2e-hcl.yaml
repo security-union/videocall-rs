@@ -104,6 +104,9 @@ jobs:
     name: Playwright E2E
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 60
+    concurrency:
+      group: hcl-ci-heavy-workload
+      cancel-in-progress: false
     needs: [check-permissions]
     if: |
       always() && (

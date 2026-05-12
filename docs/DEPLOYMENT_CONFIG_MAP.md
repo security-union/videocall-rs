@@ -76,6 +76,7 @@ Browser-side configuration injected at deploy time.
 | File | Role |
 |---|---|
 | `dioxus-ui/scripts/config.js` | Committed default; baseline shape, e.g. `window.VIDEOCALL_CONFIG = { ... }` |
+| `dioxus-ui/scripts/config.local.js.example` | Committed template — copy to `config.local.js` for local overrides |
 | `dioxus-ui/scripts/config.local.js` | Local override (gitignored); injects env-specific URLs |
 | `dioxus-ui/dist/config.js` | Trunk build artifact (output of `cp` step in `index.html` / Trunk config) |
 
@@ -99,6 +100,7 @@ Helm injects production URLs into one of these at deploy time per cluster.
 | Path | Status |
 |---|---|
 | `.github/workflows/` | Active CI workflows (PR checks, deploys) |
+| `.github/oss-workflows/` | Active OSS-mirror workflows (e.g. Dioxus UI Docker Hub upload) |
 | `.github/workflows-opensource/` | Archived (not in current use) |
 
 ---
@@ -126,8 +128,8 @@ Helm injects production URLs into one of these at deploy time per cluster.
 - **Helm overlays are sparse.** If a cluster overlay doesn't have a `values.yaml` for a particular chart, the default at `helm/<chart>/values.yaml` is used as-is. Don't assume every cluster has every chart.
 - **The `hcl` overlay had no `prometheus/` subchart** until PR #716 added one. If you're adding a new overlay for a new service, you may need to create the directory structure too.
 - **`config.local.js` is the deploy-time injection point** for the Dioxus frontend. Missing or malformed `config.local.js` produces a runtime `SyntaxError: Unexpected token '<'` in the browser console because the frontend falls back to fetching the index page as JS. This is what bit E2E in #730 / was fixed in #741.
-- **`WT_OUTBOUND_CHANNEL_CAPACITY`** has both a code default (`actix-api/src/constants.rs:75`, currently `4096`) and a helm env override. After PR #706 landed, the env override in helm is redundant but harmless; the code default is the source of truth.
-- **Alertmanager is currently disabled in all chart overlays** (`prometheus.alertmanager.enabled: false`). All alert rules evaluate and appear in Prometheus' `/alerts` UI but do NOT page anyone until Alertmanager is wired up. Tracked in issue #729.
+- **`WT_OUTBOUND_CHANNEL_CAPACITY`** (env var, read at startup) is resolved from `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` in `actix-api/src/constants.rs:85`, currently `4096`. After PR #706 landed, the env override in helm is redundant but harmless; the code default is the source of truth.
+- **Alertmanager is not wired up across overlays.** `helm/global/us-east/prometheus/values.yaml` sets `alertmanager.enabled: false` explicitly; the `hcl` and `hcl-daily-deployment` overlays don't configure the key (rely on chart default). Either way, no Alertmanager routes or receivers are configured, so alerts evaluate and appear in Prometheus' `/alerts` UI but do NOT page anyone. Tracked in issue #729.
 
 ---
 

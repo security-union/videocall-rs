@@ -54,6 +54,18 @@ pub struct PersistentSendStream {
     /// on this media type.  The writer enforces FIFO ordering of writes; we
     /// do not need to serialise writes ourselves once the writer is created.
     writer: WritableStreamDefaultWriter,
+    /// Per-entry identity token used to defeat a concurrent-eviction race
+    /// (issue #773).
+    ///
+    /// The send path captures a clone of this `Rc<()>` *while holding the
+    /// map lock*, alongside the writer it is about to use.  If the write
+    /// later fails, the error handler must remove this entry — but only if
+    /// the entry currently in the map is the *same* entry the failing
+    /// writer came from.  Without this token, two concurrent failing
+    /// senders for the same key plus a fresh sender opening a new entry in
+    /// between can result in the fresh entry being evicted by a stale
+    /// error handler.  Identity is compared via [`std::rc::Rc::ptr_eq`].
+    identity_token: Rc<()>,
 }
 
 /// Map of per-media-type persistent send streams, keyed by an opaque `u8`
@@ -71,6 +83,61 @@ pub type PersistentStreamMap = Rc<AsyncMutex<HashMap<u8, PersistentSendStream>>>
 /// and threaded through `send_on_persistent_stream`.
 pub fn new_persistent_stream_map() -> PersistentStreamMap {
     Rc::new(AsyncMutex::new(HashMap::new()))
+}
+
+/// Internal abstraction so [`remove_if_token_matches`] can be unit-tested in
+/// pure Rust without constructing a real `PersistentSendStream` (which
+/// requires JS `WritableStream`/`WritableStreamDefaultWriter` instances and
+/// therefore only works under `wasm32-unknown-unknown`).
+trait HasIdentityToken {
+    fn identity_token(&self) -> &Rc<()>;
+}
+
+impl HasIdentityToken for PersistentSendStream {
+    fn identity_token(&self) -> &Rc<()> {
+        &self.identity_token
+    }
+}
+
+/// Compare-and-remove for persistent-stream map entries (issue #773).
+///
+/// Removes the entry at `key` **only** if the entry currently in the map
+/// has the same identity token as `captured_token` (as compared via
+/// [`std::rc::Rc::ptr_eq`]).  Returns `true` if the entry was removed.
+///
+/// ## Why this is needed
+///
+/// The send path takes a brief lock on the map, clones the writer, and
+/// releases the lock before awaiting the write.  If the write fails, the
+/// error handler must re-acquire the lock and evict the broken entry.
+///
+/// Without identity tracking, the following race is possible:
+///
+/// 1. Senders A and B each acquire writers from entry `e1` for the same
+///    key.  Both writes are in flight.
+/// 2. The underlying stream dies.  Sender A's write returns an error.
+/// 3. Sender A re-acquires the lock and removes `e1`.
+/// 4. Sender C (a fresh send for the same key) acquires the lock, sees
+///    the key vacant, opens a new stream and inserts entry `e2`.
+/// 5. Sender B's write returns an error.  Sender B re-acquires the lock
+///    and — *without* an identity check — removes `e2`, orphaning the
+///    healthy new stream.
+///
+/// With per-entry identity tokens captured at writer-clone time, sender
+/// B sees that `e2.identity_token` is not the token it captured from
+/// `e1`, leaves `e2` alone, and the healthy stream survives.
+fn remove_if_token_matches<V: HasIdentityToken>(
+    map: &mut HashMap<u8, V>,
+    key: u8,
+    captured_token: &Rc<()>,
+) -> bool {
+    let matches = map
+        .get(&key)
+        .is_some_and(|entry| Rc::ptr_eq(entry.identity_token(), captured_token));
+    if matches {
+        map.remove(&key);
+    }
+    matches
 }
 
 /// Errors raised when attempting to parse a length-prefix-framed payload
@@ -592,6 +659,11 @@ impl WebTransportTask {
         }
 
         wasm_bindgen_futures::spawn_local(async move {
+            // Captured alongside the writer when we acquire it from the
+            // map; passed into the error handler so a stale failing send
+            // can only evict the entry it actually used.  See the eviction
+            // race notes in `remove_if_token_matches` (issue #773).
+            let mut captured_token: Option<Rc<()>> = None;
             let result: Result<(), anyhow::Error> = async {
                 // --- Wait for the transport handshake ------------------------
                 // ready() resolves once the underlying QUIC session is
@@ -626,14 +698,19 @@ impl WebTransportTask {
                         entry.insert(PersistentSendStream {
                             _stream: stream,
                             writer,
+                            identity_token: Rc::new(()),
                         });
                     }
                     // Clone the writer JsValue so we can release the map
                     // lock before the (potentially long) write await.
-                    map.get(&stream_key)
-                        .expect("entry was just inserted or already existed")
-                        .writer
-                        .clone()
+                    // Capture the entry's identity token alongside the
+                    // writer so the error handler can verify we are
+                    // evicting the same entry our writer came from.
+                    let entry = map
+                        .get(&stream_key)
+                        .expect("entry was just inserted or already existed");
+                    captured_token = Some(entry.identity_token.clone());
+                    entry.writer.clone()
                 };
 
                 // --- Build the framed payload --------------------------------
@@ -657,15 +734,32 @@ impl WebTransportTask {
             .await;
 
             if let Err(e) = result {
-                // Stream is broken — remove it from the map so the next send
-                // for this key opens a fresh stream.  We do this *after* the
-                // map lock has been dropped (the lock is scoped above) so we
-                // don't deadlock with ourselves.
+                // Stream is broken — remove it from the map so the next
+                // send for this key opens a fresh stream.  We compare
+                // identity tokens to defeat the concurrent-eviction race
+                // (issue #773): if a fresh sender has already opened a
+                // new entry while we were awaiting the failing write, we
+                // must not evict the fresh entry.
+                //
+                // The map lock is re-acquired here because the lock taken
+                // above to acquire the writer was scoped and has been
+                // released — we cannot hold it across the write await.
                 let mut map = streams.lock().await;
-                map.remove(&stream_key);
+                let removed = match captured_token {
+                    Some(token) => remove_if_token_matches(&mut map, stream_key, &token),
+                    None => {
+                        // We failed before acquiring a writer (e.g.
+                        // transport.ready() or create_unidirectional_stream
+                        // failed), so no entry was ever inserted on our
+                        // behalf — nothing to evict.
+                        false
+                    }
+                };
                 log!(
                     "persistent stream send failed (stream reset, frame dropped):",
-                    e.to_string()
+                    e.to_string(),
+                    "evicted:",
+                    removed
                 );
             }
         });

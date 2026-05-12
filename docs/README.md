@@ -37,6 +37,10 @@ If you are looking for a per-crate README (e.g. `videocall-client`, `dioxus-ui`,
 
 ## Operations and deployment
 
+- [Deployment Configuration Map](DEPLOYMENT_CONFIG_MAP.md) — where every kind of
+  deployment configuration lives (Helm, Docker Compose, frontend runtime
+  injection, build-time, CI) and which file to edit for which job. Start here
+  if you're not sure where a setting lives.
 - [VC2 Deployment Runbook](VC2_DEPLOYMENT_RUNBOOK.md) — building, pushing, and
   rolling out images to the VC2 cluster.
 - [Production Monitoring Stack](Monitoring_Production.md) — Prometheus, Grafana,

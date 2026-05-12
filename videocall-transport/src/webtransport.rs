@@ -73,6 +73,80 @@ pub fn new_persistent_stream_map() -> PersistentStreamMap {
     Rc::new(AsyncMutex::new(HashMap::new()))
 }
 
+/// Errors raised when attempting to parse a length-prefix-framed payload
+/// out of a stream buffer.  Used by `parse_persistent_stream_frame` and
+/// (indirectly) by the server-side reader at
+/// `actix-api/src/webtransport/bridge.rs`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// Less than 4 header bytes are available — caller should accumulate
+    /// more data and retry.
+    NeedMoreHeader,
+    /// Header is present but the indicated payload is not fully buffered
+    /// yet — caller should accumulate more data and retry.
+    NeedMorePayload {
+        /// Number of payload bytes still missing.
+        missing: usize,
+    },
+    /// Decoded length is zero or exceeds `PERSISTENT_STREAM_MAX_FRAME_SIZE`.
+    /// The stream is unrecoverable; caller should close it and drop any
+    /// buffered data.
+    InvalidLength(usize),
+}
+
+/// Encode `payload` as a `[u32 BE length][payload]` frame ready to be
+/// written to a persistent WebTransport unidirectional stream.
+///
+/// The returned `Vec<u8>` is a single chunk — when handed to JS as one
+/// `Uint8Array` and written via `writer.write_with_chunk`, the JS
+/// WritableStream spec guarantees that the header and body cannot be
+/// interleaved with another frame's bytes on the wire.
+///
+/// `payload.len()` is required to be at most `PERSISTENT_STREAM_MAX_FRAME_SIZE`;
+/// callers must enforce this themselves (the send path drops over-sized
+/// frames before reaching this helper).
+pub fn frame_persistent_stream_payload(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Attempt to extract a complete `[u32 BE length][payload]` frame from
+/// `buf`.  On success returns `Ok((payload, rest))` where `rest` is the
+/// remaining unconsumed bytes.  This is the symmetric reverse of
+/// `frame_persistent_stream_payload`.
+///
+/// `Err(FrameParseError::NeedMoreHeader)` and
+/// `Err(FrameParseError::NeedMorePayload)` indicate that the caller must
+/// accumulate more data and retry.  `Err(FrameParseError::InvalidLength)`
+/// indicates an unrecoverable framing violation; the stream must be
+/// closed.
+///
+/// The client itself does not currently call this — the client receives
+/// framed payloads via the existing `handle_unidirectional_stream` in
+/// `videocall-client/src/connection/webtransport.rs` which has its own
+/// inline framing parser.  This helper is exported so the server-side
+/// implementation and the unit tests can share the same protocol
+/// definition.
+pub fn parse_persistent_stream_frame(buf: &[u8]) -> Result<(&[u8], &[u8]), FrameParseError> {
+    if buf.len() < 4 {
+        return Err(FrameParseError::NeedMoreHeader);
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len == 0 || len > PERSISTENT_STREAM_MAX_FRAME_SIZE {
+        return Err(FrameParseError::InvalidLength(len));
+    }
+    let frame_end = 4 + len;
+    if buf.len() < frame_end {
+        return Err(FrameParseError::NeedMorePayload {
+            missing: frame_end - buf.len(),
+        });
+    }
+    Ok((&buf[4..frame_end], &buf[frame_end..]))
+}
+
 /// Represents formatting errors.
 #[derive(Debug, ThisError)]
 pub enum FormatError {
@@ -525,8 +599,9 @@ impl WebTransportTask {
                 // concurrent senders for the same key cannot both observe
                 // `None` and open duplicate streams.
                 let writer = {
+                    use std::collections::hash_map::Entry;
                     let mut map = streams.lock().await;
-                    if !map.contains_key(&stream_key) {
+                    if let Entry::Vacant(entry) = map.entry(stream_key) {
                         let stream: WritableStream =
                             JsFuture::from(transport.create_unidirectional_stream())
                                 .await
@@ -541,13 +616,10 @@ impl WebTransportTask {
                         let writer = stream
                             .get_writer()
                             .map_err(|e| anyhow!("error getting writer: {:?}", e))?;
-                        map.insert(
-                            stream_key,
-                            PersistentSendStream {
-                                _stream: stream,
-                                writer,
-                            },
-                        );
+                        entry.insert(PersistentSendStream {
+                            _stream: stream,
+                            writer,
+                        });
                     }
                     // Clone the writer JsValue so we can release the map
                     // lock before the (potentially long) write await.
@@ -560,10 +632,7 @@ impl WebTransportTask {
                 // --- Build the framed payload --------------------------------
                 // [u32 BE length][payload] in a single Uint8Array so the
                 // browser cannot split the header off from its body.
-                let len = data.len() as u32;
-                let mut framed = Vec::with_capacity(4 + data.len());
-                framed.extend_from_slice(&len.to_be_bytes());
-                framed.extend_from_slice(&data);
+                let framed = frame_persistent_stream_payload(&data);
                 let chunk = Uint8Array::from(framed.as_slice());
 
                 // --- Write the frame ----------------------------------------
@@ -746,5 +815,184 @@ impl WebTransportTask {
                 );
             }
         });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests for the length-prefix framing protocol.
+//
+// The framing helpers (`frame_persistent_stream_payload` and
+// `parse_persistent_stream_frame`) are pure-Rust and run on the host target.
+// The WebTransport send path itself is WASM-only (it depends on the JS
+// WritableStream API) and is exercised by integration tests rather than
+// unit tests.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[test]
+    fn frame_round_trips_byte_for_byte() {
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![0x00],
+            vec![0xFF; 1],
+            (0u8..=255).collect(),
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+            vec![0xAA; 1500],
+            vec![0x55; 64 * 1024],
+        ];
+        for payload in &payloads {
+            let framed = frame_persistent_stream_payload(payload);
+            assert_eq!(framed.len(), 4 + payload.len(), "framed length wrong");
+            let (parsed, rest) =
+                parse_persistent_stream_frame(&framed).expect("frame should parse back cleanly");
+            assert_eq!(parsed, payload.as_slice(), "round-trip payload differs");
+            assert!(rest.is_empty(), "no trailing bytes expected");
+        }
+    }
+
+    #[test]
+    fn parses_thousand_concatenated_frames_in_order() {
+        // Simulate 1000 framed packets accumulated on the wire (the scenario
+        // where the JS chunk boundary does not align with frame boundaries).
+        // The parser must extract every payload in order and with no
+        // length-prefix corruption.
+        const N: usize = 1000;
+        let mut originals: Vec<Vec<u8>> = Vec::with_capacity(N);
+        let mut buffer: Vec<u8> = Vec::new();
+        for i in 0..N {
+            // Mix of small, medium, and occasionally larger frames to exercise
+            // the parser at different boundary alignments.
+            let len = match i % 5 {
+                0 => 1,
+                1 => 80,        // typical Opus audio frame size
+                2 => 1200,      // datagram-MTU-sized
+                3 => 8 * 1024,  // video delta range
+                _ => 64 * 1024, // small keyframe range
+            };
+            let payload: Vec<u8> = (0..len).map(|j| ((i + j) & 0xFF) as u8).collect();
+            buffer.extend_from_slice(&frame_persistent_stream_payload(&payload));
+            originals.push(payload);
+        }
+
+        // Walk the buffer one frame at a time.  We deliberately use the
+        // returned `rest` slice as the next iteration's input so that any
+        // off-by-one bug in the consumed-byte count surfaces here.
+        let mut cursor: &[u8] = &buffer;
+        for (idx, expected) in originals.iter().enumerate() {
+            let (parsed, rest) = parse_persistent_stream_frame(cursor)
+                .unwrap_or_else(|e| panic!("frame {idx} failed to parse: {e:?}"));
+            assert_eq!(parsed, expected.as_slice(), "frame {idx} payload mismatch");
+            cursor = rest;
+        }
+        assert!(cursor.is_empty(), "all bytes should be consumed");
+    }
+
+    #[test]
+    fn need_more_header_when_buffer_short() {
+        for short in 0..4 {
+            let buf = vec![0u8; short];
+            assert_eq!(
+                parse_persistent_stream_frame(&buf),
+                Err(FrameParseError::NeedMoreHeader),
+            );
+        }
+    }
+
+    #[test]
+    fn need_more_payload_when_body_short() {
+        // Header claims 100 bytes but only 50 are present.
+        let mut buf = (100u32).to_be_bytes().to_vec();
+        buf.extend(std::iter::repeat_n(0u8, 50));
+        match parse_persistent_stream_frame(&buf) {
+            Err(FrameParseError::NeedMorePayload { missing }) => {
+                assert_eq!(missing, 50);
+            }
+            other => panic!("expected NeedMorePayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_length_is_invalid() {
+        let buf = (0u32).to_be_bytes();
+        assert_eq!(
+            parse_persistent_stream_frame(&buf),
+            Err(FrameParseError::InvalidLength(0)),
+        );
+    }
+
+    #[test]
+    fn oversized_length_is_invalid() {
+        // One byte over the limit must be rejected.
+        let too_big = (PERSISTENT_STREAM_MAX_FRAME_SIZE + 1) as u32;
+        let mut buf = too_big.to_be_bytes().to_vec();
+        // Pad with bogus bytes; the length check fires before we look at the body.
+        buf.extend(std::iter::repeat_n(0u8, 8));
+        assert_eq!(
+            parse_persistent_stream_frame(&buf),
+            Err(FrameParseError::InvalidLength(
+                PERSISTENT_STREAM_MAX_FRAME_SIZE + 1
+            )),
+        );
+    }
+
+    #[test]
+    fn max_size_payload_is_accepted() {
+        // A payload at exactly the max size must round-trip.  We use a small
+        // pattern so the test stays fast; the size is what we are validating.
+        let payload = vec![0xC3u8; PERSISTENT_STREAM_MAX_FRAME_SIZE];
+        let framed = frame_persistent_stream_payload(&payload);
+        let (parsed, rest) =
+            parse_persistent_stream_frame(&framed).expect("max-size frame must parse");
+        assert_eq!(parsed.len(), PERSISTENT_STREAM_MAX_FRAME_SIZE);
+        assert!(rest.is_empty());
+    }
+
+    /// Property: interleaving the wire bytes of two senders that each wrote
+    /// `[len][payload]` as a single chunk must never decode into a corrupt
+    /// frame.  The JS WritableStream guarantees no sub-chunk interleaving,
+    /// so on the wire we only ever see fully-concatenated frames.  This
+    /// test asserts that the *parser* respects that invariant: any input
+    /// that is two adjacent valid frames decodes back to those two
+    /// payloads exactly.
+    #[test]
+    fn two_adjacent_frames_decode_to_two_payloads() {
+        let a: Vec<u8> = (0u8..=99).collect();
+        let b: Vec<u8> = (100u8..=199).collect();
+        let mut wire = frame_persistent_stream_payload(&a);
+        wire.extend_from_slice(&frame_persistent_stream_payload(&b));
+
+        let (got_a, rest) = parse_persistent_stream_frame(&wire).unwrap();
+        assert_eq!(got_a, a.as_slice());
+        let (got_b, rest2) = parse_persistent_stream_frame(rest).unwrap();
+        assert_eq!(got_b, b.as_slice());
+        assert!(rest2.is_empty());
+    }
+
+    /// Stream-restart simulation at the protocol level.
+    ///
+    /// The real WT stream-restart path lives behind the JS WebTransport API
+    /// and is not unit-testable.  What *is* testable is the invariant the
+    /// restart relies on: a truncated frame (write failed mid-write, stream
+    /// reset on the wire) must not be silently consumed by the parser as if
+    /// it were a complete frame.  We assert that the parser reports
+    /// "NeedMorePayload" — the receiver then sees EOF on the stream and
+    /// discards the partial buffer.  When the sender opens a fresh stream
+    /// for the next send, the receiver starts a new buffer.  The framing
+    /// protocol is what makes this clean.
+    #[test]
+    fn truncated_frame_is_detected_not_silently_consumed() {
+        let payload = vec![0xABu8; 500];
+        let framed = frame_persistent_stream_payload(&payload);
+
+        // Drop the last byte to simulate a mid-frame stream reset.
+        let truncated = &framed[..framed.len() - 1];
+
+        match parse_persistent_stream_frame(truncated) {
+            Err(FrameParseError::NeedMorePayload { missing }) => {
+                assert_eq!(missing, 1, "must report the exact shortfall");
+            }
+            other => panic!("truncated frame must surface as NeedMorePayload, got {other:?}"),
+        }
     }
 }

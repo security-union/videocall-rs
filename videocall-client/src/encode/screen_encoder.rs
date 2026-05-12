@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::connection::MediaStreamKey;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_timers::future::sleep;
@@ -30,7 +31,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use crate::connection::MediaStreamKey;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;

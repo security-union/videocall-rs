@@ -1,0 +1,5 @@
+host: pushgateway.videocall.fnxlabs.com
+serviceName: prometheus-prometheus-pushgateway
+servicePort: 9091
+tlsSecretName: pushgateway-tls
+issuer: letsencrypt-prod

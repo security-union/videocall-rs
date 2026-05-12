@@ -1,0 +1,275 @@
+name: E2E Tests (HCL)
+
+on:
+  push:
+    branches: [hcl-main, PR-staging]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test'
+        required: true
+        default: 'PR-staging'
+      grep:
+        description: 'Playwright --grep filter (optional, e.g. @smoke)'
+        required: false
+
+concurrency:
+  group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  e2e:
+    name: Playwright E2E
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 60
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/run-e2e'))
+
+    outputs:
+      tests_passed: ${{ steps.results.outputs.passed }}
+      tests_failed: ${{ steps.results.outputs.failed }}
+      tests_skipped: ${{ steps.results.outputs.skipped }}
+      duration: ${{ steps.results.outputs.duration }}
+      status: ${{ steps.results.outputs.status }}
+      branch: ${{ steps.setup.outputs.branch }}
+
+    steps:
+      - name: Acknowledge /run-e2e comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content=rocket
+
+      - name: Determine branch
+        id: setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ inputs.branch }}"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_NUMBER="${{ github.event.issue.number }}"
+            BRANCH=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.ref')
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "Testing branch: ${BRANCH}"
+
+      - name: Clean workspace (root-owned files from Docker)
+        run: |
+          sudo find . -mindepth 1 -delete 2>/dev/null || true
+          sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.setup.outputs.branch }}
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies and Playwright browser
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install chromium
+
+      - name: Build E2E stack images
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
+
+      - name: Start E2E stack
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for dioxus-ui to be ready..."
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:3001 > /dev/null 2>&1; then
+              echo "dioxus-ui ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          echo "Waiting for meeting-api..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8081/session > /dev/null 2>&1 || \
+               curl -so /dev/null -w '%{http_code}' http://localhost:8081/session 2>/dev/null | grep -q '401'; then
+              echo "meeting-api ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          echo "Waiting for websocket-api..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080 > /dev/null 2>&1 || \
+               curl -so /dev/null -w '%{http_code}' http://localhost:8080 2>/dev/null | grep -qE '2[0-9][0-9]|4[0-9][0-9]'; then
+              echo "websocket-api ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run Playwright tests
+        id: playwright
+        working-directory: e2e
+        run: |
+          GREP_ARG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.grep }}" ]; then
+            GREP_ARG="--grep '${{ inputs.grep }}'"
+          fi
+
+          START_TIME=$(date +%s)
+          set +e
+          eval npx playwright test ${GREP_ARG} --reporter=json 2>&1 | tee playwright-results.json
+          EXIT_CODE=$?
+          set -e
+          END_TIME=$(date +%s)
+
+          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+          echo "start_time=${START_TIME}" >> $GITHUB_OUTPUT
+          echo "end_time=${END_TIME}" >> $GITHUB_OUTPUT
+
+      - name: Parse test results
+        id: results
+        working-directory: e2e
+        run: |
+          DURATION=$(( ${{ steps.playwright.outputs.end_time }} - ${{ steps.playwright.outputs.start_time }} ))
+
+          if [ -f playwright-results.json ] && jq -e '.stats' playwright-results.json >/dev/null 2>&1; then
+            PASSED=$(jq '.stats.expected // 0' playwright-results.json)
+            FAILED=$(jq '(.stats.unexpected // 0) + (.stats.flaky // 0)' playwright-results.json)
+            SKIPPED=$(jq '.stats.skipped // 0' playwright-results.json)
+          else
+            # Fallback: parse from exit code
+            PASSED=0
+            FAILED=0
+            SKIPPED=0
+            if [ "${{ steps.playwright.outputs.exit_code }}" = "0" ]; then
+              PASSED=1
+            else
+              FAILED=1
+            fi
+          fi
+
+          STATUS=0
+          if [ "${{ steps.playwright.outputs.exit_code }}" = "0" ]; then
+            STATUS=1
+          fi
+
+          echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "failed=${FAILED}" >> $GITHUB_OUTPUT
+          echo "skipped=${SKIPPED}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}" >> $GITHUB_OUTPUT
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+          echo "Results: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped (${DURATION}s)"
+
+      - name: Push metrics to Pushgateway
+        if: always() && steps.results.outputs.status != ''
+        run: |
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          STATUS="${{ steps.results.outputs.status }}"
+          TIMESTAMP=$(date +%s)
+
+          cat <<METRICS | curl --fail-with-body --data-binary @- "https://pushgateway.videocall.fnxlabs.com/metrics/job/e2e/branch/${BRANCH}"
+          # HELP e2e_tests_passed Number of passing E2E tests
+          # TYPE e2e_tests_passed gauge
+          e2e_tests_passed ${PASSED}
+          # HELP e2e_tests_failed Number of failing E2E tests
+          # TYPE e2e_tests_failed gauge
+          e2e_tests_failed ${FAILED}
+          # HELP e2e_tests_skipped Number of skipped E2E tests
+          # TYPE e2e_tests_skipped gauge
+          e2e_tests_skipped ${SKIPPED}
+          # HELP e2e_run_duration_seconds E2E suite wall-clock duration
+          # TYPE e2e_run_duration_seconds gauge
+          e2e_run_duration_seconds ${DURATION}
+          # HELP e2e_run_status E2E run pass (1) or fail (0)
+          # TYPE e2e_run_status gauge
+          e2e_run_status ${STATUS}
+          # HELP e2e_run_timestamp Unix timestamp of the E2E run
+          # TYPE e2e_run_timestamp gauge
+          e2e_run_timestamp ${TIMESTAMP}
+          METRICS
+
+          echo "Metrics pushed for branch=${BRANCH}"
+
+      - name: Post results to PR comment
+        if: always() && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          STATUS="${{ steps.results.outputs.status }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${STATUS}" = "1" ]; then
+            EMOJI="✅"
+            VERDICT="PASSED"
+          else
+            EMOJI="❌"
+            VERDICT="FAILED"
+          fi
+
+          BODY="${EMOJI} **E2E ${VERDICT}** on \`${BRANCH}\`
+
+          | Passed | Failed | Skipped | Duration |
+          |--------|--------|---------|----------|
+          | ${PASSED} | ${FAILED} | ${SKIPPED} | ${DURATION}s |
+
+          [Workflow run](${RUN_URL})"
+
+          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
+            -f body="${BODY}"
+
+      - name: Notify Google Chat on failure
+        if: always() && steps.results.outputs.status == '0' && github.event_name == 'push'
+        run: |
+          BRANCH="${{ steps.setup.outputs.branch }}"
+          PASSED="${{ steps.results.outputs.passed }}"
+          FAILED="${{ steps.results.outputs.failed }}"
+          SKIPPED="${{ steps.results.outputs.skipped }}"
+          DURATION="${{ steps.results.outputs.duration }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\`\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s\n📝 Commit: \`${SHORT_SHA}\`\n🔗 ${RUN_URL}"
+
+          curl -X POST \
+            'https://chat.googleapis.com/v1/spaces/AAQASkMZ_-E/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=6S5dBAiPJ4qvM-grSUnyz2G8Ggx9cnQt__gqvSOG06U' \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${MESSAGE}\"}" || echo "Google Chat notification failed (non-fatal)"
+
+      - name: Dump docker logs on failure
+        if: failure()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs
+
+      - name: Teardown (preserve volumes for cache)
+        if: always()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down
+
+      - name: Fail job if tests failed
+        if: steps.playwright.outputs.exit_code != '0'
+        run: exit 1

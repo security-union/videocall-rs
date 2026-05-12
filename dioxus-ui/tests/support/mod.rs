@@ -10,8 +10,8 @@
 
 use dioxus::prelude::*;
 use js_sys::Array;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{MediaDeviceInfo, MediaDeviceKind, MediaStreamConstraints};

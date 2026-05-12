@@ -758,7 +758,10 @@ mod tests {
         std::env::remove_var("SEARCH_API_URL");
 
         let cfg = Config::from_env().expect("from_env with DEV_USER set must succeed");
-        assert!(cfg.dev_user.is_some(), "dev_user must be Some when DEV_USER is set");
+        assert!(
+            cfg.dev_user.is_some(),
+            "dev_user must be Some when DEV_USER is set"
+        );
         assert!(
             logs_contain("DEV_USER auto-login is ENABLED"),
             "startup warning must fire when dev_user is active"
@@ -801,7 +804,10 @@ mod tests {
         std::env::remove_var("DEV_USER");
 
         let cfg = Config::from_env().expect("from_env without DEV_USER must succeed");
-        assert!(cfg.dev_user.is_none(), "dev_user must be None when DEV_USER is unset");
+        assert!(
+            cfg.dev_user.is_none(),
+            "dev_user must be None when DEV_USER is unset"
+        );
         assert!(
             !logs_contain("DEV_USER auto-login is ENABLED"),
             "startup warning must NOT fire when dev_user is None"

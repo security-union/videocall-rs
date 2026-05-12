@@ -354,7 +354,9 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
 
-          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\`\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s\n📝 Commit: \`${SHORT_SHA}\`\n🔗 ${RUN_URL}"
+          DASHBOARD_URL="https://grafana.videocall.fnxlabs.com/public-dashboards/2dd04ba37cf144f1862941620daa6349?orgId=1&from=now-24h&to=now"
+
+          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\`\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s\n📝 Commit: \`${SHORT_SHA}\`\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
 
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
             -H 'Content-Type: application/json' \

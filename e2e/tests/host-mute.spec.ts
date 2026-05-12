@@ -241,7 +241,7 @@ test.describe("Host mute controls", () => {
    * is_owner=true, so the host never receives the mute callback even though
    * the NATS broadcast reaches their transport layer.
    */
-  test.fixme("host mute-all mutes all guests but not the host", async ({ baseURL }) => {
+  test("host mute-all mutes all guests but not the host", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_hostmute_all_${Date.now()}`;
@@ -288,12 +288,14 @@ test.describe("Host mute controls", () => {
       });
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
 
-      // ---- Host clicks "Mute all" ----
-      // The btn-mute-all button lives in HostControls which is always rendered
-      // for the meeting owner — it is not subject to controls-nav auto-hide.
-      const muteAllBtn = hostPage.locator("button.btn-mute-all");
-      await expect(muteAllBtn).toBeVisible({ timeout: 10_000 });
-      await muteAllBtn.click();
+      // ---- Host clicks "Mute all" via the host actions context menu ----
+      const hostActionsBtn = hostPage.locator('button[aria-label="Host actions"]');
+      await expect(hostActionsBtn).toBeVisible({ timeout: 10_000 });
+      await hostActionsBtn.click();
+
+      const muteAllItem = hostPage.locator("button.context-menu-item", { hasText: "Mute all" });
+      await expect(muteAllItem).toBeVisible({ timeout: 5_000 });
+      await muteAllItem.click();
 
       // ---- Guest receives the NATS broadcast and sees the toast ----
       const guestMuteToast = guestPage.locator(".peer-toast .toast-name", {

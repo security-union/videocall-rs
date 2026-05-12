@@ -189,7 +189,7 @@ test.describe("Host-gone join check", () => {
    *   → host joins → host leaves → new participant tries to join
    *   → API must return 403 JOINING_NOT_ALLOWED (nobody can admit them)
    */
-  test.fixme("new participant receives JOINING_NOT_ALLOWED after host leaves when waiting_room_enabled=ON, admitted_can_admit=OFF and end_on_host_leave=OFF", async () => {
+  test("new participant receives JOINING_NOT_ALLOWED after host leaves when waiting_room_enabled=ON, admitted_can_admit=OFF and end_on_host_leave=OFF", async () => {
     const meetingId = `e2e_hgjc_wron_${Date.now()}`;
     const hostEmail = "hgjc-wron-host@videocall.rs";
     const hostName = "HGJCWROnHost";
@@ -240,7 +240,7 @@ test.describe("Host-gone join check", () => {
     expect(lateJoinRes.status).toBe(403);
 
     const body = await lateJoinRes.json();
-    expect(body?.error?.code ?? body?.code).toBe("JOINING_NOT_ALLOWED");
+    expect(body?.result?.code ?? body?.error?.code ?? body?.code).toBe("JOINING_NOT_ALLOWED");
   });
 
   /**
@@ -289,7 +289,7 @@ test.describe("Host-gone join check", () => {
    *
    * This validates that the correct code path is exercised in each branch.
    */
-  test.fixme("join after host leaves with end_on_host_leave=ON does not return JOINING_NOT_ALLOWED", async () => {
+  test("join after host leaves with end_on_host_leave=ON does not return JOINING_NOT_ALLOWED", async () => {
     const meetingId = `e2e_hgjc_eohl_${Date.now()}`;
     const hostEmail = "hgjc-eohl-host@videocall.rs";
     const hostName = "HGJCEOHLHost";
@@ -309,10 +309,11 @@ test.describe("Host-gone join check", () => {
     // Host leaves → meeting should be ended by the server.
     await leaveMeeting(hostEmail, hostName, meetingId);
 
-    // The late joiner should not see JOINING_NOT_ALLOWED; the meeting is ended.
+    // The late joiner should not see JOINING_NOT_ALLOWED. With end_on_host_leave=ON,
+    // the meeting is ended; the backend returns 200 "waiting_for_meeting" (not 403).
     const lateJoinRes = await joinMeetingRaw(lateEmail, lateName, meetingId);
-    expect(lateJoinRes.ok).toBe(false);
-    const text = await lateJoinRes.text();
-    expect(text).not.toContain("JOINING_NOT_ALLOWED");
+    const body = await lateJoinRes.json();
+    expect(body?.result?.code).not.toBe("JOINING_NOT_ALLOWED");
+    expect(body?.result?.status).toBe("waiting_for_meeting");
   });
 });

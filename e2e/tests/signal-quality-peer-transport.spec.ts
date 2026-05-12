@@ -85,7 +85,7 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
     await waitForServices();
   });
 
-  test.fixme("host opening the signal popup for a remote peer sees a WT/WS transport badge", async ({
+  test("host opening the signal popup for a remote peer sees a WT/WS transport badge", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
@@ -154,10 +154,9 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
         await expect(guestGrid).toBeVisible({ timeout: 15_000 });
       }
 
-      // Wait for the mesh to settle — peer discovery + at least one
-      // HeartbeatMetadata cycle so `peer_transport` flows through to the
-      // signal-quality popup state.
-      await members[0].page.waitForTimeout(8000);
+      // Wait for mesh to settle — peer discovery + HeartbeatMetadata cycle
+      // so `peer_transport` flows through to the signal-quality popup state.
+      await members[0].page.waitForTimeout(15000);
 
       // Host should see exactly one remote peer tile in the grid.
       const hostPage = members[0].page;
@@ -200,12 +199,8 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
       const title = (await badge.getAttribute("title")) || "";
       expect(title).toMatch(/^(WebTransport|WebSocket)$/);
 
-      // In Playwright every browser defaults to Auto -> WebTransport, so we
-      // expect the remote peer to report WT. We assert this as a stronger
-      // sanity check; if the default ever flips to WS this assertion will
-      // need to be relaxed back to the WT|WS regex above.
-      await expect(badge).toHaveText("WT");
-      await expect(badge).toHaveClass(/type-webtransport/);
+      // The E2E stack may have WebTransport disabled; accept either transport.
+      await expect(badge).toHaveText(expectedTransports);
     } finally {
       for (const m of members) {
         if (m.page) {

@@ -104,6 +104,9 @@ jobs:
     name: Playwright E2E
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 60
+    concurrency:
+      group: hcl-ci-heavy-workload
+      cancel-in-progress: false
     needs: [check-permissions]
     if: |
       always() && (
@@ -333,8 +336,11 @@ jobs:
 
           [Workflow run](${RUN_URL})"
 
-          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-            -f body="${BODY}"
+          curl -sf -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg body "${BODY}" '{body: $body}')" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments"
 
       - name: Notify Google Chat on failure
         if: always() && steps.results.outputs.status == '0' && github.event_name == 'push'
@@ -356,8 +362,12 @@ jobs:
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
 
           PR_INFO=""
-          PR_JSON=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0] | "\(.number) \(.title)"' 2>/dev/null || true)
-          if [ -n "${PR_JSON}" ]; then
+          PR_JSON=$(curl -sf \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" 2>/dev/null | \
+            jq -r '.[0] | "\(.number) \(.title)"' 2>/dev/null || true)
+          if [ -n "${PR_JSON}" ] && [ "${PR_JSON}" != "null null" ]; then
             PR_NUM=$(echo "${PR_JSON}" | cut -d' ' -f1)
             PR_TITLE=$(echo "${PR_JSON}" | cut -d' ' -f2-)
             PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"

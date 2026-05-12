@@ -36,6 +36,9 @@ jobs:
     name: cargo tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 20
+    concurrency:
+      group: hcl-ci-heavy-workload
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:

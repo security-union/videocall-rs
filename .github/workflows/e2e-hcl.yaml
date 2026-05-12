@@ -33,7 +33,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/run-e2e'))
+       github.event.comment.body == '/run-e2e')
 
     outputs:
       tests_passed: ${{ steps.results.outputs.passed }}
@@ -96,47 +96,40 @@ jobs:
 
       - name: Wait for services to be healthy
         run: |
-          echo "Waiting for dioxus-ui to be ready..."
-          for i in $(seq 1 120); do
-            if curl -sf http://localhost:3001 > /dev/null 2>&1; then
-              echo "dioxus-ui ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          echo "Waiting for meeting-api..."
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8081/session > /dev/null 2>&1 || \
-               curl -so /dev/null -w '%{http_code}' http://localhost:8081/session 2>/dev/null | grep -q '401'; then
-              echo "meeting-api ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          echo "Waiting for websocket-api..."
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8080 > /dev/null 2>&1 || \
-               curl -so /dev/null -w '%{http_code}' http://localhost:8080 2>/dev/null | grep -qE '2[0-9][0-9]|4[0-9][0-9]'; then
-              echo "websocket-api ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
+          wait_for_service() {
+            local name="$1" url="$2" timeout="$3"
+            echo "Waiting for ${name}..."
+            for i in $(seq 1 "${timeout}"); do
+              if curl -sf "${url}" > /dev/null 2>&1 || \
+                 curl -so /dev/null -w '%{http_code}' "${url}" 2>/dev/null | grep -qE '2[0-9][0-9]|4[0-9][0-9]'; then
+                echo "${name} ready after ${i}s"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "ERROR: ${name} failed to become ready within ${timeout}s"
+            return 1
+          }
+
+          wait_for_service "dioxus-ui" "http://localhost:3001" 120
+          wait_for_service "meeting-api" "http://localhost:8081/session" 60
+          wait_for_service "websocket-api" "http://localhost:8080" 60
 
       - name: Run Playwright tests
         id: playwright
         working-directory: e2e
         env:
           PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
+          E2E_GREP: ${{ inputs.grep }}
         run: |
-          GREP_ARG=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.grep }}" ]; then
-            GREP_ARG="--grep '${{ inputs.grep }}'"
+          ARGS=(--reporter=list,json)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${E2E_GREP}" ]; then
+            ARGS+=(--grep "${E2E_GREP}")
           fi
 
           START_TIME=$(date +%s)
           set +e
-          eval npx playwright test ${GREP_ARG} --reporter=list,json
+          npx playwright test "${ARGS[@]}"
           EXIT_CODE=$?
           set -e
           END_TIME=$(date +%s)
@@ -252,7 +245,14 @@ jobs:
 
       - name: Notify Google Chat on failure
         if: always() && steps.results.outputs.status == '0' && github.event_name == 'push'
+        env:
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
         run: |
+          if [ -z "${GCHAT_WEBHOOK_URL}" ]; then
+            echo "GCHAT_WEBHOOK_URL secret not set, skipping notification"
+            exit 0
+          fi
+
           BRANCH="${{ steps.setup.outputs.branch }}"
           PASSED="${{ steps.results.outputs.passed }}"
           FAILED="${{ steps.results.outputs.failed }}"
@@ -263,8 +263,7 @@ jobs:
 
           MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\`\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s\n📝 Commit: \`${SHORT_SHA}\`\n🔗 ${RUN_URL}"
 
-          curl -X POST \
-            'https://chat.googleapis.com/v1/spaces/AAQASkMZ_-E/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=6S5dBAiPJ4qvM-grSUnyz2G8Ggx9cnQt__gqvSOG06U' \
+          curl -X POST "${GCHAT_WEBHOOK_URL}" \
             -H 'Content-Type: application/json' \
             -d "{\"text\": \"${MESSAGE}\"}" || echo "Google Chat notification failed (non-fatal)"
 

@@ -53,6 +53,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
+- [Documentation](#documentation)
 - [Demos and Media](#demos-and-media)
 - [Contributors](#contributors)
 - [License](#license)
@@ -656,6 +657,83 @@ chmod +x .git/hooks/pre-commit .git/hooks/post-commit
 ```
 
 These hooks help maintain code quality by ensuring proper formatting and checking for common issues.
+
+## Project Structure
+
+The repository is a Cargo workspace with the following primary crates and
+front-ends. Each entry links to that crate's README, and to its CHANGELOG when
+the crate publishes one.
+
+### Front-ends
+
+| Component | README | CHANGELOG |
+|-----------|--------|-----------|
+| `dioxus-ui` — Dioxus web frontend (the sole UI) | [README](dioxus-ui/README.md) | [CHANGELOG](dioxus-ui/CHANGELOG.md) |
+| `leptos-website` — Public marketing site (Leptos, WIP) | [README](leptos-website/README.md) | — |
+
+### Backend services
+
+| Component | README | CHANGELOG |
+|-----------|--------|-----------|
+| `actix-api` — Actix Web backend (meeting API, WebSocket, WebTransport) | [Backend testing guide](actix-api/TESTING.md) | [CHANGELOG](actix-api/CHANGELOG.md) |
+
+### Shared and client libraries
+
+| Component | README | CHANGELOG |
+|-----------|--------|-----------|
+| `videocall-client` — Framework-agnostic browser client library (WASM) | [README](videocall-client/README.md) | [CHANGELOG](videocall-client/CHANGELOG.md) |
+| `videocall-types` — Shared protobuf types | [README](videocall-types/README.md) | [CHANGELOG](videocall-types/CHANGELOG.md) |
+| `videocall-codecs` — Audio/video codec wrappers (jitter buffer, decoder) | [README](videocall-codecs/README.md) | [CHANGELOG](videocall-codecs/CHANGELOG.md) |
+| `videocall-transport` — Framework-agnostic WebSocket / WebTransport wrappers | [README](videocall-transport/README.md) | [CHANGELOG](videocall-transport/CHANGELOG.md) |
+| `videocall-diagnostics` — Diagnostics event bus | [README](videocall-diagnostics/README.md) | [CHANGELOG](videocall-diagnostics/CHANGELOG.md) |
+| `videocall-meeting-client` — Cross-platform REST client for the meeting API | [README](videocall-meeting-client/README.md) | [CHANGELOG](videocall-meeting-client/CHANGELOG.md) |
+| `videocall-meeting-types` — Shared meeting API types | [README](videocall-meeting-types/README.md) | [CHANGELOG](videocall-meeting-types/CHANGELOG.md) |
+| `neteq` — Adaptive jitter buffer for real-time audio | [README](neteq/README.md) | [CHANGELOG](neteq/CHANGELOG.md) |
+
+### Native and CLI tools
+
+| Component | README | CHANGELOG |
+|-----------|--------|-----------|
+| `videocall-cli` — Command-line streaming client for headless devices | [README](videocall-cli/README.md) | [CHANGELOG](videocall-cli/CHANGELOG.md) |
+| `videocall-cli/nokhwa` — Vendored fork of the `nokhwa` webcam capture library | [README](videocall-cli/nokhwa/README.md) | — |
+| `videocall-sdk` — iOS and Android native bindings | [README](videocall-sdk/README.md) | [CHANGELOG](videocall-sdk/CHANGELOG.md) |
+| `vcprobe` — CLI diagnostic tool for inspecting meeting traffic | [README](vcprobe/README.md) | — |
+| `bot` — Synthetic-client bot for load testing | [README](bot/README.md) | [CHANGELOG](bot/CHANGELOG.md) |
+
+### Other directories
+
+| Path | What it is |
+|------|------------|
+| [`docs/`](docs/README.md) | The long-form documentation index — operations runbooks, design docs, plans, performance investigations, and changelogs. |
+| [`helm/`](helm/README.md) | Helm charts and per-chart READMEs for the Kubernetes deployment. |
+| [`engineering-vlog/`](engineering-vlog/README.md) | Long-form engineering posts published from this repository (Zola static site). |
+| [`rfc/`](rfc/rfc-1-q3-q4-2023-planning.md) | Historical RFCs. |
+| [`scripts/`](scripts/parse_meeting_console_logs.README.md) | Operational scripts and their per-script READMEs. |
+| [`.github/workflows-opensource/`](.github/workflows-opensource/README.md) | Archived GitHub Actions workflows that targeted the public OSS mirror. |
+| [`CLAUDE.md`](CLAUDE.md) | Claude Code agent and code-quality policy for this repository. |
+
+## Documentation
+
+The full curated documentation index lives in **[`docs/README.md`](docs/README.md)**.
+It groups every long-form document in the repository by topic — meeting features,
+architecture and design, operations and deployment, testing, performance
+investigations, change logs, planning and RFCs, setup guides, and tooling.
+
+A few highlights:
+
+- **Architecture** — [Architecture Document](ARCHITECTURE.md),
+  [Global High-Availability Deployment Design](GLOBAL_DEPLOYMENT.md).
+- **Operations** — [VC2 Deployment Runbook](docs/VC2_DEPLOYMENT_RUNBOOK.md),
+  [Production Monitoring Stack](docs/Monitoring_Production.md),
+  [PR Previews](docs/PR_PREVIEWS.md),
+  [OAuth Helm Configuration](docs/OAUTH_HELM_CONFIGURATION.md),
+  [Server Sizing Guide](docs/server-sizing-guide.md).
+- **Meeting features** — [Meeting Ownership](docs/MEETING_OWNERSHIP.md),
+  [Meeting API](docs/MEETING_API.md), [Searching for Meetings](docs/SEARCH.md).
+- **Testing** — [Testing Overview](docs/TESTING.md),
+  [Backend testing guide](actix-api/TESTING.md).
+- **Setup** — [macOS Apple Silicon Setup Guide](MACOS_APPLE_SILICON_INSTALLATION_GUIDE.md).
+- **Engineering vlog** — [Index of posts](engineering-vlog/README.md).
 
 ## Demos and Media
 

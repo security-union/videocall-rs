@@ -6,6 +6,8 @@ const CHROME_ARGS = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
 ];
 
 process.env.DISPLAY_NAME_RATE_LIMIT_DISABLED ??= "true";

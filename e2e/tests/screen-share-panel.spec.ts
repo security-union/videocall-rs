@@ -32,6 +32,8 @@ const BROWSER_ARGS = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
   // Auto-accept getDisplayMedia() system picker for screen sharing.
   "--auto-select-desktop-capture-source=Entire screen",
 ];

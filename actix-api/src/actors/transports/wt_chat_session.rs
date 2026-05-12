@@ -174,6 +174,46 @@ fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) 
     }
 }
 
+/// Whether this packet should be proactively shed to protect audio/control.
+///
+/// Only positively identified `VIDEO` and `SCREEN` media are sheddable.
+/// Everything else falls through to the regular `try_send` path, including
+/// audio, control, and encrypted media whose inner type could not be parsed.
+fn should_priority_shed(
+    remaining_capacity: usize,
+    shedding_threshold: usize,
+    media_type: Option<MediaType>,
+) -> bool {
+    matches!(media_type, Some(MediaType::VIDEO) | Some(MediaType::SCREEN))
+        && remaining_capacity < shedding_threshold
+}
+
+/// Apply the priority-shed policy and emit the corresponding counters.
+///
+/// Returns `true` when the packet was proactively shed and the caller should
+/// stop before attempting the regular `try_send` path.
+fn maybe_priority_shed(
+    room: &str,
+    remaining_capacity: usize,
+    shedding_threshold: usize,
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> bool {
+    if !should_priority_shed(remaining_capacity, shedding_threshold, media_type) {
+        return false;
+    }
+
+    let kind = drop_kind_label(parsed, is_media, media_type);
+    OUTBOUND_CHANNEL_SHED_TOTAL
+        .with_label_values(&["webtransport", kind])
+        .inc();
+    RELAY_PACKET_DROPS_TOTAL
+        .with_label_values(&[room, "webtransport", "shed"])
+        .inc();
+    true
+}
+
 impl WtChatSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -298,18 +338,15 @@ impl WtChatSession {
         // to protect audio from collateral starvation. Only shed positively
         // identified video/screen — encrypted media (unparseable inner) has
         // media_type=None and must NOT be shed since it could be audio.
-        if matches!(media_type, Some(MediaType::VIDEO) | Some(MediaType::SCREEN)) {
-            let remaining = self.outbound_tx.capacity();
-            if remaining < crate::constants::wt_outbound_shedding_threshold() {
-                let kind = drop_kind_label(parsed, is_media, media_type);
-                OUTBOUND_CHANNEL_SHED_TOTAL
-                    .with_label_values(&["webtransport", kind])
-                    .inc();
-                RELAY_PACKET_DROPS_TOTAL
-                    .with_label_values(&[&self.logic.room, "webtransport", "shed"])
-                    .inc();
-                return WtSendResult::Dropped;
-            }
+        if maybe_priority_shed(
+            &self.logic.room,
+            self.outbound_tx.capacity(),
+            crate::constants::wt_outbound_shedding_threshold(),
+            parsed,
+            is_media,
+            media_type,
+        ) {
+            return WtSendResult::Dropped;
         }
 
         let outbound = build_outbound(data, is_media, is_audio);
@@ -692,6 +729,9 @@ impl WtChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{OUTBOUND_CHANNEL_SHED_TOTAL, RELAY_PACKET_DROPS_TOTAL};
+    use prometheus::CounterVec;
+    use serial_test::serial;
 
     /// Helper: construct an `is_audio` test packet of the requested size.
     /// Size is the *outbound bytes* length passed into `build_outbound`.
@@ -710,6 +750,10 @@ mod tests {
 
     fn is_unistream(o: &WtOutbound) -> bool {
         matches!(o, WtOutbound::UniStream(_))
+    }
+
+    fn snapshot(counter: &CounterVec, labels: &[&str]) -> f64 {
+        counter.with_label_values(labels).get()
     }
 
     // -----------------------------------------------------------------------
@@ -842,6 +886,190 @@ mod tests {
             is_datagram(&out),
             "is_audio without is_media should fall through to control routing, got {:?}",
             out
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority shedding regression coverage (Discussion #699 / PR #700)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn video_below_threshold_is_shed_and_increments_metrics() {
+        let room = "wt-priority-shed-video";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "video"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 127,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ true,
+            Some(MediaType::VIDEO),
+        );
+
+        assert!(shed, "video below threshold should be proactively shed");
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "video"]),
+            shed_before + 1.0
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before + 1.0
+        );
+    }
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn screen_below_threshold_is_shed_and_increments_metrics() {
+        let room = "wt-priority-shed-screen";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "screen"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 127,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ true,
+            Some(MediaType::SCREEN),
+        );
+
+        assert!(shed, "screen below threshold should be proactively shed");
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "screen"]),
+            shed_before + 1.0
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before + 1.0
+        );
+    }
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn audio_below_threshold_is_not_shed() {
+        let room = "wt-priority-shed-audio";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "audio"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 127,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ true,
+            Some(MediaType::AUDIO),
+        );
+
+        assert!(
+            !shed,
+            "audio must fall through to the regular try_send path, not the shed path"
+        );
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "audio"]),
+            shed_before
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before
+        );
+    }
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn encrypted_media_below_threshold_is_not_shed() {
+        let room = "wt-priority-shed-encrypted";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "media"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 127,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ true,
+            /*media_type=*/ None,
+        );
+
+        assert!(
+            !shed,
+            "encrypted/unparseable media must not be shed because it could be audio"
+        );
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "media"]),
+            shed_before
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before
+        );
+    }
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn control_packet_below_threshold_is_not_shed() {
+        let room = "wt-priority-shed-control";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "control"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 127,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ false,
+            /*media_type=*/ None,
+        );
+
+        assert!(
+            !shed,
+            "control packets must bypass priority shedding regardless of queue depth"
+        );
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "control"]),
+            shed_before
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before
+        );
+    }
+
+    #[test]
+    #[serial(wt_priority_shed)]
+    fn video_at_threshold_is_not_shed() {
+        let room = "wt-priority-shed-threshold";
+        let shed_before = snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "video"]);
+        let relay_before =
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]);
+
+        let shed = maybe_priority_shed(
+            room,
+            /*remaining_capacity=*/ 128,
+            /*shedding_threshold=*/ 128,
+            /*parsed=*/ true,
+            /*is_media=*/ true,
+            Some(MediaType::VIDEO),
+        );
+
+        assert!(
+            !shed,
+            "video at the threshold should still fall through; only strictly lower capacity sheds"
+        );
+        assert_eq!(
+            snapshot(&OUTBOUND_CHANNEL_SHED_TOTAL, &["webtransport", "video"]),
+            shed_before
+        );
+        assert_eq!(
+            snapshot(&RELAY_PACKET_DROPS_TOTAL, &[room, "webtransport", "shed"]),
+            relay_before
         );
     }
 

@@ -179,13 +179,23 @@ services:
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      # WT host is published from the host (browser) perspective: the
+      # webtransport-api service binds UDP 4433 on the host, and the
+      # Playwright Chrome launch in playwright.config.ts forces QUIC on
+      # 127.0.0.1:4433. Inside the dioxus-ui container this is only
+      # baked into runtime config.js for the wasm client, not dialed
+      # from the container itself.
       - WEBTRANSPORT_HOST=https://127.0.0.1:4433
       - TRUNK_SERVE_PORT=3001
       - ENABLE_OAUTH=false
       - API_BASE_URL=http://localhost:8081
       - LOGIN_URL=http://localhost:8081/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
-      - WEBTRANSPORT_ENABLED=false
+      # WT must be enabled in the wasm client so the
+      # `vc_transport_preference=webtransport` localStorage flag (set by
+      # the regression spec) actually elects WT instead of being clamped
+      # back to WS. See issue #777.
+      - WEBTRANSPORT_ENABLED=true
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
       - USERS_ALLOWED_TO_STREAM=

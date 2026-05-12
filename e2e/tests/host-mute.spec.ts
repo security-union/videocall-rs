@@ -289,6 +289,9 @@ test.describe("Host mute controls", () => {
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
 
       // ---- Host opens peer list then clicks "Mute all" via context menu ----
+      // Wake auto-hidden controls bar before clicking.
+      await hostPage.mouse.move(400, 400);
+      await hostPage.waitForTimeout(300);
       const openPeersBtn = hostPage.locator("button.video-control-button", {
         has: hostPage.locator("span.tooltip", { hasText: "Open Peers" }),
       });

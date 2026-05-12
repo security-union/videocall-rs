@@ -113,6 +113,11 @@ test.describe("Diagnostics popup — per-peer transport badge", () => {
     await waitForServices();
   });
 
+  // FIXME(#741): 3-user peer mesh takes longer than 180s to settle in
+  // the containerized E2E env (3 sequential browser launches + joins +
+  // HeartbeatMetadata cycles). Unblock: reduce serverElectionPeriodMs
+  // in docker-compose.e2e.yaml, or move to a dedicated slow-test project
+  // with a longer timeout.
   test.fixme("three users see WT/WS transport badge for each remote peer", async ({ baseURL }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;

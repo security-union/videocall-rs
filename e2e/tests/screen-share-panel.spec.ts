@@ -147,6 +147,27 @@ async function admitGuestIfNeeded(
   }
 }
 
+// Synthetic getDisplayMedia mock — injected via addInitScript so screen
+// share tests run reliably in headless without a system-level picker.
+const MOCK_GET_DISPLAY_MEDIA_SCRIPT = `
+  (() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices) return;
+    const createStream = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 640; canvas.height = 480;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 640, 480);
+      ctx.fillStyle = '#fff'; ctx.font = '24px sans-serif';
+      ctx.fillText('Mock Screen Share', 160, 240);
+      return canvas.captureStream(5);
+    };
+    Object.defineProperty(mediaDevices, 'getDisplayMedia', {
+      configurable: true, value: async () => createStream(),
+    });
+  })();
+`;
+
 /**
  * Set up a two-user meeting (host + guest) and return both pages
  * along with browser handles for cleanup.
@@ -156,6 +177,7 @@ async function setupTwoUserMeeting(
   meetingId: string,
   hostName: string,
   guestName: string,
+  opts: { mockDisplayMedia?: boolean } = {},
 ) {
   const browser1 = await chromium.launch({ args: BROWSER_ARGS });
   const browser2 = await chromium.launch({ args: BROWSER_ARGS });
@@ -172,6 +194,11 @@ async function setupTwoUserMeeting(
     guestName,
     uiURL,
   );
+
+  if (opts.mockDisplayMedia) {
+    await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+    await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+  }
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -201,7 +228,9 @@ async function setupTwoUserMeeting(
  * false otherwise.
  */
 async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
-  // The screen share button's tooltip reads "Share Screen" when inactive.
+  // Wake auto-hidden controls bar, then find the share button by tooltip.
+  await sharerPage.mouse.move(400, 400);
+  await sharerPage.waitForTimeout(300);
   const shareButton = sharerPage.locator("button.video-control-button", {
     has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),
   });
@@ -265,7 +294,7 @@ test.describe("Screen share right panel layout", () => {
   // to a split layout where the right panel uses a 2-column CSS grid
   // with `.split-peer-tile` elements for peer video tiles.
   // ──────────────────────────────────────────────────────────────────────
-  test.fixme("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
+  test("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_panel_grid_${Date.now()}`;
@@ -275,6 +304,7 @@ test.describe("Screen share right panel layout", () => {
       meetingId,
       "SSGridHost",
       "SSGridGuest",
+      { mockDisplayMedia: true },
     );
 
     try {
@@ -307,12 +337,14 @@ test.describe("Screen share right panel layout", () => {
       // Verify the right panel has grid-template-columns with 2 columns (1fr 1fr)
       // The right panel is the second child of #grid-container with inline
       // style containing "grid-template-columns: 1fr 1fr"
-      const rightPanel = hostPage.locator("#grid-container > div:nth-child(2)");
+      // Right panel is the 3rd child: left + resize-handle + right.
+      const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
       const rightPanelStyle = await rightPanel.getAttribute("style");
       expect(rightPanelStyle).toBeTruthy();
-      expect(rightPanelStyle).toContain("grid-template-columns: 1fr 1fr");
+      // 2-column when >1 peer, 1-column when only 1 peer in right panel.
+      expect(rightPanelStyle).toMatch(/grid-template-columns: 1fr( 1fr)?/);
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");

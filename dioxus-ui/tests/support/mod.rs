@@ -9,11 +9,9 @@
 #![allow(dead_code)]
 
 use dioxus::prelude::*;
-use futures::future::{select, Either};
-use gloo_timers::future::TimeoutFuture;
 use js_sys::Array;
-use std::pin::pin;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{MediaDeviceInfo, MediaDeviceKind, MediaStreamConstraints};
@@ -410,13 +408,23 @@ async fn await_js_promise_with_timeout(
     operation: &str,
     timeout_ms: u32,
 ) -> Result<JsValue, String> {
-    let promise_fut = pin!(JsFuture::from(promise));
-    let timeout_fut = pin!(TimeoutFuture::new(timeout_ms));
+    let op_name = operation.to_owned();
+    let timeout_promise = js_sys::Promise::new(&mut move |_resolve, reject| {
+        let message = JsValue::from_str(&format!("{op_name} timed out after {timeout_ms}ms"));
+        let reject_cb = Closure::once_into_js(move || {
+            let _ = reject.call1(&JsValue::UNDEFINED, &message);
+        });
+        let window = web_sys::window().expect("window should be available in browser tests");
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            reject_cb.as_ref().unchecked_ref(),
+            timeout_ms as i32,
+        );
+    });
 
-    match select(promise_fut, timeout_fut).await {
-        Either::Left((Ok(value), _)) => Ok(value),
-        Either::Left((Err(e), _)) => Err(format!("{} failed: {:?}", operation, e)),
-        Either::Right((_, _)) => Err(format!("{} timed out after {}ms", operation, timeout_ms)),
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &timeout_promise));
+    match JsFuture::from(race).await {
+        Ok(value) => Ok(value),
+        Err(e) => Err(format!("{} failed: {:?}", operation, e)),
     }
 }
 

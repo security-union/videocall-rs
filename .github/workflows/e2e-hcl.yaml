@@ -188,6 +188,12 @@ jobs:
           wait_for_service "meeting-api" "http://localhost:8081/session" 60
           wait_for_service "websocket-api" "http://localhost:8080" 60
 
+      - name: Start resource monitor
+        run: |
+          vmstat 5 > /tmp/e2e-vmstat.log &
+          echo $! > /tmp/vmstat-pid
+          echo "Resource monitoring started (vmstat every 5s)"
+
       - name: Run Playwright tests
         id: playwright
         working-directory: e2e
@@ -210,6 +216,19 @@ jobs:
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
           echo "start_time=${START_TIME}" >> $GITHUB_OUTPUT
           echo "end_time=${END_TIME}" >> $GITHUB_OUTPUT
+
+      - name: Stop resource monitor and report
+        if: always()
+        run: |
+          kill "$(cat /tmp/vmstat-pid)" 2>/dev/null || true
+          echo "=== Resource usage during E2E tests ==="
+          echo "Columns: r=runnable procs, b=blocked, us=user%, sy=system%, id=idle%, wa=iowait%"
+          cat /tmp/e2e-vmstat.log
+          echo ""
+          echo "=== Peak usage summary ==="
+          awk 'NR>2 {if($13<min_idle || min_idle==""){min_idle=$13; peak_line=NR": "$0}} END{print "Lowest idle%: "min_idle"% (line "peak_line")"}' /tmp/e2e-vmstat.log || true
+          echo "=== Docker container resource snapshot ==="
+          docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null || true
 
       - name: Parse test results
         id: results

@@ -15,5 +15,3 @@ data:
     {{ .Files.Get "dashboards/server-connections-analytics.json" | nindent 4 }}
   videocall-health.json: |-
     {{ .Files.Get "dashboards/videocall-health.json" | nindent 4 }}
-  e2e-scoreboard.json: |-
-    {{ .Files.Get "dashboards/e2e-scoreboard.json" | nindent 4 }}

@@ -126,6 +126,8 @@ jobs:
       - name: Run Playwright tests
         id: playwright
         working-directory: e2e
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
         run: |
           GREP_ARG=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.grep }}" ]; then
@@ -134,7 +136,7 @@ jobs:
 
           START_TIME=$(date +%s)
           set +e
-          eval npx playwright test ${GREP_ARG} --reporter=json 2>&1 | tee playwright-results.json
+          eval npx playwright test ${GREP_ARG} --reporter=list,json
           EXIT_CODE=$?
           set -e
           END_TIME=$(date +%s)
@@ -189,8 +191,9 @@ jobs:
           STATUS="${{ steps.results.outputs.status }}"
           TIMESTAMP=$(date +%s)
 
-          cat <<METRICS | curl --fail-with-body --data-binary @- "https://pushgateway.videocall.fnxlabs.com/metrics/job/e2e/branch/${BRANCH}"
-          # HELP e2e_tests_passed Number of passing E2E tests
+          PUSHGATEWAY_URL="https://pushgateway.videocall.fnxlabs.com"
+
+          METRICS_PAYLOAD="# HELP e2e_tests_passed Number of passing E2E tests
           # TYPE e2e_tests_passed gauge
           e2e_tests_passed ${PASSED}
           # HELP e2e_tests_failed Number of failing E2E tests
@@ -207,8 +210,11 @@ jobs:
           e2e_run_status ${STATUS}
           # HELP e2e_run_timestamp Unix timestamp of the E2E run
           # TYPE e2e_run_timestamp gauge
-          e2e_run_timestamp ${TIMESTAMP}
-          METRICS
+          e2e_run_timestamp ${TIMESTAMP}"
+
+          echo "${METRICS_PAYLOAD}" | curl --fail-with-body --data-binary @- \
+            "${PUSHGATEWAY_URL}/metrics/job/e2e/branch/${BRANCH}" || \
+          echo "Pushgateway push failed (non-fatal, DNS may not be configured yet)"
 
           echo "Metrics pushed for branch=${BRANCH}"
 

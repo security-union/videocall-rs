@@ -165,21 +165,22 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 }
 
-/// Reads from a unidirectional QUIC stream, handling two framing modes:
+/// Reads from a **persistent length-prefixed unidirectional QUIC stream**
+/// (server -> client) and emits each complete frame to `on_inbound_media`.
 ///
-/// 1. **Legacy per-packet streams**: The sender opens a stream, writes one
-///    packet, and closes the stream.  `done` becomes truthy after the first
-///    (or only) read and any buffered data is emitted as a single packet.
+/// The server keeps the stream open and prefixes every packet with a 4-byte
+/// big-endian length header (see `actix-api/src/webtransport/bridge.rs::
+/// spawn_unistream_writer`).  This reader accumulates chunks across QUIC
+/// chunk boundaries and extracts complete `[length][payload]` frames as
+/// they arrive, emitting each immediately.
 ///
-/// 2. **Persistent length-prefixed streams** (server -> client): The server
-///    keeps the stream open and prefixes every packet with a 4-byte big-endian
-///    length header.  The reader accumulates chunks and extracts complete
-///    `[length][payload]` frames as they arrive, emitting each immediately.
-///
-/// The two modes are distinguished at runtime: if we can extract at least one
-/// complete length-prefixed frame from the buffer we stay in framed mode;
-/// otherwise, when `done` is signalled we fall back to emitting the raw buffer
-/// (legacy mode).
+/// **Framed-only.** Issue #776: the legacy per-packet "emit raw buffer on
+/// done" fallback was removed alongside the rest of PR #772 — both ends of
+/// the WebTransport unidirectional path are framed-only.  A truncated
+/// frame at EOF (server crash mid-write, or a corrupt-length break) leaves
+/// `pending` with bytes that cannot be parsed as a `PacketWrapper`; we
+/// drop them on the floor with a warning rather than emit garbage to the
+/// decoder.
 fn handle_unidirectional_stream(
     stream: WebTransportReceiveStream,
     on_inbound_media: Callback<PacketWrapper>,
@@ -198,8 +199,8 @@ fn handle_unidirectional_stream(
     });
     wasm_bindgen_futures::spawn_local(async move {
         // Buffer for accumulating partial reads across QUIC chunk boundaries.
-        // For per-packet (legacy) streams this typically holds a single chunk.
-        // For persistent streams it may span multiple length-prefixed frames.
+        // May span multiple length-prefixed frames within a single chunk,
+        // or split a single frame across multiple chunks.
         let mut pending: Vec<u8> = Vec::new();
 
         loop {
@@ -229,15 +230,15 @@ fn handle_unidirectional_stream(
                                 as usize;
 
                         if len == 0 || len > MAX_INBOUND_STREAM_SIZE {
-                            // Corrupt or oversized frame -- not a framed stream.
-                            // This can happen on a legacy per-packet stream whose
-                            // first 4 bytes happen to decode to a bad length.
-                            // We will emit the raw buffer when `done` fires.
+                            // Corrupt or oversized length header on a
+                            // framed-only stream — the server should
+                            // never emit this.  Drop the rest of the
+                            // buffer and stop reading from this stream.
                             error!(
-                                "Frame length {} invalid (max {}), treating as non-framed stream",
+                                "Frame length {} invalid (max {}), dropping framed unistream",
                                 len, MAX_INBOUND_STREAM_SIZE
                             );
-                            break;
+                            return;
                         }
 
                         if pending.len() < 4 + len {
@@ -251,11 +252,22 @@ fn handle_unidirectional_stream(
                     }
 
                     if done {
-                        // Stream finished. Any remaining data in `pending` is
-                        // from a legacy per-packet stream (single packet, no
-                        // length prefix) -- emit it as-is.
+                        // Stream finished.  With both ends framed-only, a
+                        // non-empty `pending` here means either (a) the
+                        // server crashed mid-frame leaving a truncated
+                        // `[len][partial-payload]` on the wire, or (b) the
+                        // loop above broke out of frame extraction because
+                        // pending.len() < 4 + len for the current header.
+                        // In either case the bytes are not a complete
+                        // `PacketWrapper`; drop them and log.  Issue #776
+                        // removed the legacy "emit raw buffer" fallback —
+                        // emitting truncated bytes would only have produced
+                        // a downstream parse failure.
                         if !pending.is_empty() {
-                            callback.emit(std::mem::take(&mut pending));
+                            warn!(
+                                "Framed unistream EOF with {} unconsumed bytes (truncated frame); dropping",
+                                pending.len()
+                            );
                         }
                         break;
                     }

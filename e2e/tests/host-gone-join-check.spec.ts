@@ -215,12 +215,9 @@ test.describe("Host-gone join check", () => {
     //    after the host leaves.
     await joinMeetingRaw(attendeeAEmail, attendeeAName, meetingId);
     // Admit Attendee A via the admit endpoint.
-    const admitRes = await apiPost(
-      `/api/v1/meetings/${meetingId}/admit/${encodeURIComponent(attendeeAEmail)}`,
-      hostEmail,
-      hostName,
-      {},
-    );
+    const admitRes = await apiPost(`/api/v1/meetings/${meetingId}/admit`, hostEmail, hostName, {
+      user_id: attendeeAEmail,
+    });
     // Discard the result intentionally.  The test's goal is to verify the
     // late-joiner path — not the admit path — and the admit is best-effort
     // setup scaffolding.  Two known reasons it may fail without affecting
@@ -243,7 +240,7 @@ test.describe("Host-gone join check", () => {
     expect(lateJoinRes.status).toBe(403);
 
     const body = await lateJoinRes.json();
-    expect(body?.error?.code ?? body?.code).toBe("JOINING_NOT_ALLOWED");
+    expect(body?.result?.code ?? body?.error?.code ?? body?.code).toBe("JOINING_NOT_ALLOWED");
   });
 
   /**
@@ -312,10 +309,11 @@ test.describe("Host-gone join check", () => {
     // Host leaves → meeting should be ended by the server.
     await leaveMeeting(hostEmail, hostName, meetingId);
 
-    // The late joiner should not see JOINING_NOT_ALLOWED; the meeting is ended.
+    // The late joiner should not see JOINING_NOT_ALLOWED. With end_on_host_leave=ON,
+    // the meeting is ended; the backend returns 200 "waiting_for_meeting" (not 403).
     const lateJoinRes = await joinMeetingRaw(lateEmail, lateName, meetingId);
-    expect(lateJoinRes.ok).toBe(false);
-    const text = await lateJoinRes.text();
-    expect(text).not.toContain("JOINING_NOT_ALLOWED");
+    const body = await lateJoinRes.json();
+    expect(body?.result?.code).not.toBe("JOINING_NOT_ALLOWED");
+    expect(body?.result?.status).toBe("waiting_for_meeting");
   });
 });

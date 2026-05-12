@@ -85,6 +85,11 @@ test.describe("GUID display name handling", () => {
     await expect(page.locator("text=Invalid character")).not.toBeVisible();
   });
 
+  // FIXME(#741): Peer discovery in the 2-user E2E env is too slow —
+  // the .floating-name tile for the remote peer doesn't appear within
+  // 30s. The self-view tile is excluded from visible_tiles, so a second
+  // user is required. Unblock: increase peer discovery timeout or reduce
+  // WebSocket reconnect / heartbeat intervals in docker-compose.e2e.yaml.
   test.fixme("GUID-format name is shown on the meeting page after joining", async ({ baseURL }) => {
     // When a user enters a GUID as their display name and joins a meeting,
     // the meeting page should show that name on the peer tile. A second

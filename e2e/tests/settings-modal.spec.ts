@@ -103,8 +103,10 @@ test.describe("Device settings modal", () => {
     await expect(page.locator("#settings-panel-video")).toBeVisible();
   });
 
-  // FIXME: tests below reference stale UI selectors (old class names, removed text)
-  // after the Appearance panel refactor. Need to rewrite against current DOM structure.
+  // FIXME(#727): Tests below have stale UI selectors after the Appearance
+  // panel refactor. Need rewrite against current DOM. Tracked in #727.
+  // FIXME(#727): Uses getByRole("button", { name: "Mute" }) which doesn't
+  // match hidden tooltip spans. Unblock: switch to tooltip locator pattern.
   test.fixme("opening settings modal preserves current microphone and camera button states", async ({
     page,
   }) => {
@@ -166,6 +168,8 @@ test.describe("Device settings modal", () => {
     expect(camStateAfter).toBe(camStateBefore);
   });
 
+  // FIXME(#727): Appearance panel DOM changed in refactor — selectors for
+  // glow controls, color swatches, and sliders need rewriting.
   test.fixme("user can open the Appearance section and adjust local glow controls", async ({
     page,
   }) => {
@@ -238,6 +242,7 @@ test.describe("Device settings modal", () => {
     await expect(previewTile).toHaveClass(/preview-tile-pulsing/);
   });
 
+  // FIXME(#727): Stale selectors after Appearance panel refactor.
   test.fixme("brightness slider at 0 keeps panel functional and color selection works", async ({
     page,
   }) => {
@@ -296,6 +301,7 @@ test.describe("Device settings modal", () => {
     await expect(previewTile).toHaveClass(/preview-tile-pulsing/);
   });
 
+  // FIXME(#727): Stale selectors after Appearance panel refactor.
   test.fixme("appearance settings persist after reload and rejoin", async ({ page }) => {
     const meetingId = `e2e_settings_persist_${Date.now()}`;
 
@@ -620,6 +626,8 @@ test.describe("Device settings modal", () => {
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
+  // FIXME(#694): Color picker feature tests — not yet validated against
+  // current DOM. Unblock: run in headed mode to confirm selectors.
   test.fixme("custom color popover closes when clicking outside and focus returns to add button", async ({
     page,
   }) => {
@@ -668,6 +676,9 @@ test.describe("Device settings modal", () => {
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
+  // FIXME(#694): Color picker feature — Add button is disabled for invalid
+  // input (by design), so the test flow of click-then-assert-error is wrong.
+  // Unblock: assert button.toBeDisabled() instead of clicking it.
   test.fixme("invalid custom color input shows error and does not add swatch", async ({ page }) => {
     const meetingId = `e2e_custom_color_invalid_${Date.now()}`;
 
@@ -727,6 +738,7 @@ test.describe("Device settings modal", () => {
     expect(swatchCountAfter).toBe(swatchCountBefore);
   });
 
+  // FIXME(#694): Color picker feature — not yet validated against current DOM.
   test.fixme("valid custom color adds swatch, selects it, and it can be reselected", async ({
     page,
   }) => {
@@ -801,6 +813,7 @@ test.describe("Device settings modal", () => {
     await expect(previewTile).toHaveClass(/preview-tile-pulsing/);
   });
 
+  // FIXME(#694): Color picker feature — not yet validated against current DOM.
   test.fixme("custom color can be deleted via delete button", async ({ page }) => {
     const meetingId = `e2e_custom_color_delete_${Date.now()}`;
 
@@ -866,6 +879,7 @@ test.describe("Device settings modal", () => {
     await expect(mintSwatch).toHaveAttribute("aria-pressed", "true");
   });
 
+  // FIXME(#694): Color picker / glow toggle feature — not yet validated.
   test.fixme("glow toggle exists, defaults to ON, and can be switched off and on", async ({
     page,
   }) => {
@@ -911,6 +925,7 @@ test.describe("Device settings modal", () => {
     await expect(glowToggle).toBeChecked();
   });
 
+  // FIXME(#694): Color picker / glow toggle feature — not yet validated.
   test.fixme("preview tile loses glow when toggle is OFF and regains it when ON", async ({
     page,
   }) => {
@@ -961,6 +976,7 @@ test.describe("Device settings modal", () => {
     await expect(panel).not.toHaveClass(/glow-disabled/);
   });
 
+  // FIXME(#694): Color picker / glow toggle feature — not yet validated.
   test.fixme("toggling glow off does not clear the selected color", async ({ page }) => {
     const meetingId = `e2e_glow_toggle_color_${Date.now()}`;
 
@@ -1009,6 +1025,7 @@ test.describe("Device settings modal", () => {
     await expect(previewTile).toHaveAttribute("style", /rgba\(12, 175, 255/);
   });
 
+  // FIXME(#694): Color picker feature — not yet validated against current DOM.
   test.fixme("custom color popover closes with Escape key and focus returns to add button", async ({
     page,
   }) => {
@@ -1059,6 +1076,7 @@ test.describe("Device settings modal", () => {
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
+  // FIXME(#694): Color picker feature — not yet validated against current DOM.
   test.fixme("custom color storage is capped at MAX_CUSTOM_COLORS (10)", async ({ page }) => {
     const meetingId = `e2e_custom_color_cap_${Date.now()}`;
 

@@ -517,6 +517,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
     }
   });
 
+  // FIXME(#741): Requires real VAD-triggered speaking state — fake media
+  // devices produce no audio so waitForTileToSpeak() never resolves and
+  // the glow border is never applied. Unblock: inject a synthetic audio
+  // track with non-zero samples, or mock the VAD signal directly in the
+  // Dioxus client.
   test.fixme("host remains highlighted for other participants while screen sharing", async ({
     baseURL,
   }) => {

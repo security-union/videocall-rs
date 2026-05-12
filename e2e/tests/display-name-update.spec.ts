@@ -558,6 +558,10 @@ test.describe("Display name live update", () => {
    * latest display name (not the stale original). This validates that the
    * `current_display_name` prop is updated before the modal re-renders.
    */
+  // FIXME(#741): The rename modal pre-fills the stale original name after a
+  // successful API rename — current_display_name signal in attendants.rs is
+  // not propagating to the modal's initial value prop. Unblock: fix the
+  // Dioxus signal update path in update_display_name_modal.rs.
   test.fixme("rename modal reopens with latest display name, not stale input", async ({
     baseURL,
   }) => {

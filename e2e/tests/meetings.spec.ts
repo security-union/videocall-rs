@@ -336,6 +336,10 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  // FIXME(#741): CSS :focus-visible pseudo-class doesn't activate reliably
+  // on programmatic focus() or Tab keypress in headless Chromium/WASM.
+  // Unblock: investigate Dioxus event delegation in headless mode, or
+  // add an aria-expanded attribute to assert state without CSS dependency.
   test.fixme("Display Name info icon reveals tooltip on keyboard focus and hides on blur", async ({
     page,
   }) => {
@@ -387,6 +391,8 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 3000 });
   });
 
+  // FIXME(#741): Same :focus-visible limitation as Display Name tooltip
+  // above — Tab navigation doesn't trigger the CSS state in headless WASM.
   test.fixme("Meeting ID info icon reveals tooltip on keyboard focus and hides on blur", async ({
     page,
   }) => {
@@ -418,6 +424,10 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 3000 });
   });
 
+  // FIXME(#460): onclick handler sets open_tooltip signal but headless
+  // Chromium doesn't consistently apply the --open CSS class in time for
+  // the visibility assertion. Unblock: expose aria-expanded on the trigger
+  // span so the test can assert state without relying on CSS class timing.
   test.fixme("Display Name info icon — click toggles the tooltip open and closed", async ({
     page,
   }) => {
@@ -448,6 +458,8 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  // FIXME(#460): Same signal + CSS timing issue as the click-toggle test
+  // above. Unblock: aria-expanded on the trigger span.
   test.fixme("Meeting ID info icon — Enter and Space keys toggle the tooltip", async ({ page }) => {
     // Keyboard activation parity with click-to-toggle (issue #460): with
     // the trigger focused, pressing Enter or Space should toggle the
@@ -496,6 +508,8 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  // FIXME(#460): Requires click-to-open to work first (see above fixme).
+  // Unblock: fix the open_tooltip signal + CSS timing, then enable.
   test.fixme("Open tooltip dismisses on Escape key", async ({ page }) => {
     // Escape-to-dismiss is installed at the window level (issue #460): the
     // home page registers a `keydown` listener that clears the open-tooltip
@@ -522,6 +536,8 @@ test.describe("Meetings", () => {
     await expect(tooltip).toBeHidden({ timeout: 1000 });
   });
 
+  // FIXME(#460): Requires click-to-open to work first (see above fixme).
+  // Unblock: fix the open_tooltip signal + CSS timing, then enable.
   test.fixme("Open tooltip dismisses on outside click", async ({ page }) => {
     // Outside-click dismissal is the touch-device equivalent of Escape
     // (issue #460): a click whose target is not inside any element marked

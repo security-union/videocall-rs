@@ -17,6 +17,41 @@ use videocall_client::VideoCallClient;
 #[derive(Clone, Copy)]
 pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
 
+/// Action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPosition {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            DockPosition::Bottom => "dock-bottom",
+            DockPosition::Left => "dock-left",
+            DockPosition::Right => "dock-right",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            DockPosition::Bottom => DockPosition::Left,
+            DockPosition::Left => DockPosition::Right,
+            DockPosition::Right => DockPosition::Bottom,
+        }
+    }
+}
+
+/// Context for the action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy)]
+pub struct DockPositionCtx(pub Signal<DockPosition>);
+
+/// Context for the action bar autohide setting.
+#[derive(Clone, Copy)]
+pub struct AutohideCtx(pub Signal<bool>);
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
@@ -806,4 +841,30 @@ pub fn register_prefers_color_scheme_listener(
         .ok()?;
 
     Some(std::rc::Rc::new(PrefersColorSchemeHandle { closure, mql }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_position_css_class() {
+        assert_eq!(DockPosition::Bottom.css_class(), "dock-bottom");
+        assert_eq!(DockPosition::Left.css_class(), "dock-left");
+        assert_eq!(DockPosition::Right.css_class(), "dock-right");
+    }
+
+    #[test]
+    fn dock_position_next_cycles() {
+        assert_eq!(DockPosition::Bottom.next(), DockPosition::Left);
+        assert_eq!(DockPosition::Left.next(), DockPosition::Right);
+        assert_eq!(DockPosition::Right.next(), DockPosition::Bottom);
+    }
+
+    #[test]
+    fn dock_position_next_full_roundtrip() {
+        let start = DockPosition::Bottom;
+        let result = start.next().next().next();
+        assert_eq!(result, start);
+    }
 }

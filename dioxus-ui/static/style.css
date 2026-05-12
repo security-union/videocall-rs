@@ -3485,6 +3485,12 @@ select {
   opacity: 0.6;
 }
 
+.glass-select-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--glass-border);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .glass-select-trigger {
     transition: none;
@@ -3852,6 +3858,10 @@ select {
   margin: 0;
 }
 
+.dock-autohide-row {
+  margin-top: 18px;
+}
+
 .appearance-section-title {
   margin: 0;
   font-size: 1.55rem;
@@ -3860,6 +3870,13 @@ select {
   line-height: 1.2;
   color: var(--text-primary);
 }
+
+.appearance-section-title--sm {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+/* Action Bar settings inside Appearance panel */
 
 .appearance-section-helper {
   margin: 0;
@@ -5334,16 +5351,18 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .mock-peers-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--mock-popover-bg) /* @token-exempt: dark near-opaque, themed via token */;
-  border: 1px solid var(--glass-border);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
   z-index: 1000000;
   min-width: 200px;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .mock-peers-popover-header {
@@ -5408,16 +5427,19 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .density-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--surface-elevated);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 12px;
   display: flex;
   gap: 8px;
   z-index: 30;
-  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .density-option {

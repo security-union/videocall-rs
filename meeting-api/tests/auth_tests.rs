@@ -120,13 +120,9 @@ async fn test_dev_auto_login_round_trip_authorizes_protected_endpoint() {
     );
 
     // --- Step 4: reuse the cookie on a protected endpoint — must NOT be 401 ---
-    let app2 = build_app_with_dev_user(
-        pool.clone(),
-        DevUser {
-            email: dev_email.to_string(),
-            name: dev_name.to_string(),
-        },
-    );
+    // Uses plain build_app (dev_user: None) to prove the session is accepted by
+    // the standard AuthUser JWT extractor, independent of dev_user in AppState.
+    let app2 = build_app(pool.clone());
     let req2 = Request::builder()
         .method("GET")
         .uri("/api/v1/meetings?limit=10&offset=0")

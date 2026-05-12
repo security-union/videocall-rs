@@ -517,6 +517,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
     }
   });
 
+  // FIXME(#741): Requires real VAD-triggered speaking state — fake media
+  // devices produce no audio so waitForTileToSpeak() never resolves and
+  // the glow border is never applied. Unblock: inject a synthetic audio
+  // track with non-zero samples, or mock the VAD signal directly in the
+  // Dioxus client.
   test.fixme("host remains highlighted for other participants while screen sharing", async ({
     baseURL,
   }) => {
@@ -538,7 +543,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       await ensureMicrophoneEnabled(hostPage);
 
-      await hostPage.getByRole("button", { name: "Share Screen" }).click();
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
 
       await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
       await expect(guestPage.locator(".screen-share-resize-handle")).toBeVisible({

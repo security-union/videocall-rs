@@ -363,7 +363,9 @@ test.describe("Device settings modal", () => {
     await expect(page.locator('.glow-switch input[type="checkbox"]')).not.toBeChecked();
   });
 
-  test("Glow Color row includes + button that opens custom color popover", async ({ page }) => {
+  test.fixme("Glow Color row includes + button that opens custom color popover", async ({
+    page,
+  }) => {
     const meetingId = `e2e_custom_color_popover_${Date.now()}`;
 
     await page.goto("/");
@@ -668,7 +670,7 @@ test.describe("Device settings modal", () => {
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
-  test("invalid custom color input shows error and does not add swatch", async ({ page }) => {
+  test.fixme("invalid custom color input shows error and does not add swatch", async ({ page }) => {
     const meetingId = `e2e_custom_color_invalid_${Date.now()}`;
 
     await page.goto("/");

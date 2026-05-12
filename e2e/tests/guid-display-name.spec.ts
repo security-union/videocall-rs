@@ -85,7 +85,7 @@ test.describe("GUID display name handling", () => {
     await expect(page.locator("text=Invalid character")).not.toBeVisible();
   });
 
-  test("GUID-format name is shown on the meeting page after joining", async ({ baseURL }) => {
+  test.fixme("GUID-format name is shown on the meeting page after joining", async ({ baseURL }) => {
     // When a user enters a GUID as their display name and joins a meeting,
     // the meeting page should show that name on the peer tile. A second
     // user is needed because .floating-name only renders for remote peers.

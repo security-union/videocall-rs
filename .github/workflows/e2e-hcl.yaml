@@ -340,6 +340,7 @@ jobs:
         if: always() && steps.results.outputs.status == '0' && github.event_name == 'push'
         env:
           GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "${GCHAT_WEBHOOK_URL}" ]; then
             echo "GCHAT_WEBHOOK_URL secret not set, skipping notification"
@@ -354,9 +355,18 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
 
+          PR_INFO=""
+          PR_JSON=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0] | "\(.number) \(.title)"' 2>/dev/null || true)
+          if [ -n "${PR_JSON}" ]; then
+            PR_NUM=$(echo "${PR_JSON}" | cut -d' ' -f1)
+            PR_TITLE=$(echo "${PR_JSON}" | cut -d' ' -f2-)
+            PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
+            PR_INFO="\n🔀 PR #${PR_NUM}: ${PR_TITLE}\n    ${PR_URL}"
+          fi
+
           DASHBOARD_URL="https://grafana.videocall.fnxlabs.com/public-dashboards/2dd04ba37cf144f1862941620daa6349?orgId=1&from=now-24h&to=now"
 
-          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\`\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s\n📝 Commit: \`${SHORT_SHA}\`\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
+          MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\` (\`${SHORT_SHA}\`)\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s${PR_INFO}\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
 
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
             -H 'Content-Type: application/json' \

@@ -23,7 +23,7 @@
 //
 use super::connection_lost_reason::ConnectionLostReason;
 use super::url_log::strip_query_for_log;
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
@@ -118,8 +118,22 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
         Ok(task)
     }
 
-    fn send_bytes(&self, bytes: Vec<u8>) {
-        WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+    /// Reliable media-packet send path.
+    ///
+    /// Phase 2 of the WebTransport freeze fix: every reliable packet rides on
+    /// a **persistent** per-media-type QUIC unidirectional stream rather than
+    /// opening a fresh stream per packet (~80 streams/sec/sender in the legacy
+    /// pattern).  Stream identity is `stream_key.as_u8()`; the server-side
+    /// reader at `actix-api/src/webtransport/bridge.rs` reads length-prefixed
+    /// frames from each stream in a loop until EOF and routes by the MediaType
+    /// inside the encrypted protobuf payload.
+    fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        WebTransportTask::send_on_persistent_stream(
+            self.transport.clone(),
+            self.persistent_streams.clone(),
+            stream_key.as_u8(),
+            bytes,
+        );
     }
 
     fn send_bytes_datagram(&self, bytes: Vec<u8>) {
@@ -127,18 +141,26 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
 
         if bytes.len() <= DATAGRAM_MAX_SIZE {
             // Packet fits within the datagram MTU -- send as unreliable datagram
-            // for lower latency and no head-of-line blocking.
+            // for lower latency and no head-of-line blocking.  Datagrams are
+            // on a separate primitive from persistent streams and are NOT
+            // length-prefix framed.
             WebTransportTask::send_datagram(self.transport.clone(), bytes);
         } else {
             // Packet exceeds datagram size limit (e.g., a keyframe).
-            // Fall back to a per-packet unidirectional stream so the server's
-            // `read_to_end` can receive it as a complete frame.
+            // Fall back to the Control persistent stream so the server's
+            // framed reader can receive it as a complete frame without
+            // application-layer fragmentation.
             debug!(
-                "Packet size {} exceeds datagram MTU {}, falling back to unistream",
+                "Packet size {} exceeds datagram MTU {}, falling back to Control persistent stream",
                 bytes.len(),
                 DATAGRAM_MAX_SIZE
             );
-            WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+            WebTransportTask::send_on_persistent_stream(
+                self.transport.clone(),
+                self.persistent_streams.clone(),
+                MediaStreamKey::Control.as_u8(),
+                bytes,
+            );
         }
     }
 }

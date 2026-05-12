@@ -1096,4 +1096,165 @@ mod framing_tests {
             other => panic!("truncated frame must surface as NeedMorePayload, got {other:?}"),
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Eviction-race tests (issue #773).
+    //
+    // These exercise the pure-Rust `remove_if_token_matches` helper, which
+    // implements the compare-and-remove logic used by the
+    // `send_on_persistent_stream` error handler.  Because the real
+    // `PersistentSendStream` contains JS WritableStream handles we cannot
+    // construct on the host, we use a tiny test stand-in that carries only
+    // the identity token.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal `HasIdentityToken` impl for host-target tests.  Real
+    /// `PersistentSendStream` instances cannot be constructed without a
+    /// live WebTransport session, so we use this to drive the eviction
+    /// helper directly.
+    struct TestEntry {
+        token: Rc<()>,
+    }
+
+    impl HasIdentityToken for TestEntry {
+        fn identity_token(&self) -> &Rc<()> {
+            &self.token
+        }
+    }
+
+    /// Baseline: a matching token evicts; a non-matching token does not.
+    #[test]
+    fn remove_if_token_matches_basic() {
+        let token = Rc::new(());
+        let other = Rc::new(());
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        map.insert(
+            7,
+            TestEntry {
+                token: token.clone(),
+            },
+        );
+
+        // Wrong token: must not evict.
+        assert!(!remove_if_token_matches(&mut map, 7, &other));
+        assert!(map.contains_key(&7));
+
+        // Correct token: evicts.
+        assert!(remove_if_token_matches(&mut map, 7, &token));
+        assert!(!map.contains_key(&7));
+
+        // Missing key: returns false, no panic.
+        assert!(!remove_if_token_matches(&mut map, 7, &token));
+    }
+
+    /// The race that motivated issue #773.
+    ///
+    /// Scenario (single-threaded WASM, so ordering is fully deterministic
+    /// once we step through it):
+    ///
+    /// 1. Sender A and sender B both clone the writer from entry `e1` for
+    ///    the same `stream_key`, each capturing `e1.token` (same `Rc<()>`
+    ///    underneath).
+    /// 2. The QUIC stream backing `e1` dies.  Sender A's write fails first.
+    /// 3. Sender A re-acquires the map lock and runs the eviction check
+    ///    against its captured token.  `e1` is still in the map with the
+    ///    matching token, so `e1` is evicted.
+    /// 4. Sender C arrives, sees the key vacant, opens a fresh stream
+    ///    and inserts `e2` with a *new* identity token.
+    /// 5. Sender B's write finally fails and runs the eviction check
+    ///    against the token it captured from `e1`.  The map currently
+    ///    holds `e2` whose token does NOT match — `e2` must survive.
+    ///
+    /// Without the identity-token check, step 5 would orphan a healthy
+    /// stream and cause the next sender for `stream_key` to needlessly
+    /// open yet another fresh stream — the precise bug #773 describes.
+    #[test]
+    fn fresh_entry_survives_stale_error_handler_eviction() {
+        const KEY: u8 = 3;
+
+        // Step 1: A and B both capture e1's token.
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        let e1_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e1_token.clone(),
+            },
+        );
+        let captured_by_a = e1_token.clone();
+        let captured_by_b = e1_token.clone();
+
+        // Step 3: A's error handler runs first, evicts e1.
+        assert!(
+            remove_if_token_matches(&mut map, KEY, &captured_by_a),
+            "A's eviction should remove e1 because its token still matches",
+        );
+        assert!(
+            !map.contains_key(&KEY),
+            "e1 must be gone after A's eviction"
+        );
+
+        // Step 4: Fresh sender C inserts e2 with a brand-new token.
+        let e2_token = Rc::new(());
+        assert!(
+            !Rc::ptr_eq(&e1_token, &e2_token),
+            "test setup invariant: e1 and e2 must have distinct tokens",
+        );
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e2_token.clone(),
+            },
+        );
+
+        // Step 5: B's stale error handler tries to evict.  Without the
+        // token check this would remove e2 and orphan the healthy stream.
+        // With the check, B sees the mismatch and leaves e2 alone.
+        assert!(
+            !remove_if_token_matches(&mut map, KEY, &captured_by_b),
+            "B's stale eviction must NOT remove the fresh entry e2",
+        );
+        assert!(map.contains_key(&KEY), "e2 must survive the stale eviction",);
+        assert!(
+            Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token),
+            "the entry under KEY must still be e2 (its token is unchanged)",
+        );
+    }
+
+    /// Variant: two stale error handlers and one fresh insert, in the
+    /// reverse interleaving order (B fires before A re-acquires the lock).
+    /// Establishes that the order of failing senders does not affect the
+    /// invariant — only the captured-token comparison matters.
+    #[test]
+    fn token_check_is_order_independent_under_multiple_stale_handlers() {
+        const KEY: u8 = 9;
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        let e1_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e1_token.clone(),
+            },
+        );
+        let captured_by_a = e1_token.clone();
+        let captured_by_b = e1_token.clone();
+
+        // B fires first this time.
+        assert!(remove_if_token_matches(&mut map, KEY, &captured_by_b));
+        assert!(!map.contains_key(&KEY));
+
+        // Fresh sender opens e2.
+        let e2_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e2_token.clone(),
+            },
+        );
+
+        // A's (now stale) error handler must NOT evict e2.
+        assert!(!remove_if_token_matches(&mut map, KEY, &captured_by_a));
+        assert!(map.contains_key(&KEY));
+        assert!(Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token));
+    }
 }

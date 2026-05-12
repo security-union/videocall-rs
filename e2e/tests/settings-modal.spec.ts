@@ -419,7 +419,7 @@ test.describe("Device settings modal", () => {
     await expect(title).toHaveText("Choose Custom Color");
 
     // Custom HSV picker: saturation/value square with proper ARIA
-    const svSquare = popover.locator(".color-picker-sv");
+    const svSquare = popover.locator(".color-picker-sv-square");
     await expect(svSquare).toBeVisible();
     await expect(svSquare).toHaveAttribute("role", "application");
     await expect(svSquare).toHaveAttribute("tabindex", "0");
@@ -707,27 +707,19 @@ test.describe("Device settings modal", () => {
     // Count existing swatches before attempting invalid adds
     const swatchCountBefore = await page.locator(".color-swatches .color-swatch").count();
 
-    // Test invalid: missing # prefix
+    // Test invalid: missing # prefix — Add button is disabled
     await colorInput.fill("123456");
-    await addColorBtn.click();
-    await expect(colorInput).toHaveClass(/error/);
-    // Error message should be visible with correct text
-    await expect(popover.locator("p")).toContainText("Invalid format");
-    // Popover stays open — no swatch added
+    await expect(addColorBtn).toBeDisabled();
     await expect(popover).toBeVisible();
 
     // Test invalid: too short
     await colorInput.fill("#12");
-    await addColorBtn.click();
-    await expect(colorInput).toHaveClass(/error/);
-    await expect(popover.locator("p")).toContainText("Invalid format");
+    await expect(addColorBtn).toBeDisabled();
     await expect(popover).toBeVisible();
 
     // Test invalid: non-hex characters
     await colorInput.fill("#GGGGGG");
-    await addColorBtn.click();
-    await expect(colorInput).toHaveClass(/error/);
-    await expect(popover.locator("p")).toContainText("Invalid format");
+    await expect(addColorBtn).toBeDisabled();
     await expect(popover).toBeVisible();
 
     // Confirm no new swatch was added

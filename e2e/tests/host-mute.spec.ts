@@ -288,7 +288,14 @@ test.describe("Host mute controls", () => {
       });
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
 
-      // ---- Host clicks "Mute all" via the host actions context menu ----
+      // ---- Host opens peer list then clicks "Mute all" via context menu ----
+      const openPeersBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Open Peers" }),
+      });
+      await expect(openPeersBtn).toBeVisible({ timeout: 10_000 });
+      await openPeersBtn.click();
+      await hostPage.waitForTimeout(1000);
+
       const hostActionsBtn = hostPage.locator('button[aria-label="Host actions"]');
       await expect(hostActionsBtn).toBeVisible({ timeout: 10_000 });
       await hostActionsBtn.click();

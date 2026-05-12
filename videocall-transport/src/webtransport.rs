@@ -571,9 +571,16 @@ impl WebTransportTask {
         stream_key: u8,
         data: Vec<u8>,
     ) {
-        // Frame-size guard: an over-large frame would be rejected by the
-        // server's `MAX_FRAME_SIZE` check.  Drop early so we don't write a
-        // bad length header that forces a stream restart.
+        // Frame-size and emptiness guards.  Mirrors the server-side
+        // `read_length_prefixed_frame` contract: zero-length payloads are
+        // treated as malformed (no legitimate caller has a reason to send
+        // one), and over-large payloads are rejected up front to avoid
+        // writing a bad header that would force an immediate stream restart
+        // on the receiver.
+        if data.is_empty() {
+            log!("persistent stream send dropped: empty payload");
+            return;
+        }
         if data.len() > PERSISTENT_STREAM_MAX_FRAME_SIZE {
             log!(
                 "persistent stream send dropped: payload exceeds max frame size,",

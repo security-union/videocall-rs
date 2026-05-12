@@ -1843,6 +1843,26 @@ fn try_intercept_display_name_change(
     true
 }
 
+/// Server-authoritative packet filter for observer (waiting-room) sessions.
+///
+/// # Enforcement Model
+///
+/// Audio/video isolation for waiting-room participants is enforced at three layers:
+///
+/// 1. **Server outbound (this function)** — Authoritative. Observer sessions only
+///    receive MEETING and SESSION_ASSIGNED packets. All other packet types,
+///    including MEDIA, are dropped. This is fail-closed: unparseable packets
+///    and unknown packet types are also dropped.
+///
+/// 2. **Server inbound (`SessionLogic::handle_inbound`)** — Observer sessions
+///    cannot publish MEDIA or KEYFRAME_REQUEST packets to the room.
+///
+/// 3. **Client-side (`decode_media = false`)** — Defense-in-depth only. The client
+///    drops MEDIA packets when in observer mode, but this is bypassable by a
+///    modified client and MUST NOT be the sole enforcement mechanism.
+///
+/// A modified client cannot bypass isolation because the server never sends
+/// MEDIA packets to observer sessions in the first place.
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,

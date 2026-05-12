@@ -22,6 +22,7 @@
 ///
 use super::task::Task;
 use super::url_log::strip_query_for_log;
+use super::webmedia::MediaStreamKey;
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
@@ -168,9 +169,14 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    /// Send a packet via the reliable stream selected by `stream_key`.
+    ///
+    /// `stream_key` selects which persistent QUIC stream the packet rides
+    /// on under WebTransport (one per media type to prevent head-of-line
+    /// blocking).  Ignored by WebSocket.
+    pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
         if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet);
+            self.task.send_packet(packet, stream_key);
         }
     }
 

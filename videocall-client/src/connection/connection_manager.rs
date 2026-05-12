@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 
 use super::connection::Connection;
 use super::url_log::strip_query_for_log;
-use super::webmedia::ConnectOptions;
+use super::webmedia::{ConnectOptions, MediaStreamKey};
 use crate::adaptive_quality_constants::{
     ELECTION_MAX_EXTENSIONS, ELECTION_MIN_RTT_SAMPLES, POST_REBASE_RETRY_DELAY_MS,
     POST_REBASE_RETRY_MAX_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_CONSECUTIVE_ZERO_LIMIT,
@@ -3207,16 +3207,17 @@ impl ConnectionManager {
         self.options.on_state_changed.emit(state);
     }
 
-    /// Send packet through active connection via reliable stream.
+    /// Send packet through active connection via the reliable per-media-type
+    /// stream selected by `stream_key`.
     ///
     /// During re-election, the old active connection (preserved in
     /// `old_active_connection`) is used if the elected connection is no
     /// longer in the main connections HashMap.
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) -> Result<()> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             // Try the main connections HashMap first.
             if let Some(connection) = self.connections.get(active_id) {
-                connection.send_packet(packet);
+                connection.send_packet(packet, stream_key);
                 // Increment packets sent counter
                 self.packets_sent.set(self.packets_sent.get() + 1);
                 return Ok(());
@@ -3224,7 +3225,7 @@ impl ConnectionManager {
             // During re-election, the old connection lives in old_active_connection.
             if let Some((ref old_id, ref old_conn)) = self.old_active_connection {
                 if old_id == active_id {
-                    old_conn.send_packet(packet);
+                    old_conn.send_packet(packet, stream_key);
                     // Increment packets sent counter
                     self.packets_sent.set(self.packets_sent.get() + 1);
                     return Ok(());

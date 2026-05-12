@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::connection::MediaStreamKey;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_timers::future::sleep;
@@ -813,7 +814,10 @@ impl ScreenEncoder {
                     &userid,
                     aes.clone(),
                 );
-                client.send_media_packet(packet);
+                // Phase 2 of WT freeze fix: route screen-share video on its
+                // own persistent QUIC stream, isolated from the camera and
+                // audio streams.
+                client.send_media_packet(packet, MediaStreamKey::Screen);
                 sequence_number += 1;
             })
         };

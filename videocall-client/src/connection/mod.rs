@@ -35,4 +35,4 @@ pub use connection_manager::{
     connection_handshake_failures, connection_session_drops, ConnectionManagerOptions,
     ConnectionState,
 };
-pub use webmedia::ConnectOptions;
+pub use webmedia::{ConnectOptions, MediaStreamKey};

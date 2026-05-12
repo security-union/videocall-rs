@@ -59,6 +59,7 @@ pub fn camera_encoder_errors_generic() -> u64 {
 pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
+use crate::connection::MediaStreamKey;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -869,7 +870,10 @@ impl CameraEncoder {
                                 &userid,
                                 aes.clone(),
                             );
-                            client.send_media_packet(packet);
+                            // Phase 2 of WT freeze fix: route camera video on
+                            // its dedicated persistent QUIC stream so a stall
+                            // on a video keyframe never blocks audio.
+                            client.send_media_packet(packet, MediaStreamKey::Video);
                             local_seq += 1;
                             seq_out_inner.set(local_seq);
                         }) as Box<dyn FnMut(JsValue)>,

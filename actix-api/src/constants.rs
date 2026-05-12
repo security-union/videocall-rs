@@ -145,6 +145,36 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
 /// provides ~6.4MB max queue depth.
 pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
+/// Bounded channel capacity for the WebTransport **datagram** outbound queue.
+///
+/// As of the Phase 2 WT-freeze fix (discussion #756), the per-session
+/// outbound channel is split into two: a unistream channel and a
+/// datagram channel. Splitting the channels is the architectural change;
+/// the unistream side keeps the env-tunable
+/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (currently 4096) since it
+/// continues to absorb video + screen + oversized control packets, while
+/// the datagram side is sized small on purpose:
+///
+/// * Datagram traffic is small (~80 audio packets/sec/sender at ~80B
+///   each, plus heartbeats / RTT echoes / non-media control under MTU).
+/// * Datagrams are independent: there is no QUIC flow-control coupling
+///   between them, so a slow receiver cannot stall the queue.
+/// * `session.send_datagram` returns immediately on the wire (UDP-style
+///   semantics inside the QUIC connection), so the queue exists only to
+///   absorb actor-side bursts during scheduling jitter — not to buffer
+///   for receiver congestion.
+///
+/// 512 slots ≈ 10 seconds of headroom at 50 audio pps (the dominant
+/// datagram rate per session); more than enough for actor / writer
+/// scheduling jitter, and small enough that a misrouted video burst
+/// (oversized audio mis-classified as datagram) would not balloon
+/// per-session memory.
+///
+/// This value is NOT env-tunable today. If a future workload genuinely
+/// needs a larger datagram queue (e.g. very chatty diagnostics), promote
+/// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
+pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
+
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------

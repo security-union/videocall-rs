@@ -363,9 +363,7 @@ test.describe("Device settings modal", () => {
     await expect(page.locator('.glow-switch input[type="checkbox"]')).not.toBeChecked();
   });
 
-  test.fixme("Glow Color row includes + button that opens custom color popover", async ({
-    page,
-  }) => {
+  test("Glow Color row includes + button that opens custom color popover", async ({ page }) => {
     const meetingId = `e2e_custom_color_popover_${Date.now()}`;
 
     await page.goto("/");
@@ -438,7 +436,7 @@ test.describe("Device settings modal", () => {
     await expect(hueTrack.locator(".color-picker-hue-thumb")).toBeVisible();
 
     // Preview swatch is rendered alongside the picker
-    await expect(popover.locator(".color-picker-preview")).toBeVisible();
+    await expect(popover.locator(".color-picker-preview-swatch")).toBeVisible();
 
     // Hex text input
     await expect(popover.locator(".custom-color-input")).toBeVisible();

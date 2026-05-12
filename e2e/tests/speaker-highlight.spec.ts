@@ -538,7 +538,11 @@ test.describe("Speaker highlight glow on video tiles", () => {
     try {
       await ensureMicrophoneEnabled(hostPage);
 
-      await hostPage.getByRole("button", { name: "Share Screen" }).click();
+      const shareBtn = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 10_000 });
+      await shareBtn.click();
 
       await expect(guestPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
       await expect(guestPage.locator(".screen-share-resize-handle")).toBeVisible({

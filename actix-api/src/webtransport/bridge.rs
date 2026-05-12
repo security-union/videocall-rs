@@ -337,8 +337,34 @@ impl WebTransportBridge {
     }
 }
 
-/// Read one length-prefixed frame (`[4-byte BE length][payload]`) from a
-/// WebTransport uni stream.
+/// Minimal abstraction over a byte source that fills a buffer exactly,
+/// used by [`read_length_prefixed_frame`].
+///
+/// We deliberately collapse all I/O errors to `Err(())` because the
+/// framing logic only needs to distinguish "the read succeeded" from
+/// "the read did not produce all the requested bytes" — it does not
+/// care about the underlying error type. This lets the same framing
+/// function drive a real `web_transport_quinn::RecvStream` in
+/// production and an in-memory byte slice in unit tests, eliminating
+/// the parallel test-only re-implementation that previously existed.
+trait FrameReader {
+    /// Fill `buf` entirely or return `Err(())`. Returning `Err(())` is
+    /// the only signal for EOF — at a frame boundary the framing logic
+    /// interprets it as a clean stream close.
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ()>;
+}
+
+impl FrameReader for web_transport_quinn::RecvStream {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ()> {
+        web_transport_quinn::RecvStream::read_exact(self, buf)
+            .await
+            .map_err(|_| ())
+    }
+}
+
+/// Read one length-prefixed frame (`[4-byte BE length][payload]`) from any
+/// byte source that implements [`FrameReader`]. In production the source is
+/// a WebTransport uni stream; in tests it is an in-memory byte slice.
 ///
 /// Returns:
 /// * `Ok(Some(payload))` on a successfully decoded frame.
@@ -354,8 +380,8 @@ impl WebTransportBridge {
 ///   the same way as `Malformed`: close the stream and stop reading.
 /// * `Err(FramedReadError::TruncatedPayload)` if the header decoded
 ///   successfully but the payload was truncated. Same handling.
-async fn read_length_prefixed_frame(
-    stream: &mut web_transport_quinn::RecvStream,
+async fn read_length_prefixed_frame<R: FrameReader>(
+    stream: &mut R,
 ) -> Result<Option<Vec<u8>>, FramedReadError> {
     // Read the 4-byte big-endian length header. We use a byte-at-a-time
     // probe for the first byte so we can distinguish "clean EOF at frame
@@ -481,79 +507,98 @@ enum FramedReadError {
 mod tests {
     //! Unit tests for the framed reader.
     //!
-    //! These tests drive `read_length_prefixed_frame` against fake
-    //! `RecvStream`-shaped inputs by building a real WebTransport
-    //! session pair in-process — the only way to obtain a genuine
-    //! `web_transport_quinn::RecvStream` (the type is opaque and has no
-    //! public constructors). For pure framing logic that does not need
-    //! the I/O type, we use a `#[cfg(test)]` cover helper that operates
-    //! on `AsyncRead`-implementing buffers via the same byte-shape
-    //! semantics.
+    //! These tests drive the real production [`read_length_prefixed_frame`]
+    //! against an in-memory byte source. The function is generic over the
+    //! [`FrameReader`] trait, and we implement that trait for a tiny
+    //! [`BytesCursor`] adapter below. This means the framing logic the
+    //! tests assert is byte-for-byte the same logic that runs in
+    //! production — there is no parallel re-implementation to drift
+    //! out of sync.
     //!
-    //! We do NOT test `read_length_prefixed_frame` directly with a
-    //! `RecvStream`; instead we ship a parallel pure-bytes helper
-    //! `decode_frames_from_bytes` that implements the identical
-    //! semantics on a `&[u8]`, and the framing logic is asserted on
-    //! that. The two implementations share the `FramedReadError` enum
-    //! and the `MAX_FRAME_SIZE` check so any divergence is caught by
-    //! review.
-    //!
-    //! Integration of the real `RecvStream` path is covered by the
-    //! existing `actix-api/src/webtransport/mod.rs` integration tests
-    //! (`test_relay_packet_webtransport_between_two_clients` etc.) which
-    //! send framed packets end-to-end through a real WebTransport
-    //! session.
+    //! Integration of the real [`web_transport_quinn::RecvStream`] path
+    //! (including QUIC's read-exact error variants) is covered by the
+    //! end-to-end tests in `actix-api/src/webtransport/mod.rs`
+    //! (`test_relay_packet_webtransport_between_two_clients` etc.).
 
     use super::*;
 
-    /// Pure-bytes parallel of [`read_length_prefixed_frame`] for unit
-    /// tests. Drives the same framing rules against an in-memory byte
-    /// slice so we can assert decode/malformed/EOF behaviour without
-    /// the cost of standing up a real `quinn::Connection`.
-    ///
-    /// Returns the list of decoded payloads and a terminal status. The
-    /// terminal status encodes whether the input ended cleanly at a
-    /// frame boundary, was truncated mid-header, was truncated
-    /// mid-payload, or contained a length outside the allowed range.
-    fn decode_frames_from_bytes(buf: &[u8]) -> (Vec<Vec<u8>>, TerminalStatus) {
-        let mut payloads = Vec::new();
-        let mut pos = 0;
-        loop {
-            if pos == buf.len() {
-                return (payloads, TerminalStatus::CleanEof);
-            }
-            if buf.len() - pos < 4 {
-                return (payloads, TerminalStatus::TruncatedHeader);
-            }
-            let mut len_buf = [0u8; 4];
-            len_buf.copy_from_slice(&buf[pos..pos + 4]);
-            let payload_len = u32::from_be_bytes(len_buf) as usize;
-            pos += 4;
-            if payload_len == 0 {
-                return (payloads, TerminalStatus::Malformed { len: 0 });
-            }
-            if payload_len > MAX_FRAME_SIZE {
-                return (payloads, TerminalStatus::Malformed { len: payload_len });
-            }
-            if buf.len() - pos < payload_len {
-                return (
-                    payloads,
-                    TerminalStatus::TruncatedPayload {
-                        expected: payload_len,
-                    },
-                );
-            }
-            payloads.push(buf[pos..pos + payload_len].to_vec());
-            pos += payload_len;
+    /// Minimal in-memory implementation of [`FrameReader`] for unit
+    /// tests. Consumes from a `Vec<u8>` exactly the way the real
+    /// `RecvStream::read_exact` consumes from a quinn stream: returns
+    /// `Ok(())` only when the full buffer can be filled, otherwise
+    /// returns `Err(())` to signal EOF / truncation.
+    struct BytesCursor {
+        buf: Vec<u8>,
+        pos: usize,
+    }
+
+    impl BytesCursor {
+        fn new(buf: Vec<u8>) -> Self {
+            Self { buf, pos: 0 }
         }
     }
 
+    impl FrameReader for BytesCursor {
+        async fn read_exact(&mut self, out: &mut [u8]) -> Result<(), ()> {
+            if self.buf.len() - self.pos < out.len() {
+                // Mirror RecvStream::read_exact's behaviour: on
+                // insufficient bytes the test cursor returns Err
+                // *without* consuming any of the partial read. The
+                // production framing logic only inspects success/failure,
+                // not the remaining cursor state, so this matches.
+                return Err(());
+            }
+            out.copy_from_slice(&self.buf[self.pos..self.pos + out.len()]);
+            self.pos += out.len();
+            Ok(())
+        }
+    }
+
+    /// Terminal state of the per-stream reader loop. Mirrors the way
+    /// [`read_framed_packets_loop`] reacts to the four possible outcomes
+    /// of [`read_length_prefixed_frame`], so each test can assert both
+    /// the decoded payload list and the reason the loop stopped.
     #[derive(Debug, PartialEq, Eq)]
     enum TerminalStatus {
         CleanEof,
         TruncatedHeader,
         TruncatedPayload { expected: usize },
         Malformed { len: usize },
+    }
+
+    /// Drive the real [`read_length_prefixed_frame`] over a byte slice
+    /// until it terminates, collecting all decoded payloads and the
+    /// terminal reason. This is the *only* decode entry point used by
+    /// the test suite; there is no parallel re-implementation to keep
+    /// in sync with production.
+    async fn decode_all(buf: &[u8]) -> (Vec<Vec<u8>>, TerminalStatus) {
+        let mut cursor = BytesCursor::new(buf.to_vec());
+        let mut payloads = Vec::new();
+        loop {
+            match read_length_prefixed_frame(&mut cursor).await {
+                Ok(Some(p)) => payloads.push(p),
+                Ok(None) => return (payloads, TerminalStatus::CleanEof),
+                Err(FramedReadError::Malformed { len }) => {
+                    return (payloads, TerminalStatus::Malformed { len });
+                }
+                Err(FramedReadError::TruncatedHeader) => {
+                    return (payloads, TerminalStatus::TruncatedHeader);
+                }
+                Err(FramedReadError::TruncatedPayload { expected }) => {
+                    return (payloads, TerminalStatus::TruncatedPayload { expected });
+                }
+            }
+        }
+    }
+
+    /// Convenience wrapper so the tests stay synchronous-looking. Spins
+    /// up a single-threaded runtime per call — fine for these
+    /// microsecond-scale framing tests.
+    fn decode_frames_from_bytes(buf: &[u8]) -> (Vec<Vec<u8>>, TerminalStatus) {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(decode_all(buf))
     }
 
     /// Build a `[u32 BE length][payload]` framed byte stream from a list

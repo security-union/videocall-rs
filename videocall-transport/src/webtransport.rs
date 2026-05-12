@@ -6,7 +6,9 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
+use futures::lock::Mutex as AsyncMutex;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
@@ -19,6 +21,7 @@ use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportDatagramDuplexStream, WebTransportReceiveStream, WritableStream,
+    WritableStreamDefaultWriter,
 };
 
 /// Cumulative count of datagrams dropped because the writable stream was locked.
@@ -27,6 +30,47 @@ static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Returns the total number of datagrams dropped since process start.
 pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Maximum length-prefixed frame payload size on a persistent stream (4 MB).
+/// Matches the server's `MAX_FRAME_SIZE` so honest senders never trip the
+/// server-side guard.  Frames larger than this are dropped client-side rather
+/// than being written and immediately torn down by the receiver.
+pub const PERSISTENT_STREAM_MAX_FRAME_SIZE: usize = 4_000_000;
+
+/// Holds a persistent unidirectional stream and its writer so the QUIC stream
+/// stays open across multiple sends, preserving packet ordering.
+///
+/// Each `PersistentSendStream` corresponds to **one** QUIC unidirectional
+/// stream.  We open one of these per media type (audio, video, screen,
+/// control) so that head-of-line blocking on one media type cannot stall the
+/// others.  See `webtransport-client` / Phase 2 architectural fix for
+/// background.
+pub struct PersistentSendStream {
+    /// The underlying `WritableStream` (QUIC send stream).  Kept alive so the
+    /// stream is not garbage-collected while the writer is in use.
+    _stream: WritableStream,
+    /// The writer acquired from `_stream`.  Reused for every reliable send
+    /// on this media type.  The writer enforces FIFO ordering of writes; we
+    /// do not need to serialise writes ourselves once the writer is created.
+    writer: WritableStreamDefaultWriter,
+}
+
+/// Map of per-media-type persistent send streams, keyed by an opaque `u8`
+/// stream identifier.  The transport layer does not interpret the key — that
+/// is the caller's responsibility (see `MediaStreamKey` in
+/// `videocall-client/src/connection/webmedia.rs`).
+///
+/// The map is wrapped in an `AsyncMutex` so that the lazy-creation path is
+/// race-free across concurrent `send_on_persistent_stream` invocations.  In
+/// single-threaded WASM the mutex is purely a re-entrancy guard across
+/// `.await` points; it does **not** block writes once the stream exists.
+pub type PersistentStreamMap = Rc<AsyncMutex<HashMap<u8, PersistentSendStream>>>;
+
+/// Construct an empty persistent-stream map.  Stored inside `WebTransportTask`
+/// and threaded through `send_on_persistent_stream`.
+pub fn new_persistent_stream_map() -> PersistentStreamMap {
+    Rc::new(AsyncMutex::new(HashMap::new()))
 }
 
 /// Represents formatting errors.
@@ -87,6 +131,11 @@ pub struct WebTransportTask {
     opened_closure: Closure<dyn FnMut(JsValue)>,
     #[allow(dead_code)]
     closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
+    /// Per-media-type persistent unidirectional send streams.  Lazily
+    /// populated by `send_on_persistent_stream` on first send for each key.
+    /// On stream-write error the entry is removed; the next send for that
+    /// key opens a fresh stream.
+    pub persistent_streams: PersistentStreamMap,
 }
 
 impl WebTransportTask {
@@ -103,6 +152,7 @@ impl WebTransportTask {
             listeners,
             opened_closure,
             closed_closure,
+            persistent_streams: new_persistent_stream_map(),
         }
     }
 }
@@ -401,7 +451,156 @@ impl WebTransportTask {
         });
     }
 
+    /// Sends a length-prefix-framed packet on a **persistent** unidirectional
+    /// QUIC stream identified by `stream_key`.
+    ///
+    /// Phase 2 of the WebTransport freeze fix (HCL discussion #756): instead of
+    /// opening a fresh QUIC stream per packet (the legacy
+    /// `send_unidirectional_stream` behaviour), each media type reuses a
+    /// long-lived stream.  This collapses ~80 streams/sec/sender to ~3
+    /// streams/connection and eliminates the relay-side `accept_uni` storm and
+    /// tokio-scheduler reorder that produced the user's five-minute WT
+    /// audio+video freeze.
+    ///
+    /// ## Framing
+    ///
+    /// Every frame is written as `[u32 BE length][payload]`.  The length
+    /// excludes the 4-byte header.  Both client and server are framed-only:
+    /// there is no per-packet-stream fallback.
+    ///
+    /// The header is emitted as a single `write_with_chunk` together with the
+    /// payload so the JS WritableStream cannot interleave the length prefix of
+    /// one frame with the payload of another (chunks are atomic — the WebIDL
+    /// spec guarantees no sub-chunk interleaving).
+    ///
+    /// ## Concurrency
+    ///
+    /// The lazy-creation path is guarded by a per-task `AsyncMutex` so that
+    /// two concurrent `send_on_persistent_stream` invocations for the same
+    /// key cannot both observe `None` and race to open a stream.  Once the
+    /// stream exists, the WritableStream writer enforces FIFO ordering of
+    /// writes internally; we do not need to hold the mutex across the
+    /// `write_with_chunk` await.
+    ///
+    /// ## Error handling
+    ///
+    /// On any write error the entry for `stream_key` is removed from the
+    /// map.  The next send for that key will open a fresh stream.  The
+    /// transport is NOT closed — a single failed frame must not kill the
+    /// session for all participants.  The receiver detects the closed stream
+    /// (via EOF) and discards any partial buffer; framing guarantees that a
+    /// truncated frame becomes a clean stream-closed event rather than a
+    /// silently-corrupted payload.
+    pub fn send_on_persistent_stream(
+        transport: Rc<WebTransport>,
+        streams: PersistentStreamMap,
+        stream_key: u8,
+        data: Vec<u8>,
+    ) {
+        // Frame-size guard: an over-large frame would be rejected by the
+        // server's `MAX_FRAME_SIZE` check.  Drop early so we don't write a
+        // bad length header that forces a stream restart.
+        if data.len() > PERSISTENT_STREAM_MAX_FRAME_SIZE {
+            log!(
+                "persistent stream send dropped: payload exceeds max frame size,",
+                data.len() as u32,
+                ">",
+                PERSISTENT_STREAM_MAX_FRAME_SIZE as u32
+            );
+            return;
+        }
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let result: Result<(), anyhow::Error> = async {
+                // --- Wait for the transport handshake ------------------------
+                // ready() resolves once the underlying QUIC session is
+                // established.  Calling create_unidirectional_stream() before
+                // ready() resolves throws.
+                JsFuture::from(transport.ready())
+                    .await
+                    .map_err(|e| anyhow!("transport.ready() failed: {:?}", e))?;
+
+                // --- Ensure a writer exists for this stream_key --------------
+                // Lock the map across the create-or-reuse decision so two
+                // concurrent senders for the same key cannot both observe
+                // `None` and open duplicate streams.
+                let writer = {
+                    let mut map = streams.lock().await;
+                    if !map.contains_key(&stream_key) {
+                        let stream: WritableStream =
+                            JsFuture::from(transport.create_unidirectional_stream())
+                                .await
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "failed to create unidirectional stream for key {}: {:?}",
+                                        stream_key,
+                                        e
+                                    )
+                                })?
+                                .unchecked_into();
+                        let writer = stream
+                            .get_writer()
+                            .map_err(|e| anyhow!("error getting writer: {:?}", e))?;
+                        map.insert(
+                            stream_key,
+                            PersistentSendStream {
+                                _stream: stream,
+                                writer,
+                            },
+                        );
+                    }
+                    // Clone the writer JsValue so we can release the map
+                    // lock before the (potentially long) write await.
+                    map.get(&stream_key)
+                        .expect("entry was just inserted or already existed")
+                        .writer
+                        .clone()
+                };
+
+                // --- Build the framed payload --------------------------------
+                // [u32 BE length][payload] in a single Uint8Array so the
+                // browser cannot split the header off from its body.
+                let len = data.len() as u32;
+                let mut framed = Vec::with_capacity(4 + data.len());
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&data);
+                let chunk = Uint8Array::from(framed.as_slice());
+
+                // --- Write the frame ----------------------------------------
+                // writer.ready() resolves when there is backpressure room.
+                // writer.write() returns immediately after enqueueing; the
+                // browser serialises chunks from this writer in call order.
+                JsFuture::from(writer.ready())
+                    .await
+                    .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                JsFuture::from(writer.write_with_chunk(&chunk))
+                    .await
+                    .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                // Stream is broken — remove it from the map so the next send
+                // for this key opens a fresh stream.  We do this *after* the
+                // map lock has been dropped (the lock is scoped above) so we
+                // don't deadlock with ourselves.
+                let mut map = streams.lock().await;
+                map.remove(&stream_key);
+                log!(
+                    "persistent stream send failed (stream reset, frame dropped):",
+                    e.to_string()
+                );
+            }
+        });
+    }
+
     /// Sends data to a WebTransport connection via a unidirectional stream.
+    ///
+    /// **Legacy per-packet path.** Used only as a fallback for transports that
+    /// have not migrated to `send_on_persistent_stream` yet.  Phase 2 of the
+    /// WebTransport freeze fix replaces this with persistent per-media-type
+    /// streams; new code paths should call `send_on_persistent_stream` instead.
     ///
     /// Stream errors (creation failure, write backpressure, QUIC congestion) are
     /// transient -- they affect only this single frame send. The transport is NOT

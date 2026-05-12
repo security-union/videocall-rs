@@ -289,6 +289,12 @@ test.describe("Host mute controls", () => {
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
 
       // ---- Host opens peer list then clicks "Mute all" via context menu ----
+      // The "Open Peers" button lives inside `.controls-secondary`, which
+      // collapses to `max-width: 0; opacity: 0` after a 1s no-mouse-activity
+      // timer fires (see attendants.rs auto-hide hook). Hover the controls
+      // container first so `controls-expanded` stays set and the secondary
+      // buttons remain visible/clickable while we navigate the menu.
+      await hostPage.locator(".video-controls-container").hover();
       const openPeersBtn = hostPage.locator("button.video-control-button", {
         has: hostPage.locator("span.tooltip", { hasText: "Open Peers" }),
       });

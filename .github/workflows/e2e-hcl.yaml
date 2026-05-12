@@ -15,6 +15,11 @@ on:
         description: 'Playwright --grep filter (optional, e.g. @smoke)'
         required: false
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 concurrency:
   group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
   cancel-in-progress: true
@@ -24,16 +29,89 @@ defaults:
     shell: bash --noprofile --norc -euo pipefail {0}
 
 jobs:
+  check-permissions:
+    name: Check permissions
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/run-e2e'
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
+      pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
+    steps:
+      - name: Get PR details
+        id: get-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('pr_sha', pr.data.head.sha);
+            core.setOutput('pr_ref', pr.data.head.ref);
+
+      - name: Check if user has write access
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = context.payload.comment.user.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: user
+            });
+            const permission = data.permission;
+            console.log(`User ${user} has permission: ${permission}`);
+            if (['admin', 'write'].includes(permission)) {
+              console.log('✅ User is authorized');
+              core.setOutput('authorized', 'true');
+            } else {
+              console.log('❌ User is not authorized');
+              core.setOutput('authorized', 'false');
+            }
+
+      - name: React to comment
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Deny unauthorized user
+        if: steps.check.outputs.authorized != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '-1'
+            });
+            core.setFailed('User does not have write access');
+
   e2e:
     name: Playwright E2E
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 60
+    needs: [check-permissions]
     if: |
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       github.event.comment.body == '/run-e2e')
+      always() && (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        (needs.check-permissions.result == 'success' &&
+         needs.check-permissions.outputs.authorized == 'true')
+      )
 
     outputs:
       tests_passed: ${{ steps.results.outputs.passed }}
@@ -44,29 +122,24 @@ jobs:
       branch: ${{ steps.setup.outputs.branch }}
 
     steps:
-      - name: Acknowledge /run-e2e comment
-        if: github.event_name == 'issue_comment'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
-            -f content=rocket
-
-      - name: Determine branch
+      - name: Determine ref
         id: setup
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             BRANCH="${{ inputs.branch }}"
+            REF="${BRANCH}"
           elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-            PR_NUMBER="${{ github.event.issue.number }}"
-            BRANCH=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.ref')
+            BRANCH="${{ needs.check-permissions.outputs.pr_ref }}"
+            REF="${{ needs.check-permissions.outputs.pr_sha }}"
           else
             BRANCH="${{ github.ref_name }}"
+            REF="${{ github.sha }}"
           fi
           echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
-          echo "Testing branch: ${BRANCH}"
+          echo "ref=${REF}" >> $GITHUB_OUTPUT
+          echo "Testing branch: ${BRANCH} (ref: ${REF})"
 
       - name: Clean workspace (root-owned files from Docker)
         run: |
@@ -75,7 +148,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.setup.outputs.branch }}
+          ref: ${{ steps.setup.outputs.ref }}
           clean: false
 
       - uses: actions/setup-node@v4
@@ -145,11 +218,10 @@ jobs:
           DURATION=$(( ${{ steps.playwright.outputs.end_time }} - ${{ steps.playwright.outputs.start_time }} ))
 
           if [ -f playwright-results.json ] && jq -e '.stats' playwright-results.json >/dev/null 2>&1; then
-            PASSED=$(jq '.stats.expected // 0' playwright-results.json)
-            FAILED=$(jq '(.stats.unexpected // 0) + (.stats.flaky // 0)' playwright-results.json)
+            PASSED=$(jq '(.stats.expected // 0) + (.stats.flaky // 0)' playwright-results.json)
+            FAILED=$(jq '.stats.unexpected // 0' playwright-results.json)
             SKIPPED=$(jq '.stats.skipped // 0' playwright-results.json)
           else
-            # Fallback: parse from exit code
             PASSED=0
             FAILED=0
             SKIPPED=0
@@ -185,6 +257,8 @@ jobs:
           TIMESTAMP=$(date +%s)
 
           PUSHGATEWAY_URL="https://pushgateway.videocall.fnxlabs.com"
+          # Sanitize branch for pushgateway URL path (slashes break label parsing)
+          SAFE_BRANCH="${BRANCH//\//_}"
 
           METRICS_PAYLOAD="# HELP e2e_tests_passed Number of passing E2E tests
           # TYPE e2e_tests_passed gauge
@@ -206,10 +280,10 @@ jobs:
           e2e_run_timestamp ${TIMESTAMP}"
 
           echo "${METRICS_PAYLOAD}" | curl --fail-with-body --data-binary @- \
-            "${PUSHGATEWAY_URL}/metrics/job/e2e/branch/${BRANCH}" || \
-          echo "Pushgateway push failed (non-fatal, DNS may not be configured yet)"
+            "${PUSHGATEWAY_URL}/metrics/job/e2e/branch/${SAFE_BRANCH}" || \
+          echo "Pushgateway push failed (non-fatal)"
 
-          echo "Metrics pushed for branch=${BRANCH}"
+          echo "Metrics pushed for branch=${SAFE_BRANCH}"
 
       - name: Post results to PR comment
         if: always() && github.event_name == 'issue_comment'

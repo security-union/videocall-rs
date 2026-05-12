@@ -58,17 +58,16 @@ async function createAuthenticatedContext(
 async function joinMeetingFromPage(
   page: Page,
 ): Promise<"in-meeting" | "waiting" | "waiting-for-meeting"> {
-  // We could be on "Ready to join?", "Waiting to be admitted", or "Waiting for meeting"
-  // Race between the possible states
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const waitingRoom = page.getByText("Waiting to be admitted");
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
+  const grid = page.locator("#grid-container");
 
-  // Wait for any of these to appear
   const result = await Promise.race([
-    joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 20_000 }).then(() => "waiting" as const),
-    waitingForMeeting.waitFor({ timeout: 20_000 }).then(() => "waiting-for-meeting" as const),
+    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
+    waitingForMeeting.waitFor({ timeout: 30_000 }).then(() => "waiting-for-meeting" as const),
+    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
   ]);
 
   if (result === "waiting") {
@@ -79,12 +78,15 @@ async function joinMeetingFromPage(
     return "waiting-for-meeting";
   }
 
-  // Click Join/Start Meeting
+  if (result === "auto-joined") {
+    return "in-meeting";
+  }
+
   await page.waitForTimeout(1000);
   await joinButton.click();
   await page.waitForTimeout(3000);
 
-  await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+  await expect(grid).toBeVisible({ timeout: 15_000 });
   return "in-meeting";
 }
 

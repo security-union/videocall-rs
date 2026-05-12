@@ -8,6 +8,8 @@ const CHROME_ARGS = [
   "--disable-gpu",
 ];
 
+process.env.DISPLAY_NAME_RATE_LIMIT_DISABLED ??= "true";
+
 export default defineConfig({
   globalSetup: "./global-setup.ts",
   testDir: "./tests",

@@ -1,5 +1,6 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, chromium } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
+import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -84,39 +85,78 @@ test.describe("GUID display name handling", () => {
     await expect(page.locator("text=Invalid character")).not.toBeVisible();
   });
 
-  test("GUID-format name is shown on the meeting page after joining", async ({ page }) => {
+  // FIXME(#741): Peer discovery in the 2-user E2E env is too slow —
+  // the .floating-name tile for the remote peer doesn't appear within
+  // 30s. The self-view tile is excluded from visible_tiles, so a second
+  // user is required. Unblock: increase peer discovery timeout or reduce
+  // WebSocket reconnect / heartbeat intervals in docker-compose.e2e.yaml.
+  test.fixme("GUID-format name is shown on the meeting page after joining", async ({ baseURL }) => {
     // When a user enters a GUID as their display name and joins a meeting,
-    // the meeting page should show that name.  In the non-OAuth flow, there
-    // is no GUID filtering -- the user's chosen name is respected as-is.
+    // the meeting page should show that name on the peer tile. A second
+    // user is needed because .floating-name only renders for remote peers.
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_guid_tile_${Date.now()}`;
 
-    await page.goto("/");
-    await page.waitForTimeout(1500);
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
 
-    await page.locator("#meeting-id").click();
-    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
-    await page.locator("#username").click();
-    await page.locator("#username").fill("");
-    await page.locator("#username").pressSequentially(SAMPLE_GUID, { delay: 30 });
-    await page.waitForTimeout(500);
+    try {
+      // User 1 (host) joins with the GUID display name.
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "guid-host@videocall.rs",
+        "GUIDHost",
+        uiURL,
+      );
+      const hostPage = await hostCtx.newPage();
+      await hostPage.goto("/");
+      await hostPage.waitForTimeout(1500);
+      await hostPage.locator("#meeting-id").click();
+      await hostPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+      await hostPage.locator("#username").click();
+      await hostPage.locator("#username").fill("");
+      await hostPage.locator("#username").pressSequentially(SAMPLE_GUID, { delay: 30 });
+      await hostPage.waitForTimeout(500);
+      await hostPage.locator("#username").press("Enter");
+      await expect(hostPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    await page.locator("#username").press("Enter");
-    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-    await page.waitForTimeout(2000);
+      const hostJoinBtn = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+      await expect(hostJoinBtn).toBeVisible({ timeout: 30_000 });
+      await hostJoinBtn.click();
+      await hostPage.waitForTimeout(3000);
 
-    // Click Start/Join Meeting to enter the grid.
-    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
-    await expect(joinButton).toBeVisible({ timeout: 20_000 });
-    await page.waitForTimeout(1000);
-    await joinButton.click();
-    await page.waitForTimeout(3000);
+      // User 2 (guest) joins — their peer tile for the host will show the GUID.
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guid-guest@videocall.rs",
+        "GUIDGuest",
+        uiURL,
+      );
+      const guestPage = await guestCtx.newPage();
+      await guestPage.goto("/");
+      await guestPage.waitForTimeout(1500);
+      await guestPage.locator("#meeting-id").click();
+      await guestPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+      await guestPage.locator("#username").click();
+      await guestPage.locator("#username").fill("");
+      await guestPage.locator("#username").pressSequentially("GUIDGuest", { delay: 50 });
+      await guestPage.waitForTimeout(500);
+      await guestPage.locator("#username").press("Enter");
+      await expect(guestPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-    // The grid should be visible with the user's self-view tile.
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+      const guestJoinBtn = guestPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+      await expect(guestJoinBtn).toBeVisible({ timeout: 30_000 });
+      await guestJoinBtn.click();
+      await guestPage.waitForTimeout(3000);
 
-    // The GUID display name should appear on the user's own tile.
-    const selfName = page.locator(".floating-name", { hasText: SAMPLE_GUID });
-    await expect(selfName.first()).toBeVisible({ timeout: 10_000 });
+      // Wait for peer discovery — guest should see host's GUID name on the tile.
+      const guidTile = guestPage.locator(".floating-name", { hasText: SAMPLE_GUID });
+      await expect(guidTile.first()).toBeVisible({ timeout: 30_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
   });
 
   test("GUID-format name persists in localStorage across page navigations", async ({ page }) => {

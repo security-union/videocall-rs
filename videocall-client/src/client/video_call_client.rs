@@ -18,6 +18,7 @@
 
 use super::super::connection::{
     ConnectionController, ConnectionLostReason, ConnectionManagerOptions, ConnectionState,
+    MediaStreamKey,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
@@ -836,13 +837,40 @@ impl VideoCallClient {
         peer_decode_manager
     }
 
+    /// Send a control/signaling packet via the reliable Control stream.
+    ///
+    /// Used for KEYFRAME_REQUEST (PLI), RSA_PUB_KEY, AES_KEY, DIAGNOSTICS,
+    /// HEALTH, MEETING, CONNECTION — anything that is not user media.
+    /// These ride on a dedicated persistent QUIC stream so they are never
+    /// stalled behind a large video keyframe write.
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        self.send_packet_on_stream(media, MediaStreamKey::Control);
+    }
+
+    /// Send a media packet (VIDEO / AUDIO / SCREEN) via the reliable stream
+    /// matching the caller-supplied `stream_key`.
+    ///
+    /// `stream_key` must reflect the inner `MediaType` of the encrypted
+    /// payload so the WebTransport implementation can route the packet to
+    /// the correct per-media-type persistent stream.  This prevents head-of-
+    /// line blocking — an audio packet is never queued behind a stalled
+    /// video frame.  WebSocket ignores `stream_key`.
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_on_stream(media, stream_key);
+    }
+
+    /// Internal helper: dispatch `media` through the active
+    /// `ConnectionController` on the persistent stream identified by
+    /// `stream_key`.
+    fn send_packet_on_stream(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
         let packet_type = media.packet_type.enum_value();
         match self.connection_controller.try_borrow() {
             Ok(cc) => {
                 if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media) {
-                        debug!("Failed to send {packet_type:?} packet: {e}");
+                    if let Err(e) = controller.send_packet(media, stream_key) {
+                        debug!(
+                            "Failed to send {packet_type:?} packet on stream {stream_key:?}: {e}"
+                        );
                     }
                 } else {
                     error!("No connection manager available for {packet_type:?} packet");
@@ -850,32 +878,6 @@ impl VideoCallClient {
             }
             Err(_) => {
                 error!("Unable to borrow connection_controller -- dropping {packet_type:?} packet")
-            }
-        }
-    }
-
-    /// Send a media packet via reliable stream.
-    ///
-    /// Used for VIDEO, AUDIO, and SCREEN packets where reliable delivery is
-    /// required to avoid visual/audio artifacts from packet loss. Control
-    /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
-    /// since they are periodic and expendable.
-    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
-        let packet_type = media.packet_type.enum_value();
-        match self.connection_controller.try_borrow() {
-            Ok(cc) => {
-                if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media) {
-                        debug!("Failed to send {packet_type:?} media packet: {e}");
-                    }
-                } else {
-                    error!("No connection manager available for {packet_type:?} media packet");
-                }
-            }
-            Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
-                )
             }
         }
     }
@@ -1726,7 +1728,9 @@ impl Inner {
                                     ..Default::default()
                                 };
 
-                                if let Err(e) = controller.send_packet(packet) {
+                                if let Err(e) =
+                                    controller.send_packet(packet, MediaStreamKey::Control)
+                                {
                                     error!("Failed to send AES key packet: {e}");
                                 }
                             } else {
@@ -2158,7 +2162,9 @@ impl Inner {
                                     ..Default::default()
                                 };
 
-                                if let Err(e) = controller.send_packet(packet) {
+                                if let Err(e) =
+                                    controller.send_packet(packet, MediaStreamKey::Control)
+                                {
                                     error!("Failed to send RSA public key packet: {e}");
                                 }
                             } else {

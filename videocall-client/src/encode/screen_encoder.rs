@@ -30,6 +30,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use crate::connection::MediaStreamKey;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -813,7 +814,10 @@ impl ScreenEncoder {
                     &userid,
                     aes.clone(),
                 );
-                client.send_media_packet(packet);
+                // Phase 2 of WT freeze fix: route screen-share video on its
+                // own persistent QUIC stream, isolated from the camera and
+                // audio streams.
+                client.send_media_packet(packet, MediaStreamKey::Screen);
                 sequence_number += 1;
             })
         };

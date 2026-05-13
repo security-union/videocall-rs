@@ -6,6 +6,7 @@ import { applyJwtCookieAuth } from "./auth/jwt-cookie";
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { type Manifest } from "./manifest";
+import { joinMeetingAndEnableMedia } from "./meeting-join";
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -158,6 +159,14 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   console.log(`[${opts.participant}] navigating to ${opts.meetingURL}`);
   await page.goto(opts.meetingURL, { waitUntil: "domcontentloaded" });
 
+  const meetingId = meetingIdFromUrl(opts.meetingURL);
+  await joinMeetingAndEnableMedia({
+    page,
+    participant: opts.participant,
+    displayName: opts.displayName,
+    meetingId,
+  });
+
   const leaveMeeting = async (): Promise<void> => {
     const hangUp = page.locator("button.video-control-button", {
       has: page.locator("span.tooltip", { hasText: "Hang Up" }),
@@ -208,4 +217,20 @@ function participantEmail(participant: string): string {
     return participant;
   }
   return `${participant}@bots-app.local`;
+}
+
+/**
+ * Extract the meeting id from a meeting URL of the form
+ * `https://.../meeting/<id>`. Used by the join-flow helper when the bot
+ * lands on the homepage form and needs to retype the id.
+ */
+function meetingIdFromUrl(meetingURL: string): string {
+  const url = new URL(meetingURL);
+  const parts = url.pathname.split("/").filter((p) => p.length > 0);
+  const meetingIdx = parts.indexOf("meeting");
+  if (meetingIdx >= 0 && meetingIdx + 1 < parts.length) {
+    return parts[meetingIdx + 1];
+  }
+  // Fallback: last path segment.
+  return parts[parts.length - 1] ?? "";
 }

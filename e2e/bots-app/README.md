@@ -4,11 +4,12 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
-## Status — phase 1f (phase 1 complete + HCL SSO support)
+## Status — phase 1g (phase 1 complete + HCL SSO + auto join/media)
 
 Phase 1 is complete. The bot:
 
 - launches headed Chrome with a configurable `--ttl` lifetime and a clean leave-meeting on TTL expiry or SIGINT/SIGTERM,
+- auto-fills the homepage display-name form, clicks "Join Meeting" when shown, then clicks "Start camera" and "Unmute Microphone" so media actually flows — no human-in-the-loop required after launch,
 - prepares per-participant fake audio (stitched WAV from `bot/conversation/lines/*.wav`) and fake video (y4m from `bot/assets/costumes/<name>/talking.mp4`) on demand,
 - wires those files into Chrome via `--use-file-for-fake-{audio,video}-capture`,
 - authenticates via:
@@ -188,6 +189,8 @@ e2e/
       costumes.ts           ← ffmpeg-driven MP4 → y4m converter (idempotent)
       assets.ts             ← resolves participant → {audioPath?, videoPath?} from run-dir
       assets.test.ts        ← vitest unit tests for the assets resolver
+      meeting-join.ts       ← post-goto: fills display-name form, clicks Join Meeting, enables mic + camera
+      meeting-join.test.ts  ← vitest placeholder (smoke test only — real coverage is the manual run)
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
         storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)

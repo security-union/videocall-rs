@@ -1,6 +1,7 @@
 import { Command } from "commander";
 
 import { launchBot } from "./bot";
+import { formatDuration, parseDuration, Ttl, waitForTtl } from "./ttl";
 
 const program = new Command();
 
@@ -19,8 +20,20 @@ program
   .requiredOption("--participant <name>", 'Participant handle (e.g. "alice") or full email')
   .option("--display-name <name>", "Display name shown in the meeting", undefined)
   .option("--headless", "Run Chrome headless (default: headed)", false)
+  .option(
+    "--ttl <duration>",
+    'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits.',
+    "5m",
+  )
   .action(async (opts: RunCommandOptions) => {
     const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
+    let ttl: Ttl;
+    try {
+      ttl = parseDuration(opts.ttl);
+    } catch (e) {
+      console.error(`bots-app: ${(e as Error).message}`);
+      process.exit(2);
+    }
 
     const bot = await launchBot({
       meetingURL: opts.meetingUrl,
@@ -28,21 +41,24 @@ program
       displayName,
       headless: opts.headless,
     });
-    console.log(`[${opts.participant}] joined; holding session until SIGINT/SIGTERM`);
+    console.log(`[${opts.participant}] joined; ttl=${formatDuration(ttl)}`);
 
+    const ttlTimer = waitForTtl(ttl);
     let shuttingDown = false;
-    const onSignal = async (signal: NodeJS.Signals): Promise<void> => {
+    const cleanLeaveAndExit = async (reason: string): Promise<void> => {
       if (shuttingDown) return;
       shuttingDown = true;
-      console.log(`[${opts.participant}] received ${signal}, shutting down`);
+      console.log(`[${opts.participant}] shutting down (${reason})`);
+      ttlTimer.cancel();
+      await bot.leaveMeeting();
       await bot.shutdown();
       process.exit(0);
     };
-    process.on("SIGINT", () => void onSignal("SIGINT"));
-    process.on("SIGTERM", () => void onSignal("SIGTERM"));
+    process.on("SIGINT", () => void cleanLeaveAndExit("SIGINT"));
+    process.on("SIGTERM", () => void cleanLeaveAndExit("SIGTERM"));
 
-    // Wait indefinitely; PR-1b adds the TTL scheduler that races against this.
-    await new Promise<void>(() => {});
+    await ttlTimer.done;
+    await cleanLeaveAndExit("ttl expired");
   });
 
 interface RunCommandOptions {
@@ -50,6 +66,7 @@ interface RunCommandOptions {
   participant: string;
   displayName?: string;
   headless: boolean;
+  ttl: string;
 }
 
 function defaultDisplayName(participant: string): string {

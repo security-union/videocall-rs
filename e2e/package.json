@@ -12,7 +12,8 @@
     "format:fix": "prettier --write .",
     "typecheck": "tsc --noEmit",
     "ci:lint": "eslint . && prettier --check . && tsc --noEmit",
-    "bot": "tsx bots-app/src/cli.ts"
+    "bot": "tsx bots-app/src/cli.ts",
+    "test:unit": "vitest run bots-app/"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -25,6 +26,7 @@
     "prettier": "^3.8.1",
     "tsx": "^4.20.4",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.1"
+    "typescript-eslint": "^8.56.1",
+    "vitest": "^4.0.5"
   }
 }

@@ -1,6 +1,7 @@
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
+import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { type Manifest } from "./manifest";
 
@@ -16,6 +17,19 @@ export interface BotRunOptions {
   participant: string;
   displayName: string;
   headless: boolean;
+  /**
+   * Auth backend selection. `"jwt"` injects a session cookie signed with
+   * the server-known JWT_SECRET (local + HCL daily + previews).
+   * `"storage-state"` replays a previously-captured Playwright storage
+   * state from `bots-app login` (for `app.videocall.rs` and any other
+   * real-OAuth-protected target). See `src/auth/storage-state.ts`.
+   */
+  authBackend: AuthBackend;
+  /**
+   * When `authBackend === "storage-state"`, the absolute path to the
+   * captured `<account>.json` file. Ignored in JWT mode.
+   */
+  storageStateFile?: string | null;
   /**
    * When provided alongside `runDir`, the bot looks up the prep'd fake
    * camera (y4m) + fake mic (WAV) for this participant and passes them
@@ -46,7 +60,6 @@ export interface BotHandle {
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const target = new URL(opts.meetingURL);
   const baseURL = `${target.protocol}//${target.host}`;
-  const email = participantEmail(opts.participant);
 
   const launchArgs = [...CHROME_ARGS];
   if (opts.manifest != null && opts.runDir != null && opts.runDir !== "") {
@@ -77,12 +90,26 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     headless: opts.headless,
     args: launchArgs,
   });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
-  await applyJwtCookieAuth(context, {
-    email,
-    displayName: opts.displayName,
-    baseURL,
+  const context = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    storageState:
+      opts.authBackend === "storage-state" && opts.storageStateFile
+        ? requireStorageState(opts.storageStateFile)
+        : undefined,
   });
+  if (opts.authBackend === "jwt") {
+    const email = participantEmail(opts.participant);
+    await applyJwtCookieAuth(context, {
+      email,
+      displayName: opts.displayName,
+      baseURL,
+    });
+    console.log(`[${opts.participant}] auth: jwt (injected session cookie for ${email})`);
+  } else {
+    console.log(
+      `[${opts.participant}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
+    );
+  }
 
   const page = await context.newPage();
   page.on("pageerror", (err) => {

@@ -102,8 +102,18 @@ impl Connection {
             TransportType::TRANSPORT_WEBSOCKET
         };
 
+        let task = Rc::new(task);
+
+        // Phase 3b (discussion #793): register a `Weak<Task>` with
+        // the per-tab netsim hook so the async `Delay` /
+        // `DelayAndDuplicate` paths can re-enter the send pipeline
+        // after the simulated delay. See
+        // `connection/netsim_hook.rs` for the full design.
+        #[cfg(feature = "netsim")]
+        super::netsim_hook::install_task(Some(Rc::downgrade(&task)));
+
         let connection = Self {
-            task: Rc::new(task),
+            task,
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
                 monitor.emit(());

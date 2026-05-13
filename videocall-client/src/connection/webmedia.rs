@@ -36,6 +36,17 @@ pub struct ConnectOptions {
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<ConnectionLostReason>,
     pub peer_monitor: Callback<()>,
+    /// Optional network-condition simulator shim applied to this
+    /// client's outbound send paths (WebTransport reliable +
+    /// datagram, WebSocket binary). Phase 3b of discussion #793 —
+    /// **opt-in via the `netsim` cargo feature**. When the feature is
+    /// off the field does not exist; when it is on but the field is
+    /// `None`, the send paths take the same fast path as today.
+    ///
+    /// Phase 3c will populate this from `?netsim=<profile>` in
+    /// `window.location`; phase 3b just exposes the wiring.
+    #[cfg(feature = "netsim")]
+    pub netsim_hook: Option<std::sync::Arc<videocall_netsim::NetSimShim>>,
 }
 
 /// Logical media-type identifier used by the WebTransport transport to pick

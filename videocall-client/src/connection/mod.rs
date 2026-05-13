@@ -27,6 +27,12 @@ mod webmedia;
 mod websocket;
 mod webtransport;
 
+// Phase 3b (discussion #793). Compiled in only when the `netsim`
+// feature is on; production builds skip this module entirely so the
+// send paths are byte-for-byte equivalent to pre-3b.
+#[cfg(feature = "netsim")]
+mod netsim_hook;
+
 pub use connection_controller::ConnectionController;
 pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]

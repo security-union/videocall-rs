@@ -8513,6 +8513,7 @@ dependencies = [
  "videocall-aq",
  "videocall-codecs",
  "videocall-diagnostics",
+ "videocall-netsim",
  "videocall-transport",
  "videocall-types",
  "wasm-bindgen",

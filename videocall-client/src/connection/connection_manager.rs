@@ -767,6 +767,10 @@ impl ConnectionManager {
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
                 peer_monitor: self.options.peer_monitor.clone(),
+                // Phase 3b placeholder. Phase 3c will populate this
+                // from the `?netsim=<profile>` URL param.
+                #[cfg(feature = "netsim")]
+                netsim_hook: None,
             };
 
             match Connection::connect(false, connect_options, self.aes.clone()) {
@@ -811,6 +815,10 @@ impl ConnectionManager {
                 on_connection_lost: self
                     .create_connection_lost_callback(conn_id.clone(), url.clone()),
                 peer_monitor: self.options.peer_monitor.clone(),
+                // Phase 3b placeholder. Phase 3c will populate this
+                // from the `?netsim=<profile>` URL param.
+                #[cfg(feature = "netsim")]
+                netsim_hook: None,
             };
 
             match Connection::connect(true, connect_options, self.aes.clone()) {

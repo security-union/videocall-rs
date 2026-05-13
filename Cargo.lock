@@ -1049,7 +1049,7 @@ dependencies = [
  "opus",
  "percent-encoding",
  "prometheus",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "rand 0.8.5",
  "serde",
  "serde_yaml",
@@ -4711,7 +4711,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "oauth2",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.26",
@@ -5788,9 +5788,9 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "protobuf"
-version = "3.7.1"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a7c64d9bf75b1b8d981124c14c179074e8caa7dfe7b6a12e6222ddcd0c8f72"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
 dependencies = [
  "once_cell",
  "protobuf-support",
@@ -5799,9 +5799,9 @@ dependencies = [
 
 [[package]]
 name = "protobuf-support"
-version = "3.7.1"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b088fd20b938a875ea00843b6faf48579462630015c3788d397ad6a786663252"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -8393,7 +8393,7 @@ dependencies = [
  "futures-util",
  "log",
  "native-tls",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "ratatui",
  "tokio",
  "tokio-tungstenite",
@@ -8430,7 +8430,7 @@ dependencies = [
  "meeting-api",
  "oauth2",
  "prometheus",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "r2d2",
  "r2d2_postgres",
  "regex",
@@ -8461,7 +8461,7 @@ dependencies = [
  "js-sys",
  "log",
  "pidgeon",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "videocall-types",
  "wasm-bindgen-test",
 ]
@@ -8476,7 +8476,7 @@ dependencies = [
  "env-libvpx-sys",
  "image 0.25.9",
  "opus",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -8503,7 +8503,7 @@ dependencies = [
  "log",
  "neteq",
  "prost",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "rand 0.8.5",
  "rsa",
  "serde",
@@ -8575,6 +8575,16 @@ name = "videocall-meeting-types"
 version = "0.1.2"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "videocall-netsim"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.16",
+ "rand 0.8.5",
+ "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]
@@ -8696,7 +8706,7 @@ name = "videocall-types"
 version = "5.0.0"
 dependencies = [
  "anyhow",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "serde",
  "serde_json",
 ]

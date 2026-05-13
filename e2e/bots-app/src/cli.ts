@@ -11,11 +11,11 @@ import {
   defaultSsoStatePath,
   storageStatePath,
 } from "./auth/storage-state";
-import { launchBot } from "./bot";
 import { prepareParticipantCostume } from "./costumes";
-import { loadManifest, type Manifest } from "./manifest";
+import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
+import { runBotsToCompletion, type BotTask } from "./orchestrator";
 import { prepareParticipantAudio } from "./stitcher";
-import { formatDuration, parseDuration, Ttl, waitForTtl } from "./ttl";
+import { parseDuration, Ttl } from "./ttl";
 
 const program = new Command();
 
@@ -26,17 +26,31 @@ program
 
 program
   .command("run")
-  .description("Launch one browser bot that joins a meeting and holds the session")
+  .description(
+    "Launch one or more browser bots that join the meeting concurrently and hold the session",
+  )
   .requiredOption(
     "--meeting-url <url>",
     "Full meeting URL (e.g. https://app.videocall.fnxlabs.com/meeting/TonyBots)",
   )
-  .requiredOption("--participant <name>", 'Participant handle (e.g. "alice") or full email')
+  .option(
+    "--participant <name>",
+    'Single-bot mode: participant handle (e.g. "alice") or full email. Mutually exclusive with --users.',
+  )
+  .option(
+    "--users <N>",
+    "Multi-bot mode: launch N bots, picking the first N named participants from the manifest in order (alice, bob, carol, ...). Mutually exclusive with --participant.",
+  )
+  .option(
+    "--max-users <N>",
+    "Resource cap when --users is set — refuses to launch more than this many bots. Default 10.",
+    "10",
+  )
   .option("--display-name <name>", "Display name shown in the meeting", undefined)
   .option("--headless", "Run Chrome headless (default: headed)", false)
   .option(
     "--ttl <duration>",
-    'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits.',
+    'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits. Shared across all bots in --users mode.',
     "5m",
   )
   .option(
@@ -62,12 +76,20 @@ program
     'Path to a captured HCL SSO storage-state JSON (from `bots-app sso-login`). Loaded in addition to JWT cookie injection when --auth=jwt. Pass "" to skip. Defaults to <assets-dir>/auth/hcl-sso.json — loaded only if the file exists.',
   )
   .action(async (opts: RunCommandOptions) => {
-    const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
     let ttl: Ttl;
     try {
       ttl = parseDuration(opts.ttl);
     } catch (e) {
       console.error(`bots-app: ${(e as Error).message}`);
+      process.exit(2);
+    }
+
+    if (opts.participant && opts.users) {
+      console.error("bots-app: --participant and --users are mutually exclusive");
+      process.exit(2);
+    }
+    if (!opts.participant && !opts.users) {
+      console.error("bots-app: one of --participant or --users is required");
       process.exit(2);
     }
 
@@ -82,6 +104,40 @@ program
       }
     }
 
+    // Resolve the participant list — single-bot via --participant, or
+    // multi-bot via --users picking from manifest order.
+    let participants: string[];
+    if (opts.users) {
+      const n = Number.parseInt(opts.users, 10);
+      const maxUsers = Number.parseInt(opts.maxUsers, 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(`bots-app: --users must be a positive integer, got "${opts.users}"`);
+        process.exit(2);
+      }
+      if (Number.isFinite(maxUsers) && maxUsers > 0 && n > maxUsers) {
+        console.error(
+          `bots-app: --users ${n} exceeds --max-users ${maxUsers}; raise --max-users to override`,
+        );
+        process.exit(2);
+      }
+      if (!manifest) {
+        console.error(
+          `bots-app: --users requires a manifest (at ${opts.manifest}). Run \`bots-app prep-assets\` first or pass --manifest <path>.`,
+        );
+        process.exit(2);
+      }
+      const namedCount = manifest.participants.length;
+      if (n > namedCount) {
+        console.error(
+          `bots-app: --users ${n} exceeds the manifest's ${namedCount} named participants`,
+        );
+        process.exit(2);
+      }
+      participants = firstNParticipantNames(manifest, n);
+    } else {
+      participants = [opts.participant as string];
+    }
+
     let authOverride: AuthBackend | undefined;
     if (opts.auth) {
       if (opts.auth !== "jwt" && opts.auth !== "storage-state") {
@@ -92,47 +148,41 @@ program
     }
     const hostname = new URL(opts.meetingUrl).hostname;
     const authBackend = chooseAuthBackend(hostname, authOverride);
-    const storageStateFile =
-      authBackend === "storage-state"
-        ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, opts.participant))
-        : null;
     const ssoStateFile =
       authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
 
-    const bot = await launchBot({
-      meetingURL: opts.meetingUrl,
-      participant: opts.participant,
-      displayName,
-      headless: opts.headless,
-      authBackend,
-      storageStateFile,
-      ssoStateFile,
-      manifest,
-      runDir: opts.assetsDir,
+    const tasks: BotTask[] = participants.map((participant) => {
+      const displayName =
+        opts.displayName && participants.length === 1
+          ? opts.displayName
+          : defaultDisplayName(participant);
+      const storageStateFile =
+        authBackend === "storage-state"
+          ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, participant))
+          : null;
+      return {
+        meetingURL: opts.meetingUrl,
+        participant,
+        displayName,
+        headless: opts.headless,
+        authBackend,
+        storageStateFile,
+        ssoStateFile,
+        manifest,
+        runDir: opts.assetsDir,
+        ttl,
+      };
     });
-    console.log(`[${opts.participant}] joined; ttl=${formatDuration(ttl)}`);
 
-    const ttlTimer = waitForTtl(ttl);
-    let shuttingDown = false;
-    const cleanLeaveAndExit = async (reason: string): Promise<void> => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      console.log(`[${opts.participant}] shutting down (${reason})`);
-      ttlTimer.cancel();
-      await bot.leaveMeeting();
-      await bot.shutdown();
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void cleanLeaveAndExit("SIGINT"));
-    process.on("SIGTERM", () => void cleanLeaveAndExit("SIGTERM"));
-
-    await ttlTimer.done;
-    await cleanLeaveAndExit("ttl expired");
+    await runBotsToCompletion(tasks);
+    process.exit(0);
   });
 
 interface RunCommandOptions {
   meetingUrl: string;
-  participant: string;
+  participant?: string;
+  users?: string;
+  maxUsers: string;
   displayName?: string;
   headless: boolean;
   ttl: string;

@@ -8,7 +8,7 @@ pub mod capability_check;
 pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
-mod density;
+pub mod density;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;

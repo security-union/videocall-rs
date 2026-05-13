@@ -52,6 +52,93 @@ pub struct DockPositionCtx(pub Signal<DockPosition>);
 #[derive(Clone, Copy)]
 pub struct AutohideCtx(pub Signal<bool>);
 
+// ---------------------------------------------------------------------------
+// Dock position & autohide persistence
+// ---------------------------------------------------------------------------
+
+const DOCK_POSITION_KEY: &str = "vc_dock_position";
+const DOCK_AUTOHIDE_KEY: &str = "vc_dock_autohide";
+
+/// Load dock position from localStorage. Defaults to Bottom.
+pub fn load_dock_position() -> DockPosition {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_POSITION_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "left" => DockPosition::Left,
+            "right" => DockPosition::Right,
+            _ => DockPosition::Bottom,
+        })
+        .unwrap_or(DockPosition::Bottom)
+}
+
+/// Load dock autohide from localStorage. Defaults to true.
+pub fn load_dock_autohide() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten())
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
+/// Persist dock position to localStorage.
+pub fn save_dock_position(pos: DockPosition) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match pos {
+            DockPosition::Bottom => "bottom",
+            DockPosition::Left => "left",
+            DockPosition::Right => "right",
+        };
+        let _ = storage.set_item(DOCK_POSITION_KEY, val);
+    }
+}
+
+/// Persist dock autohide to localStorage.
+pub fn save_dock_autohide(enabled: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(DOCK_AUTOHIDE_KEY, if enabled { "true" } else { "false" });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Density mode persistence
+// ---------------------------------------------------------------------------
+
+use crate::components::density::DensityMode;
+
+/// Context for the tile density mode.
+#[derive(Clone, Copy)]
+pub struct DensityModeCtx(pub Signal<DensityMode>);
+
+const DENSITY_MODE_KEY: &str = "vc_density_mode";
+
+/// Load density mode from localStorage. Defaults to Auto.
+pub fn load_density_mode() -> DensityMode {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DENSITY_MODE_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "standard" => DensityMode::Standard,
+            "dense" => DensityMode::Dense,
+            "maximum" => DensityMode::Maximum,
+            _ => DensityMode::Auto,
+        })
+        .unwrap_or(DensityMode::Auto)
+}
+
+/// Persist density mode to localStorage.
+pub fn save_density_mode(mode: DensityMode) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match mode {
+            DensityMode::Auto => "auto",
+            DensityMode::Standard => "standard",
+            DensityMode::Dense => "dense",
+            DensityMode::Maximum => "maximum",
+        };
+        let _ = storage.set_item(DENSITY_MODE_KEY, val);
+    }
+}
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);

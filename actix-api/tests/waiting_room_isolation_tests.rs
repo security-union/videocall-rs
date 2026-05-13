@@ -296,7 +296,7 @@ async fn test_admitted_session_receives_media_normally() {
 
     // Alice sends a MEDIA packet
     let media_bytes = make_media_packet("alice@test.com");
-    ws_a.send(Message::Binary(media_bytes.into()))
+    ws_a.send(Message::Binary(media_bytes))
         .await
         .expect("Alice should be able to send media");
 
@@ -352,7 +352,7 @@ async fn test_observer_does_not_receive_media_from_admitted_peer() {
     // Admitted session sends a MEDIA packet with AUDIO
     let media_bytes = make_media_packet("alice@test.com");
     ws_admitted
-        .send(Message::Binary(media_bytes.into()))
+        .send(Message::Binary(media_bytes))
         .await
         .expect("Admitted session should be able to send media");
 
@@ -408,7 +408,7 @@ async fn test_observer_cannot_publish_media() {
     // Observer tries to send a MEDIA packet (simulating a modified client)
     let media_bytes = make_media_packet("observer@test.com");
     ws_observer
-        .send(Message::Binary(media_bytes.into()))
+        .send(Message::Binary(media_bytes))
         .await
         .expect("WebSocket send should succeed at the transport level");
 

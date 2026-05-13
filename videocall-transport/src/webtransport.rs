@@ -6,7 +6,9 @@
 
 use anyhow::{anyhow, Error};
 use futures::channel::oneshot::channel;
+use futures::lock::Mutex as AsyncMutex;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
@@ -19,6 +21,7 @@ use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportDatagramDuplexStream, WebTransportReceiveStream, WritableStream,
+    WritableStreamDefaultWriter,
 };
 
 /// Cumulative count of datagrams dropped because the writable stream was locked.
@@ -27,6 +30,188 @@ static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Returns the total number of datagrams dropped since process start.
 pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Maximum length-prefixed frame payload size on a persistent stream (4 MB).
+/// Matches the server's `MAX_FRAME_SIZE` so honest senders never trip the
+/// server-side guard.  Frames larger than this are dropped client-side rather
+/// than being written and immediately torn down by the receiver.
+pub const PERSISTENT_STREAM_MAX_FRAME_SIZE: usize = 4_000_000;
+
+/// Holds a persistent unidirectional stream and its writer so the QUIC stream
+/// stays open across multiple sends, preserving packet ordering.
+///
+/// Each `PersistentSendStream` corresponds to **one** QUIC unidirectional
+/// stream.  We open one of these per media type (audio, video, screen,
+/// control) so that head-of-line blocking on one media type cannot stall the
+/// others.  See `webtransport-client` / Phase 2 architectural fix for
+/// background.
+pub struct PersistentSendStream {
+    /// The underlying `WritableStream` (QUIC send stream).  Kept alive so the
+    /// stream is not garbage-collected while the writer is in use.
+    _stream: WritableStream,
+    /// The writer acquired from `_stream`.  Reused for every reliable send
+    /// on this media type.  The writer enforces FIFO ordering of writes; we
+    /// do not need to serialise writes ourselves once the writer is created.
+    writer: WritableStreamDefaultWriter,
+    /// Per-entry identity token used to defeat a concurrent-eviction race
+    /// (issue #773).
+    ///
+    /// The send path captures a clone of this `Rc<()>` *while holding the
+    /// map lock*, alongside the writer it is about to use.  If the write
+    /// later fails, the error handler must remove this entry — but only if
+    /// the entry currently in the map is the *same* entry the failing
+    /// writer came from.  Without this token, two concurrent failing
+    /// senders for the same key plus a fresh sender opening a new entry in
+    /// between can result in the fresh entry being evicted by a stale
+    /// error handler.  Identity is compared via [`std::rc::Rc::ptr_eq`].
+    identity_token: Rc<()>,
+}
+
+/// Map of per-media-type persistent send streams, keyed by an opaque `u8`
+/// stream identifier.  The transport layer does not interpret the key — that
+/// is the caller's responsibility (see `MediaStreamKey` in
+/// `videocall-client/src/connection/webmedia.rs`).
+///
+/// The map is wrapped in an `AsyncMutex` so that the lazy-creation path is
+/// race-free across concurrent `send_on_persistent_stream` invocations.  In
+/// single-threaded WASM the mutex is purely a re-entrancy guard across
+/// `.await` points; it does **not** block writes once the stream exists.
+pub type PersistentStreamMap = Rc<AsyncMutex<HashMap<u8, PersistentSendStream>>>;
+
+/// Construct an empty persistent-stream map.  Stored inside `WebTransportTask`
+/// and threaded through `send_on_persistent_stream`.
+pub fn new_persistent_stream_map() -> PersistentStreamMap {
+    Rc::new(AsyncMutex::new(HashMap::new()))
+}
+
+/// Internal abstraction so [`remove_if_token_matches`] can be unit-tested in
+/// pure Rust without constructing a real `PersistentSendStream` (which
+/// requires JS `WritableStream`/`WritableStreamDefaultWriter` instances and
+/// therefore only works under `wasm32-unknown-unknown`).
+trait HasIdentityToken {
+    fn identity_token(&self) -> &Rc<()>;
+}
+
+impl HasIdentityToken for PersistentSendStream {
+    fn identity_token(&self) -> &Rc<()> {
+        &self.identity_token
+    }
+}
+
+/// Compare-and-remove for persistent-stream map entries (issue #773).
+///
+/// Removes the entry at `key` **only** if the entry currently in the map
+/// has the same identity token as `captured_token` (as compared via
+/// [`std::rc::Rc::ptr_eq`]).  Returns `true` if the entry was removed.
+///
+/// ## Why this is needed
+///
+/// The send path takes a brief lock on the map, clones the writer, and
+/// releases the lock before awaiting the write.  If the write fails, the
+/// error handler must re-acquire the lock and evict the broken entry.
+///
+/// Without identity tracking, the following race is possible:
+///
+/// 1. Senders A and B each acquire writers from entry `e1` for the same
+///    key.  Both writes are in flight.
+/// 2. The underlying stream dies.  Sender A's write returns an error.
+/// 3. Sender A re-acquires the lock and removes `e1`.
+/// 4. Sender C (a fresh send for the same key) acquires the lock, sees
+///    the key vacant, opens a new stream and inserts entry `e2`.
+/// 5. Sender B's write returns an error.  Sender B re-acquires the lock
+///    and — *without* an identity check — removes `e2`, orphaning the
+///    healthy new stream.
+///
+/// With per-entry identity tokens captured at writer-clone time, sender
+/// B sees that `e2.identity_token` is not the token it captured from
+/// `e1`, leaves `e2` alone, and the healthy stream survives.
+fn remove_if_token_matches<V: HasIdentityToken>(
+    map: &mut HashMap<u8, V>,
+    key: u8,
+    captured_token: &Rc<()>,
+) -> bool {
+    let matches = map
+        .get(&key)
+        .is_some_and(|entry| Rc::ptr_eq(entry.identity_token(), captured_token));
+    if matches {
+        map.remove(&key);
+    }
+    matches
+}
+
+/// Errors raised when attempting to parse a length-prefix-framed payload
+/// out of a stream buffer.  Used by `parse_persistent_stream_frame` and
+/// (indirectly) by the server-side reader at
+/// `actix-api/src/webtransport/bridge.rs`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// Less than 4 header bytes are available — caller should accumulate
+    /// more data and retry.
+    NeedMoreHeader,
+    /// Header is present but the indicated payload is not fully buffered
+    /// yet — caller should accumulate more data and retry.
+    NeedMorePayload {
+        /// Number of payload bytes still missing.
+        missing: usize,
+    },
+    /// Decoded length is zero or exceeds `PERSISTENT_STREAM_MAX_FRAME_SIZE`.
+    /// The stream is unrecoverable; caller should close it and drop any
+    /// buffered data.
+    InvalidLength(usize),
+}
+
+/// Encode `payload` as a `[u32 BE length][payload]` frame ready to be
+/// written to a persistent WebTransport unidirectional stream.
+///
+/// The returned `Vec<u8>` is a single chunk — when handed to JS as one
+/// `Uint8Array` and written via `writer.write_with_chunk`, the JS
+/// WritableStream spec guarantees that the header and body cannot be
+/// interleaved with another frame's bytes on the wire.
+///
+/// `payload.len()` is required to be at most `PERSISTENT_STREAM_MAX_FRAME_SIZE`;
+/// callers must enforce this themselves (the send path drops over-sized
+/// frames before reaching this helper).
+pub fn frame_persistent_stream_payload(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Attempt to extract a complete `[u32 BE length][payload]` frame from
+/// `buf`.  On success returns `Ok((payload, rest))` where `rest` is the
+/// remaining unconsumed bytes.  This is the symmetric reverse of
+/// `frame_persistent_stream_payload`.
+///
+/// `Err(FrameParseError::NeedMoreHeader)` and
+/// `Err(FrameParseError::NeedMorePayload)` indicate that the caller must
+/// accumulate more data and retry.  `Err(FrameParseError::InvalidLength)`
+/// indicates an unrecoverable framing violation; the stream must be
+/// closed.
+///
+/// The client itself does not currently call this — the client receives
+/// framed payloads via the existing `handle_unidirectional_stream` in
+/// `videocall-client/src/connection/webtransport.rs` which has its own
+/// inline framing parser.  This helper is exported so the server-side
+/// implementation and the unit tests can share the same protocol
+/// definition.
+pub fn parse_persistent_stream_frame(buf: &[u8]) -> Result<(&[u8], &[u8]), FrameParseError> {
+    if buf.len() < 4 {
+        return Err(FrameParseError::NeedMoreHeader);
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len == 0 || len > PERSISTENT_STREAM_MAX_FRAME_SIZE {
+        return Err(FrameParseError::InvalidLength(len));
+    }
+    let frame_end = 4 + len;
+    if buf.len() < frame_end {
+        return Err(FrameParseError::NeedMorePayload {
+            missing: frame_end - buf.len(),
+        });
+    }
+    Ok((&buf[4..frame_end], &buf[frame_end..]))
 }
 
 /// Represents formatting errors.
@@ -87,6 +272,11 @@ pub struct WebTransportTask {
     opened_closure: Closure<dyn FnMut(JsValue)>,
     #[allow(dead_code)]
     closed_closure: Rc<Closure<dyn FnMut(JsValue)>>,
+    /// Per-media-type persistent unidirectional send streams.  Lazily
+    /// populated by `send_on_persistent_stream` on first send for each key.
+    /// On stream-write error the entry is removed; the next send for that
+    /// key opens a fresh stream.
+    pub persistent_streams: PersistentStreamMap,
 }
 
 impl WebTransportTask {
@@ -103,6 +293,7 @@ impl WebTransportTask {
             listeners,
             opened_closure,
             closed_closure,
+            persistent_streams: new_persistent_stream_map(),
         }
     }
 }
@@ -401,7 +592,185 @@ impl WebTransportTask {
         });
     }
 
+    /// Sends a length-prefix-framed packet on a **persistent** unidirectional
+    /// QUIC stream identified by `stream_key`.
+    ///
+    /// Phase 2 of the WebTransport freeze fix (HCL discussion #756): instead of
+    /// opening a fresh QUIC stream per packet (the legacy
+    /// `send_unidirectional_stream` behaviour), each media type reuses a
+    /// long-lived stream.  This collapses ~80 streams/sec/sender to ~3
+    /// streams/connection and eliminates the relay-side `accept_uni` storm and
+    /// tokio-scheduler reorder that produced the user's five-minute WT
+    /// audio+video freeze.
+    ///
+    /// ## Framing
+    ///
+    /// Every frame is written as `[u32 BE length][payload]`.  The length
+    /// excludes the 4-byte header.  Both client and server are framed-only:
+    /// there is no per-packet-stream fallback.
+    ///
+    /// The header is emitted as a single `write_with_chunk` together with the
+    /// payload so the JS WritableStream cannot interleave the length prefix of
+    /// one frame with the payload of another (chunks are atomic — the WebIDL
+    /// spec guarantees no sub-chunk interleaving).
+    ///
+    /// ## Concurrency
+    ///
+    /// The lazy-creation path is guarded by a per-task `AsyncMutex` so that
+    /// two concurrent `send_on_persistent_stream` invocations for the same
+    /// key cannot both observe `None` and race to open a stream.  Once the
+    /// stream exists, the WritableStream writer enforces FIFO ordering of
+    /// writes internally; we do not need to hold the mutex across the
+    /// `write_with_chunk` await.
+    ///
+    /// ## Error handling
+    ///
+    /// On any write error the entry for `stream_key` is removed from the
+    /// map.  The next send for that key will open a fresh stream.  The
+    /// transport is NOT closed — a single failed frame must not kill the
+    /// session for all participants.  The receiver detects the closed stream
+    /// (via EOF) and discards any partial buffer; framing guarantees that a
+    /// truncated frame becomes a clean stream-closed event rather than a
+    /// silently-corrupted payload.
+    pub fn send_on_persistent_stream(
+        transport: Rc<WebTransport>,
+        streams: PersistentStreamMap,
+        stream_key: u8,
+        data: Vec<u8>,
+    ) {
+        // Frame-size and emptiness guards.  Mirrors the server-side
+        // `read_length_prefixed_frame` contract: zero-length payloads are
+        // treated as malformed (no legitimate caller has a reason to send
+        // one), and over-large payloads are rejected up front to avoid
+        // writing a bad header that would force an immediate stream restart
+        // on the receiver.
+        if data.is_empty() {
+            log!("persistent stream send dropped: empty payload");
+            return;
+        }
+        if data.len() > PERSISTENT_STREAM_MAX_FRAME_SIZE {
+            log!(
+                "persistent stream send dropped: payload exceeds max frame size,",
+                data.len() as u32,
+                ">",
+                PERSISTENT_STREAM_MAX_FRAME_SIZE as u32
+            );
+            return;
+        }
+
+        wasm_bindgen_futures::spawn_local(async move {
+            // Captured alongside the writer when we acquire it from the
+            // map; passed into the error handler so a stale failing send
+            // can only evict the entry it actually used.  See the eviction
+            // race notes in `remove_if_token_matches` (issue #773).
+            let mut captured_token: Option<Rc<()>> = None;
+            let result: Result<(), anyhow::Error> = async {
+                // --- Wait for the transport handshake ------------------------
+                // ready() resolves once the underlying QUIC session is
+                // established.  Calling create_unidirectional_stream() before
+                // ready() resolves throws.
+                JsFuture::from(transport.ready())
+                    .await
+                    .map_err(|e| anyhow!("transport.ready() failed: {:?}", e))?;
+
+                // --- Ensure a writer exists for this stream_key --------------
+                // Lock the map across the create-or-reuse decision so two
+                // concurrent senders for the same key cannot both observe
+                // `None` and open duplicate streams.
+                let writer = {
+                    use std::collections::hash_map::Entry;
+                    let mut map = streams.lock().await;
+                    if let Entry::Vacant(entry) = map.entry(stream_key) {
+                        let stream: WritableStream =
+                            JsFuture::from(transport.create_unidirectional_stream())
+                                .await
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "failed to create unidirectional stream for key {}: {:?}",
+                                        stream_key,
+                                        e
+                                    )
+                                })?
+                                .unchecked_into();
+                        let writer = stream
+                            .get_writer()
+                            .map_err(|e| anyhow!("error getting writer: {:?}", e))?;
+                        entry.insert(PersistentSendStream {
+                            _stream: stream,
+                            writer,
+                            identity_token: Rc::new(()),
+                        });
+                    }
+                    // Clone the writer JsValue so we can release the map
+                    // lock before the (potentially long) write await.
+                    // Capture the entry's identity token alongside the
+                    // writer so the error handler can verify we are
+                    // evicting the same entry our writer came from.
+                    let entry = map
+                        .get(&stream_key)
+                        .expect("entry was just inserted or already existed");
+                    captured_token = Some(entry.identity_token.clone());
+                    entry.writer.clone()
+                };
+
+                // --- Build the framed payload --------------------------------
+                // [u32 BE length][payload] in a single Uint8Array so the
+                // browser cannot split the header off from its body.
+                let framed = frame_persistent_stream_payload(&data);
+                let chunk = Uint8Array::from(framed.as_slice());
+
+                // --- Write the frame ----------------------------------------
+                // writer.ready() resolves when there is backpressure room.
+                // writer.write() returns immediately after enqueueing; the
+                // browser serialises chunks from this writer in call order.
+                JsFuture::from(writer.ready())
+                    .await
+                    .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                JsFuture::from(writer.write_with_chunk(&chunk))
+                    .await
+                    .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                // Stream is broken — remove it from the map so the next
+                // send for this key opens a fresh stream.  We compare
+                // identity tokens to defeat the concurrent-eviction race
+                // (issue #773): if a fresh sender has already opened a
+                // new entry while we were awaiting the failing write, we
+                // must not evict the fresh entry.
+                //
+                // The map lock is re-acquired here because the lock taken
+                // above to acquire the writer was scoped and has been
+                // released — we cannot hold it across the write await.
+                let mut map = streams.lock().await;
+                let removed = match captured_token {
+                    Some(token) => remove_if_token_matches(&mut map, stream_key, &token),
+                    None => {
+                        // We failed before acquiring a writer (e.g.
+                        // transport.ready() or create_unidirectional_stream
+                        // failed), so no entry was ever inserted on our
+                        // behalf — nothing to evict.
+                        false
+                    }
+                };
+                log!(
+                    "persistent stream send failed (stream reset, frame dropped):",
+                    e.to_string(),
+                    "evicted:",
+                    removed
+                );
+            }
+        });
+    }
+
     /// Sends data to a WebTransport connection via a unidirectional stream.
+    ///
+    /// **Legacy per-packet path.** Used only as a fallback for transports that
+    /// have not migrated to `send_on_persistent_stream` yet.  Phase 2 of the
+    /// WebTransport freeze fix replaces this with persistent per-media-type
+    /// streams; new code paths should call `send_on_persistent_stream` instead.
     ///
     /// Stream errors (creation failure, write backpressure, QUIC congestion) are
     /// transient -- they affect only this single frame send. The transport is NOT
@@ -547,5 +916,345 @@ impl WebTransportTask {
                 );
             }
         });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests for the length-prefix framing protocol.
+//
+// The framing helpers (`frame_persistent_stream_payload` and
+// `parse_persistent_stream_frame`) are pure-Rust and run on the host target.
+// The WebTransport send path itself is WASM-only (it depends on the JS
+// WritableStream API) and is exercised by integration tests rather than
+// unit tests.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[test]
+    fn frame_round_trips_byte_for_byte() {
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![0x00],
+            vec![0xFF; 1],
+            (0u8..=255).collect(),
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+            vec![0xAA; 1500],
+            vec![0x55; 64 * 1024],
+        ];
+        for payload in &payloads {
+            let framed = frame_persistent_stream_payload(payload);
+            assert_eq!(framed.len(), 4 + payload.len(), "framed length wrong");
+            let (parsed, rest) =
+                parse_persistent_stream_frame(&framed).expect("frame should parse back cleanly");
+            assert_eq!(parsed, payload.as_slice(), "round-trip payload differs");
+            assert!(rest.is_empty(), "no trailing bytes expected");
+        }
+    }
+
+    #[test]
+    fn parses_thousand_concatenated_frames_in_order() {
+        // Simulate 1000 framed packets accumulated on the wire (the scenario
+        // where the JS chunk boundary does not align with frame boundaries).
+        // The parser must extract every payload in order and with no
+        // length-prefix corruption.
+        const N: usize = 1000;
+        let mut originals: Vec<Vec<u8>> = Vec::with_capacity(N);
+        let mut buffer: Vec<u8> = Vec::new();
+        for i in 0..N {
+            // Mix of small, medium, and occasionally larger frames to exercise
+            // the parser at different boundary alignments.
+            let len = match i % 5 {
+                0 => 1,
+                1 => 80,        // typical Opus audio frame size
+                2 => 1200,      // datagram-MTU-sized
+                3 => 8 * 1024,  // video delta range
+                _ => 64 * 1024, // small keyframe range
+            };
+            let payload: Vec<u8> = (0..len).map(|j| ((i + j) & 0xFF) as u8).collect();
+            buffer.extend_from_slice(&frame_persistent_stream_payload(&payload));
+            originals.push(payload);
+        }
+
+        // Walk the buffer one frame at a time.  We deliberately use the
+        // returned `rest` slice as the next iteration's input so that any
+        // off-by-one bug in the consumed-byte count surfaces here.
+        let mut cursor: &[u8] = &buffer;
+        for (idx, expected) in originals.iter().enumerate() {
+            let (parsed, rest) = parse_persistent_stream_frame(cursor)
+                .unwrap_or_else(|e| panic!("frame {idx} failed to parse: {e:?}"));
+            assert_eq!(parsed, expected.as_slice(), "frame {idx} payload mismatch");
+            cursor = rest;
+        }
+        assert!(cursor.is_empty(), "all bytes should be consumed");
+    }
+
+    #[test]
+    fn need_more_header_when_buffer_short() {
+        for short in 0..4 {
+            let buf = vec![0u8; short];
+            assert_eq!(
+                parse_persistent_stream_frame(&buf),
+                Err(FrameParseError::NeedMoreHeader),
+            );
+        }
+    }
+
+    #[test]
+    fn need_more_payload_when_body_short() {
+        // Header claims 100 bytes but only 50 are present.
+        let mut buf = (100u32).to_be_bytes().to_vec();
+        buf.extend(std::iter::repeat_n(0u8, 50));
+        match parse_persistent_stream_frame(&buf) {
+            Err(FrameParseError::NeedMorePayload { missing }) => {
+                assert_eq!(missing, 50);
+            }
+            other => panic!("expected NeedMorePayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_length_is_invalid() {
+        let buf = (0u32).to_be_bytes();
+        assert_eq!(
+            parse_persistent_stream_frame(&buf),
+            Err(FrameParseError::InvalidLength(0)),
+        );
+    }
+
+    #[test]
+    fn oversized_length_is_invalid() {
+        // One byte over the limit must be rejected.
+        let too_big = (PERSISTENT_STREAM_MAX_FRAME_SIZE + 1) as u32;
+        let mut buf = too_big.to_be_bytes().to_vec();
+        // Pad with bogus bytes; the length check fires before we look at the body.
+        buf.extend(std::iter::repeat_n(0u8, 8));
+        assert_eq!(
+            parse_persistent_stream_frame(&buf),
+            Err(FrameParseError::InvalidLength(
+                PERSISTENT_STREAM_MAX_FRAME_SIZE + 1
+            )),
+        );
+    }
+
+    #[test]
+    fn max_size_payload_is_accepted() {
+        // A payload at exactly the max size must round-trip.  We use a small
+        // pattern so the test stays fast; the size is what we are validating.
+        let payload = vec![0xC3u8; PERSISTENT_STREAM_MAX_FRAME_SIZE];
+        let framed = frame_persistent_stream_payload(&payload);
+        let (parsed, rest) =
+            parse_persistent_stream_frame(&framed).expect("max-size frame must parse");
+        assert_eq!(parsed.len(), PERSISTENT_STREAM_MAX_FRAME_SIZE);
+        assert!(rest.is_empty());
+    }
+
+    /// Property: interleaving the wire bytes of two senders that each wrote
+    /// `[len][payload]` as a single chunk must never decode into a corrupt
+    /// frame.  The JS WritableStream guarantees no sub-chunk interleaving,
+    /// so on the wire we only ever see fully-concatenated frames.  This
+    /// test asserts that the *parser* respects that invariant: any input
+    /// that is two adjacent valid frames decodes back to those two
+    /// payloads exactly.
+    #[test]
+    fn two_adjacent_frames_decode_to_two_payloads() {
+        let a: Vec<u8> = (0u8..=99).collect();
+        let b: Vec<u8> = (100u8..=199).collect();
+        let mut wire = frame_persistent_stream_payload(&a);
+        wire.extend_from_slice(&frame_persistent_stream_payload(&b));
+
+        let (got_a, rest) = parse_persistent_stream_frame(&wire).unwrap();
+        assert_eq!(got_a, a.as_slice());
+        let (got_b, rest2) = parse_persistent_stream_frame(rest).unwrap();
+        assert_eq!(got_b, b.as_slice());
+        assert!(rest2.is_empty());
+    }
+
+    /// Stream-restart simulation at the protocol level.
+    ///
+    /// The real WT stream-restart path lives behind the JS WebTransport API
+    /// and is not unit-testable.  What *is* testable is the invariant the
+    /// restart relies on: a truncated frame (write failed mid-write, stream
+    /// reset on the wire) must not be silently consumed by the parser as if
+    /// it were a complete frame.  We assert that the parser reports
+    /// "NeedMorePayload" — the receiver then sees EOF on the stream and
+    /// discards the partial buffer.  When the sender opens a fresh stream
+    /// for the next send, the receiver starts a new buffer.  The framing
+    /// protocol is what makes this clean.
+    #[test]
+    fn truncated_frame_is_detected_not_silently_consumed() {
+        let payload = vec![0xABu8; 500];
+        let framed = frame_persistent_stream_payload(&payload);
+
+        // Drop the last byte to simulate a mid-frame stream reset.
+        let truncated = &framed[..framed.len() - 1];
+
+        match parse_persistent_stream_frame(truncated) {
+            Err(FrameParseError::NeedMorePayload { missing }) => {
+                assert_eq!(missing, 1, "must report the exact shortfall");
+            }
+            other => panic!("truncated frame must surface as NeedMorePayload, got {other:?}"),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Eviction-race tests (issue #773).
+    //
+    // These exercise the pure-Rust `remove_if_token_matches` helper, which
+    // implements the compare-and-remove logic used by the
+    // `send_on_persistent_stream` error handler.  Because the real
+    // `PersistentSendStream` contains JS WritableStream handles we cannot
+    // construct on the host, we use a tiny test stand-in that carries only
+    // the identity token.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal `HasIdentityToken` impl for host-target tests.  Real
+    /// `PersistentSendStream` instances cannot be constructed without a
+    /// live WebTransport session, so we use this to drive the eviction
+    /// helper directly.
+    struct TestEntry {
+        token: Rc<()>,
+    }
+
+    impl HasIdentityToken for TestEntry {
+        fn identity_token(&self) -> &Rc<()> {
+            &self.token
+        }
+    }
+
+    /// Baseline: a matching token evicts; a non-matching token does not.
+    #[test]
+    fn remove_if_token_matches_basic() {
+        let token = Rc::new(());
+        let other = Rc::new(());
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        map.insert(
+            7,
+            TestEntry {
+                token: token.clone(),
+            },
+        );
+
+        // Wrong token: must not evict.
+        assert!(!remove_if_token_matches(&mut map, 7, &other));
+        assert!(map.contains_key(&7));
+
+        // Correct token: evicts.
+        assert!(remove_if_token_matches(&mut map, 7, &token));
+        assert!(!map.contains_key(&7));
+
+        // Missing key: returns false, no panic.
+        assert!(!remove_if_token_matches(&mut map, 7, &token));
+    }
+
+    /// The race that motivated issue #773.
+    ///
+    /// Scenario (single-threaded WASM, so ordering is fully deterministic
+    /// once we step through it):
+    ///
+    /// 1. Sender A and sender B both clone the writer from entry `e1` for
+    ///    the same `stream_key`, each capturing `e1.token` (same `Rc<()>`
+    ///    underneath).
+    /// 2. The QUIC stream backing `e1` dies.  Sender A's write fails first.
+    /// 3. Sender A re-acquires the map lock and runs the eviction check
+    ///    against its captured token.  `e1` is still in the map with the
+    ///    matching token, so `e1` is evicted.
+    /// 4. Sender C arrives, sees the key vacant, opens a fresh stream
+    ///    and inserts `e2` with a *new* identity token.
+    /// 5. Sender B's write finally fails and runs the eviction check
+    ///    against the token it captured from `e1`.  The map currently
+    ///    holds `e2` whose token does NOT match — `e2` must survive.
+    ///
+    /// Without the identity-token check, step 5 would orphan a healthy
+    /// stream and cause the next sender for `stream_key` to needlessly
+    /// open yet another fresh stream — the precise bug #773 describes.
+    #[test]
+    fn fresh_entry_survives_stale_error_handler_eviction() {
+        const KEY: u8 = 3;
+
+        // Step 1: A and B both capture e1's token.
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        let e1_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e1_token.clone(),
+            },
+        );
+        let captured_by_a = e1_token.clone();
+        let captured_by_b = e1_token.clone();
+
+        // Step 3: A's error handler runs first, evicts e1.
+        assert!(
+            remove_if_token_matches(&mut map, KEY, &captured_by_a),
+            "A's eviction should remove e1 because its token still matches",
+        );
+        assert!(
+            !map.contains_key(&KEY),
+            "e1 must be gone after A's eviction"
+        );
+
+        // Step 4: Fresh sender C inserts e2 with a brand-new token.
+        let e2_token = Rc::new(());
+        assert!(
+            !Rc::ptr_eq(&e1_token, &e2_token),
+            "test setup invariant: e1 and e2 must have distinct tokens",
+        );
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e2_token.clone(),
+            },
+        );
+
+        // Step 5: B's stale error handler tries to evict.  Without the
+        // token check this would remove e2 and orphan the healthy stream.
+        // With the check, B sees the mismatch and leaves e2 alone.
+        assert!(
+            !remove_if_token_matches(&mut map, KEY, &captured_by_b),
+            "B's stale eviction must NOT remove the fresh entry e2",
+        );
+        assert!(map.contains_key(&KEY), "e2 must survive the stale eviction",);
+        assert!(
+            Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token),
+            "the entry under KEY must still be e2 (its token is unchanged)",
+        );
+    }
+
+    /// Variant: two stale error handlers and one fresh insert, in the
+    /// reverse interleaving order (B fires before A re-acquires the lock).
+    /// Establishes that the order of failing senders does not affect the
+    /// invariant — only the captured-token comparison matters.
+    #[test]
+    fn token_check_is_order_independent_under_multiple_stale_handlers() {
+        const KEY: u8 = 9;
+        let mut map: HashMap<u8, TestEntry> = HashMap::new();
+        let e1_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e1_token.clone(),
+            },
+        );
+        let captured_by_a = e1_token.clone();
+        let captured_by_b = e1_token.clone();
+
+        // B fires first this time.
+        assert!(remove_if_token_matches(&mut map, KEY, &captured_by_b));
+        assert!(!map.contains_key(&KEY));
+
+        // Fresh sender opens e2.
+        let e2_token = Rc::new(());
+        map.insert(
+            KEY,
+            TestEntry {
+                token: e2_token.clone(),
+            },
+        );
+
+        // A's (now stale) error handler must NOT evict e2.
+        assert!(!remove_if_token_matches(&mut map, KEY, &captured_by_a));
+        assert!(map.contains_key(&KEY));
+        assert!(Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token));
     }
 }

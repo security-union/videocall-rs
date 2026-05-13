@@ -27,7 +27,9 @@ use crate::actors::priority_drop::{
     evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::{wt_outbound_channel_capacity, CLIENT_TIMEOUT};
+use crate::constants::{
+    wt_outbound_channel_capacity, CLIENT_TIMEOUT, WT_DATAGRAM_CHANNEL_CAPACITY,
+};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
@@ -57,12 +59,28 @@ const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Keep-alive ping data (WebTransport-specific)
 const KEEP_ALIVE_PING: &[u8] = b"ping";
 
-/// Outbound message with transport type specification
+/// Routing decision for an outbound WebTransport packet.
+///
+/// Produced by [`build_outbound`] and consumed by [`WtChatSession::send_auto`]
+/// to pick the correct per-primitive channel. The bridge no longer sees this
+/// enum — each variant maps 1:1 to a dedicated bridge writer task drained by
+/// its own bounded channel of [`Bytes`].
+///
+/// The split-channel topology is the central architectural fix for the
+/// WT-freeze symptom: when QUIC flow-control credits on the persistent uni
+/// stream drain to zero, the unistream writer task blocks on `write_all`.
+/// Because datagrams are drained by an independent task on an independent
+/// channel, they continue to flow through `send_datagram` even while the
+/// unistream writer is parked. See discussion #756 for the full analysis.
 #[derive(Debug, Clone)]
 pub enum WtOutbound {
-    /// Send via UniStream (reliable, ordered)
+    /// Send via the persistent unidirectional QUIC stream (reliable, ordered,
+    /// length-prefix framed). Used for video, screen, and oversized
+    /// audio/control packets.
     UniStream(Bytes),
-    /// Send via Datagram (unreliable, unordered, low latency)
+    /// Send via QUIC datagram (unreliable, unordered, low latency).
+    /// Used for small audio media (Opus frames) and non-media control that
+    /// fits within `DATAGRAM_MAX_SIZE`.
     Datagram(Bytes),
 }
 
@@ -112,6 +130,26 @@ pub struct StopSession;
 ///
 /// A thin transport adapter that delegates business logic to `SessionLogic`.
 /// Handles WebTransport-specific I/O via channels.
+///
+/// ### Why two outbound senders?
+///
+/// As of the Phase 2 WT-freeze fix (discussion #756), the actor holds
+/// **two** independent `mpsc::Sender<Bytes>` handles — one feeding the
+/// persistent uni-stream writer task and one feeding the datagram writer
+/// task. The split mirrors the QUIC primitives:
+///
+/// * `unistream_tx` (capacity = [`wt_outbound_channel_capacity`], today 4096)
+///   absorbs video, screen, and any oversized audio/control. This is where
+///   QUIC flow control surfaces; the priority-drop policy applies here.
+/// * `datagram_tx` (capacity = [`WT_DATAGRAM_CHANNEL_CAPACITY`], 512) carries
+///   audio media (Opus, ~80B) and non-media control under MTU. Datagrams
+///   are independent of stream flow control, so the channel exists only to
+///   absorb scheduling jitter.
+///
+/// Previously a single channel multiplexed both. When QUIC stalled the
+/// uni-stream, the writer task parked on `write_all`, and audio datagrams
+/// queued behind the stalled video write in the same channel. The split
+/// removes that coupling: a stalled stream cannot starve datagrams.
 pub struct WtChatSession {
     /// Shared session logic (business logic)
     logic: SessionLogic,
@@ -119,8 +157,15 @@ pub struct WtChatSession {
     /// Heartbeat tracking (transport-specific timing)
     heartbeat: actix::clock::Instant,
 
-    /// Channel to send data back to WebTransport session
-    outbound_tx: mpsc::Sender<WtOutbound>,
+    /// Channel to the persistent unidirectional QUIC stream writer task.
+    /// Used for video, screen, and oversized audio/control packets. The
+    /// priority-drop policy is evaluated against this channel's fill ratio.
+    unistream_tx: mpsc::Sender<Bytes>,
+
+    /// Channel to the datagram writer task. Used for audio media (when it
+    /// fits MTU) and small non-media control. Independent of `unistream_tx`
+    /// so a stalled uni-stream cannot block datagram delivery.
+    datagram_tx: mpsc::Sender<Bytes>,
 
     /// Track if ActivateConnection has been sent
     activated: bool,
@@ -196,7 +241,8 @@ impl WtChatSession {
         user_id: String,
         display_name: String,
         is_guest: bool,
-        outbound_tx: mpsc::Sender<WtOutbound>,
+        unistream_tx: mpsc::Sender<Bytes>,
+        datagram_tx: mpsc::Sender<Bytes>,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -224,7 +270,8 @@ impl WtChatSession {
         WtChatSession {
             logic,
             heartbeat: actix::clock::Instant::now(),
-            outbound_tx,
+            unistream_tx,
+            datagram_tx,
             activated: false,
         }
     }
@@ -242,14 +289,15 @@ impl WtChatSession {
     /// packets is alertable on its own (separate from the much higher-
     /// volume media drops).
     fn send(&self, data: Vec<u8>) -> bool {
-        match self
-            .outbound_tx
-            .try_send(WtOutbound::UniStream(data.into()))
-        {
+        // Lifecycle control (SESSION_ASSIGNED, MEETING_STARTED, MEETING_ENDED)
+        // routes via the reliable uni-stream channel by design — these packets
+        // are not idempotent and must arrive in order. They never use the
+        // datagram path even though they typically fit MTU.
+        match self.unistream_tx.try_send(data.into()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(
-                    "Outbound channel closed for session {}, connection dead",
+                    "UniStream outbound channel closed for session {}, connection dead",
                     self.logic.id
                 );
                 false
@@ -267,7 +315,7 @@ impl WtChatSession {
                     .with_label_values(&["webtransport", "overflow_critical"])
                     .inc();
                 error!(
-                    "Outbound channel full for session {} on Critical control packet, dropping (overflow_critical)",
+                    "UniStream outbound channel full for session {} on Critical control packet, dropping (overflow_critical)",
                     self.logic.id
                 );
                 true // Channel still open, just full
@@ -320,26 +368,33 @@ impl WtChatSession {
         packet_type: PacketType,
         media_type: Option<MediaType>,
     ) -> WtSendResult {
-        // Priority-drop pre-check: before paying the `try_send` cost we
-        // ask the per-session policy whether this packet should be
-        // preempted given the current channel fill. Video / screen are
-        // shed at ~80% fill, audio at ~95% fill, control / critical
-        // never preempt. See `actors::priority_drop` for the policy.
-        //
-        // Lifecycle note: this branch fires PURELY based on channel
-        // depth — it does NOT distinguish reconnection storms from
-        // steady-state saturation. The Critical packet set
-        // (SESSION_ASSIGNED, CONGESTION, RSA_PUB_KEY, MEETING) is
-        // *never* preempted here, so a reconnection wave that needs
-        // to deliver SESSION_ASSIGNED + MEETING_STARTED still goes
-        // through. Media drops during the storm are exactly the
-        // intended behaviour — they free queue slots for the lifecycle
-        // traffic that the new participant actually needs.
+        // Classify the packet first — both the routing decision (datagram
+        // vs unistream) and the priority-drop pre-check depend on it.
+        let outbound = build_outbound(data, is_media, is_audio);
         let priority = OutboundPriority::classify(parsed, packet_type, media_type);
-        let total_capacity = wt_outbound_channel_capacity();
-        let free_capacity = self.outbound_tx.capacity();
+
+        // Priority-drop pre-check is evaluated against the destination
+        // channel's fill, not a single unified queue. After the channel
+        // split, audio media routes via `datagram_tx` and never collides
+        // with video on `unistream_tx`, so audio's 95% drop threshold
+        // applies to the datagram channel and video's 80% threshold
+        // applies to the unistream channel. Critical / Control never
+        // preempt on either channel — `evaluate_priority_drop` enforces
+        // that internally.
+        //
+        // Lifecycle note: a reconnection wave that needs to deliver
+        // SESSION_ASSIGNED + MEETING_STARTED still goes through —
+        // Critical packets are never preempted by this layer regardless
+        // of channel fill.
+        let (target_total_capacity, free_capacity) = match &outbound {
+            WtOutbound::UniStream(_) => {
+                (wt_outbound_channel_capacity(), self.unistream_tx.capacity())
+            }
+            WtOutbound::Datagram(_) => (WT_DATAGRAM_CHANNEL_CAPACITY, self.datagram_tx.capacity()),
+        };
+
         if let PriorityDropDecision::Drop { reason } =
-            evaluate_priority_drop(priority, free_capacity, total_capacity)
+            evaluate_priority_drop(priority, free_capacity, target_total_capacity)
         {
             // Mirror the legacy drop-counter pair so per-room and
             // protocol-wide series both observe the preempt. The
@@ -353,15 +408,21 @@ impl WtChatSession {
                 .with_label_values(&["webtransport", reason])
                 .inc();
             trace!(
-                "Priority-drop {reason} on WT session {}: free={free_capacity}/{total_capacity}",
+                "Priority-drop {reason} on WT session {}: free={free_capacity}/{target_total_capacity}",
                 self.logic.id,
             );
             return WtSendResult::PriorityDropped;
         }
 
-        let outbound = build_outbound(data, is_media, is_audio);
+        // Phase 2 split: route the bytes to the dedicated per-primitive
+        // channel. The bridge writer tasks drain these independently — a
+        // stalled unistream writer cannot back up the datagram channel.
+        let try_send_result = match outbound {
+            WtOutbound::UniStream(bytes) => self.unistream_tx.try_send(bytes),
+            WtOutbound::Datagram(bytes) => self.datagram_tx.try_send(bytes),
+        };
 
-        match self.outbound_tx.try_send(outbound) {
+        match try_send_result {
             Ok(()) => WtSendResult::Sent,
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(
@@ -420,17 +481,37 @@ impl WtChatSession {
         }
     }
 
-    /// Check if the outbound channel is closed
+    /// Check if either outbound channel is closed.
+    ///
+    /// The session is considered dead if **either** primitive's writer task
+    /// has gone away — the actor cannot meaningfully continue if it can only
+    /// deliver half of its outbound traffic. In practice both channels are
+    /// dropped together when the bridge tears down on session end, so this
+    /// is symmetric.
     fn is_connection_dead(&self) -> bool {
-        self.outbound_tx.is_closed()
+        self.unistream_tx.is_closed() || self.datagram_tx.is_closed()
     }
 
-    /// Start heartbeat check (WebTransport-specific timing)
+    /// Start heartbeat check (WebTransport-specific timing).
+    ///
+    /// Emits the `relay_outbound_queue_depth` gauge as the sum of the two
+    /// per-primitive channels. The label scheme is preserved
+    /// (`transport=webtransport`) so existing dashboards continue to work:
+    /// the gauge now reflects the *total* outbound backlog across both
+    /// primitives — the same operational signal it had before the split.
+    /// Per-primitive depth can still be derived from the per-channel
+    /// capacity constants and the `kind` label on `videocall_outbound_channel_drops_total`.
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
-            // `depth = total_capacity - free_capacity`. Resolved capacity is
-            // memoised, so the call is a single pointer read after init.
-            let depth = wt_outbound_channel_capacity().saturating_sub(act.outbound_tx.capacity());
+            // Per-primitive depths. Resolved capacity is memoised, so the
+            // unistream call is a single pointer read after init; the
+            // datagram capacity is a `const`.
+            let uni_depth =
+                wt_outbound_channel_capacity().saturating_sub(act.unistream_tx.capacity());
+            let dgram_depth =
+                WT_DATAGRAM_CHANNEL_CAPACITY.saturating_sub(act.datagram_tx.capacity());
+            // Sum so the existing gauge label scheme is preserved end-to-end.
+            let depth = uni_depth + dgram_depth;
             RELAY_OUTBOUND_QUEUE_DEPTH
                 .with_label_values(&[&act.logic.room, "webtransport"])
                 .set(depth as f64);
@@ -671,15 +752,17 @@ impl Handler<WtInbound> for WtChatSession {
 
         match action {
             InboundAction::Echo(data) => {
-                let outbound = match msg.source {
-                    WtInboundSource::UniStream => {
-                        WtOutbound::UniStream(Bytes::from(data.as_ref().clone()))
-                    }
-                    WtInboundSource::Datagram => {
-                        WtOutbound::Datagram(Bytes::from(data.as_ref().clone()))
-                    }
+                // RTT echo is routed onto the same primitive it arrived on
+                // so the round-trip measurement reflects that primitive's
+                // path — a UniStream probe measures stream RTT (which can
+                // be inflated by flow-control stalls), a Datagram probe
+                // measures the unframed datagram RTT.
+                let echo_bytes = Bytes::from(data.as_ref().clone());
+                let try_send_result = match msg.source {
+                    WtInboundSource::UniStream => self.unistream_tx.try_send(echo_bytes),
+                    WtInboundSource::Datagram => self.datagram_tx.try_send(echo_bytes),
                 };
-                match self.outbound_tx.try_send(outbound) {
+                match try_send_result {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         warn!(
@@ -1086,5 +1169,205 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 split-channel invariant (discussion #756)
+    //
+    // The architectural fix is that the unistream and datagram channels are
+    // independent: a saturated unistream channel — typical when QUIC flow
+    // control stalls on a slow receiver — must not block the datagram
+    // channel from accepting new audio frames. These tests lock in that
+    // invariant at the `mpsc::channel` level. The bridge-level invariant
+    // (a stalled `write_all` on the persistent stream does not park the
+    // datagram writer task) is enforced by the structural split in
+    // `bridge.rs::spawn_unistream_writer` / `spawn_datagram_writer` —
+    // those run in independent `tokio::spawn` tasks and never share state.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn split_channels_datagrams_survive_unistream_saturation() {
+        // The whole point of the channel split: if the unistream channel
+        // were a shared queue with datagrams (the pre-Phase-2 topology),
+        // saturating it would also drop audio. Under the split,
+        // saturating the unistream channel has zero effect on the
+        // datagram channel.
+        const UNI_CAP: usize = 64;
+        const DGRAM_CAP: usize = 16;
+
+        let (uni_tx, _uni_rx) = mpsc::channel::<Bytes>(UNI_CAP);
+        let (dgram_tx, mut dgram_rx) = mpsc::channel::<Bytes>(DGRAM_CAP);
+
+        // Saturate the unistream channel completely — we never drain it,
+        // simulating a writer task parked on `stream.write_all().await`.
+        for i in 0..UNI_CAP {
+            uni_tx
+                .try_send(Bytes::from(vec![0xBB; 100]))
+                .unwrap_or_else(|_| panic!("uni slot {i} must accept"));
+        }
+        assert_eq!(
+            uni_tx.capacity(),
+            0,
+            "unistream channel must be exactly full before the test runs"
+        );
+
+        // The next unistream send must fail (channel full) — proves we
+        // really did saturate it.
+        match uni_tx.try_send(Bytes::from(vec![0xBB; 100])) {
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            other => panic!("expected Full, got {other:?}"),
+        }
+
+        // Now push DGRAM_CAP audio packets onto the datagram channel —
+        // every one must succeed because the channels are independent.
+        for i in 0..DGRAM_CAP {
+            dgram_tx
+                .try_send(Bytes::from(vec![0xAA; 80]))
+                .unwrap_or_else(|_| {
+                    panic!("datagram slot {i} must accept while unistream is full")
+                });
+        }
+
+        // Drain the datagram receiver and confirm we received exactly
+        // DGRAM_CAP packets — none were silently dropped or blocked.
+        let mut received = 0usize;
+        while dgram_rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, DGRAM_CAP,
+            "datagram channel must deliver every packet pushed while unistream is saturated",
+        );
+    }
+
+    #[tokio::test]
+    async fn split_channels_unistream_back_to_admit_after_drain() {
+        // Sanity check that the unistream channel itself recovers normally
+        // after being drained — proves the split doesn't introduce any
+        // accidental persistence of the saturated state.
+        const UNI_CAP: usize = 8;
+        let (uni_tx, mut uni_rx) = mpsc::channel::<Bytes>(UNI_CAP);
+
+        for _ in 0..UNI_CAP {
+            uni_tx
+                .try_send(Bytes::from(vec![0; 1]))
+                .expect("saturating sends must succeed");
+        }
+        assert!(uni_tx.try_send(Bytes::from(vec![0; 1])).is_err());
+
+        // Drain everything.
+        while uni_rx.try_recv().is_ok() {}
+
+        // After drain we can send up to UNI_CAP again.
+        for _ in 0..UNI_CAP {
+            uni_tx
+                .try_send(Bytes::from(vec![0; 1]))
+                .expect("post-drain sends must succeed");
+        }
+    }
+
+    /// Integration-style verification of the split-writer flow.
+    ///
+    /// We do not build a real `WebTransportBridge` (that requires a real
+    /// `quinn::Connection`), but we *do* mirror the bridge's per-primitive
+    /// writer-task topology: spawn one task that drains the unistream
+    /// receiver into a stub stream (which artificially blocks, mimicking
+    /// QUIC flow-control stall), and another that drains the datagram
+    /// receiver into a counter. The test then pushes N video packets onto
+    /// the unistream channel and M audio packets onto the datagram
+    /// channel concurrently, and asserts that all M datagrams are
+    /// delivered even while the unistream writer is parked on the stub
+    /// stream's blocking write.
+    #[tokio::test]
+    async fn split_writer_topology_datagrams_unblocked_by_stream_stall() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        const UNI_CAP: usize = 64;
+        const DGRAM_CAP: usize = 32;
+        const M_AUDIO: usize = 30;
+
+        let (uni_tx, mut uni_rx) = mpsc::channel::<Bytes>(UNI_CAP);
+        let (dgram_tx, mut dgram_rx) = mpsc::channel::<Bytes>(DGRAM_CAP);
+
+        // Stub "stream" — a writer task that consumes from `uni_rx` but
+        // blocks forever on a single `Notify::notified()` after the first
+        // message. This mimics a real `stream.write_all().await` that has
+        // stalled on QUIC flow-control credit exhaustion. Critically, this
+        // task never yields — once parked, it does NOT come back to drain
+        // more packets. That is the production failure mode the split is
+        // designed to survive.
+        let stall = Arc::new(Notify::new());
+        let stall_writer = stall.clone();
+        let unistream_writer = tokio::spawn(async move {
+            // Consume the first message to prove the writer was alive,
+            // then park indefinitely.
+            let _ = uni_rx.recv().await;
+            stall_writer.notified().await;
+            // After notify, drain remaining (used only by the test
+            // teardown so the channel close is observed cleanly).
+            while uni_rx.recv().await.is_some() {}
+        });
+
+        // Datagram writer — fully independent task that pulls from
+        // `dgram_rx` and forwards each payload to a shared counter.
+        // Mirrors `spawn_datagram_writer` (no blocking, no shared state
+        // with the unistream writer).
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivered_writer = delivered.clone();
+        let datagram_writer = tokio::spawn(async move {
+            while let Some(_packet) = dgram_rx.recv().await {
+                delivered_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Push N video packets onto the unistream channel (some will
+        // saturate after the writer parks). The exact count doesn't
+        // matter; only that the writer becomes blocked.
+        for _ in 0..UNI_CAP {
+            // Use try_send so the test never deadlocks on a real `send`
+            // awaiting capacity. We expect some sends to fail once the
+            // writer is parked and the channel fills up — that's the
+            // failure mode we tolerate.
+            let _ = uni_tx.try_send(Bytes::from(vec![0xBB; 1024]));
+        }
+
+        // Push M audio packets onto the *datagram* channel. The whole
+        // point: every one of these must be delivered to the datagram
+        // writer's counter, even while the unistream writer is parked.
+        for i in 0..M_AUDIO {
+            // `send` (not `try_send`) — datagram channel has capacity
+            // DGRAM_CAP and the writer drains promptly, so this will not
+            // block on a healthy split. If split independence is broken
+            // we'll deadlock and fail the test's outer timeout.
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                dgram_tx.send(Bytes::from(vec![0xAA; 80])).await
+            })
+            .await
+            .unwrap_or_else(|_| panic!("audio packet {i} blocked — split-channel invariant broken"))
+            .expect("datagram channel must remain open");
+        }
+
+        // Give the datagram writer a moment to drain.
+        for _ in 0..50 {
+            if delivered.load(std::sync::atomic::Ordering::SeqCst) >= M_AUDIO {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            delivered.load(std::sync::atomic::Ordering::SeqCst),
+            M_AUDIO,
+            "every audio datagram must be delivered while the unistream writer is parked",
+        );
+
+        // Clean teardown: release the parked unistream writer and drop
+        // the senders so both writer tasks exit.
+        stall.notify_one();
+        drop(uni_tx);
+        drop(dgram_tx);
+        let _ = unistream_writer.await;
+        let _ = datagram_writer.await;
     }
 }

@@ -351,9 +351,7 @@ h3 {
 }
 
 .grid-item:hover .tile-mute-btn,
-.split-peer-tile:hover .tile-mute-btn,
-.grid-item.speaking-tile .tile-mute-btn,
-.split-peer-tile.speaking-tile .tile-mute-btn {
+.split-peer-tile:hover .tile-mute-btn {
   visibility: visible;
 }
 

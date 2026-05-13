@@ -20,6 +20,8 @@ services:
       dockerfile: docker/Dockerfile.actix.dev
       context: ../
     working_dir: /app/actix-api
+    cpus: 4
+    mem_limit: 8g
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
       - RUST_LOG=info

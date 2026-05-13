@@ -18,7 +18,7 @@ web-transport-quinn = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 tokio = { version = "1", features = ["full"] }
-protobuf = "=3.7.1"
+protobuf = "=3.7.2"
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 log = "0.4"

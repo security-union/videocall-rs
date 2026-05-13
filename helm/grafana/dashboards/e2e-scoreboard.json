@@ -13,6 +13,7 @@
       "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_run_status{branch=\"PR-staging\"}",
           "legendFormat": "{{branch}}"
         }
@@ -46,6 +47,7 @@
       "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_run_status{branch=\"hcl-main\"}",
           "legendFormat": "{{branch}}"
         }
@@ -79,7 +81,9 @@
       "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
       "targets": [
         {
-          "expr": "e2e_run_timestamp{branch=~\"PR-staging|hcl-main\"}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_run_timestamp{branch=~\"PR-staging|hcl-main\"} * 1000",
           "legendFormat": "{{branch}}"
         }
       ],
@@ -102,6 +106,7 @@
       "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_run_duration_seconds{branch=~\"PR-staging|hcl-main\"}",
           "legendFormat": "{{branch}}"
         }
@@ -133,10 +138,14 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
       "targets": [
         {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_tests_passed{branch=~\"PR-staging|hcl-main\"}",
           "legendFormat": "{{branch}} passed"
         },
         {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_tests_failed{branch=~\"PR-staging|hcl-main\"}",
           "legendFormat": "{{branch}} failed"
         }
@@ -174,6 +183,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_run_duration_seconds{branch=~\"PR-staging|hcl-main\"}",
           "legendFormat": "{{branch}}"
         }
@@ -193,48 +203,115 @@
     },
     {
       "id": 7,
-      "title": "Test Counts — Latest Run",
-      "type": "table",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 13 },
+      "title": "PR-staging — Test Counts",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 13 },
       "targets": [
         {
-          "expr": "e2e_tests_passed{branch=~\"PR-staging|hcl-main\"}",
-          "legendFormat": "{{branch}}",
-          "instant": true,
-          "format": "table"
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_passed{branch=\"PR-staging\"}",
+          "legendFormat": "Passed"
         },
         {
-          "expr": "e2e_tests_failed{branch=~\"PR-staging|hcl-main\"}",
-          "legendFormat": "{{branch}}",
-          "instant": true,
-          "format": "table"
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_failed{branch=\"PR-staging\"}",
+          "legendFormat": "Failed"
         },
         {
-          "expr": "e2e_tests_skipped{branch=~\"PR-staging|hcl-main\"}",
-          "legendFormat": "{{branch}}",
-          "instant": true,
-          "format": "table"
-        },
-        {
-          "expr": "e2e_run_duration_seconds{branch=~\"PR-staging|hcl-main\"}",
-          "legendFormat": "{{branch}}",
-          "instant": true,
-          "format": "table"
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_skipped{branch=\"PR-staging\"}",
+          "legendFormat": "Skipped"
         }
       ],
-      "transformations": [
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failed" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Skipped" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 9,
+      "title": "hcl-main — Test Counts",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 13 },
+      "targets": [
         {
-          "id": "merge",
-          "options": {}
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_passed{branch=\"hcl-main\"}",
+          "legendFormat": "Passed"
         },
         {
-          "id": "organize",
-          "options": {
-            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
-            "renameByName": { "branch": "Branch", "Value #A": "Passed", "Value #B": "Failed", "Value #C": "Skipped", "Value #D": "Duration (s)" }
-          }
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_failed{branch=\"hcl-main\"}",
+          "legendFormat": "Failed"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "e2e_tests_skipped{branch=\"hcl-main\"}",
+          "legendFormat": "Skipped"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failed" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Skipped" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
     },
     {
       "id": 8,
@@ -243,6 +320,8 @@
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 19 },
       "targets": [
         {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
           "expr": "e2e_tests_passed{branch=~\"PR-staging|hcl-main\"} / (e2e_tests_passed{branch=~\"PR-staging|hcl-main\"} + e2e_tests_failed{branch=~\"PR-staging|hcl-main\"}) * 100",
           "legendFormat": "{{branch}} pass rate %"
         }

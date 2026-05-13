@@ -26,7 +26,7 @@ use videocall_transport::websocket::WebSocketTask;
 use videocall_transport::webtransport::WebTransportTask;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -46,21 +46,27 @@ impl Task {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    /// Send a packet via the reliable per-media-type stream selected by
+    /// `stream_key`.  WebSocket ignores the key (single TCP stream);
+    /// WebTransport routes to the matching persistent QUIC stream.
+    pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
         match self {
-            Task::WebSocket(ws) => ws.send_packet(packet),
-            Task::WebTransport(wt) => wt.send_packet(packet),
+            Task::WebSocket(ws) => ws.send_packet(packet, stream_key),
+            Task::WebTransport(wt) => wt.send_packet(packet, stream_key),
         }
     }
 
     /// Send a packet via datagram (unreliable, low-latency) when supported.
     ///
     /// For WebTransport, this uses datagrams for small packets and falls back
-    /// to streams for oversized packets. For WebSocket, this is equivalent to
-    /// `send_packet()` since WebSocket has no datagram concept.
+    /// to the Control persistent stream for oversized packets.  For
+    /// WebSocket, this routes through the single TCP stream (the key is
+    /// ignored by the WS impl).
     pub fn send_packet_datagram(&self, packet: PacketWrapper) {
         match self {
-            Task::WebSocket(ws) => ws.send_packet(packet),
+            // WebSocket has no datagram concept — fall back to reliable
+            // delivery on the Control stream-key (ignored by WS).
+            Task::WebSocket(ws) => ws.send_packet(packet, MediaStreamKey::Control),
             Task::WebTransport(wt) => wt.send_packet_datagram(packet),
         }
     }

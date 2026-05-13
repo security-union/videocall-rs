@@ -20,6 +20,7 @@ use super::connection_manager::{
     monotonic_now_ms, ConnectionManager, ConnectionManagerOptions, ConnectionState,
     CPU_OVERLOADED_DURATION_MS, CPU_OVERLOAD_DRIFT_THRESHOLD_MS,
 };
+use super::webmedia::MediaStreamKey;
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
@@ -227,13 +228,18 @@ impl ConnectionController {
 
     // Delegate methods to ConnectionManager
 
-    /// Send packet through active connection via reliable stream.
-    pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
+    /// Send packet through active connection via the reliable per-media-type
+    /// stream selected by `stream_key`.
+    ///
+    /// Callers must classify each packet up-front (audio/video/screen/control)
+    /// so the WebTransport implementation can route it onto the correct
+    /// persistent QUIC stream.  WebSocket ignores the hint.
+    pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) -> Result<()> {
         let mgr = self
             .manager
             .try_borrow()
             .map_err(|_| anyhow!("Failed to borrow ConnectionManager"))?;
-        mgr.send_packet(packet)
+        mgr.send_packet(packet, stream_key)
     }
 
     /// Send packet through active connection via datagram (unreliable, low-latency).

@@ -591,6 +591,8 @@ jobs:
             --set "env[13].value=pr${SLOT}-session" \
             --set "env[14].name=SERVICE_VERSION_URLS" \
             --set "env[14].value=http://websocket-pr-${PR_NUM}:8080/version\,http://dx-pr-${PR_NUM}:80/version.json" \
+            --set "env[15].name=NATS_URL" \
+            --set "env[15].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
             --set "ingress.hosts[0].host=pr${SLOT}-api.preview.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

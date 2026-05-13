@@ -1079,7 +1079,14 @@ pub fn AttendantsComponent(
                 }))
             },
             // Host's own client must NOT disable its own camera on disable-video-all —
-            // skip the callback entirely when is_owner is true.
+            // skip the callback entirely when is_owner is true (client-side guard).
+            //
+            // Self-protection model:
+            //   • disable-video-all  → client-side only: is_owner check here prevents the
+            //     host from receiving the broadcast as a target of its own "disable video for all" action.
+            //   • disable-video (single-target) → server-side: routes/host.rs rejects any
+            //     request where body.user_id == the authenticated caller's user_id.
+            //
             on_host_disable_video: if is_owner {
                 None
             } else {

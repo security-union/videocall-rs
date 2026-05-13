@@ -115,7 +115,7 @@ async function enableMic(page: Page): Promise<void> {
  * before interacting.
  *
  * The flow is two-step:
- *   1. Click the menu-toggle button (`title="Mute participant"`, an
+ *   1. Click the menu-toggle button (`title="Host actions"`, an
  *      `.tile-mute-btn`) to open the tile context menu.
  *   2. Click the inner "Mute" item (`.tile-context-menu-item`) to actually
  *      invoke `on_mute` and broadcast the host-mute via NATS.
@@ -131,7 +131,7 @@ async function hostMutePeerViaTile(page: Page): Promise<void> {
   // `.grid-item:hover`).
   await guestTile.hover();
 
-  const muteToggle = guestTile.getByTitle("Mute participant");
+  const muteToggle = guestTile.getByTitle("Host actions");
   await expect(muteToggle).toBeVisible({ timeout: 15_000 });
   await muteToggle.click();
 
@@ -210,7 +210,7 @@ test.describe("Host mute controls", () => {
       await enableMic(guestPage);
 
       // ---- Host opens the tile menu and clicks the inner "Mute" item ----
-      // The tile menu-toggle (`title="Mute participant"`) only opens the
+      // The tile menu-toggle (`title="Host actions"`) only opens the
       // context menu — it does not call on_mute directly. The inner "Mute"
       // menu item is what actually triggers the host-mute broadcast.
       await hostMutePeerViaTile(hostPage);
@@ -223,9 +223,9 @@ test.describe("Host mute controls", () => {
 
       // ---- Mute menu-toggle disappears from host's view (peer is now muted) ----
       // Once the guest is muted, on_mute becomes None and the entire
-      // `.tile-mute-menu-wrapper` (and its `title="Mute participant"` button)
+      // `.tile-mute-menu-wrapper` (and its `title="Host actions"` button)
       // is no longer rendered for that peer.
-      await expect(hostPage.getByTitle("Mute participant")).toHaveCount(0, {
+      await expect(hostPage.getByTitle("Host actions")).toHaveCount(0, {
         timeout: 10_000,
       });
     } finally {

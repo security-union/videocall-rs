@@ -4,12 +4,13 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
-## Status — phase 2a (multi-bot via `--users N`)
+## Status — phase 2b (multi-bot + seeded random-N matrix)
 
-Phase 2 adds multi-bot orchestration on top of the phase-1 single-bot foundation:
+Phase 2 adds multi-bot orchestration + a seeded random-N generator on top of the phase-1 single-bot foundation:
 
 - `bots-app run --users N` launches N bots concurrently in one Node process (in-process Playwright `Browser` instances — cheaper than N subprocesses; resource cap configurable via `--max-users`, default 10).
-- Bots pick the first N named participants from `bot/conversation/manifest.yaml` in manifest order (alice, bob, carol, ...).
+- `bots-app gen --count N --seed S --meeting-url <url>` emits a meeting-config YAML with N randomly-shuffled participants (deterministic given `--seed`). By default the shuffle pool is **only costumed participants**; pass `--include-observers` to also pick observer-NN seats.
+- `bots-app run --config <path>` consumes a meeting-config YAML — produced by `gen` or hand-rolled — and routes through the same orchestrator. Per-bot TTL overrides supported.
 - Per-bot TTL timer; SIGINT/SIGTERM cleanly signals every bot to leave.
 - An error in one bot's launch is logged and doesn't take the others down.
 
@@ -46,6 +47,40 @@ npm run bot -- run \
 ```
 
 Each bot opens its own headed Chrome window. SIGINT (Ctrl+C) signals all of them to leave cleanly before the parent exits. Default cap is 10 bots per invocation; raise with `--max-users <N>` if you need more (and your laptop can handle it — each bot is ~0.5-1 GB RAM).
+
+## Seeded random-N matrix (`gen` + `run --config`)
+
+`bots-app gen` emits a meeting-config YAML with `--count` randomly-shuffled participants. Same `--seed` always produces the same picks, so any bug surfaced by a random run is reproducible by re-running with the same seed.
+
+```bash
+cd e2e
+# Emit a 5-bot config to stdout (or --out path)
+npm run bot -- gen \
+  --count 5 \
+  --seed 42 \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --ttl 5m \
+  --out /tmp/meeting-42.yaml
+
+# Replay it
+npm run bot -- run --config /tmp/meeting-42.yaml
+```
+
+The generated file looks like:
+
+```yaml
+meeting_url: https://app.videocall.fnxlabs.com/meeting/TonyBots
+ttl: 5m
+bots:
+  - participant: pete
+  - participant: grace
+  - participant: mona
+meta:
+  seed: 42
+  generated_at: 2026-05-13T23:05:42.506Z
+```
+
+By default `gen` only picks from **costumed participants** in the manifest (the 19 named characters with `costume_dir`). Pass `--include-observers` to also pick from observer-NN seats — useful when you specifically want a meeting filled mostly with receive-only bots. Note that observer bots show up as Chrome's default fake pattern with no audio, since `prep-assets` doesn't produce any artifacts for them.
 
 ## Usage
 
@@ -157,9 +192,10 @@ Environment variables:
 bots-app run
   --meeting-url <url>          Full meeting URL (required)
   --participant <name>         Single-bot: handle (alice/bob/...) or full email. Mutually exclusive with --users.
-  --users <N>                  Multi-bot: launch N bots picking the first N manifest participants. Mutually exclusive with --participant.
+  --users <N>                  Multi-bot: launch N bots picking the first N manifest participants. Mutually exclusive with --participant / --config.
   --max-users <N>              Cap for --users (default 10)
-  --display-name <name>        Display name (single-bot only; ignored in --users mode)
+  --config <path>              Multi-bot: load meeting-config YAML (from `gen` or hand-rolled). Mutually exclusive with --participant / --users.
+  --display-name <name>        Display name (single-bot only; ignored in --users / --config modes)
   --headless                   Run Chrome headless (default: headed)
   --ttl <duration>             Bot lifespan — "<int>s|m|h" or "infinite" (default: 5m)
   --manifest <path>            Path to bot/conversation/manifest.yaml; pass "" to skip fake-device wiring
@@ -176,6 +212,15 @@ bots-app sso-login
   --start-url <url>            Where to navigate headed Chrome to trigger SSO (default: https://app.videocall.fnxlabs.com/)
   --assets-dir <dir>           Where to write auth/hcl-sso.json (default: e2e/bots-app/run)
   --out-file <path>            Override the output file location
+
+bots-app gen
+  --count <N>                  Number of bots in the generated config (required)
+  --meeting-url <url>          Meeting URL baked into the generated config (required)
+  --seed <S>                   RNG seed (integer; default: random per run)
+  --ttl <duration>             Shared TTL baked into the generated config
+  --manifest <path>            Manifest path (default: bot/conversation/manifest.yaml)
+  --out <path>                 Write YAML to this file (default: stdout)
+  --include-observers          Also pick from observer-NN seats (default: costumed participants only)
 ```
 
 ## Development
@@ -220,6 +265,8 @@ e2e/
       meeting-join.ts       ← post-goto: fills display-name form, clicks Join Meeting, enables mic + camera
       meeting-join.test.ts  ← vitest placeholder (smoke test only — real coverage is the manual run)
       orchestrator.ts       ← runBotsToCompletion — spawns N in-process bots, races TTL vs shutdown signal
+      meeting-config.ts     ← parse / emit meeting-config YAML + seeded random-N generator
+      meeting-config.test.ts ← vitest unit tests (22) for parse/emit, seeded RNG, shuffle, generate
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
         storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)

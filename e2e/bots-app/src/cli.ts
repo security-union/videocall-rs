@@ -11,8 +11,11 @@ import {
   defaultSsoStatePath,
   storageStatePath,
 } from "./auth/storage-state";
+import { writeFileSync } from "node:fs";
+
 import { prepareParticipantCostume } from "./costumes";
 import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
+import { emitMeetingConfigYaml, generateMeetingConfig, loadMeetingConfig } from "./meeting-config";
 import { runBotsToCompletion, type BotTask } from "./orchestrator";
 import { prepareParticipantAudio } from "./stitcher";
 import { parseDuration, Ttl } from "./ttl";
@@ -29,13 +32,13 @@ program
   .description(
     "Launch one or more browser bots that join the meeting concurrently and hold the session",
   )
-  .requiredOption(
+  .option(
     "--meeting-url <url>",
-    "Full meeting URL (e.g. https://app.videocall.fnxlabs.com/meeting/TonyBots)",
+    "Full meeting URL (e.g. https://app.videocall.fnxlabs.com/meeting/TonyBots). Required unless --config is set (the file carries it).",
   )
   .option(
     "--participant <name>",
-    'Single-bot mode: participant handle (e.g. "alice") or full email. Mutually exclusive with --users.',
+    'Single-bot mode: participant handle (e.g. "alice") or full email. Mutually exclusive with --users / --config.',
   )
   .option(
     "--users <N>",
@@ -45,6 +48,10 @@ program
     "--max-users <N>",
     "Resource cap when --users is set — refuses to launch more than this many bots. Default 10.",
     "10",
+  )
+  .option(
+    "--config <path>",
+    "Path to a meeting-config YAML emitted by `bots-app gen` (or hand-rolled). Provides meeting_url + bots[] from the file; CLI flags still override individual fields. Mutually exclusive with --participant and --users.",
   )
   .option("--display-name <name>", "Display name shown in the meeting", undefined)
   .option("--headless", "Run Chrome headless (default: headed)", false)
@@ -76,20 +83,53 @@ program
     'Path to a captured HCL SSO storage-state JSON (from `bots-app sso-login`). Loaded in addition to JWT cookie injection when --auth=jwt. Pass "" to skip. Defaults to <assets-dir>/auth/hcl-sso.json — loaded only if the file exists.',
   )
   .action(async (opts: RunCommandOptions) => {
-    let ttl: Ttl;
-    try {
-      ttl = parseDuration(opts.ttl);
-    } catch (e) {
-      console.error(`bots-app: ${(e as Error).message}`);
+    // Mutual exclusion / required-arg checks ──────────────────────────
+    const modeCount = [opts.participant, opts.users, opts.config].filter(Boolean).length;
+    if (modeCount > 1) {
+      console.error("bots-app: --participant, --users, and --config are mutually exclusive");
+      process.exit(2);
+    }
+    if (modeCount === 0) {
+      console.error("bots-app: one of --participant, --users, or --config is required");
       process.exit(2);
     }
 
-    if (opts.participant && opts.users) {
-      console.error("bots-app: --participant and --users are mutually exclusive");
+    // Load the config file first (if any) — it can supply meeting_url
+    // + per-bot list + a default ttl that --ttl can override.
+    let configMeetingUrl: string | null = null;
+    let configBots: { participant: string; ttl?: string }[] = [];
+    let configTtl: string | null = null;
+    if (opts.config) {
+      try {
+        const cfg = loadMeetingConfig(opts.config);
+        configMeetingUrl = cfg.meetingUrl;
+        configBots = cfg.bots;
+        configTtl = cfg.ttl ?? null;
+        console.log(
+          `bots-app: loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
+            (cfg.meta?.seed !== undefined ? `, seed=${cfg.meta.seed}` : "") +
+            `)`,
+        );
+      } catch (e) {
+        console.error(`bots-app: failed to read config ${opts.config}:`, (e as Error).message);
+        process.exit(2);
+      }
+    }
+
+    const meetingUrl = opts.meetingUrl ?? configMeetingUrl;
+    if (!meetingUrl) {
+      console.error("bots-app: --meeting-url is required (or set it in the --config file)");
       process.exit(2);
     }
-    if (!opts.participant && !opts.users) {
-      console.error("bots-app: one of --participant or --users is required");
+
+    // TTL resolution: CLI flag wins over config file; config file wins
+    // over the implicit default.
+    const ttlRaw = opts.ttl !== "5m" ? opts.ttl : (configTtl ?? opts.ttl);
+    let ttl: Ttl;
+    try {
+      ttl = parseDuration(ttlRaw);
+    } catch (e) {
+      console.error(`bots-app: ${(e as Error).message}`);
       process.exit(2);
     }
 
@@ -104,10 +144,14 @@ program
       }
     }
 
-    // Resolve the participant list — single-bot via --participant, or
-    // multi-bot via --users picking from manifest order.
+    // Resolve the participant list:
+    //   --config  → bots[] from the file
+    //   --users N → first N from the manifest
+    //   --participant <name> → single-bot
     let participants: string[];
-    if (opts.users) {
+    if (opts.config) {
+      participants = configBots.map((b) => b.participant);
+    } else if (opts.users) {
       const n = Number.parseInt(opts.users, 10);
       const maxUsers = Number.parseInt(opts.maxUsers, 10);
       if (!Number.isFinite(n) || n <= 0) {
@@ -146,7 +190,7 @@ program
       }
       authOverride = opts.auth;
     }
-    const hostname = new URL(opts.meetingUrl).hostname;
+    const hostname = new URL(meetingUrl).hostname;
     const authBackend = chooseAuthBackend(hostname, authOverride);
     const ssoStateFile =
       authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
@@ -160,8 +204,20 @@ program
         authBackend === "storage-state"
           ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, participant))
           : null;
+      // Per-bot ttl override from --config wins over the shared TTL.
+      let botTtl: Ttl = ttl;
+      const perBotTtl = configBots.find((b) => b.participant === participant)?.ttl;
+      if (perBotTtl) {
+        try {
+          botTtl = parseDuration(perBotTtl);
+        } catch (e) {
+          console.warn(
+            `bots-app: invalid per-bot ttl "${perBotTtl}" for ${participant}; falling back to shared ttl. (${(e as Error).message})`,
+          );
+        }
+      }
       return {
-        meetingURL: opts.meetingUrl,
+        meetingURL: meetingUrl,
         participant,
         displayName,
         headless: opts.headless,
@@ -170,7 +226,7 @@ program
         ssoStateFile,
         manifest,
         runDir: opts.assetsDir,
-        ttl,
+        ttl: botTtl,
       };
     });
 
@@ -179,10 +235,11 @@ program
   });
 
 interface RunCommandOptions {
-  meetingUrl: string;
+  meetingUrl?: string;
   participant?: string;
   users?: string;
   maxUsers: string;
+  config?: string;
   displayName?: string;
   headless: boolean;
   ttl: string;
@@ -311,6 +368,90 @@ interface SsoLoginCommandOptions {
   startUrl: string;
   assetsDir: string;
   outFile?: string;
+}
+
+program
+  .command("gen")
+  .description(
+    "Generate a meeting-config YAML for `bots-app run --config <path>`. Deterministic given the same --seed. Default output is stdout; pass --out to write to a file.",
+  )
+  .requiredOption("--count <N>", "Number of bots to include (must be ≤ manifest participants)")
+  .requiredOption(
+    "--meeting-url <url>",
+    "Meeting URL that gets baked into the generated config's top-level `meeting_url`",
+  )
+  .option("--seed <S>", "Seed for the RNG (integer; default: random per run)")
+  .option(
+    "--ttl <duration>",
+    "Shared TTL written to the generated config (top-level). Per-bot TTLs are not randomized today.",
+  )
+  .option(
+    "--manifest <path>",
+    "Path to bot/conversation/manifest.yaml",
+    join(repoRoot(), "bot/conversation/manifest.yaml"),
+  )
+  .option("--out <path>", "Write the generated YAML to this file instead of stdout")
+  .option(
+    "--include-observers",
+    "Allow the shuffle to pick observer-NN slots (no costume, no audio). Default is to draw only from costumed participants.",
+    false,
+  )
+  .action((opts: GenCommandOptions) => {
+    const count = Number.parseInt(opts.count, 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      console.error(`bots-app: --count must be a positive integer, got "${opts.count}"`);
+      process.exit(2);
+    }
+    const seed =
+      opts.seed !== undefined
+        ? Number.parseInt(opts.seed, 10)
+        : Math.floor(Math.random() * 2 ** 31);
+    if (!Number.isFinite(seed)) {
+      console.error(`bots-app: --seed must be an integer, got "${opts.seed}"`);
+      process.exit(2);
+    }
+
+    if (!existsSync(opts.manifest)) {
+      console.error(
+        `bots-app: manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+      );
+      process.exit(2);
+    }
+    const { manifest } = loadManifest(opts.manifest);
+
+    let config;
+    try {
+      config = generateMeetingConfig({
+        manifest,
+        count,
+        seed,
+        meetingUrl: opts.meetingUrl,
+        ttl: opts.ttl,
+        includeObservers: opts.includeObservers,
+      });
+    } catch (e) {
+      console.error(`bots-app: gen failed: ${(e as Error).message}`);
+      process.exit(2);
+    }
+    const yaml = emitMeetingConfigYaml(config);
+    if (opts.out) {
+      writeFileSync(opts.out, yaml, "utf8");
+      console.error(
+        `bots-app gen: wrote ${config.bots.length} bot(s) → ${opts.out} (seed=${seed})`,
+      );
+    } else {
+      process.stdout.write(yaml);
+    }
+  });
+
+interface GenCommandOptions {
+  count: string;
+  meetingUrl: string;
+  seed?: string;
+  ttl?: string;
+  manifest: string;
+  out?: string;
+  includeObservers: boolean;
 }
 
 program

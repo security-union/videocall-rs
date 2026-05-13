@@ -954,4 +954,38 @@ mod tests {
         let result = start.next().next().next();
         assert_eq!(result, start);
     }
+
+    #[test]
+    fn density_mode_labels() {
+        assert_eq!(DensityMode::Auto.label(), "Auto");
+        assert_eq!(DensityMode::Standard.label(), "Standard");
+        assert_eq!(DensityMode::Dense.label(), "Dense");
+        assert_eq!(DensityMode::Maximum.label(), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_debug_impl() {
+        assert_eq!(format!("{:?}", DensityMode::Auto), "Auto");
+        assert_eq!(format!("{:?}", DensityMode::Standard), "Standard");
+        assert_eq!(format!("{:?}", DensityMode::Dense), "Dense");
+        assert_eq!(format!("{:?}", DensityMode::Maximum), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_clone_and_eq() {
+        let original = DensityMode::Dense;
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DensityMode::Auto, DensityMode::Standard);
+        assert_ne!(DensityMode::Dense, DensityMode::Maximum);
+        assert_ne!(DensityMode::Auto, DensityMode::Maximum);
+    }
+
+    #[test]
+    fn density_mode_ctx_clone() {
+        // Compile-time check that DensityModeCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DensityModeCtx>();
+    }
 }

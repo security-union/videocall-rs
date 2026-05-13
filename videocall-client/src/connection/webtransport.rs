@@ -59,6 +59,13 @@ enum MessageType {
 
 impl WebMedia<WebTransportTask> for WebTransportTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebTransportTask> {
+        // Phase 3b: stash the optional netsim shim in the per-tab
+        // thread-local before constructing the transport task. See
+        // `connection/netsim_hook.rs` for the design notes (Option
+        // A — thread-local hook + re-entrancy flag).
+        #[cfg(feature = "netsim")]
+        super::netsim_hook::install_hook(options.netsim_hook.clone());
+
         let on_datagram = {
             let callback = options.on_inbound_media.clone();
             Callback::from(move |bytes: Vec<u8>| {
@@ -128,6 +135,15 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     /// frames from each stream in a loop until EOF and routes by the MediaType
     /// inside the encrypted protobuf payload.
     fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        // Phase 3b: consult the per-tab netsim shim. When the
+        // `netsim` feature is off the entire block compiles out and
+        // the send path is byte-for-byte identical to pre-3b.
+        #[cfg(feature = "netsim")]
+        {
+            if super::netsim_hook::shape_uplink_reliable(&bytes, stream_key) {
+                return;
+            }
+        }
         WebTransportTask::send_on_persistent_stream(
             self.transport.clone(),
             self.persistent_streams.clone(),
@@ -138,6 +154,15 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
 
     fn send_bytes_datagram(&self, bytes: Vec<u8>) {
         use crate::adaptive_quality_constants::DATAGRAM_MAX_SIZE;
+
+        // Phase 3b: consult the per-tab netsim shim. See
+        // `send_bytes` above for the no-feature compile-out.
+        #[cfg(feature = "netsim")]
+        {
+            if super::netsim_hook::shape_uplink_datagram(&bytes) {
+                return;
+            }
+        }
 
         if bytes.len() <= DATAGRAM_MAX_SIZE {
             // Packet fits within the datagram MTU -- send as unreliable datagram

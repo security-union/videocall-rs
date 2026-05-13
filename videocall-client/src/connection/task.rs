@@ -77,4 +77,31 @@ impl Task {
             Task::WebTransport(_) => None, // WebTransport doesn't expose bufferedAmount
         }
     }
+
+    /// Raw byte send on the reliable path. Phase 3b (netsim): used by
+    /// the async `Delay` / `DelayAndDuplicate` paths in `netsim_hook`
+    /// to re-enter the send pipeline after the simulated delay. The
+    /// re-entrancy flag inside `netsim_hook` short-circuits hook
+    /// consultation on this second pass so we never recurse.
+    ///
+    /// Only compiled in when the `netsim` feature is on so production
+    /// builds carry zero extra surface.
+    #[cfg(feature = "netsim")]
+    pub fn send_raw_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        match self {
+            Task::WebSocket(ws) => ws.send_bytes(bytes, stream_key),
+            Task::WebTransport(wt) => wt.send_bytes(bytes, stream_key),
+        }
+    }
+
+    /// Raw byte send on the datagram path (with WebSocket
+    /// reliable-fallback baked in via the trait default). Companion
+    /// to [`Self::send_raw_bytes`] for the netsim async-delay path.
+    #[cfg(feature = "netsim")]
+    pub fn send_raw_bytes_datagram(&self, bytes: Vec<u8>) {
+        match self {
+            Task::WebSocket(ws) => ws.send_bytes_datagram(bytes),
+            Task::WebTransport(wt) => wt.send_bytes_datagram(bytes),
+        }
+    }
 }

@@ -191,3 +191,11 @@ pub struct MuteParticipantRequest {
     /// User ID of the participant to ask to mute.
     pub user_id: String,
 }
+
+/// Query parameters for `POST /api/v1/meetings/{meeting_id}/disable-video`
+/// and `POST /api/v1/meetings/{meeting_id}/disable-video-all`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DisableVideoParticipantRequest {
+    /// User ID of the participant to ask to disable video.
+    pub user_id: String,
+}

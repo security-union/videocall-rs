@@ -766,6 +766,8 @@ pub fn AttendantsComponent(
     let toast_version: Signal<u32> = use_signal(|| 0);
     let show_muted_toast: Signal<bool> = use_signal(|| false);
     let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
+    let show_video_off_toast: Signal<bool> = use_signal(|| false);
+    let video_off_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
     // Create the peer status map signal early so it can be captured by the
@@ -1073,6 +1075,34 @@ pub fn AttendantsComponent(
                         let mut toast_timer = toast_timer;
                         show_muted_toast.set(false);
                         toast_timer.set(None);
+                    })));
+                }))
+            },
+            // Host's own client must NOT disable its own camera on disable-video-all —
+            // skip the callback entirely when is_owner is true (client-side guard).
+            //
+            // Self-protection model:
+            //   • disable-video-all  → client-side only: is_owner check here prevents the
+            //     host from receiving the broadcast as a target of its own "disable video for all" action.
+            //   • disable-video (single-target) → server-side: routes/host.rs rejects any
+            //     request where body.user_id == the authenticated caller's user_id.
+            //
+            on_host_disable_video: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("HOST_DISABLE_VIDEO: disabling local camera on host request");
+                    let mut video_enabled = video_enabled;
+                    let mut show_video_off_toast = show_video_off_toast;
+                    let mut video_off_toast_timer = video_off_toast_timer;
+                    video_enabled.set(false);
+                    show_video_off_toast.set(true);
+                    video_off_toast_timer.set(None);
+                    video_off_toast_timer.set(Some(Timeout::new(6_000, move || {
+                        let mut show_video_off_toast = show_video_off_toast;
+                        let mut video_off_toast_timer = video_off_toast_timer;
+                        show_video_off_toast.set(false);
+                        video_off_toast_timer.set(None);
                     })));
                 }))
             },
@@ -2294,7 +2324,7 @@ pub fn AttendantsComponent(
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() || show_muted_toast() {
+                if !peer_toasts().is_empty() || show_muted_toast() || show_video_off_toast() {
                     div { class: "peer-toasts",
                         if show_muted_toast() {
                             div { class: "peer-toast toast-left",
@@ -2319,6 +2349,29 @@ pub fn AttendantsComponent(
                                     span { class: "toast-name", "Host muted your microphone" }
                                     br {}
                                     span { class: "toast-action", "Click the mic button to unmute." }
+                                }
+                            }
+                        }
+                        if show_video_off_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host turned off your camera" }
+                                    br {}
+                                    span { class: "toast-action", "Click the camera button to turn it back on." }
                                 }
                             }
                         }

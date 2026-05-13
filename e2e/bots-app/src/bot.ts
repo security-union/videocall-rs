@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
@@ -30,6 +32,17 @@ export interface BotRunOptions {
    * captured `<account>.json` file. Ignored in JWT mode.
    */
   storageStateFile?: string | null;
+  /**
+   * **Only consulted when `authBackend === "jwt"`.** Path to a captured
+   * SSO storage-state file (typically `<runDir>/auth/hcl-sso.json` from
+   * `bots-app sso-login`). When the file exists, its cookies are loaded
+   * into the context *before* the JWT cookie is injected — letting the
+   * bot pass through the HCL SSO portal without an interactive auth
+   * step on every run. When the file is missing this is a no-op (the
+   * bot still launches; the page-load will hit the SSO portal on the
+   * first navigation if one is in the way).
+   */
+  ssoStateFile?: string | null;
   /**
    * When provided alongside `runDir`, the bot looks up the prep'd fake
    * camera (y4m) + fake mic (WAV) for this participant and passes them
@@ -90,12 +103,22 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     headless: opts.headless,
     args: launchArgs,
   });
+  let initialStorageState: string | undefined;
+  let ssoStateLoaded = false;
+  if (opts.authBackend === "storage-state" && opts.storageStateFile) {
+    initialStorageState = requireStorageState(opts.storageStateFile);
+  } else if (
+    opts.authBackend === "jwt" &&
+    opts.ssoStateFile &&
+    opts.ssoStateFile !== "" &&
+    existsSync(opts.ssoStateFile)
+  ) {
+    initialStorageState = opts.ssoStateFile;
+    ssoStateLoaded = true;
+  }
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
-    storageState:
-      opts.authBackend === "storage-state" && opts.storageStateFile
-        ? requireStorageState(opts.storageStateFile)
-        : undefined,
+    storageState: initialStorageState,
   });
   if (opts.authBackend === "jwt") {
     const email = participantEmail(opts.participant);
@@ -104,7 +127,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       displayName: opts.displayName,
       baseURL,
     });
-    console.log(`[${opts.participant}] auth: jwt (injected session cookie for ${email})`);
+    if (ssoStateLoaded) {
+      console.log(
+        `[${opts.participant}] auth: jwt + SSO state from ${opts.ssoStateFile} (injected session cookie for ${email})`,
+      );
+    } else {
+      console.log(`[${opts.participant}] auth: jwt (injected session cookie for ${email})`);
+      if (opts.ssoStateFile && opts.ssoStateFile !== "" && !existsSync(opts.ssoStateFile)) {
+        console.warn(
+          `[${opts.participant}] no SSO state at ${opts.ssoStateFile} — if the target sits behind HCL SSO, the page-load will redirect to the SSO portal. Run \`bots-app sso-login\` once to capture it.`,
+        );
+      }
+    }
   } else {
     console.log(
       `[${opts.participant}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,

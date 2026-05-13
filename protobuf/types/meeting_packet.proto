@@ -26,6 +26,8 @@ message MeetingPacket {
     MEETING_SETTINGS_UPDATED = 10;
     // Host requests participants mute their mic
     HOST_MUTE_PARTICIPANT = 11;
+    // Host requests participants disable their video
+    HOST_DISABLE_VIDEO = 12;
   }
 
   MeetingEventType event_type = 1;

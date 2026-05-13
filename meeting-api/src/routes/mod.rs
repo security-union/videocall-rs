@@ -208,6 +208,14 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/mute-all",
             post(host::mute_all),
         )
+        .route(
+            "/api/v1/meetings/{meeting_id}/disable-video",
+            post(host::disable_video_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/disable-video-all",
+            post(host::disable_video_all),
+        )
         // Console log uploads
         .route(
             "/api/v1/meetings/{meeting_id}/console-logs",

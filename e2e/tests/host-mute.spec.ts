@@ -111,8 +111,8 @@ async function enableMic(page: Page): Promise<void> {
  * The host-only mute control is rendered inside each remote peer's grid tile
  * (see `canvas_generator.rs`). It only renders when the host viewer sees the
  * peer with `audio_enabled=true`. The button is hidden via `visibility:
- * hidden` until the parent `.grid-item` is hovered (or the tile is in the
- * `.speaking-tile` state), so the test must hover before interacting.
+ * hidden` until the parent `.grid-item` is hovered, so the test must hover
+ * before interacting.
  *
  * The flow is two-step:
  *   1. Click the menu-toggle button (`title="Mute participant"`, an
@@ -128,7 +128,7 @@ async function hostMutePeerViaTile(page: Page): Promise<void> {
   await expect(guestTile).toBeVisible({ timeout: 15_000 });
 
   // Hover to reveal `.tile-mute-btn` (CSS sets visibility:hidden until
-  // `.grid-item:hover` or `.grid-item.speaking-tile`).
+  // `.grid-item:hover`).
   await guestTile.hover();
 
   const muteToggle = guestTile.getByTitle("Mute participant");

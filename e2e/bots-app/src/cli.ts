@@ -1,6 +1,15 @@
-import { Command } from "commander";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 
+import { Command } from "commander";
+import { chromium } from "@playwright/test";
+
+import { type AuthBackend, chooseAuthBackend, storageStatePath } from "./auth/storage-state";
 import { launchBot } from "./bot";
+import { prepareParticipantCostume } from "./costumes";
+import { loadManifest, type Manifest } from "./manifest";
+import { prepareParticipantAudio } from "./stitcher";
 import { formatDuration, parseDuration, Ttl, waitForTtl } from "./ttl";
 
 const program = new Command();
@@ -25,6 +34,24 @@ program
     'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits.',
     "5m",
   )
+  .option(
+    "--manifest <path>",
+    "Path to bot/conversation/manifest.yaml. When set together with --assets-dir, the bot uses the prep'd WAV + y4m for this participant via Chrome's --use-file-for-fake-*-capture flags. Pass an empty string to skip and fall back to Chrome's default fake devices.",
+    join(repoRoot(), "bot/conversation/manifest.yaml"),
+  )
+  .option(
+    "--assets-dir <dir>",
+    "Directory containing audio/<name>.wav and costumes/<name>.y4m (the output of `bots-app prep-assets`).",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .option(
+    "--auth <backend>",
+    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews) or "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs). When omitted, picks automatically by hostname.',
+  )
+  .option(
+    "--storage-state-file <path>",
+    "Explicit path to the captured storage-state JSON. Defaults to <assets-dir>/auth/<participant>.json when --auth=storage-state is in effect.",
+  )
   .action(async (opts: RunCommandOptions) => {
     const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
     let ttl: Ttl;
@@ -35,11 +62,41 @@ program
       process.exit(2);
     }
 
+    let manifest: Manifest | null = null;
+    if (opts.manifest && opts.manifest !== "") {
+      if (!existsSync(opts.manifest)) {
+        console.warn(
+          `bots-app: manifest not found at ${opts.manifest} — proceeding without fake-device wiring (Chrome will use its default fake pattern). Run \`bots-app prep-assets\` to fix.`,
+        );
+      } else {
+        manifest = loadManifest(opts.manifest).manifest;
+      }
+    }
+
+    let authOverride: AuthBackend | undefined;
+    if (opts.auth) {
+      if (opts.auth !== "jwt" && opts.auth !== "storage-state") {
+        console.error(`bots-app: --auth must be "jwt" or "storage-state", got "${opts.auth}"`);
+        process.exit(2);
+      }
+      authOverride = opts.auth;
+    }
+    const hostname = new URL(opts.meetingUrl).hostname;
+    const authBackend = chooseAuthBackend(hostname, authOverride);
+    const storageStateFile =
+      authBackend === "storage-state"
+        ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, opts.participant))
+        : null;
+
     const bot = await launchBot({
       meetingURL: opts.meetingUrl,
       participant: opts.participant,
       displayName,
       headless: opts.headless,
+      authBackend,
+      storageStateFile,
+      manifest,
+      runDir: opts.assetsDir,
     });
     console.log(`[${opts.participant}] joined; ttl=${formatDuration(ttl)}`);
 
@@ -67,6 +124,10 @@ interface RunCommandOptions {
   displayName?: string;
   headless: boolean;
   ttl: string;
+  manifest: string;
+  assetsDir: string;
+  auth?: string;
+  storageStateFile?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -74,6 +135,156 @@ function defaultDisplayName(participant: string): string {
     return participant.split("@", 1)[0];
   }
   return participant.charAt(0).toUpperCase() + participant.slice(1);
+}
+
+program
+  .command("login")
+  .description(
+    "One-time interactive Google OAuth login to capture a Playwright storage state for use against app.videocall.rs. Opens a headed Chrome — the operator logs in normally, then presses Enter in the terminal to save the captured session.",
+  )
+  .argument(
+    "<account>",
+    'Account handle that names the captured session file (e.g. "alice" → <assets-dir>/auth/alice.json). The same handle is later passed to `bots-app run --participant <account>` to reuse the session.',
+  )
+  .option(
+    "--start-url <url>",
+    "Where to navigate the headed Chrome before the operator logs in.",
+    "https://app.videocall.rs/",
+  )
+  .option(
+    "--assets-dir <dir>",
+    "Directory under which auth/<account>.json is written.",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .action(async (account: string, opts: LoginCommandOptions) => {
+    const outPath = storageStatePath(opts.assetsDir, account);
+    mkdirSync(dirname(outPath), { recursive: true });
+
+    console.log(`bots-app login: opening headed Chrome at ${opts.startUrl}`);
+    console.log(`bots-app login: log in normally, then press Enter here to save the session.`);
+    console.log(
+      `bots-app login: the captured file at ${outPath} contains real session tokens — do NOT commit or share it.`,
+    );
+
+    const browser = await chromium.launch({ headless: false });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await context.newPage();
+    await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await rl.question("Press Enter once logged in to capture the session... ");
+    } finally {
+      rl.close();
+    }
+
+    await context.storageState({ path: outPath });
+    await context.close();
+    await browser.close();
+    console.log(`bots-app login: captured session → ${outPath}`);
+    console.log(
+      `bots-app login: reuse with \`bots-app run --participant ${account} --meeting-url <url>\`.`,
+    );
+  });
+
+interface LoginCommandOptions {
+  startUrl: string;
+  assetsDir: string;
+}
+
+program
+  .command("prep-assets")
+  .description(
+    "One-shot prepare per-participant audio (stitched WAV) and costume video (y4m) for Chrome's fake-device input",
+  )
+  .option(
+    "--manifest <path>",
+    "Path to bot/conversation/manifest.yaml",
+    join(repoRoot(), "bot/conversation/manifest.yaml"),
+  )
+  .option(
+    "--costume-source <dir>",
+    "Directory containing <name>/talking.mp4 per costume",
+    join(repoRoot(), "bot/assets/costumes"),
+  )
+  .option(
+    "--output-dir <dir>",
+    "Where to write run/audio/<name>.wav and run/costumes/<name>.y4m",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .option(
+    "--participants <list>",
+    "Comma-separated participants to prep (default: every named entry in the manifest)",
+  )
+  .action(async (opts: PrepAssetsOptions) => {
+    if (!existsSync(opts.manifest)) {
+      console.error(
+        `bots-app: manifest not found at ${opts.manifest} — run \`python3 bot/generate-conversation-edge.py\` first`,
+      );
+      process.exit(2);
+    }
+    const { manifest, manifestDir } = loadManifest(opts.manifest);
+    const audioDir = join(opts.outputDir, "audio");
+    const costumesOutDir = join(opts.outputDir, "costumes");
+
+    const requested =
+      opts.participants
+        ?.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean) ?? manifest.participants.map((p) => p.name);
+
+    let audioPrepped = 0;
+    let costumesPrepped = 0;
+    for (const participant of requested) {
+      try {
+        const audio = prepareParticipantAudio(manifest, manifestDir, participant, audioDir);
+        if (audio.lineCount > 0) {
+          audioPrepped += 1;
+          console.log(
+            `[${participant}] audio ${audio.rebuilt ? "stitched" : "cached"} (${audio.lineCount} lines) → ${audio.path}`,
+          );
+        }
+        if (!existsSync(opts.costumeSource)) {
+          console.warn(
+            `bots-app: costume source ${opts.costumeSource} not found — skipping y4m conversion`,
+          );
+          continue;
+        }
+        const costume = prepareParticipantCostume(
+          manifest,
+          participant,
+          opts.costumeSource,
+          costumesOutDir,
+        );
+        if (costume.path !== null) {
+          costumesPrepped += 1;
+          console.log(
+            `[${participant}] costume ${costume.rebuilt ? "converted" : "cached"} (${costume.costumeName}) → ${costume.path}`,
+          );
+        }
+      } catch (e) {
+        console.error(`[${participant}] prep failed:`, (e as Error).message);
+      }
+    }
+    console.log(`prep-assets done — ${audioPrepped} audio file(s), ${costumesPrepped} costume(s)`);
+  });
+
+interface PrepAssetsOptions {
+  manifest: string;
+  costumeSource: string;
+  outputDir: string;
+  participants?: string;
+}
+
+/**
+ * Resolve the repo root (one level above `e2e/`) from this file's location.
+ * Lets the `prep-assets` defaults work no matter the cwd.
+ */
+function repoRoot(): string {
+  // import.meta.url is bots-app/src/cli.ts at runtime via tsx; the repo
+  // root is three directories up: src → bots-app → e2e → repo.
+  const here = new URL(".", import.meta.url).pathname;
+  return resolve(here, "..", "..", "..");
 }
 
 program.parseAsync(process.argv).catch((err: unknown) => {

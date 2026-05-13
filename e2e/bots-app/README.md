@@ -4,9 +4,9 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
-## Status — phase 1c
+## Status — phase 1d
 
-The bot launches headed Chrome with `--ttl`-bounded lifetime and clean leave-on-expiry (phase 1a + 1b), and there is now a `prep-assets` subcommand that prepares the per-participant fake audio (stitched WAVs from `bot/conversation/lines/*.wav`) and fake video (y4m files from `bot/assets/costumes/<name>/talking.mp4`) that Chrome's `--use-file-for-fake-*-capture` flags consume. **The bot itself does not yet wire those files into the Chrome launch** — that's PR-1d. **No support for `app.videocall.rs` yet** — that's PR-1e.
+The bot now **actually sends realistic media**: `bots-app run` resolves the participant's prep'd WAV (`run/audio/<name>.wav`) and costume y4m (`run/costumes/<costume>.y4m`) from the manifest, and passes them to Chrome via `--use-file-for-fake-{audio,video}-capture`. Missing assets degrade gracefully — Chrome's default fake-device pattern is used, with a warning that points the operator at `prep-assets`. **No support for `app.videocall.rs` yet** — that's PR-1e (storage-state auth).
 
 ## Usage
 
@@ -76,6 +76,8 @@ bots-app run
   --display-name <name>        Display name shown in the meeting (default: capitalized participant)
   --headless                   Run Chrome headless (default: headed)
   --ttl <duration>             Bot lifespan — "<int>s|m|h" or "infinite" (default: 5m)
+  --manifest <path>            Path to bot/conversation/manifest.yaml; pass "" to skip fake-device wiring
+  --assets-dir <dir>           Directory of audio/<name>.wav + costumes/<name>.y4m (default: e2e/bots-app/run)
 ```
 
 ## Development
@@ -92,8 +94,8 @@ npm run test:unit             # vitest unit tests for bots-app/
 | ------------ | --------------------------------- | ------------------------------------------------------------------------- |
 | 1a           | :white_check_mark: done           | Scaffold + minimal CLI                                                    |
 | 1b           | :white_check_mark: done           | `--ttl <duration>` flag + clean leave-meeting on TTL/SIGTERM              |
-| 1c (this PR) | :construction_worker: in progress | Asset prep (costume MP4 → y4m, audio stitching from `bot/conversation/`)  |
-| 1d           | pending                           | Fake camera + mic wired into Chrome launch                                |
+| 1c           | :white_check_mark: done           | Asset prep (costume MP4 → y4m, audio stitching from `bot/conversation/`)  |
+| 1d (this PR) | :construction_worker: in progress | Fake camera + mic wired into Chrome launch                                |
 | 1e           | pending                           | Storage-state auth backend for `app.videocall.rs`                         |
 | 2            | pending                           | `--users N` multi-bot + `bots-app gen` random matrix                      |
 | 3            | pending                           | Network simulation via WASM-injected `netsim.rs`                          |
@@ -115,6 +117,8 @@ e2e/
       manifest.test.ts      ← vitest unit tests for the manifest parser
       stitcher.ts           ← ffmpeg-driven per-participant WAV stitcher (idempotent)
       costumes.ts           ← ffmpeg-driven MP4 → y4m converter (idempotent)
+      assets.ts             ← resolves participant → {audioPath?, videoPath?} from run-dir
+      assets.test.ts        ← vitest unit tests for the assets resolver
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
     scripts/

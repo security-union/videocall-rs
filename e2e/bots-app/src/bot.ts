@@ -1,6 +1,8 @@
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
+import { resolveAssetsForParticipant } from "./assets";
+import { type Manifest } from "./manifest";
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -14,6 +16,17 @@ export interface BotRunOptions {
   participant: string;
   displayName: string;
   headless: boolean;
+  /**
+   * When provided alongside `runDir`, the bot looks up the prep'd fake
+   * camera (y4m) + fake mic (WAV) for this participant and passes them
+   * to Chrome via `--use-file-for-fake-{video,audio}-capture`. When
+   * either of the resolved files is missing, the bot falls back to
+   * Chrome's default fake-device pattern for that media kind and logs
+   * a warning. Pass `manifest = null` (or omit both) to skip the
+   * lookup entirely (the launch then uses default fake devices).
+   */
+  manifest?: Manifest | null;
+  runDir?: string | null;
 }
 
 export interface BotHandle {
@@ -35,9 +48,34 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const baseURL = `${target.protocol}//${target.host}`;
   const email = participantEmail(opts.participant);
 
+  const launchArgs = [...CHROME_ARGS];
+  if (opts.manifest != null && opts.runDir != null && opts.runDir !== "") {
+    const assets = resolveAssetsForParticipant({
+      manifest: opts.manifest,
+      runDir: opts.runDir,
+      participant: opts.participant,
+    });
+    if (assets.audioPath !== null) {
+      launchArgs.push(`--use-file-for-fake-audio-capture=${assets.audioPath}`);
+      console.log(`[${opts.participant}] fake mic → ${assets.audioPath}`);
+    } else {
+      console.warn(
+        `[${opts.participant}] no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
+      );
+    }
+    if (assets.videoPath !== null) {
+      launchArgs.push(`--use-file-for-fake-video-capture=${assets.videoPath}`);
+      console.log(`[${opts.participant}] fake camera → ${assets.videoPath}`);
+    } else {
+      console.warn(
+        `[${opts.participant}] no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
+      );
+    }
+  }
+
   const browser = await chromium.launch({
     headless: opts.headless,
-    args: CHROME_ARGS,
+    args: launchArgs,
   });
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   await applyJwtCookieAuth(context, {

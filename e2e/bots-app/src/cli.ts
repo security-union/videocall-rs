@@ -5,7 +5,7 @@ import { Command } from "commander";
 
 import { launchBot } from "./bot";
 import { prepareParticipantCostume } from "./costumes";
-import { loadManifest } from "./manifest";
+import { loadManifest, type Manifest } from "./manifest";
 import { prepareParticipantAudio } from "./stitcher";
 import { formatDuration, parseDuration, Ttl, waitForTtl } from "./ttl";
 
@@ -31,6 +31,16 @@ program
     'Bot lifespan — "<int>s|m|h" or "infinite". On expiry the bot leaves the meeting and exits.',
     "5m",
   )
+  .option(
+    "--manifest <path>",
+    "Path to bot/conversation/manifest.yaml. When set together with --assets-dir, the bot uses the prep'd WAV + y4m for this participant via Chrome's --use-file-for-fake-*-capture flags. Pass an empty string to skip and fall back to Chrome's default fake devices.",
+    join(repoRoot(), "bot/conversation/manifest.yaml"),
+  )
+  .option(
+    "--assets-dir <dir>",
+    "Directory containing audio/<name>.wav and costumes/<name>.y4m (the output of `bots-app prep-assets`).",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
   .action(async (opts: RunCommandOptions) => {
     const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
     let ttl: Ttl;
@@ -41,11 +51,24 @@ program
       process.exit(2);
     }
 
+    let manifest: Manifest | null = null;
+    if (opts.manifest && opts.manifest !== "") {
+      if (!existsSync(opts.manifest)) {
+        console.warn(
+          `bots-app: manifest not found at ${opts.manifest} — proceeding without fake-device wiring (Chrome will use its default fake pattern). Run \`bots-app prep-assets\` to fix.`,
+        );
+      } else {
+        manifest = loadManifest(opts.manifest).manifest;
+      }
+    }
+
     const bot = await launchBot({
       meetingURL: opts.meetingUrl,
       participant: opts.participant,
       displayName,
       headless: opts.headless,
+      manifest,
+      runDir: opts.assetsDir,
     });
     console.log(`[${opts.participant}] joined; ttl=${formatDuration(ttl)}`);
 
@@ -73,6 +96,8 @@ interface RunCommandOptions {
   displayName?: string;
   headless: boolean;
   ttl: string;
+  manifest: string;
+  assetsDir: string;
 }
 
 function defaultDisplayName(participant: string): string {

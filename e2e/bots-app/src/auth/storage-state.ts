@@ -59,6 +59,22 @@ export function storageStatePath(runDir: string, account: string): string {
 }
 
 /**
+ * Basename of the default HCL SSO state file. SSO is captured separately
+ * from per-account OAuth state because it lives in a *parent* domain
+ * (`*.fnxlabs.com`) and is shared across all bots — a single
+ * `bots-app sso-login` capture serves every participant for the lifetime
+ * of the HCL SSO session.
+ */
+export const DEFAULT_SSO_STATE_BASENAME = "hcl-sso.json";
+
+/**
+ * Conventional path to the captured SSO state — `<runDir>/auth/hcl-sso.json`.
+ */
+export function defaultSsoStatePath(runDir: string): string {
+  return join(runDir, "auth", DEFAULT_SSO_STATE_BASENAME);
+}
+
+/**
  * Resolve and validate that a storage-state file exists. Throws with a
  * human-readable message when the file is missing so the caller can
  * surface the right "run `bots-app login` first" guidance.

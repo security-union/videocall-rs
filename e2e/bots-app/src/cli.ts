@@ -5,7 +5,12 @@ import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { chromium } from "@playwright/test";
 
-import { type AuthBackend, chooseAuthBackend, storageStatePath } from "./auth/storage-state";
+import {
+  type AuthBackend,
+  chooseAuthBackend,
+  defaultSsoStatePath,
+  storageStatePath,
+} from "./auth/storage-state";
 import { launchBot } from "./bot";
 import { prepareParticipantCostume } from "./costumes";
 import { loadManifest, type Manifest } from "./manifest";
@@ -52,6 +57,10 @@ program
     "--storage-state-file <path>",
     "Explicit path to the captured storage-state JSON. Defaults to <assets-dir>/auth/<participant>.json when --auth=storage-state is in effect.",
   )
+  .option(
+    "--sso-state-file <path>",
+    'Path to a captured HCL SSO storage-state JSON (from `bots-app sso-login`). Loaded in addition to JWT cookie injection when --auth=jwt. Pass "" to skip. Defaults to <assets-dir>/auth/hcl-sso.json — loaded only if the file exists.',
+  )
   .action(async (opts: RunCommandOptions) => {
     const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
     let ttl: Ttl;
@@ -87,6 +96,8 @@ program
       authBackend === "storage-state"
         ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, opts.participant))
         : null;
+    const ssoStateFile =
+      authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
 
     const bot = await launchBot({
       meetingURL: opts.meetingUrl,
@@ -95,6 +106,7 @@ program
       headless: opts.headless,
       authBackend,
       storageStateFile,
+      ssoStateFile,
       manifest,
       runDir: opts.assetsDir,
     });
@@ -128,6 +140,7 @@ interface RunCommandOptions {
   assetsDir: string;
   auth?: string;
   storageStateFile?: string;
+  ssoStateFile?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -190,6 +203,64 @@ program
 interface LoginCommandOptions {
   startUrl: string;
   assetsDir: string;
+}
+
+program
+  .command("sso-login")
+  .description(
+    "One-time interactive HCL SSO login to capture a Playwright storage state for use against HCL-gated targets (e.g. *.videocall.fnxlabs.com). Opens a headed Chrome — the operator authenticates against HCL SSO normally, then presses Enter in the terminal to save the captured cookies. The result is shared across all participants for the lifetime of the SSO session.",
+  )
+  .option(
+    "--start-url <url>",
+    "Where to navigate the headed Chrome before the operator logs in. Default redirects through HCL SSO.",
+    "https://app.videocall.fnxlabs.com/",
+  )
+  .option(
+    "--assets-dir <dir>",
+    "Directory under which auth/hcl-sso.json is written.",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .option(
+    "--out-file <path>",
+    "Override the output file location (default: <assets-dir>/auth/hcl-sso.json).",
+  )
+  .action(async (opts: SsoLoginCommandOptions) => {
+    const outPath = opts.outFile ?? defaultSsoStatePath(opts.assetsDir);
+    mkdirSync(dirname(outPath), { recursive: true });
+
+    console.log(`bots-app sso-login: opening headed Chrome at ${opts.startUrl}`);
+    console.log(
+      `bots-app sso-login: complete the HCL SSO challenge in the browser, then press Enter here to save the session.`,
+    );
+    console.log(
+      `bots-app sso-login: the captured file at ${outPath} contains real SSO cookies — do NOT commit or share it.`,
+    );
+
+    const browser = await chromium.launch({ headless: false });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await context.newPage();
+    await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await rl.question("Press Enter once SSO auth is complete to capture cookies... ");
+    } finally {
+      rl.close();
+    }
+
+    await context.storageState({ path: outPath });
+    await context.close();
+    await browser.close();
+    console.log(`bots-app sso-login: captured SSO session → ${outPath}`);
+    console.log(
+      `bots-app sso-login: subsequent \`bots-app run\` invocations against HCL-gated hosts will pick this up automatically.`,
+    );
+  });
+
+interface SsoLoginCommandOptions {
+  startUrl: string;
+  assetsDir: string;
+  outFile?: string;
 }
 
 program

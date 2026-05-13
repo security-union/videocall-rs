@@ -4,14 +4,19 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
-## Status — phase 1e (phase 1 complete)
+## Status — phase 1f (phase 1 complete + HCL SSO support)
 
 Phase 1 is complete. The bot:
 
 - launches headed Chrome with a configurable `--ttl` lifetime and a clean leave-meeting on TTL expiry or SIGINT/SIGTERM,
 - prepares per-participant fake audio (stitched WAV from `bot/conversation/lines/*.wav`) and fake video (y4m from `bot/assets/costumes/<name>/talking.mp4`) on demand,
 - wires those files into Chrome via `--use-file-for-fake-{audio,video}-capture`,
-- authenticates via JWT cookie injection for local / HCL / preview targets and via captured Playwright storage state (`bots-app login`) for `app.videocall.rs` and any other real-OAuth-protected target — auto-picked by hostname unless `--auth` is set.
+- authenticates via:
+  - **JWT cookie injection** for local / HCL daily / preview targets,
+  - **Captured Playwright storage state** (`bots-app login`) for `app.videocall.rs` and any other real-OAuth-protected target,
+  - **HCL SSO state** (`bots-app sso-login`) loaded _in addition to_ the JWT cookie for HCL-gated targets that sit behind the corporate SSO portal.
+
+Backend is auto-picked by hostname unless `--auth` is set.
 
 **Phase 2** (multi-bot + random-N matrix testing) is up next.
 
@@ -56,6 +61,33 @@ The bot auto-selects the storage-state backend because the hostname doesn't matc
 
 **Security:** the captured `auth/<account>.json` files contain real Google session tokens. `e2e/bots-app/run/` is gitignored — don't move these files out of it, don't share them, and rotate by re-running `bots-app login` whenever the Google session expires (typically every few weeks).
 
+## Authenticating against HCL daily (`*.videocall.fnxlabs.com`)
+
+HCL daily sits behind the corporate SSO portal AND the videocall app itself uses session-cookie auth. The bot needs **two** auth layers:
+
+1. **HCL SSO state** — captured once via `bots-app sso-login`, lives in `e2e/bots-app/run/auth/hcl-sso.json`, lets the bot through the SSO challenge without an interactive auth step on every run.
+2. **JWT cookie** — minted at launch time from the cluster's `JWT_SECRET`, authenticates the bot to the videocall app.
+
+One-time setup per SSO session (typically hours to days, depending on HCL's policy):
+
+```bash
+cd e2e
+npm run bot -- sso-login     # opens headed Chrome → complete SSO challenge → press Enter
+# Captured cookies saved to e2e/bots-app/run/auth/hcl-sso.json (gitignored).
+```
+
+Then each bot run picks up both layers automatically:
+
+```bash
+export JWT_SECRET=$(kubectl --kubeconfig=$HCL_KUBECONFIG -n videocall get secret jwt-secret -o jsonpath='{.data.secret}' | base64 -d)
+npm run bot -- run \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --participant alice \
+  --ttl 5m
+```
+
+The terminal will log `auth: jwt + SSO state from .../hcl-sso.json (...)` confirming both layers are active. When the SSO session expires (you'll see the bot's page redirect to the SSO portal on next launch), re-run `sso-login` and you're back.
+
 ## Preparing assets (prep-assets)
 
 PR-1c adds a `prep-assets` subcommand that builds the per-participant audio + video files Chrome's `--use-file-for-fake-{audio,video}-capture` flags need. Run it once before launching bots that should send realistic media:
@@ -92,13 +124,6 @@ Environment variables:
 | `JWT_SECRET`  | HMAC secret for the session cookie. Must match the server's secret. | `dev-jwt-secret-change-me` |
 | `COOKIE_NAME` | Session cookie name on the server.                                  | `session`                  |
 
-For HCL daily (`videocall.fnxlabs.com`), pull the secret from the cluster:
-
-```bash
-JWT_SECRET=$(kubectl --kubeconfig=$HCL_KUBECONFIG -n videocall get secret jwt-secret -o jsonpath='{.data.secret}' | base64 -d) \
-  npm run bot -- run --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots --participant alice
-```
-
 ## Flags
 
 ```
@@ -112,10 +137,16 @@ bots-app run
   --assets-dir <dir>           Directory of audio/<name>.wav + costumes/<name>.y4m (default: e2e/bots-app/run)
   --auth <backend>             Override auth backend: "jwt" or "storage-state" (default: auto by hostname)
   --storage-state-file <path>  Explicit storage-state JSON path (default: <assets-dir>/auth/<participant>.json)
+  --sso-state-file <path>      HCL SSO state path (default: <assets-dir>/auth/hcl-sso.json; loaded only if present)
 
 bots-app login <account>
   --start-url <url>            Where to navigate headed Chrome (default: https://app.videocall.rs/)
   --assets-dir <dir>           Where to write auth/<account>.json (default: e2e/bots-app/run)
+
+bots-app sso-login
+  --start-url <url>            Where to navigate headed Chrome to trigger SSO (default: https://app.videocall.fnxlabs.com/)
+  --assets-dir <dir>           Where to write auth/hcl-sso.json (default: e2e/bots-app/run)
+  --out-file <path>            Override the output file location
 ```
 
 ## Development
@@ -159,7 +190,7 @@ e2e/
       assets.test.ts        ← vitest unit tests for the assets resolver
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
-        storage-state.ts    ← backend picker + captured-session path resolver
+        storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)
         storage-state.test.ts ← vitest unit tests
     scripts/
       setup-assets.sh       ← thin wrapper over `npm run bot -- prep-assets`

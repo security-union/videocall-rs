@@ -13,6 +13,17 @@ The symptoms are silent: everything appears to deploy successfully, but the
 missing env var's code default (which is often conservative / wrong for prod)
 takes effect.
 
+### Specifically: `NATS_URL`
+
+`NATS_URL` enables meeting-api to publish and subscribe to NATS event subjects.
+Without it, all broadcast features silently degrade: mute participants, rename
+display name, admit/reject from waiting room, and host-leave meeting-end
+propagation. The chart default is `nats://nats:4222`.
+
+**If your workflow uses `--set env[N]` overrides, you MUST include `NATS_URL`
+explicitly.** The code treats a missing value as "NATS disabled" and logs
+`NATS_URL not set — meeting event push notifications disabled` at startup.
+
 ### Specifically: `TOKEN_TTL_SECS`
 
 `TOKEN_TTL_SECS` controls room-access token lifetime. Setting it too short (e.g.

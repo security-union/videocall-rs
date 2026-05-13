@@ -20,6 +20,13 @@ export interface BotHandle {
   browser: Browser;
   context: BrowserContext;
   page: Page;
+  /**
+   * Best-effort click the meeting's HangUp button and wait briefly for the
+   * client-side leave-meeting API call to settle. Idempotent: if the button
+   * is not visible (the bot never finished joining), this returns without
+   * raising. Always followed by `shutdown` for the actual browser teardown.
+   */
+  leaveMeeting: () => Promise<void>;
   shutdown: () => Promise<void>;
 }
 
@@ -52,6 +59,28 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   console.log(`[${opts.participant}] navigating to ${opts.meetingURL}`);
   await page.goto(opts.meetingURL, { waitUntil: "domcontentloaded" });
 
+  const leaveMeeting = async (): Promise<void> => {
+    const hangUp = page.locator("button.video-control-button", {
+      has: page.locator("span.tooltip", { hasText: "Hang Up" }),
+    });
+    try {
+      if (await hangUp.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        await hangUp.click({ timeout: 2_000 });
+        // After hang-up the page navigates to `/`. Wait briefly so the
+        // client-side `meeting_api::leave_meeting` request has time to
+        // reach the server before we tear the context down.
+        await page
+          .waitForURL((url) => url.pathname === "/", { timeout: 2_000 })
+          .catch(() => {
+            // Falling through is fine — the API call may still complete
+            // after we close, and the relay handles the disconnect anyway.
+          });
+      }
+    } catch (e) {
+      console.error(`[${opts.participant}] leaveMeeting failed:`, e);
+    }
+  };
+
   const shutdown = async (): Promise<void> => {
     try {
       await context.close();
@@ -65,7 +94,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   };
 
-  return { browser, context, page, shutdown };
+  return { browser, context, page, leaveMeeting, shutdown };
 }
 
 /**

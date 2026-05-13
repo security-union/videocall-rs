@@ -72,6 +72,23 @@ impl Connection {
         options: ConnectOptions,
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
+        // Phase 3c (discussion #793): on the first call per tab,
+        // parse `?netsim=<profile>` from `window.location` and
+        // install the matching `NetSimShim` in the per-tab hook
+        // slot. `std::sync::Once` makes this idempotent across
+        // reconnects — a re-election or session drop that calls
+        // `Connection::connect` again must not reinstall and reset
+        // the hook, because `wasm32-unknown-unknown` is
+        // single-threaded inside a browser tab and the hook is
+        // per-tab state. See `connection/netsim_url.rs`.
+        #[cfg(feature = "netsim")]
+        {
+            static NETSIM_URL_INSTALL: std::sync::Once = std::sync::Once::new();
+            NETSIM_URL_INSTALL.call_once(|| {
+                let _ = super::netsim_url::try_install_from_url();
+            });
+        }
+
         let mut new_options = options.clone();
         let status = Rc::new(Cell::new(Status::Connecting));
 

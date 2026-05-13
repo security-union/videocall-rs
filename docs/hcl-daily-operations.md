@@ -158,7 +158,7 @@ The videocall application runs as several microservices:
 ### Key environment variables (set per-service via Helm)
 
 - `JWT_SECRET` — shared across meeting-api, websocket, and webtransport (K8s secret `jwt-secret`)
-- `NATS_URL` — inter-service messaging (typically `nats:4222`)
+- `NATS_URL` — inter-service messaging (typically `nats://nats:4222`). Required by **all** services: meeting-api (broadcast features: mute, rename, waiting room, host-leave), websocket, webtransport, and metrics-api. Without it, meeting-api silently degrades — no error, just disabled push notifications.
 - `DATABASE_URL` — Postgres connection string (meeting-api only)
 - `RUST_LOG` — log verbosity (`warn` for relays, `info` for meeting-api)
 - `TOKEN_TTL_SECS` — JWT token lifetime (currently `86400` = 24h)

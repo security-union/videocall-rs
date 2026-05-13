@@ -148,10 +148,36 @@ enum RawRoute {
     Datagram,
 }
 
+/// RAII guard that sets [`NETSIM_BYPASS`] on construction and clears
+/// it on drop. Used by [`raw_send`] so the re-entrancy flag is always
+/// restored, even if the inner `Task::send_*_raw_bytes` call panics.
+///
+/// Without this, a panic on the post-delay send path would leave
+/// `NETSIM_BYPASS = true` for the rest of the tab and silently
+/// disable the shim — every subsequent send would short-circuit
+/// past the hook consultation in [`consult`]. The guard makes the
+/// invariant local and panic-safe. (Folded in from PR-3b code
+/// review.)
+struct BypassGuard;
+
+impl BypassGuard {
+    fn new() -> Self {
+        NETSIM_BYPASS.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for BypassGuard {
+    fn drop(&mut self) {
+        NETSIM_BYPASS.with(|c| c.set(false));
+    }
+}
+
 /// Send `bytes` through the active task without consulting the
 /// netsim hook. Sets [`NETSIM_BYPASS`] for the duration of the call
-/// so the trait-level `send_bytes` / `send_bytes_datagram` impls
-/// take the fast path.
+/// (via [`BypassGuard`]) so the trait-level `send_bytes` /
+/// `send_bytes_datagram` impls take the fast path. The guard ensures
+/// the flag is cleared even on panic.
 ///
 /// Returns silently if the owning `Rc<Task>` has been dropped
 /// (transport disconnected between the original send call and the
@@ -162,7 +188,7 @@ fn raw_send(bytes: Vec<u8>, route: RawRoute) {
         None => return,
     };
 
-    NETSIM_BYPASS.with(|c| c.set(true));
+    let _bypass = BypassGuard::new();
     // The `Task::send_*_raw_bytes` helpers (see `task.rs`) sidestep
     // the protobuf framing layer so we can deliver the original
     // payload bytes verbatim, the same way the original caller
@@ -171,7 +197,7 @@ fn raw_send(bytes: Vec<u8>, route: RawRoute) {
         RawRoute::Reliable(key) => task.send_raw_bytes(bytes, key),
         RawRoute::Datagram => task.send_raw_bytes_datagram(bytes),
     }
-    NETSIM_BYPASS.with(|c| c.set(false));
+    // `_bypass` drops here, clearing NETSIM_BYPASS.
 }
 
 /// Apply the netsim admission decision for an uplink reliable-stream
@@ -231,4 +257,20 @@ fn shape_uplink(bytes: &[u8], route: RawRoute) -> ShapeOutcome {
 /// realtime call, but clamping keeps `TimeoutFuture::new(u32)` safe.
 fn duration_to_millis_u32(d: Duration) -> u32 {
     d.as_millis().min(u32::MAX as u128) as u32
+}
+
+// Compile-only marker confirming the feature gate links cleanly.
+// The hook module is wasm32-only in practice (its send-path bodies
+// touch `gloo_timers` / `wasm_bindgen_futures`), but the symbols
+// declared here compile on native too — and the test runner only
+// fires on the native target, where this just verifies the
+// `#[cfg(feature = "netsim")]` plumbing isn't broken. Behavior is
+// exercised in the videocall-netsim shim tests and the bots-app
+// integration test in phase 3d. (Folded in from PR-3b code review.)
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    #[test]
+    fn netsim_feature_links() {
+        // If this compiles, the feature gate is correctly wired.
+    }
 }

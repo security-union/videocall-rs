@@ -153,6 +153,7 @@ features = [
     "IntersectionObserverInit",
     "Crypto",
     "Window",
+    "Location",
 ]
 
 [dev-dependencies]

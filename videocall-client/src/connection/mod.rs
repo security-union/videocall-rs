@@ -33,6 +33,13 @@ mod webtransport;
 #[cfg(feature = "netsim")]
 mod netsim_hook;
 
+// Phase 3c (discussion #793). URL-param shim that reads
+// `?netsim=<profile>` from `window.location` and installs the
+// matching `NetSimShim` in `netsim_hook`. Compile-gated identically
+// to the hook itself so default builds compile this out entirely.
+#[cfg(feature = "netsim")]
+mod netsim_url;
+
 pub use connection_controller::ConnectionController;
 pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]

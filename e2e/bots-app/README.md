@@ -4,9 +4,18 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
-## Status — phase 1g (phase 1 complete + HCL SSO + auto join/media)
+## Status — phase 2a (multi-bot via `--users N`)
 
-Phase 1 is complete. The bot:
+Phase 2 adds multi-bot orchestration on top of the phase-1 single-bot foundation:
+
+- `bots-app run --users N` launches N bots concurrently in one Node process (in-process Playwright `Browser` instances — cheaper than N subprocesses; resource cap configurable via `--max-users`, default 10).
+- Bots pick the first N named participants from `bot/conversation/manifest.yaml` in manifest order (alice, bob, carol, ...).
+- Per-bot TTL timer; SIGINT/SIGTERM cleanly signals every bot to leave.
+- An error in one bot's launch is logged and doesn't take the others down.
+
+Phase 1 features carry through unchanged (`--ttl`, `--manifest`, `--auth`, `--sso-state-file`, etc.).
+
+### Phase 1 still applies — the bot:
 
 - launches headed Chrome with a configurable `--ttl` lifetime and a clean leave-meeting on TTL expiry or SIGINT/SIGTERM,
 - auto-fills the homepage display-name form, clicks "Join Meeting" when shown, then clicks "Start camera" and "Unmute Microphone" so media actually flows — no human-in-the-loop required after launch,
@@ -19,7 +28,24 @@ Phase 1 is complete. The bot:
 
 Backend is auto-picked by hostname unless `--auth` is set.
 
-**Phase 2** (multi-bot + random-N matrix testing) is up next.
+**Phase 2b** (random-N matrix testing via `bots-app gen`) is up next.
+
+## Multi-bot mode (`--users N`)
+
+To fill a meeting around a human peer, pass `--users N` instead of `--participant <name>`. The bot picks the first N named participants from the manifest in order (alice, bob, carol, dave, eve, ...) and launches them concurrently in one Node process. All bots share the same `--ttl`, `--meeting-url`, and auth backend.
+
+```bash
+cd e2e
+# Prereq: prep audio + costumes for at least N participants
+npm run bot -- prep-assets --participants alice,bob,carol --costume-source /tmp/costume-videos
+
+npm run bot -- run \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --users 3 \
+  --ttl 5m
+```
+
+Each bot opens its own headed Chrome window. SIGINT (Ctrl+C) signals all of them to leave cleanly before the parent exits. Default cap is 10 bots per invocation; raise with `--max-users <N>` if you need more (and your laptop can handle it — each bot is ~0.5-1 GB RAM).
 
 ## Usage
 
@@ -130,8 +156,10 @@ Environment variables:
 ```
 bots-app run
   --meeting-url <url>          Full meeting URL (required)
-  --participant <name>         Handle (alice/bob/...) or full email (required)
-  --display-name <name>        Display name shown in the meeting (default: capitalized participant)
+  --participant <name>         Single-bot: handle (alice/bob/...) or full email. Mutually exclusive with --users.
+  --users <N>                  Multi-bot: launch N bots picking the first N manifest participants. Mutually exclusive with --participant.
+  --max-users <N>              Cap for --users (default 10)
+  --display-name <name>        Display name (single-bot only; ignored in --users mode)
   --headless                   Run Chrome headless (default: headed)
   --ttl <duration>             Bot lifespan — "<int>s|m|h" or "infinite" (default: 5m)
   --manifest <path>            Path to bot/conversation/manifest.yaml; pass "" to skip fake-device wiring
@@ -191,6 +219,7 @@ e2e/
       assets.test.ts        ← vitest unit tests for the assets resolver
       meeting-join.ts       ← post-goto: fills display-name form, clicks Join Meeting, enables mic + camera
       meeting-join.test.ts  ← vitest placeholder (smoke test only — real coverage is the manual run)
+      orchestrator.ts       ← runBotsToCompletion — spawns N in-process bots, races TTL vs shutdown signal
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
         storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)

@@ -111,6 +111,17 @@ export function linesForParticipant(manifest: Manifest, participant: string): Ma
 }
 
 /**
+ * The first `n` participant names from the manifest, in manifest order.
+ * Used by `bots-app run --users N` to fill a multi-bot meeting without
+ * the operator having to enumerate each handle. Returns at most
+ * `manifest.participants.length` names — callers should bound `n` first
+ * if they want to error on over-subscription.
+ */
+export function firstNParticipantNames(manifest: Manifest, n: number): string[] {
+  return manifest.participants.slice(0, n).map((p) => p.name);
+}
+
+/**
  * Costume name = basename of `costume_dir`. The Rust bot's manifest uses
  * `assets/costumes/<name>` paths relative to `bot/`; we only need the
  * trailing path component to look up `bot/assets/costumes/<name>/talking.mp4`

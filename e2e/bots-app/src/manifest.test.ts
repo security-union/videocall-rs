@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   costumeNameForParticipant,
+  firstNParticipantNames,
   lineAudioPath,
   linesForParticipant,
   parseManifestText,
@@ -110,5 +111,23 @@ describe("lineAudioPath", () => {
     const m = parseManifestText(FIXTURE);
     const line = linesForParticipant(m, "alice")[0];
     expect(lineAudioPath("/tmp/conversation", line)).toBe("/tmp/conversation/lines/line_000.wav");
+  });
+});
+
+describe("firstNParticipantNames", () => {
+  it("returns the first N names in manifest order", () => {
+    const m = parseManifestText(FIXTURE);
+    expect(firstNParticipantNames(m, 1)).toEqual(["alice"]);
+    expect(firstNParticipantNames(m, 2)).toEqual(["alice", "tina"]);
+  });
+
+  it("returns the empty array when N is 0", () => {
+    const m = parseManifestText(FIXTURE);
+    expect(firstNParticipantNames(m, 0)).toEqual([]);
+  });
+
+  it("returns all available names when N exceeds the participant count", () => {
+    const m = parseManifestText(FIXTURE);
+    expect(firstNParticipantNames(m, 99)).toEqual(["alice", "tina"]);
   });
 });

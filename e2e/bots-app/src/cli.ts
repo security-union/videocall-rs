@@ -1,8 +1,11 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 
 import { Command } from "commander";
+import { chromium } from "@playwright/test";
 
+import { type AuthBackend, chooseAuthBackend, storageStatePath } from "./auth/storage-state";
 import { launchBot } from "./bot";
 import { prepareParticipantCostume } from "./costumes";
 import { loadManifest, type Manifest } from "./manifest";
@@ -41,6 +44,14 @@ program
     "Directory containing audio/<name>.wav and costumes/<name>.y4m (the output of `bots-app prep-assets`).",
     join(repoRoot(), "e2e/bots-app/run"),
   )
+  .option(
+    "--auth <backend>",
+    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews) or "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs). When omitted, picks automatically by hostname.',
+  )
+  .option(
+    "--storage-state-file <path>",
+    "Explicit path to the captured storage-state JSON. Defaults to <assets-dir>/auth/<participant>.json when --auth=storage-state is in effect.",
+  )
   .action(async (opts: RunCommandOptions) => {
     const displayName = opts.displayName ?? defaultDisplayName(opts.participant);
     let ttl: Ttl;
@@ -62,11 +73,28 @@ program
       }
     }
 
+    let authOverride: AuthBackend | undefined;
+    if (opts.auth) {
+      if (opts.auth !== "jwt" && opts.auth !== "storage-state") {
+        console.error(`bots-app: --auth must be "jwt" or "storage-state", got "${opts.auth}"`);
+        process.exit(2);
+      }
+      authOverride = opts.auth;
+    }
+    const hostname = new URL(opts.meetingUrl).hostname;
+    const authBackend = chooseAuthBackend(hostname, authOverride);
+    const storageStateFile =
+      authBackend === "storage-state"
+        ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, opts.participant))
+        : null;
+
     const bot = await launchBot({
       meetingURL: opts.meetingUrl,
       participant: opts.participant,
       displayName,
       headless: opts.headless,
+      authBackend,
+      storageStateFile,
       manifest,
       runDir: opts.assetsDir,
     });
@@ -98,6 +126,8 @@ interface RunCommandOptions {
   ttl: string;
   manifest: string;
   assetsDir: string;
+  auth?: string;
+  storageStateFile?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -105,6 +135,61 @@ function defaultDisplayName(participant: string): string {
     return participant.split("@", 1)[0];
   }
   return participant.charAt(0).toUpperCase() + participant.slice(1);
+}
+
+program
+  .command("login")
+  .description(
+    "One-time interactive Google OAuth login to capture a Playwright storage state for use against app.videocall.rs. Opens a headed Chrome — the operator logs in normally, then presses Enter in the terminal to save the captured session.",
+  )
+  .argument(
+    "<account>",
+    'Account handle that names the captured session file (e.g. "alice" → <assets-dir>/auth/alice.json). The same handle is later passed to `bots-app run --participant <account>` to reuse the session.',
+  )
+  .option(
+    "--start-url <url>",
+    "Where to navigate the headed Chrome before the operator logs in.",
+    "https://app.videocall.rs/",
+  )
+  .option(
+    "--assets-dir <dir>",
+    "Directory under which auth/<account>.json is written.",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .action(async (account: string, opts: LoginCommandOptions) => {
+    const outPath = storageStatePath(opts.assetsDir, account);
+    mkdirSync(dirname(outPath), { recursive: true });
+
+    console.log(`bots-app login: opening headed Chrome at ${opts.startUrl}`);
+    console.log(`bots-app login: log in normally, then press Enter here to save the session.`);
+    console.log(
+      `bots-app login: the captured file at ${outPath} contains real session tokens — do NOT commit or share it.`,
+    );
+
+    const browser = await chromium.launch({ headless: false });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await context.newPage();
+    await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await rl.question("Press Enter once logged in to capture the session... ");
+    } finally {
+      rl.close();
+    }
+
+    await context.storageState({ path: outPath });
+    await context.close();
+    await browser.close();
+    console.log(`bots-app login: captured session → ${outPath}`);
+    console.log(
+      `bots-app login: reuse with \`bots-app run --participant ${account} --meeting-url <url>\`.`,
+    );
+  });
+
+interface LoginCommandOptions {
+  startUrl: string;
+  assetsDir: string;
 }
 
 program

@@ -13,6 +13,12 @@ function renderWithClient(ui: React.ReactElement) {
 
 interface FetchState {
   profiles: { name: string; savedAt: string; botCount: number }[];
+  /**
+   * Per-profile full payload returned by `GET /api/profiles/:name`.
+   * Tests that exercise the Details dialog populate this; tests that
+   * don't can leave it empty and the mock returns a 404.
+   */
+  profilesByName?: Record<string, unknown>;
   lastSavePayload?: unknown;
   lastLaunched?: string;
   lastDeleted?: string;
@@ -48,10 +54,22 @@ function stubFetch(state: FetchState) {
           headers: { "content-type": "application/json" },
         });
       }
-      const delMatch = /^\/api\/profiles\/([^/]+)$/.exec(url);
-      if (delMatch && init?.method === "DELETE") {
-        state.lastDeleted = delMatch[1];
-        return new Response(JSON.stringify({ name: delMatch[1], deleted: true }), {
+      const detailMatch = /^\/api\/profiles\/([^/]+)$/.exec(url);
+      if (detailMatch && (!init?.method || init.method === "GET")) {
+        const name = decodeURIComponent(detailMatch[1]);
+        const payload = state.profilesByName?.[name];
+        if (payload === undefined) {
+          return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (detailMatch && init?.method === "DELETE") {
+        const name = decodeURIComponent(detailMatch[1]);
+        state.lastDeleted = name;
+        return new Response(JSON.stringify({ name, deleted: true }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -124,6 +142,96 @@ describe("<RunProfiles />", () => {
     fireEvent.click(launchBtn);
     await waitFor(() => {
       expect(state.lastLaunched).toBe("to-launch");
+    });
+  });
+
+  it("Details button opens the dialog and renders the profile's bots + metadata", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "demo-3-bots", savedAt: "2026-05-13T22:00:00Z", botCount: 2 }],
+      profilesByName: {
+        "demo-3-bots": {
+          name: "demo-3-bots",
+          savedAt: "2026-05-13T22:00:00Z",
+          version: 1,
+          bots: [
+            {
+              participant: "alice",
+              meetingURL: "https://app.videocall.fnxlabs.com/meeting/TonyBots",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              costume: "pirate.y4m",
+              audio: "alice.wav",
+            },
+            {
+              participant: "bob",
+              meetingURL: "https://app.videocall.fnxlabs.com/meeting/TonyBots",
+              ttl: "10m",
+              headless: true,
+              network: "wifi-bad",
+              authBackend: "none",
+            },
+          ],
+        },
+      },
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    const detailsBtn = await screen.findByTestId("run-profile-details-demo-3-bots");
+    fireEvent.click(detailsBtn);
+    // Dialog appears with the bot table populated.
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-details-dialog")).toBeInTheDocument();
+      expect(screen.getByTestId("profile-details-table")).toBeInTheDocument();
+    });
+    // Both bot rows are rendered with their participant + override
+    // values; the second bot (no costume/audio set) shows "auto-match".
+    expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("alice");
+    expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("pirate.y4m");
+    expect(screen.getByTestId("profile-details-row-0")).toHaveTextContent("alice.wav");
+    expect(screen.getByTestId("profile-details-row-1")).toHaveTextContent("bob");
+    expect(screen.getByTestId("profile-details-row-1")).toHaveTextContent("auto-match");
+    // Metadata line shows the schema version + bot count so operators
+    // can verify the right test setup before launching.
+    expect(screen.getByTestId("profile-details-meta")).toHaveTextContent("schema v1");
+    expect(screen.getByTestId("profile-details-meta")).toHaveTextContent("2 bots");
+  });
+
+  it("Launch button inside the Details dialog calls the launch endpoint", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "from-dialog", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+      profilesByName: {
+        "from-dialog": {
+          name: "from-dialog",
+          savedAt: "2026-05-13T22:00:00Z",
+          version: 1,
+          bots: [
+            {
+              participant: "alice",
+              meetingURL: "https://app.videocall.fnxlabs.com/meeting/X",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+            },
+          ],
+        },
+      },
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    fireEvent.click(await screen.findByTestId("run-profile-details-from-dialog"));
+    // Wait until the dialog query finishes loading so the Launch
+    // button has been enabled (the metadata line only appears after
+    // `query.data` is populated, which gates the button's `disabled`
+    // attribute).
+    await screen.findByTestId("profile-details-meta");
+    const dialogLaunch = screen.getByTestId("profile-details-launch");
+    expect(dialogLaunch).not.toBeDisabled();
+    fireEvent.click(dialogLaunch);
+    await waitFor(() => {
+      expect(state.lastLaunched).toBe("from-dialog");
     });
   });
 });

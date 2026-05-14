@@ -414,6 +414,7 @@ describe("<LaunchForm /> manifest auto-match", () => {
       authBackend: "jwt" as const,
       storageStateFile: "",
       runLocation: "local" as const,
+      sshHostLabel: "",
       costume: "default",
       audio: "default",
     };

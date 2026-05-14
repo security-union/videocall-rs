@@ -7,6 +7,15 @@
 
 export type BotStatus = "launching" | "joining" | "in-meeting" | "leaving" | "done" | "failed";
 
+/**
+ * Where the bot is running. `{ kind: "local" }` is the in-process
+ * Playwright path; `{ kind: "ssh", hostLabel }` means the bot was
+ * launched on a remote machine over SSH using the registry entry
+ * `<hostLabel>`. The dashboard's bots-table renders this as a chip
+ * (`local` or `ssh:<label>`).
+ */
+export type BotHostKind = { kind: "local" } | { kind: "ssh"; hostLabel: string };
+
 export interface BotSnapshot {
   botId: string;
   participant: string;
@@ -18,6 +27,12 @@ export interface BotSnapshot {
   ttlRemainingMs: number | null;
   finishReason?: string;
   lastError?: string;
+  /**
+   * Where the bot is running. Always emitted by current servers; the
+   * `?` is back-compat with the older pre-SSH server payload that
+   * omits the field — the table renders that as "local".
+   */
+  host?: BotHostKind;
 }
 
 export interface BotListResponse {
@@ -84,7 +99,21 @@ export interface LaunchRequest {
    * `<runDir>/audio/`.
    */
   audio?: string;
-  runLocation: "local" | "future-vm" | "future-ssh" | "future-docker";
+  /**
+   * Where the bot's Chrome runs. Pre-SSH the dashboard sent the bare
+   * string `"local"` / `"future-ssh"`; the SSH PR introduces the
+   * structured form `{ kind: "local" }` / `{ kind: "ssh", hostLabel }`.
+   * The Node sidecar accepts both shapes; new clients should use the
+   * structured one. The legacy string-only union stays for
+   * back-compat with stored profiles and external callers.
+   */
+  runLocation:
+    | "local"
+    | "future-vm"
+    | "future-ssh"
+    | "future-docker"
+    | { kind: "local" }
+    | { kind: "ssh"; hostLabel: string };
 }
 
 export interface LaunchResponse {
@@ -238,6 +267,12 @@ export interface MultiLaunchRequest {
   storageStateFile?: string;
   ssoStateFile?: string;
   displayNameTemplate?: string;
+  /**
+   * Where every spawned bot's Chrome runs. Same shape as the single
+   * launch's `runLocation`. v1 has no fan-out — all N bots land on
+   * the one chosen host.
+   */
+  runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
 }
 
 export interface MultiLaunchResponse {
@@ -347,4 +382,53 @@ export interface PrepAssetsJobStatus {
   error: string | null;
   audioPrepped: number;
   costumesPrepped: number;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SSH host registry — per-host CRUD + the `POST /hosts/:label/test`
+// probe. Persistence is server-side under `<runDir>/hosts.json`. See
+// `e2e/bots-app/src/control/ssh-hosts.ts` for the validation rules.
+// ──────────────────────────────────────────────────────────────────────
+
+export interface SshHost {
+  label: string;
+  host: string;
+  user: string;
+  sshKey: string | null;
+  reposPath: string;
+  notes: string | null;
+  addedAt: number;
+}
+
+export interface SshHostsResponse {
+  hosts: SshHost[];
+}
+
+export interface AddSshHostRequest {
+  label: string;
+  host: string;
+  user?: string;
+  sshKey?: string | null;
+  reposPath: string;
+  notes?: string | null;
+}
+
+export interface UpdateSshHostRequest {
+  host?: string;
+  user?: string;
+  sshKey?: string | null;
+  reposPath?: string;
+  notes?: string | null;
+}
+
+export interface TestSshHostResponse {
+  ok: boolean;
+  latencyMs?: number;
+  output?: string;
+  error?: string;
+}
+
+export interface BotLogResponse {
+  lines: string[];
+  totalLines: number;
 }

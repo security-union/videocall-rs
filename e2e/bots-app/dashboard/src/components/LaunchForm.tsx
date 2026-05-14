@@ -37,6 +37,11 @@ export interface LaunchFormInitial {
   authBackend: AuthBackend;
   storageStateFile: string;
   runLocation: RunLocation;
+  /**
+   * Label of the registered SSH host this bot will launch on. Ignored
+   * unless `runLocation === "ssh"`. Empty string means "no pick yet".
+   */
+  sshHostLabel: string;
   costume: string;
   audio: string;
 }
@@ -57,6 +62,7 @@ const DEFAULT_VALUES: LaunchFormInitial = {
   authBackend: "jwt",
   storageStateFile: "",
   runLocation: "local",
+  sshHostLabel: "",
   costume: "default",
   audio: "default",
 };
@@ -128,6 +134,15 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
   const ssoStatusQuery = useQuery({
     queryKey: ["sso", "status"],
     queryFn: api.ssoStatus,
+    refetchInterval: 60_000,
+  });
+
+  // Fetch the registered SSH hosts so the "Run location: SSH-able
+  // host" option can populate its sub-Select. Refetch every 60s so
+  // additions from the Tools page show up without a manual reload.
+  const hostsQuery = useQuery({
+    queryKey: ["ssh", "hosts"],
+    queryFn: api.listHosts,
     refetchInterval: 60_000,
   });
 
@@ -293,6 +308,18 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
       values.costume && values.costume !== "default" ? values.costume : undefined;
     const audio = values.audio && values.audio !== "default" ? values.audio : undefined;
 
+    // Translate the radio + sub-Select into the structured wire
+    // shape the Node sidecar expects (`{ kind: "local" }` or
+    // `{ kind: "ssh", hostLabel }`). Anything other than "local" or
+    // "ssh" is blocked by the client-side validator above, so we
+    // narrow defensively.
+    let runLocation: LaunchRequest["runLocation"];
+    if (values.runLocation === "ssh") {
+      runLocation = { kind: "ssh", hostLabel: values.sshHostLabel.trim() };
+    } else {
+      runLocation = { kind: "local" };
+    }
+
     const req: LaunchRequest = {
       meetingURL: values.meetingURL.trim(),
       participant: values.participant.trim(),
@@ -308,7 +335,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
       ssoStateFile,
       costume,
       audio,
-      runLocation: values.runLocation as LaunchRequest["runLocation"],
+      runLocation,
     };
     launchMutation.mutate(req);
   };
@@ -657,8 +684,13 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               <HelpPopover fieldLabel="Run location" testId="help-runLocation">
                 <p>Where the bot&apos;s Chrome runs.</p>
                 <p className="mt-1">
-                  Today only Local is supported; future versions will allow remote VMs / SSH /
-                  Docker.
+                  Local and SSH are supported; Cloud VM and Docker slots remain disabled until
+                  those backends ship.
+                </p>
+                <p className="mt-1">
+                  SSH-able host requires at least one entry in the host registry (Tools page).
+                  Asset prep + most ctl actions are not proxied for remote bots in v1 — see the
+                  panel under the radio for the action matrix.
                 </p>
               </HelpPopover>
             }
@@ -668,44 +700,97 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               onValueChange={(v) => setField("runLocation", v as RunLocation)}
               className="flex flex-col gap-2"
             >
-              {RUN_LOCATIONS.map((loc) => (
-                <Tooltip.Root key={loc.value} delayDuration={150}>
-                  <Tooltip.Trigger asChild>
-                    <label
-                      className={`flex items-center gap-2 text-sm ${
-                        loc.available
-                          ? "text-neutral-700 dark:text-slate-200"
-                          : "text-neutral-400 dark:text-slate-500"
-                      }`}
-                      htmlFor={`runloc-${loc.value}`}
-                    >
-                      <RadioGroup.Item
-                        id={`runloc-${loc.value}`}
-                        value={loc.value}
-                        disabled={!loc.available}
-                        className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+              {RUN_LOCATIONS.map((loc) => {
+                const sshUnavailable =
+                  loc.value === "ssh" && (hostsQuery.data?.hosts?.length ?? 0) === 0;
+                const itemDisabled = !loc.available || sshUnavailable;
+                const tooltip = !loc.available
+                  ? "Future feature — see discussion #793"
+                  : sshUnavailable
+                    ? "No hosts registered — add one in Tools"
+                    : null;
+                return (
+                  <Tooltip.Root key={loc.value} delayDuration={150}>
+                    <Tooltip.Trigger asChild>
+                      <label
+                        className={`flex items-center gap-2 text-sm ${
+                          itemDisabled
+                            ? "text-neutral-400 dark:text-slate-500"
+                            : "text-neutral-700 dark:text-slate-200"
+                        }`}
+                        htmlFor={`runloc-${loc.value}`}
+                        data-testid={`runloc-label-${loc.value}`}
                       >
-                        <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
-                      </RadioGroup.Item>
-                      {loc.label}
-                    </label>
-                  </Tooltip.Trigger>
-                  {!loc.available && (
-                    <Tooltip.Portal>
-                      <Tooltip.Content
-                        side="right"
-                        sideOffset={6}
-                        className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
-                      >
-                        Future feature — see discussion #793
-                        <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
-                      </Tooltip.Content>
-                    </Tooltip.Portal>
-                  )}
-                </Tooltip.Root>
-              ))}
+                        <RadioGroup.Item
+                          id={`runloc-${loc.value}`}
+                          value={loc.value}
+                          disabled={itemDisabled}
+                          className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+                        >
+                          <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
+                        </RadioGroup.Item>
+                        {loc.label}
+                      </label>
+                    </Tooltip.Trigger>
+                    {tooltip !== null && (
+                      <Tooltip.Portal>
+                        <Tooltip.Content
+                          side="right"
+                          sideOffset={6}
+                          className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+                        >
+                          {tooltip}
+                          <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+                        </Tooltip.Content>
+                      </Tooltip.Portal>
+                    )}
+                  </Tooltip.Root>
+                );
+              })}
             </RadioGroup.Root>
           </Field>
+
+          {values.runLocation === "ssh" && (
+            <Field
+              label="SSH host"
+              required
+              error={errors.sshHostLabel}
+              help={
+                <HelpPopover fieldLabel="SSH host" testId="help-sshHostLabel">
+                  <p>
+                    Picks one of the hosts registered under Tools → Remote Hosts. The bot is
+                    launched via{" "}
+                    <code className="font-mono text-[11px]">ssh user@host &apos;npm run bot …&apos;</code>
+                    .
+                  </p>
+                  <p className="mt-1">
+                    v1 limitations: assets are NOT rsync&apos;d to the remote host (the bot
+                    falls back to Chrome&apos;s default fake patterns unless you&apos;ve prep&apos;d
+                    them out-of-band), and Mute / Camera / Share / Tune-network / Duplicate /
+                    Extend-TTL are not proxied — Leave + Force-kill ARE wired (via SIGTERM /
+                    SIGKILL over SSH).
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.sshHostLabel || "__none__"}
+                onValueChange={(v) => setField("sshHostLabel", v === "__none__" ? "" : v)}
+                options={[
+                  { value: "__none__", label: "Pick a host…" },
+                  ...(hostsQuery.data?.hosts ?? []).map((h: { label: string; user: string; host: string }) => ({
+                    value: h.label,
+                    label: `${h.label}  (${h.user}@${h.host})`,
+                  })),
+                ]}
+                testId="ssh-host-select"
+              />
+              <p className="mt-1 text-xs text-neutral-500 dark:text-slate-400">
+                Add or edit hosts under{" "}
+                <code className="font-mono text-[11px]">Tools → Remote Hosts</code>.
+              </p>
+            </Field>
+          )}
         </Section>
 
         <div className="flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">

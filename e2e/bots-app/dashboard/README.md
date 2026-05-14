@@ -117,18 +117,44 @@ first, then `bots-app dashboard` (which boots Vite for you).
   name, TTL with suggestion chips, network preset, headless toggle, auth
   backend, storage-state file, costume + audio asset hints).
 - Running-bots table with status badges, live TTL countdown, meeting link,
-  network profile, and per-row actions: Extend / Set TTL, Mute, Toggle camera,
-  Toggle share, Duplicate, Leave meeting, Force kill.
+  network profile, **host chip** (`local` / `ssh:<label>`), and per-row actions:
+  View logs, Extend / Set TTL, Mute, Toggle camera, Toggle share, Duplicate,
+  Leave meeting, Force kill.
 - Auto-collapse of the launch form once at least one bot is running.
 - Duplicate-bot flow pre-fills the launch form with the source bot's settings.
-- Run-location pick list with "Local machine" enabled and "Cloud VM", "SSH host",
-  "Docker container" disabled with a "Future feature — see discussion #793" tooltip.
+- Run-location pick list with **Local machine** and **SSH-able host** enabled
+  (latter only when at least one host is registered); Cloud VM + Docker stay
+  disabled with the "Future feature" tooltip.
+- **Remote Hosts (SSH)** Tools card with CRUD + a `Test` button that probes the
+  host with `ssh -o ConnectTimeout=5 ... 'echo bots-app-probe-ok && uname -a'`.
+- Per-bot log viewer dialog (polls `GET /api/bots/:id/log?since=<n>` every 2.5s).
+
+## Remote hosts (SSH)
+
+The Tools page's **Remote Hosts (SSH)** card lets you register the hosts the
+Launch form can target. Each row is persisted to `<runDir>/hosts.json` (mode
+`0o600`); credentials are sourced from your local `ssh-agent` and
+`~/.ssh/config` — the dashboard does not store private-key material.
+
+v1 limitations:
+
+- **Asset sync is not performed.** Remote bots fall back to Chrome's default
+  fake patterns unless you've manually prep'd costumes/audio on the remote host.
+- **Most ctl actions are not proxied.** Mute / Camera / Share / Tune-network /
+  Duplicate / Extend-TTL are disabled on the per-bot action row for SSH-hosted
+  bots (the server also returns 501 defense-in-depth). The actions that ARE
+  wired are **Leave** (SIGTERM to the local `ssh` ChildProcess) and **Force kill**
+  (SIGKILL).
+- **Multi-launch fans out to one host only.** All N bots in a multi-launch land
+  on the same chosen host in v1.
+
+See `e2e/bots-app/README.md` for the full design + security model.
 
 ## Known limitations
 
-- Run-location backends other than `local` (cloud VM, SSH-able host, Docker) are
-  not yet implemented.
+- Cloud VM and Docker run-location backends are not yet implemented.
 - The ctl token rotates when the orchestrator restarts; the dashboard discovers
   the new file but doesn't notify the operator.
 - No dark mode; the table layout assumes a reasonably wide viewport.
 - Bot list updates via a 2.5s poll — there is no server-push (SSE / WebSocket) channel today.
+- SSH-hosted bots: the action-button matrix is intentionally reduced (see Remote hosts section above).

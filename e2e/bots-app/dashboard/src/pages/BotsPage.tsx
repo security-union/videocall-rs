@@ -207,6 +207,7 @@ export function BotsPage() {
                 authBackend: "jwt",
                 storageStateFile: "",
                 runLocation: "local",
+                sshHostLabel: "",
                 costume: "default",
                 audio: "default",
               });

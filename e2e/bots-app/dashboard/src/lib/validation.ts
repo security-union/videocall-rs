@@ -17,6 +17,13 @@ export interface LaunchFormValues {
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile: string;
   runLocation: string;
+  /**
+   * When `runLocation === "ssh"`, the label of the registered host the
+   * operator picked. The form sets this empty string when the
+   * dropdown has no value chosen yet. Validation rejects an empty
+   * string only when SSH mode is active.
+   */
+  sshHostLabel?: string;
   costume: string;
   audio: string;
 }
@@ -28,6 +35,7 @@ export interface FieldErrors {
   network?: string;
   storageStateFile?: string;
   runLocation?: string;
+  sshHostLabel?: string;
 }
 
 export function isValidMeetingUrl(value: string): boolean {
@@ -66,8 +74,14 @@ export function validateLaunchForm(values: LaunchFormValues): FieldErrors {
   if (values.authBackend === "storage-state" && values.storageStateFile.trim() === "") {
     errors.storageStateFile = "Storage-state file path is required when auth=storage-state";
   }
-  if (values.runLocation !== "local") {
-    errors.runLocation = "Only the local-machine backend is wired today";
+  if (values.runLocation !== "local" && values.runLocation !== "ssh") {
+    errors.runLocation = "Only Local machine and SSH-able host are wired today";
+  }
+  if (values.runLocation === "ssh") {
+    const label = (values.sshHostLabel ?? "").trim();
+    if (label === "") {
+      errors.sshHostLabel = "Pick a registered SSH host";
+    }
   }
   return errors;
 }

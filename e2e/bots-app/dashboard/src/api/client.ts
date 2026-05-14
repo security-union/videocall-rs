@@ -1,6 +1,8 @@
 import type {
+  AddSshHostRequest,
   AssetsManifestResponse,
   BotListResponse,
+  BotLogResponse,
   BotSnapshot,
   DaemonInfo,
   HealthResponse,
@@ -23,10 +25,14 @@ import type {
   ProfileListResponse,
   RunProfile,
   SaveProfileRequest,
+  SshHost,
+  SshHostsResponse,
   SsoRecaptureCancelResponse,
   SsoRecaptureStartRequest,
   SsoRecaptureStartResponse,
   SsoStatusResponse,
+  TestSshHostResponse,
+  UpdateSshHostRequest,
   VpnStatusResponse,
 } from "./types";
 
@@ -240,4 +246,30 @@ export const api = {
     ),
   prepAssetsForget: (jobId: string): Promise<{ jobId: string; deleted: boolean }> =>
     request("DELETE", `/api/assets/prep/${encodeURIComponent(jobId)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // SSH host registry — CRUD + connectivity probe.
+  // ──────────────────────────────────────────────────────────────────
+  listHosts: (): Promise<SshHostsResponse> => request<SshHostsResponse>("GET", "/api/hosts"),
+  addHost: (req: AddSshHostRequest): Promise<{ host: SshHost }> =>
+    request<{ host: SshHost }>("POST", "/api/hosts", req as unknown as Record<string, unknown>),
+  updateHost: (label: string, req: UpdateSshHostRequest): Promise<{ host: SshHost }> =>
+    request<{ host: SshHost }>(
+      "PUT",
+      `/api/hosts/${encodeURIComponent(label)}`,
+      req as unknown as Record<string, unknown>,
+    ),
+  removeHost: (label: string): Promise<null> =>
+    request<null>("DELETE", `/api/hosts/${encodeURIComponent(label)}`),
+  testHost: (label: string): Promise<TestSshHostResponse> =>
+    request<TestSshHostResponse>("POST", `/api/hosts/${encodeURIComponent(label)}/test`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-bot log window (used by the log viewer dialog).
+  // ──────────────────────────────────────────────────────────────────
+  botLog: (botId: string, since = 0): Promise<BotLogResponse> =>
+    request<BotLogResponse>(
+      "GET",
+      `/api/bots/${encodeURIComponent(botId)}/log?since=${since}`,
+    ),
 };

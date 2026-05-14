@@ -20,6 +20,19 @@ export const NETSIM_PRESETS = [
 export type NetsimPreset = (typeof NETSIM_PRESETS)[number];
 
 /**
+ * Display-only mapping from a netsim preset name to its UI label.
+ * The underlying value sent to the server (and stored in
+ * `BotLaunchSpec.network`) stays as the raw preset string — this
+ * function only changes what the dashboard renders. The "none"
+ * preset is the passthrough/disable-netsim option; in the UI we
+ * surface it as "as is" so operators recognize the
+ * no-simulation-applied path at a glance.
+ */
+export function networkLabel(preset: string): string {
+  return preset === "none" ? "as is" : preset;
+}
+
+/**
  * Suggestion chips rendered under the TTL input. Each item must
  * round-trip cleanly through `parseDurationClient` — the form
  * validates before submitting.

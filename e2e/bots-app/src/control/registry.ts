@@ -7,6 +7,30 @@ import { formatDuration, type Ttl } from "../ttl";
 // type-only import to avoid a runtime circular dependency between the
 // registry helpers and the orchestrator that imports them.
 import type { BotTask } from "../orchestrator";
+import type { SshBotHandle } from "./ssh-launcher";
+
+/**
+ * Where a bot is physically running. Local bots use Playwright in the
+ * orchestrator's own Node process; SSH-hosted bots are launched on a
+ * remote machine via the operator's system `ssh` and their lifecycle
+ * is tracked through the SSH ChildProcess.
+ */
+export type BotHostKind = { kind: "local" } | { kind: "ssh"; hostLabel: string };
+
+/**
+ * Thrown by SSH-hosted-bot action handlers (mute, camera, share, etc.)
+ * that are not proxied through to the remote host in v1. The control
+ * server maps this to HTTP 501 with a clear message so the dashboard
+ * can pre-emptively disable the corresponding buttons.
+ */
+export class NotSupportedRemoteError extends Error {
+  constructor(action: string) {
+    super(
+      `Action '${action}' is not available for SSH-hosted bots (v1). Use the CLI directly on the host for now.`,
+    );
+    this.name = "NotSupportedRemoteError";
+  }
+}
 
 /**
  * Lifecycle states a bot transitions through in the orchestrator's
@@ -58,6 +82,20 @@ export interface BotRegistryEntry {
   readonly botId: string;
   task: BotTask;
   handle: BotHandle | null;
+  /**
+   * Where this bot is running. `{ kind: "local" }` (the default) means
+   * it's a Playwright bot in the orchestrator's own Node process; the
+   * `handle` field above tracks its lifecycle. `{ kind: "ssh", … }`
+   * means it was launched via SSH and the lifecycle is tracked via
+   * {@link sshHandle} instead.
+   */
+  host: BotHostKind;
+  /**
+   * Set only when `host.kind === "ssh"`. Owns the live SSH
+   * ChildProcess + the rolling log buffer the dashboard's log viewer
+   * paginates over.
+   */
+  sshHandle: SshBotHandle | null;
   status: BotStatus;
   readonly startedAt: number;
   ttl: Ttl;
@@ -105,6 +143,14 @@ export interface BotSnapshot {
   ttlRemainingMs: number | null;
   finishReason?: string;
   lastError?: string;
+  /**
+   * Where the bot is running. Mirrors `BotRegistryEntry.host` 1:1 —
+   * the dashboard's bots-table renders a small chip ("local" or
+   * "ssh:<label>") based on this. `null`/undefined would be
+   * back-compat-friendly, but we always emit a value to keep the
+   * client logic simple.
+   */
+  host: BotHostKind;
 }
 
 /**
@@ -137,13 +183,18 @@ export function shortBotId(botId: string): string {
  * The fresh entry is in `launching` state with `handle: null`. The
  * orchestrator is responsible for transitioning it forward.
  */
-export function newRegistryEntry(task: BotTask): BotRegistryEntry {
+export function newRegistryEntry(
+  task: BotTask,
+  host: BotHostKind = { kind: "local" },
+): BotRegistryEntry {
   const now = Date.now();
   const ttlDeadline = task.ttl === "infinite" ? null : now + task.ttl;
   return {
     botId: task.botId,
     task,
     handle: null,
+    host,
+    sshHandle: null,
     status: "launching",
     startedAt: now,
     ttl: task.ttl,
@@ -173,6 +224,7 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
     network: entry.network,
     ttl: formatDuration(entry.ttl),
     ttlRemainingMs,
+    host: entry.host,
   };
   if (entry.finishReason !== undefined) snap.finishReason = entry.finishReason;
   if (entry.lastError !== undefined) snap.lastError = entry.lastError;

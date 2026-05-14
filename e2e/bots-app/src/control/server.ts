@@ -50,9 +50,23 @@ import {
 import {
   type BotRegistryEntry,
   type BotSnapshot,
+  NotSupportedRemoteError,
   snapshotEntry,
   sweepStaleEntries,
 } from "./registry";
+import {
+  addHost,
+  listHosts,
+  removeHost,
+  SshHostExistsError,
+  SshHostNotFoundError,
+  SshHostValidationError,
+  testHost,
+  updateHost,
+  type SshHostInput,
+  type SshHostPatch,
+} from "./ssh-hosts";
+import { readLogWindow } from "./ssh-launcher";
 
 /**
  * Callbacks the orchestrator exposes to the control server. Keeps the
@@ -136,6 +150,14 @@ export interface LaunchSpec {
    * basename like `alice.wav` under `<runDir>/audio/`.
    */
   audio?: string;
+  /**
+   * Where the bot's Chrome runs. Default is `{ kind: "local" }`
+   * (back-compat with every pre-SSH caller). `{ kind: "ssh",
+   * hostLabel }` looks up the host in the registry and runs the bot
+   * over SSH on that host. Cloud-VM / Docker variants are tracked
+   * separately and rejected by the validator today.
+   */
+  runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
 }
 
 /**
@@ -489,6 +511,7 @@ async function handleRequest(
       ssoState,
       assetsManifestState,
       prepAssetsJobs,
+      url,
     );
     sendJson(res, result.status, result.body);
   } catch (err) {
@@ -506,6 +529,22 @@ async function handleRequest(
     }
     if (err instanceof ProfileExistsError) {
       sendJson(res, 409, { error: err.message });
+      return;
+    }
+    if (err instanceof SshHostValidationError) {
+      sendJson(res, 400, { error: err.message });
+      return;
+    }
+    if (err instanceof SshHostNotFoundError) {
+      sendJson(res, 404, { error: err.message });
+      return;
+    }
+    if (err instanceof SshHostExistsError) {
+      sendJson(res, 409, { error: err.message });
+      return;
+    }
+    if (err instanceof NotSupportedRemoteError) {
+      sendJson(res, 501, { error: err.message });
       return;
     }
     throw err;
@@ -526,6 +565,7 @@ async function route(
   ssoState: SsoState,
   assetsManifestState: AssetsManifestCacheState,
   prepAssetsJobs: Map<string, PrepAssetsJob>,
+  url: URL,
 ): Promise<RouteResult> {
   const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
@@ -645,6 +685,35 @@ async function route(
     }
   }
 
+  // ──────────────────────────────────────────────────────────────────
+  // SSH host registry endpoints. CRUD + a `POST /hosts/:label/test`
+  // probe that runs `ssh -o ConnectTimeout=5 ... 'echo … && uname -a'`
+  // so the operator can sanity-check a registered host without leaving
+  // the dashboard. Persistence lives at `<runDir>/hosts.json` (mode
+  // 0o600). See `./ssh-hosts.ts` for the wire shape.
+  // ──────────────────────────────────────────────────────────────────
+  if (pathname === "/hosts") {
+    if (method === "GET") return listHostsRoute(opts);
+    if (method === "POST") {
+      const body = await readJsonBody(req);
+      return addHostRoute(opts, body);
+    }
+  }
+  const hostPath = /^\/hosts\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+  if (hostPath) {
+    const label = decodeURIComponent(hostPath[1]);
+    const sub = hostPath[2];
+    if (sub === undefined) {
+      if (method === "PUT") {
+        const body = await readJsonBody(req);
+        return updateHostRoute(opts, label, body);
+      }
+      if (method === "DELETE") return removeHostRoute(opts, label);
+    } else if (sub === "test" && method === "POST") {
+      return testHostRoute(opts, label);
+    }
+  }
+
   const botPath = /^\/bots\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
   if (botPath) {
     const botId = decodeURIComponent(botPath[1]);
@@ -652,6 +721,8 @@ async function route(
     if (sub === undefined) {
       if (method === "GET") return getOneBot(surface, botId);
       if (method === "DELETE") return killBot(surface, botId);
+    } else if (sub === "log" && method === "GET") {
+      return botLogRoute(surface, botId, url);
     } else {
       const body = await readJsonBody(req);
       if (method === "POST" && sub === "leave") return leaveBot(surface, botId);
@@ -1114,16 +1185,12 @@ async function launchOne(
       `"audio" must match ${ASSET_FILENAME_PATTERN.source} (got "${audio}")`,
     );
   }
-  // `runLocation` is dashboard-only metadata; we accept it but only
-  // honor "local" today. Anything else is rejected so a future
-  // backend implementation can't be silently downgraded.
-  const runLocation = body.runLocation;
-  if (runLocation !== undefined && runLocation !== "local") {
-    throw new ControlServerError(
-      400,
-      'only "local" runLocation is wired today; see discussion #793',
-    );
-  }
+  // `runLocation` carries the operator's "where does this bot's
+  // Chrome run" pick. The legacy shape was the bare string `"local"`
+  // / `"future-ssh"`; the SSH PR introduces the structured form
+  // `{ kind: "local" }` / `{ kind: "ssh", hostLabel }`. We accept
+  // either shape for back-compat and normalize to the structured one.
+  const runLocation = parseRunLocationField(body.runLocation);
   const spec: LaunchSpec = {
     meetingURL,
     participant,
@@ -1136,9 +1203,63 @@ async function launchOne(
     ssoStateFile: ssoStateFile as string | undefined,
     costume: costume as string | undefined,
     audio: audio as string | undefined,
+    runLocation,
   };
   const newId = await surface.launchOne(spec);
   return { status: 201, body: { botId: newId } };
+}
+
+/**
+ * Parse the `runLocation` field accepted by `POST /launch` (and the
+ * multi-launch variants). Accepts:
+ *
+ *   - undefined / "local" / { kind: "local" }  → { kind: "local" }
+ *   - { kind: "ssh", hostLabel: "<label>" }    → { kind: "ssh", … }
+ *
+ * The pre-SSH dashboard used the bare strings `"future-vm"` /
+ * `"future-ssh"` / `"future-docker"` as placeholders; those are now
+ * rejected explicitly so a regression on the UI side surfaces loudly
+ * instead of silently downgrading to local.
+ */
+export function parseRunLocationField(
+  raw: unknown,
+): { kind: "local" } | { kind: "ssh"; hostLabel: string } {
+  if (raw === undefined || raw === null) return { kind: "local" };
+  if (raw === "local") return { kind: "local" };
+  if (typeof raw === "string") {
+    if (raw === "future-vm" || raw === "future-docker") {
+      throw new ControlServerError(
+        400,
+        `runLocation "${raw}" is not wired in this release; see discussion #793`,
+      );
+    }
+    if (raw === "future-ssh") {
+      throw new ControlServerError(
+        400,
+        'runLocation "future-ssh" is the legacy placeholder; pass { kind: "ssh", hostLabel } instead',
+      );
+    }
+    throw new ControlServerError(400, `unknown runLocation string "${raw}"`);
+  }
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const o = raw as Record<string, unknown>;
+    if (o.kind === "local") return { kind: "local" };
+    if (o.kind === "ssh") {
+      const hostLabel = o.hostLabel;
+      if (typeof hostLabel !== "string" || hostLabel === "") {
+        throw new ControlServerError(
+          400,
+          'runLocation.kind="ssh" requires a non-empty "hostLabel"',
+        );
+      }
+      return { kind: "ssh", hostLabel };
+    }
+    throw new ControlServerError(
+      400,
+      `runLocation.kind must be "local" or "ssh" (got ${JSON.stringify(o.kind)})`,
+    );
+  }
+  throw new ControlServerError(400, "runLocation must be a string or { kind, hostLabel }");
 }
 
 async function duplicate(
@@ -1617,6 +1738,7 @@ async function launchMultiRoute(
       : undefined;
   const displayNameTemplate =
     typeof body.displayNameTemplate === "string" ? body.displayNameTemplate : undefined;
+  const runLocation = parseRunLocationField(body.runLocation);
 
   let seed: number | undefined;
   if (body.seed !== undefined) {
@@ -1670,6 +1792,7 @@ async function launchMultiRoute(
       authBackend,
       storageStateFile,
       ssoStateFile,
+      runLocation,
     };
     try {
       const id = await surface.launchOne(spec);
@@ -2270,6 +2393,149 @@ function defaultPrepManifest(runDir: string): string {
 
 function defaultPrepCostumeSource(runDir: string): string {
   return join(runDir, "..", "..", "..", DEFAULT_PREP_COSTUME_SOURCE_RELATIVE);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SSH host registry routes. All four CRUD verbs + a synchronous
+// probe. Persistence lives in `<runDir>/hosts.json`; see ssh-hosts.ts.
+// ──────────────────────────────────────────────────────────────────────
+
+async function listHostsRoute(opts: ControlServerOptions): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const hosts = await listHosts(runDir);
+  return { status: 200, body: { hosts } };
+}
+
+async function addHostRoute(
+  opts: ControlServerOptions,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const spec = parseHostInput(body);
+  const host = await addHost(runDir, spec);
+  return { status: 201, body: { host } };
+}
+
+async function updateHostRoute(
+  opts: ControlServerOptions,
+  label: string,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const patch = parseHostPatch(body);
+  const host = await updateHost(runDir, label, patch);
+  return { status: 200, body: { host } };
+}
+
+async function removeHostRoute(opts: ControlServerOptions, label: string): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  await removeHost(runDir, label);
+  return { status: 204, body: null };
+}
+
+async function testHostRoute(opts: ControlServerOptions, label: string): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const result = await testHost(runDir, label);
+  // Always 200 — the result body carries `ok: false` for the failure
+  // case so the dashboard can render a colored chip without falling
+  // through to the error-banner path.
+  return { status: 200, body: result };
+}
+
+function parseHostInput(body: Record<string, unknown>): SshHostInput {
+  const label = body.label;
+  if (typeof label !== "string") throw new ControlServerError(400, '"label" must be a string');
+  const host = body.host;
+  if (typeof host !== "string") throw new ControlServerError(400, '"host" must be a string');
+  const reposPath = body.reposPath;
+  if (typeof reposPath !== "string") {
+    throw new ControlServerError(400, '"reposPath" must be a string');
+  }
+  const user = body.user;
+  if (user !== undefined && typeof user !== "string") {
+    throw new ControlServerError(400, '"user" must be a string when provided');
+  }
+  const sshKey = body.sshKey;
+  if (sshKey !== undefined && sshKey !== null && typeof sshKey !== "string") {
+    throw new ControlServerError(400, '"sshKey" must be a string or null');
+  }
+  const notes = body.notes;
+  if (notes !== undefined && notes !== null && typeof notes !== "string") {
+    throw new ControlServerError(400, '"notes" must be a string or null');
+  }
+  return {
+    label,
+    host,
+    reposPath,
+    user: user as string | undefined,
+    sshKey: sshKey === undefined ? undefined : (sshKey as string | null),
+    notes: notes === undefined ? undefined : (notes as string | null),
+  };
+}
+
+function parseHostPatch(body: Record<string, unknown>): SshHostPatch {
+  const patch: SshHostPatch = {};
+  if (body.host !== undefined) {
+    if (typeof body.host !== "string") {
+      throw new ControlServerError(400, '"host" must be a string when provided');
+    }
+    patch.host = body.host;
+  }
+  if (body.user !== undefined) {
+    if (typeof body.user !== "string") {
+      throw new ControlServerError(400, '"user" must be a string when provided');
+    }
+    patch.user = body.user;
+  }
+  if (body.sshKey !== undefined) {
+    if (body.sshKey !== null && typeof body.sshKey !== "string") {
+      throw new ControlServerError(400, '"sshKey" must be a string or null when provided');
+    }
+    patch.sshKey = body.sshKey as string | null;
+  }
+  if (body.reposPath !== undefined) {
+    if (typeof body.reposPath !== "string") {
+      throw new ControlServerError(400, '"reposPath" must be a string when provided');
+    }
+    patch.reposPath = body.reposPath;
+  }
+  if (body.notes !== undefined) {
+    if (body.notes !== null && typeof body.notes !== "string") {
+      throw new ControlServerError(400, '"notes" must be a string or null when provided');
+    }
+    patch.notes = body.notes as string | null;
+  }
+  return patch;
+}
+
+/**
+ * `GET /bots/:id/log?since=<n>` — paginates the rolling log buffer
+ * stored on the registry entry. For SSH-hosted bots this is the SSH
+ * ChildProcess's stdout/stderr; for local bots it's currently always
+ * empty (Playwright bots log to stdout directly, not to the registry).
+ * The wire shape is stable across both kinds so the dashboard can use
+ * a single fetch path.
+ */
+function botLogRoute(surface: OrchestratorControlSurface, botId: string, url: URL): RouteResult {
+  const entry = surface.getRegistry().get(botId);
+  if (entry === undefined) {
+    throw new ControlServerError(404, `bot ${botId} not found`);
+  }
+  let since = 0;
+  const sinceRaw = url.searchParams.get("since");
+  if (sinceRaw !== null) {
+    const n = Number.parseInt(sinceRaw, 10);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new ControlServerError(400, '"since" must be a non-negative integer');
+    }
+    since = n;
+  }
+  if (entry.sshHandle !== null) {
+    return { status: 200, body: readLogWindow(entry.sshHandle, since) };
+  }
+  // Local bot — no rolling buffer (yet). Return an empty window so
+  // the dashboard's polling loop is a no-op.
+  return { status: 200, body: { lines: [], totalLines: 0 } };
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

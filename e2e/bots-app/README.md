@@ -344,6 +344,30 @@ npm run ci:lint               # eslint + prettier + tsc
 npm run test:unit             # vitest unit tests for bots-app/
 ```
 
+## Remote hosts (SSH) — v1
+
+The dashboard can launch bots on a remote machine using the operator's local `ssh` binary. Hosts are registered via the **Tools → Remote Hosts** card; once at least one host is registered, the launch form's **SSH-able host** radio activates.
+
+How it works:
+
+- The dashboard's Node sidecar stores host metadata at `e2e/bots-app/run/hosts.json` (mode `0o600`). No private keys live in this file — credentials are sourced from the operator's `ssh-agent` and `~/.ssh/config`.
+- When SSH is selected, the orchestrator spawns the local `ssh` binary directly (`child_process.spawn("ssh", [...])`, no shell) and runs a single-line bash command on the remote host:
+  ```
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new [-i <key>] user@host[:port] \
+    "cd '<reposPath>'/e2e && npm run bot -- run --headless --ttl '<ttl>' --meeting-url '<url>' --participant '<p>' [--network '<net>'] [--auth '<auth>'] [--display-name '<name>']"
+  ```
+  Every dynamic substring is shell-escaped via the `shellEscape` helper (POSIX single-quote wrap + `'\''` for embedded quotes).
+- Stdout/stderr from the remote bot are tee'd into the registry entry's rolling log buffer (capped at 200 lines). The dashboard's per-bot "View logs" dialog polls `GET /api/bots/:id/log?since=<n>` every 2.5s.
+- **Leave** sends `SIGTERM` to the local `ssh` ChildProcess (which propagates to the remote bot via the SSH connection). **Force-kill** sends `SIGKILL`.
+
+v1 limitations (deliberately deferred):
+
+- **Asset sync is out of scope.** Remote bots fall back to Chrome's default fake patterns unless an operator has manually prep'd `costumes/*.y4m` and `audio/*.wav` on the remote host's `<reposPath>/e2e/bots-app/run/` directory.
+- **Remote ctl-API proxy is out of scope.** Mute / Camera / Share / Tune-network / Duplicate / Extend-TTL are not proxied for SSH-hosted bots. The dashboard greys them out with a tooltip ("Not available for remote bots (v1)") and the server returns `501` defense-in-depth.
+- **Multi-launch fans out to one host only.** All N bots in a multi-launch land on the same chosen host in v1.
+
+Security model: the dashboard process spawns `ssh` as the operator's local user; we do not elevate. The `127.0.0.1`-only bind + bearer token applies to the host registry endpoints just like the rest of the control API. The local `ssh-agent` + `~/.ssh/config` remain the source of truth for credentials.
+
 ## Architecture
 
 ```
@@ -365,11 +389,13 @@ e2e/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
         storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)
       control/              ← HTTP control surface + ctl client
-        registry.ts         ← BotRegistryEntry + snapshot + retention sweeper
+        registry.ts         ← BotRegistryEntry + snapshot + retention sweeper (incl. SSH-host tag)
         auth.ts             ← token generation + token-file IO + bearer header parsing
-        server.ts           ← Node http.createServer routes (`/healthz`, `/bots`, `/bots/:id/*`)
+        server.ts           ← Node http.createServer routes (`/healthz`, `/bots`, `/hosts`, `/bots/:id/*`)
         client.ts           ← thin node:http JSON client used by ctl subcommands
         ctl.ts              ← registerCtlCommands(program, runDir) — wires `bots-app ctl <subcmd>` family
+        ssh-hosts.ts        ← `<runDir>/hosts.json` registry + validation + `shellEscape` + remote-cmd builder
+        ssh-launcher.ts     ← `spawnRemoteBot` — wraps the `ssh` ChildProcess with a rolling log buffer
     scripts/
       setup-assets.sh       ← thin wrapper over `npm run bot -- prep-assets`
     run/                    ← gitignored; per-participant stitched WAVs + costume y4m caches + ctl-<pid>.token files

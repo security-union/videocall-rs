@@ -82,6 +82,10 @@ meta:
 
 By default `gen` only picks from **costumed participants** in the manifest (the 19 named characters with `costume_dir`). Pass `--include-observers` to also pick from observer-NN seats — useful when you specifically want a meeting filled mostly with receive-only bots. Note that observer bots show up as Chrome's default fake pattern with no audio, since `prep-assets` doesn't produce any artifacts for them.
 
+## Network simulation (`--network <profile>`)
+
+Both `bots-app run` and `bots-app gen` accept `--network <profile>`, and meeting-config YAML files accept `network:` at both the meeting level and per-bot. When set, the bot's meeting URL is rewritten to include `?netsim=<profile>` before navigation — the in-tab `videocall-client` (built with `--features netsim`) installs the matching shim on its WT + WS send paths to mimic a degraded peer. Without that build flag the URL param is parsed by the browser but silently ignored. Valid profiles: `none`, `good_wifi`, `good_4g`, `congested_wifi`, `lossy_mobile`, `satellite`, `dialup`. See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) phase 3.
+
 ## Usage
 
 ```bash

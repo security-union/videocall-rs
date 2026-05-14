@@ -55,6 +55,12 @@ export interface BotRunOptions {
    */
   manifest?: Manifest | null;
   runDir?: string | null;
+  /**
+   * When set, appends `?netsim=<profile>` to the meeting URL before
+   * navigating. Requires the videocall-client build to have
+   * `--features netsim`. See discussion #793 phase 3.
+   */
+  network?: string | null;
 }
 
 export interface BotHandle {
@@ -72,8 +78,21 @@ export interface BotHandle {
 }
 
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
+  // `baseURL` is derived from the *original* URL (no query) so the
+  // JWT session cookie's scope doesn't drift if a `?netsim=` param is
+  // injected below. `target` is the URL we actually navigate to —
+  // when `opts.network` is set, it carries the `?netsim=<profile>`
+  // search param that the in-tab `videocall-client` parses at startup
+  // (when built with `--features netsim`).
+  const originalUrl = new URL(opts.meetingURL);
+  const baseURL = `${originalUrl.protocol}//${originalUrl.host}`;
   const target = new URL(opts.meetingURL);
-  const baseURL = `${target.protocol}//${target.host}`;
+  if (opts.network && opts.network !== "") {
+    target.searchParams.set("netsim", opts.network);
+    console.log(
+      `[${opts.participant}] netsim: applying profile '${opts.network}' via ?netsim=<profile>`,
+    );
+  }
 
   const launchArgs = [...CHROME_ARGS];
   if (opts.manifest != null && opts.runDir != null && opts.runDir !== "") {
@@ -156,9 +175,13 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   });
 
-  console.log(`[${opts.participant}] navigating to ${opts.meetingURL}`);
-  await page.goto(opts.meetingURL, { waitUntil: "domcontentloaded" });
+  const navigateUrl = target.toString();
+  console.log(`[${opts.participant}] navigating to ${navigateUrl}`);
+  await page.goto(navigateUrl, { waitUntil: "domcontentloaded" });
 
+  // `meetingIdFromUrl` operates on the raw `opts.meetingURL` because
+  // the meeting-id lives in the path, not the query — adding a
+  // `?netsim=` search param does not affect it.
   const meetingId = meetingIdFromUrl(opts.meetingURL);
   await joinMeetingAndEnableMedia({
     page,

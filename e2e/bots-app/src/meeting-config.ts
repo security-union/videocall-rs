@@ -5,6 +5,27 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { type Manifest } from "./manifest";
 
 /**
+ * Canonical list of netsim preset names accepted on the `network`
+ * field (both per-bot and meeting-level). The single source of truth
+ * is the Rust crate at `videocall-netsim/src/profiles.rs` —
+ * specifically the `PRESET_NAMES` constant. This TS array must mirror
+ * that list exactly; any drift will surface as a parse-time
+ * `network must be one of: <list>` error before the browser is ever
+ * launched.
+ *
+ * See discussion #793 phase 3 for the design.
+ */
+export const NETSIM_PRESETS: readonly string[] = [
+  "none",
+  "good_wifi",
+  "good_4g",
+  "congested_wifi",
+  "lossy_mobile",
+  "satellite",
+  "dialup",
+] as const;
+
+/**
  * One bot's entry within a meeting config. Currently only carries the
  * participant handle; `ttl` and (future) network-condition overrides
  * are placeholders for phase 3+ work but don't ship per-bot yet so
@@ -20,6 +41,15 @@ export interface BotEntry {
    * parse/emit so generators can populate it without a schema change.
    */
   ttl?: string;
+  /**
+   * Optional per-bot netsim profile (one of `NETSIM_PRESETS`).
+   * Overrides the meeting-level default. When set, the bot's meeting
+   * URL is rewritten to include `?netsim=<profile>` before navigation
+   * — the in-tab `videocall-client` (when built with `--features
+   * netsim`) installs the matching shim on the WT + WS send paths.
+   * See discussion #793 phase 3.
+   */
+  network?: string;
 }
 
 /**
@@ -32,12 +62,35 @@ export interface BotEntry {
 export interface MeetingConfig {
   meetingUrl: string;
   ttl?: string;
+  /**
+   * Optional meeting-level netsim profile (one of `NETSIM_PRESETS`).
+   * Bots that do not specify their own `network` inherit this value.
+   * See `BotEntry.network` for the per-bot override.
+   */
+  network?: string;
   bots: BotEntry[];
   /** Provenance metadata `gen` writes so a generated file can be re-rolled. */
   meta?: {
     seed?: number;
     generatedAt?: string;
   };
+}
+
+/**
+ * Throws `network must be one of: <list>` when `value` is not in
+ * `NETSIM_PRESETS`. `where` is a human-readable prefix injected into
+ * the error message (e.g. `"meeting"` or `"bots[2]"`).
+ */
+function validateNetsimProfile(value: unknown, where: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${where}.network, when present, must be a string`);
+  }
+  if (!NETSIM_PRESETS.includes(value)) {
+    throw new Error(
+      `${where}.network must be one of: ${NETSIM_PRESETS.join(", ")} (got "${value}")`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -59,6 +112,8 @@ export function parseMeetingConfigText(text: string): MeetingConfig {
   if (ttl !== undefined && typeof ttl !== "string") {
     throw new Error("ttl, when present, must be a string");
   }
+  const network =
+    obj.network !== undefined ? validateNetsimProfile(obj.network, "meeting") : undefined;
   if (!Array.isArray(obj.bots)) {
     throw new Error("bots must be an array");
   }
@@ -78,10 +133,12 @@ export function parseMeetingConfigText(text: string): MeetingConfig {
     if (botTtl !== undefined && typeof botTtl !== "string") {
       throw new Error(`bots[${idx}].ttl, when present, must be a string`);
     }
-    return { participant, ttl: botTtl };
+    const botNetwork =
+      row.network !== undefined ? validateNetsimProfile(row.network, `bots[${idx}]`) : undefined;
+    return { participant, ttl: botTtl, network: botNetwork };
   });
   const meta = obj.meta;
-  const result: MeetingConfig = { meetingUrl, ttl, bots };
+  const result: MeetingConfig = { meetingUrl, ttl, network, bots };
   if (meta != null && typeof meta === "object" && !Array.isArray(meta)) {
     const m = meta as Record<string, unknown>;
     result.meta = {
@@ -110,9 +167,13 @@ export function emitMeetingConfigYaml(config: MeetingConfig): string {
   if (config.ttl !== undefined) {
     out.ttl = config.ttl;
   }
+  if (config.network !== undefined) {
+    out.network = config.network;
+  }
   out.bots = config.bots.map((b) => {
     const entry: Record<string, unknown> = { participant: b.participant };
     if (b.ttl !== undefined) entry.ttl = b.ttl;
+    if (b.network !== undefined) entry.network = b.network;
     return entry;
   });
   if (config.meta) {
@@ -179,10 +240,21 @@ export function generateMeetingConfig(args: {
   seed: number;
   meetingUrl: string;
   ttl?: string;
+  /**
+   * Optional meeting-level netsim profile written to the generated
+   * config. Validated against `NETSIM_PRESETS`; throws on an unknown
+   * name. Per-bot networks are NOT randomized today — a future
+   * `--network-jitter` flag can layer that on without a schema
+   * change.
+   */
+  network?: string;
   includeObservers?: boolean;
 }): MeetingConfig {
   if (args.count <= 0) {
     throw new Error("count must be a positive integer");
+  }
+  if (args.network !== undefined) {
+    validateNetsimProfile(args.network, "meeting");
   }
   const eligible = args.includeObservers
     ? args.manifest.participants
@@ -200,6 +272,7 @@ export function generateMeetingConfig(args: {
   return {
     meetingUrl: args.meetingUrl,
     ttl: args.ttl,
+    network: args.network,
     bots: picked.map((participant) => ({ participant })),
     meta: {
       seed: args.seed,

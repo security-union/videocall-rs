@@ -6,7 +6,7 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import { Rocket } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
-import type { LaunchRequest } from "../api/types";
+import type { LaunchRequest, SsoStatusResponse } from "../api/types";
 import {
   AUTH_BACKENDS,
   NETSIM_PRESETS,
@@ -20,6 +20,7 @@ import { type FieldErrors, validateLaunchForm } from "../lib/validation";
 import { HelpPopover } from "./ui/HelpPopover";
 import { HistoryInput } from "./ui/HistoryInput";
 import { Select } from "./ui/Select";
+import { SsoPanel } from "./SsoPanel";
 
 export interface LaunchFormInitial {
   meetingURL: string;
@@ -62,6 +63,17 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
   const [values, setValues] = useState<LaunchFormInitial>(initialValues ?? DEFAULT_VALUES);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitted, setSubmitted] = useState(false);
+  const [ssoPanelOpen, setSsoPanelOpen] = useState(false);
+
+  // Surface the captured SSO state in the Identity section when the
+  // operator picks JWT auth (which is the path that consumes it). The
+  // query shares its cache with the header chip + SsoPanel, so this
+  // does NOT add a duplicate network call.
+  const ssoStatusQuery = useQuery({
+    queryKey: ["sso", "status"],
+    queryFn: api.ssoStatus,
+    refetchInterval: 60_000,
+  });
 
   // Per-field history controllers. Each gets its own localStorage
   // namespace via the key passed to `useFieldHistory`. On successful
@@ -128,6 +140,17 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     setErrors(v);
     if (Object.keys(v).length > 0) return;
 
+    // When the operator is using JWT auth and we have a captured SSO
+    // state file on disk, forward its path so the orchestrator
+    // pre-loads its cookies into the bot's BrowserContext. This is
+    // exactly the wire-through the launch form was missing — without
+    // it dashboard-spawned bots would ignore `run/auth/hcl-sso.json`
+    // even though the file existed.
+    const ssoStateFile =
+      values.authBackend === "jwt" && ssoStatusQuery.data?.exists
+        ? ssoStatusQuery.data.filePath
+        : undefined;
+
     const req: LaunchRequest = {
       meetingURL: values.meetingURL.trim(),
       participant: values.participant.trim(),
@@ -140,6 +163,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
         values.authBackend === "storage-state"
           ? values.storageStateFile.trim() || undefined
           : undefined,
+      ssoStateFile,
       runLocation: values.runLocation as LaunchRequest["runLocation"],
     };
     launchMutation.mutate(req);
@@ -289,6 +313,13 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               ))}
             </RadioGroup.Root>
           </Field>
+
+          {values.authBackend === "jwt" && (
+            <SsoStateLine
+              data={ssoStatusQuery.data}
+              onConfigure={() => setSsoPanelOpen(true)}
+            />
+          )}
 
           {values.authBackend === "storage-state" && (
             <Field
@@ -541,7 +572,76 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           </button>
         </div>
       </form>
+      <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} />
     </Tooltip.Provider>
+  );
+}
+
+interface SsoStateLineProps {
+  data?: SsoStatusResponse;
+  onConfigure: () => void;
+}
+
+/**
+ * Compact status line shown inside the Launch form's Identity section
+ * when auth=JWT. Surfaces whether the captured `hcl-sso.json` exists
+ * (and its age) so the operator knows what the bot will pick up. The
+ * "Configure SSO" link opens the same SsoPanel dialog the header chip
+ * uses — one source of truth for the recapture flow.
+ */
+function SsoStateLine({ data, onConfigure }: SsoStateLineProps) {
+  if (data === undefined) {
+    return (
+      <p
+        className="text-xs text-neutral-500 dark:text-slate-400"
+        data-testid="launch-sso-line"
+      >
+        Checking SSO state…
+      </p>
+    );
+  }
+  if (!data.exists) {
+    return (
+      <p
+        className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300"
+        data-testid="launch-sso-line"
+      >
+        <span aria-hidden="true">⚠️</span>
+        No SSO state captured — bots will hit the HCL SSO portal.{" "}
+        <button
+          type="button"
+          onClick={onConfigure}
+          className="underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-200"
+          data-testid="launch-sso-capture-now"
+        >
+          Capture now
+        </button>
+      </p>
+    );
+  }
+  const age = data.ageHours !== null ? `${data.ageHours.toFixed(1)}h` : "?";
+  return (
+    <p
+      className="flex flex-wrap items-center gap-x-2 text-xs text-neutral-600 dark:text-slate-300"
+      data-testid="launch-sso-line"
+    >
+      Uses SSO state:{" "}
+      <code
+        className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[11px] text-neutral-700 dark:bg-slate-900 dark:text-slate-200"
+        data-testid="launch-sso-path"
+      >
+        {data.filePath}
+      </code>
+      <span className="text-neutral-500 dark:text-slate-400">(captured {age} ago)</span>
+      <button
+        type="button"
+        onClick={onConfigure}
+        className="underline underline-offset-2 hover:text-neutral-900 dark:hover:text-slate-100"
+        data-testid="launch-sso-configure"
+      >
+        Configure SSO
+      </button>
+    </p>
   );
 }
 

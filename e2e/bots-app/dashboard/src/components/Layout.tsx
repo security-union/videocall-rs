@@ -1,9 +1,11 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Bot, CircleDot, HelpCircle, Info } from "lucide-react";
 
 import { api } from "../api/client";
 import type { Route } from "../App";
+import { SsoChip } from "./SsoChip";
+import { SsoPanel } from "./SsoPanel";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface LayoutProps {
@@ -23,6 +25,7 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
     queryFn: api.health,
     refetchInterval: 5_000,
   });
+  const [ssoPanelOpen, setSsoPanelOpen] = useState(false);
 
   const healthy = healthQuery.data?.ok === true;
   const daemon = daemonQuery.data;
@@ -39,38 +42,42 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
             </h1>
             <ThemeToggle />
           </div>
-          <div
-            className="flex items-center gap-2 text-sm"
-            data-testid="daemon-status"
-            data-healthy={healthy}
-          >
-            <CircleDot
-              className={`h-3 w-3 ${
-                healthy
-                  ? "text-emerald-500 dark:text-emerald-400"
-                  : "text-red-500 dark:text-red-400"
-              }`}
-              aria-hidden="true"
-            />
-            <span className="text-neutral-600 dark:text-slate-300">
-              {daemon ? (
-                <>
-                  {daemon.mode === "self-hosted" ? (
-                    <>Self-hosted daemon</>
-                  ) : (
-                    <>ctl :{daemon.port}</>
-                  )}{" "}
-                  <span className="font-mono text-xs text-neutral-400 dark:text-slate-500">
-                    pid {daemon.pid}
-                  </span>
-                </>
-              ) : (
-                "discovering ctl daemon…"
-              )}
-            </span>
+          <div className="flex items-center gap-3 text-sm">
+            <SsoChip onOpen={() => setSsoPanelOpen(true)} />
+            <div
+              className="flex items-center gap-2"
+              data-testid="daemon-status"
+              data-healthy={healthy}
+            >
+              <CircleDot
+                className={`h-3 w-3 ${
+                  healthy
+                    ? "text-emerald-500 dark:text-emerald-400"
+                    : "text-red-500 dark:text-red-400"
+                }`}
+                aria-hidden="true"
+              />
+              <span className="text-neutral-600 dark:text-slate-300">
+                {daemon ? (
+                  <>
+                    {daemon.mode === "self-hosted" ? (
+                      <>Self-hosted daemon</>
+                    ) : (
+                      <>ctl :{daemon.port}</>
+                    )}{" "}
+                    <span className="font-mono text-xs text-neutral-400 dark:text-slate-500">
+                      pid {daemon.pid}
+                    </span>
+                  </>
+                ) : (
+                  "discovering ctl daemon…"
+                )}
+              </span>
+            </div>
           </div>
         </div>
       </header>
+      <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} />
 
       <div className="mx-auto flex w-full max-w-7xl flex-1 gap-6 px-6 py-6">
         <nav aria-label="Primary" className="w-44 shrink-0">

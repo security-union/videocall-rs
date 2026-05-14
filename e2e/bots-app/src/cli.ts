@@ -11,6 +11,7 @@ import {
   defaultSsoStatePath,
   storageStatePath,
 } from "./auth/storage-state";
+import { captureSsoStateInteractive } from "./auth/sso-capture";
 import { writeFileSync } from "node:fs";
 
 import { registerCtlCommands } from "./control/ctl";
@@ -444,21 +445,22 @@ program
       `bots-app sso-login: the captured file at ${outPath} contains real SSO cookies — do NOT commit or share it.`,
     );
 
-    const browser = await chromium.launch({ headless: false });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true });
-    const page = await context.newPage();
-    await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
-
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    try {
-      await rl.question("Press Enter once SSO auth is complete to capture cookies... ");
-    } finally {
-      rl.close();
-    }
-
-    await context.storageState({ path: outPath });
-    await context.close();
-    await browser.close();
+    // Delegate the actual browser dance to the shared helper. Same code
+    // path the dashboard's `POST /api/sso/recapture` endpoint uses;
+    // here we just wrap it with a terminal prompt instead of a UI
+    // round-trip.
+    await captureSsoStateInteractive({
+      startUrl: opts.startUrl,
+      outPath,
+      waitForOperator: async (): Promise<void> => {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          await rl.question("Press Enter once SSO auth is complete to capture cookies... ");
+        } finally {
+          rl.close();
+        }
+      },
+    });
     console.log(`bots-app sso-login: captured SSO session → ${outPath}`);
     console.log(
       `bots-app sso-login: subsequent \`bots-app run\` invocations against HCL-gated hosts will pick this up automatically.`,

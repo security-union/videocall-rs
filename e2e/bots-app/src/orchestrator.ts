@@ -1,4 +1,7 @@
+import { existsSync } from "node:fs";
+
 import { type BotExitReason, launchBot, type BotRunOptions } from "./bot";
+import { defaultSsoStatePath } from "./auth/storage-state";
 import {
   type BotRegistryEntry,
   generateBotId,
@@ -198,6 +201,22 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       await toggleScreenShare(entry, share);
     },
     launchOne: async (spec: LaunchSpec) => {
+      // Resolve SSO state path with this priority:
+      //   1. explicit `spec.ssoStateFile` (dashboard launch form sets
+      //      this when the captured file exists)
+      //   2. the conventional `<runDir>/auth/hcl-sso.json` if it
+      //      happens to be present — matches the CLI default
+      //   3. null (no SSO state — bot will hit the SSO portal if the
+      //      target sits behind one)
+      let ssoStateFile: string | null = null;
+      if (spec.authBackend === "jwt") {
+        if (spec.ssoStateFile && spec.ssoStateFile !== "") {
+          ssoStateFile = spec.ssoStateFile;
+        } else if (opts.control?.runDir) {
+          const candidate = defaultSsoStatePath(opts.control.runDir);
+          if (existsSync(candidate)) ssoStateFile = candidate;
+        }
+      }
       const newTask: BotTask = {
         botId: generateBotId(),
         meetingURL: spec.meetingURL,
@@ -207,13 +226,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         authBackend: spec.authBackend,
         storageStateFile:
           spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
-        // Use the same SSO-state convention as the CLI: only consulted
-        // when authBackend === "jwt", and the path resolution mirrors
-        // the legacy `--sso-state-file` default. We can't reach the
-        // CLI's `assetsDir` from here without leaking state into the
-        // surface, so we accept SSO files only at the path the CLI's
-        // default scan covers (callers can pre-stage the file).
-        ssoStateFile: null,
+        ssoStateFile,
         manifest: null,
         runDir: null,
         ttl: spec.ttl,

@@ -135,6 +135,21 @@ export async function joinMeetingAndEnableMedia(args: {
 
     throwIfNavigatedAway(navigatedAway, participant);
 
+    // Best-effort: if this bot is the meeting owner (first participant
+    // in a non-existing meeting), the pre-join card renders a
+    // "Waiting Room" toggle that defaults to ON. Leaving it on would
+    // park every subsequent peer in a waiting room the bot has no
+    // admit logic for. Disable it before clicking Join. The toggle is
+    // only present when `is_owner = true` — see
+    // `dioxus-ui/src/components/pre_join_settings_card.rs:102-159` —
+    // so this is a no-op (skipped silently) when joining an existing
+    // meeting.
+    if (await joinButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await disableWaitingRoomIfOwner(page, participant);
+    }
+
+    throwIfNavigatedAway(navigatedAway, participant);
+
     // Either we just filled a display name (which arms the Join button)
     // or we landed straight on a Join button. Click it if present, then
     // race the grid against a re-appearance of the (enabled) Join
@@ -183,6 +198,70 @@ function throwIfNavigatedAway(navigatedAway: boolean, participant: string): void
     );
     throw new MeetingNavigatedAwayError(
       "page navigated away from /meeting/ during join (likely manual hang-up)",
+    );
+  }
+}
+
+/**
+ * Best-effort attempt to flip the pre-join card's "Waiting Room" toggle
+ * to OFF when the bot is the meeting owner.
+ *
+ * Context: the toggle renders only when `is_owner = true` in
+ * `dioxus-ui/src/components/pre_join_settings_card.rs` (lines 102-159).
+ * `is_owner` is true when the bot is the first participant in a
+ * non-existing meeting. Its default value is ON — leaving it that way
+ * would strand any peer (human or bot) that joins afterwards because the
+ * bot has no admit logic. The "Admitted can admit" toggle is automatically
+ * disabled by the UI when Waiting Room is off (see the same file,
+ * lines 139-141), so we don't need to touch it here.
+ *
+ * The toggle is the `ToggleSwitch` component
+ * (`dioxus-ui/src/components/toggle_switch.rs`), which renders as a
+ * `<button role="switch" aria-checked="true|false">`. Clicking it triggers
+ * an async PATCH against the meeting settings API, so we wait ~300ms for
+ * the save to settle.
+ *
+ * This step is best-effort: a missing toggle (the common case where the
+ * bot is joining an existing meeting), a click failure, or a `aria-checked`
+ * read failure must not block the join. We log a warning and move on.
+ */
+async function disableWaitingRoomIfOwner(page: Page, participant: string): Promise<void> {
+  const waitingRoomRow = page.locator(".settings-option-row").filter({ hasText: "Waiting Room" });
+  const waitingRoomToggle = waitingRoomRow.locator('[role="switch"]').first();
+
+  // Short visibility timeout: in the common case the toggle isn't
+  // present (bot is joining an existing meeting), we don't want to
+  // burn 30s waiting on a UI element that won't appear.
+  const toggleVisible = await waitingRoomToggle.isVisible({ timeout: 2_000 }).catch(() => false);
+  if (!toggleVisible) {
+    console.log(
+      `[${participant}] Waiting Room toggle not present — skipping (bot is not meeting owner)`,
+    );
+    return;
+  }
+
+  try {
+    const ariaChecked = await waitingRoomToggle.getAttribute("aria-checked");
+    if (ariaChecked === "false") {
+      // Already off — nothing to do.
+      return;
+    }
+    if (ariaChecked !== "true") {
+      console.warn(
+        `[${participant}] Waiting Room toggle has unexpected aria-checked="${ariaChecked}" — skipping`,
+      );
+      return;
+    }
+    console.log(`[${participant}] disabling Waiting Room (bot is meeting owner)`);
+    await waitingRoomToggle.click({ timeout: 2_000 });
+    // The toggle's onclick triggers an async PATCH against the meeting
+    // settings API (see pre_join_settings_card.rs:127-156). Give it a
+    // moment to settle so the click isn't lost to a re-render.
+    await page.waitForTimeout(300);
+  } catch (e) {
+    console.warn(
+      `[${participant}] could not disable Waiting Room toggle (proceeding with join):`,
+      (e as Error).message,
     );
   }
 }

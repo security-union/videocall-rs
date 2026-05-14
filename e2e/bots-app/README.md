@@ -8,9 +8,14 @@ See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discus
 
 Phase 5 adds a browser-based UX dashboard on top of the phase-4 control API:
 
-- `bots-app dashboard` boots a small Node sidecar (defaults: port 5174) that proxies a React UI to the running orchestrator's ctl API.
-- The dashboard auto-discovers the orchestrator's token file (`run/ctl-*.token`) and injects the bearer token server-side — the browser never sees it.
+- `bots-app dashboard` is now **self-contained**: it spawns the orchestrator + ctl server in the same Node process and serves the React UI on port 5174 by default. No separate `bots-app run --ctl-port auto` terminal needed.
+  - Attach-mode is still supported for headless / scripted setups: pass `--ctl-port` + `--ctl-token` (or `--ctl-token-file`) to point the dashboard at an externally-managed daemon.
+- The dashboard auto-discovers the orchestrator's token file (`run/ctl-*.token`) in attach-mode and injects the bearer token server-side — the browser never sees it.
 - UI covers: launching a bot with all phase-4 options (meeting URL, participant, TTL with suggestion chips, network preset, headless, auth backend, costume / audio), and managing every running bot (extend TTL, leave, force-kill, mute, toggle camera, share screen, duplicate).
+- Auth backend radio offers three options: **JWT (cookie injection)**, **Storage State (replay OAuth)**, and **Guest (no auth)** — the last one is used for meetings that allow guest join.
+- The launch form is grouped into Meeting / Identity / Behavior / Assets / Runtime sections with per-field help popovers (hover, click, or focus to open).
+- A **Run Profiles** section lets the operator save the current set of bot configurations under a name and re-launch the whole group with one click. Profiles persist to `<runDir>/profiles/<name>.json` and survive restarts.
+- An in-app **Help** page documents auth backends, network profiles, run profiles, troubleshooting, and the dashboard architecture.
 - Run-location pick list exposes "Local machine" today; "Cloud VM", "SSH-able host", "Docker container" are placeholders pending future work.
 
 Implementation lives under `e2e/bots-app/dashboard/` with its own `package.json`, build, and test surface — no dependencies leak into the parent `e2e/` workspace. See `dashboard/README.md` for the security model and dev workflow.
@@ -292,7 +297,7 @@ bots-app run
   --ttl <duration>             Bot lifespan — "<int>s|m|h" or "infinite" (default: 5m)
   --manifest <path>            Path to bot/conversation/manifest.yaml; pass "" to skip fake-device wiring
   --assets-dir <dir>           Directory of audio/<name>.wav + costumes/<name>.y4m (default: e2e/bots-app/run)
-  --auth <backend>             Override auth backend: "jwt" or "storage-state" (default: auto by hostname)
+  --auth <backend>             Override auth backend: "jwt", "storage-state", or "none" (guest join). Default: auto by hostname.
   --storage-state-file <path>  Explicit storage-state JSON path (default: <assets-dir>/auth/<participant>.json)
   --sso-state-file <path>      HCL SSO state path (default: <assets-dir>/auth/hcl-sso.json; loaded only if present)
   --ctl-port <port|auto>       Phase 4: bind a local HTTP control API. "auto" lets the kernel pick a free port. Token file written to run/ctl-<pid>.token (mode 0600).

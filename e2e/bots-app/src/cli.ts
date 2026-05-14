@@ -80,7 +80,7 @@ program
   )
   .option(
     "--auth <backend>",
-    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews) or "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs). When omitted, picks automatically by hostname.',
+    'Auth backend override: "jwt" (cookie injection; for local + HCL + previews), "storage-state" (replay a captured Google OAuth session from `bots-app login`; for app.videocall.rs), or "none" (skip auth entirely; for meetings that allow guest joining). When omitted, picks automatically by hostname.',
   )
   .option(
     "--storage-state-file <path>",
@@ -123,9 +123,10 @@ program
     // Load the config file first (if any) — it can supply meeting_url
     // + per-bot list + a default ttl that --ttl can override.
     let configMeetingUrl: string | null = null;
-    let configBots: { participant: string; ttl?: string; network?: string }[] = [];
+    let configBots: { participant: string; ttl?: string; network?: string; auth?: string }[] = [];
     let configTtl: string | null = null;
     let configNetwork: string | null = null;
+    let configAuth: string | null = null;
     if (opts.config) {
       try {
         const cfg = loadMeetingConfig(opts.config);
@@ -133,6 +134,7 @@ program
         configBots = cfg.bots;
         configTtl = cfg.ttl ?? null;
         configNetwork = cfg.network ?? null;
+        configAuth = cfg.auth ?? null;
         console.log(
           `bots-app: loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
             (cfg.meta?.seed !== undefined ? `, seed=${cfg.meta.seed}` : "") +
@@ -212,14 +214,22 @@ program
 
     let authOverride: AuthBackend | undefined;
     if (opts.auth) {
-      if (opts.auth !== "jwt" && opts.auth !== "storage-state") {
-        console.error(`bots-app: --auth must be "jwt" or "storage-state", got "${opts.auth}"`);
+      if (opts.auth !== "jwt" && opts.auth !== "storage-state" && opts.auth !== "none") {
+        console.error(
+          `bots-app: --auth must be "jwt", "storage-state", or "none", got "${opts.auth}"`,
+        );
         process.exit(2);
       }
       authOverride = opts.auth;
     }
+    // Config-file auth is consulted only when there's no explicit
+    // --auth CLI override. The meeting-config loader already validated
+    // any `auth:` against `AUTH_BACKEND_NAMES`, so the assertion below
+    // narrows safely.
+    const effectiveAuthOverride: AuthBackend | undefined =
+      authOverride ?? (configAuth ? (configAuth as AuthBackend) : undefined);
     const hostname = new URL(meetingUrl).hostname;
-    const authBackend = chooseAuthBackend(hostname, authOverride);
+    const authBackend = chooseAuthBackend(hostname, effectiveAuthOverride);
     const ssoStateFile =
       authBackend === "jwt" ? (opts.ssoStateFile ?? defaultSsoStatePath(opts.assetsDir)) : null;
 
@@ -228,13 +238,22 @@ program
         opts.displayName && participants.length === 1
           ? opts.displayName
           : defaultDisplayName(participant);
+      // Per-bot auth override from --config trumps the meeting-level
+      // resolution. The loader validated the value against
+      // `AUTH_BACKEND_NAMES`, so the cast is safe.
+      const configEntry = configBots.find((b) => b.participant === participant);
+      const perBotAuth = configEntry?.auth ? (configEntry.auth as AuthBackend) : undefined;
+      const effectiveAuthBackend: AuthBackend = perBotAuth ?? authBackend;
       const storageStateFile =
-        authBackend === "storage-state"
+        effectiveAuthBackend === "storage-state"
           ? (opts.storageStateFile ?? storageStatePath(opts.assetsDir, participant))
           : null;
+      // SSO-state is only consulted for JWT auth. Bots downgraded to
+      // `"none"` get a null here so the launcher never tries to load
+      // the file.
+      const effectiveSsoStateFile = effectiveAuthBackend === "jwt" ? ssoStateFile : null;
       // Per-bot ttl override from --config wins over the shared TTL.
       let botTtl: Ttl = ttl;
-      const configEntry = configBots.find((b) => b.participant === participant);
       const perBotTtl = configEntry?.ttl;
       if (perBotTtl) {
         try {
@@ -256,9 +275,9 @@ program
         participant,
         displayName,
         headless: opts.headless,
-        authBackend,
+        authBackend: effectiveAuthBackend,
         storageStateFile,
-        ssoStateFile,
+        ssoStateFile: effectiveSsoStateFile,
         manifest,
         runDir: opts.assetsDir,
         ttl: botTtl,
@@ -296,6 +315,7 @@ program
           port: ctlPort,
           token,
           tokenFilePath,
+          runDir: opts.assetsDir,
           onListen: async ({ port, token: t }) => {
             await writeTokenFile(tokenFilePath, {
               port,
@@ -642,27 +662,32 @@ function repoRoot(): string {
 registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 
 // Phase 5: the dashboard subcommand. Spins up a small Node HTTP
-// sidecar that proxies the browser-facing UI to a running phase-4
+// sidecar that proxies the browser-facing UI to a phase-4
 // orchestrator's ctl API, attaching the bearer token server-side so
-// the token never reaches the browser. See `dashboard.ts` for the
-// proxy implementation + security model.
+// the token never reaches the browser. By default the orchestrator
+// + ctl server are spawned IN-PROCESS alongside the dashboard, so a
+// single `bots-app dashboard` invocation is self-contained — no
+// separate `bots-app run` terminal needed.
+//
+// For headless / scripted / "attach to an already-running daemon"
+// flows, pass `--ctl-port` + `--ctl-token` (or `--ctl-token-file`)
+// and the dashboard skips the in-process spawn.
 program
   .command("dashboard")
   .description(
     "Phase 5: serve a browser-based UX dashboard for launching and managing bots. " +
-      "Requires a running `bots-app run --ctl-port auto` orchestrator (the dashboard " +
-      "auto-discovers its token file under run/ctl-*.token).",
+      "By default the dashboard is self-contained: the orchestrator + ctl server " +
+      "are spawned in-process and accept launch requests over the dashboard's " +
+      "form. Pass --ctl-port/--ctl-token (or --ctl-token-file) to attach to an " +
+      "externally-managed `bots-app run --ctl-port auto` daemon instead.",
   )
   .option("--port <port>", "Port to bind the dashboard HTTP server to (default 5174)", "5174")
   .option(
     "--ctl-token-file <path>",
-    "Explicit path to a ctl-<pid>.token file. Overrides token-file auto-discovery.",
+    "Attach to an existing daemon via its ctl-<pid>.token file. When unset (and no --ctl-port/--ctl-token), the dashboard spawns the orchestrator in-process.",
   )
-  .option("--ctl-port <port>", "Override the port from the token file (use with --ctl-token).")
-  .option(
-    "--ctl-token <token>",
-    "Override the bearer token from the token file (use with --ctl-port).",
-  )
+  .option("--ctl-port <port>", "Attach to an existing daemon on this port (use with --ctl-token).")
+  .option("--ctl-token <token>", "Bearer token for the attached daemon (use with --ctl-port).")
   .option(
     "--run-dir <dir>",
     "Override the directory scanned for ctl-*.token files (and the asset directories).",
@@ -693,21 +718,69 @@ program
         process.exit(2);
       }
     }
-    let ctl;
-    try {
-      ctl = await resolveCtlConfig({
-        port: ctlPortNum,
-        token: opts.ctlToken,
-        tokenFile: opts.ctlTokenFile,
-        runDir: opts.runDir,
+
+    // Decide between attach-mode and self-hosted mode. Attach-mode is
+    // selected when any of the three "attach" flags is set; otherwise
+    // we self-host the orchestrator in-process.
+    const attachRequested =
+      opts.ctlPort !== undefined || opts.ctlToken !== undefined || opts.ctlTokenFile !== undefined;
+
+    let ctl: { port: number; token: string };
+    let daemonMode: "self-hosted" | "attached";
+    let orchestratorTask: Promise<void> | null = null;
+
+    if (attachRequested) {
+      try {
+        const resolved = await resolveCtlConfig({
+          port: ctlPortNum,
+          token: opts.ctlToken,
+          tokenFile: opts.ctlTokenFile,
+          runDir: opts.runDir,
+        });
+        ctl = { port: resolved.port, token: resolved.token };
+        daemonMode = "attached";
+        console.log(
+          `bots-app dashboard: attached to ctl daemon at 127.0.0.1:${resolved.port} (pid ${resolved.pid || "?"}, started ${resolved.startedAt})`,
+        );
+      } catch (e) {
+        console.error(`bots-app dashboard: ${(e as Error).message}`);
+        process.exit(2);
+        return;
+      }
+    } else {
+      // Self-hosted mode: spawn the orchestrator + ctl server in this
+      // same Node process. Zero initial bots; the dashboard's launch
+      // form adds them on demand. The orchestrator's own
+      // SIGINT/SIGTERM handlers run the clean-leave path on every bot
+      // before resolving — our cleanup hook below awaits that.
+      const token = generateToken();
+      const tokenFilePath = defaultTokenFilePath(opts.runDir);
+      const ctlReady = new Promise<{ port: number; token: string }>((resolveReady) => {
+        orchestratorTask = runBotsToCompletion({
+          tasks: [],
+          control: {
+            port: 0,
+            token,
+            tokenFilePath,
+            runDir: opts.runDir,
+            onListen: async ({ port: resolvedPort, token: t }) => {
+              await writeTokenFile(tokenFilePath, {
+                port: resolvedPort,
+                token: t,
+                startedAt: new Date().toISOString(),
+                pid: process.pid,
+              });
+              console.log(
+                `bots-app dashboard: self-hosted ctl daemon listening on 127.0.0.1:${resolvedPort} (token at ${tokenFilePath}, mode 0600)`,
+              );
+              resolveReady({ port: resolvedPort, token: t });
+            },
+          },
+        });
       });
-    } catch (e) {
-      console.error(`bots-app dashboard: ${(e as Error).message}`);
-      process.exit(2);
+      ctl = await ctlReady;
+      daemonMode = "self-hosted";
     }
-    console.log(
-      `bots-app dashboard: using ctl daemon at 127.0.0.1:${ctl.port} (pid ${ctl.pid || "?"}, started ${ctl.startedAt})`,
-    );
 
     const dashboardDir = join(repoRoot(), "e2e/bots-app/dashboard");
     const distDir = opts.distDir;
@@ -722,9 +795,10 @@ program
 
     const handle = await startDashboardServer({
       port,
-      ctl: { port: ctl.port, token: ctl.token },
+      ctl,
       distDir: builtMode ? distDir : undefined,
       assetsDir: opts.runDir,
+      daemonMode,
       onListen: ({ port: actual }) => {
         const url = `http://127.0.0.1:${actual}/`;
         if (builtMode) {
@@ -746,10 +820,20 @@ program
       // so Vite's proxy targets a port that already accepts connections.
       spawnViteDev({ dashboardDir, backendPort: handle.port });
     }
-    // Keep the process alive until SIGINT.
+    // Coordinated shutdown: SIGINT/SIGTERM tear down the dashboard
+    // sidecar; the orchestrator's own SIGINT/SIGTERM handlers (in
+    // self-hosted mode) take care of its bots. We just await its
+    // resolution so the process doesn't exit before the browsers
+    // have actually quit.
+    let cleaning = false;
     const cleanup = async (): Promise<void> => {
+      if (cleaning) return;
+      cleaning = true;
       console.log("bots-app dashboard: shutting down");
       await handle.close().catch(() => {});
+      if (orchestratorTask) {
+        await orchestratorTask.catch(() => {});
+      }
       process.exit(0);
     };
     process.on("SIGINT", () => void cleanup());

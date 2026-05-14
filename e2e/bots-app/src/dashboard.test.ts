@@ -119,8 +119,34 @@ describe("dashboard HTTP server", () => {
   it("synthesizes /api/daemon locally without hitting the ctl API", async () => {
     const res = await fetch(`http://127.0.0.1:${dashboard!.port}/api/daemon`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { port: number };
+    const body = (await res.json()) as { port: number; mode: string };
     expect(body.port).toBe(ctlHandle!.port);
+    // Default is "attached" unless the CLI / caller explicitly opts in.
+    expect(body.mode).toBe("attached");
+  });
+
+  it("reports daemonMode=self-hosted when the option is set", async () => {
+    const localToken = generateToken();
+    const localDir = mkdtempSync(join(tmpdir(), "bots-dashboard-mode-"));
+    const localCtl = await startControlServer({
+      port: 0,
+      token: localToken,
+      surface: emptySurface(),
+    });
+    const localDash = await startDashboardServer({
+      port: 0,
+      ctl: { port: localCtl.port, token: localToken },
+      assetsDir: localDir,
+      daemonMode: "self-hosted",
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${localDash.port}/api/daemon`);
+      const body = (await res.json()) as { mode: string };
+      expect(body.mode).toBe("self-hosted");
+    } finally {
+      await localDash.close();
+      await localCtl.close();
+    }
   });
 
   it("serves /api/assets/audio from the asset directory", async () => {

@@ -1,3 +1,7 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BotTask } from "../orchestrator";
@@ -357,10 +361,215 @@ describe("control server", () => {
     expect(launch!).toContain(`"network":"none"`);
   });
 
+  it('POST /launch accepts authBackend: "none" (guest)', async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "none",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    expect(launch!).toContain(`"authBackend":"none"`);
+  });
+
+  it("POST /launch rejects an unknown authBackend value", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "cookies",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("returns 404 for unknown routes", async () => {
     const res = await fetchJson(handle.port, "/nope", {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(404);
+  });
+});
+
+describe("control server: run profiles", () => {
+  let handle: ControlServerHandle;
+  let token: string;
+  let surface: MockSurface;
+  let runDir: string;
+
+  beforeEach(async () => {
+    token = generateToken();
+    surface = mockSurface();
+    runDir = mkdtempSync(join(tmpdir(), "bots-profiles-"));
+    handle = await startControlServer({ port: 0, token, surface, runDir });
+  });
+
+  afterEach(async () => {
+    await handle.close();
+  });
+
+  it("GET /profiles returns an empty list before any profile is saved", async () => {
+    const res = await fetchJson(handle.port, "/profiles", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ profiles: [] });
+  });
+
+  it("POST /profiles with source=current snapshots the live registry", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "alice" }));
+    surface.registry.set(entry.botId, entry);
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "demo-1", source: "current" },
+    });
+    expect(res.status).toBe(201);
+    const profile = res.body as { name: string; bots: { participant: string }[] };
+    expect(profile.name).toBe("demo-1");
+    expect(profile.bots).toHaveLength(1);
+    expect(profile.bots[0].participant).toBe("alice");
+  });
+
+  it("POST /profiles rejects source=current when no bots are running", async () => {
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "demo-empty", source: "current" },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /profiles rejects a name with bad characters", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    surface.registry.set(entry.botId, entry);
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "../escape", source: "current" },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /profiles refuses to overwrite an existing profile (409)", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    surface.registry.set(entry.botId, entry);
+    const ok = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "dup", source: "current" },
+    });
+    expect(ok.status).toBe(201);
+    const dup = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "dup", source: "current" },
+    });
+    expect(dup.status).toBe(409);
+  });
+
+  it("GET /profiles/:name returns the saved profile, DELETE removes it", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "carol" }));
+    surface.registry.set(entry.botId, entry);
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "carol-only", source: "current" },
+    });
+    const got = await fetchJson(handle.port, `/profiles/carol-only`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(got.status).toBe(200);
+    const list = await fetchJson(handle.port, `/profiles`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect((list.body as { profiles: unknown[] }).profiles).toHaveLength(1);
+    const del = await fetchJson(handle.port, `/profiles/carol-only`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(del.status).toBe(200);
+    const after = await fetchJson(handle.port, `/profiles`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect((after.body as { profiles: unknown[] }).profiles).toHaveLength(0);
+  });
+
+  it("POST /profiles/:name/launch fans out launchOne for every bot in the profile", async () => {
+    // Save a profile via explicit bots[] so the test doesn't depend on
+    // the registry path.
+    const saveRes = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        name: "two-bots",
+        source: {
+          bots: [
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "alice",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+            },
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "bob",
+              ttl: "10m",
+              headless: false,
+              network: "none",
+              authBackend: "none",
+            },
+          ],
+        },
+      },
+    });
+    expect(saveRes.status).toBe(201);
+    const launchRes = await fetchJson(handle.port, `/profiles/two-bots/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(launchRes.status).toBe(202);
+    const body = launchRes.body as { name: string; botIds: string[] };
+    expect(body.name).toBe("two-bots");
+    expect(body.botIds).toHaveLength(2);
+    const launches = surface.callLog.filter((l) => l.startsWith("launch:"));
+    expect(launches).toHaveLength(2);
+    expect(launches[0]).toContain(`"participant":"alice"`);
+    expect(launches[1]).toContain(`"participant":"bob"`);
+    expect(launches[1]).toContain(`"authBackend":"none"`);
+  });
+
+  it("GET /profiles/:name returns 404 for unknown profile", async () => {
+    const res = await fetchJson(handle.port, `/profiles/nope`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 503 on /profiles when the server has no runDir", async () => {
+    const otherHandle = await startControlServer({ port: 0, token, surface });
+    try {
+      const res = await fetchJson(otherHandle.port, "/profiles", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.status).toBe(503);
+    } finally {
+      await otherHandle.close();
+    }
   });
 });

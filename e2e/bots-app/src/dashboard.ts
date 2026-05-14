@@ -30,6 +30,15 @@ export interface DashboardOptions {
    */
   ctl: { port: number; token: string };
   /**
+   * Mode hint surfaced on `/api/daemon`. `"self-hosted"` means the
+   * dashboard subcommand spawned the orchestrator + ctl server in
+   * this same process (the default when `bots-app dashboard` is run
+   * without `--ctl-port`); `"attached"` means the dashboard attached
+   * to an externally-managed `bots-app run --ctl-port auto`
+   * orchestrator. Affects only the layout status badge.
+   */
+  daemonMode?: "self-hosted" | "attached";
+  /**
    * Filesystem path to the dashboard `dist/` directory. When present,
    * the dashboard serves the static build. When absent, the caller
    * should arrange for a Vite dev process to serve from `index.html`
@@ -117,6 +126,7 @@ async function handleRequest(
       port: opts.ctl.port,
       pid: process.pid,
       startedAt: new Date().toISOString(),
+      mode: opts.daemonMode ?? "attached",
     });
     return;
   }

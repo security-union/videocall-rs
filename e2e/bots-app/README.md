@@ -4,6 +4,12 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
+## Status — phase 4 (stateful orchestrator + ctl control API)
+
+Phase 4 turns `bots-app run` into a long-running orchestrator with an introspectable / mutable control surface. When started with `--ctl-port <port>` (or `--ctl-port auto`), the run process binds a local HTTP API and writes a token file under `run/ctl-<pid>.token` (mode `0600`); the new `bots-app ctl <subcommand>` family auto-discovers that file and talks to the orchestrator over `127.0.0.1`. See the "Phase 4: control API" section below for endpoint + subcommand details.
+
+Without `--ctl-port` the orchestrator behaves byte-for-byte the same as in phase 3 — the control surface is strictly opt-in.
+
 ## Status — phase 2b (multi-bot + seeded random-N matrix)
 
 Phase 2 adds multi-bot orchestration + a seeded random-N generator on top of the phase-1 single-bot foundation:
@@ -81,6 +87,77 @@ meta:
 ```
 
 By default `gen` only picks from **costumed participants** in the manifest (the 19 named characters with `costume_dir`). Pass `--include-observers` to also pick from observer-NN seats — useful when you specifically want a meeting filled mostly with receive-only bots. Note that observer bots show up as Chrome's default fake pattern with no audio, since `prep-assets` doesn't produce any artifacts for them.
+
+## Phase 4: control API (`--ctl-port` + `bots-app ctl`)
+
+When `bots-app run` is invoked with `--ctl-port <port|auto>`, the orchestrator becomes long-lived and exposes an HTTP control surface so the running fleet can be introspected and mutated without restarting the process.
+
+```bash
+cd e2e
+# Start the orchestrator with the control surface enabled. `auto`
+# lets the kernel pick a free ephemeral port — recommended.
+npm run bot -- run \
+  --meeting-url https://app.videocall.fnxlabs.com/meeting/TonyBots \
+  --users 3 \
+  --ttl 30m \
+  --ctl-port auto
+
+# In another shell:
+npm run bot -- ctl list
+# BOT_ID                                PARTICIPANT  STATUS      TTL_REMAINING  NETWORK  MEETING_URL
+# 7f3b2d1e-1234-...                     alice        in-meeting  1799s          -        https://...
+# c0ffee23-aaaa-...                     bob          in-meeting  1798s          -        https://...
+
+# Add a fourth bot mid-flight by duplicating an existing one:
+npm run bot -- ctl duplicate 7f3b2d1e-1234-... --participant frank --ttl 5m
+
+# Extend a bot's TTL without restarting it:
+npm run bot -- ctl ttl 7f3b2d1e-1234-... --extend 10m
+
+# Swap a bot's netsim profile (forces a reconnect — see caveat below):
+npm run bot -- ctl tune c0ffee23-aaaa-... --network lossy_mobile
+
+# Mute / unmute / camera off / camera on:
+npm run bot -- ctl mute 7f3b2d1e-1234-...        # mutes
+npm run bot -- ctl mute 7f3b2d1e-1234-... --off  # unmutes
+npm run bot -- ctl video 7f3b2d1e-1234-...       # camera off
+npm run bot -- ctl video 7f3b2d1e-1234-... --on  # camera on
+
+# Graceful leave (clicks HangUp in-browser) vs force-kill:
+npm run bot -- ctl leave 7f3b2d1e-1234-...
+npm run bot -- ctl kill c0ffee23-aaaa-...
+```
+
+### Subcommands
+
+| Subcommand                                                                  | Endpoint                   | Notes                                                                             |
+| --------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
+| `ctl list`                                                                  | `GET /bots`                | Table of every live + recently-finished bot.                                      |
+| `ctl status <id>`                                                           | `GET /bots/:id`            | One bot's full detail as JSON (machine-parseable).                                |
+| `ctl leave <id>`                                                            | `POST /bots/:id/leave`     | Clicks HangUp + tears the browser down cleanly.                                   |
+| `ctl kill <id>`                                                             | `DELETE /bots/:id`         | Skips graceful leave; for tests + emergencies.                                    |
+| `ctl ttl <id> --set <dur>` / `--extend <dur>`                               | `POST /bots/:id/ttl`       | Absolute set or additive extend (e.g. `--set 10m`, `--extend 5m`).                |
+| `ctl tune <id> --network <profile>`                                         | `POST /bots/:id/network`   | Validates against `NETSIM_PRESETS` on both sides. Reconnects (see caveat).        |
+| `ctl mute <id> [--off]`                                                     | `POST /bots/:id/mute`      | `mute` mutes; `mute --off` unmutes.                                               |
+| `ctl video <id> [--on]`                                                     | `POST /bots/:id/video`     | `video` turns camera off; `video --on` turns it back on.                          |
+| `ctl duplicate <id> [--participant <name>] [--ttl <dur>] [--network <pro>]` | `POST /bots/:id/duplicate` | Clones the source bot's config, applies overrides, launches the duplicate.        |
+| `ctl <any>` — `--state-file <path>` / `--port <port> --token <tok>`         | (any of the above)         | Override token-file auto-discovery (e.g. for tests against an explicit instance). |
+
+There's also an unauthenticated `GET /healthz` for readiness probes — returns `{ ok: true, bots: <count> }`.
+
+### Security model
+
+- At startup the orchestrator generates a 32-byte CSPRNG bearer token (64 hex chars) and writes `e2e/bots-app/run/ctl-<pid>.token` with mode `0600` (owner read/write only).
+- Every endpoint except `/healthz` requires `Authorization: Bearer <token>`.
+- The control server binds to `127.0.0.1` only — no network exposure.
+- `e2e/bots-app/run/` is already `.gitignore`d, so token files never get committed. The token never leaves disk (it isn't logged or echoed to stdout); it's only written to the file mode-0600 token file.
+- `ctl` auto-discovers the most-recently-started orchestrator's token file under `--run-dir` (default `e2e/bots-app/run`). Override with `--state-file <path>` or `--port <port> --token <token>`.
+
+### Operational caveats
+
+- **Network swap forces a reconnect.** `POST /bots/:id/network` (and `ctl tune`) rewrites the bot's URL with the new `?netsim=<profile>` param and re-navigates. The bot drops the meeting, re-runs `joinMeetingAndEnableMedia`, and rejoins the grid. This is intentional — the netsim shim is installed at client startup, so there's no way to swap profiles in place without a fresh page load. If you need to compare the same participant on two different profiles concurrently, use `ctl duplicate <id> --network <new_profile>` and leave the original running.
+- **Done entries linger for ~60s.** A bot that completes its TTL or is leaved via `ctl leave` stays in `ctl list` (with `status=done` and a `finishReason`) for ~60 seconds before being swept. This lets a follow-up `ctl list` see the recent finish.
+- **Dynamic add only via `ctl duplicate`.** There's no `ctl spawn <from-scratch>` today; new bots have to be cloned from an existing in-flight bot. That covers the canonical "fill a meeting around a human peer, then add one more" case; an arbitrary-participant spawn endpoint can be layered in later without a schema change.
 
 ## Network simulation (`--network <profile>`)
 
@@ -207,6 +284,19 @@ bots-app run
   --auth <backend>             Override auth backend: "jwt" or "storage-state" (default: auto by hostname)
   --storage-state-file <path>  Explicit storage-state JSON path (default: <assets-dir>/auth/<participant>.json)
   --sso-state-file <path>      HCL SSO state path (default: <assets-dir>/auth/hcl-sso.json; loaded only if present)
+  --ctl-port <port|auto>       Phase 4: bind a local HTTP control API. "auto" lets the kernel pick a free port. Token file written to run/ctl-<pid>.token (mode 0600).
+
+bots-app ctl <subcommand>      Phase 4 control client; auto-discovers the most recent run/ctl-*.token (override with --state-file / --port + --token).
+  list                         Tabular list of every bot in the registry
+  status <id>                  Full bot detail as JSON
+  leave <id>                   Graceful leave (HangUp + shutdown)
+  kill <id>                    Force-kill (no graceful leave) — for tests
+  ttl <id> --set <dur> | --extend <dur>   Set / extend a bot's TTL
+  tune <id> --network <profile>           Swap netsim profile (forces a reconnect)
+  mute <id> [--off]            Mute (default) or unmute (--off) the bot
+  video <id> [--on]            Camera off (default) or on (--on)
+  duplicate <id> [--participant <name>] [--ttl <dur>] [--network <profile>]
+                               Clone this bot's config and launch the clone with optional overrides
 
 bots-app login <account>
   --start-url <url>            Where to navigate headed Chrome (default: https://app.videocall.rs/)
@@ -237,17 +327,17 @@ npm run test:unit             # vitest unit tests for bots-app/
 
 ## Roadmap
 
-| Phase        | Status                            | What it adds                                                              |
-| ------------ | --------------------------------- | ------------------------------------------------------------------------- |
-| 1a           | :white_check_mark: done           | Scaffold + minimal CLI                                                    |
-| 1b           | :white_check_mark: done           | `--ttl <duration>` flag + clean leave-meeting on TTL/SIGTERM              |
-| 1c           | :white_check_mark: done           | Asset prep (costume MP4 → y4m, audio stitching from `bot/conversation/`)  |
-| 1d           | :white_check_mark: done           | Fake camera + mic wired into Chrome launch                                |
-| 1e (this PR) | :construction_worker: in progress | Storage-state auth backend for `app.videocall.rs` + `bots-app login`      |
-| 2            | pending                           | `--users N` multi-bot + `bots-app gen` random matrix                      |
-| 3            | pending                           | Network simulation via WASM-injected `netsim.rs`                          |
-| 4            | pending                           | Stateful orchestrator (`bots-app orchestrator` daemon + `ctl` subcommand) |
-| 5            | pending                           | UX dashboard                                                              |
+| Phase        | Status                            | What it adds                                                             |
+| ------------ | --------------------------------- | ------------------------------------------------------------------------ |
+| 1a           | :white_check_mark: done           | Scaffold + minimal CLI                                                   |
+| 1b           | :white_check_mark: done           | `--ttl <duration>` flag + clean leave-meeting on TTL/SIGTERM             |
+| 1c           | :white_check_mark: done           | Asset prep (costume MP4 → y4m, audio stitching from `bot/conversation/`) |
+| 1d           | :white_check_mark: done           | Fake camera + mic wired into Chrome launch                               |
+| 1e (this PR) | :construction_worker: in progress | Storage-state auth backend for `app.videocall.rs` + `bots-app login`     |
+| 2            | :white_check_mark: done           | `--users N` multi-bot + `bots-app gen` random matrix                     |
+| 3            | :white_check_mark: done           | Network simulation via WASM-injected `netsim.rs`                         |
+| 4 (this PR)  | :white_check_mark: done           | Stateful orchestrator (`--ctl-port` + `bots-app ctl` subcommand family)  |
+| 5            | pending                           | UX dashboard                                                             |
 
 ## Architecture (current)
 
@@ -268,15 +358,25 @@ e2e/
       assets.test.ts        ← vitest unit tests for the assets resolver
       meeting-join.ts       ← post-goto: fills display-name form, clicks Join Meeting, enables mic + camera
       meeting-join.test.ts  ← vitest placeholder (smoke test only — real coverage is the manual run)
-      orchestrator.ts       ← runBotsToCompletion — spawns N in-process bots, races TTL vs shutdown signal
+      orchestrator.ts       ← runBotsToCompletion — Phase 4: Map<botId, Promise> wait loop + registry + control server wiring
       meeting-config.ts     ← parse / emit meeting-config YAML + seeded random-N generator
       meeting-config.test.ts ← vitest unit tests (22) for parse/emit, seeded RNG, shuffle, generate
       auth/
         jwt-cookie.ts       ← thin wrapper over helpers/auth.ts injectSessionCookie
         storage-state.ts    ← backend picker + captured-session path resolver (incl. HCL SSO state)
         storage-state.test.ts ← vitest unit tests
+      control/              ← Phase 4: HTTP control surface + ctl client
+        registry.ts         ← BotRegistryEntry + snapshot + retention sweeper
+        registry.test.ts    ← vitest unit tests
+        auth.ts             ← token generation + token-file IO + bearer header parsing
+        auth.test.ts        ← vitest unit tests (mode 0600, round-trip, token-file discovery)
+        server.ts           ← Node http.createServer routes (`/healthz`, `/bots`, `/bots/:id/*`)
+        server.test.ts      ← in-process integration tests with mock OrchestratorControlSurface
+        client.ts           ← thin node:http JSON client used by ctl subcommands
+        client.test.ts      ← vitest unit tests
+        ctl.ts              ← registerCtlCommands(program, runDir) — wires `bots-app ctl <subcmd>` family
     scripts/
       setup-assets.sh       ← thin wrapper over `npm run bot -- prep-assets`
-    run/                    ← gitignored; per-participant stitched WAVs + costume y4m caches
+    run/                    ← gitignored; per-participant stitched WAVs + costume y4m caches + Phase 4 ctl-<pid>.token files
     README.md               ← this file
 ```

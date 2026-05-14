@@ -19,6 +19,14 @@ const CHROME_ARGS = [
 export interface BotRunOptions {
   meetingURL: string;
   participant: string;
+  /**
+   * Optional short id (typically the first 8 hex chars of the bot's
+   * Phase 4 UUID) embedded in the bot's log prefix so operators can
+   * correlate stdout with `bots-app ctl list` rows. When unset, the
+   * legacy `[participant]` prefix is used — preserving byte-for-byte
+   * compatibility with the pre-Phase 4 single-bot run.
+   */
+  botIdShort?: string | null;
   displayName: string;
   headless: boolean;
   /**
@@ -104,7 +112,18 @@ export interface BotHandle {
   userHangupDetected: Promise<void>;
 }
 
+/**
+ * Build the log-prefix label for the bot. Returns `participant` when
+ * `botIdShort` is unset, `participant@<idshort>` when it is. Reuse
+ * everywhere so the prefix is identical across launch / join /
+ * shutdown.
+ */
+function logLabel(opts: Pick<BotRunOptions, "participant" | "botIdShort">): string {
+  return opts.botIdShort ? `${opts.participant}@${opts.botIdShort}` : opts.participant;
+}
+
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
+  const label = logLabel(opts);
   // `baseURL` is derived from the *original* URL (no query) so the
   // JWT session cookie's scope doesn't drift if a `?netsim=` param is
   // injected below. `target` is the URL we actually navigate to —
@@ -116,9 +135,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   const target = new URL(opts.meetingURL);
   if (opts.network && opts.network !== "") {
     target.searchParams.set("netsim", opts.network);
-    console.log(
-      `[${opts.participant}] netsim: applying profile '${opts.network}' via ?netsim=<profile>`,
-    );
+    console.log(`[${label}] netsim: applying profile '${opts.network}' via ?netsim=<profile>`);
   }
 
   const launchArgs = [...CHROME_ARGS];
@@ -130,18 +147,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     });
     if (assets.audioPath !== null) {
       launchArgs.push(`--use-file-for-fake-audio-capture=${assets.audioPath}`);
-      console.log(`[${opts.participant}] fake mic → ${assets.audioPath}`);
+      console.log(`[${label}] fake mic → ${assets.audioPath}`);
     } else {
       console.warn(
-        `[${opts.participant}] no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
+        `[${label}] no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
       );
     }
     if (assets.videoPath !== null) {
       launchArgs.push(`--use-file-for-fake-video-capture=${assets.videoPath}`);
-      console.log(`[${opts.participant}] fake camera → ${assets.videoPath}`);
+      console.log(`[${label}] fake camera → ${assets.videoPath}`);
     } else {
       console.warn(
-        `[${opts.participant}] no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
+        `[${label}] no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
       );
     }
   }
@@ -176,19 +193,19 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     });
     if (ssoStateLoaded) {
       console.log(
-        `[${opts.participant}] auth: jwt + SSO state from ${opts.ssoStateFile} (injected session cookie for ${email})`,
+        `[${label}] auth: jwt + SSO state from ${opts.ssoStateFile} (injected session cookie for ${email})`,
       );
     } else {
-      console.log(`[${opts.participant}] auth: jwt (injected session cookie for ${email})`);
+      console.log(`[${label}] auth: jwt (injected session cookie for ${email})`);
       if (opts.ssoStateFile && opts.ssoStateFile !== "" && !existsSync(opts.ssoStateFile)) {
         console.warn(
-          `[${opts.participant}] no SSO state at ${opts.ssoStateFile} — if the target sits behind HCL SSO, the page-load will redirect to the SSO portal. Run \`bots-app sso-login\` once to capture it.`,
+          `[${label}] no SSO state at ${opts.ssoStateFile} — if the target sits behind HCL SSO, the page-load will redirect to the SSO portal. Run \`bots-app sso-login\` once to capture it.`,
         );
       }
     }
   } else {
     console.log(
-      `[${opts.participant}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
+      `[${label}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
     );
   }
 
@@ -206,7 +223,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(`[${opts.participant}] pageerror:`, err.message);
+    console.error(`[${label}] pageerror:`, err.message);
   });
   page.on("console", (msg) => {
     if (msg.type() !== "error") return;
@@ -214,11 +231,11 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       suppressedNoise++;
       return;
     }
-    console.error(`[${opts.participant}] console.error:`, msg.text());
+    console.error(`[${label}] console.error:`, msg.text());
   });
 
   const navigateUrl = target.toString();
-  console.log(`[${opts.participant}] navigating to ${navigateUrl}`);
+  console.log(`[${label}] navigating to ${navigateUrl}`);
   await page.goto(navigateUrl, { waitUntil: "domcontentloaded" });
 
   // `meetingIdFromUrl` operates on the raw `opts.meetingURL` because
@@ -247,15 +264,18 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
     if (!pathname.startsWith(meetingPathPrefix) && !userHangupFired) {
       userHangupFired = true;
-      console.log(`[${opts.participant}] page navigated away from meeting (likely manual hang-up)`);
+      console.log(`[${label}] page navigated away from meeting (likely manual hang-up)`);
       resolveUserHangup();
     }
   });
 
   try {
+    // Pass the composite label (participant or participant@idshort)
+    // through to the join helper so its log lines match the rest of
+    // the bot's prefix.
     await joinMeetingAndEnableMedia({
       page,
-      participant: opts.participant,
+      participant: label,
       displayName: opts.displayName,
       meetingId,
     });
@@ -285,7 +305,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // dropping signal).
   if (suppressedNoise > 0) {
     console.log(
-      `[${opts.participant}] suppressing ${suppressedNoise} Dioxus dev-server noise events; this is normal under \`trunk serve\``,
+      `[${label}] suppressing ${suppressedNoise} Dioxus dev-server noise events; this is normal under \`trunk serve\``,
     );
   }
 
@@ -307,7 +327,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
           });
       }
     } catch (e) {
-      console.error(`[${opts.participant}] leaveMeeting failed:`, e);
+      console.error(`[${label}] leaveMeeting failed:`, e);
     }
   };
 
@@ -315,12 +335,12 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     try {
       await context.close();
     } catch (e) {
-      console.error(`[${opts.participant}] context.close failed:`, e);
+      console.error(`[${label}] context.close failed:`, e);
     }
     try {
       await browser.close();
     } catch (e) {
-      console.error(`[${opts.participant}] browser.close failed:`, e);
+      console.error(`[${label}] browser.close failed:`, e);
     }
   };
 

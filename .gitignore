@@ -78,6 +78,10 @@ e2e/playwright-report/**
 node_modules/
 e2e/node_modules
 e2e/node_modules/**
+# bots-app run dir: per-participant stitched WAVs, costume y4m caches,
+# captured auth/SSO storage states, AND the Phase 4 ctl-<pid>.token
+# files (mode 0600; bearer token for the local HTTP control API).
+# Everything under this directory is treated as sensitive / local-only.
 e2e/bots-app/run/
 bot/assets/costumes/
 

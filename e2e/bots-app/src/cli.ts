@@ -13,6 +13,9 @@ import {
 } from "./auth/storage-state";
 import { writeFileSync } from "node:fs";
 
+import { registerCtlCommands } from "./control/ctl";
+import { generateBotId } from "./control/registry";
+import { defaultTokenFilePath, generateToken, writeTokenFile } from "./control/auth";
 import { prepareParticipantCostume } from "./costumes";
 import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
 import {
@@ -90,6 +93,10 @@ program
   .option(
     "--network <profile>",
     `Netsim profile applied to the bot's outbound media (one of: ${NETSIM_PRESETS.join(", ")}). Appends ?netsim=<profile> to the meeting URL — only takes effect when the served videocall-client is built with --features netsim. In --config mode this acts as a default that per-bot config entries override. See discussion #793 phase 3.`,
+  )
+  .option(
+    "--ctl-port <port>",
+    'Phase 4: bind a local HTTP control API so `bots-app ctl <cmd>` can introspect and mutate the running fleet. Pass an integer port, "auto" to let the kernel pick a free port, or omit to disable the control surface entirely. The token is written to run/ctl-<pid>.token (mode 0600). See discussion #793 phase 4.',
   )
   .action(async (opts: RunCommandOptions) => {
     // Mutual exclusion / required-arg checks ──────────────────────────
@@ -244,6 +251,7 @@ program
       // before the config was loaded.
       const network = configEntry?.network ?? configNetwork ?? opts.network ?? undefined;
       return {
+        botId: generateBotId(),
         meetingURL: meetingUrl,
         participant,
         displayName,
@@ -258,7 +266,50 @@ program
       };
     });
 
-    await runBotsToCompletion(tasks);
+    // Parse --ctl-port. The flag is opt-in: omitting it preserves the
+    // pre-Phase 4 byte-for-byte behavior. Accepts a literal integer or
+    // "auto" (which becomes port=0 — the kernel picks a free one).
+    let ctlPort: number | null = null;
+    if (opts.ctlPort !== undefined) {
+      if (opts.ctlPort === "auto") {
+        ctlPort = 0;
+      } else {
+        const n = Number.parseInt(opts.ctlPort, 10);
+        if (!Number.isFinite(n) || n < 0 || n > 65535) {
+          console.error(
+            `bots-app: --ctl-port must be a port number (0-65535) or "auto", got "${opts.ctlPort}"`,
+          );
+          process.exit(2);
+        }
+        ctlPort = n;
+      }
+    }
+
+    if (ctlPort === null) {
+      await runBotsToCompletion(tasks);
+    } else {
+      const token = generateToken();
+      const tokenFilePath = defaultTokenFilePath(opts.assetsDir);
+      await runBotsToCompletion({
+        tasks,
+        control: {
+          port: ctlPort,
+          token,
+          tokenFilePath,
+          onListen: async ({ port, token: t }) => {
+            await writeTokenFile(tokenFilePath, {
+              port,
+              token: t,
+              startedAt: new Date().toISOString(),
+              pid: process.pid,
+            });
+            console.log(
+              `bots-app: ctl token written to ${tokenFilePath} (mode 0600) — port ${port}`,
+            );
+          },
+        },
+      });
+    }
     process.exit(0);
   });
 
@@ -277,6 +328,7 @@ interface RunCommandOptions {
   storageStateFile?: string;
   ssoStateFile?: string;
   network?: string;
+  ctlPort?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -583,6 +635,11 @@ function repoRoot(): string {
   const here = new URL(".", import.meta.url).pathname;
   return resolve(here, "..", "..", "..");
 }
+
+// Phase 4: register the `ctl` family. Token discovery defaults to
+// scanning the same `e2e/bots-app/run/` directory the orchestrator
+// writes to.
+registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   console.error("bots-app fatal:", err);

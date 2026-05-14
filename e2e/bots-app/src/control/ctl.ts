@@ -154,6 +154,22 @@ export function registerCtlCommands(program: Command, defaultRunDir: string): vo
       console.log(`video: ${res.botId} → camera ${res.camera ? "OFF" : "ON"}`);
     });
 
+  sharedConnOptions(ctl.command("share"))
+    .description("Toggle a bot's screen share. `share` starts; `share --off` stops.")
+    .argument("<botId>")
+    .option("--off", "Stop sharing instead of starting", false)
+    .action(async (botId: string, opts: ConnOptions & { off: boolean }) => {
+      const cfg = await resolveConfig(opts);
+      const share = !opts.off;
+      const res = await ctlRequest<{ botId: string; share: boolean }>(
+        cfg,
+        "POST",
+        `/bots/${encodeURIComponent(botId)}/share`,
+        { share },
+      );
+      console.log(`share: ${res.botId} → ${res.share ? "ON" : "OFF"}`);
+    });
+
   sharedConnOptions(ctl.command("duplicate"))
     .description(
       "Clone a bot's config and launch the clone. Override participant / ttl / network individually.",

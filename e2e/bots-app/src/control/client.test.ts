@@ -38,7 +38,9 @@ describe("ctlRequest", () => {
         changeNetwork: async () => {},
         setMicMuted: async () => {},
         setCameraOff: async () => {},
+        setScreenShare: async () => {},
         duplicateBot: async () => "new-id",
+        launchOne: async () => "new-id",
       },
     });
   });

@@ -8,6 +8,7 @@ import {
 import {
   startControlServer,
   type ControlServerHandle,
+  type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
 import { MeetingNavigatedAwayError } from "./meeting-join";
@@ -170,6 +171,39 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
       if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
       await toggleCamera(entry, cameraOff);
+    },
+    setScreenShare: async (botId, share) => {
+      const entry = registry.get(botId);
+      if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
+      await toggleScreenShare(entry, share);
+    },
+    launchOne: async (spec: LaunchSpec) => {
+      const newTask: BotTask = {
+        botId: generateBotId(),
+        meetingURL: spec.meetingURL,
+        participant: spec.participant,
+        displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+        headless: spec.headless,
+        authBackend: spec.authBackend,
+        storageStateFile: spec.storageStateFile ?? null,
+        // Use the same SSO-state convention as the CLI: only consulted
+        // when authBackend === "jwt", and the path resolution mirrors
+        // the legacy `--sso-state-file` default. We can't reach the
+        // CLI's `assetsDir` from here without leaking state into the
+        // surface, so we accept SSO files only at the path the CLI's
+        // default scan covers (callers can pre-stage the file).
+        ssoStateFile: null,
+        manifest: null,
+        runDir: null,
+        ttl: spec.ttl,
+        network: spec.network === "none" ? null : spec.network,
+      };
+      registerTask(newTask);
+      console.log(
+        `[orchestrator] dashboard-launch → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+      );
+      return newTask.botId;
     },
     duplicateBot: async (sourceBotId, overrides) => {
       const src = registry.get(sourceBotId);
@@ -489,6 +523,31 @@ async function toggleCamera(entry: BotRegistryEntry, cameraOff: boolean): Promis
     ? ["Stop Video", "Stop Camera", "Stop camera"]
     : ["Start Video", "Start Camera", "Start camera"];
   await clickFirstMatchingTooltip(entry, tooltips, cameraOff ? "camera-off" : "camera-on");
+}
+
+/**
+ * Click the in-meeting screen-share toggle. Same pattern as mic/cam:
+ * hover the action bar so the auto-hide doesn't get in the way, then
+ * click the button matching the tooltip text. The matching tooltips
+ * live in `dioxus-ui/src/components/video_control_buttons.rs` —
+ * `"Share Screen"` (idle) and `"Stop Screen Share"` (active).
+ *
+ * Note: the browser's `getDisplayMedia()` prompt cannot be auto-confirmed
+ * by a Playwright click. The bot relies on `--use-fake-ui-for-media-stream`
+ * (already in `CHROME_ARGS`) to bypass the prompt entirely — Chrome
+ * picks the first available source. This is acceptable for bots; for
+ * the human-operator case the operator wouldn't be using a bot.
+ */
+async function toggleScreenShare(entry: BotRegistryEntry, share: boolean): Promise<void> {
+  if (entry.handle === null) return;
+  const { page } = entry.handle;
+  await page
+    .locator(".video-controls-container")
+    .first()
+    .hover()
+    .catch(() => {});
+  const tooltips = share ? ["Share Screen"] : ["Stop Screen Share"];
+  await clickFirstMatchingTooltip(entry, tooltips, share ? "share-start" : "share-stop");
 }
 
 async function clickFirstMatchingTooltip(

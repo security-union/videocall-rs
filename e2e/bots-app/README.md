@@ -4,6 +4,17 @@ Browser-driven bot CLI for videocall meetings. Runs a real Chrome instance via P
 
 See discussion [#793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793) for the design and implementation plan.
 
+## Status — phase 5 (browser dashboard)
+
+Phase 5 adds a browser-based UX dashboard on top of the phase-4 control API:
+
+- `bots-app dashboard` boots a small Node sidecar (defaults: port 5174) that proxies a React UI to the running orchestrator's ctl API.
+- The dashboard auto-discovers the orchestrator's token file (`run/ctl-*.token`) and injects the bearer token server-side — the browser never sees it.
+- UI covers: launching a bot with all phase-4 options (meeting URL, participant, TTL with suggestion chips, network preset, headless, auth backend, costume / audio), and managing every running bot (extend TTL, leave, force-kill, mute, toggle camera, share screen, duplicate).
+- Run-location pick list exposes "Local machine" today; "Cloud VM", "SSH-able host", "Docker container" are placeholders pending future work.
+
+Implementation lives under `e2e/bots-app/dashboard/` with its own `package.json`, build, and test surface — no dependencies leak into the parent `e2e/` workspace. See `dashboard/README.md` for the security model and dev workflow.
+
 ## Status — phase 4 (stateful orchestrator + ctl control API)
 
 Phase 4 turns `bots-app run` into a long-running orchestrator with an introspectable / mutable control surface. When started with `--ctl-port <port>` (or `--ctl-port auto`), the run process binds a local HTTP API and writes a token file under `run/ctl-<pid>.token` (mode `0600`); the new `bots-app ctl <subcommand>` family auto-discovers that file and talks to the orchestrator over `127.0.0.1`. See the "Phase 4: control API" section below for endpoint + subcommand details.

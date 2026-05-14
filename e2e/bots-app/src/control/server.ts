@@ -37,11 +37,38 @@ export interface OrchestratorControlSurface {
   setMicMuted(botId: string, micMuted: boolean): Promise<void>;
   /** Click in-meeting camera on/off. `cameraOff === true` means off. */
   setCameraOff(botId: string, cameraOff: boolean): Promise<void>;
+  /** Click in-meeting screen-share toggle. `share === true` means share active. */
+  setScreenShare(botId: string, share: boolean): Promise<void>;
   /** Spawn a duplicate; returns the new bot's id. */
   duplicateBot(
     sourceBotId: string,
     overrides: { participant?: string; ttl?: Ttl; network?: string },
   ): Promise<string>;
+  /**
+   * Spawn a fresh bot with the supplied fields. Returns the new bot's
+   * id. Used by `POST /launch` from the phase-5 dashboard.
+   *
+   * `participantOverride` is the same handle the legacy CLI accepts —
+   * implementations are responsible for resolving fake-device assets
+   * and JWT subjects exactly as the `bots-app run` command does.
+   */
+  launchOne(spec: LaunchSpec): Promise<string>;
+}
+
+/**
+ * Spec accepted by `OrchestratorControlSurface.launchOne`. Mirrors the
+ * fields the dashboard's launch form sends. Validated by
+ * `server.handleLaunch` before reaching the orchestrator.
+ */
+export interface LaunchSpec {
+  meetingURL: string;
+  participant: string;
+  displayName?: string;
+  ttl: Ttl;
+  headless: boolean;
+  network: string;
+  authBackend: "jwt" | "storage-state";
+  storageStateFile?: string;
 }
 
 /**
@@ -176,6 +203,10 @@ async function route(
   if (method === "GET" && pathname === "/bots") {
     return listBots(surface);
   }
+  if (method === "POST" && pathname === "/launch") {
+    const body = await readJsonBody(req);
+    return launchOne(surface, body);
+  }
 
   const botPath = /^\/bots\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
   if (botPath) {
@@ -191,6 +222,7 @@ async function route(
       if (method === "POST" && sub === "network") return changeNetwork(surface, botId, body);
       if (method === "POST" && sub === "mute") return mute(surface, botId, body);
       if (method === "POST" && sub === "video") return video(surface, botId, body);
+      if (method === "POST" && sub === "share") return share(surface, botId, body);
       if (method === "POST" && sub === "duplicate") return duplicate(surface, botId, body);
     }
   }
@@ -321,6 +353,115 @@ async function video(
   }
   await surface.setCameraOff(botId, body.camera);
   return { status: 200, body: { botId, camera: body.camera } };
+}
+
+async function share(
+  surface: OrchestratorControlSurface,
+  botId: string,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  requireBot(surface, botId);
+  if (typeof body.share !== "boolean") {
+    throw new ControlServerError(
+      400,
+      '"share" must be a boolean (true=start sharing, false=stop sharing)',
+    );
+  }
+  await surface.setScreenShare(botId, body.share);
+  return { status: 200, body: { botId, share: body.share } };
+}
+
+async function launchOne(
+  surface: OrchestratorControlSurface,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  // Validate each field one at a time so we can return precise error
+  // messages. The dashboard's client-side validation runs the same
+  // checks first, but the server is the source of truth.
+  const meetingURL = body.meetingURL;
+  if (typeof meetingURL !== "string" || meetingURL === "") {
+    throw new ControlServerError(400, '"meetingURL" must be a non-empty string');
+  }
+  let url: URL;
+  try {
+    url = new URL(meetingURL);
+  } catch {
+    throw new ControlServerError(400, `"meetingURL" is not a valid URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new ControlServerError(400, `"meetingURL" must use http or https`);
+  }
+  const participant = body.participant;
+  if (typeof participant !== "string" || participant === "") {
+    throw new ControlServerError(400, '"participant" must be a non-empty string');
+  }
+  if (!/^[A-Za-z0-9._@+-]+$/.test(participant)) {
+    throw new ControlServerError(400, '"participant" contains invalid characters');
+  }
+  const displayName = body.displayName;
+  if (displayName !== undefined && typeof displayName !== "string") {
+    throw new ControlServerError(400, '"displayName" must be a string when provided');
+  }
+  const ttlRaw = body.ttl;
+  if (typeof ttlRaw !== "string") {
+    throw new ControlServerError(400, '"ttl" must be a string');
+  }
+  let ttl: Ttl;
+  try {
+    ttl = parseDuration(ttlRaw);
+  } catch (e) {
+    throw new ControlServerError(400, (e as Error).message);
+  }
+  const headless = body.headless;
+  if (typeof headless !== "boolean") {
+    throw new ControlServerError(400, '"headless" must be a boolean');
+  }
+  const network = body.network;
+  if (typeof network !== "string") {
+    throw new ControlServerError(400, '"network" must be a string');
+  }
+  if (!NETSIM_PRESETS.includes(network)) {
+    throw new ControlServerError(
+      400,
+      `"network" must be one of: ${NETSIM_PRESETS.join(", ")} (got "${network}")`,
+    );
+  }
+  const authBackend = body.authBackend;
+  if (authBackend !== "jwt" && authBackend !== "storage-state") {
+    throw new ControlServerError(400, '"authBackend" must be "jwt" or "storage-state"');
+  }
+  const storageStateFile = body.storageStateFile;
+  if (storageStateFile !== undefined && typeof storageStateFile !== "string") {
+    throw new ControlServerError(400, '"storageStateFile" must be a string when provided');
+  }
+  if (authBackend === "storage-state" && (!storageStateFile || storageStateFile === "")) {
+    throw new ControlServerError(
+      400,
+      '"storageStateFile" is required when authBackend === "storage-state"',
+    );
+  }
+  // `runLocation` is dashboard-only metadata; we accept it but only
+  // honor "local" today. Anything else is rejected so a future
+  // backend implementation can't be silently downgraded.
+  const runLocation = body.runLocation;
+  if (runLocation !== undefined && runLocation !== "local") {
+    throw new ControlServerError(
+      400,
+      'only "local" runLocation is wired today; see discussion #793',
+    );
+  }
+  const spec: LaunchSpec = {
+    meetingURL,
+    participant,
+    displayName: displayName as string | undefined,
+    ttl,
+    headless,
+    network,
+    authBackend,
+    storageStateFile: storageStateFile as string | undefined,
+  };
+  const newId = await surface.launchOne(spec);
+  return { status: 201, body: { botId: newId } };
 }
 
 async function duplicate(

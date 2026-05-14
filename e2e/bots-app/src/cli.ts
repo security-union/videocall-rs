@@ -641,6 +641,163 @@ function repoRoot(): string {
 // writes to.
 registerCtlCommands(program, join(repoRoot(), "e2e/bots-app/run"));
 
+// Phase 5: the dashboard subcommand. Spins up a small Node HTTP
+// sidecar that proxies the browser-facing UI to a running phase-4
+// orchestrator's ctl API, attaching the bearer token server-side so
+// the token never reaches the browser. See `dashboard.ts` for the
+// proxy implementation + security model.
+program
+  .command("dashboard")
+  .description(
+    "Phase 5: serve a browser-based UX dashboard for launching and managing bots. " +
+      "Requires a running `bots-app run --ctl-port auto` orchestrator (the dashboard " +
+      "auto-discovers its token file under run/ctl-*.token).",
+  )
+  .option("--port <port>", "Port to bind the dashboard HTTP server to (default 5174)", "5174")
+  .option(
+    "--ctl-token-file <path>",
+    "Explicit path to a ctl-<pid>.token file. Overrides token-file auto-discovery.",
+  )
+  .option("--ctl-port <port>", "Override the port from the token file (use with --ctl-token).")
+  .option(
+    "--ctl-token <token>",
+    "Override the bearer token from the token file (use with --ctl-port).",
+  )
+  .option(
+    "--run-dir <dir>",
+    "Override the directory scanned for ctl-*.token files (and the asset directories).",
+    join(repoRoot(), "e2e/bots-app/run"),
+  )
+  .option("--no-open", "Skip auto-opening the dashboard URL in the operator's default browser")
+  .option(
+    "--dist-dir <dir>",
+    "Override the location of the dashboard's built `dist/` directory.",
+    join(repoRoot(), "e2e/bots-app/dashboard/dist"),
+  )
+  .action(async (opts: DashboardCommandOptions) => {
+    const { startDashboardServer, resolveCtlConfig, spawnViteDev } = await import("./dashboard");
+    const port = Number.parseInt(opts.port, 10);
+    if (!Number.isFinite(port) || port < 0 || port > 65535) {
+      console.error(
+        `bots-app dashboard: --port must be a port number (0-65535), got "${opts.port}"`,
+      );
+      process.exit(2);
+    }
+    let ctlPortNum: number | undefined;
+    if (opts.ctlPort !== undefined) {
+      ctlPortNum = Number.parseInt(opts.ctlPort, 10);
+      if (!Number.isFinite(ctlPortNum) || ctlPortNum <= 0 || ctlPortNum > 65535) {
+        console.error(
+          `bots-app dashboard: --ctl-port must be a port number (1-65535), got "${opts.ctlPort}"`,
+        );
+        process.exit(2);
+      }
+    }
+    let ctl;
+    try {
+      ctl = await resolveCtlConfig({
+        port: ctlPortNum,
+        token: opts.ctlToken,
+        tokenFile: opts.ctlTokenFile,
+        runDir: opts.runDir,
+      });
+    } catch (e) {
+      console.error(`bots-app dashboard: ${(e as Error).message}`);
+      process.exit(2);
+    }
+    console.log(
+      `bots-app dashboard: using ctl daemon at 127.0.0.1:${ctl.port} (pid ${ctl.pid || "?"}, started ${ctl.startedAt})`,
+    );
+
+    const dashboardDir = join(repoRoot(), "e2e/bots-app/dashboard");
+    const distDir = opts.distDir;
+    const builtMode = existsSync(distDir) && existsSync(join(distDir, "index.html"));
+    if (builtMode) {
+      console.log(`bots-app dashboard: serving built UI from ${distDir}`);
+    } else {
+      console.log(
+        `bots-app dashboard: no built UI at ${distDir} — falling back to Vite dev mode (spawning \`npm run dev\` in ${dashboardDir}). Run \`npm run build\` there to produce a static bundle.`,
+      );
+    }
+
+    const handle = await startDashboardServer({
+      port,
+      ctl: { port: ctl.port, token: ctl.token },
+      distDir: builtMode ? distDir : undefined,
+      assetsDir: opts.runDir,
+      onListen: ({ port: actual }) => {
+        const url = `http://127.0.0.1:${actual}/`;
+        if (builtMode) {
+          console.log(`bots-app dashboard: listening on ${url}`);
+        } else {
+          console.log(`bots-app dashboard: backend on ${url} (Vite dev UI will follow on :5173)`);
+        }
+        if (opts.open !== false) {
+          // In dev mode, prefer to open the Vite URL once it's up.
+          // We don't have a reliable readiness signal short of probing
+          // the Vite port, so we log a tip instead.
+          openInBrowser(builtMode ? url : "http://127.0.0.1:5173/");
+        }
+      },
+    });
+
+    if (!builtMode) {
+      // Spawn Vite in dev mode AFTER the Node sidecar is listening
+      // so Vite's proxy targets a port that already accepts connections.
+      spawnViteDev({ dashboardDir, backendPort: handle.port });
+    }
+    // Keep the process alive until SIGINT.
+    const cleanup = async (): Promise<void> => {
+      console.log("bots-app dashboard: shutting down");
+      await handle.close().catch(() => {});
+      process.exit(0);
+    };
+    process.on("SIGINT", () => void cleanup());
+    process.on("SIGTERM", () => void cleanup());
+  });
+
+interface DashboardCommandOptions {
+  port: string;
+  ctlPort?: string;
+  ctlToken?: string;
+  ctlTokenFile?: string;
+  runDir: string;
+  open?: boolean;
+  distDir: string;
+}
+
+/**
+ * Best-effort open `url` in the operator's default browser. Failure is
+ * non-fatal — the operator can copy the URL out of the listen-line log.
+ */
+function openInBrowser(url: string): void {
+  let cmd: string;
+  let args: string[];
+  if (process.platform === "darwin") {
+    cmd = "open";
+    args = [url];
+  } else if (process.platform === "win32") {
+    cmd = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    cmd = "xdg-open";
+    args = [url];
+  }
+  try {
+    const child = spawnDetached(cmd, args);
+    child.unref();
+  } catch (e) {
+    console.warn(`bots-app dashboard: could not auto-open ${url}: ${(e as Error).message}`);
+  }
+}
+
+function spawnDetached(cmd: string, args: string[]): import("node:child_process").ChildProcess {
+  // Lazy import to avoid a top-level require for a cold path.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { spawn } = require("node:child_process") as typeof import("node:child_process");
+  return spawn(cmd, args, { detached: true, stdio: "ignore" });
+}
+
 program.parseAsync(process.argv).catch((err: unknown) => {
   console.error("bots-app fatal:", err);
   process.exit(1);

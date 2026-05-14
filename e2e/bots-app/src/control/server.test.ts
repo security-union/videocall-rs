@@ -46,9 +46,15 @@ function mockSurface(initial: BotRegistryEntry[] = []): MockSurface {
     changeNetwork: async (id, n) => void callLog.push(`network:${id}:${n}`),
     setMicMuted: async (id, m) => void callLog.push(`mic:${id}:${m}`),
     setCameraOff: async (id, c) => void callLog.push(`cam:${id}:${c}`),
+    setScreenShare: async (id, s) => void callLog.push(`share:${id}:${s}`),
     duplicateBot: async (id, ov) => {
       const newId = generateBotId();
       callLog.push(`dup:${id}->${newId}:${JSON.stringify(ov)}`);
+      return newId;
+    },
+    launchOne: async (spec) => {
+      const newId = generateBotId();
+      callLog.push(`launch:${newId}:${JSON.stringify(spec)}`);
       return newId;
     },
   };
@@ -266,6 +272,89 @@ describe("control server", () => {
     });
     expect(res.status).toBe(202);
     expect(surface.callLog).toContain(`kill:${entry.botId}`);
+  });
+
+  it("POST /bots/:id/share requires the `share` boolean", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    surface.registry.set(entry.botId, entry);
+    const bad = await fetchJson(handle.port, `/bots/${entry.botId}/share`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {},
+    });
+    expect(bad.status).toBe(400);
+    const ok = await fetchJson(handle.port, `/bots/${entry.botId}/share`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { share: true },
+    });
+    expect(ok.status).toBe(200);
+    expect(surface.callLog).toContain(`share:${entry.botId}:true`);
+  });
+
+  it("POST /launch validates required fields", async () => {
+    const bad = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { meetingURL: "https://example.com/meeting/X" },
+    });
+    expect(bad.status).toBe(400);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
+  });
+
+  it("POST /launch rejects an unknown netsim profile", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "bogus",
+        authBackend: "jwt",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /launch rejects non-local runLocation", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        runLocation: "future-vm",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /launch routes to surface.launchOne and returns 201", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+      },
+    });
+    expect(res.status).toBe(201);
+    const body = res.body as { botId: string };
+    expect(body.botId).toMatch(/^[0-9a-f-]+$/);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    expect(launch!).toContain(`"participant":"alice"`);
+    expect(launch!).toContain(`"network":"none"`);
   });
 
   it("returns 404 for unknown routes", async () => {

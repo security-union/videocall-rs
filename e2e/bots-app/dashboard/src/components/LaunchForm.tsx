@@ -15,7 +15,9 @@ import {
   type AuthBackend,
   type RunLocation,
 } from "../lib/constants";
+import { useFieldHistory } from "../lib/fieldHistory";
 import { type FieldErrors, validateLaunchForm } from "../lib/validation";
+import { HistoryInput } from "./ui/HistoryInput";
 import { Select } from "./ui/Select";
 
 export interface LaunchFormInitial {
@@ -52,10 +54,22 @@ const DEFAULT_VALUES: LaunchFormInitial = {
   audio: "default",
 };
 
+const INPUT_CLASS =
+  "w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+
 export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormProps) {
   const [values, setValues] = useState<LaunchFormInitial>(initialValues ?? DEFAULT_VALUES);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitted, setSubmitted] = useState(false);
+
+  // Per-field history controllers. Each gets its own localStorage
+  // namespace via the key passed to `useFieldHistory`. On successful
+  // submit we push each field's value to its history.
+  const meetingUrlHistory = useFieldHistory("meetingURL");
+  const participantHistory = useFieldHistory("participant");
+  const displayNameHistory = useFieldHistory("displayName");
+  const ttlHistory = useFieldHistory("ttl");
+  const storageStateHistory = useFieldHistory("storageStateFile");
 
   useEffect(() => {
     if (initialValues) {
@@ -82,7 +96,17 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
 
   const launchMutation = useMutation({
     mutationFn: (req: LaunchRequest) => api.launch(req),
-    onSuccess: (data) => onLaunched(data.botId),
+    onSuccess: (data, variables) => {
+      // Persist the submitted values into each field's history.
+      // Display name + storage-state are optional; push only when
+      // non-empty so we don't poison the history list with blanks.
+      meetingUrlHistory.push(variables.meetingURL);
+      participantHistory.push(variables.participant);
+      if (values.displayName.trim()) displayNameHistory.push(values.displayName);
+      ttlHistory.push(variables.ttl);
+      if (variables.storageStateFile) storageStateHistory.push(variables.storageStateFile);
+      onLaunched(data.botId);
+    },
     onError: (err) => {
       const msg = err instanceof DashboardApiError ? err.message : (err as Error).message;
       onError(msg);
@@ -124,49 +148,54 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     <Tooltip.Provider>
       <form className="grid grid-cols-1 gap-5 md:grid-cols-2" onSubmit={handleSubmit} noValidate>
         <Field label="Meeting URL" required error={errors.meetingURL}>
-          <input
-            type="text"
+          <HistoryInput
+            fieldKey="meetingURL"
             value={values.meetingURL}
-            onChange={(e) => setField("meetingURL", e.target.value)}
+            onChange={(v) => setField("meetingURL", v)}
             placeholder="https://app.videocall.fnxlabs.com/meeting/TonyBots"
-            className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
-            data-testid="meeting-url"
-            aria-invalid={errors.meetingURL ? "true" : "false"}
+            className={INPUT_CLASS}
+            testId="meeting-url"
+            ariaInvalid={!!errors.meetingURL}
+            ariaLabel="Meeting URL"
+            type="url"
           />
         </Field>
 
         <Field label="Participant" required error={errors.participant}>
-          <input
-            type="text"
+          <HistoryInput
+            fieldKey="participant"
             value={values.participant}
-            onChange={(e) => setField("participant", e.target.value)}
+            onChange={(v) => setField("participant", v)}
             placeholder="alice"
-            className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
-            data-testid="participant"
-            aria-invalid={errors.participant ? "true" : "false"}
+            className={INPUT_CLASS}
+            testId="participant"
+            ariaInvalid={!!errors.participant}
+            ariaLabel="Participant"
           />
         </Field>
 
         <Field label="Display name (optional)">
-          <input
-            type="text"
+          <HistoryInput
+            fieldKey="displayName"
             value={values.displayName}
-            onChange={(e) => setField("displayName", e.target.value)}
+            onChange={(v) => setField("displayName", v)}
             placeholder="Alice"
-            className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
-            data-testid="display-name"
+            className={INPUT_CLASS}
+            testId="display-name"
+            ariaLabel="Display name"
           />
         </Field>
 
         <Field label="TTL" required error={errors.ttl}>
-          <input
-            type="text"
+          <HistoryInput
+            fieldKey="ttl"
             value={values.ttl}
-            onChange={(e) => setField("ttl", e.target.value)}
+            onChange={(v) => setField("ttl", v)}
             placeholder='"5m", "30s", "1h", or "infinite"'
-            className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
-            data-testid="ttl"
-            aria-invalid={errors.ttl ? "true" : "false"}
+            className={INPUT_CLASS}
+            testId="ttl"
+            ariaInvalid={!!errors.ttl}
+            ariaLabel="TTL"
           />
           <div className="mt-2 flex flex-wrap gap-1">
             {TTL_SUGGESTIONS.map((s) => (
@@ -238,13 +267,15 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
 
         {values.authBackend === "storage-state" && (
           <Field label="Storage-state file" error={errors.storageStateFile} required>
-            <input
-              type="text"
+            <HistoryInput
+              fieldKey="storageStateFile"
               value={values.storageStateFile}
-              onChange={(e) => setField("storageStateFile", e.target.value)}
+              onChange={(v) => setField("storageStateFile", v)}
               placeholder="run/auth/alice.json"
-              className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
-              data-testid="storage-state-file"
+              className={INPUT_CLASS}
+              testId="storage-state-file"
+              ariaInvalid={!!errors.storageStateFile}
+              ariaLabel="Storage-state file path"
             />
           </Field>
         )}

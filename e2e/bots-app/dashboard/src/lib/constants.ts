@@ -146,18 +146,48 @@ export const STATUS_BADGE_CLASS: Record<string, string> = {
 };
 
 /**
- * Derive the badge label + key for a bot snapshot. Most statuses just
- * render as themselves; `done` gets a `(waiting)` suffix when the bot
- * exited because it was parked in a Waiting Room (not a failure, but
- * worth surfacing visually so operators can tell apart "leave by
- * design" from "leave because the host never admitted me").
+ * Friendly display labels per status key. Centralised so the table and
+ * any future consumer (timeline, tooltips, etc.) all spell things the
+ * same way. The keys here mirror `BotStatus` from the bots-app server.
+ */
+const STATUS_LABEL: Record<string, string> = {
+  launching: "Launching",
+  joining: "Joining",
+  "in-meeting": "In meeting",
+  leaving: "Leaving",
+  done: "Done",
+  failed: "Failed",
+};
+
+/**
+ * Title-case a hyphenated/space-separated status key as a fallback for
+ * any status the dashboard hasn't been taught about yet. Keeps unknown
+ * values legible without throwing them away.
+ */
+function titleCase(status: string): string {
+  return status
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+/**
+ * Derive the badge label + key for a bot snapshot. Statuses map to
+ * human-friendly labels via `STATUS_LABEL`; `done` gets a `(waiting)`
+ * suffix when the bot exited because it was parked in a Waiting Room
+ * (not a failure, but worth surfacing visually so operators can tell
+ * apart "leave by design" from "leave because the host never admitted
+ * me"). Unknown statuses fall through to a title-cased version of the
+ * raw key so the UI stays informative even for new server states.
  */
 export function badgeForBot(snap: {
   status: string;
   finishReason?: string;
 }): { label: string; badgeKey: string } {
   if (snap.status === "done" && snap.finishReason?.startsWith("waiting-room:")) {
-    return { label: "done (waiting)", badgeKey: "done-waiting" };
+    return { label: "Done (waiting)", badgeKey: "done-waiting" };
   }
-  return { label: snap.status, badgeKey: snap.status };
+  const label = STATUS_LABEL[snap.status] ?? titleCase(snap.status);
+  return { label, badgeKey: snap.status };
 }

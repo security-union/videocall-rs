@@ -21,6 +21,24 @@ function renderLayout(daemonBody: Record<string, unknown> | null) {
           headers: { "content-type": "application/json" },
         });
       }
+      if (url === "/api/sso/vpn-status") {
+        return new Response(
+          JSON.stringify({ status: "up", checkedAt: Date.now(), responseTimeMs: 5 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url === "/api/sso/status") {
+        return new Response(
+          JSON.stringify({
+            filePath: "/runDir/auth/hcl-sso.json",
+            exists: false,
+            capturedAt: null,
+            ageHours: null,
+            size: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify({}), { status: 200 });
     }),
   );

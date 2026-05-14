@@ -1,5 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 
+import { defaultSsoStatePath } from "../auth/storage-state";
+import {
+  DEFAULT_SSO_START_URL,
+  openSsoCaptureBrowser,
+  type SsoCaptureSession,
+} from "../auth/sso-capture";
 import { NETSIM_PRESETS } from "../meeting-config";
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
@@ -79,7 +87,38 @@ export interface LaunchSpec {
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
+  /**
+   * Absolute path to a captured SSO state file (typically
+   * `<runDir>/auth/hcl-sso.json`). Only consulted when
+   * `authBackend === "jwt"`. The dashboard sets this to the
+   * conventional `defaultSsoStatePath(runDir)` when the file is
+   * present so dashboard-launched bots transparently pick up the
+   * captured HCL SSO session, matching the legacy CLI behavior.
+   */
+  ssoStateFile?: string;
 }
+
+/**
+ * Default URL the VPN-status probe targets when `VPN_CHECK_URL` is not
+ * set. We probe the production HCL host because that is the gated
+ * surface bots need to reach — if it is unreachable from the operator's
+ * host, no bot can join, and the dashboard should surface that
+ * up-front rather than waiting for a per-bot launch timeout.
+ *
+ * `app.videocall.fnxlabs.com` redirects to HCL SSO when no session
+ * cookie is present, so a real 401/302 here counts as "VPN up, just no
+ * session"; we deliberately do NOT conflate the 401 case with "down".
+ */
+export const DEFAULT_VPN_CHECK_URL = "https://app.videocall.fnxlabs.com/";
+
+/**
+ * How long the SSO recapture endpoint's headed-Chrome session is
+ * allowed to sit idle before it is force-cancelled and torn down. 15
+ * minutes is generous for an operator who alt-tabs away mid-login but
+ * tight enough that an abandoned session does not leak a Chrome
+ * process for an entire workday.
+ */
+export const SSO_RECAPTURE_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
  * Bind options for the control server. `port: 0` (the default) asks
@@ -94,8 +133,31 @@ export interface ControlServerOptions {
    * Directory that holds persisted run-profile JSON files (one
    * per profile, under `<runDir>/profiles/`). When unset, the
    * `/profiles*` endpoints reply 503. Phase 5.1 feature.
+   *
+   * The SSO endpoints also use this to derive the conventional
+   * `<runDir>/auth/hcl-sso.json` path. When unset, `/sso/status`
+   * and `/sso/recapture` reply 503 — same pattern as `/profiles*`.
    */
   runDir?: string;
+  /**
+   * Injection seam for unit tests: when set, the VPN-status endpoint
+   * calls this instead of the global `fetch`. Production callers
+   * leave it unset and the endpoint uses the platform `fetch`.
+   */
+  vpnFetch?: typeof fetch;
+  /**
+   * Injection seam for unit tests: when set, the SSO recapture
+   * endpoint calls this instead of {@link openSsoCaptureBrowser}. Lets
+   * the suite exercise the spawn/save/cancel lifecycle without
+   * actually launching Playwright Chromium.
+   */
+  ssoCaptureFactory?: (opts: { startUrl: string }) => Promise<SsoCaptureSession>;
+  /**
+   * Idle timeout (ms) applied to every recapture session. Defaults to
+   * {@link SSO_RECAPTURE_IDLE_TIMEOUT_MS}. Overridable for tests using
+   * fake timers.
+   */
+  ssoRecaptureIdleTimeoutMs?: number;
 }
 
 export interface ControlServerHandle {
@@ -105,6 +167,25 @@ export interface ControlServerHandle {
   server: Server;
   /** Gracefully stop accepting new connections and close. */
   close(): Promise<void>;
+  /**
+   * Cancel and tear down every in-flight SSO recapture session. Called
+   * by the orchestrator on SIGINT/SIGTERM so a stranded headed Chrome
+   * process does not survive the parent's shutdown.
+   */
+  closeSsoRecaptureSessions(): Promise<void>;
+}
+
+/**
+ * Per-session entry tracked in the SSO recapture map. The Node HTTP
+ * server keeps these alive between `POST /sso/recapture` and the
+ * subsequent `POST /sso/recapture/:id/complete` (or `DELETE`) call.
+ */
+interface SsoRecaptureEntry {
+  id: string;
+  startUrl: string;
+  startedAt: number;
+  session: SsoCaptureSession;
+  idleTimer: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -132,9 +213,30 @@ interface RouteResult {
  * port is known.
  */
 export function startControlServer(opts: ControlServerOptions): Promise<ControlServerHandle> {
+  // Per-process state for the SSO recapture endpoints. Lives on the
+  // server handle (closed-over here) so each `startControlServer` call
+  // gets its own map — important for the in-process tests.
+  const ssoRecaptureSessions: Map<string, SsoRecaptureEntry> = new Map();
+  const idleTimeout = opts.ssoRecaptureIdleTimeoutMs ?? SSO_RECAPTURE_IDLE_TIMEOUT_MS;
+
+  const closeSsoRecaptureSessions = async (): Promise<void> => {
+    const entries = Array.from(ssoRecaptureSessions.values());
+    ssoRecaptureSessions.clear();
+    for (const entry of entries) {
+      clearTimeout(entry.idleTimer);
+      try {
+        await entry.session.close();
+      } catch (e) {
+        console.warn(
+          `[control] failed to close stranded sso recapture ${entry.id}: ${(e as Error).message}`,
+        );
+      }
+    }
+  };
+
   return new Promise<ControlServerHandle>((resolve, reject) => {
     const server = createServer((req, res) => {
-      handleRequest(req, res, opts).catch((err: unknown) => {
+      handleRequest(req, res, opts, { ssoRecaptureSessions, idleTimeout }).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         sendJson(res, 500, { error: `internal error: ${msg}` });
       });
@@ -150,20 +252,32 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
       const handle: ControlServerHandle = {
         port: addr.port,
         server,
-        close: () =>
-          new Promise<void>((res, rej) => {
+        close: async () => {
+          // Always tear down stranded recapture browsers before
+          // closing the HTTP listener — otherwise a parent that
+          // shuts down mid-recapture leaks a Chrome process.
+          await closeSsoRecaptureSessions();
+          await new Promise<void>((res, rej) => {
             server.close((err) => (err ? rej(err) : res()));
-          }),
+          });
+        },
+        closeSsoRecaptureSessions,
       };
       resolve(handle);
     });
   });
 }
 
+interface SsoState {
+  ssoRecaptureSessions: Map<string, SsoRecaptureEntry>;
+  idleTimeout: number;
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   opts: ControlServerOptions,
+  ssoState: SsoState,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const { pathname } = url;
@@ -193,7 +307,7 @@ async function handleRequest(
   sweepStaleEntries(opts.surface.getRegistry());
 
   try {
-    const result = await route(req, opts, pathname, method);
+    const result = await route(req, opts, pathname, method, ssoState);
     sendJson(res, result.status, result.body);
   } catch (err) {
     if (err instanceof ControlServerError) {
@@ -227,6 +341,7 @@ async function route(
   opts: ControlServerOptions,
   pathname: string,
   method: string,
+  ssoState: SsoState,
 ): Promise<RouteResult> {
   const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
@@ -235,6 +350,31 @@ async function route(
   if (method === "POST" && pathname === "/launch") {
     const body = await readJsonBody(req);
     return launchOne(surface, body);
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // HCL SSO / VPN status endpoints (feat/bots-app-dashboard-sso)
+  // ──────────────────────────────────────────────────────────────────
+  if (method === "GET" && pathname === "/sso/vpn-status") {
+    return vpnStatusRoute(opts);
+  }
+  if (method === "GET" && pathname === "/sso/status") {
+    return ssoStatusRoute(opts);
+  }
+  if (method === "POST" && pathname === "/sso/recapture") {
+    const body = await readJsonBody(req);
+    return ssoRecaptureStartRoute(opts, ssoState, body);
+  }
+  const recapturePath = /^\/sso\/recapture\/([^/]+)(?:\/(complete))?$/.exec(pathname);
+  if (recapturePath) {
+    const sessionId = decodeURIComponent(recapturePath[1]);
+    const sub = recapturePath[2];
+    if (sub === "complete" && method === "POST") {
+      return ssoRecaptureCompleteRoute(opts, ssoState, sessionId);
+    }
+    if (sub === undefined && method === "DELETE") {
+      return ssoRecaptureCancelRoute(ssoState, sessionId);
+    }
   }
 
   if (pathname === "/profiles") {
@@ -664,6 +804,10 @@ async function launchOne(
       '"storageStateFile" is required when authBackend === "storage-state"',
     );
   }
+  const ssoStateFile = body.ssoStateFile;
+  if (ssoStateFile !== undefined && typeof ssoStateFile !== "string") {
+    throw new ControlServerError(400, '"ssoStateFile" must be a string when provided');
+  }
   // `runLocation` is dashboard-only metadata; we accept it but only
   // honor "local" today. Anything else is rejected so a future
   // backend implementation can't be silently downgraded.
@@ -683,6 +827,7 @@ async function launchOne(
     network,
     authBackend,
     storageStateFile: storageStateFile as string | undefined,
+    ssoStateFile: ssoStateFile as string | undefined,
   };
   const newId = await surface.launchOne(spec);
   return { status: 201, body: { botId: newId } };
@@ -733,6 +878,240 @@ function requireBot(surface: OrchestratorControlSurface, botId: string): BotRegi
     throw new ControlServerError(404, `bot ${botId} not found`);
   }
   return entry;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// HCL SSO / VPN status route handlers
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Best-effort fetch of {@link DEFAULT_VPN_CHECK_URL} (or the
+ * `VPN_CHECK_URL` env override) with a 5s timeout. Returns one of:
+ *
+ *   `{ status: "up", responseTimeMs }`   — TCP+TLS reachable, server responded.
+ *   `{ status: "down", error }`          — timeout / DNS / connect / TLS / 5xx.
+ *
+ * A 401 is treated as "up" — it means the VPN is reachable, the gated
+ * site responded, and the only reason the response wasn't 200 is the
+ * lack of a session cookie (which is expected here: the dashboard does
+ * not inject one). Conflating 401 with "down" would mask the actual
+ * VPN status and trigger spurious "VPN unreachable" UI banners.
+ */
+async function vpnStatusRoute(opts: ControlServerOptions): Promise<RouteResult> {
+  const target = process.env.VPN_CHECK_URL ?? DEFAULT_VPN_CHECK_URL;
+  const fetchImpl = opts.vpnFetch ?? globalThis.fetch;
+  const checkedAt = Date.now();
+  if (typeof fetchImpl !== "function") {
+    return {
+      status: 200,
+      body: {
+        status: "down" as const,
+        checkedAt,
+        error: "fetch unavailable in this runtime",
+      },
+    };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  const t0 = Date.now();
+  try {
+    const res = await fetchImpl(target, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    const responseTimeMs = Date.now() - t0;
+    // 1xx/2xx/3xx/4xx = reachable. 5xx = the upstream is broken even
+    // though the VPN itself is up; we still classify that as "down"
+    // for the operator's purpose ("can I usefully launch a bot here?")
+    // — same as the legacy curl one-liner the team was using.
+    if (res.status >= 500) {
+      return {
+        status: 200,
+        body: {
+          status: "down" as const,
+          checkedAt,
+          error: `HTTP ${res.status}`,
+          responseTimeMs,
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: {
+        status: "up" as const,
+        checkedAt,
+        responseTimeMs,
+        httpStatus: res.status,
+      },
+    };
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    let reason = msg;
+    if ((err as { name?: string }).name === "AbortError") reason = "timeout";
+    else if (msg.includes("ENOTFOUND")) reason = "DNS lookup failed (ENOTFOUND)";
+    else if (msg.includes("ECONNREFUSED")) reason = "connection refused";
+    else if (/tls|certificate/i.test(msg)) reason = `TLS error: ${msg}`;
+    return {
+      status: 200,
+      body: { status: "down" as const, checkedAt, error: reason },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Report SSO storage-state file status by inspecting the conventional
+ * path under `<runDir>/auth/hcl-sso.json`. We deliberately stay out of
+ * the file contents — cookies have opaque expiry semantics and trying
+ * to predict their validity from JSON shape leads to false positives.
+ * mtime is the closest proxy available.
+ */
+function ssoStatusRoute(opts: ControlServerOptions): RouteResult {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "sso status unavailable: control server was started without a runDir",
+    );
+  }
+  const filePath = defaultSsoStatePath(opts.runDir);
+  try {
+    const st = statSync(filePath);
+    const ageHours = (Date.now() - st.mtimeMs) / (1000 * 60 * 60);
+    return {
+      status: 200,
+      body: {
+        filePath,
+        exists: true,
+        capturedAt: st.mtimeMs,
+        ageHours,
+        size: st.size,
+      },
+    };
+  } catch {
+    return {
+      status: 200,
+      body: {
+        filePath,
+        exists: false,
+        capturedAt: null,
+        ageHours: null,
+        size: null,
+      },
+    };
+  }
+}
+
+async function ssoRecaptureStartRoute(
+  opts: ControlServerOptions,
+  ssoState: SsoState,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "sso recapture unavailable: control server was started without a runDir",
+    );
+  }
+  let startUrl = DEFAULT_SSO_START_URL;
+  if (body.startUrl !== undefined) {
+    if (typeof body.startUrl !== "string") {
+      throw new ControlServerError(400, '"startUrl" must be a string when provided');
+    }
+    try {
+      const u = new URL(body.startUrl);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        throw new Error("only http(s) URLs are accepted");
+      }
+    } catch (e) {
+      throw new ControlServerError(400, `invalid startUrl: ${(e as Error).message}`);
+    }
+    startUrl = body.startUrl;
+  }
+  const factory = opts.ssoCaptureFactory ?? openSsoCaptureBrowser;
+  const sessionId = randomUUID();
+  let session: SsoCaptureSession;
+  try {
+    session = await factory({ startUrl });
+  } catch (e) {
+    throw new ControlServerError(
+      500,
+      `sso recapture: browser launch failed: ${(e as Error).message}`,
+    );
+  }
+  const startedAt = Date.now();
+  const idleTimer = setTimeout(() => {
+    const entry = ssoState.ssoRecaptureSessions.get(sessionId);
+    if (entry === undefined) return;
+    ssoState.ssoRecaptureSessions.delete(sessionId);
+    void entry.session.close().catch((err: unknown) => {
+      console.warn(
+        `[control] idle-timeout teardown of sso recapture ${sessionId} failed: ${
+          (err as Error).message
+        }`,
+      );
+    });
+    console.log(
+      `[control] sso recapture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+    );
+  }, ssoState.idleTimeout);
+  // Detach the timer from keeping the event loop alive — the parent
+  // process should be allowed to exit even with a pending recapture.
+  if (typeof idleTimer.unref === "function") idleTimer.unref();
+  ssoState.ssoRecaptureSessions.set(sessionId, {
+    id: sessionId,
+    startUrl,
+    startedAt,
+    session,
+    idleTimer,
+  });
+  return {
+    status: 201,
+    body: { recaptureSessionId: sessionId, startUrl, startedAt },
+  };
+}
+
+async function ssoRecaptureCompleteRoute(
+  opts: ControlServerOptions,
+  ssoState: SsoState,
+  sessionId: string,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "sso recapture unavailable: control server was started without a runDir",
+    );
+  }
+  const entry = ssoState.ssoRecaptureSessions.get(sessionId);
+  if (entry === undefined) {
+    throw new ControlServerError(404, `sso recapture session ${sessionId} not found`);
+  }
+  ssoState.ssoRecaptureSessions.delete(sessionId);
+  clearTimeout(entry.idleTimer);
+  const outPath = defaultSsoStatePath(opts.runDir);
+  try {
+    await entry.session.saveAndClose(outPath);
+  } catch (e) {
+    // Save failed (e.g. operator closed the window first). Make a
+    // best-effort to tear down anyway so we don't leak a half-dead
+    // browser, then surface a 500.
+    await entry.session.close().catch(() => {});
+    throw new ControlServerError(500, `sso recapture save failed: ${(e as Error).message}`);
+  }
+  return ssoStatusRoute(opts);
+}
+
+function ssoRecaptureCancelRoute(ssoState: SsoState, sessionId: string): Promise<RouteResult> {
+  const entry = ssoState.ssoRecaptureSessions.get(sessionId);
+  if (entry === undefined) {
+    throw new ControlServerError(404, `sso recapture session ${sessionId} not found`);
+  }
+  ssoState.ssoRecaptureSessions.delete(sessionId);
+  clearTimeout(entry.idleTimer);
+  return entry.session
+    .close()
+    .then(() => ({ status: 200, body: { recaptureSessionId: sessionId, cancelled: true } }));
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

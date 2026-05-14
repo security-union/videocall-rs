@@ -59,6 +59,16 @@ export interface LaunchRequest {
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
+  /**
+   * Absolute path to the HCL SSO storage-state JSON the dashboard
+   * has captured (typically `<runDir>/auth/hcl-sso.json`). Forwarded
+   * to the orchestrator and consumed only when `authBackend === "jwt"`.
+   * Optional: when absent and the file does not exist on the
+   * orchestrator's runDir, the bot falls back to the legacy "no SSO
+   * state" path (the operator's session must already be valid in the
+   * target environment, or the bot will hit the SSO portal).
+   */
+  ssoStateFile?: string;
   runLocation: "local" | "future-vm" | "future-ssh" | "future-docker";
 }
 
@@ -117,4 +127,50 @@ export type SaveProfileRequest = SaveProfileFromCurrentRequest | SaveProfileFrom
 export interface LaunchProfileResponse {
   name: string;
   botIds: string[];
+}
+
+/**
+ * Response shape for `GET /api/sso/vpn-status`. The endpoint
+ * synthesizes a 5s `fetch` against the HCL host and translates the
+ * outcome into one of two statuses.
+ */
+export type VpnStatusResponse =
+  | {
+      status: "up";
+      checkedAt: number;
+      responseTimeMs: number;
+      httpStatus?: number;
+    }
+  | {
+      status: "down";
+      checkedAt: number;
+      error: string;
+      responseTimeMs?: number;
+    };
+
+/**
+ * Response shape for `GET /api/sso/status`. `ageHours` is derived from
+ * the file's mtime; cookie expiry is intentionally not inspected.
+ */
+export interface SsoStatusResponse {
+  filePath: string;
+  exists: boolean;
+  capturedAt: number | null;
+  ageHours: number | null;
+  size: number | null;
+}
+
+export interface SsoRecaptureStartRequest {
+  startUrl?: string;
+}
+
+export interface SsoRecaptureStartResponse {
+  recaptureSessionId: string;
+  startUrl: string;
+  startedAt: number;
+}
+
+export interface SsoRecaptureCancelResponse {
+  recaptureSessionId: string;
+  cancelled: boolean;
 }

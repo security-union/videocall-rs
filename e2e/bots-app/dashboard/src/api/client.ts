@@ -9,6 +9,11 @@ import type {
   ProfileListResponse,
   RunProfile,
   SaveProfileRequest,
+  SsoRecaptureCancelResponse,
+  SsoRecaptureStartRequest,
+  SsoRecaptureStartResponse,
+  SsoStatusResponse,
+  VpnStatusResponse,
 } from "./types";
 
 /**
@@ -114,4 +119,28 @@ export const api = {
     ),
   deleteProfile: (name: string): Promise<{ name: string; deleted: boolean }> =>
     request("DELETE", `/api/profiles/${encodeURIComponent(name)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // HCL VPN + SSO state management (feat/bots-app-dashboard-sso)
+  // ──────────────────────────────────────────────────────────────────
+  vpnStatus: (): Promise<VpnStatusResponse> =>
+    request<VpnStatusResponse>("GET", "/api/sso/vpn-status"),
+  ssoStatus: (): Promise<SsoStatusResponse> =>
+    request<SsoStatusResponse>("GET", "/api/sso/status"),
+  ssoRecaptureStart: (req: SsoRecaptureStartRequest = {}): Promise<SsoRecaptureStartResponse> =>
+    request<SsoRecaptureStartResponse>(
+      "POST",
+      "/api/sso/recapture",
+      req as unknown as Record<string, unknown>,
+    ),
+  ssoRecaptureComplete: (sessionId: string): Promise<SsoStatusResponse> =>
+    request<SsoStatusResponse>(
+      "POST",
+      `/api/sso/recapture/${encodeURIComponent(sessionId)}/complete`,
+    ),
+  ssoRecaptureCancel: (sessionId: string): Promise<SsoRecaptureCancelResponse> =>
+    request<SsoRecaptureCancelResponse>(
+      "DELETE",
+      `/api/sso/recapture/${encodeURIComponent(sessionId)}`,
+    ),
 };

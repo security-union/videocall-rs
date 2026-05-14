@@ -16,7 +16,10 @@ function renderWithClient(ui: React.ReactElement) {
 
 describe("<LaunchForm />", () => {
   beforeEach(() => {
-    // Stub /api/assets endpoints called by useQuery in the form.
+    // Stub /api/assets + /api/sso/status endpoints called by useQuery
+    // in the form. The form's `ssoStatusQuery` fires regardless of
+    // auth backend; without a stub here the unmocked fetch would
+    // surface as a console error in the test output.
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async (url: string) => {
@@ -25,6 +28,18 @@ describe("<LaunchForm />", () => {
             status: 200,
             headers: { "content-type": "application/json" },
           });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
         }
         // Default: empty success — the real launch request goes
         // through `api.launch` which uses `fetch("/api/launch")`.
@@ -123,5 +138,114 @@ describe("<LaunchForm />", () => {
     expect(screen.getByTestId("help-costume")).toBeInTheDocument();
     expect(screen.getByTestId("help-audio")).toBeInTheDocument();
     expect(screen.getByTestId("help-runLocation")).toBeInTheDocument();
+  });
+
+  it("renders the SSO state warning when JWT auth + missing file", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("launch-sso-line")).toHaveTextContent(/No SSO state captured/);
+    });
+    expect(screen.getByTestId("launch-sso-capture-now")).toBeInTheDocument();
+  });
+
+  it("renders the SSO path + age when the file exists, and forwards ssoStateFile in the launch payload", async () => {
+    const onLaunched = vi.fn();
+    let captured: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/run/auth/hcl-sso.json",
+              exists: true,
+              capturedAt: Date.now(),
+              ageHours: 1.25,
+              size: 3210,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          captured = JSON.parse(init?.body as string);
+          return new Response(
+            JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    renderWithClient(<LaunchForm onLaunched={onLaunched} onError={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("launch-sso-path")).toHaveTextContent("/run/auth/hcl-sso.json");
+      expect(screen.getByTestId("launch-sso-line")).toHaveTextContent(/captured 1\.3h ago/);
+    });
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/TonyBots" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onLaunched).toHaveBeenCalled();
+    });
+    expect((captured as { ssoStateFile?: string } | null)?.ssoStateFile).toBe(
+      "/run/auth/hcl-sso.json",
+    );
+  });
+
+  it("omits ssoStateFile from the launch payload when auth is not JWT", async () => {
+    let captured: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/run/auth/hcl-sso.json",
+              exists: true,
+              capturedAt: Date.now(),
+              ageHours: 1,
+              size: 1024,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          captured = JSON.parse(init?.body as string);
+          return new Response(
+            JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    const guestRadio = document.getElementById("auth-none") as HTMLElement;
+    fireEvent.click(guestRadio);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "guest1" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    expect((captured as { ssoStateFile?: unknown } | null)?.ssoStateFile).toBeUndefined();
+    // And the SSO line is hidden when auth ≠ JWT.
+    expect(screen.queryByTestId("launch-sso-line")).not.toBeInTheDocument();
   });
 });

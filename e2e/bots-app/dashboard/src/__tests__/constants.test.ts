@@ -3,44 +3,66 @@ import { describe, expect, it } from "vitest";
 import { badgeForBot, STATUS_BADGE_CLASS } from "../lib/constants";
 
 describe("badgeForBot status mapping", () => {
-  it("returns the raw status label for in-progress bots", () => {
+  it("returns a friendly label for in-progress bots", () => {
     expect(badgeForBot({ status: "in-meeting" })).toEqual({
-      label: "in-meeting",
+      label: "In meeting",
       badgeKey: "in-meeting",
     });
   });
 
-  it("returns 'done' for bots that exited via ttl-expired", () => {
+  it("returns friendly labels for each known status key", () => {
+    expect(badgeForBot({ status: "launching" })).toEqual({
+      label: "Launching",
+      badgeKey: "launching",
+    });
+    expect(badgeForBot({ status: "joining" })).toEqual({
+      label: "Joining",
+      badgeKey: "joining",
+    });
+    expect(badgeForBot({ status: "leaving" })).toEqual({
+      label: "Leaving",
+      badgeKey: "leaving",
+    });
+  });
+
+  it("returns 'Done' for bots that exited via ttl-expired", () => {
     expect(badgeForBot({ status: "done", finishReason: "ttl-expired" })).toEqual({
-      label: "done",
+      label: "Done",
       badgeKey: "done",
     });
   });
 
-  it("returns 'done (waiting)' for waiting-room exits", () => {
+  it("returns 'Done (waiting)' for waiting-room exits", () => {
     expect(
       badgeForBot({ status: "done", finishReason: "waiting-room:waiting-room" }),
     ).toEqual({
-      label: "done (waiting)",
+      label: "Done (waiting)",
       badgeKey: "done-waiting",
     });
   });
 
-  it("returns 'done (waiting)' for waiting-for-host exits", () => {
+  it("returns 'Done (waiting)' for waiting-for-host exits", () => {
     expect(
       badgeForBot({ status: "done", finishReason: "waiting-room:waiting-for-host" }),
     ).toEqual({
-      label: "done (waiting)",
+      label: "Done (waiting)",
       badgeKey: "done-waiting",
     });
   });
 
-  it("returns 'failed' for status=failed regardless of finishReason", () => {
+  it("returns 'Failed' for status=failed regardless of finishReason", () => {
     expect(
       badgeForBot({ status: "failed", finishReason: "meeting-rejected:rejected" }),
     ).toEqual({
-      label: "failed",
+      label: "Failed",
       badgeKey: "failed",
+    });
+  });
+
+  it("title-cases unknown statuses as a fallback", () => {
+    expect(badgeForBot({ status: "totally-new-state" })).toEqual({
+      label: "Totally New State",
+      badgeKey: "totally-new-state",
     });
   });
 });

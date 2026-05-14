@@ -198,7 +198,7 @@ export function RunningBotsTable({
                       const { label, badgeKey } = badgeForBot(b);
                       return (
                         <span
-                          className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${
+                          className={`inline-flex whitespace-nowrap rounded-full border px-2.5 py-0.5 text-xs font-medium ${
                             STATUS_BADGE_CLASS[badgeKey] ?? STATUS_BADGE_CLASS.done
                           }`}
                           title={b.finishReason ? `finishReason: ${b.finishReason}` : undefined}

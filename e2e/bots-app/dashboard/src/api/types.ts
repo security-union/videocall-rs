@@ -428,6 +428,37 @@ export interface TestSshHostResponse {
   error?: string;
 }
 
+/**
+ * Body shape for `POST /api/hosts/:label/preview-launch`. Mirrors the
+ * subset of {@link LaunchRequest} fields that affect the constructed
+ * SSH command — costume / audio / storage-state-path are deliberately
+ * omitted because they do NOT change the remote bash command and would
+ * just clutter the wire.
+ */
+export interface SshPreviewLaunchRequest {
+  meetingURL: string;
+  participant: string;
+  displayName?: string;
+  ttl: string;
+  headless: boolean;
+  network: string;
+  authBackend: "jwt" | "storage-state" | "none";
+}
+
+/**
+ * Response shape for `POST /api/hosts/:label/preview-launch`. The
+ * `display` field is a single-line human-readable rendering of the
+ * `argv` slot list (each slot single-quoted where needed). The
+ * `remoteCommand` is the embedded bash command (the last argv slot)
+ * exposed separately so the dashboard can show it on its own if it
+ * wants.
+ */
+export interface SshPreviewLaunchResponse {
+  argv: string[];
+  display: string;
+  remoteCommand: string;
+}
+
 export interface BotLogResponse {
   lines: string[];
   totalLines: number;

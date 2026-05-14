@@ -56,6 +56,7 @@ import {
 } from "./registry";
 import {
   addHost,
+  getHost,
   listHosts,
   removeHost,
   SshHostExistsError,
@@ -66,7 +67,7 @@ import {
   type SshHostInput,
   type SshHostPatch,
 } from "./ssh-hosts";
-import { readLogWindow } from "./ssh-launcher";
+import { buildSshCommand, readLogWindow } from "./ssh-launcher";
 
 /**
  * Callbacks the orchestrator exposes to the control server. Keeps the
@@ -711,6 +712,9 @@ async function route(
       if (method === "DELETE") return removeHostRoute(opts, label);
     } else if (sub === "test" && method === "POST") {
       return testHostRoute(opts, label);
+    } else if (sub === "preview-launch" && method === "POST") {
+      const body = await readJsonBody(req);
+      return previewLaunchRoute(opts, label, body);
     }
   }
 
@@ -2440,6 +2444,134 @@ async function testHostRoute(opts: ControlServerOptions, label: string): Promise
   // case so the dashboard can render a colored chip without falling
   // through to the error-banner path.
   return { status: 200, body: result };
+}
+
+/**
+ * `POST /hosts/:label/preview-launch` — pure command-construction
+ * endpoint that returns the exact `ssh` argv (and human-readable
+ * rendering) the dashboard would invoke if the operator clicked
+ * "Launch Bot" with the supplied launch spec + this host.
+ *
+ * This endpoint MUST NOT spawn anything. It exists solely to back the
+ * "SSH command preview" surface in the Launch + Multi-launch forms.
+ * Validation reuses the same field-by-field checks `launchOne` applies
+ * to the real launch endpoint so an invalid spec surfaces the same
+ * error message in the preview as it would on a real submit.
+ *
+ * Returns 404 if `label` is not registered; 400 on invalid launch spec.
+ */
+async function previewLaunchRoute(
+  opts: ControlServerOptions,
+  label: string,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const host = await getHost(runDir, label);
+  if (host === null) {
+    throw new ControlServerError(404, `ssh host "${label}" not found`);
+  }
+  // Reuse the existing field-validation logic from the real launch
+  // path so a typo'd `participant` or unknown `network` surfaces in
+  // the preview just like it would on a real submit. We synthesize a
+  // run-location of { kind: "ssh", hostLabel } from the URL so the
+  // operator does not have to repeat it in the body.
+  const spec = parseLaunchSpecForPreview(body);
+  const render = buildSshCommand(host, {
+    host,
+    ttl: formatDuration(spec.ttl),
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    network: spec.network === "none" ? null : spec.network,
+    authBackend: spec.authBackend,
+    displayName: spec.displayName ?? null,
+    headless: spec.headless,
+  });
+  return {
+    status: 200,
+    body: {
+      argv: render.argv,
+      display: render.display,
+      remoteCommand: render.remoteCommand,
+    },
+  };
+}
+
+/**
+ * Validate the subset of {@link LaunchSpec} fields the preview endpoint
+ * needs. This mirrors the launch-form validators in `launchOne` but
+ * skips fields that do not affect the SSH command shape (costume /
+ * audio / storage-state path / SSO state path are irrelevant to the
+ * preview because they are not part of the remote bash command).
+ */
+function parseLaunchSpecForPreview(body: Record<string, unknown>): {
+  meetingURL: string;
+  participant: string;
+  displayName: string | undefined;
+  ttl: Ttl;
+  headless: boolean;
+  network: string;
+  authBackend: "jwt" | "storage-state" | "none";
+} {
+  const meetingURL = body.meetingURL;
+  if (typeof meetingURL !== "string" || meetingURL === "") {
+    throw new ControlServerError(400, '"meetingURL" must be a non-empty string');
+  }
+  try {
+    const url = new URL(meetingURL);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new ControlServerError(400, `"meetingURL" must use http or https`);
+    }
+  } catch {
+    throw new ControlServerError(400, `"meetingURL" is not a valid URL`);
+  }
+  const participant = body.participant;
+  if (typeof participant !== "string" || participant === "") {
+    throw new ControlServerError(400, '"participant" must be a non-empty string');
+  }
+  if (!/^[A-Za-z0-9._@+-]+$/.test(participant)) {
+    throw new ControlServerError(400, '"participant" contains invalid characters');
+  }
+  const displayName = body.displayName;
+  if (displayName !== undefined && typeof displayName !== "string") {
+    throw new ControlServerError(400, '"displayName" must be a string when provided');
+  }
+  const ttlRaw = body.ttl;
+  if (typeof ttlRaw !== "string") {
+    throw new ControlServerError(400, '"ttl" must be a string');
+  }
+  let ttl: Ttl;
+  try {
+    ttl = parseDuration(ttlRaw);
+  } catch (e) {
+    throw new ControlServerError(400, (e as Error).message);
+  }
+  const headless = body.headless;
+  if (typeof headless !== "boolean") {
+    throw new ControlServerError(400, '"headless" must be a boolean');
+  }
+  const network = body.network;
+  if (typeof network !== "string") {
+    throw new ControlServerError(400, '"network" must be a string');
+  }
+  if (!NETSIM_PRESETS.includes(network)) {
+    throw new ControlServerError(
+      400,
+      `"network" must be one of: ${NETSIM_PRESETS.join(", ")} (got "${network}")`,
+    );
+  }
+  const authBackend = body.authBackend;
+  if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
+    throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
+  }
+  return {
+    meetingURL,
+    participant,
+    displayName: typeof displayName === "string" && displayName !== "" ? displayName : undefined,
+    ttl,
+    headless,
+    network,
+    authBackend,
+  };
 }
 
 function parseHostInput(body: Record<string, unknown>): SshHostInput {

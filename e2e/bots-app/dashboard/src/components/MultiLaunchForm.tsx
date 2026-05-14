@@ -19,6 +19,7 @@ import { isValidMeetingUrl } from "../lib/validation";
 import { isValidTtl } from "../lib/ttl";
 import { HelpPopover } from "./ui/HelpPopover";
 import { Select } from "./ui/Select";
+import { SshCommandPreview } from "./SshCommandPreview";
 
 /**
  * Default + max participants the dashboard surface lets an operator
@@ -282,6 +283,22 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 testId="multi-ssh-host-select"
               />
             </Field>
+          )}
+
+          {values.runLocation === "ssh" && (
+            <SshCommandPreview
+              hostLabel={values.sshHostLabel.trim() || null}
+              spec={{
+                meetingURL: values.meetingURL.trim(),
+                participant: "alice",
+                ttl: values.ttl.trim(),
+                headless: values.headless,
+                network: values.network,
+                authBackend: values.authBackend,
+              }}
+              subtitle="Preview for first participant — every bot in the batch runs on this same host with this same command shape; only --participant differs."
+              testIdPrefix="multi-ssh-cmd-preview"
+            />
           )}
         </Section>
 

@@ -5,8 +5,9 @@ import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
+import { isDevServerNoise } from "./dev-noise";
 import { type Manifest } from "./manifest";
-import { joinMeetingAndEnableMedia } from "./meeting-join";
+import { joinMeetingAndEnableMedia, MeetingNavigatedAwayError } from "./meeting-join";
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -63,6 +64,23 @@ export interface BotRunOptions {
   network?: string | null;
 }
 
+/**
+ * Reason the orchestrator should record for a finished bot task. Used by
+ * `runSingleBotTask` to distinguish between "launch error" (real failure;
+ * counts toward the orchestrator's "ended with an error" tally) and
+ * "graceful early exit" (e.g. user clicked the in-browser hang-up
+ * button; logged normally and does *not* count as a failure).
+ *
+ * Kept as a discriminated union (not a bare string) so callers can carry
+ * a structured `cause` along with the reason — and so adding a new
+ * variant is a compile-time signal at every callsite.
+ */
+export type BotExitReason =
+  | { kind: "ttl-expired" }
+  | { kind: "shutdown-signal" }
+  | { kind: "user-hangup" }
+  | { kind: "launch-error"; cause: unknown };
+
 export interface BotHandle {
   browser: Browser;
   context: BrowserContext;
@@ -75,6 +93,15 @@ export interface BotHandle {
    */
   leaveMeeting: () => Promise<void>;
   shutdown: () => Promise<void>;
+  /**
+   * Resolves when the user manually leaves the meeting via the browser
+   * (top-frame URL transitions away from `/meeting/…`). The orchestrator
+   * races this against the TTL + shutdown signal so a manual hang-up
+   * shuts the bot down promptly rather than waiting out the TTL.
+   *
+   * Resolves at most once per bot; rejection is not possible.
+   */
+  userHangupDetected: Promise<void>;
 }
 
 export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
@@ -166,13 +193,28 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const page = await context.newPage();
+
+  // Dioxus 0.7's `trunk serve` workflow injects noisy diagnostics on
+  // every page load (HMR websocket failure + the SPA HTML being served
+  // where the browser expected JS during build_id resolution). The
+  // volume is high enough to drown actually-interesting errors, so we
+  // suppress matching events and surface a single summary line on
+  // shutdown. See `dev-noise.ts` for the matcher.
+  let suppressedNoise = 0;
   page.on("pageerror", (err) => {
+    if (isDevServerNoise(err.message, { pageUrl: page.url() })) {
+      suppressedNoise++;
+      return;
+    }
     console.error(`[${opts.participant}] pageerror:`, err.message);
   });
   page.on("console", (msg) => {
-    if (msg.type() === "error") {
-      console.error(`[${opts.participant}] console.error:`, msg.text());
+    if (msg.type() !== "error") return;
+    if (isDevServerNoise(msg.text(), { pageUrl: page.url() })) {
+      suppressedNoise++;
+      return;
     }
+    console.error(`[${opts.participant}] console.error:`, msg.text());
   });
 
   const navigateUrl = target.toString();
@@ -183,12 +225,69 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // the meeting-id lives in the path, not the query — adding a
   // `?netsim=` search param does not affect it.
   const meetingId = meetingIdFromUrl(opts.meetingURL);
-  await joinMeetingAndEnableMedia({
-    page,
-    participant: opts.participant,
-    displayName: opts.displayName,
-    meetingId,
+
+  // Detect manual hang-up at any point in the bot's lifetime. The same
+  // signal is consumed by `joinMeetingAndEnableMedia` (to abort the
+  // join cleanly via `MeetingNavigatedAwayError`) and by the
+  // orchestrator (to shut down a running bot when the user dismisses
+  // it from the browser).
+  const meetingPathPrefix = `/meeting/${meetingId}`;
+  let resolveUserHangup!: () => void;
+  const userHangupDetected = new Promise<void>((resolve) => {
+    resolveUserHangup = resolve;
   });
+  let userHangupFired = false;
+  page.on("framenavigated", (frame) => {
+    if (frame.parentFrame() !== null) return; // top frame only
+    let pathname: string;
+    try {
+      pathname = new URL(frame.url()).pathname;
+    } catch {
+      return;
+    }
+    if (!pathname.startsWith(meetingPathPrefix) && !userHangupFired) {
+      userHangupFired = true;
+      console.log(`[${opts.participant}] page navigated away from meeting (likely manual hang-up)`);
+      resolveUserHangup();
+    }
+  });
+
+  try {
+    await joinMeetingAndEnableMedia({
+      page,
+      participant: opts.participant,
+      displayName: opts.displayName,
+      meetingId,
+    });
+  } catch (e) {
+    if (e instanceof MeetingNavigatedAwayError) {
+      // Make sure the orchestrator-facing signal fires even if for some
+      // reason the `framenavigated` handler ran after the join helper's
+      // own detection (e.g. handler ordering during fast back-to-back
+      // navigations).
+      if (!userHangupFired) {
+        userHangupFired = true;
+        resolveUserHangup();
+      }
+      // Tear down quietly — caller (orchestrator) will see this via
+      // `userHangupDetected` and skip the leaveMeeting step.
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+      // Re-throw so the orchestrator's `launchBot` await sees the
+      // typed sentinel and can branch on it.
+      throw e;
+    }
+    throw e;
+  }
+
+  // Best-effort: log the suppression summary once, after a successful
+  // join (so the user knows we filtered something rather than silently
+  // dropping signal).
+  if (suppressedNoise > 0) {
+    console.log(
+      `[${opts.participant}] suppressing ${suppressedNoise} Dioxus dev-server noise events; this is normal under \`trunk serve\``,
+    );
+  }
 
   const leaveMeeting = async (): Promise<void> => {
     const hangUp = page.locator("button.video-control-button", {
@@ -225,7 +324,7 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
     }
   };
 
-  return { browser, context, page, leaveMeeting, shutdown };
+  return { browser, context, page, leaveMeeting, shutdown, userHangupDetected };
 }
 
 /**

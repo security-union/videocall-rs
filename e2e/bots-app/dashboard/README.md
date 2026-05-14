@@ -1,8 +1,9 @@
-# bots-app dashboard (phase 5)
+# bots-app dashboard
 
 Browser-based UX dashboard for launching and managing browser-driven videocall bots.
-Layers on top of the phase-4 stateful orchestrator + HTTP control API (see
-[discussion #793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793)).
+Layers on top of the stateful orchestrator + HTTP control API exposed by
+`bots-app run --ctl-port` (see [discussion #793](https://github01.hclpnp.com/labs-projects/videocall/discussions/793)
+for the design discussion).
 
 ## Quick start
 
@@ -11,9 +12,9 @@ cd <repo>/e2e
 npm run bot -- dashboard
 ```
 
-That's it. The dashboard now spawns the orchestrator + ctl server in-process —
-no separate `bots-app run` terminal needed. The launch form on the Bots page
-adds bots; the table below shows running ones.
+That's it. The dashboard spawns the orchestrator + ctl server in-process — no
+separate `bots-app run` terminal needed. The launch form on the Bots page adds
+bots; the table below shows running ones.
 
 The dashboard listens on `http://127.0.0.1:5174/` (built mode) or
 `http://127.0.0.1:5173/` (Vite dev mode). The Layout header shows a
@@ -48,7 +49,7 @@ The Layout header switches to **ctl :<port>** in that mode.
 ### Security model
 
 - The dashboard's Node sidecar binds to `127.0.0.1` only — never exposed over the network.
-- The phase-4 ctl-API bearer token lives only in the Node sidecar process. The browser
+- The ctl-API bearer token lives only in the Node sidecar process. The browser
   fetches `/api/*` without any `Authorization` header; the sidecar attaches
   `Authorization: Bearer <token>` server-side before forwarding to the ctl API.
 - The token never reaches the browser tab and is never logged.
@@ -68,15 +69,15 @@ Two reasons:
 
 ## CLI flags
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--port <port>` | `5174` | Dashboard Node sidecar port. `0` lets the kernel pick. |
-| `--ctl-token-file <path>` | (self-hosted mode) | Attach to an existing daemon. Setting this (or `--ctl-port`/`--ctl-token`) disables in-process orchestrator spawn. |
-| `--ctl-port <port>` | (self-hosted mode) | Attach mode; combine with `--ctl-token`. |
-| `--ctl-token <token>` | (self-hosted mode) | Attach mode; combine with `--ctl-port`. |
-| `--run-dir <dir>` | `e2e/bots-app/run` | Token files, asset listings, and `<runDir>/profiles/*.json`. |
-| `--no-open` | (open) | Skip auto-opening the dashboard URL in the operator's browser. |
-| `--dist-dir <dir>` | `e2e/bots-app/dashboard/dist` | Where to serve the built UI from. |
+| Flag                      | Default                       | Notes                                                                                                              |
+| ------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--port <port>`           | `5174`                        | Dashboard Node sidecar port. `0` lets the kernel pick.                                                             |
+| `--ctl-token-file <path>` | (self-hosted mode)            | Attach to an existing daemon. Setting this (or `--ctl-port`/`--ctl-token`) disables in-process orchestrator spawn. |
+| `--ctl-port <port>`       | (self-hosted mode)            | Attach mode; combine with `--ctl-token`.                                                                           |
+| `--ctl-token <token>`     | (self-hosted mode)            | Attach mode; combine with `--ctl-port`.                                                                            |
+| `--run-dir <dir>`         | `e2e/bots-app/run`            | Token files, asset listings, and `<runDir>/profiles/*.json`.                                                       |
+| `--no-open`               | (open)                        | Skip auto-opening the dashboard URL in the operator's browser.                                                     |
+| `--dist-dir <dir>`        | `e2e/bots-app/dashboard/dist` | Where to serve the built UI from.                                                                                  |
 
 If `--dist-dir` exists and contains an `index.html`, the dashboard runs in
 **built mode** and serves static files directly from Node. Otherwise it falls
@@ -110,9 +111,9 @@ The sidecar speaks to a real running orchestrator, so `npm run dev` by itself
 won't show any bots — start `bots-app run --ctl-port auto` in another terminal
 first, then `bots-app dashboard` (which boots Vite for you).
 
-## What's covered today
+## Features
 
-- Launch form with all phase-4 launch options (meeting URL, participant, display
+- Launch form with all `bots-app run` options (meeting URL, participant, display
   name, TTL with suggestion chips, network preset, headless toggle, auth
   backend, storage-state file, costume + audio asset hints).
 - Running-bots table with status badges, live TTL countdown, meeting link,
@@ -123,12 +124,11 @@ first, then `bots-app dashboard` (which boots Vite for you).
 - Run-location pick list with "Local machine" enabled and "Cloud VM", "SSH host",
   "Docker container" disabled with a "Future feature — see discussion #793" tooltip.
 
-## Deferred (future PRs)
+## Known limitations
 
-- Run-location backends other than `local` (cloud VM, SSH-able host, Docker).
-- Cookieless / auto-rotating tokens (today the token rotates when the
-  orchestrator restarts; the dashboard discovers the new file but doesn't
-  notify the operator).
-- Dark mode + responsive table layout for narrow viewports.
-- Server-pushed bot updates (SSE / WebSocket) so the bot list reflects
-  reality faster than the 2.5s poll.
+- Run-location backends other than `local` (cloud VM, SSH-able host, Docker) are
+  not yet implemented.
+- The ctl token rotates when the orchestrator restarts; the dashboard discovers
+  the new file but doesn't notify the operator.
+- No dark mode; the table layout assumes a reasonably wide viewport.
+- Bot list updates via a 2.5s poll — there is no server-push (SSE / WebSocket) channel today.

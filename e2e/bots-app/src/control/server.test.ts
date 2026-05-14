@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -571,5 +571,173 @@ describe("control server: run profiles", () => {
     } finally {
       await otherHandle.close();
     }
+  });
+});
+
+describe("GET /assets/manifest", () => {
+  // The endpoint reads the manifest YAML at request time and stat()s
+  // every candidate y4m / wav under <runDir>/{costumes,audio}. The
+  // tests below build a temp manifest + temp runDir and assert the
+  // wire response one cell at a time.
+  let token: string;
+  let runDir: string;
+  let manifestPath: string;
+  let handle: ControlServerHandle;
+
+  beforeEach(() => {
+    token = generateToken();
+    runDir = mkdtempSync(join(tmpdir(), "bots-ctl-manifest-"));
+    mkdirSync(join(runDir, "costumes"));
+    mkdirSync(join(runDir, "audio"));
+    manifestPath = join(runDir, "manifest.yaml");
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+  });
+
+  it("returns participants with matching costume + audio files", async () => {
+    // alice: has both a costume and an audio file on disk.
+    // bob:   manifest entry has no costume_dir AND no audio file on disk.
+    writeFileSync(
+      manifestPath,
+      `participants:
+  - name: alice
+    costume_dir: assets/costumes/pirate
+  - name: bob
+lines:
+  - speaker: alice
+    audio_file: alice/1.wav
+  - speaker: bob
+    audio_file: bob/1.wav
+pause_ms: 0
+`,
+    );
+    writeFileSync(join(runDir, "costumes", "pirate.y4m"), "");
+    writeFileSync(join(runDir, "audio", "alice.wav"), "");
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+      manifestPath,
+    });
+    const res = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      participants: [
+        { name: "alice", costumeFile: "pirate.y4m", audioFile: "alice.wav" },
+        { name: "bob", costumeFile: null, audioFile: null },
+      ],
+    });
+  });
+
+  it("returns null costumeFile when manifest assigns a costume but the y4m is missing on disk", async () => {
+    writeFileSync(
+      manifestPath,
+      `participants:
+  - name: carol
+    costume_dir: assets/costumes/wizard
+lines:
+  - speaker: carol
+    audio_file: carol/1.wav
+pause_ms: 0
+`,
+    );
+    // No wizard.y4m on disk — only an audio file.
+    writeFileSync(join(runDir, "audio", "carol.wav"), "");
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+      manifestPath,
+    });
+    const res = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      participants: [{ name: "carol", costumeFile: null, audioFile: "carol.wav" }],
+    });
+  });
+
+  it("returns an empty participants list when the manifest path is unset", async () => {
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+    });
+    const res = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ participants: [] });
+  });
+
+  it("returns an empty participants list when the manifest file does not exist on disk", async () => {
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+      manifestPath: join(runDir, "does-not-exist.yaml"),
+    });
+    const res = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ participants: [] });
+  });
+
+  it("requires auth", async () => {
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+      manifestPath,
+    });
+    const res = await fetchJson(handle.port, "/assets/manifest");
+    expect(res.status).toBe(401);
+  });
+
+  it("caches the response so a stat'd file flipping between requests is not seen until TTL expires", async () => {
+    writeFileSync(
+      manifestPath,
+      `participants:
+  - name: dave
+    costume_dir: assets/costumes/cowboy
+lines:
+  - speaker: dave
+    audio_file: dave/1.wav
+pause_ms: 0
+`,
+    );
+    handle = await startControlServer({
+      port: 0,
+      token,
+      surface: mockSurface(),
+      runDir,
+      manifestPath,
+    });
+    // First call: no costume, no audio.
+    const first = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(first.body).toEqual({
+      participants: [{ name: "dave", costumeFile: null, audioFile: null }],
+    });
+    // Drop the files in between — within the 30s cache window the
+    // endpoint should still return the prior snapshot.
+    writeFileSync(join(runDir, "costumes", "cowboy.y4m"), "");
+    writeFileSync(join(runDir, "audio", "dave.wav"), "");
+    const second = await fetchJson(handle.port, "/assets/manifest", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(second.body).toEqual(first.body);
   });
 });

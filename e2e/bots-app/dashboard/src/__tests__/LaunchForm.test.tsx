@@ -23,6 +23,12 @@ describe("<LaunchForm />", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
         if (url.startsWith("/api/assets")) {
           return new Response(JSON.stringify({ files: [] }), {
             status: 200,
@@ -154,6 +160,12 @@ describe("<LaunchForm />", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
         if (url.startsWith("/api/assets")) {
           return new Response(JSON.stringify({ files: [] }), {
             status: 200,
@@ -205,6 +217,12 @@ describe("<LaunchForm />", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
         if (url.startsWith("/api/assets")) {
           return new Response(JSON.stringify({ files: [] }), {
             status: 200,
@@ -247,5 +265,173 @@ describe("<LaunchForm />", () => {
     expect((captured as { ssoStateFile?: unknown } | null)?.ssoStateFile).toBeUndefined();
     // And the SSO line is hidden when auth ≠ JWT.
     expect(screen.queryByTestId("launch-sso-line")).not.toBeInTheDocument();
+  });
+});
+
+describe("<LaunchForm /> manifest auto-match", () => {
+  // The auto-match useEffect runs on a 250ms debounce; vitest's
+  // default `waitFor` window (1s) accommodates that without explicit
+  // fake timers. Each test starts with a fresh fetch stub that
+  // returns a 2-participant manifest: alice→pirate.y4m+alice.wav,
+  // bob→cowboy.y4m+bob.wav.
+  function manifestStub() {
+    return {
+      participants: [
+        { name: "alice", costumeFile: "pirate.y4m", audioFile: "alice.wav" },
+        { name: "bob", costumeFile: "cowboy.y4m", audioFile: "bob.wav" },
+      ],
+    };
+  }
+  function installFetchStub() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify(manifestStub()), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/assets/costumes") {
+          return new Response(JSON.stringify({ files: ["pirate.y4m", "cowboy.y4m"] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/assets/audio") {
+          return new Response(JSON.stringify({ files: ["alice.wav", "bob.wav"] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+  }
+
+  beforeEach(() => {
+    installFetchStub();
+  });
+
+  it("auto-fills Costume + Audio + shows the manifest badge when the typed participant matches", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    await waitFor(
+      () => {
+        expect(screen.getByTestId("costume-auto-matched")).toBeInTheDocument();
+        expect(screen.getByTestId("audio-auto-matched")).toBeInTheDocument();
+      },
+      { timeout: 1500 },
+    );
+    // Both Selects use Radix; the trigger button's text content
+    // reflects the option label, which is the basename for non-default
+    // values.
+    expect(screen.getByTestId("costume")).toHaveTextContent("pirate.y4m");
+    expect(screen.getByTestId("audio")).toHaveTextContent("alice.wav");
+  });
+
+  it("does not show a badge or auto-fill when the participant is not in the manifest", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "zelda" } });
+    // Give the debounce + a couple of tick frames a chance to run; the
+    // badge must remain absent.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.queryByTestId("costume-auto-matched")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("audio-auto-matched")).not.toBeInTheDocument();
+    expect(screen.getByTestId("costume")).toHaveTextContent(/Default fake pattern/);
+    expect(screen.getByTestId("audio")).toHaveTextContent(/Default fake mic/);
+  });
+
+  it("preserves a manually-picked Costume when the operator re-types the same participant", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    // First, type the participant; auto-match populates Costume.
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    await waitFor(
+      () => expect(screen.getByTestId("costume-auto-matched")).toBeInTheDocument(),
+      { timeout: 1500 },
+    );
+    // Now manually override Costume to "cowboy.y4m". Radix Select
+    // doesn't expose the trigger as a native <select>; we drive it by
+    // opening the listbox and clicking the option.
+    fireEvent.click(screen.getByTestId("costume"));
+    const cowboyOption = await screen.findByRole("option", { name: "cowboy.y4m" });
+    fireEvent.click(cowboyOption);
+    await waitFor(() =>
+      expect(screen.getByTestId("costume")).toHaveTextContent("cowboy.y4m"),
+    );
+    // The badge must disappear — the value no longer equals the
+    // manifest's match for alice.
+    expect(screen.queryByTestId("costume-auto-matched")).not.toBeInTheDocument();
+    // Re-type the participant. Auto-match must NOT clobber the manual
+    // pick. We clear + re-set the participant input to force the
+    // useEffect to re-run.
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alic" } });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.getByTestId("costume")).toHaveTextContent("cowboy.y4m");
+    expect(screen.queryByTestId("costume-auto-matched")).not.toBeInTheDocument();
+  });
+
+  it("matches participant names case-insensitively and trims whitespace", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "  ALICE  " } });
+    await waitFor(
+      () => {
+        expect(screen.getByTestId("costume-auto-matched")).toBeInTheDocument();
+      },
+      { timeout: 1500 },
+    );
+  });
+
+  it("respects 'freshly duplicated' mode: pre-filled values are not overwritten before the first user edit", async () => {
+    // A "duplicated" form pre-fills costume/audio with their pre-set
+    // sentinel defaults but ALSO supplies an existing participant
+    // ("alice"). Without the freshly-duplicated guard, the auto-match
+    // would immediately set Costume → pirate.y4m. The guard suppresses
+    // this until the operator makes any edit.
+    const initial = {
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+      displayName: "alice",
+      ttl: "5m",
+      network: "none",
+      headless: false,
+      authBackend: "jwt" as const,
+      storageStateFile: "",
+      runLocation: "local" as const,
+      costume: "default",
+      audio: "default",
+    };
+    renderWithClient(
+      <LaunchForm initialValues={initial} onLaunched={vi.fn()} onError={vi.fn()} />,
+    );
+    // Wait past the debounce window; no auto-match should have fired.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.queryByTestId("costume-auto-matched")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("audio-auto-matched")).not.toBeInTheDocument();
+    // After the operator's first edit (here: changing the TTL),
+    // freshlyDuplicated clears. Re-typing the participant value
+    // re-triggers the auto-match useEffect against the cleared guard.
+    fireEvent.change(screen.getByTestId("ttl"), { target: { value: "10m" } });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    await waitFor(
+      () => expect(screen.getByTestId("costume-auto-matched")).toBeInTheDocument(),
+      { timeout: 1500 },
+    );
   });
 });

@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { join } from "node:path";
 
 import { defaultSsoStatePath } from "../auth/storage-state";
 import {
@@ -8,6 +9,7 @@ import {
   openSsoCaptureBrowser,
   type SsoCaptureSession,
 } from "../auth/sso-capture";
+import { costumeNameForParticipant, loadManifest, type Manifest } from "../manifest";
 import { NETSIM_PRESETS } from "../meeting-config";
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
@@ -121,6 +123,17 @@ export const DEFAULT_VPN_CHECK_URL = "https://app.videocall.fnxlabs.com/";
 export const SSO_RECAPTURE_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
+ * How long the `/assets/manifest` endpoint reuses a previously-built
+ * response before re-parsing the YAML + re-stat'ing the per-participant
+ * y4m / wav files. The manifest changes ~never during a dashboard
+ * session (operators rerun `bots-app prep-assets` out-of-band), so a
+ * 30s window cheaply absorbs the polling pattern the launch form uses
+ * (60s refetchInterval) and any incidental refresh storms from
+ * remounts.
+ */
+export const ASSETS_MANIFEST_CACHE_MS = 30_000;
+
+/**
  * Bind options for the control server. `port: 0` (the default) asks
  * the kernel for a free ephemeral port — used by `--ctl-port auto`
  * on the CLI and by the in-process integration tests.
@@ -139,6 +152,19 @@ export interface ControlServerOptions {
    * and `/sso/recapture` reply 503 — same pattern as `/profiles*`.
    */
   runDir?: string;
+  /**
+   * Absolute path to `bot/conversation/manifest.yaml` (or whichever
+   * manifest the CLI was invoked with). The `/assets/manifest`
+   * endpoint reads this to expose the participant → costume / audio
+   * mapping the dashboard's launch form uses to auto-default the
+   * costume + audio fields when an operator picks a participant name.
+   *
+   * When unset, the `/assets/manifest` endpoint replies with an empty
+   * `participants` array — the dashboard treats that as "no manifest
+   * available" and skips the auto-match logic entirely. Same fail-soft
+   * shape the CLI uses when the manifest file is missing.
+   */
+  manifestPath?: string;
   /**
    * Injection seam for unit tests: when set, the VPN-status endpoint
    * calls this instead of the global `fetch`. Production callers
@@ -189,6 +215,28 @@ interface SsoRecaptureEntry {
 }
 
 /**
+ * One participant entry in the `/assets/manifest` response. `costumeFile`
+ * and `audioFile` are basenames (e.g. `pirate.y4m`, `alice.wav`) the
+ * dashboard's launch form pipes directly into its costume + audio
+ * dropdowns. `null` means "no manifest match" or "manifest mapping
+ * present but the corresponding prep'd file is missing on disk" — the
+ * dashboard treats both cases the same: do not auto-default that field.
+ */
+export interface AssetsManifestParticipant {
+  name: string;
+  costumeFile: string | null;
+  audioFile: string | null;
+}
+
+export interface AssetsManifestResponse {
+  participants: AssetsManifestParticipant[];
+}
+
+interface AssetsManifestCacheState {
+  cache: { value: AssetsManifestResponse; expiresAt: number } | null;
+}
+
+/**
  * A handler-thrown error that should render as a specific HTTP
  * status. Anything else thrown out of a handler becomes a `500`.
  */
@@ -218,6 +266,11 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
   // gets its own map — important for the in-process tests.
   const ssoRecaptureSessions: Map<string, SsoRecaptureEntry> = new Map();
   const idleTimeout = opts.ssoRecaptureIdleTimeoutMs ?? SSO_RECAPTURE_IDLE_TIMEOUT_MS;
+  // Per-server response cache for /assets/manifest. Survives across
+  // requests but is scoped to one `startControlServer` call so tests
+  // get a clean slate each time. `cache` is mutated in-place by the
+  // route handler.
+  const assetsManifestState: AssetsManifestCacheState = { cache: null };
 
   const closeSsoRecaptureSessions = async (): Promise<void> => {
     const entries = Array.from(ssoRecaptureSessions.values());
@@ -236,7 +289,13 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
 
   return new Promise<ControlServerHandle>((resolve, reject) => {
     const server = createServer((req, res) => {
-      handleRequest(req, res, opts, { ssoRecaptureSessions, idleTimeout }).catch((err: unknown) => {
+      handleRequest(
+        req,
+        res,
+        opts,
+        { ssoRecaptureSessions, idleTimeout },
+        assetsManifestState,
+      ).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         sendJson(res, 500, { error: `internal error: ${msg}` });
       });
@@ -278,6 +337,7 @@ async function handleRequest(
   res: ServerResponse,
   opts: ControlServerOptions,
   ssoState: SsoState,
+  assetsManifestState: AssetsManifestCacheState,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const { pathname } = url;
@@ -307,7 +367,7 @@ async function handleRequest(
   sweepStaleEntries(opts.surface.getRegistry());
 
   try {
-    const result = await route(req, opts, pathname, method, ssoState);
+    const result = await route(req, opts, pathname, method, ssoState, assetsManifestState);
     sendJson(res, result.status, result.body);
   } catch (err) {
     if (err instanceof ControlServerError) {
@@ -342,6 +402,7 @@ async function route(
   pathname: string,
   method: string,
   ssoState: SsoState,
+  assetsManifestState: AssetsManifestCacheState,
 ): Promise<RouteResult> {
   const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
@@ -350,6 +411,9 @@ async function route(
   if (method === "POST" && pathname === "/launch") {
     const body = await readJsonBody(req);
     return launchOne(surface, body);
+  }
+  if (method === "GET" && pathname === "/assets/manifest") {
+    return assetsManifestRoute(opts, assetsManifestState);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -1112,6 +1176,83 @@ function ssoRecaptureCancelRoute(ssoState: SsoState, sessionId: string): Promise
   return entry.session
     .close()
     .then(() => ({ status: 200, body: { recaptureSessionId: sessionId, cancelled: true } }));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// /assets/manifest — participant → costume/audio mapping for the
+// dashboard launch form's auto-default behavior. See
+// {@link AssetsManifestResponse} for the wire shape.
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Build (or reuse the cached) participant → asset mapping. Cache TTL
+ * is {@link ASSETS_MANIFEST_CACHE_MS}; on a miss we re-parse the
+ * manifest YAML and re-`existsSync` every candidate file. Both
+ * `runDir` and `manifestPath` are optional in the server options —
+ * when either is missing we return an empty `participants` array
+ * (fail-soft, matches the CLI's behavior when the manifest is absent).
+ *
+ * Per-participant rules:
+ *   - participant not in manifest        → costumeFile=null, audioFile=null
+ *   - manifest has no costume_dir         → costumeFile=null
+ *   - manifest has costume_dir but the
+ *     `<runDir>/costumes/<name>.y4m` file
+ *     does NOT exist                      → costumeFile=null
+ *   - `<runDir>/audio/<name>.wav` exists  → audioFile=`<name>.wav`
+ *   - `<runDir>/audio/<name>.wav` missing → audioFile=null
+ *
+ * Filenames are basenames only — the dashboard's costume/audio Select
+ * options use basenames too, so the form can match by string equality.
+ */
+function assetsManifestRoute(
+  opts: ControlServerOptions,
+  state: AssetsManifestCacheState,
+): RouteResult {
+  const now = Date.now();
+  if (state.cache !== null && state.cache.expiresAt > now) {
+    return { status: 200, body: state.cache.value };
+  }
+  const value = computeAssetsManifest(opts);
+  state.cache = { value, expiresAt: now + ASSETS_MANIFEST_CACHE_MS };
+  return { status: 200, body: value };
+}
+
+function computeAssetsManifest(opts: ControlServerOptions): AssetsManifestResponse {
+  // Fail-soft: if either the manifest or the runDir is missing we just
+  // hand back an empty list. The dashboard's auto-match logic skips
+  // when participants is empty, so the operator's manual selections
+  // remain in charge.
+  if (!opts.manifestPath || !opts.runDir) {
+    return { participants: [] };
+  }
+  if (!existsSync(opts.manifestPath)) {
+    return { participants: [] };
+  }
+  let manifest: Manifest;
+  try {
+    manifest = loadManifest(opts.manifestPath).manifest;
+  } catch {
+    // Malformed manifest — same fail-soft response. The launch form
+    // surfaces this as "no auto-match" rather than a hard error
+    // because the operator can still manually pick assets.
+    return { participants: [] };
+  }
+  const costumesDir = join(opts.runDir, "costumes");
+  const audioDir = join(opts.runDir, "audio");
+  const participants: AssetsManifestParticipant[] = manifest.participants.map((p) => {
+    const costumeName = costumeNameForParticipant(manifest, p.name);
+    let costumeFile: string | null = null;
+    if (costumeName) {
+      const candidate = `${costumeName}.y4m`;
+      if (existsSync(join(costumesDir, candidate))) {
+        costumeFile = candidate;
+      }
+    }
+    const audioCandidate = `${p.name}.wav`;
+    const audioFile = existsSync(join(audioDir, audioCandidate)) ? audioCandidate : null;
+    return { name: p.name, costumeFile, audioFile };
+  });
+  return { participants };
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

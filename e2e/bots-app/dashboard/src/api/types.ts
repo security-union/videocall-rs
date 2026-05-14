@@ -208,3 +208,113 @@ export interface AssetsManifestParticipant {
 export interface AssetsManifestResponse {
   participants: AssetsManifestParticipant[];
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Multi-launch (first-N from manifest + random-N) and YAML config import
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Body shape for `POST /api/launch/multi`. Mirrors the CLI's
+ * `bots-app run --users N` (first-N pick) and `bots-app gen` (random
+ * pick) flows so dashboard operators can spawn a fleet with one click.
+ *
+ * `displayNameTemplate` accepts a `{participant}` token that the server
+ * substitutes per bot — e.g. `"Bot {participant}"` → `"Bot alice"`,
+ * `"Bot bob"`. Untemplated strings become a constant prefix for all
+ * bots in the batch.
+ */
+export interface MultiLaunchRequest {
+  mode: "first-n" | "random";
+  count: number;
+  seed?: number;
+  includeObservers?: boolean;
+  maxUsers?: number;
+
+  meetingURL: string;
+  ttl: string;
+  network?: string;
+  headless?: boolean;
+  authBackend?: "jwt" | "storage-state" | "none";
+  storageStateFile?: string;
+  ssoStateFile?: string;
+  displayNameTemplate?: string;
+}
+
+export interface MultiLaunchResponse {
+  mode: "first-n" | "random";
+  count: number;
+  seed: number | null;
+  participants: string[];
+  botIds: string[];
+  errors: Array<{ participant: string; message: string }>;
+}
+
+/**
+ * Body shape for `POST /api/launch/from-config`. The whole YAML text
+ * comes in on `configYaml`; the server parses and validates it the
+ * same way the CLI's `--config <path>` flag does.
+ */
+export interface LaunchFromConfigRequest {
+  configYaml: string;
+  headless?: boolean;
+  authBackend?: "jwt" | "storage-state" | "none";
+  storageStateFile?: string;
+  ssoStateFile?: string;
+}
+
+export interface LaunchFromConfigResponse {
+  meetingUrl: string;
+  count: number;
+  botIds: string[];
+  errors: Array<{ index: number; participant?: string; message: string }>;
+}
+
+export interface LaunchFromConfigPreviewResponse {
+  meetingUrl: string;
+  ttl: string | null;
+  network: string | null;
+  auth: string | null;
+  botCount: number;
+  bots: Array<{
+    participant: string;
+    ttl?: string;
+    network?: string;
+    auth?: string;
+  }>;
+  meta: { seed?: number; generatedAt?: string } | null;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// OAuth session capture (Google OAuth for app.videocall.rs et al.).
+// Parallel to the HCL SSO recapture flow above; files live at
+// <runDir>/auth/<label>.json. hcl-sso.json is excluded from listings.
+// ──────────────────────────────────────────────────────────────────────
+
+export interface OauthSessionInfo {
+  label: string;
+  filePath: string;
+  capturedAt: number;
+  ageHours: number;
+  size: number;
+}
+
+export interface OauthSessionsResponse {
+  sessions: OauthSessionInfo[];
+}
+
+export interface OauthCaptureStartRequest {
+  label: string;
+  startUrl?: string;
+}
+
+export interface OauthCaptureStartResponse {
+  captureSessionId: string;
+  label: string;
+  startUrl: string;
+  startedAt: number;
+}
+
+export interface OauthCaptureCancelResponse {
+  captureSessionId: string;
+  cancelled: boolean;
+}

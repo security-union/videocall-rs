@@ -319,7 +319,25 @@ describe("buildSshArgs*", () => {
   it("buildSshArgsForLaunch uses ConnectTimeout=10", () => {
     const args = buildSshArgsForLaunch(host, "echo hi");
     expect(args).toContain("ConnectTimeout=10");
-    expect(args[args.length - 1]).toBe("echo hi");
+    // The remote command is wrapped in `${SHELL:-/bin/bash} -lc <esc>`
+    // so the remote shell runs as a login shell (sources the operator's
+    // profile, which is where modern node installs put `npm` on PATH).
+    // The inner `echo hi` is shell-escaped exactly once into `'echo hi'`.
+    expect(args[args.length - 1]).toBe("${SHELL:-/bin/bash} -lc 'echo hi'");
+  });
+
+  it("buildSshArgsForLaunch wraps the remote command in $SHELL -lc (login shell)", () => {
+    // Regression: SSH's default non-interactive non-login shell does
+    // NOT source ~/.bash_profile / ~/.profile / ~/.zprofile, so
+    // operators who installed node via nvm / fnm / asdf / homebrew used
+    // to hit `bash: npm: command not found`. The login-shell wrapper
+    // forces the profile to load and puts `npm` back on PATH.
+    const args = buildSshArgsForLaunch(host, "cd '/p'/e2e && npm run bot");
+    const tail = args[args.length - 1];
+    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    // Inner command is single-quoted with `'\''` for embedded quotes —
+    // exactly one layer of escaping (not double).
+    expect(tail).toBe("${SHELL:-/bin/bash} -lc 'cd '\\''/p'\\''/e2e && npm run bot'");
   });
 
   it("omits -i when sshKey is null", () => {

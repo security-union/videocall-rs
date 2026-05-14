@@ -301,9 +301,25 @@ export function buildSshArgsForProbe(host: SshHost): string[] {
  * Build the argv for a real bot launch over SSH. The remote command is
  * a single token (single-line bash) — every dynamic substring is
  * shell-escaped via {@link shellEscape}.
+ *
+ * The inner command is wrapped in `${SHELL:-/bin/bash} -lc <escaped>`
+ * so the remote shell runs as a **login shell**. Without `-l` the
+ * remote shell is non-interactive non-login and does NOT source the
+ * operator's profile (`~/.bash_profile`, `~/.profile`, `~/.zprofile`),
+ * which is where modern node installs (nvm, fnm, asdf, homebrew on
+ * macOS) put `npm` on PATH. The symptom of skipping this wrapper is a
+ * remote-side `bash: npm: command not found`.
+ *
+ * `$SHELL` expands on the REMOTE side — it stays as a literal token
+ * here. The `${SHELL:-/bin/bash}` form falls back to `/bin/bash` on
+ * stripped-down hosts where `$SHELL` isn't exported (rare). Using the
+ * operator's login shell (rather than hard-coding bash) handles
+ * zsh-default macOS hosts whose PATH lives in `~/.zprofile`, which
+ * `bash -l` would not source.
  */
 export function buildSshArgsForLaunch(host: SshHost, remoteCmd: string): string[] {
-  return [...buildBaseSshArgs(host, { connectTimeout: 10 }), remoteCmd];
+  const wrapped = `\${SHELL:-/bin/bash} -lc ${shellEscape(remoteCmd)}`;
+  return [...buildBaseSshArgs(host, { connectTimeout: 10 }), wrapped];
 }
 
 function buildBaseSshArgs(host: SshHost, opts: { connectTimeout: number }): string[] {

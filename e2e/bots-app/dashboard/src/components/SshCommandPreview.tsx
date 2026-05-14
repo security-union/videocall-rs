@@ -148,13 +148,23 @@ export function SshCommandPreview({
         <span>SSH command preview</span>
         <HelpPopover fieldLabel="SSH command preview" testId={`${testIdPrefix}-help`}>
           <p>
-            Shows the exact <code className="font-mono text-[11px]">ssh</code> command the
-            dashboard will run when you click Launch.
+            Shows the exact <code className="font-mono text-[11px]">ssh</code> command the dashboard
+            will run when you click Launch.
           </p>
           <p className="mt-1">
-            Useful for debugging connection issues — copy-paste this into a terminal to
-            reproduce manually. The same command is also recorded as the first line of the
-            bot&apos;s log after launch.
+            Useful for debugging connection issues — copy-paste this into a terminal to reproduce
+            manually. The same command is also recorded as the first line of the bot&apos;s log
+            after launch.
+          </p>
+          <p className="mt-1">
+            The remote command is wrapped in{" "}
+            <code className="font-mono text-[11px]">${"{SHELL:-/bin/bash}"} -lc</code> so the
+            operator&apos;s login PATH is loaded (necessary for nvm / homebrew / asdf node
+            installs). If <code className="font-mono text-[11px]">npm</code> is still not found on
+            the remote, ensure it&apos;s exported by{" "}
+            <code className="font-mono text-[11px]">~/.bash_profile</code>,{" "}
+            <code className="font-mono text-[11px]">~/.profile</code>, or{" "}
+            <code className="font-mono text-[11px]">~/.zprofile</code>.
           </p>
         </HelpPopover>
       </button>

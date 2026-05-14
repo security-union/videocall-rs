@@ -76,7 +76,12 @@ describe("spawnRemoteBot", () => {
     expect(args).toContain("-p");
     expect(args).toContain("2222");
     expect(args).toContain("alice@example.com");
-    expect(args[args.length - 1]).toContain("npm run bot");
+    // The last argv slot is the `${SHELL:-/bin/bash} -lc '<inner>'`
+    // wrapper. The inner command (which contains `npm run bot`) lives
+    // inside the single-quoted wrapper payload.
+    const tail = args[args.length - 1] as string;
+    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    expect(tail).toContain("npm run bot");
   });
 
   it("accumulates stdout lines in recentLog up to REMOTE_LOG_CAP", () => {
@@ -128,9 +133,11 @@ describe("spawnRemoteBot", () => {
     expect(firstLine).toContain("alice@example.com");
     expect(firstLine).toContain("ConnectTimeout=10");
     expect(firstLine).toContain("npm run bot");
-    // The remote command lives inside a single-quoted argv slot, so the
-    // inner `--participant 'alice'` shows up with the standard '\\'' dance.
-    expect(firstLine).toContain("--participant '\\''alice'\\''");
+    // The remote command is wrapped in `${SHELL:-/bin/bash} -lc '<inner>'`
+    // so the operator's login PATH is loaded on the remote. The
+    // `$SHELL` literal stays unescaped — it expands on the remote.
+    expect(firstLine).toContain("${SHELL:-/bin/bash} -lc");
+    expect(firstLine).toContain("alice");
   });
 
   it("resolves exit with the process code and marks finished", async () => {
@@ -248,14 +255,20 @@ describe("buildSshCommand", () => {
     expect(r.argv).toContain("-o");
     expect(r.argv).toContain("ConnectTimeout=10");
     expect(r.argv).toContain("alice@my-host.lan");
-    // Last argv slot is the remote bash command.
-    expect(r.argv[r.argv.length - 1]).toBe(r.remoteCommand);
+    // Last argv slot is the wrapped `${SHELL:-/bin/bash} -lc '<inner>'`
+    // form; `remoteCommand` is the inner (unwrapped) cd && npm command,
+    // exposed separately so the preview UI can display it on its own.
+    const tail = r.argv[r.argv.length - 1];
+    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    expect(tail).toContain(r.remoteCommand.replace(/'/g, "'\\''"));
     expect(r.remoteCommand).toContain("npm run bot");
+    expect(r.remoteCommand.startsWith("cd '/home/alice/videocall'/e2e &&")).toBe(true);
     expect(r.display).toMatch(/^ssh /);
     expect(r.display).toContain("alice@my-host.lan");
-    // The remote command lives inside a single-quoted argv slot in the
-    // display rendering (it has spaces and shell metacharacters).
-    expect(r.display).toContain("'cd '\\''/home/alice/videocall'\\''/e2e &&");
+    // The wrapper survives display rendering as a single-quoted argv
+    // slot. The `$SHELL` literal stays unescaped — it expands on the
+    // remote side, not locally.
+    expect(r.display).toContain("'${SHELL:-/bin/bash} -lc");
   });
 
   it("emits -i and -p when host has a key + non-default port", () => {
@@ -352,5 +365,59 @@ describe("buildSshCommand", () => {
     });
     expect(a.display).toBe(b.display);
     expect(a.argv).toEqual(b.argv);
+  });
+
+  it("wraps the remote command in $SHELL -lc so the login PATH loads", () => {
+    // Regression test for `bash: npm: command not found` on remote
+    // hosts whose node lives in a profile-installed PATH (nvm / fnm /
+    // asdf / homebrew). SSH's default non-interactive non-login shell
+    // does NOT source the operator's profile; wrapping the remote
+    // command in `${SHELL:-/bin/bash} -lc` forces a login shell so the
+    // profile is sourced and `npm` is on PATH.
+    const r = buildSshCommand(h(), {
+      host: h(),
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    // The wrapper is the literal first 24 chars of the argv slot; the
+    // `$SHELL` token must be left unescaped so it expands remotely, and
+    // the `:-/bin/bash` fallback covers stripped-down hosts.
+    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    // The wrapper payload contains the inner command, with each single
+    // quote in the inner string escaped via the standard `'\''` dance
+    // because the wrapper applies shellEscape to it once.
+    expect(tail).toContain("npm run bot");
+    expect(tail).toContain("cd '\\''/home/alice/videocall'\\''/e2e");
+    // The wrapper is also visible in the display rendering — operators
+    // copy-pasting the display string into a terminal reproduce the
+    // exact spawn behaviour.
+    expect(r.display).toContain("${SHELL:-/bin/bash} -lc");
+  });
+
+  it("the inner command is shell-escaped exactly once, not double-escaped", () => {
+    // The remoteCommand field on the render output is the INNER
+    // unwrapped string. shellEscape produces a single layer of POSIX
+    // single-quote escaping; the wrapper applies that once, not twice,
+    // so the inner command is recoverable by stripping the outer
+    // single-quote pair (no `'\''\'\'''\''` triples at the wrapper
+    // boundary).
+    const r = buildSshCommand(h(), {
+      host: h(),
+      ttl: "5m",
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    // Build what a SINGLE shellEscape application produces and check it
+    // appears verbatim in the tail.
+    const singleEscaped = "'" + r.remoteCommand.replace(/'/g, "'\\''") + "'";
+    expect(tail).toBe(`\${SHELL:-/bin/bash} -lc ${singleEscaped}`);
+    // Sanity: double-escaping would have produced a `'\\''\\\\'\\'''\\''`
+    // pattern (the standard dance applied twice). Assert that NEVER
+    // appears — even one occurrence means we double-wrapped.
+    const doubleEscaped = "'" + singleEscaped.replace(/'/g, "'\\''") + "'";
+    expect(tail).not.toBe(`\${SHELL:-/bin/bash} -lc ${doubleEscaped}`);
   });
 });

@@ -354,9 +354,10 @@ How it works:
 - When SSH is selected, the orchestrator spawns the local `ssh` binary directly (`child_process.spawn("ssh", [...])`, no shell) and runs a single-line bash command on the remote host:
   ```
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new [-i <key>] user@host[:port] \
-    "cd '<reposPath>'/e2e && npm run bot -- run --headless --ttl '<ttl>' --meeting-url '<url>' --participant '<p>' [--network '<net>'] [--auth '<auth>'] [--display-name '<name>']"
+    "${SHELL:-/bin/bash} -lc 'cd '\''<reposPath>'\''/e2e && npm run bot -- run --headless --ttl '\''<ttl>'\'' --meeting-url '\''<url>'\'' --participant '\''<p>'\'' [--network '\''<net>'\''] [--auth '\''<auth>'\''] [--display-name '\''<name>'\'']'"
   ```
   Every dynamic substring is shell-escaped via the `shellEscape` helper (POSIX single-quote wrap + `'\''` for embedded quotes).
+- The inner `cd … && npm run …` is wrapped in `${SHELL:-/bin/bash} -lc` so the remote shell runs as a **login shell** and sources the operator's profile (`~/.bash_profile`, `~/.profile`, `~/.zprofile`). Without this wrapper, SSH's default non-interactive non-login shell skips PATH init and `npm` is not found on remotes that get node via nvm / fnm / asdf / homebrew. `$SHELL` expands on the remote side so the operator's login shell (bash, zsh, fish, …) handles the login-shell logic uniformly; the `:-/bin/bash` fallback covers stripped-down hosts where `$SHELL` isn't exported.
 - Stdout/stderr from the remote bot are tee'd into the registry entry's rolling log buffer (capped at 200 lines). The dashboard's per-bot "View logs" dialog polls `GET /api/bots/:id/log?since=<n>` every 2.5s.
 - **Leave** sends `SIGTERM` to the local `ssh` ChildProcess (which propagates to the remote bot via the SSH connection). **Force-kill** sends `SIGKILL`.
 

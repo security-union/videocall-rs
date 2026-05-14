@@ -136,6 +136,13 @@ Launch form can target. Each row is persisted to `<runDir>/hosts.json` (mode
 `0o600`); credentials are sourced from your local `ssh-agent` and
 `~/.ssh/config` — the dashboard does not store private-key material.
 
+The remote command is wrapped in `${SHELL:-/bin/bash} -lc` so the remote shell
+runs as a login shell and sources your profile (`~/.bash_profile`, `~/.profile`,
+or `~/.zprofile`). This is necessary for nvm / fnm / asdf / homebrew node
+installs — without the wrapper, SSH's default non-interactive non-login shell
+skips PATH init and you'll see `bash: npm: command not found` on the remote. If
+`npm` is still not found, ensure it's exported from one of those profile files.
+
 v1 limitations:
 
 - **Asset sync is not performed.** Remote bots fall back to Chrome's default

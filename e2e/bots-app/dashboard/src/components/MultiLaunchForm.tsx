@@ -19,6 +19,7 @@ import { isValidMeetingUrl } from "../lib/validation";
 import { isValidTtl } from "../lib/ttl";
 import { HelpPopover } from "./ui/HelpPopover";
 import { Select } from "./ui/Select";
+import { SshCommandPreview } from "./SshCommandPreview";
 
 /**
  * Default + max participants the dashboard surface lets an operator
@@ -623,6 +624,30 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 testId="multi-ssh-host-select"
               />
             </Field>
+          )}
+
+          {values.runLocation === "ssh" && (
+            <SshCommandPreview
+              hostLabel={values.sshHostLabel.trim() || null}
+              spec={{
+                meetingURL: values.meetingURL.trim(),
+                // Multi-launch picks per-bot participants server-side
+                // from the manifest (first-N order or seeded shuffle).
+                // We do not know that list client-side without
+                // pre-fetching the manifest, so the preview uses a
+                // stable placeholder. The shape of the command is the
+                // same for every bot — only the `--participant`
+                // argument changes — so this is "what one of these
+                // looks like" and the subtitle says so.
+                participant: "alice",
+                ttl: values.ttl.trim(),
+                headless: values.headless,
+                network: values.network,
+                authBackend: values.authBackend,
+              }}
+              subtitle="Preview for first participant — every bot in the batch runs on this same host with this same command shape; only --participant differs."
+              testIdPrefix="multi-ssh-cmd-preview"
+            />
           )}
         </Section>
 

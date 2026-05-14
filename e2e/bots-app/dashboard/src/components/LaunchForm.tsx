@@ -25,6 +25,7 @@ import { type FieldErrors, validateLaunchForm } from "../lib/validation";
 import { HelpPopover } from "./ui/HelpPopover";
 import { HistoryInput } from "./ui/HistoryInput";
 import { Select } from "./ui/Select";
+import { SshCommandPreview } from "./SshCommandPreview";
 import { SsoPanel } from "./SsoPanel";
 
 export interface LaunchFormInitial {
@@ -790,6 +791,22 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 <code className="font-mono text-[11px]">Tools → Remote Hosts</code>.
               </p>
             </Field>
+          )}
+
+          {values.runLocation === "ssh" && (
+            <SshCommandPreview
+              hostLabel={values.sshHostLabel.trim() || null}
+              spec={{
+                meetingURL: values.meetingURL.trim(),
+                participant: values.participant.trim(),
+                displayName: values.displayName.trim() || undefined,
+                ttl: values.ttl.trim(),
+                headless: values.headless,
+                network: values.network,
+                authBackend: values.authBackend,
+              }}
+              testIdPrefix="ssh-cmd-preview"
+            />
           )}
         </Section>
 

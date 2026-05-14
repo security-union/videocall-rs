@@ -27,6 +27,8 @@ import type {
   SaveProfileRequest,
   SshHost,
   SshHostsResponse,
+  SshPreviewLaunchRequest,
+  SshPreviewLaunchResponse,
   SsoRecaptureCancelResponse,
   SsoRecaptureStartRequest,
   SsoRecaptureStartResponse,
@@ -263,6 +265,15 @@ export const api = {
     request<null>("DELETE", `/api/hosts/${encodeURIComponent(label)}`),
   testHost: (label: string): Promise<TestSshHostResponse> =>
     request<TestSshHostResponse>("POST", `/api/hosts/${encodeURIComponent(label)}/test`),
+  previewSshLaunch: (
+    label: string,
+    req: SshPreviewLaunchRequest,
+  ): Promise<SshPreviewLaunchResponse> =>
+    request<SshPreviewLaunchResponse>(
+      "POST",
+      `/api/hosts/${encodeURIComponent(label)}/preview-launch`,
+      req as unknown as Record<string, unknown>,
+    ),
 
   // ──────────────────────────────────────────────────────────────────
   // Per-bot log window (used by the log viewer dialog).

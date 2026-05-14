@@ -181,6 +181,127 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
   return (
     <Tooltip.Provider>
       <form className="flex flex-col gap-5" onSubmit={handleSubmit} noValidate>
+        {/* Section: Runtime — rendered first so the operator picks the
+            run location before downstream choices (asset availability,
+            network reachability, applicable auth flow) depend on it.
+            All N bots share one runtime / one host. */}
+        <Section title="Runtime" description="Where every spawned bot's Chrome runs.">
+          <Field
+            label="Run location"
+            help={
+              <HelpPopover fieldLabel="Run location" testId="help-multi-run-location">
+                <p>
+                  Local runs the bots in this orchestrator&apos;s own Node process. SSH-able
+                  host runs them all on the same registered remote machine via{" "}
+                  <code className="font-mono text-[11px]">ssh user@host npm run bot …</code>.
+                </p>
+                <p className="mt-1">
+                  v1 does not fan out across hosts; pick one. Cloud VM and Docker remain
+                  future features.
+                </p>
+              </HelpPopover>
+            }
+          >
+            <RadioGroup.Root
+              value={values.runLocation}
+              onValueChange={(v) => setField("runLocation", v as RunLocation)}
+              className="flex flex-col gap-2"
+            >
+              {RUN_LOCATIONS.map((loc) => {
+                const sshUnavailable =
+                  loc.value === "ssh" && (hostsQuery.data?.hosts?.length ?? 0) === 0;
+                const itemDisabled = !loc.available || sshUnavailable;
+                const tooltip = !loc.available
+                  ? "Future feature — see discussion #793"
+                  : sshUnavailable
+                    ? "No hosts registered — add one in Tools"
+                    : null;
+                return (
+                  <Tooltip.Root key={loc.value} delayDuration={150}>
+                    <Tooltip.Trigger asChild>
+                      <label
+                        className={`flex items-center gap-2 text-sm ${
+                          itemDisabled
+                            ? "text-neutral-400 dark:text-slate-500"
+                            : "text-neutral-700 dark:text-slate-200"
+                        }`}
+                        htmlFor={`multi-runloc-${loc.value}`}
+                      >
+                        <RadioGroup.Item
+                          id={`multi-runloc-${loc.value}`}
+                          value={loc.value}
+                          disabled={itemDisabled}
+                          className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+                        >
+                          <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
+                        </RadioGroup.Item>
+                        {loc.label}
+                      </label>
+                    </Tooltip.Trigger>
+                    {tooltip !== null && (
+                      <Tooltip.Portal>
+                        <Tooltip.Content
+                          side="right"
+                          sideOffset={6}
+                          className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+                        >
+                          {tooltip}
+                          <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+                        </Tooltip.Content>
+                      </Tooltip.Portal>
+                    )}
+                  </Tooltip.Root>
+                );
+              })}
+            </RadioGroup.Root>
+          </Field>
+
+          {values.runLocation === "ssh" && (
+            <Field
+              label="SSH host"
+              required
+              error={errors.sshHostLabel}
+              help={
+                <HelpPopover fieldLabel="SSH host" testId="help-multi-ssh-host">
+                  <p>
+                    All {values.count} bots will be launched on this host. Same v1 caveats
+                    as the single-launch flow.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.sshHostLabel || "__none__"}
+                onValueChange={(v) => setField("sshHostLabel", v === "__none__" ? "" : v)}
+                options={[
+                  { value: "__none__", label: "Pick a host…" },
+                  ...(hostsQuery.data?.hosts ?? []).map((h) => ({
+                    value: h.label,
+                    label: `${h.label}  (${h.user}@${h.host})`,
+                  })),
+                ]}
+                testId="multi-ssh-host-select"
+              />
+            </Field>
+          )}
+
+          {values.runLocation === "ssh" && (
+            <SshCommandPreview
+              hostLabel={values.sshHostLabel.trim() || null}
+              spec={{
+                meetingURL: values.meetingURL.trim(),
+                participant: "alice",
+                ttl: values.ttl.trim(),
+                headless: values.headless,
+                network: values.network,
+                authBackend: values.authBackend,
+              }}
+              subtitle="Preview for first participant — every bot in the batch runs on this same host with this same command shape; only --participant differs."
+              testIdPrefix="multi-ssh-cmd-preview"
+            />
+          )}
+        </Section>
+
         {/* Section: Pick mode */}
         <Section
           title="Pick mode"
@@ -522,132 +643,6 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 aria-invalid={!!errors.storageStateFile}
               />
             </Field>
-          )}
-        </Section>
-
-        {/* Section: Runtime — all N bots share one runtime / one host. */}
-        <Section title="Runtime" description="Where every spawned bot's Chrome runs.">
-          <Field
-            label="Run location"
-            help={
-              <HelpPopover fieldLabel="Run location" testId="help-multi-run-location">
-                <p>
-                  Local runs the bots in this orchestrator&apos;s own Node process. SSH-able
-                  host runs them all on the same registered remote machine via{" "}
-                  <code className="font-mono text-[11px]">ssh user@host npm run bot …</code>.
-                </p>
-                <p className="mt-1">
-                  v1 does not fan out across hosts; pick one. Cloud VM and Docker remain
-                  future features.
-                </p>
-              </HelpPopover>
-            }
-          >
-            <RadioGroup.Root
-              value={values.runLocation}
-              onValueChange={(v) => setField("runLocation", v as RunLocation)}
-              className="flex flex-col gap-2"
-            >
-              {RUN_LOCATIONS.map((loc) => {
-                const sshUnavailable =
-                  loc.value === "ssh" && (hostsQuery.data?.hosts?.length ?? 0) === 0;
-                const itemDisabled = !loc.available || sshUnavailable;
-                const tooltip = !loc.available
-                  ? "Future feature — see discussion #793"
-                  : sshUnavailable
-                    ? "No hosts registered — add one in Tools"
-                    : null;
-                return (
-                  <Tooltip.Root key={loc.value} delayDuration={150}>
-                    <Tooltip.Trigger asChild>
-                      <label
-                        className={`flex items-center gap-2 text-sm ${
-                          itemDisabled
-                            ? "text-neutral-400 dark:text-slate-500"
-                            : "text-neutral-700 dark:text-slate-200"
-                        }`}
-                        htmlFor={`multi-runloc-${loc.value}`}
-                      >
-                        <RadioGroup.Item
-                          id={`multi-runloc-${loc.value}`}
-                          value={loc.value}
-                          disabled={itemDisabled}
-                          className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
-                        >
-                          <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
-                        </RadioGroup.Item>
-                        {loc.label}
-                      </label>
-                    </Tooltip.Trigger>
-                    {tooltip !== null && (
-                      <Tooltip.Portal>
-                        <Tooltip.Content
-                          side="right"
-                          sideOffset={6}
-                          className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
-                        >
-                          {tooltip}
-                          <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
-                        </Tooltip.Content>
-                      </Tooltip.Portal>
-                    )}
-                  </Tooltip.Root>
-                );
-              })}
-            </RadioGroup.Root>
-          </Field>
-
-          {values.runLocation === "ssh" && (
-            <Field
-              label="SSH host"
-              required
-              error={errors.sshHostLabel}
-              help={
-                <HelpPopover fieldLabel="SSH host" testId="help-multi-ssh-host">
-                  <p>
-                    All {values.count} bots will be launched on this host. Same v1 caveats
-                    as the single-launch flow.
-                  </p>
-                </HelpPopover>
-              }
-            >
-              <Select
-                value={values.sshHostLabel || "__none__"}
-                onValueChange={(v) => setField("sshHostLabel", v === "__none__" ? "" : v)}
-                options={[
-                  { value: "__none__", label: "Pick a host…" },
-                  ...(hostsQuery.data?.hosts ?? []).map((h) => ({
-                    value: h.label,
-                    label: `${h.label}  (${h.user}@${h.host})`,
-                  })),
-                ]}
-                testId="multi-ssh-host-select"
-              />
-            </Field>
-          )}
-
-          {values.runLocation === "ssh" && (
-            <SshCommandPreview
-              hostLabel={values.sshHostLabel.trim() || null}
-              spec={{
-                meetingURL: values.meetingURL.trim(),
-                // Multi-launch picks per-bot participants server-side
-                // from the manifest (first-N order or seeded shuffle).
-                // We do not know that list client-side without
-                // pre-fetching the manifest, so the preview uses a
-                // stable placeholder. The shape of the command is the
-                // same for every bot — only the `--participant`
-                // argument changes — so this is "what one of these
-                // looks like" and the subtitle says so.
-                participant: "alice",
-                ttl: values.ttl.trim(),
-                headless: values.headless,
-                network: values.network,
-                authBackend: values.authBackend,
-              }}
-              subtitle="Preview for first participant — every bot in the batch runs on this same host with this same command shape; only --participant differs."
-              testIdPrefix="multi-ssh-cmd-preview"
-            />
           )}
         </Section>
 

@@ -20,6 +20,7 @@ import {
   ProfileNotFoundError,
   ProfileValidationError,
   readProfile,
+  renameProfile,
   saveProfile,
   type ProfileBotSpec,
 } from "./profiles";
@@ -480,6 +481,9 @@ async function route(
       if (method === "DELETE") return deleteProfileRoute(opts, name);
     } else if (sub === "launch" && method === "POST") {
       return launchProfileRoute(opts, name);
+    } else if (sub === "rename" && method === "POST") {
+      const body = await readJsonBody(req);
+      return renameProfileRoute(opts, name, body);
     }
   }
 
@@ -572,6 +576,24 @@ async function saveProfileRoute(
   }
   const profile = await saveProfile(runDir, name, bots);
   return { status: 201, body: profile };
+}
+
+async function renameProfileRoute(
+  opts: ControlServerOptions,
+  oldName: string,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const newName = body.newName;
+  if (typeof newName !== "string" || newName === "") {
+    throw new ControlServerError(400, '"newName" must be a non-empty string');
+  }
+  // The pattern + length cap are enforced by `profilePath` inside
+  // `renameProfile`, which throws `ProfileValidationError` on bad
+  // input. We surface that as a 400 via the top-level catch in
+  // `handleRequest`.
+  const profile = await renameProfile(runDir, oldName, newName);
+  return { status: 200, body: profile };
 }
 
 async function launchProfileRoute(opts: ControlServerOptions, name: string): Promise<RouteResult> {

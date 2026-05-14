@@ -17,6 +17,9 @@ import type {
   OauthCaptureStartResponse,
   OauthSessionInfo,
   OauthSessionsResponse,
+  PrepAssetsJobStatus,
+  PrepAssetsStartRequest,
+  PrepAssetsStartResponse,
   ProfileListResponse,
   RunProfile,
   SaveProfileRequest,
@@ -218,4 +221,23 @@ export const api = {
     ),
   oauthSessionDelete: (label: string): Promise<{ label: string; deleted: boolean }> =>
     request("DELETE", `/api/oauth/sessions/${encodeURIComponent(label)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // prep-assets background-job lifecycle. The SSE stream is consumed
+  // directly via `new EventSource(...)` rather than through this
+  // typed-request wrapper because EventSource is its own protocol.
+  // ──────────────────────────────────────────────────────────────────
+  prepAssetsStart: (req: PrepAssetsStartRequest = {}): Promise<PrepAssetsStartResponse> =>
+    request<PrepAssetsStartResponse>(
+      "POST",
+      "/api/assets/prep",
+      req as unknown as Record<string, unknown>,
+    ),
+  prepAssetsStatus: (jobId: string): Promise<PrepAssetsJobStatus> =>
+    request<PrepAssetsJobStatus>(
+      "GET",
+      `/api/assets/prep/${encodeURIComponent(jobId)}`,
+    ),
+  prepAssetsForget: (jobId: string): Promise<{ jobId: string; deleted: boolean }> =>
+    request("DELETE", `/api/assets/prep/${encodeURIComponent(jobId)}`),
 };

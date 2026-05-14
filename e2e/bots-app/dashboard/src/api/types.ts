@@ -318,3 +318,33 @@ export interface OauthCaptureCancelResponse {
   captureSessionId: string;
   cancelled: boolean;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// prep-assets background job — regenerates costume y4m + stitched WAV
+// from the conversation manifest, identical to `bots-app prep-assets`.
+// ──────────────────────────────────────────────────────────────────────
+
+export interface PrepAssetsStartRequest {
+  manifestPath?: string;
+  costumeSource?: string;
+  outputDir?: string;
+  participants?: string[];
+}
+
+export interface PrepAssetsStartResponse {
+  jobId: string;
+  status: "running";
+  startedAt: number;
+}
+
+export interface PrepAssetsJobStatus {
+  jobId: string;
+  status: "running" | "done" | "failed";
+  startedAt: number;
+  finishedAt: number | null;
+  stdoutLog: string[];
+  exitCode: number | null;
+  error: string | null;
+  audioPrepped: number;
+  costumesPrepped: number;
+}

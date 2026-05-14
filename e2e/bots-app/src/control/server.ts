@@ -29,6 +29,14 @@ import {
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
 import {
+  createPrepAssetsJob,
+  type PrepAssetsJob,
+  type PrepAssetsOptions,
+  runPrepAssetsJob,
+  sweepStalePrepAssetsJobs,
+  validatePrepAssetsPath,
+} from "./prep-assets";
+import {
   deleteProfile,
   listProfiles,
   ProfileExistsError,
@@ -339,6 +347,7 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
   // gets its own map — important for the in-process tests.
   const ssoRecaptureSessions: Map<string, SsoRecaptureEntry> = new Map();
   const oauthCaptureSessions: Map<string, OauthCaptureEntry> = new Map();
+  const prepAssetsJobs: Map<string, PrepAssetsJob> = new Map();
   const idleTimeout = opts.ssoRecaptureIdleTimeoutMs ?? SSO_RECAPTURE_IDLE_TIMEOUT_MS;
   // Per-server response cache for /assets/manifest. Survives across
   // requests but is scoped to one `startControlServer` call so tests
@@ -385,6 +394,7 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
         opts,
         { ssoRecaptureSessions, oauthCaptureSessions, idleTimeout },
         assetsManifestState,
+        prepAssetsJobs,
       ).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         sendJson(res, 500, { error: `internal error: ${msg}` });
@@ -429,6 +439,7 @@ async function handleRequest(
   opts: ControlServerOptions,
   ssoState: SsoState,
   assetsManifestState: AssetsManifestCacheState,
+  prepAssetsJobs: Map<string, PrepAssetsJob>,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const { pathname } = url;
@@ -456,9 +467,29 @@ async function handleRequest(
   // path (vs a setInterval) keeps the orchestrator process truly
   // idle when nobody's polling, and is cheap enough at our scale.
   sweepStaleEntries(opts.surface.getRegistry());
+  sweepStalePrepAssetsJobs(prepAssetsJobs);
+
+  // SSE streaming route is handled out-of-band because it owns the
+  // response lifetime itself (writes its own headers, keeps the
+  // connection open, pushes events). All other routes go through the
+  // RouteResult-based `route` dispatcher below.
+  const prepStreamMatch = /^\/assets\/prep\/([^/]+)\/stream$/.exec(pathname);
+  if (prepStreamMatch && method === "GET") {
+    const jobId = decodeURIComponent(prepStreamMatch[1]);
+    handlePrepAssetsStream(req, res, prepAssetsJobs, jobId);
+    return;
+  }
 
   try {
-    const result = await route(req, opts, pathname, method, ssoState, assetsManifestState);
+    const result = await route(
+      req,
+      opts,
+      pathname,
+      method,
+      ssoState,
+      assetsManifestState,
+      prepAssetsJobs,
+    );
     sendJson(res, result.status, result.body);
   } catch (err) {
     if (err instanceof ControlServerError) {
@@ -494,6 +525,7 @@ async function route(
   method: string,
   ssoState: SsoState,
   assetsManifestState: AssetsManifestCacheState,
+  prepAssetsJobs: Map<string, PrepAssetsJob>,
 ): Promise<RouteResult> {
   const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
@@ -517,6 +549,23 @@ async function route(
   }
   if (method === "GET" && pathname === "/assets/manifest") {
     return assetsManifestRoute(opts, assetsManifestState);
+  }
+
+  // Prep-assets background job endpoints. SSE stream is handled
+  // out-of-band in `handleRequest`.
+  if (method === "POST" && pathname === "/assets/prep") {
+    const body = await readJsonBody(req);
+    return prepAssetsStartRoute(opts, prepAssetsJobs, body);
+  }
+  const prepJobMatch = /^\/assets\/prep\/([^/]+)$/.exec(pathname);
+  if (prepJobMatch && method === "GET") {
+    const jobId = decodeURIComponent(prepJobMatch[1]);
+    return prepAssetsStatusRoute(prepAssetsJobs, jobId);
+  }
+  const prepCancelMatch = /^\/assets\/prep\/([^/]+)$/.exec(pathname);
+  if (prepCancelMatch && method === "DELETE") {
+    const jobId = decodeURIComponent(prepCancelMatch[1]);
+    return prepAssetsForgetRoute(prepAssetsJobs, jobId);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -2012,6 +2061,215 @@ function oauthSessionDeleteRoute(opts: ControlServerOptions, label: string): Rou
     throw new ControlServerError(500, `delete failed: ${(e as Error).message}`);
   }
   return { status: 200, body: { label, deleted: true } };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Prep-assets background-job routes. The work itself lives in
+// `prep-assets.ts`; here we just register the job, hand back the id,
+// and stream log lines as SSE on the dedicated /stream endpoint.
+// ──────────────────────────────────────────────────────────────────────
+
+const DEFAULT_PREP_MANIFEST_RELATIVE = "bot/conversation/manifest.yaml";
+const DEFAULT_PREP_COSTUME_SOURCE_RELATIVE = "bot/assets/costumes";
+
+async function prepAssetsStartRoute(
+  opts: ControlServerOptions,
+  jobs: Map<string, PrepAssetsJob>,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "prep-assets unavailable: control server was started without a runDir",
+    );
+  }
+  // Only one prep job at a time per daemon — ffmpeg is expensive and
+  // running two concurrently against the same output dir would race
+  // on the same files. The 409 carries the running jobId so the
+  // dashboard can re-attach to its stream instead of spawning a dup.
+  for (const job of jobs.values()) {
+    if (job.status === "running") {
+      throw new ControlServerError(409, `prep-assets job ${job.jobId} is already running`);
+    }
+  }
+
+  // Validate optional override fields. The dashboard form sends fixed
+  // defaults today, but the API is reachable from curl and must be
+  // hardened against path-traversal exactly like the other file-bearing
+  // endpoints. `validatePrepAssetsPath` throws plain Error on bad
+  // input — wrap it in a 400-shaped ControlServerError so the response
+  // matches the route's contract.
+  const safeValidate = (raw: unknown, field: string): string => {
+    try {
+      return validatePrepAssetsPath(raw, field);
+    } catch (e) {
+      throw new ControlServerError(400, (e as Error).message);
+    }
+  };
+  const manifestPath =
+    body.manifestPath !== undefined
+      ? safeValidate(body.manifestPath, "manifestPath")
+      : (opts.manifestPath ?? defaultPrepManifest(opts.runDir));
+  const costumeSource =
+    body.costumeSource !== undefined
+      ? safeValidate(body.costumeSource, "costumeSource")
+      : defaultPrepCostumeSource(opts.runDir);
+  const outputDir =
+    body.outputDir !== undefined ? safeValidate(body.outputDir, "outputDir") : opts.runDir;
+  let participants: string[] | undefined;
+  if (body.participants !== undefined) {
+    if (!Array.isArray(body.participants)) {
+      throw new ControlServerError(400, '"participants" must be an array of strings');
+    }
+    participants = body.participants.map((p: unknown, idx: number) => {
+      if (typeof p !== "string" || p === "") {
+        throw new ControlServerError(400, `participants[${idx}] must be a non-empty string`);
+      }
+      if (!/^[A-Za-z0-9._@+-]+$/.test(p)) {
+        throw new ControlServerError(400, `participants[${idx}] contains invalid characters`);
+      }
+      return p;
+    });
+  }
+
+  const job = createPrepAssetsJob();
+  jobs.set(job.jobId, job);
+  const opts2: PrepAssetsOptions = {
+    manifestPath,
+    costumeSource,
+    outputDir,
+    participants,
+  };
+  // Fire-and-forget. Kicked off via a microtask so the response below
+  // reports the initial "running" state even when the worker can fail
+  // synchronously (e.g. missing manifest) — the dashboard then sees
+  // the transition on its next status poll, matching the contract.
+  queueMicrotask(() => {
+    void runPrepAssetsJob(job, opts2).catch((e: unknown) => {
+      job.status = "failed";
+      job.error = (e as Error).message;
+      job.finishedAt = Date.now();
+    });
+  });
+  return {
+    status: 202,
+    body: {
+      jobId: job.jobId,
+      status: "running",
+      startedAt: job.startedAt,
+    },
+  };
+}
+
+function prepAssetsStatusRoute(jobs: Map<string, PrepAssetsJob>, jobId: string): RouteResult {
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    throw new ControlServerError(404, `prep-assets job ${jobId} not found`);
+  }
+  return {
+    status: 200,
+    body: snapshotPrepAssetsJob(job),
+  };
+}
+
+function prepAssetsForgetRoute(jobs: Map<string, PrepAssetsJob>, jobId: string): RouteResult {
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    throw new ControlServerError(404, `prep-assets job ${jobId} not found`);
+  }
+  // We do NOT actually terminate the underlying work — ffmpeg is
+  // expensive to restart, and the dashboard's "Cancel" button is
+  // explicitly documented as "close the modal but let it finish in
+  // the background". Just drop the record so the dashboard's polling
+  // exits gracefully.
+  if (job.status === "running") {
+    throw new ControlServerError(
+      409,
+      `prep-assets job ${jobId} is still running; close the dashboard modal but let the job finish`,
+    );
+  }
+  jobs.delete(jobId);
+  return { status: 200, body: { jobId, deleted: true } };
+}
+
+function snapshotPrepAssetsJob(job: PrepAssetsJob): Record<string, unknown> {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt ?? null,
+    stdoutLog: job.stdoutLog,
+    exitCode: job.exitCode,
+    error: job.error ?? null,
+    audioPrepped: job.audioPrepped,
+    costumesPrepped: job.costumesPrepped,
+  };
+}
+
+function handlePrepAssetsStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  jobs: Map<string, PrepAssetsJob>,
+  jobId: string,
+): void {
+  // Auth was already enforced by `handleRequest` before dispatch — the
+  // route-aware authenticate runs there, so by the time this function
+  // is called the request is authorized.
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    sendJson(res, 404, { error: `prep-assets job ${jobId} not found` });
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    // Tell intermediaries (nginx, etc.) not to buffer.
+    "x-accel-buffering": "no",
+  });
+
+  // Send the existing log buffer first so a late subscriber sees the
+  // whole history.
+  for (const line of job.stdoutLog) {
+    res.write(`data: ${line}\n\n`);
+  }
+  // If the job already finished, close immediately.
+  if (job.status !== "running") {
+    res.write(
+      `event: end\ndata: ${JSON.stringify({ status: job.status, exitCode: job.exitCode })}\n\n`,
+    );
+    res.end();
+    return;
+  }
+
+  const onLine = (line: string | null): void => {
+    if (line === null) {
+      res.write(
+        `event: end\ndata: ${JSON.stringify({ status: job.status, exitCode: job.exitCode })}\n\n`,
+      );
+      res.end();
+      return;
+    }
+    res.write(`data: ${line}\n\n`);
+  };
+  job.subscribers.add(onLine);
+  req.on("close", () => {
+    job.subscribers.delete(onLine);
+  });
+}
+
+function defaultPrepManifest(runDir: string): string {
+  // Convention used by the CLI defaults: prep-assets is run from the
+  // repo root so the manifest lives at <repo>/bot/conversation/manifest.yaml.
+  // We re-derive it by walking up from runDir (`<repo>/e2e/bots-app/run`)
+  // — defaultPrepManifest("/repo/e2e/bots-app/run") → "/repo/bot/.../manifest.yaml".
+  // Falls back to a sentinel that the runner's existsSync check will
+  // reject if the layout differs.
+  return join(runDir, "..", "..", "..", DEFAULT_PREP_MANIFEST_RELATIVE);
+}
+
+function defaultPrepCostumeSource(runDir: string): string {
+  return join(runDir, "..", "..", "..", DEFAULT_PREP_COSTUME_SOURCE_RELATIVE);
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

@@ -4,6 +4,7 @@ import { parseManifestText } from "./manifest";
 import {
   emitMeetingConfigYaml,
   generateMeetingConfig,
+  NETSIM_PRESETS,
   parseMeetingConfigText,
   seededRng,
   shuffleSeeded,
@@ -84,6 +85,89 @@ meta:
       /meeting_url must be a non-empty string/,
     );
   });
+
+  it("parses a meeting-level network field", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+network: lossy_mobile
+bots:
+- participant: alice
+`);
+    expect(cfg.network).toBe("lossy_mobile");
+    expect(cfg.bots[0].network).toBeUndefined();
+  });
+
+  it("parses a per-bot network field", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+bots:
+- participant: alice
+  network: satellite
+- participant: bob
+`);
+    expect(cfg.network).toBeUndefined();
+    expect(cfg.bots[0].network).toBe("satellite");
+    expect(cfg.bots[1].network).toBeUndefined();
+  });
+
+  it("accepts network: none (the passthrough sentinel)", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+network: none
+bots:
+- participant: alice
+  network: none
+`);
+    expect(cfg.network).toBe("none");
+    expect(cfg.bots[0].network).toBe("none");
+  });
+
+  it("rejects an unknown meeting-level network profile", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+network: nonsense
+bots:
+- participant: alice
+`),
+    ).toThrow(/meeting\.network must be one of: .*good_wifi.*satellite.*dialup.*got "nonsense"/s);
+  });
+
+  it("rejects an unknown per-bot network profile", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+bots:
+- participant: alice
+  network: not-a-real-profile
+`),
+    ).toThrow(/bots\[0\]\.network must be one of: .*got "not-a-real-profile"/s);
+  });
+
+  it("rejects a non-string network value", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+network: 42
+bots:
+- participant: alice
+`),
+    ).toThrow(/meeting\.network, when present, must be a string/);
+  });
+});
+
+describe("NETSIM_PRESETS", () => {
+  it("matches the Rust source-of-truth list (videocall-netsim/src/profiles.rs PRESET_NAMES)", () => {
+    expect([...NETSIM_PRESETS]).toEqual([
+      "none",
+      "good_wifi",
+      "good_4g",
+      "congested_wifi",
+      "lossy_mobile",
+      "satellite",
+      "dialup",
+    ]);
+  });
 });
 
 describe("emitMeetingConfigYaml", () => {
@@ -113,6 +197,39 @@ meta:
     expect(yaml).toContain("alice");
     expect(yaml).not.toContain("ttl:");
     expect(yaml).not.toContain("meta:");
+    expect(yaml).not.toContain("network:");
+  });
+
+  it("round-trips a meeting-level network field through parse → emit → parse", () => {
+    const original = parseMeetingConfigText(`
+meeting_url: https://x/y
+network: congested_wifi
+bots:
+- participant: alice
+`);
+    const yaml = emitMeetingConfigYaml(original);
+    expect(yaml).toContain("network: congested_wifi");
+    const reparsed = parseMeetingConfigText(yaml);
+    expect(reparsed.network).toBe("congested_wifi");
+    expect(reparsed).toEqual(original);
+  });
+
+  it("round-trips a per-bot network field through parse → emit → parse", () => {
+    const original = parseMeetingConfigText(`
+meeting_url: https://x/y
+bots:
+- participant: alice
+  network: dialup
+- participant: bob
+  network: good_4g
+`);
+    const yaml = emitMeetingConfigYaml(original);
+    expect(yaml).toContain("network: dialup");
+    expect(yaml).toContain("network: good_4g");
+    const reparsed = parseMeetingConfigText(yaml);
+    expect(reparsed.bots[0].network).toBe("dialup");
+    expect(reparsed.bots[1].network).toBe("good_4g");
+    expect(reparsed).toEqual(original);
   });
 });
 
@@ -276,5 +393,45 @@ lines: []
     });
     expect(cfg.meta?.seed).toBe(42);
     expect(cfg.meta?.generatedAt).toBeDefined();
+  });
+
+  it("populates the meeting-level network field when supplied", () => {
+    const m = parseManifestText(MANIFEST_FIXTURE);
+    const cfg = generateMeetingConfig({
+      manifest: m,
+      count: 2,
+      seed: 42,
+      meetingUrl: "https://x/y",
+      network: "lossy_mobile",
+    });
+    expect(cfg.network).toBe("lossy_mobile");
+    // Per-bot networks are NOT randomized today.
+    for (const bot of cfg.bots) {
+      expect(bot.network).toBeUndefined();
+    }
+  });
+
+  it("rejects an unknown network profile", () => {
+    const m = parseManifestText(MANIFEST_FIXTURE);
+    expect(() =>
+      generateMeetingConfig({
+        manifest: m,
+        count: 2,
+        seed: 42,
+        meetingUrl: "https://x/y",
+        network: "nonsense",
+      }),
+    ).toThrow(/meeting\.network must be one of: .*got "nonsense"/s);
+  });
+
+  it("omits the network field when not supplied", () => {
+    const m = parseManifestText(MANIFEST_FIXTURE);
+    const cfg = generateMeetingConfig({
+      manifest: m,
+      count: 2,
+      seed: 42,
+      meetingUrl: "https://x/y",
+    });
+    expect(cfg.network).toBeUndefined();
   });
 });

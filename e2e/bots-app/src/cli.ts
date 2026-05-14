@@ -15,7 +15,12 @@ import { writeFileSync } from "node:fs";
 
 import { prepareParticipantCostume } from "./costumes";
 import { firstNParticipantNames, loadManifest, type Manifest } from "./manifest";
-import { emitMeetingConfigYaml, generateMeetingConfig, loadMeetingConfig } from "./meeting-config";
+import {
+  emitMeetingConfigYaml,
+  generateMeetingConfig,
+  loadMeetingConfig,
+  NETSIM_PRESETS,
+} from "./meeting-config";
 import { runBotsToCompletion, type BotTask } from "./orchestrator";
 import { prepareParticipantAudio } from "./stitcher";
 import { parseDuration, Ttl } from "./ttl";
@@ -82,6 +87,10 @@ program
     "--sso-state-file <path>",
     'Path to a captured HCL SSO storage-state JSON (from `bots-app sso-login`). Loaded in addition to JWT cookie injection when --auth=jwt. Pass "" to skip. Defaults to <assets-dir>/auth/hcl-sso.json — loaded only if the file exists.',
   )
+  .option(
+    "--network <profile>",
+    `Netsim profile applied to the bot's outbound media (one of: ${NETSIM_PRESETS.join(", ")}). Appends ?netsim=<profile> to the meeting URL — only takes effect when the served videocall-client is built with --features netsim. In --config mode this acts as a default that per-bot config entries override. See discussion #793 phase 3.`,
+  )
   .action(async (opts: RunCommandOptions) => {
     // Mutual exclusion / required-arg checks ──────────────────────────
     const modeCount = [opts.participant, opts.users, opts.config].filter(Boolean).length;
@@ -94,17 +103,29 @@ program
       process.exit(2);
     }
 
+    // Validate --network up-front (before reading the config file)
+    // so a typo on the CLI fails fast with the same error a bad config
+    // would produce.
+    if (opts.network !== undefined && !NETSIM_PRESETS.includes(opts.network)) {
+      console.error(
+        `bots-app: --network must be one of: ${NETSIM_PRESETS.join(", ")} (got "${opts.network}")`,
+      );
+      process.exit(2);
+    }
+
     // Load the config file first (if any) — it can supply meeting_url
     // + per-bot list + a default ttl that --ttl can override.
     let configMeetingUrl: string | null = null;
-    let configBots: { participant: string; ttl?: string }[] = [];
+    let configBots: { participant: string; ttl?: string; network?: string }[] = [];
     let configTtl: string | null = null;
+    let configNetwork: string | null = null;
     if (opts.config) {
       try {
         const cfg = loadMeetingConfig(opts.config);
         configMeetingUrl = cfg.meetingUrl;
         configBots = cfg.bots;
         configTtl = cfg.ttl ?? null;
+        configNetwork = cfg.network ?? null;
         console.log(
           `bots-app: loaded meeting config from ${opts.config} (${cfg.bots.length} bot(s)` +
             (cfg.meta?.seed !== undefined ? `, seed=${cfg.meta.seed}` : "") +
@@ -206,7 +227,8 @@ program
           : null;
       // Per-bot ttl override from --config wins over the shared TTL.
       let botTtl: Ttl = ttl;
-      const perBotTtl = configBots.find((b) => b.participant === participant)?.ttl;
+      const configEntry = configBots.find((b) => b.participant === participant);
+      const perBotTtl = configEntry?.ttl;
       if (perBotTtl) {
         try {
           botTtl = parseDuration(perBotTtl);
@@ -216,6 +238,11 @@ program
           );
         }
       }
+      // Network resolution: per-bot config entry > meeting-level config > CLI flag.
+      // The parser already validated every value it returned, so no
+      // re-check needed here. The CLI flag was validated up-front
+      // before the config was loaded.
+      const network = configEntry?.network ?? configNetwork ?? opts.network ?? undefined;
       return {
         meetingURL: meetingUrl,
         participant,
@@ -227,6 +254,7 @@ program
         manifest,
         runDir: opts.assetsDir,
         ttl: botTtl,
+        network,
       };
     });
 
@@ -248,6 +276,7 @@ interface RunCommandOptions {
   auth?: string;
   storageStateFile?: string;
   ssoStateFile?: string;
+  network?: string;
 }
 
 function defaultDisplayName(participant: string): string {
@@ -396,6 +425,10 @@ program
     "Allow the shuffle to pick observer-NN slots (no costume, no audio). Default is to draw only from costumed participants.",
     false,
   )
+  .option(
+    "--network <profile>",
+    `Meeting-level netsim profile to bake into the generated config (one of: ${NETSIM_PRESETS.join(", ")}). Bots inherit it unless they specify their own. Requires the served videocall-client to be built with --features netsim to take effect.`,
+  )
   .action((opts: GenCommandOptions) => {
     const count = Number.parseInt(opts.count, 10);
     if (!Number.isFinite(count) || count <= 0) {
@@ -427,6 +460,7 @@ program
         seed,
         meetingUrl: opts.meetingUrl,
         ttl: opts.ttl,
+        network: opts.network,
         includeObservers: opts.includeObservers,
       });
     } catch (e) {
@@ -452,6 +486,7 @@ interface GenCommandOptions {
   manifest: string;
   out?: string;
   includeObservers: boolean;
+  network?: string;
 }
 
 program

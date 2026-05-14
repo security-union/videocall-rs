@@ -11,6 +11,7 @@ function host(overrides: Partial<SshHost> = {}): SshHost {
     sshKey: null,
     reposPath: "/home/alice/videocall",
     notes: null,
+    shellInit: null,
     addedAt: 0,
     ...overrides,
   };
@@ -76,12 +77,15 @@ describe("spawnRemoteBot", () => {
     expect(args).toContain("-p");
     expect(args).toContain("2222");
     expect(args).toContain("alice@example.com");
-    // The last argv slot is the `${SHELL:-/bin/bash} -lc '<inner>'`
-    // wrapper. The inner command (which contains `npm run bot`) lives
-    // inside the single-quoted wrapper payload.
+    // The last argv slot is the `bash -lc '<inner>'` wrapper. The
+    // inner command (which contains `npm run bot`) lives inside the
+    // single-quoted wrapper payload. We hard-code `bash` here so the
+    // login-shell init chain reliably sources `~/.bash_profile` even
+    // when the operator's default shell is zsh.
     const tail = args[args.length - 1] as string;
-    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    expect(tail.startsWith("bash -lc ")).toBe(true);
     expect(tail).toContain("npm run bot");
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
   });
 
   it("accumulates stdout lines in recentLog up to REMOTE_LOG_CAP", () => {
@@ -133,10 +137,13 @@ describe("spawnRemoteBot", () => {
     expect(firstLine).toContain("alice@example.com");
     expect(firstLine).toContain("ConnectTimeout=10");
     expect(firstLine).toContain("npm run bot");
-    // The remote command is wrapped in `${SHELL:-/bin/bash} -lc '<inner>'`
-    // so the operator's login PATH is loaded on the remote. The
-    // `$SHELL` literal stays unescaped — it expands on the remote.
-    expect(firstLine).toContain("${SHELL:-/bin/bash} -lc");
+    // The remote command is wrapped in `bash -lc '<inner>'` so the
+    // operator's login PATH is loaded on the remote. The inner command
+    // is also prefixed with an explicit `. ~/.bash_profile` source for
+    // belt-and-suspenders coverage on hosts where bash's login-shell
+    // init is intercepted.
+    expect(firstLine).toContain("bash -lc");
+    expect(firstLine).toContain(". ~/.bash_profile");
     expect(firstLine).toContain("alice");
   });
 
@@ -239,6 +246,7 @@ describe("buildSshCommand", () => {
       sshKey: null,
       reposPath: "/home/alice/videocall",
       notes: null,
+      shellInit: null,
       addedAt: 0,
       ...overrides,
     };
@@ -255,20 +263,28 @@ describe("buildSshCommand", () => {
     expect(r.argv).toContain("-o");
     expect(r.argv).toContain("ConnectTimeout=10");
     expect(r.argv).toContain("alice@my-host.lan");
-    // Last argv slot is the wrapped `${SHELL:-/bin/bash} -lc '<inner>'`
-    // form; `remoteCommand` is the inner (unwrapped) cd && npm command,
+    // Last argv slot is the wrapped `bash -lc '<inner>'` form;
+    // `remoteCommand` is the inner (unwrapped) `cd && npm` command,
     // exposed separately so the preview UI can display it on its own.
+    // The default `. ~/.bash_profile` prefix shows up in the wrapper
+    // payload but NOT in `remoteCommand` — `remoteCommand` stays just
+    // the cd/npm chain so dashboards can show it cleanly.
     const tail = r.argv[r.argv.length - 1];
-    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    expect(tail.startsWith("bash -lc ")).toBe(true);
     expect(tail).toContain(r.remoteCommand.replace(/'/g, "'\\''"));
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
     expect(r.remoteCommand).toContain("npm run bot");
     expect(r.remoteCommand.startsWith("cd '/home/alice/videocall'/e2e &&")).toBe(true);
+    // `remoteCommand` is the inner cd/npm command only — the shell-init
+    // prefix is part of the wrapper payload, not the cd/npm chain.
+    expect(r.remoteCommand).not.toContain(".bash_profile");
     expect(r.display).toMatch(/^ssh /);
     expect(r.display).toContain("alice@my-host.lan");
     // The wrapper survives display rendering as a single-quoted argv
-    // slot. The `$SHELL` literal stays unescaped — it expands on the
-    // remote side, not locally.
-    expect(r.display).toContain("'${SHELL:-/bin/bash} -lc");
+    // slot. We use the literal `bash` token rather than `$SHELL` so the
+    // remote always runs a bash login shell regardless of the operator's
+    // default shell.
+    expect(r.display).toContain("'bash -lc");
   });
 
   it("emits -i and -p when host has a key + non-default port", () => {
@@ -367,13 +383,15 @@ describe("buildSshCommand", () => {
     expect(a.argv).toEqual(b.argv);
   });
 
-  it("wraps the remote command in $SHELL -lc so the login PATH loads", () => {
+  it("wraps the remote command in bash -lc so the login PATH loads", () => {
     // Regression test for `bash: npm: command not found` on remote
     // hosts whose node lives in a profile-installed PATH (nvm / fnm /
     // asdf / homebrew). SSH's default non-interactive non-login shell
     // does NOT source the operator's profile; wrapping the remote
-    // command in `${SHELL:-/bin/bash} -lc` forces a login shell so the
-    // profile is sourced and `npm` is on PATH.
+    // command in `bash -lc` forces a bash login shell so the profile
+    // is sourced and `npm` is on PATH. We hard-code `bash` (not
+    // `$SHELL`) to avoid the zsh-default-shell pitfall on macOS, where
+    // `zsh -lc` would source `~/.zprofile` but NOT `~/.bash_profile`.
     const r = buildSshCommand(h(), {
       host: h(),
       ttl: "5m",
@@ -381,28 +399,27 @@ describe("buildSshCommand", () => {
       participant: "p",
     });
     const tail = r.argv[r.argv.length - 1];
-    // The wrapper is the literal first 24 chars of the argv slot; the
-    // `$SHELL` token must be left unescaped so it expands remotely, and
-    // the `:-/bin/bash` fallback covers stripped-down hosts.
-    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    // The wrapper is the literal first 9 chars of the argv slot.
+    expect(tail.startsWith("bash -lc ")).toBe(true);
     // The wrapper payload contains the inner command, with each single
     // quote in the inner string escaped via the standard `'\''` dance
-    // because the wrapper applies shellEscape to it once.
+    // because the wrapper applies shellEscape to it once. The inner
+    // command also includes the defensive `. ~/.bash_profile` prefix.
     expect(tail).toContain("npm run bot");
     expect(tail).toContain("cd '\\''/home/alice/videocall'\\''/e2e");
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
     // The wrapper is also visible in the display rendering — operators
     // copy-pasting the display string into a terminal reproduce the
     // exact spawn behaviour.
-    expect(r.display).toContain("${SHELL:-/bin/bash} -lc");
+    expect(r.display).toContain("bash -lc");
   });
 
   it("the inner command is shell-escaped exactly once, not double-escaped", () => {
     // The remoteCommand field on the render output is the INNER
-    // unwrapped string. shellEscape produces a single layer of POSIX
-    // single-quote escaping; the wrapper applies that once, not twice,
-    // so the inner command is recoverable by stripping the outer
-    // single-quote pair (no `'\''\'\'''\''` triples at the wrapper
-    // boundary).
+    // unwrapped cd/npm string. The wrapper concatenates the shell-init
+    // prefix + remoteCommand and applies shellEscape exactly once, so
+    // the result is recoverable by stripping the outer single-quote
+    // pair (no `'\''\'\'''\''` triples at the wrapper boundary).
     const r = buildSshCommand(h(), {
       host: h(),
       ttl: "5m",
@@ -410,14 +427,33 @@ describe("buildSshCommand", () => {
       participant: "alice",
     });
     const tail = r.argv[r.argv.length - 1];
-    // Build what a SINGLE shellEscape application produces and check it
-    // appears verbatim in the tail.
-    const singleEscaped = "'" + r.remoteCommand.replace(/'/g, "'\\''") + "'";
-    expect(tail).toBe(`\${SHELL:-/bin/bash} -lc ${singleEscaped}`);
-    // Sanity: double-escaping would have produced a `'\\''\\\\'\\'''\\''`
-    // pattern (the standard dance applied twice). Assert that NEVER
-    // appears — even one occurrence means we double-wrapped.
+    // Build what a SINGLE shellEscape of (prefix + remoteCommand)
+    // produces and check it appears verbatim in the tail.
+    const prefix = "[ -f ~/.bash_profile ] && . ~/.bash_profile; ";
+    const inner = prefix + r.remoteCommand;
+    const singleEscaped = "'" + inner.replace(/'/g, "'\\''") + "'";
+    expect(tail).toBe(`bash -lc ${singleEscaped}`);
+    // Sanity: double-escaping would have produced the standard dance
+    // applied twice. Assert that NEVER appears — even one occurrence
+    // would mean we double-wrapped.
     const doubleEscaped = "'" + singleEscaped.replace(/'/g, "'\\''") + "'";
-    expect(tail).not.toBe(`\${SHELL:-/bin/bash} -lc ${doubleEscaped}`);
+    expect(tail).not.toBe(`bash -lc ${doubleEscaped}`);
+  });
+
+  it("uses host.shellInit to override the default prefix when set", () => {
+    // Operators whose node install lives in `~/.zshrc` (rather than
+    // `~/.bash_profile`) can register a host with a `shellInit` field;
+    // that value REPLACES the default prefix in the wrapper payload.
+    const r = buildSshCommand(h({ shellInit: ". ~/.zshrc" }), {
+      host: h({ shellInit: ". ~/.zshrc" }),
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    expect(tail).toContain(". ~/.zshrc;");
+    // The default `. ~/.bash_profile` prefix MUST NOT also appear when
+    // a custom shellInit replaces it.
+    expect(tail).not.toContain(".bash_profile");
   });
 });

@@ -12,6 +12,7 @@ interface State {
     sshKey: string | null;
     reposPath: string;
     notes: string | null;
+    shellInit: string | null;
     addedAt: number;
   }>;
   lastAdded?: unknown;
@@ -52,6 +53,7 @@ function stubFetch(state: State) {
           sshKey: body.sshKey ?? null,
           reposPath: body.reposPath,
           notes: body.notes ?? null,
+          shellInit: body.shellInit ?? null,
           addedAt: Date.now(),
         };
         state.hosts = [...state.hosts, newHost];
@@ -104,6 +106,7 @@ describe("RemoteHostsPanel", () => {
         sshKey: "/home/alice/.ssh/id_ed25519",
         reposPath: "/home/alice/videocall",
         notes: null,
+        shellInit: null,
         addedAt: Date.now(),
       },
     ];
@@ -162,6 +165,7 @@ describe("RemoteHostsPanel", () => {
         sshKey: null,
         reposPath: "/home/alice/videocall",
         notes: null,
+        shellInit: null,
         addedAt: Date.now(),
       },
     ];
@@ -183,6 +187,7 @@ describe("RemoteHostsPanel", () => {
         sshKey: null,
         reposPath: "/home/alice/videocall",
         notes: null,
+        shellInit: null,
         addedAt: Date.now(),
       },
     ];
@@ -207,6 +212,7 @@ describe("RemoteHostsPanel", () => {
     expect(screen.getByTestId("help-sshKey")).toBeInTheDocument();
     expect(screen.getByTestId("help-reposPath")).toBeInTheDocument();
     expect(screen.getByTestId("help-notes")).toBeInTheDocument();
+    expect(screen.getByTestId("help-shellInit")).toBeInTheDocument();
   });
 
   it("renders per-field help triggers in the Edit host dialog", async () => {
@@ -218,6 +224,7 @@ describe("RemoteHostsPanel", () => {
         sshKey: null,
         reposPath: "/home/alice/videocall",
         notes: null,
+        shellInit: null,
         addedAt: Date.now(),
       },
     ];
@@ -231,5 +238,83 @@ describe("RemoteHostsPanel", () => {
     expect(screen.getByTestId("help-sshKey")).toBeInTheDocument();
     expect(screen.getByTestId("help-reposPath")).toBeInTheDocument();
     expect(screen.getByTestId("help-notes")).toBeInTheDocument();
+    expect(screen.getByTestId("help-shellInit")).toBeInTheDocument();
+  });
+
+  it("renders the shellInit input in both Add and Edit dialogs", async () => {
+    state.hosts = [
+      {
+        label: "init-host",
+        host: "h",
+        user: "alice",
+        sshKey: null,
+        reposPath: "/home/alice/videocall",
+        notes: null,
+        shellInit: ". ~/.zshrc",
+        addedAt: Date.now(),
+      },
+    ];
+    renderPanel();
+    // Add dialog
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    const addInput = screen.getByTestId("remote-host-dialog-shellInit") as HTMLInputElement;
+    expect(addInput).toBeInTheDocument();
+    expect(addInput.value).toBe("");
+    // Close the add dialog and open the edit dialog on the seeded row.
+    fireEvent.click(screen.getByText("Cancel"));
+    await screen.findByTestId("remote-host-row-init-host");
+    fireEvent.click(screen.getByTestId("remote-host-edit-init-host"));
+    await screen.findByTestId("remote-host-dialog");
+    // Edit dialog pre-fills from the row.
+    const editInput = screen.getByTestId("remote-host-dialog-shellInit") as HTMLInputElement;
+    expect(editInput.value).toBe(". ~/.zshrc");
+  });
+
+  it("posts shellInit on Add when the field is filled in", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    fireEvent.change(screen.getByTestId("remote-host-dialog-label"), {
+      target: { value: "zsh-mac" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-host"), {
+      target: { value: "zsh-mac.lan" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-reposPath"), {
+      target: { value: "/home/alice/videocall" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-shellInit"), {
+      target: { value: ". ~/.zshrc" },
+    });
+    fireEvent.click(screen.getByTestId("remote-host-dialog-submit"));
+    await waitFor(() => {
+      expect(state.lastAdded).toMatchObject({
+        label: "zsh-mac",
+        shellInit: ". ~/.zshrc",
+      });
+    });
+  });
+
+  it("client-side rejects shellInit longer than 512 chars", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    fireEvent.change(screen.getByTestId("remote-host-dialog-label"), {
+      target: { value: "ok-label" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-host"), {
+      target: { value: "h" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-reposPath"), {
+      target: { value: "/home/alice/videocall" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-shellInit"), {
+      target: { value: "a".repeat(513) },
+    });
+    fireEvent.click(screen.getByTestId("remote-host-dialog-submit"));
+    expect(await screen.findByTestId("remote-host-dialog-error")).toHaveTextContent(
+      /Shell init snippet too long/,
+    );
   });
 });

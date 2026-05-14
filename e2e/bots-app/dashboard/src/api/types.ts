@@ -397,6 +397,15 @@ export interface SshHost {
   sshKey: string | null;
   reposPath: string;
   notes: string | null;
+  /**
+   * Optional shell-init snippet sourced on the remote before
+   * `cd <reposPath>/e2e && npm run …`. When `null`, the orchestrator
+   * uses the default `[ -f ~/.bash_profile ] && . ~/.bash_profile`
+   * prefix. When set, the operator-supplied snippet REPLACES the
+   * default — useful for nvm-in-zshrc setups, asdf shims, etc.
+   * See `e2e/bots-app/src/control/ssh-hosts.ts` for validation rules.
+   */
+  shellInit: string | null;
   addedAt: number;
 }
 
@@ -411,6 +420,7 @@ export interface AddSshHostRequest {
   sshKey?: string | null;
   reposPath: string;
   notes?: string | null;
+  shellInit?: string | null;
 }
 
 export interface UpdateSshHostRequest {
@@ -419,6 +429,7 @@ export interface UpdateSshHostRequest {
   sshKey?: string | null;
   reposPath?: string;
   notes?: string | null;
+  shellInit?: string | null;
 }
 
 export interface TestSshHostResponse {

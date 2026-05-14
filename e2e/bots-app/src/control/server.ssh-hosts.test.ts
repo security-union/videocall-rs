@@ -188,6 +188,107 @@ describe("control server: SSH host registry endpoints", () => {
     expect(body.host.host).toBe("new");
   });
 
+  it("POST /hosts persists the shellInit field and surfaces it on GET", async () => {
+    const post = await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "zsh-mac",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+        shellInit: ". ~/.zshrc",
+      },
+    });
+    expect(post.status).toBe(201);
+    const created = (post.body as { host: { shellInit: string | null } }).host;
+    expect(created.shellInit).toBe(". ~/.zshrc");
+    // Round-trip via GET to confirm persistence.
+    const list = await fetchJson(handle.port, "/hosts", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const found = (
+      list.body as { hosts: Array<{ label: string; shellInit: string | null }> }
+    ).hosts.find((h) => h.label === "zsh-mac");
+    expect(found?.shellInit).toBe(". ~/.zshrc");
+  });
+
+  it("POST /hosts defaults shellInit to null when omitted", async () => {
+    const post = await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "default-init",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+      },
+    });
+    expect(post.status).toBe(201);
+    const created = (post.body as { host: { shellInit: string | null } }).host;
+    expect(created.shellInit).toBeNull();
+  });
+
+  it("PUT /hosts/:label updates the shellInit field", async () => {
+    await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "patch-init",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+      },
+    });
+    const put = await fetchJson(handle.port, "/hosts/patch-init", {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}` },
+      body: { shellInit: ". ~/.zshrc" },
+    });
+    expect(put.status).toBe(200);
+    const patched = (put.body as { host: { shellInit: string | null } }).host;
+    expect(patched.shellInit).toBe(". ~/.zshrc");
+    // Clearing it (`null`) round-trips.
+    const cleared = await fetchJson(handle.port, "/hosts/patch-init", {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}` },
+      body: { shellInit: null },
+    });
+    expect(cleared.status).toBe(200);
+    const clearedHost = (cleared.body as { host: { shellInit: string | null } }).host;
+    expect(clearedHost.shellInit).toBeNull();
+  });
+
+  it("POST /hosts rejects shellInit longer than 512 chars with 400", async () => {
+    const res = await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "too-long",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+        shellInit: "a".repeat(513),
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /hosts rejects shellInit with embedded newlines as 400", async () => {
+    const res = await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "with-newline",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+        shellInit: ". ~/.zshrc\nrm -rf /",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("DELETE /hosts/:label removes the row", async () => {
     await fetchJson(handle.port, "/hosts", {
       method: "POST",

@@ -59,6 +59,24 @@ export interface SshHost {
   sshKey: string | null;
   reposPath: string;
   notes: string | null;
+  /**
+   * Optional shell-init snippet sourced on the remote BEFORE the
+   * `cd <reposPath>/e2e && npm run …` chain runs. Use this to load
+   * PATH for the operator's node install when their nvm / fnm / asdf /
+   * homebrew config lives somewhere other than `~/.bash_profile`
+   * (e.g. zsh-only users with `nvm` in `~/.zshrc`).
+   *
+   * When `null` (the default) the builder prepends
+   * `[ -f ~/.bash_profile ] && . ~/.bash_profile;` so the most common
+   * macOS / Linux setups work out of the box. When set to a non-empty
+   * string, that snippet replaces the default (operator opts in fully).
+   *
+   * Examples:
+   *   ". ~/.zshrc"
+   *   ". ~/.nvm/nvm.sh && nvm use 22"
+   *   "export PATH=$HOME/.local/bin:$PATH"
+   */
+  shellInit: string | null;
   addedAt: number;
 }
 
@@ -69,6 +87,7 @@ export interface SshHostInput {
   sshKey?: string | null;
   reposPath: string;
   notes?: string | null;
+  shellInit?: string | null;
 }
 
 export interface SshHostPatch {
@@ -77,6 +96,7 @@ export interface SshHostPatch {
   sshKey?: string | null;
   reposPath?: string;
   notes?: string | null;
+  shellInit?: string | null;
 }
 
 export class SshHostValidationError extends Error {
@@ -203,6 +223,12 @@ export async function updateHost(
         : patch.notes === null || patch.notes === ""
           ? null
           : validateNotesField(patch.notes),
+    shellInit:
+      patch.shellInit === undefined
+        ? existing.shellInit
+        : patch.shellInit === null || patch.shellInit === ""
+          ? null
+          : validateShellInitField(patch.shellInit),
   };
   const next = [...all];
   next[idx] = merged;
@@ -302,24 +328,61 @@ export function buildSshArgsForProbe(host: SshHost): string[] {
  * a single token (single-line bash) — every dynamic substring is
  * shell-escaped via {@link shellEscape}.
  *
- * The inner command is wrapped in `${SHELL:-/bin/bash} -lc <escaped>`
- * so the remote shell runs as a **login shell**. Without `-l` the
- * remote shell is non-interactive non-login and does NOT source the
- * operator's profile (`~/.bash_profile`, `~/.profile`, `~/.zprofile`),
- * which is where modern node installs (nvm, fnm, asdf, homebrew on
- * macOS) put `npm` on PATH. The symptom of skipping this wrapper is a
- * remote-side `bash: npm: command not found`.
+ * The inner command is wrapped in `bash -lc <escaped>` so the remote
+ * runs as a **bash login shell**. We deliberately hard-code `bash`
+ * rather than `$SHELL` because `bash -l` has a POSIX-defined
+ * login-shell init chain that ALWAYS includes `~/.bash_profile`
+ * (followed by `~/.bash_login` and `~/.profile`). The previous
+ * `${SHELL:-/bin/bash}` form expanded to `/bin/zsh` on macOS hosts
+ * where the operator's default shell is zsh — and `zsh -lc` sources
+ * `~/.zprofile` but NOT `~/.bash_profile`, so an nvm install in
+ * `~/.bash_profile` was invisible. Hard-coding bash gives us a
+ * predictable PATH-loading path regardless of the operator's default
+ * shell.
  *
- * `$SHELL` expands on the REMOTE side — it stays as a literal token
- * here. The `${SHELL:-/bin/bash}` form falls back to `/bin/bash` on
- * stripped-down hosts where `$SHELL` isn't exported (rare). Using the
- * operator's login shell (rather than hard-coding bash) handles
- * zsh-default macOS hosts whose PATH lives in `~/.zprofile`, which
- * `bash -l` would not source.
+ * Defensive belt-and-suspenders: the inner command is ALSO prefixed
+ * with `[ -f ~/.bash_profile ] && . ~/.bash_profile;` (or the host's
+ * `shellInit` override) so even when something interferes with the
+ * login-shell init chain, the operator's PATH is loaded explicitly.
+ * The `[ -f … ] &&` guard makes the prefix safe on hosts that lack
+ * `~/.bash_profile`, and the trailing `;` (not `&&`) keeps the rest
+ * of the chain running even if the source command returns non-zero.
+ *
+ * If the operator's PATH lives somewhere other than `~/.bash_profile`
+ * (e.g. nvm-only-in-zshrc), they can register a host with a
+ * `shellInit` field (`. ~/.zshrc`, `. ~/.nvm/nvm.sh && nvm use 22`,
+ * etc.) and that snippet replaces the default prefix.
  */
 export function buildSshArgsForLaunch(host: SshHost, remoteCmd: string): string[] {
-  const wrapped = `\${SHELL:-/bin/bash} -lc ${shellEscape(remoteCmd)}`;
+  const prefix = buildShellInitPrefix(host);
+  const inner = `${prefix}${remoteCmd}`;
+  const wrapped = `bash -lc ${shellEscape(inner)}`;
   return [...buildBaseSshArgs(host, { connectTimeout: 10 }), wrapped];
+}
+
+/**
+ * Default shell-init snippet sourced before the `cd && npm` chain.
+ * Wrapped in an `[ -f … ] &&` guard so it's a safe no-op on hosts that
+ * lack `~/.bash_profile`. Trailing `;` (not `&&`) so an empty/failing
+ * source command doesn't abort the launch chain.
+ */
+export const DEFAULT_SHELL_INIT_PREFIX = "[ -f ~/.bash_profile ] && . ~/.bash_profile";
+
+/**
+ * Build the shell-init prefix string for the given host. Returns the
+ * snippet terminated with `; ` so it composes cleanly with the rest of
+ * the single-line bash command. When the host has a non-empty
+ * `shellInit` field, that value REPLACES the default — the operator
+ * is opting in fully.
+ */
+function buildShellInitPrefix(host: SshHost): string {
+  const init =
+    host.shellInit !== null && host.shellInit !== "" ? host.shellInit : DEFAULT_SHELL_INIT_PREFIX;
+  // Trim any trailing whitespace + terminator the operator may have
+  // typed so we produce a canonical `<snippet>; ` form regardless of
+  // input style.
+  const trimmed = init.replace(/[\s;&]+$/, "");
+  return `${trimmed}; `;
 }
 
 function buildBaseSshArgs(host: SshHost, opts: { connectTimeout: number }): string[] {
@@ -465,6 +528,10 @@ function buildHost(spec: SshHostInput, now: number): SshHost {
       spec.notes === undefined || spec.notes === null || spec.notes === ""
         ? null
         : validateNotesField(spec.notes),
+    shellInit:
+      spec.shellInit === undefined || spec.shellInit === null || spec.shellInit === ""
+        ? null
+        : validateShellInitField(spec.shellInit),
     addedAt: now,
   };
 }
@@ -483,6 +550,13 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
     o.sshKey === undefined || o.sshKey === null ? null : expectString(o.sshKey, `${where}.sshKey`);
   const notes =
     o.notes === undefined || o.notes === null ? null : expectString(o.notes, `${where}.notes`);
+  // `shellInit` is a forward-compat optional field — registries
+  // written before the field existed simply lack the key, which is
+  // treated as `null` (use the default `. ~/.bash_profile` prefix).
+  const shellInit =
+    o.shellInit === undefined || o.shellInit === null
+      ? null
+      : expectString(o.shellInit, `${where}.shellInit`);
   // Run the same regex/path checks on the stored row — if a malicious
   // operator hand-edited hosts.json to inject shell metacharacters or
   // a relative path, we refuse to load it.
@@ -493,6 +567,7 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
     sshKey: sshKey === null ? null : validateSshKeyField(sshKey, { mustExist: false }),
     reposPath: validateReposPathField(reposPath),
     notes: notes === null ? null : validateNotesField(notes),
+    shellInit: shellInit === null || shellInit === "" ? null : validateShellInitField(shellInit),
     addedAt,
   };
 }
@@ -592,6 +667,39 @@ export function validateNotesField(raw: string): string {
   }
   if (raw.length > 2048) {
     throw new SshHostValidationError(`notes too long (max 2048 chars)`);
+  }
+  return raw;
+}
+
+/**
+ * Validate a `shellInit` snippet. The field is operator-supplied bash
+ * that runs on the remote BEFORE the `cd && npm` chain, so we do not
+ * try to sandbox it — the operator already has full shell access to
+ * the remote via the SSH login they configured. We only reject input
+ * that is obviously garbage: NUL bytes, newlines/CRs (the launch
+ * command is single-line bash; embedded newlines would break the
+ * argv-quoting contract), and overlong values.
+ *
+ * Maximum length is 512 chars — enough for a chained
+ * `. ~/.nvm/nvm.sh && nvm use 22 && export PATH=…` recipe but
+ * nowhere near enough to hide a full payload.
+ */
+export function validateShellInitField(raw: string): string {
+  if (raw === "") {
+    // Callers should be passing `null` instead of `""` to mean
+    // "no shellInit"; reaching here means a programmer error.
+    throw new SshHostValidationError(`shellInit must be a non-empty string when provided`);
+  }
+  if (raw.includes("\0")) {
+    throw new SshHostValidationError(`shellInit must not contain NUL bytes`);
+  }
+  if (/[\r\n]/.test(raw)) {
+    throw new SshHostValidationError(
+      `shellInit must not contain newline or carriage-return characters`,
+    );
+  }
+  if (raw.length > 512) {
+    throw new SshHostValidationError(`shellInit too long (max 512 chars)`);
   }
   return raw;
 }

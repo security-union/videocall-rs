@@ -2595,6 +2595,10 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
   if (notes !== undefined && notes !== null && typeof notes !== "string") {
     throw new ControlServerError(400, '"notes" must be a string or null');
   }
+  const shellInit = body.shellInit;
+  if (shellInit !== undefined && shellInit !== null && typeof shellInit !== "string") {
+    throw new ControlServerError(400, '"shellInit" must be a string or null');
+  }
   return {
     label,
     host,
@@ -2602,6 +2606,7 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
     user: user as string | undefined,
     sshKey: sshKey === undefined ? undefined : (sshKey as string | null),
     notes: notes === undefined ? undefined : (notes as string | null),
+    shellInit: shellInit === undefined ? undefined : (shellInit as string | null),
   };
 }
 
@@ -2636,6 +2641,12 @@ function parseHostPatch(body: Record<string, unknown>): SshHostPatch {
       throw new ControlServerError(400, '"notes" must be a string or null when provided');
     }
     patch.notes = body.notes as string | null;
+  }
+  if (body.shellInit !== undefined) {
+    if (body.shellInit !== null && typeof body.shellInit !== "string") {
+      throw new ControlServerError(400, '"shellInit" must be a string or null when provided');
+    }
+    patch.shellInit = body.shellInit as string | null;
   }
   return patch;
 }

@@ -136,12 +136,17 @@ Launch form can target. Each row is persisted to `<runDir>/hosts.json` (mode
 `0o600`); credentials are sourced from your local `ssh-agent` and
 `~/.ssh/config` — the dashboard does not store private-key material.
 
-The remote command is wrapped in `${SHELL:-/bin/bash} -lc` so the remote shell
-runs as a login shell and sources your profile (`~/.bash_profile`, `~/.profile`,
-or `~/.zprofile`). This is necessary for nvm / fnm / asdf / homebrew node
-installs — without the wrapper, SSH's default non-interactive non-login shell
-skips PATH init and you'll see `bash: npm: command not found` on the remote. If
-`npm` is still not found, ensure it's exported from one of those profile files.
+The remote command is wrapped in `bash -lc` AND the inner command is prefixed
+with `[ -f ~/.bash_profile ] && . ~/.bash_profile;` so the operator's PATH
+(typically set by nvm / homebrew / asdf) loads on the remote. We hard-code
+`bash` (not `$SHELL`) so the login-shell init chain reliably sources
+`~/.bash_profile` — the previous `$SHELL` form expanded to `/bin/zsh` on
+zsh-default macOS hosts, where `zsh -lc` skips `~/.bash_profile`.
+
+If your `npm` lives in a different shell init file (e.g. nvm-only-in-zshrc),
+set the host's **Shell init** field (Tools → Remote Hosts → Add / Edit) to a
+snippet like `. ~/.zshrc` or `. ~/.nvm/nvm.sh && nvm use 22`. That snippet
+REPLACES the default `. ~/.bash_profile` prefix.
 
 v1 limitations:
 

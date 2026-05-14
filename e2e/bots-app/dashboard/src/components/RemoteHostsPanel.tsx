@@ -319,6 +319,7 @@ export function RemoteHostsPanel({ onToast }: RemoteHostsPanelProps) {
             sshKey: payload.sshKey ?? null,
             reposPath: payload.reposPath,
             notes: payload.notes ?? null,
+            shellInit: payload.shellInit ?? null,
           };
           updateMutation.mutate({ label: editHost.label, patch });
         }}
@@ -355,6 +356,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
   const [sshKey, setSshKey] = useState(initial?.sshKey ?? "");
   const [reposPath, setReposPath] = useState(initial?.reposPath ?? "");
   const [notes, setNotes] = useState(initial?.notes ?? "");
+  const [shellInit, setShellInit] = useState(initial?.shellInit ?? "");
   const [error, setError] = useState<string | null>(null);
 
   // Re-seed inputs when the dialog opens or when the row changes. We
@@ -370,6 +372,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
     setSshKey(initial?.sshKey ?? "");
     setReposPath(initial?.reposPath ?? "");
     setNotes(initial?.notes ?? "");
+    setShellInit(initial?.shellInit ?? "");
     setError(null);
   }, [open, initial]);
 
@@ -380,6 +383,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
     const trimmedUser = user.trim();
     const trimmedReposPath = reposPath.trim();
     const trimmedSshKey = sshKey.trim();
+    const trimmedShellInit = shellInit.trim();
 
     if (mode === "add" && !LABEL_PATTERN.test(trimmedLabel)) {
       setError("Label must be alphanumeric + hyphen, 1–63 chars, no leading hyphen.");
@@ -409,6 +413,14 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       setError("SSH key must be an absolute path (or leave empty to use ssh-agent).");
       return;
     }
+    if (trimmedShellInit.length > 512) {
+      setError("Shell init snippet too long (max 512 chars).");
+      return;
+    }
+    if (/[\r\n]/.test(trimmedShellInit)) {
+      setError("Shell init snippet must not contain newlines.");
+      return;
+    }
     setError(null);
     onSubmit({
       label: trimmedLabel,
@@ -417,6 +429,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       sshKey: trimmedSshKey === "" ? null : trimmedSshKey,
       reposPath: trimmedReposPath,
       notes: notes.trim() === "" ? null : notes.trim(),
+      shellInit: trimmedShellInit === "" ? null : trimmedShellInit,
     });
   };
 
@@ -614,6 +627,52 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
                 rows={2}
                 className={DIALOG_INPUT_CLASS}
                 data-testid="remote-host-dialog-notes"
+              />
+            </DialogField>
+
+            <DialogField
+              label="Shell init (optional)"
+              testIdSuffix="shellInit"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Shell init" testId="help-shellInit">
+                  <p>
+                    Optional. Shell commands to run before{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      cd
+                    </code>{" "}
+                    +{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      npm
+                    </code>{" "}
+                    on the remote, e.g.{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      . ~/.zshrc
+                    </code>{" "}
+                    or{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      . ~/.nvm/nvm.sh &amp;&amp; nvm use 22
+                    </code>
+                    . Leave blank to use the default{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      . ~/.bash_profile
+                    </code>
+                    . Use this if your PATH lives somewhere other than{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ~/.bash_profile
+                    </code>
+                    .
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <input
+                type="text"
+                value={shellInit}
+                onChange={(e) => setShellInit(e.target.value)}
+                placeholder=". ~/.zshrc  (leave empty for default . ~/.bash_profile)"
+                className={`${DIALOG_INPUT_CLASS} font-mono`}
+                data-testid="remote-host-dialog-shellInit"
               />
             </DialogField>
 

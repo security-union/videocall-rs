@@ -158,13 +158,12 @@ export function SshCommandPreview({
           </p>
           <p className="mt-1">
             The remote command is wrapped in{" "}
-            <code className="font-mono text-[11px]">${"{SHELL:-/bin/bash}"} -lc</code> so the
-            operator&apos;s login PATH is loaded (necessary for nvm / homebrew / asdf node
-            installs). If <code className="font-mono text-[11px]">npm</code> is still not found on
-            the remote, ensure it&apos;s exported by{" "}
-            <code className="font-mono text-[11px]">~/.bash_profile</code>,{" "}
-            <code className="font-mono text-[11px]">~/.profile</code>, or{" "}
-            <code className="font-mono text-[11px]">~/.zprofile</code>.
+            <code className="font-mono text-[11px]">bash -lc</code> AND explicitly sources{" "}
+            <code className="font-mono text-[11px]">~/.bash_profile</code> so the operator&apos;s
+            PATH (typically set by nvm / homebrew / asdf) loads on the remote. If{" "}
+            <code className="font-mono text-[11px]">npm</code> is in a different shell init file,
+            set the host&apos;s <code className="font-mono text-[11px]">shellInit</code> field
+            (Tools → Remote Hosts → Edit) to override.
           </p>
         </HelpPopover>
       </button>

@@ -9,6 +9,7 @@ import {
   buildRemoteLaunchCommand,
   buildSshArgsForLaunch,
   buildSshArgsForProbe,
+  DEFAULT_SHELL_INIT_PREFIX,
   getHost,
   hostsFilePath,
   HOSTS_FILE_MODE,
@@ -23,6 +24,7 @@ import {
   updateHost,
   validateHostField,
   validateLabelField,
+  validateShellInitField,
   validateUserField,
   type SshHost,
 } from "./ssh-hosts";
@@ -301,6 +303,7 @@ describe("buildSshArgs*", () => {
     sshKey: "/keys/id_ed25519",
     reposPath: "/home/alice/videocall",
     notes: null,
+    shellInit: null,
     addedAt: 0,
   };
 
@@ -319,25 +322,82 @@ describe("buildSshArgs*", () => {
   it("buildSshArgsForLaunch uses ConnectTimeout=10", () => {
     const args = buildSshArgsForLaunch(host, "echo hi");
     expect(args).toContain("ConnectTimeout=10");
-    // The remote command is wrapped in `${SHELL:-/bin/bash} -lc <esc>`
-    // so the remote shell runs as a login shell (sources the operator's
-    // profile, which is where modern node installs put `npm` on PATH).
-    // The inner `echo hi` is shell-escaped exactly once into `'echo hi'`.
-    expect(args[args.length - 1]).toBe("${SHELL:-/bin/bash} -lc 'echo hi'");
+    // The remote command is wrapped in `bash -lc <esc>` so the remote
+    // shell runs as a bash login shell (which has a POSIX-defined init
+    // chain that sources `~/.bash_profile`). Additionally, the inner
+    // command is prefixed with `[ -f ~/.bash_profile ] && . ~/.bash_profile;`
+    // as a defensive belt-and-suspenders measure — see the long comment
+    // on `buildSshArgsForLaunch` for the rationale (macOS-zsh PATH
+    // pitfall + visibility for operators reading the executed command).
+    const tail = args[args.length - 1];
+    expect(tail).toBe("bash -lc '[ -f ~/.bash_profile ] && . ~/.bash_profile; echo hi'");
   });
 
-  it("buildSshArgsForLaunch wraps the remote command in $SHELL -lc (login shell)", () => {
+  it("buildSshArgsForLaunch wraps the remote command in bash -lc (login shell)", () => {
     // Regression: SSH's default non-interactive non-login shell does
     // NOT source ~/.bash_profile / ~/.profile / ~/.zprofile, so
     // operators who installed node via nvm / fnm / asdf / homebrew used
-    // to hit `bash: npm: command not found`. The login-shell wrapper
-    // forces the profile to load and puts `npm` back on PATH.
+    // to hit `bash: npm: command not found`. We hard-code `bash` (not
+    // `$SHELL`) because `bash -l` has a POSIX-defined login-shell init
+    // chain that always reads `~/.bash_profile` — `$SHELL` would expand
+    // to `/bin/zsh` on macOS, and `zsh -lc` does not source it.
     const args = buildSshArgsForLaunch(host, "cd '/p'/e2e && npm run bot");
     const tail = args[args.length - 1];
-    expect(tail.startsWith("${SHELL:-/bin/bash} -lc ")).toBe(true);
+    expect(tail.startsWith("bash -lc ")).toBe(true);
     // Inner command is single-quoted with `'\''` for embedded quotes —
-    // exactly one layer of escaping (not double).
-    expect(tail).toBe("${SHELL:-/bin/bash} -lc 'cd '\\''/p'\\''/e2e && npm run bot'");
+    // exactly one layer of escaping (not double). The defensive
+    // `[ -f ~/.bash_profile ] && . ~/.bash_profile;` prefix runs first.
+    expect(tail).toBe(
+      "bash -lc '[ -f ~/.bash_profile ] && . ~/.bash_profile; cd '\\''/p'\\''/e2e && npm run bot'",
+    );
+  });
+
+  it("prefixes the inner command with `. ~/.bash_profile` by default", () => {
+    // Belt-and-suspenders: even when bash -l would auto-source it, we
+    // explicitly source it again. The `[ -f … ] &&` guard makes the
+    // prefix safe on hosts that lack ~/.bash_profile.
+    const args = buildSshArgsForLaunch(host, "npm run bot");
+    const tail = args[args.length - 1];
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
+    // Trailing `;` (not `&&`) so a non-zero exit from the source
+    // doesn't abort the npm chain.
+    expect(tail).not.toContain(".bash_profile &&");
+    // Sanity: the default-prefix constant matches what's emitted.
+    expect(tail).toContain(DEFAULT_SHELL_INIT_PREFIX);
+  });
+
+  it("uses operator-supplied shellInit when set, replacing the default", () => {
+    // When the host has a non-empty `shellInit`, that snippet REPLACES
+    // the default `. ~/.bash_profile` prefix (no concatenation). This
+    // covers nvm-only-in-zshrc operators and similar non-standard
+    // setups.
+    const zshHost: SshHost = { ...host, shellInit: ". ~/.zshrc" };
+    const args = buildSshArgsForLaunch(zshHost, "npm run bot");
+    const tail = args[args.length - 1];
+    expect(tail).toBe("bash -lc '. ~/.zshrc; npm run bot'");
+    // The default prefix MUST NOT also appear — `shellInit` is a full
+    // replacement, not an addition.
+    expect(tail).not.toContain(".bash_profile");
+  });
+
+  it("falls back to the default prefix when shellInit is an empty string", () => {
+    // Defensive: an empty string and `null` both mean "use default".
+    // (Persistence canonicalizes empty → null at write time, but the
+    // builder must tolerate either at read time.)
+    const emptyHost: SshHost = { ...host, shellInit: "" };
+    const args = buildSshArgsForLaunch(emptyHost, "npm run bot");
+    const tail = args[args.length - 1];
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
+  });
+
+  it("strips trailing terminators from shellInit so the prefix joins cleanly", () => {
+    // Operators may end their snippet with `;` or `&&` or trailing
+    // whitespace. The builder canonicalizes the trailing token so the
+    // emitted prefix always reads `<snippet>; ` regardless of input.
+    const trailHost: SshHost = { ...host, shellInit: ". ~/.zshrc &&" };
+    const args = buildSshArgsForLaunch(trailHost, "npm run bot");
+    const tail = args[args.length - 1];
+    expect(tail).toBe("bash -lc '. ~/.zshrc; npm run bot'");
   });
 
   it("omits -i when sshKey is null", () => {
@@ -349,6 +409,128 @@ describe("buildSshArgs*", () => {
     const args = buildSshArgsForProbe({ ...host, host: "example.com" });
     expect(args).not.toContain("-p");
     expect(args).toContain("alice@example.com");
+  });
+});
+
+describe("validateShellInitField", () => {
+  it("accepts a typical zshrc source line", () => {
+    expect(validateShellInitField(". ~/.zshrc")).toBe(". ~/.zshrc");
+  });
+
+  it("accepts a chained nvm + npm setup", () => {
+    const v = ". ~/.nvm/nvm.sh && nvm use 22";
+    expect(validateShellInitField(v)).toBe(v);
+  });
+
+  it("rejects an empty string (callers must pass null instead)", () => {
+    expect(() => validateShellInitField("")).toThrow(SshHostValidationError);
+  });
+
+  it("rejects embedded newlines (would break single-line bash contract)", () => {
+    expect(() => validateShellInitField(". ~/.zshrc\nrm -rf /")).toThrow(SshHostValidationError);
+    expect(() => validateShellInitField("a\rb")).toThrow(SshHostValidationError);
+  });
+
+  it("rejects embedded NUL bytes", () => {
+    expect(() => validateShellInitField("a\0b")).toThrow(SshHostValidationError);
+  });
+
+  it("rejects strings longer than 512 chars", () => {
+    expect(() => validateShellInitField("a".repeat(513))).toThrow(SshHostValidationError);
+    // 512 exactly is the boundary — must be accepted.
+    const exact = "a".repeat(512);
+    expect(validateShellInitField(exact)).toBe(exact);
+  });
+});
+
+describe("ssh-hosts shellInit persistence", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tempDir();
+  });
+
+  it("addHost persists shellInit when supplied", async () => {
+    const host = await addHost(dir, {
+      label: "zsh-mac",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+      shellInit: ". ~/.zshrc",
+    });
+    expect(host.shellInit).toBe(". ~/.zshrc");
+    const reloaded = await getHost(dir, "zsh-mac");
+    expect(reloaded?.shellInit).toBe(". ~/.zshrc");
+  });
+
+  it("addHost defaults shellInit to null when not supplied", async () => {
+    const host = await addHost(dir, {
+      label: "default-init",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+    });
+    expect(host.shellInit).toBeNull();
+  });
+
+  it("addHost treats empty-string shellInit as null", async () => {
+    const host = await addHost(dir, {
+      label: "empty-init",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+      shellInit: "",
+    });
+    expect(host.shellInit).toBeNull();
+  });
+
+  it("updateHost sets shellInit when patched with a value", async () => {
+    await addHost(dir, {
+      label: "init-me",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+    });
+    const patched = await updateHost(dir, "init-me", { shellInit: ". ~/.zshrc" });
+    expect(patched.shellInit).toBe(". ~/.zshrc");
+  });
+
+  it("updateHost clears shellInit when patched with null", async () => {
+    await addHost(dir, {
+      label: "clear-me",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+      shellInit: ". ~/.zshrc",
+    });
+    const patched = await updateHost(dir, "clear-me", { shellInit: null });
+    expect(patched.shellInit).toBeNull();
+  });
+
+  it("listHosts tolerates legacy rows that lack the shellInit key", async () => {
+    // Forward-compat: registries written before this field existed
+    // simply lack the key. They must load as `shellInit: null` rather
+    // than failing validation.
+    writeFileSync(
+      hostsFilePath(dir),
+      JSON.stringify({
+        version: 1,
+        hosts: [
+          {
+            label: "legacy",
+            host: "h",
+            user: "alice",
+            sshKey: null,
+            reposPath: "/home/alice/videocall",
+            notes: null,
+            addedAt: 0,
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const all = await listHosts(dir);
+    expect(all).toHaveLength(1);
+    expect(all[0].shellInit).toBeNull();
   });
 });
 
@@ -441,6 +623,7 @@ describe("testHost (with stubbed spawn)", () => {
       sshKey: null,
       reposPath: "/home/alice/videocall",
       notes: null,
+      shellInit: null,
       addedAt: 0,
     };
     const fakeSpawn = stubSpawn({ stdout: "different output\n", code: 0 });

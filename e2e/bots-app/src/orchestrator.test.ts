@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { countFailed } from "./orchestrator";
+import { buildLaunchedBotTask, countFailed } from "./orchestrator";
 import { newRegistryEntry, type BotRegistryEntry } from "./control/registry";
+import type { LaunchSpec } from "./control/server";
+import { parseManifestText } from "./manifest";
 import type { BotTask } from "./orchestrator";
 
 function task(participant: string): BotTask {
@@ -138,5 +140,95 @@ describe("orchestrator.countFailed (failure-tally classification)", () => {
       registry.set(e.botId, e);
     }
     expect(countFailed(registry)).toBe(2);
+  });
+});
+
+describe("orchestrator.buildLaunchedBotTask (dashboard /launch shape)", () => {
+  const MANIFEST_FIXTURE = `
+participants:
+- name: alice
+  costume_dir: assets/costumes/pirate
+- name: tina
+pause_ms: 0
+lines:
+- speaker: alice
+  audio_file: lines/line_000.wav
+`;
+
+  function baseSpec(overrides: Partial<LaunchSpec> = {}): LaunchSpec {
+    return {
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+      ttl: 300_000,
+      headless: false,
+      network: "none",
+      authBackend: "jwt",
+      ...overrides,
+    };
+  }
+
+  it("threads the orchestrator-loaded manifest + runDir into the BotTask", () => {
+    const manifest = parseManifestText(MANIFEST_FIXTURE);
+    const task = buildLaunchedBotTask(baseSpec(), {
+      manifest,
+      runDir: "/tmp/bots-app-run",
+    });
+    expect(task.manifest).toBe(manifest);
+    expect(task.runDir).toBe("/tmp/bots-app-run");
+    // No override picked → costumeOverride/audioOverride are null, so
+    // bot.ts falls through to the manifest auto-match path.
+    expect(task.costumeOverride).toBeNull();
+    expect(task.audioOverride).toBeNull();
+    expect(task.participant).toBe("alice");
+    expect(task.displayName).toBe("Alice");
+  });
+
+  it("forwards explicit costume + audio overrides as basenames", () => {
+    const manifest = parseManifestText(MANIFEST_FIXTURE);
+    const task = buildLaunchedBotTask(baseSpec({ costume: "pirate.y4m", audio: "alice.wav" }), {
+      manifest,
+      runDir: "/tmp/bots-app-run",
+    });
+    expect(task.costumeOverride).toBe("pirate.y4m");
+    expect(task.audioOverride).toBe("alice.wav");
+    // Manifest still attached so a missing override file can fall
+    // back to the auto-match path.
+    expect(task.manifest).toBe(manifest);
+  });
+
+  it('collapses costume/audio="default" to null overrides (no operator pick)', () => {
+    const task = buildLaunchedBotTask(baseSpec({ costume: "default", audio: "default" }), {
+      manifest: null,
+      runDir: "/tmp/bots-app-run",
+    });
+    expect(task.costumeOverride).toBeNull();
+    expect(task.audioOverride).toBeNull();
+  });
+
+  it("falls back gracefully when the orchestrator has no manifest", () => {
+    const task = buildLaunchedBotTask(baseSpec(), {
+      manifest: null,
+      runDir: "/tmp/bots-app-run",
+    });
+    expect(task.manifest).toBeNull();
+    // runDir still propagates so an explicit override can still work
+    // even without a manifest.
+    expect(task.runDir).toBe("/tmp/bots-app-run");
+  });
+
+  it('collapses network="none" to null so ?netsim= is not appended', () => {
+    const task = buildLaunchedBotTask(baseSpec({ network: "none" }), {
+      manifest: null,
+      runDir: null,
+    });
+    expect(task.network).toBeNull();
+  });
+
+  it("clears storageStateFile when authBackend is not storage-state", () => {
+    const task = buildLaunchedBotTask(
+      baseSpec({ authBackend: "jwt", storageStateFile: "/run/auth/alice.json" }),
+      { manifest: null, runDir: null },
+    );
+    expect(task.storageStateFile).toBeNull();
   });
 });

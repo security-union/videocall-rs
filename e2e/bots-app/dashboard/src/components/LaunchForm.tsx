@@ -283,6 +283,16 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
         ? ssoStatusQuery.data.filePath
         : undefined;
 
+    // Costume / audio are pipe-through fields: the orchestrator's
+    // `/launch` endpoint validates the basename against
+    // `ASSET_FILENAME_PATTERN` and rejects any path-like value. The
+    // sentinel `"default"` (and the empty string) collapse to
+    // `undefined` so the server doesn't run the basename regex on a
+    // non-file value.
+    const costume =
+      values.costume && values.costume !== "default" ? values.costume : undefined;
+    const audio = values.audio && values.audio !== "default" ? values.audio : undefined;
+
     const req: LaunchRequest = {
       meetingURL: values.meetingURL.trim(),
       participant: values.participant.trim(),
@@ -296,6 +306,8 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           ? values.storageStateFile.trim() || undefined
           : undefined,
       ssoStateFile,
+      costume,
+      audio,
       runLocation: values.runLocation as LaunchRequest["runLocation"],
     };
     launchMutation.mutate(req);

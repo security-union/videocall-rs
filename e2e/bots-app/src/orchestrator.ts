@@ -14,6 +14,7 @@ import {
   type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
+import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
@@ -153,6 +154,41 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     console.log("[orchestrator] starting with 0 bots; waiting for dashboard / ctl to add some");
   }
 
+  // Pre-load the conversation manifest once at startup when the
+  // control server is attached, so dashboard-launched bots can inherit
+  // the participant → costume / audio auto-match (matching the legacy
+  // CLI behavior). Without this, `launchOne` built BotTask values with
+  // `manifest: null, runDir: null` and the bot.ts launch path silently
+  // skipped the Chrome `--use-file-for-fake-*-capture` flags — so
+  // dashboard-launched bots showed the gray pattern + sine tone
+  // instead of the prep'd y4m + stitched WAV the auto-match panel
+  // promised.
+  //
+  // Failure is non-fatal: a missing or malformed manifest degrades to
+  // null (the same "no auto-match available" state the /assets/manifest
+  // route surfaces to the dashboard), and operators' explicit
+  // costume / audio dropdown picks still take effect via the override
+  // path on launchOne.
+  let dashboardManifest: Manifest | null = null;
+  if (opts.control?.manifestPath) {
+    if (existsSync(opts.control.manifestPath)) {
+      try {
+        dashboardManifest = loadManifest(opts.control.manifestPath).manifest;
+        console.log(
+          `[orchestrator] dashboard manifest loaded from ${opts.control.manifestPath} (${dashboardManifest.participants.length} participant(s))`,
+        );
+      } catch (e) {
+        console.warn(
+          `[orchestrator] dashboard manifest at ${opts.control.manifestPath} failed to parse: ${(e as Error).message} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+        );
+      }
+    } else {
+      console.warn(
+        `[orchestrator] dashboard manifest not found at ${opts.control.manifestPath} — dashboard-launched bots will fall back to default fake devices unless an operator explicitly picks costume/audio.`,
+      );
+    }
+  }
+
   // Build the control surface up front so we can hand it to the
   // server before any bot finishes — the server can be queried the
   // instant it's listening.
@@ -210,37 +246,10 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       await toggleScreenShare(entry, share);
     },
     launchOne: async (spec: LaunchSpec) => {
-      // Resolve SSO state path with this priority:
-      //   1. explicit `spec.ssoStateFile` (dashboard launch form sets
-      //      this when the captured file exists)
-      //   2. the conventional `<runDir>/auth/hcl-sso.json` if it
-      //      happens to be present — matches the CLI default
-      //   3. null (no SSO state — bot will hit the SSO portal if the
-      //      target sits behind one)
-      let ssoStateFile: string | null = null;
-      if (spec.authBackend === "jwt") {
-        if (spec.ssoStateFile && spec.ssoStateFile !== "") {
-          ssoStateFile = spec.ssoStateFile;
-        } else if (opts.control?.runDir) {
-          const candidate = defaultSsoStatePath(opts.control.runDir);
-          if (existsSync(candidate)) ssoStateFile = candidate;
-        }
-      }
-      const newTask: BotTask = {
-        botId: generateBotId(),
-        meetingURL: spec.meetingURL,
-        participant: spec.participant,
-        displayName: spec.displayName ?? defaultDisplayName(spec.participant),
-        headless: spec.headless,
-        authBackend: spec.authBackend,
-        storageStateFile:
-          spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
-        ssoStateFile,
-        manifest: null,
-        runDir: null,
-        ttl: spec.ttl,
-        network: spec.network === "none" ? null : spec.network,
-      };
+      const newTask = buildLaunchedBotTask(spec, {
+        manifest: dashboardManifest,
+        runDir: opts.control?.runDir ?? null,
+      });
       registerTask(newTask);
       console.log(
         `[orchestrator] dashboard-launch → ${newTask.participant}@${shortBotId(newTask.botId)}`,
@@ -701,6 +710,59 @@ export function countFailed(registry: Map<string, BotRegistryEntry>): number {
     if (entry.status === "failed") n++;
   }
   return n;
+}
+
+/**
+ * Build a {@link BotTask} from a {@link LaunchSpec} the control
+ * server's `/launch` handler accepted, plus the orchestrator's loaded
+ * dashboard manifest + runDir. Pure (no I/O except an optional
+ * `existsSync` on the SSO state file) so the orchestrator's
+ * dashboard-launch shape is unit-testable without spawning Playwright.
+ *
+ * Semantics:
+ *   - `manifest` + `runDir` from the orchestrator are threaded through
+ *     so bot.ts's auto-match block fires for dashboard-launched bots.
+ *   - `costume` / `audio` overrides in the spec collapse to `null`
+ *     when set to the sentinel `"default"` (or the empty string) —
+ *     same as "operator made no pick".
+ *   - SSO state path resolution falls through: explicit spec value →
+ *     conventional `<runDir>/auth/hcl-sso.json` if it exists → null.
+ *   - `network === "none"` collapses to `null` so the `?netsim=` query
+ *     param is NOT appended on launch.
+ */
+export function buildLaunchedBotTask(
+  spec: LaunchSpec,
+  deps: { manifest: Manifest | null; runDir: string | null },
+): BotTask {
+  let ssoStateFile: string | null = null;
+  if (spec.authBackend === "jwt") {
+    if (spec.ssoStateFile && spec.ssoStateFile !== "") {
+      ssoStateFile = spec.ssoStateFile;
+    } else if (deps.runDir) {
+      const candidate = defaultSsoStatePath(deps.runDir);
+      if (existsSync(candidate)) ssoStateFile = candidate;
+    }
+  }
+  const costumeOverride =
+    spec.costume && spec.costume !== "" && spec.costume !== "default" ? spec.costume : null;
+  const audioOverride =
+    spec.audio && spec.audio !== "" && spec.audio !== "default" ? spec.audio : null;
+  return {
+    botId: generateBotId(),
+    meetingURL: spec.meetingURL,
+    participant: spec.participant,
+    displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+    headless: spec.headless,
+    authBackend: spec.authBackend,
+    storageStateFile: spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
+    ssoStateFile,
+    manifest: deps.manifest,
+    runDir: deps.runDir,
+    costumeOverride,
+    audioOverride,
+    ttl: spec.ttl,
+    network: spec.network === "none" ? null : spec.network,
+  };
 }
 
 // `parseDuration` is exported by `./ttl`; re-exporting here keeps the

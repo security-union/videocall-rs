@@ -380,6 +380,122 @@ describe("control server", () => {
     expect(launch!).toContain(`"authBackend":"none"`);
   });
 
+  it("POST /launch forwards costume + audio overrides to surface.launchOne", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        costume: "pirate.y4m",
+        audio: "alice.wav",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    expect(launch!).toContain(`"costume":"pirate.y4m"`);
+    expect(launch!).toContain(`"audio":"alice.wav"`);
+  });
+
+  it("POST /launch rejects costume containing directory traversal", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        costume: "../etc/passwd",
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(surface.callLog.filter((l) => l.startsWith("launch:"))).toHaveLength(0);
+  });
+
+  it("POST /launch rejects costume with path separators", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        costume: "subdir/pirate.y4m",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /launch rejects audio with the wrong extension", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        audio: "alice.mp3",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /launch accepts costume: "default" as the sentinel for no override', async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+        costume: "default",
+        audio: "default",
+      },
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("POST /launch with no costume/audio omits them from the launch spec (orchestrator uses manifest auto-match)", async () => {
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    // costume + audio MUST be absent from the spec so the orchestrator
+    // can distinguish "operator made no pick" (apply auto-match) from
+    // "operator picked default" (still no override, but the form was
+    // touched).
+    expect(launch!).not.toMatch(/"costume":/);
+    expect(launch!).not.toMatch(/"audio":/);
+  });
+
   it("POST /launch rejects an unknown authBackend value", async () => {
     const res = await fetchJson(handle.port, `/launch`, {
       method: "POST",

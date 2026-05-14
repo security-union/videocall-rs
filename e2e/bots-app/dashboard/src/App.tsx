@@ -6,6 +6,7 @@ import { Layout } from "./components/Layout";
 import { BotsPage } from "./pages/BotsPage";
 import { AboutPage } from "./pages/AboutPage";
 import { HelpPage } from "./pages/HelpPage";
+import { ToolsPage } from "./pages/ToolsPage";
 import { ThemeProvider } from "./lib/theme";
 
 /**
@@ -27,13 +28,15 @@ const queryClient = new QueryClient({
   },
 });
 
-export type Route = "bots" | "help" | "about";
+export type Route = "bots" | "tools" | "help" | "about";
 
 export function App() {
   const [route, setRoute] = useState<Route>("bots");
   let page;
   if (route === "bots") {
     page = <BotsPage />;
+  } else if (route === "tools") {
+    page = <ToolsPage />;
   } else if (route === "help") {
     page = <HelpPage />;
   } else {

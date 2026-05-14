@@ -4,9 +4,22 @@ import type {
   BotSnapshot,
   DaemonInfo,
   HealthResponse,
+  LaunchFromConfigPreviewResponse,
+  LaunchFromConfigRequest,
+  LaunchFromConfigResponse,
   LaunchProfileResponse,
   LaunchRequest,
   LaunchResponse,
+  MultiLaunchRequest,
+  MultiLaunchResponse,
+  OauthCaptureCancelResponse,
+  OauthCaptureStartRequest,
+  OauthCaptureStartResponse,
+  OauthSessionInfo,
+  OauthSessionsResponse,
+  PrepAssetsJobStatus,
+  PrepAssetsStartRequest,
+  PrepAssetsStartResponse,
   ProfileListResponse,
   RunProfile,
   SaveProfileRequest,
@@ -157,4 +170,74 @@ export const api = {
   // ──────────────────────────────────────────────────────────────────
   assetsManifest: (): Promise<AssetsManifestResponse> =>
     request<AssetsManifestResponse>("GET", "/api/assets/manifest"),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Multi-launch (first-N + random-N) and YAML config import. Closes
+  // the CLI-vs-dashboard gap for `bots-app run --users N` and
+  // `bots-app gen` (deterministic random pick).
+  // ──────────────────────────────────────────────────────────────────
+  launchMulti: (req: MultiLaunchRequest): Promise<MultiLaunchResponse> =>
+    request<MultiLaunchResponse>(
+      "POST",
+      "/api/launch/multi",
+      req as unknown as Record<string, unknown>,
+    ),
+  launchFromConfig: (req: LaunchFromConfigRequest): Promise<LaunchFromConfigResponse> =>
+    request<LaunchFromConfigResponse>(
+      "POST",
+      "/api/launch/from-config",
+      req as unknown as Record<string, unknown>,
+    ),
+  previewFromConfig: (configYaml: string): Promise<LaunchFromConfigPreviewResponse> =>
+    request<LaunchFromConfigPreviewResponse>(
+      "POST",
+      "/api/launch/from-config/preview",
+      { configYaml },
+    ),
+
+  // ──────────────────────────────────────────────────────────────────
+  // OAuth session capture (Google OAuth via `bots-app login` equivalent).
+  // Sibling of the HCL SSO recapture flow but per-account; each
+  // captured file lives at <runDir>/auth/<label>.json and is replayed
+  // by storage-state auth.
+  // ──────────────────────────────────────────────────────────────────
+  oauthSessions: (): Promise<OauthSessionsResponse> =>
+    request<OauthSessionsResponse>("GET", "/api/oauth/sessions"),
+  oauthCaptureStart: (req: OauthCaptureStartRequest): Promise<OauthCaptureStartResponse> =>
+    request<OauthCaptureStartResponse>(
+      "POST",
+      "/api/oauth/capture",
+      req as unknown as Record<string, unknown>,
+    ),
+  oauthCaptureComplete: (sessionId: string): Promise<OauthSessionInfo> =>
+    request<OauthSessionInfo>(
+      "POST",
+      `/api/oauth/capture/${encodeURIComponent(sessionId)}/complete`,
+    ),
+  oauthCaptureCancel: (sessionId: string): Promise<OauthCaptureCancelResponse> =>
+    request<OauthCaptureCancelResponse>(
+      "DELETE",
+      `/api/oauth/capture/${encodeURIComponent(sessionId)}`,
+    ),
+  oauthSessionDelete: (label: string): Promise<{ label: string; deleted: boolean }> =>
+    request("DELETE", `/api/oauth/sessions/${encodeURIComponent(label)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // prep-assets background-job lifecycle. The SSE stream is consumed
+  // directly via `new EventSource(...)` rather than through this
+  // typed-request wrapper because EventSource is its own protocol.
+  // ──────────────────────────────────────────────────────────────────
+  prepAssetsStart: (req: PrepAssetsStartRequest = {}): Promise<PrepAssetsStartResponse> =>
+    request<PrepAssetsStartResponse>(
+      "POST",
+      "/api/assets/prep",
+      req as unknown as Record<string, unknown>,
+    ),
+  prepAssetsStatus: (jobId: string): Promise<PrepAssetsJobStatus> =>
+    request<PrepAssetsJobStatus>(
+      "GET",
+      `/api/assets/prep/${encodeURIComponent(jobId)}`,
+    ),
+  prepAssetsForget: (jobId: string): Promise<{ jobId: string; deleted: boolean }> =>
+    request("DELETE", `/api/assets/prep/${encodeURIComponent(jobId)}`),
 };

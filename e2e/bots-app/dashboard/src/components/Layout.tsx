@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Bot, CircleDot, HelpCircle, Info } from "lucide-react";
+import { Bot, CircleDot, HelpCircle, Info, Wrench } from "lucide-react";
 
 import { api } from "../api/client";
 import type { Route } from "../App";
@@ -88,6 +88,14 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
                 onClick={() => onNavigate("bots")}
                 icon={<Bot className="h-4 w-4" />}
                 label="Bots"
+              />
+            </li>
+            <li>
+              <NavItem
+                active={currentRoute === "tools"}
+                onClick={() => onNavigate("tools")}
+                icon={<Wrench className="h-4 w-4" />}
+                label="Tools"
               />
             </li>
             <li>

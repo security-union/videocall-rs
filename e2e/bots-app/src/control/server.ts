@@ -1,18 +1,41 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultSsoStatePath } from "../auth/storage-state";
+import {
+  defaultSsoStatePath,
+  storageStatePath,
+  DEFAULT_SSO_STATE_BASENAME,
+} from "../auth/storage-state";
 import {
   DEFAULT_SSO_START_URL,
   openSsoCaptureBrowser,
   type SsoCaptureSession,
 } from "../auth/sso-capture";
-import { costumeNameForParticipant, loadManifest, type Manifest } from "../manifest";
-import { NETSIM_PRESETS } from "../meeting-config";
+import {
+  costumeNameForParticipant,
+  firstNParticipantNames,
+  loadManifest,
+  type Manifest,
+} from "../manifest";
+import {
+  NETSIM_PRESETS,
+  parseMeetingConfigText,
+  seededRng,
+  shuffleSeeded,
+  type MeetingConfig,
+} from "../meeting-config";
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
+import {
+  createPrepAssetsJob,
+  type PrepAssetsJob,
+  type PrepAssetsOptions,
+  runPrepAssetsJob,
+  sweepStalePrepAssetsJobs,
+  validatePrepAssetsPath,
+} from "./prep-assets";
 import {
   deleteProfile,
   listProfiles,
@@ -158,6 +181,25 @@ export const SSO_RECAPTURE_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 export const ASSETS_MANIFEST_CACHE_MS = 30_000;
 
 /**
+ * Server-side cap on the number of bots a single multi-launch /
+ * from-config request may spawn. Matches the legacy CLI's
+ * `--max-users 10` default. Operators who genuinely need a larger fleet
+ * pass an explicit `maxUsers` field in the request body, but the
+ * dashboard's form does not surface that knob to keep the UX simple.
+ */
+export const MULTI_LAUNCH_DEFAULT_MAX = 10;
+
+/**
+ * Filename pattern accepted by the OAuth-session endpoints. Allows
+ * alphanumerics, hyphen, underscore, dot, and @-sign — matching the
+ * legacy CLI's `bots-app login <account>` handle expectations (e.g.
+ * `alice`, `alice.smith`, `alice@example.com`). Rejects any path
+ * separator, leading dot, `..`, etc. so the resulting file cannot
+ * escape `<runDir>/auth/`.
+ */
+export const OAUTH_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$/;
+
+/**
  * Bind options for the control server. `port: 0` (the default) asks
  * the kernel for a free ephemeral port — used by `--ctl-port auto`
  * on the CLI and by the in-process integration tests.
@@ -239,6 +281,21 @@ interface SsoRecaptureEntry {
 }
 
 /**
+ * Per-session entry tracked in the OAuth capture map. Mirrors
+ * {@link SsoRecaptureEntry} but additionally records the operator-
+ * supplied `label` — used to derive the save path
+ * (`<runDir>/auth/<label>.json`) when the operator clicks "save".
+ */
+interface OauthCaptureEntry {
+  id: string;
+  label: string;
+  startUrl: string;
+  startedAt: number;
+  session: SsoCaptureSession;
+  idleTimer: ReturnType<typeof setTimeout>;
+}
+
+/**
  * One participant entry in the `/assets/manifest` response. `costumeFile`
  * and `audioFile` are basenames (e.g. `pirate.y4m`, `alice.wav`) the
  * dashboard's launch form pipes directly into its costume + audio
@@ -289,6 +346,8 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
   // server handle (closed-over here) so each `startControlServer` call
   // gets its own map — important for the in-process tests.
   const ssoRecaptureSessions: Map<string, SsoRecaptureEntry> = new Map();
+  const oauthCaptureSessions: Map<string, OauthCaptureEntry> = new Map();
+  const prepAssetsJobs: Map<string, PrepAssetsJob> = new Map();
   const idleTimeout = opts.ssoRecaptureIdleTimeoutMs ?? SSO_RECAPTURE_IDLE_TIMEOUT_MS;
   // Per-server response cache for /assets/manifest. Survives across
   // requests but is scoped to one `startControlServer` call so tests
@@ -309,6 +368,22 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
         );
       }
     }
+    // Tear down stranded OAuth capture sessions alongside SSO ones —
+    // they share the same Playwright Chromium pattern and the same
+    // shutdown semantics, so it would be confusing to leak one while
+    // closing the other.
+    const oauthEntries = Array.from(oauthCaptureSessions.values());
+    oauthCaptureSessions.clear();
+    for (const entry of oauthEntries) {
+      clearTimeout(entry.idleTimer);
+      try {
+        await entry.session.close();
+      } catch (e) {
+        console.warn(
+          `[control] failed to close stranded oauth capture ${entry.id}: ${(e as Error).message}`,
+        );
+      }
+    }
   };
 
   return new Promise<ControlServerHandle>((resolve, reject) => {
@@ -317,8 +392,9 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
         req,
         res,
         opts,
-        { ssoRecaptureSessions, idleTimeout },
+        { ssoRecaptureSessions, oauthCaptureSessions, idleTimeout },
         assetsManifestState,
+        prepAssetsJobs,
       ).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         sendJson(res, 500, { error: `internal error: ${msg}` });
@@ -353,6 +429,7 @@ export function startControlServer(opts: ControlServerOptions): Promise<ControlS
 
 interface SsoState {
   ssoRecaptureSessions: Map<string, SsoRecaptureEntry>;
+  oauthCaptureSessions: Map<string, OauthCaptureEntry>;
   idleTimeout: number;
 }
 
@@ -362,6 +439,7 @@ async function handleRequest(
   opts: ControlServerOptions,
   ssoState: SsoState,
   assetsManifestState: AssetsManifestCacheState,
+  prepAssetsJobs: Map<string, PrepAssetsJob>,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const { pathname } = url;
@@ -389,9 +467,29 @@ async function handleRequest(
   // path (vs a setInterval) keeps the orchestrator process truly
   // idle when nobody's polling, and is cheap enough at our scale.
   sweepStaleEntries(opts.surface.getRegistry());
+  sweepStalePrepAssetsJobs(prepAssetsJobs);
+
+  // SSE streaming route is handled out-of-band because it owns the
+  // response lifetime itself (writes its own headers, keeps the
+  // connection open, pushes events). All other routes go through the
+  // RouteResult-based `route` dispatcher below.
+  const prepStreamMatch = /^\/assets\/prep\/([^/]+)\/stream$/.exec(pathname);
+  if (prepStreamMatch && method === "GET") {
+    const jobId = decodeURIComponent(prepStreamMatch[1]);
+    handlePrepAssetsStream(req, res, prepAssetsJobs, jobId);
+    return;
+  }
 
   try {
-    const result = await route(req, opts, pathname, method, ssoState, assetsManifestState);
+    const result = await route(
+      req,
+      opts,
+      pathname,
+      method,
+      ssoState,
+      assetsManifestState,
+      prepAssetsJobs,
+    );
     sendJson(res, result.status, result.body);
   } catch (err) {
     if (err instanceof ControlServerError) {
@@ -427,6 +525,7 @@ async function route(
   method: string,
   ssoState: SsoState,
   assetsManifestState: AssetsManifestCacheState,
+  prepAssetsJobs: Map<string, PrepAssetsJob>,
 ): Promise<RouteResult> {
   const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
@@ -436,8 +535,67 @@ async function route(
     const body = await readJsonBody(req);
     return launchOne(surface, body);
   }
+  if (method === "POST" && pathname === "/launch/multi") {
+    const body = await readJsonBody(req);
+    return launchMultiRoute(opts, body);
+  }
+  if (method === "POST" && pathname === "/launch/from-config") {
+    const body = await readJsonBody(req);
+    return launchFromConfigRoute(opts, body);
+  }
+  if (method === "POST" && pathname === "/launch/from-config/preview") {
+    const body = await readJsonBody(req);
+    return previewFromConfigRoute(body);
+  }
   if (method === "GET" && pathname === "/assets/manifest") {
     return assetsManifestRoute(opts, assetsManifestState);
+  }
+
+  // Prep-assets background job endpoints. SSE stream is handled
+  // out-of-band in `handleRequest`.
+  if (method === "POST" && pathname === "/assets/prep") {
+    const body = await readJsonBody(req);
+    return prepAssetsStartRoute(opts, prepAssetsJobs, body);
+  }
+  const prepJobMatch = /^\/assets\/prep\/([^/]+)$/.exec(pathname);
+  if (prepJobMatch && method === "GET") {
+    const jobId = decodeURIComponent(prepJobMatch[1]);
+    return prepAssetsStatusRoute(prepAssetsJobs, jobId);
+  }
+  const prepCancelMatch = /^\/assets\/prep\/([^/]+)$/.exec(pathname);
+  if (prepCancelMatch && method === "DELETE") {
+    const jobId = decodeURIComponent(prepCancelMatch[1]);
+    return prepAssetsForgetRoute(prepAssetsJobs, jobId);
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // OAuth storage-state capture endpoints (parallel to HCL SSO recapture
+  // but for Google OAuth targets like app.videocall.rs). Sessions live
+  // at <runDir>/auth/<label>.json. HCL SSO state (hcl-sso.json) is
+  // excluded from the listing — it is owned by the SSO recapture flow.
+  // ──────────────────────────────────────────────────────────────────
+  if (method === "GET" && pathname === "/oauth/sessions") {
+    return oauthSessionsRoute(opts);
+  }
+  if (method === "POST" && pathname === "/oauth/capture") {
+    const body = await readJsonBody(req);
+    return oauthCaptureStartRoute(opts, ssoState, body);
+  }
+  const oauthCapturePath = /^\/oauth\/capture\/([^/]+)(?:\/(complete))?$/.exec(pathname);
+  if (oauthCapturePath) {
+    const sessionId = decodeURIComponent(oauthCapturePath[1]);
+    const sub = oauthCapturePath[2];
+    if (sub === "complete" && method === "POST") {
+      return oauthCaptureCompleteRoute(opts, ssoState, sessionId);
+    }
+    if (sub === undefined && method === "DELETE") {
+      return oauthCaptureCancelRoute(ssoState, sessionId);
+    }
+  }
+  const oauthSessionPath = /^\/oauth\/sessions\/([^/]+)$/.exec(pathname);
+  if (oauthSessionPath && method === "DELETE") {
+    const label = decodeURIComponent(oauthSessionPath[1]);
+    return oauthSessionDeleteRoute(opts, label);
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -1339,6 +1497,779 @@ function computeAssetsManifest(opts: ControlServerOptions): AssetsManifestRespon
     return { name: p.name, costumeFile, audioFile };
   });
   return { participants };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Multi-launch + from-config routes. Mirror the CLI's `bots-app gen`
+// (random pick) and `bots-app run --users N` (first-N pick) flows so
+// dashboard operators can spawn a fleet from one click instead of N
+// invocations of the single-bot launch form.
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Pick `count` participants from the manifest using the requested
+ * mode. Re-implements the legacy CLI's first-N + random selection
+ * exactly so a given (`seed`, `count`, `includeObservers`, manifest)
+ * tuple produces the same names through either entry point.
+ *
+ * Throws when:
+ *   - `mode === "first-n"` and the manifest has fewer than `count`
+ *     named participants
+ *   - `mode === "random"`  and the eligible pool (costumed-only by
+ *     default, all when `includeObservers === true`) has fewer than
+ *     `count` rows
+ */
+export function pickParticipantsForMultiLaunch(args: {
+  manifest: Manifest;
+  mode: "first-n" | "random";
+  count: number;
+  seed?: number;
+  includeObservers?: boolean;
+}): string[] {
+  if (args.mode === "first-n") {
+    if (args.count > args.manifest.participants.length) {
+      throw new Error(
+        `count ${args.count} exceeds the manifest's ${args.manifest.participants.length} named participants`,
+      );
+    }
+    return firstNParticipantNames(args.manifest, args.count);
+  }
+  const eligible = args.includeObservers
+    ? args.manifest.participants
+    : args.manifest.participants.filter((p) => p.costumeDir);
+  if (args.count > eligible.length) {
+    const label = args.includeObservers ? "participants" : "costumed participants";
+    throw new Error(`count ${args.count} exceeds the manifest's ${eligible.length} ${label}`);
+  }
+  const seed = args.seed ?? Math.floor(Math.random() * 2 ** 31);
+  const rng = seededRng(seed);
+  const shuffled = shuffleSeeded(
+    eligible.map((p) => p.name),
+    rng,
+  );
+  return shuffled.slice(0, args.count);
+}
+
+/**
+ * Render a display name from a `{participant}`-templated string, used by
+ * the dashboard's multi-launch form so operators can label their fleet
+ * uniformly (e.g. `"Bot {participant}"` → `"Bot alice"`, `"Bot bob"`).
+ * Untemplated strings pass through as a constant prefix for everyone.
+ * Empty / undefined falls back to a per-participant default.
+ */
+function templateDisplayName(
+  template: string | undefined,
+  participant: string,
+): string | undefined {
+  if (!template || template === "") return undefined;
+  return template.replace(/\{participant\}/g, participant);
+}
+
+async function launchMultiRoute(
+  opts: ControlServerOptions,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const surface = opts.surface;
+  const mode = body.mode;
+  if (mode !== "first-n" && mode !== "random") {
+    throw new ControlServerError(400, '"mode" must be "first-n" or "random"');
+  }
+  const countRaw = body.count;
+  if (typeof countRaw !== "number" || !Number.isFinite(countRaw) || countRaw <= 0) {
+    throw new ControlServerError(400, '"count" must be a positive integer');
+  }
+  const count = Math.floor(countRaw);
+  const maxUsers =
+    typeof body.maxUsers === "number" && Number.isFinite(body.maxUsers) && body.maxUsers > 0
+      ? Math.floor(body.maxUsers)
+      : MULTI_LAUNCH_DEFAULT_MAX;
+  if (count > maxUsers) {
+    throw new ControlServerError(
+      400,
+      `count ${count} exceeds maxUsers ${maxUsers}; raise the cap to override`,
+    );
+  }
+
+  const meetingURL = validateMeetingUrl(body.meetingURL);
+  const ttlRaw = body.ttl;
+  if (typeof ttlRaw !== "string") {
+    throw new ControlServerError(400, '"ttl" must be a string');
+  }
+  let ttl: Ttl;
+  try {
+    ttl = parseDuration(ttlRaw);
+  } catch (e) {
+    throw new ControlServerError(400, (e as Error).message);
+  }
+  const network = body.network !== undefined ? validateNetworkField(body.network) : "none";
+  const headless = typeof body.headless === "boolean" ? body.headless : false;
+  const authBackend = body.authBackend ?? "jwt";
+  if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
+    throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
+  }
+  const storageStateFile =
+    body.storageStateFile !== undefined && body.storageStateFile !== null
+      ? String(body.storageStateFile)
+      : undefined;
+  const ssoStateFile =
+    body.ssoStateFile !== undefined && body.ssoStateFile !== null
+      ? String(body.ssoStateFile)
+      : undefined;
+  const displayNameTemplate =
+    typeof body.displayNameTemplate === "string" ? body.displayNameTemplate : undefined;
+
+  let seed: number | undefined;
+  if (body.seed !== undefined) {
+    if (typeof body.seed !== "number" || !Number.isFinite(body.seed)) {
+      throw new ControlServerError(400, '"seed" must be a number when provided');
+    }
+    seed = Math.floor(body.seed);
+  }
+  const includeObservers =
+    typeof body.includeObservers === "boolean" ? body.includeObservers : false;
+
+  // Load the manifest. We reuse `opts.manifestPath` (the same path the
+  // /assets/manifest endpoint caches against) so behavior matches the
+  // dashboard's auto-match Select.
+  if (!opts.manifestPath || !existsSync(opts.manifestPath)) {
+    throw new ControlServerError(
+      503,
+      "multi-launch unavailable: no manifest configured on the control server",
+    );
+  }
+  let manifest: Manifest;
+  try {
+    manifest = loadManifest(opts.manifestPath).manifest;
+  } catch (e) {
+    throw new ControlServerError(500, `failed to load manifest: ${(e as Error).message}`);
+  }
+
+  let picked: string[];
+  try {
+    picked = pickParticipantsForMultiLaunch({
+      manifest,
+      mode,
+      count,
+      seed,
+      includeObservers,
+    });
+  } catch (e) {
+    throw new ControlServerError(400, (e as Error).message);
+  }
+
+  const botIds: string[] = [];
+  const errors: Array<{ participant: string; message: string }> = [];
+  for (const participant of picked) {
+    const spec: LaunchSpec = {
+      meetingURL,
+      participant,
+      displayName: templateDisplayName(displayNameTemplate, participant),
+      ttl,
+      headless,
+      network,
+      authBackend,
+      storageStateFile,
+      ssoStateFile,
+    };
+    try {
+      const id = await surface.launchOne(spec);
+      botIds.push(id);
+    } catch (e) {
+      errors.push({ participant, message: (e as Error).message });
+    }
+  }
+
+  return {
+    status: 202,
+    body: {
+      mode,
+      count: picked.length,
+      seed: seed ?? null,
+      participants: picked,
+      botIds,
+      errors,
+    },
+  };
+}
+
+async function launchFromConfigRoute(
+  opts: ControlServerOptions,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const surface = opts.surface;
+  const configYaml = body.configYaml;
+  if (typeof configYaml !== "string" || configYaml === "") {
+    throw new ControlServerError(400, '"configYaml" must be a non-empty string');
+  }
+  let config: MeetingConfig;
+  try {
+    config = parseMeetingConfigText(configYaml);
+  } catch (e) {
+    throw new ControlServerError(400, `meeting config parse failed: ${(e as Error).message}`);
+  }
+
+  const headless = typeof body.headless === "boolean" ? body.headless : false;
+  const overrideAuth = body.authBackend;
+  if (
+    overrideAuth !== undefined &&
+    overrideAuth !== "jwt" &&
+    overrideAuth !== "storage-state" &&
+    overrideAuth !== "none"
+  ) {
+    throw new ControlServerError(
+      400,
+      '"authBackend" must be "jwt", "storage-state", or "none" when provided',
+    );
+  }
+  const overrideStorageStateFile =
+    typeof body.storageStateFile === "string" ? body.storageStateFile : undefined;
+  const overrideSsoStateFile =
+    typeof body.ssoStateFile === "string" ? body.ssoStateFile : undefined;
+
+  // Default TTL: per-bot ttl wins, then meeting-level, then 5m.
+  const defaultTtl = config.ttl ?? "5m";
+  // Default network: per-bot network wins, then meeting-level, then "none".
+  const defaultNetwork = config.network ?? "none";
+  // Default auth backend: per-bot auth wins, then meeting-level, then
+  // the override on the request body, then "jwt".
+  const defaultAuth =
+    (config.auth as "jwt" | "storage-state" | "none" | undefined) ??
+    (overrideAuth as "jwt" | "storage-state" | "none" | undefined) ??
+    "jwt";
+
+  const botIds: string[] = [];
+  const errors: Array<{ index: number; participant?: string; message: string }> = [];
+  for (let i = 0; i < config.bots.length; i++) {
+    const bot = config.bots[i];
+    const ttlRaw = bot.ttl ?? defaultTtl;
+    let ttl: Ttl;
+    try {
+      ttl = parseDuration(ttlRaw);
+    } catch (e) {
+      errors.push({
+        index: i,
+        participant: bot.participant,
+        message: `invalid ttl "${ttlRaw}": ${(e as Error).message}`,
+      });
+      continue;
+    }
+    const network = bot.network ?? defaultNetwork;
+    const authBackend = (bot.auth ?? defaultAuth) as "jwt" | "storage-state" | "none";
+    const spec: LaunchSpec = {
+      meetingURL: config.meetingUrl,
+      participant: bot.participant,
+      ttl,
+      headless,
+      network,
+      authBackend,
+      storageStateFile: overrideStorageStateFile,
+      ssoStateFile: overrideSsoStateFile,
+    };
+    try {
+      const id = await surface.launchOne(spec);
+      botIds.push(id);
+    } catch (e) {
+      errors.push({
+        index: i,
+        participant: bot.participant,
+        message: (e as Error).message,
+      });
+    }
+  }
+
+  return {
+    status: 202,
+    body: {
+      meetingUrl: config.meetingUrl,
+      count: botIds.length,
+      botIds,
+      errors,
+    },
+  };
+}
+
+function previewFromConfigRoute(body: Record<string, unknown>): RouteResult {
+  const configYaml = body.configYaml;
+  if (typeof configYaml !== "string" || configYaml === "") {
+    throw new ControlServerError(400, '"configYaml" must be a non-empty string');
+  }
+  let config: MeetingConfig;
+  try {
+    config = parseMeetingConfigText(configYaml);
+  } catch (e) {
+    throw new ControlServerError(400, `meeting config parse failed: ${(e as Error).message}`);
+  }
+  return {
+    status: 200,
+    body: {
+      meetingUrl: config.meetingUrl,
+      ttl: config.ttl ?? null,
+      network: config.network ?? null,
+      auth: config.auth ?? null,
+      botCount: config.bots.length,
+      bots: config.bots,
+      meta: config.meta ?? null,
+    },
+  };
+}
+
+function validateMeetingUrl(raw: unknown): string {
+  if (typeof raw !== "string" || raw === "") {
+    throw new ControlServerError(400, '"meetingURL" must be a non-empty string');
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ControlServerError(400, '"meetingURL" is not a valid URL');
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new ControlServerError(400, '"meetingURL" must use http or https');
+  }
+  return raw;
+}
+
+function validateNetworkField(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new ControlServerError(400, '"network" must be a string');
+  }
+  if (!NETSIM_PRESETS.includes(raw)) {
+    throw new ControlServerError(
+      400,
+      `"network" must be one of: ${NETSIM_PRESETS.join(", ")} (got "${raw}")`,
+    );
+  }
+  return raw;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// OAuth session capture endpoints. Sibling of the HCL SSO recapture
+// flow but for Google OAuth sessions used by storage-state auth. Files
+// land at <runDir>/auth/<label>.json; the legacy hcl-sso.json is
+// excluded from this listing because it is owned by the SSO flow.
+// ──────────────────────────────────────────────────────────────────────
+
+interface OauthSessionInfo {
+  label: string;
+  filePath: string;
+  capturedAt: number;
+  ageHours: number;
+  size: number;
+}
+
+function oauthSessionsRoute(opts: ControlServerOptions): RouteResult {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "oauth sessions unavailable: control server was started without a runDir",
+    );
+  }
+  const authDir = join(opts.runDir, "auth");
+  let entries: string[];
+  try {
+    entries = readdirSync(authDir);
+  } catch {
+    return { status: 200, body: { sessions: [] } };
+  }
+  const now = Date.now();
+  const sessions: OauthSessionInfo[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    if (name === DEFAULT_SSO_STATE_BASENAME) continue;
+    if (name.startsWith(".") || name.startsWith("_")) continue;
+    const label = name.slice(0, -".json".length);
+    if (!OAUTH_LABEL_PATTERN.test(label)) continue;
+    const filePath = join(authDir, name);
+    try {
+      const st = statSync(filePath);
+      if (!st.isFile()) continue;
+      sessions.push({
+        label,
+        filePath,
+        capturedAt: st.mtimeMs,
+        ageHours: (now - st.mtimeMs) / (1000 * 60 * 60),
+        size: st.size,
+      });
+    } catch {
+      continue;
+    }
+  }
+  sessions.sort((a, b) => a.label.localeCompare(b.label));
+  return { status: 200, body: { sessions } };
+}
+
+async function oauthCaptureStartRoute(
+  opts: ControlServerOptions,
+  ssoState: SsoState,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "oauth capture unavailable: control server was started without a runDir",
+    );
+  }
+  const label = body.label;
+  if (typeof label !== "string" || label === "") {
+    throw new ControlServerError(400, '"label" must be a non-empty string');
+  }
+  if (!OAUTH_LABEL_PATTERN.test(label)) {
+    throw new ControlServerError(
+      400,
+      `"label" must match ${OAUTH_LABEL_PATTERN.source} (got "${label}")`,
+    );
+  }
+  let startUrl = "https://app.videocall.rs/";
+  if (body.startUrl !== undefined) {
+    if (typeof body.startUrl !== "string") {
+      throw new ControlServerError(400, '"startUrl" must be a string when provided');
+    }
+    try {
+      const u = new URL(body.startUrl);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        throw new Error("only http(s) URLs are accepted");
+      }
+    } catch (e) {
+      throw new ControlServerError(400, `invalid startUrl: ${(e as Error).message}`);
+    }
+    startUrl = body.startUrl;
+  }
+  const factory = opts.ssoCaptureFactory ?? openSsoCaptureBrowser;
+  const sessionId = randomUUID();
+  let session: SsoCaptureSession;
+  try {
+    session = await factory({ startUrl });
+  } catch (e) {
+    throw new ControlServerError(
+      500,
+      `oauth capture: browser launch failed: ${(e as Error).message}`,
+    );
+  }
+  const startedAt = Date.now();
+  const idleTimer = setTimeout(() => {
+    const entry = ssoState.oauthCaptureSessions.get(sessionId);
+    if (entry === undefined) return;
+    ssoState.oauthCaptureSessions.delete(sessionId);
+    void entry.session.close().catch((err: unknown) => {
+      console.warn(
+        `[control] idle-timeout teardown of oauth capture ${sessionId} failed: ${(err as Error).message}`,
+      );
+    });
+    console.log(
+      `[control] oauth capture ${sessionId} auto-cancelled after idle timeout (${ssoState.idleTimeout}ms)`,
+    );
+  }, ssoState.idleTimeout);
+  if (typeof idleTimer.unref === "function") idleTimer.unref();
+  ssoState.oauthCaptureSessions.set(sessionId, {
+    id: sessionId,
+    label,
+    startUrl,
+    startedAt,
+    session,
+    idleTimer,
+  });
+  return {
+    status: 201,
+    body: { captureSessionId: sessionId, label, startUrl, startedAt },
+  };
+}
+
+async function oauthCaptureCompleteRoute(
+  opts: ControlServerOptions,
+  ssoState: SsoState,
+  sessionId: string,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "oauth capture unavailable: control server was started without a runDir",
+    );
+  }
+  const entry = ssoState.oauthCaptureSessions.get(sessionId);
+  if (entry === undefined) {
+    throw new ControlServerError(404, `oauth capture session ${sessionId} not found`);
+  }
+  ssoState.oauthCaptureSessions.delete(sessionId);
+  clearTimeout(entry.idleTimer);
+  const outPath = storageStatePath(opts.runDir, entry.label);
+  try {
+    await entry.session.saveAndClose(outPath);
+  } catch (e) {
+    await entry.session.close().catch(() => {});
+    throw new ControlServerError(500, `oauth capture save failed: ${(e as Error).message}`);
+  }
+  // Return the freshly-captured session's metadata so the dashboard can
+  // refresh its list without a second round-trip.
+  let info: OauthSessionInfo;
+  try {
+    const st = statSync(outPath);
+    info = {
+      label: entry.label,
+      filePath: outPath,
+      capturedAt: st.mtimeMs,
+      ageHours: (Date.now() - st.mtimeMs) / (1000 * 60 * 60),
+      size: st.size,
+    };
+  } catch (e) {
+    throw new ControlServerError(500, `oauth capture stat failed: ${(e as Error).message}`);
+  }
+  return { status: 200, body: info };
+}
+
+function oauthCaptureCancelRoute(ssoState: SsoState, sessionId: string): Promise<RouteResult> {
+  const entry = ssoState.oauthCaptureSessions.get(sessionId);
+  if (entry === undefined) {
+    throw new ControlServerError(404, `oauth capture session ${sessionId} not found`);
+  }
+  ssoState.oauthCaptureSessions.delete(sessionId);
+  clearTimeout(entry.idleTimer);
+  return entry.session
+    .close()
+    .then(() => ({ status: 200, body: { captureSessionId: sessionId, cancelled: true } }));
+}
+
+function oauthSessionDeleteRoute(opts: ControlServerOptions, label: string): RouteResult {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "oauth sessions unavailable: control server was started without a runDir",
+    );
+  }
+  if (!OAUTH_LABEL_PATTERN.test(label)) {
+    throw new ControlServerError(
+      400,
+      `"label" must match ${OAUTH_LABEL_PATTERN.source} (got "${label}")`,
+    );
+  }
+  // Refuse to touch the HCL SSO state file via this endpoint — it is
+  // owned by the separate SSO recapture flow. Operators who want to
+  // wipe HCL SSO state delete the file out-of-band.
+  if (`${label}.json` === DEFAULT_SSO_STATE_BASENAME) {
+    throw new ControlServerError(
+      400,
+      `"${label}" refers to the HCL SSO state file; use the SSO panel to manage it`,
+    );
+  }
+  const filePath = storageStatePath(opts.runDir, label);
+  try {
+    unlinkSync(filePath);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new ControlServerError(404, `oauth session "${label}" not found`);
+    }
+    throw new ControlServerError(500, `delete failed: ${(e as Error).message}`);
+  }
+  return { status: 200, body: { label, deleted: true } };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Prep-assets background-job routes. The work itself lives in
+// `prep-assets.ts`; here we just register the job, hand back the id,
+// and stream log lines as SSE on the dedicated /stream endpoint.
+// ──────────────────────────────────────────────────────────────────────
+
+const DEFAULT_PREP_MANIFEST_RELATIVE = "bot/conversation/manifest.yaml";
+const DEFAULT_PREP_COSTUME_SOURCE_RELATIVE = "bot/assets/costumes";
+
+async function prepAssetsStartRoute(
+  opts: ControlServerOptions,
+  jobs: Map<string, PrepAssetsJob>,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "prep-assets unavailable: control server was started without a runDir",
+    );
+  }
+  // Only one prep job at a time per daemon — ffmpeg is expensive and
+  // running two concurrently against the same output dir would race
+  // on the same files. The 409 carries the running jobId so the
+  // dashboard can re-attach to its stream instead of spawning a dup.
+  for (const job of jobs.values()) {
+    if (job.status === "running") {
+      throw new ControlServerError(409, `prep-assets job ${job.jobId} is already running`);
+    }
+  }
+
+  // Validate optional override fields. The dashboard form sends fixed
+  // defaults today, but the API is reachable from curl and must be
+  // hardened against path-traversal exactly like the other file-bearing
+  // endpoints. `validatePrepAssetsPath` throws plain Error on bad
+  // input — wrap it in a 400-shaped ControlServerError so the response
+  // matches the route's contract.
+  const safeValidate = (raw: unknown, field: string): string => {
+    try {
+      return validatePrepAssetsPath(raw, field);
+    } catch (e) {
+      throw new ControlServerError(400, (e as Error).message);
+    }
+  };
+  const manifestPath =
+    body.manifestPath !== undefined
+      ? safeValidate(body.manifestPath, "manifestPath")
+      : (opts.manifestPath ?? defaultPrepManifest(opts.runDir));
+  const costumeSource =
+    body.costumeSource !== undefined
+      ? safeValidate(body.costumeSource, "costumeSource")
+      : defaultPrepCostumeSource(opts.runDir);
+  const outputDir =
+    body.outputDir !== undefined ? safeValidate(body.outputDir, "outputDir") : opts.runDir;
+  let participants: string[] | undefined;
+  if (body.participants !== undefined) {
+    if (!Array.isArray(body.participants)) {
+      throw new ControlServerError(400, '"participants" must be an array of strings');
+    }
+    participants = body.participants.map((p: unknown, idx: number) => {
+      if (typeof p !== "string" || p === "") {
+        throw new ControlServerError(400, `participants[${idx}] must be a non-empty string`);
+      }
+      if (!/^[A-Za-z0-9._@+-]+$/.test(p)) {
+        throw new ControlServerError(400, `participants[${idx}] contains invalid characters`);
+      }
+      return p;
+    });
+  }
+
+  const job = createPrepAssetsJob();
+  jobs.set(job.jobId, job);
+  const opts2: PrepAssetsOptions = {
+    manifestPath,
+    costumeSource,
+    outputDir,
+    participants,
+  };
+  // Fire-and-forget. Kicked off via a microtask so the response below
+  // reports the initial "running" state even when the worker can fail
+  // synchronously (e.g. missing manifest) — the dashboard then sees
+  // the transition on its next status poll, matching the contract.
+  queueMicrotask(() => {
+    void runPrepAssetsJob(job, opts2).catch((e: unknown) => {
+      job.status = "failed";
+      job.error = (e as Error).message;
+      job.finishedAt = Date.now();
+    });
+  });
+  return {
+    status: 202,
+    body: {
+      jobId: job.jobId,
+      status: "running",
+      startedAt: job.startedAt,
+    },
+  };
+}
+
+function prepAssetsStatusRoute(jobs: Map<string, PrepAssetsJob>, jobId: string): RouteResult {
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    throw new ControlServerError(404, `prep-assets job ${jobId} not found`);
+  }
+  return {
+    status: 200,
+    body: snapshotPrepAssetsJob(job),
+  };
+}
+
+function prepAssetsForgetRoute(jobs: Map<string, PrepAssetsJob>, jobId: string): RouteResult {
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    throw new ControlServerError(404, `prep-assets job ${jobId} not found`);
+  }
+  // We do NOT actually terminate the underlying work — ffmpeg is
+  // expensive to restart, and the dashboard's "Cancel" button is
+  // explicitly documented as "close the modal but let it finish in
+  // the background". Just drop the record so the dashboard's polling
+  // exits gracefully.
+  if (job.status === "running") {
+    throw new ControlServerError(
+      409,
+      `prep-assets job ${jobId} is still running; close the dashboard modal but let the job finish`,
+    );
+  }
+  jobs.delete(jobId);
+  return { status: 200, body: { jobId, deleted: true } };
+}
+
+function snapshotPrepAssetsJob(job: PrepAssetsJob): Record<string, unknown> {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt ?? null,
+    stdoutLog: job.stdoutLog,
+    exitCode: job.exitCode,
+    error: job.error ?? null,
+    audioPrepped: job.audioPrepped,
+    costumesPrepped: job.costumesPrepped,
+  };
+}
+
+function handlePrepAssetsStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  jobs: Map<string, PrepAssetsJob>,
+  jobId: string,
+): void {
+  // Auth was already enforced by `handleRequest` before dispatch — the
+  // route-aware authenticate runs there, so by the time this function
+  // is called the request is authorized.
+  const job = jobs.get(jobId);
+  if (job === undefined) {
+    sendJson(res, 404, { error: `prep-assets job ${jobId} not found` });
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    // Tell intermediaries (nginx, etc.) not to buffer.
+    "x-accel-buffering": "no",
+  });
+
+  // Send the existing log buffer first so a late subscriber sees the
+  // whole history.
+  for (const line of job.stdoutLog) {
+    res.write(`data: ${line}\n\n`);
+  }
+  // If the job already finished, close immediately.
+  if (job.status !== "running") {
+    res.write(
+      `event: end\ndata: ${JSON.stringify({ status: job.status, exitCode: job.exitCode })}\n\n`,
+    );
+    res.end();
+    return;
+  }
+
+  const onLine = (line: string | null): void => {
+    if (line === null) {
+      res.write(
+        `event: end\ndata: ${JSON.stringify({ status: job.status, exitCode: job.exitCode })}\n\n`,
+      );
+      res.end();
+      return;
+    }
+    res.write(`data: ${line}\n\n`);
+  };
+  job.subscribers.add(onLine);
+  req.on("close", () => {
+    job.subscribers.delete(onLine);
+  });
+}
+
+function defaultPrepManifest(runDir: string): string {
+  // Convention used by the CLI defaults: prep-assets is run from the
+  // repo root so the manifest lives at <repo>/bot/conversation/manifest.yaml.
+  // We re-derive it by walking up from runDir (`<repo>/e2e/bots-app/run`)
+  // — defaultPrepManifest("/repo/e2e/bots-app/run") → "/repo/bot/.../manifest.yaml".
+  // Falls back to a sentinel that the runner's existsSync check will
+  // reject if the layout differs.
+  return join(runDir, "..", "..", "..", DEFAULT_PREP_MANIFEST_RELATIVE);
+}
+
+function defaultPrepCostumeSource(runDir: string): string {
+  return join(runDir, "..", "..", "..", DEFAULT_PREP_COSTUME_SOURCE_RELATIVE);
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

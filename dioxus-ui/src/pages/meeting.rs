@@ -567,7 +567,11 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Waiting for host to start
             (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
-                div { class: "waiting-room-container",
+                // `data-testid` added for the bots-app waiting-room detection
+                // path (see e2e/bots-app/src/meeting-join.ts). The bot uses it
+                // to distinguish "host hasn't started the meeting yet" from
+                // the post-admit grid. Behaviourally inert.
+                div { class: "waiting-room-container", "data-testid": "meeting-waiting-for-host",
                     div { class: "waiting-room-card card-apple",
                         div { class: "waiting-room-icon",
                             div { class: "loading-spinner", style: "width: 48px; height: 48px;" }
@@ -591,7 +595,11 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Rejected
             (Some(_), MeetingStatus::Rejected) => rsx! {
-                div { class: "rejected-container",
+                // `data-testid` for bots-app rejection detection
+                // (see e2e/bots-app/src/meeting-join.ts). Lets the bot
+                // exit cleanly with `JoinRejectedError` instead of the
+                // misleading "join button reappeared" diagnostic.
+                div { class: "rejected-container", "data-testid": "meeting-rejected",
                     div { class: "rejected-card card-apple",
                         svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff6b6b", stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }
@@ -613,7 +621,13 @@ pub fn MeetingPage(id: String) -> Element {
 
             // Error
             (Some(_), MeetingStatus::Error(error)) => rsx! {
-                div { class: "error-container",
+                // `data-testid` for bots-app meeting-error detection
+                // (see e2e/bots-app/src/meeting-join.ts). The base
+                // `.error-container` class is shared with non-meeting
+                // screens (config_error.rs, browser_compatibility.rs),
+                // so the bot relies on this attribute for an
+                // unambiguous selector.
+                div { class: "error-container", "data-testid": "meeting-error",
                     div { class: "error-card card-apple",
                         svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff9800", stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }

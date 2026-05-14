@@ -98,7 +98,30 @@ export interface LaunchSpec {
    * captured HCL SSO session, matching the legacy CLI behavior.
    */
   ssoStateFile?: string;
+  /**
+   * Optional basename (e.g. `pirate.y4m`) of a costume the operator
+   * picked in the dashboard's launch form. When set, overrides the
+   * manifest-resolved costume for this participant. Validated against
+   * the {@link ASSET_FILENAME_PATTERN} regex up-front so a path-like
+   * value (`../etc/passwd`, `/abs/path.y4m`, etc.) cannot escape the
+   * `<runDir>/costumes/` directory.
+   */
+  costume?: string;
+  /**
+   * Mirror of {@link costume} for the audio side. Expected to be a
+   * basename like `alice.wav` under `<runDir>/audio/`.
+   */
+  audio?: string;
 }
+
+/**
+ * Filename pattern accepted by the launch endpoint's `costume` /
+ * `audio` fields. Matches the `/api/assets/*` listing convention
+ * (basenames only, no path separators, no `..`). Rejecting anything
+ * else server-side prevents a directory-traversal attack on the
+ * fake-device path the orchestrator hands to Chrome.
+ */
+export const ASSET_FILENAME_PATTERN = /^[A-Za-z0-9_-]+\.(y4m|wav)$/;
 
 /**
  * Default URL the VPN-status probe targets when `VPN_CHECK_URL` is not
@@ -872,6 +895,45 @@ async function launchOne(
   if (ssoStateFile !== undefined && typeof ssoStateFile !== "string") {
     throw new ControlServerError(400, '"ssoStateFile" must be a string when provided');
   }
+  // Costume / audio overrides: the dashboard's launch form picks a
+  // basename from its `/api/assets/{costumes,audio}` listing. Validate
+  // up-front so a malicious or fat-fingered value (`/etc/passwd`,
+  // `../../somewhere.y4m`) can't escape the `<runDir>/{costumes,audio}/`
+  // directory once the orchestrator composes the absolute path.
+  //
+  // The literal sentinel `"default"` is accepted for symmetry with the
+  // dashboard's Select widget ("Default fake pattern") — it's
+  // semantically equivalent to omitting the field.
+  const costume = body.costume;
+  if (costume !== undefined && typeof costume !== "string") {
+    throw new ControlServerError(400, '"costume" must be a string when provided');
+  }
+  if (
+    typeof costume === "string" &&
+    costume !== "" &&
+    costume !== "default" &&
+    !ASSET_FILENAME_PATTERN.test(costume)
+  ) {
+    throw new ControlServerError(
+      400,
+      `"costume" must match ${ASSET_FILENAME_PATTERN.source} (got "${costume}")`,
+    );
+  }
+  const audio = body.audio;
+  if (audio !== undefined && typeof audio !== "string") {
+    throw new ControlServerError(400, '"audio" must be a string when provided');
+  }
+  if (
+    typeof audio === "string" &&
+    audio !== "" &&
+    audio !== "default" &&
+    !ASSET_FILENAME_PATTERN.test(audio)
+  ) {
+    throw new ControlServerError(
+      400,
+      `"audio" must match ${ASSET_FILENAME_PATTERN.source} (got "${audio}")`,
+    );
+  }
   // `runLocation` is dashboard-only metadata; we accept it but only
   // honor "local" today. Anything else is rejected so a future
   // backend implementation can't be silently downgraded.
@@ -892,6 +954,8 @@ async function launchOne(
     authBackend,
     storageStateFile: storageStateFile as string | undefined,
     ssoStateFile: ssoStateFile as string | undefined,
+    costume: costume as string | undefined,
+    audio: audio as string | undefined,
   };
   const newId = await surface.launchOne(spec);
   return { status: 201, body: { botId: newId } };

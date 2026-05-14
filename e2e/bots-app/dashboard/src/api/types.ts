@@ -69,6 +69,21 @@ export interface LaunchRequest {
    * target environment, or the bot will hit the SSO portal).
    */
   ssoStateFile?: string;
+  /**
+   * Operator-picked costume basename (e.g. `pirate.y4m`) from the
+   * launch form's Costume Select. Forwarded to the orchestrator,
+   * which composes `<runDir>/costumes/<costume>` and feeds it to
+   * Chrome's `--use-file-for-fake-video-capture` flag — overriding
+   * the participant-based manifest auto-match. The literal sentinel
+   * `"default"` is omitted by the form (the user is asking for
+   * Chrome's default fake pattern).
+   */
+  costume?: string;
+  /**
+   * Mirror of {@link costume} for the audio side. Basename under
+   * `<runDir>/audio/`.
+   */
+  audio?: string;
   runLocation: "local" | "future-vm" | "future-ssh" | "future-docker";
 }
 

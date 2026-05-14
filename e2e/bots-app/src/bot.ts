@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 
@@ -69,6 +70,23 @@ export interface BotRunOptions {
    */
   manifest?: Manifest | null;
   runDir?: string | null;
+  /**
+   * Optional basename (e.g. `pirate.y4m`) of an explicit costume file
+   * the operator picked in the dashboard's launch form. When set, this
+   * overrides the manifest auto-match: the bot uses
+   * `<runDir>/costumes/<costumeOverride>` for `--use-file-for-fake-video-capture`
+   * regardless of what the manifest says about this participant.
+   *
+   * Falls back to the default fake camera (with a warning log) when
+   * the resolved path doesn't exist on disk. The orchestrator validates
+   * the filename against directory traversal before forwarding it.
+   */
+  costumeOverride?: string | null;
+  /**
+   * Mirror of {@link costumeOverride} for the audio side. Expected to
+   * be a basename like `alice.wav` under `<runDir>/audio/`.
+   */
+  audioOverride?: string | null;
   /**
    * When set, appends `?netsim=<profile>` to the meeting URL before
    * navigating. Requires the videocall-client build to have
@@ -161,24 +179,58 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   }
 
   const launchArgs = [...CHROME_ARGS];
-  if (opts.manifest != null && opts.runDir != null && opts.runDir !== "") {
-    const assets = resolveAssetsForParticipant({
-      manifest: opts.manifest,
+  // Two paths feed the fake-device flags here:
+  //   1. manifest auto-match — resolve `<participant>` → costume/audio
+  //      via the loaded conversation manifest (CLI + dashboard-default
+  //      behavior; the dashboard's orchestrator caches the manifest at
+  //      startup so dashboard-launched bots get it for free).
+  //   2. explicit overrides — the dashboard's launch form lets the
+  //      operator pick a specific costume/audio basename. When set,
+  //      those win over the manifest-resolved files, but we still keep
+  //      the manifest path as a fallback (so a typo in the override
+  //      degrades to "auto-match" rather than "default fake pattern").
+  //
+  // Either source resolves to absolute paths fed to Chrome via
+  // `--use-file-for-fake-{video,audio}-capture`. A missing file at the
+  // resolved path falls back to Chrome's default pattern with a
+  // warning — never a hard failure.
+  if (opts.runDir != null && opts.runDir !== "") {
+    const assets =
+      opts.manifest != null
+        ? resolveAssetsForParticipant({
+            manifest: opts.manifest,
+            runDir: opts.runDir,
+            participant: opts.participant,
+          })
+        : { audioPath: null, videoPath: null };
+    const audioPath = resolveOverrideOrAuto({
+      override: opts.audioOverride,
       runDir: opts.runDir,
-      participant: opts.participant,
+      subdir: "audio",
+      autoPath: assets.audioPath,
+      label,
+      kind: "audio",
     });
-    if (assets.audioPath !== null) {
-      launchArgs.push(`--use-file-for-fake-audio-capture=${assets.audioPath}`);
-      console.log(`[${label}] fake mic → ${assets.audioPath}`);
-    } else {
+    const videoPath = resolveOverrideOrAuto({
+      override: opts.costumeOverride,
+      runDir: opts.runDir,
+      subdir: "costumes",
+      autoPath: assets.videoPath,
+      label,
+      kind: "video",
+    });
+    if (audioPath !== null) {
+      launchArgs.push(`--use-file-for-fake-audio-capture=${audioPath}`);
+      console.log(`[${label}] fake mic → ${audioPath}`);
+    } else if (opts.manifest != null) {
       console.warn(
         `[${label}] no stitched WAV found under ${opts.runDir}/audio — using Chrome's default fake mic. Run \`npm run bot -- prep-assets\` to fix.`,
       );
     }
-    if (assets.videoPath !== null) {
-      launchArgs.push(`--use-file-for-fake-video-capture=${assets.videoPath}`);
-      console.log(`[${label}] fake camera → ${assets.videoPath}`);
-    } else {
+    if (videoPath !== null) {
+      launchArgs.push(`--use-file-for-fake-video-capture=${videoPath}`);
+      console.log(`[${label}] fake camera → ${videoPath}`);
+    } else if (opts.manifest != null) {
       console.warn(
         `[${label}] no costume y4m found under ${opts.runDir}/costumes — using Chrome's default fake camera. Run \`npm run bot -- prep-assets\` to fix (or the participant has no costume_dir).`,
       );
@@ -383,6 +435,36 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   };
 
   return { browser, context, page, leaveMeeting, shutdown, userHangupDetected };
+}
+
+/**
+ * Resolve the final fake-device file path given an optional explicit
+ * override basename and the manifest-resolved auto-match path. The
+ * override is composed against `<runDir>/<subdir>/<override>` and used
+ * verbatim when the file exists; if the file is missing we fall back
+ * to the auto-match path (and log a warning so the operator notices
+ * the typo). When no override is supplied, returns the auto-match path
+ * directly. `null` means "no usable file found — Chrome will use its
+ * default fake pattern".
+ */
+function resolveOverrideOrAuto(args: {
+  override: string | null | undefined;
+  runDir: string;
+  subdir: string;
+  autoPath: string | null;
+  label: string;
+  kind: "audio" | "video";
+}): string | null {
+  if (args.override && args.override !== "" && args.override !== "default") {
+    const overridePath = join(args.runDir, args.subdir, args.override);
+    if (existsSync(overridePath)) {
+      return overridePath;
+    }
+    console.warn(
+      `[${args.label}] ${args.kind} override "${args.override}" missing at ${overridePath} — falling back to manifest auto-match.`,
+    );
+  }
+  return args.autoPath;
 }
 
 /**

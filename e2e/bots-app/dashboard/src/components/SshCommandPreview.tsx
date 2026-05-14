@@ -156,6 +156,12 @@ export function SshCommandPreview({
             reproduce manually. The same command is also recorded as the first line of the
             bot&apos;s log after launch.
           </p>
+          <p className="mt-1">
+            Auto-prime runs locally only; SSH-hosted bots need assets pre-existing on the
+            remote host (run{" "}
+            <code className="font-mono text-[11px]">bots-app prep-assets</code> there
+            first).
+          </p>
         </HelpPopover>
       </button>
       {subtitle && (

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { badgeForBot, STATUS_BADGE_CLASS } from "../lib/constants";
+import { badgeForBot, STATUS_BADGE_CLASS, STATUS_LABEL } from "../lib/constants";
 
 describe("badgeForBot status mapping", () => {
   it("returns a friendly label for in-progress bots", () => {
@@ -22,6 +22,13 @@ describe("badgeForBot status mapping", () => {
     expect(badgeForBot({ status: "leaving" })).toEqual({
       label: "Leaving",
       badgeKey: "leaving",
+    });
+  });
+
+  it("renders the new 'Priming assets' label for the auto-prime step", () => {
+    expect(badgeForBot({ status: "priming" })).toEqual({
+      label: "Priming assets",
+      badgeKey: "priming",
     });
   });
 
@@ -76,5 +83,18 @@ describe("STATUS_BADGE_CLASS coverage", () => {
     for (const key of ["launching", "joining", "in-meeting", "leaving", "done", "failed"]) {
       expect(STATUS_BADGE_CLASS[key]).toBeTruthy();
     }
+  });
+
+  it("has a Tailwind class for the new priming badge (yellow/amber family)", () => {
+    expect(STATUS_BADGE_CLASS.priming).toBeTruthy();
+    expect(STATUS_BADGE_CLASS.priming).toMatch(/yellow|amber/);
+  });
+});
+
+describe("STATUS_LABEL coverage", () => {
+  it("maps every known status key to a friendly label, including 'priming'", () => {
+    expect(STATUS_LABEL.priming).toBe("Priming assets");
+    expect(STATUS_LABEL.launching).toBe("Launching");
+    expect(STATUS_LABEL["in-meeting"]).toBe("In meeting");
   });
 });

@@ -165,13 +165,16 @@ program
     }
 
     let manifest: Manifest | null = null;
+    let manifestDir: string | null = null;
     if (opts.manifest && opts.manifest !== "") {
       if (!existsSync(opts.manifest)) {
         console.warn(
           `bots-app: manifest not found at ${opts.manifest} — proceeding without fake-device wiring (Chrome will use its default fake pattern). Run \`bots-app prep-assets\` to fix.`,
         );
       } else {
-        manifest = loadManifest(opts.manifest).manifest;
+        const loaded = loadManifest(opts.manifest);
+        manifest = loaded.manifest;
+        manifestDir = loaded.manifestDir;
       }
     }
 
@@ -280,6 +283,7 @@ program
         storageStateFile,
         ssoStateFile: effectiveSsoStateFile,
         manifest,
+        manifestDir,
         runDir: opts.assetsDir,
         ttl: botTtl,
         network,

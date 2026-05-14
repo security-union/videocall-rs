@@ -5,7 +5,14 @@
  * will fail to compile and surface the divergence loudly.
  */
 
-export type BotStatus = "launching" | "joining" | "in-meeting" | "leaving" | "done" | "failed";
+export type BotStatus =
+  | "priming"
+  | "launching"
+  | "joining"
+  | "in-meeting"
+  | "leaving"
+  | "done"
+  | "failed";
 
 /**
  * Where the bot is running. `{ kind: "local" }` is the in-process

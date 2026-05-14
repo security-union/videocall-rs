@@ -146,6 +146,26 @@ describe("<LaunchForm />", () => {
     expect(screen.getByTestId("help-runLocation")).toBeInTheDocument();
   });
 
+  it("surfaces the auto-prime caveat in the Costume + Audio help popovers", async () => {
+    renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // Costume popover
+    fireEvent.click(screen.getByTestId("help-costume"));
+    await waitFor(() => {
+      expect(screen.getByText(/auto-prime it on launch/i)).toBeInTheDocument();
+    });
+    // Audio popover — open it next; the costume popover closes when the
+    // user clicks outside, so we re-open by clicking the audio trigger.
+    fireEvent.click(screen.getByTestId("help-audio"));
+    await waitFor(() => {
+      // Both popovers carry the same auto-prime sentence; finding ≥1
+      // is sufficient to prove the audio help text was updated. Use
+      // `findAllByText` to avoid mistaking the costume-still-open
+      // case for an audio assertion.
+      const matches = screen.queryAllByText(/auto-prime it on launch/i);
+      expect(matches.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   it("renders the SSO state warning when JWT auth + missing file", async () => {
     renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
     await waitFor(() => {

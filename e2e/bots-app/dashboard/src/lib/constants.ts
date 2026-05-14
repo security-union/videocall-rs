@@ -134,6 +134,8 @@ export type RunLocation = (typeof RUN_LOCATIONS)[number]["value"];
  * tree-shake unused color combinations correctly.
  */
 export const STATUS_BADGE_CLASS: Record<string, string> = {
+  priming:
+    "bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-300 dark:border-yellow-800",
   launching:
     "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800",
   joining:
@@ -154,7 +156,8 @@ export const STATUS_BADGE_CLASS: Record<string, string> = {
  * any future consumer (timeline, tooltips, etc.) all spell things the
  * same way. The keys here mirror `BotStatus` from the bots-app server.
  */
-const STATUS_LABEL: Record<string, string> = {
+export const STATUS_LABEL: Record<string, string> = {
+  priming: "Priming assets",
   launching: "Launching",
   joining: "Joining",
   "in-meeting": "In meeting",

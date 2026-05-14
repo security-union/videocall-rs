@@ -6,6 +6,7 @@ import { chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { applyJwtCookieAuth } from "./auth/jwt-cookie";
 import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
+import { ensureAssetsPrimed, type PrimeProgress } from "./auto-prime";
 import { isDevServerNoise } from "./dev-noise";
 import { type Manifest } from "./manifest";
 import {
@@ -69,7 +70,32 @@ export interface BotRunOptions {
    * lookup entirely (the launch then uses default fake devices).
    */
   manifest?: Manifest | null;
+  /**
+   * Directory the manifest's `audio_file` paths are anchored against.
+   * Required for the auto-prime path to resolve per-line WAVs when
+   * stitching a participant's audio; without it (or without a
+   * `manifest`), the auto-prime is skipped and the bot falls through
+   * to the existing "resolve already-prepped files" path.
+   *
+   * Set automatically by the CLI (`loadManifest` returns it alongside
+   * the parsed manifest) and by the orchestrator (which loads the
+   * manifest at startup for dashboard-launched bots).
+   */
+  manifestDir?: string | null;
   runDir?: string | null;
+  /**
+   * Optional override for the directory containing per-costume
+   * `<name>/talking.mp4` files the auto-prime feeds into ffmpeg's
+   * y4m conversion. Defaults to `<repoRoot>/bot/assets/costumes`.
+   */
+  costumeSource?: string | null;
+  /**
+   * Optional progress callback wired into `ensureAssetsPrimed`. The
+   * CLI logs to `console.log`; the dashboard's orchestrator forwards
+   * each event into the per-bot rolling log buffer so the `View logs`
+   * dialog can render priming progress live.
+   */
+  onPrimeProgress?: ((p: PrimeProgress) => void) | null;
   /**
    * Optional basename (e.g. `pirate.y4m`) of an explicit costume file
    * the operator picked in the dashboard's launch form. When set, this
@@ -194,6 +220,43 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
   // `--use-file-for-fake-{video,audio}-capture`. A missing file at the
   // resolved path falls back to Chrome's default pattern with a
   // warning — never a hard failure.
+  //
+  // Auto-prime: before resolving the prep'd files, check whether the
+  // expected outputs are actually on disk + up-to-date. If they're
+  // not, run the same `prepare*` helpers `bots-app prep-assets`
+  // invokes — inline, so the operator doesn't have to remember the
+  // batch step. SSH-hosted bots never reach this code path
+  // (`spawnRemoteBot` bypasses `launchBot` entirely), so the
+  // auto-prime is local-only by construction.
+  if (
+    opts.manifest != null &&
+    opts.manifestDir != null &&
+    opts.manifestDir !== "" &&
+    opts.runDir != null &&
+    opts.runDir !== ""
+  ) {
+    await ensureAssetsPrimed({
+      manifest: opts.manifest,
+      manifestDir: opts.manifestDir,
+      runDir: opts.runDir,
+      participant: opts.participant,
+      costumeSource: opts.costumeSource ?? undefined,
+      onProgress: (p) => {
+        // CLI default: prefix every progress event with the bot's
+        // label so the merged stdout stays readable when several
+        // bots are priming in parallel. The dashboard orchestrator
+        // overrides this via `opts.onPrimeProgress` to append into
+        // the per-bot rolling log buffer instead (with the same
+        // formatted line).
+        const line = `[${label}] auto-prime: ${p.step} — ${p.message}`;
+        if (opts.onPrimeProgress) {
+          opts.onPrimeProgress(p);
+        } else {
+          console.log(line);
+        }
+      },
+    });
+  }
   if (opts.runDir != null && opts.runDir !== "") {
     const assets =
       opts.manifest != null

@@ -3,8 +3,12 @@ import type {
   BotSnapshot,
   DaemonInfo,
   HealthResponse,
+  LaunchProfileResponse,
   LaunchRequest,
   LaunchResponse,
+  ProfileListResponse,
+  RunProfile,
+  SaveProfileRequest,
 } from "./types";
 
 /**
@@ -93,4 +97,21 @@ export const api = {
     overrides: { participant?: string; ttl?: string; network?: string },
   ): Promise<{ botId: string }> =>
     request("POST", `/api/bots/${encodeURIComponent(botId)}/duplicate`, overrides),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Run profiles (phase 5.1)
+  // ──────────────────────────────────────────────────────────────────
+  listProfiles: (): Promise<ProfileListResponse> =>
+    request<ProfileListResponse>("GET", "/api/profiles"),
+  getProfile: (name: string): Promise<RunProfile> =>
+    request<RunProfile>("GET", `/api/profiles/${encodeURIComponent(name)}`),
+  saveProfile: (req: SaveProfileRequest): Promise<RunProfile> =>
+    request<RunProfile>("POST", "/api/profiles", req as unknown as Record<string, unknown>),
+  launchProfile: (name: string): Promise<LaunchProfileResponse> =>
+    request<LaunchProfileResponse>(
+      "POST",
+      `/api/profiles/${encodeURIComponent(name)}/launch`,
+    ),
+  deleteProfile: (name: string): Promise<{ name: string; deleted: boolean }> =>
+    request("DELETE", `/api/profiles/${encodeURIComponent(name)}`),
 };

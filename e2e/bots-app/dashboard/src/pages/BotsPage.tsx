@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp } from "lucide-react";
 import { api } from "../api/client";
 import { LaunchForm, type LaunchFormInitial } from "../components/LaunchForm";
 import { RunningBotsTable } from "../components/RunningBotsTable";
+import { RunProfiles } from "../components/RunProfiles";
 import { ToastShelf, useToastShelf } from "../components/ToastShelf";
 
 export function BotsPage() {
@@ -81,6 +82,11 @@ export function BotsPage() {
           </div>
         )}
       </section>
+
+      <RunProfiles
+        hasBots={(botsQuery.data?.bots ?? []).length > 0}
+        onToast={(t) => toast.push(t)}
+      />
 
       <section
         aria-label="Running Bots"

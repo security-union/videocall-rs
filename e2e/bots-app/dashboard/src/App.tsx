@@ -5,6 +5,7 @@ import * as Toast from "@radix-ui/react-toast";
 import { Layout } from "./components/Layout";
 import { BotsPage } from "./pages/BotsPage";
 import { AboutPage } from "./pages/AboutPage";
+import { HelpPage } from "./pages/HelpPage";
 import { ThemeProvider } from "./lib/theme";
 
 /**
@@ -26,16 +27,24 @@ const queryClient = new QueryClient({
   },
 });
 
-export type Route = "bots" | "about";
+export type Route = "bots" | "help" | "about";
 
 export function App() {
   const [route, setRoute] = useState<Route>("bots");
+  let page;
+  if (route === "bots") {
+    page = <BotsPage />;
+  } else if (route === "help") {
+    page = <HelpPage />;
+  } else {
+    page = <AboutPage />;
+  }
   return (
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <Toast.Provider swipeDirection="right" duration={5000}>
           <Layout currentRoute={route} onNavigate={setRoute}>
-            {route === "bots" ? <BotsPage /> : <AboutPage />}
+            {page}
           </Layout>
           <Toast.Viewport className="fixed bottom-4 right-4 z-50 flex w-96 flex-col gap-2 outline-none" />
         </Toast.Provider>

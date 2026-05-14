@@ -14,7 +14,7 @@ export interface LaunchFormValues {
   ttl: string;
   network: string;
   headless: boolean;
-  authBackend: "jwt" | "storage-state";
+  authBackend: "jwt" | "storage-state" | "none";
   storageStateFile: string;
   runLocation: string;
   costume: string;

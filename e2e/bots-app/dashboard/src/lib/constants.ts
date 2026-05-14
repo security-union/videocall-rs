@@ -28,14 +28,87 @@ export const TTL_SUGGESTIONS = ["5m", "30m", "1h", "infinite"] as const;
 
 /**
  * Auth backends recognized by `bots-app run --auth`. The radio
- * group renders one option per entry.
+ * group renders one option per entry. `"none"` is the guest-join
+ * path — no session cookie injected; works only on meetings that
+ * allow guests to land on `/meeting/<id>` without auth.
  */
 export const AUTH_BACKENDS = [
   { value: "jwt", label: "JWT (cookie injection)" },
   { value: "storage-state", label: "Storage-state (replay OAuth)" },
+  { value: "none", label: "Guest (no auth)" },
 ] as const;
 
 export type AuthBackend = (typeof AUTH_BACKENDS)[number]["value"];
+
+/**
+ * Network preset metadata surfaced by the Help page. Each entry
+ * mirrors a `videocall-netsim` preset and carries the
+ * characteristic numbers a user needs to pick the right profile.
+ * Kept in lockstep with the Rust crate's `profiles.rs` — drift
+ * surfaces as a typecheck error in `Help.test.tsx`.
+ */
+export interface NetsimPresetMeta {
+  name: NetsimPreset;
+  description: string;
+  /** Round-trip-ish latency in milliseconds (one-way half). */
+  latencyMs: string;
+  /** Packet-loss percentage as a readable string. */
+  loss: string;
+  /** Downstream bandwidth. */
+  bandwidth: string;
+}
+
+export const NETSIM_PRESET_META: readonly NetsimPresetMeta[] = [
+  {
+    name: "none",
+    description: "Disable the netsim shim entirely — Chrome talks to the server at full speed.",
+    latencyMs: "0",
+    loss: "0%",
+    bandwidth: "unbounded",
+  },
+  {
+    name: "good_wifi",
+    description: "Quiet home or office WiFi; the baseline most users see on a desktop.",
+    latencyMs: "20",
+    loss: "0.1%",
+    bandwidth: "50 Mbps",
+  },
+  {
+    name: "good_4g",
+    description: "Healthy LTE / 4G connection on a phone with decent signal.",
+    latencyMs: "60",
+    loss: "0.5%",
+    bandwidth: "20 Mbps",
+  },
+  {
+    name: "congested_wifi",
+    description: "Crowded WiFi (coffee shop, conference) — bursts of jitter, occasional drops.",
+    latencyMs: "120",
+    loss: "2%",
+    bandwidth: "5 Mbps",
+  },
+  {
+    name: "lossy_mobile",
+    description: "Marginal mobile signal — high latency, noticeable packet loss.",
+    latencyMs: "200",
+    loss: "5%",
+    bandwidth: "1.5 Mbps",
+  },
+  {
+    name: "satellite",
+    description: "GEO satellite link — usable bandwidth but ~600ms latency.",
+    latencyMs: "600",
+    loss: "1%",
+    bandwidth: "10 Mbps",
+  },
+  {
+    name: "dialup",
+    description: "Worst-case fallback: ancient narrow-band link. Stress-test the FEC path.",
+    latencyMs: "150",
+    loss: "3%",
+    bandwidth: "56 kbps",
+  },
+];
 
 /**
  * Where the bot instance runs. Only `"local"` is wired today; the

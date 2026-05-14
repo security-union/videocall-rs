@@ -17,6 +17,7 @@ import {
 } from "../lib/constants";
 import { useFieldHistory } from "../lib/fieldHistory";
 import { type FieldErrors, validateLaunchForm } from "../lib/validation";
+import { HelpPopover } from "./ui/HelpPopover";
 import { HistoryInput } from "./ui/HistoryInput";
 import { Select } from "./ui/Select";
 
@@ -146,210 +147,389 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
 
   return (
     <Tooltip.Provider>
-      <form className="grid grid-cols-1 gap-5 md:grid-cols-2" onSubmit={handleSubmit} noValidate>
-        <Field label="Meeting URL" required error={errors.meetingURL}>
-          <HistoryInput
-            fieldKey="meetingURL"
-            value={values.meetingURL}
-            onChange={(v) => setField("meetingURL", v)}
-            placeholder="https://app.videocall.fnxlabs.com/meeting/TonyBots"
-            className={INPUT_CLASS}
-            testId="meeting-url"
-            ariaInvalid={!!errors.meetingURL}
-            ariaLabel="Meeting URL"
-            type="url"
-          />
-        </Field>
-
-        <Field label="Participant" required error={errors.participant}>
-          <HistoryInput
-            fieldKey="participant"
-            value={values.participant}
-            onChange={(v) => setField("participant", v)}
-            placeholder="alice"
-            className={INPUT_CLASS}
-            testId="participant"
-            ariaInvalid={!!errors.participant}
-            ariaLabel="Participant"
-          />
-        </Field>
-
-        <Field label="Display name (optional)">
-          <HistoryInput
-            fieldKey="displayName"
-            value={values.displayName}
-            onChange={(v) => setField("displayName", v)}
-            placeholder="Alice"
-            className={INPUT_CLASS}
-            testId="display-name"
-            ariaLabel="Display name"
-          />
-        </Field>
-
-        <Field label="TTL" required error={errors.ttl}>
-          <HistoryInput
-            fieldKey="ttl"
-            value={values.ttl}
-            onChange={(v) => setField("ttl", v)}
-            placeholder='"5m", "30s", "1h", or "infinite"'
-            className={INPUT_CLASS}
-            testId="ttl"
-            ariaInvalid={!!errors.ttl}
-            ariaLabel="TTL"
-          />
-          <div className="mt-2 flex flex-wrap gap-1">
-            {TTL_SUGGESTIONS.map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setField("ttl", s)}
-                className={`rounded-full border px-2.5 py-0.5 text-xs ${
-                  values.ttl === s
-                    ? "border-sky-300 bg-sky-100 text-sky-700 dark:border-sky-700 dark:bg-sky-900/40 dark:text-sky-200"
-                    : "border-neutral-200 bg-neutral-50 text-neutral-600 hover:bg-neutral-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
-                }`}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        </Field>
-
-        <Field label="Network profile" error={errors.network}>
-          <Select
-            value={values.network}
-            onValueChange={(v) => setField("network", v)}
-            options={NETSIM_PRESETS.map((p) => ({ value: p, label: p }))}
-            testId="network"
-          />
-        </Field>
-
-        <Field label="Headless">
-          <div className="flex items-center gap-3 py-2">
-            <Switch.Root
-              checked={values.headless}
-              onCheckedChange={(v) => setField("headless", v)}
-              className="relative h-6 w-10 rounded-full bg-neutral-200 data-[state=checked]:bg-sky-500 dark:bg-slate-600 dark:data-[state=checked]:bg-sky-500"
-              data-testid="headless"
-            >
-              <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-4" />
-            </Switch.Root>
-            <span className="text-sm text-neutral-600 dark:text-slate-300">
-              {values.headless ? "Chrome will run headless" : "Chrome will run headed (default)"}
-            </span>
-          </div>
-        </Field>
-
-        <Field label="Auth backend">
-          <RadioGroup.Root
-            value={values.authBackend}
-            onValueChange={(v) => setField("authBackend", v as AuthBackend)}
-            className="flex flex-col gap-2"
+      <form className="flex flex-col gap-5" onSubmit={handleSubmit} noValidate>
+        {/* Section: Meeting */}
+        <Section title="Meeting" description="Where the bot connects.">
+          <Field
+            label="Meeting URL"
+            required
+            error={errors.meetingURL}
+            help={
+              <HelpPopover fieldLabel="Meeting URL" testId="help-meetingURL">
+                <p>The full URL the bot will navigate to.</p>
+                <p className="mt-1">
+                  Example:{" "}
+                  <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                    http://localhost:3001/meeting/Test123
+                  </code>
+                  . Must include the{" "}
+                  <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                    /meeting/&lt;id&gt;
+                  </code>{" "}
+                  path segment.
+                </p>
+              </HelpPopover>
+            }
           >
-            {AUTH_BACKENDS.map((opt) => (
-              <label
-                key={opt.value}
-                className="flex items-center gap-2 text-sm text-neutral-700 dark:text-slate-200"
-                htmlFor={`auth-${opt.value}`}
-              >
-                <RadioGroup.Item
-                  id={`auth-${opt.value}`}
-                  value={opt.value}
-                  className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400"
-                >
-                  <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
-                </RadioGroup.Item>
-                {opt.label}
-              </label>
-            ))}
-          </RadioGroup.Root>
-        </Field>
-
-        {values.authBackend === "storage-state" && (
-          <Field label="Storage-state file" error={errors.storageStateFile} required>
             <HistoryInput
-              fieldKey="storageStateFile"
-              value={values.storageStateFile}
-              onChange={(v) => setField("storageStateFile", v)}
-              placeholder="run/auth/alice.json"
+              fieldKey="meetingURL"
+              value={values.meetingURL}
+              onChange={(v) => setField("meetingURL", v)}
+              placeholder="https://app.videocall.fnxlabs.com/meeting/TonyBots"
               className={INPUT_CLASS}
-              testId="storage-state-file"
-              ariaInvalid={!!errors.storageStateFile}
-              ariaLabel="Storage-state file path"
+              testId="meeting-url"
+              ariaInvalid={!!errors.meetingURL}
+              ariaLabel="Meeting URL"
+              type="url"
             />
           </Field>
-        )}
+        </Section>
 
-        <Field label="Run location" error={errors.runLocation}>
-          <RadioGroup.Root
-            value={values.runLocation}
-            onValueChange={(v) => setField("runLocation", v as RunLocation)}
-            className="flex flex-col gap-2"
+        {/* Section: Identity */}
+        <Section title="Identity" description="Who the bot is in the room.">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Field
+              label="Participant"
+              required
+              error={errors.participant}
+              help={
+                <HelpPopover fieldLabel="Participant" testId="help-participant">
+                  <p>Bot identity.</p>
+                  <p className="mt-1">
+                    For JWT auth this becomes the email subject{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      &lt;participant&gt;@bots-app.local
+                    </code>
+                    . For Guest, this becomes the display name shown in the meeting.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <HistoryInput
+                fieldKey="participant"
+                value={values.participant}
+                onChange={(v) => setField("participant", v)}
+                placeholder="alice"
+                className={INPUT_CLASS}
+                testId="participant"
+                ariaInvalid={!!errors.participant}
+                ariaLabel="Participant"
+              />
+            </Field>
+
+            <Field
+              label="Display name (optional)"
+              help={
+                <HelpPopover fieldLabel="Display name" testId="help-displayName">
+                  <p>What other meeting participants see.</p>
+                  <p className="mt-1">Defaults to the participant handle when unset.</p>
+                </HelpPopover>
+              }
+            >
+              <HistoryInput
+                fieldKey="displayName"
+                value={values.displayName}
+                onChange={(v) => setField("displayName", v)}
+                placeholder="Alice"
+                className={INPUT_CLASS}
+                testId="display-name"
+                ariaLabel="Display name"
+              />
+            </Field>
+          </div>
+
+          <Field
+            label="Auth backend"
+            help={
+              <HelpPopover fieldLabel="Auth backend" testId="help-authBackend">
+                <p>How the bot proves identity to the server.</p>
+                <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                  <li>
+                    <strong>JWT:</strong> inject a session cookie signed with the dev{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      JWT_SECRET
+                    </code>
+                    . Works on local + HCL daily + PR previews.
+                  </li>
+                  <li>
+                    <strong>Storage State:</strong> replay a previously-captured session (use{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      bots-app login
+                    </code>{" "}
+                    to capture). Works against real-OAuth deployments.
+                  </li>
+                  <li>
+                    <strong>Guest (no auth):</strong> skip auth entirely; works only when the
+                    meeting allows guest join.
+                  </li>
+                </ul>
+              </HelpPopover>
+            }
           >
-            {RUN_LOCATIONS.map((loc) => (
-              <Tooltip.Root key={loc.value} delayDuration={150}>
-                <Tooltip.Trigger asChild>
-                  <label
-                    className={`flex items-center gap-2 text-sm ${
-                      loc.available
-                        ? "text-neutral-700 dark:text-slate-200"
-                        : "text-neutral-400 dark:text-slate-500"
-                    }`}
-                    htmlFor={`runloc-${loc.value}`}
+            <RadioGroup.Root
+              value={values.authBackend}
+              onValueChange={(v) => setField("authBackend", v as AuthBackend)}
+              className="flex flex-col gap-2"
+            >
+              {AUTH_BACKENDS.map((opt) => (
+                <label
+                  key={opt.value}
+                  className="flex items-center gap-2 text-sm text-neutral-700 dark:text-slate-200"
+                  htmlFor={`auth-${opt.value}`}
+                >
+                  <RadioGroup.Item
+                    id={`auth-${opt.value}`}
+                    value={opt.value}
+                    className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400"
                   >
-                    <RadioGroup.Item
-                      id={`runloc-${loc.value}`}
-                      value={loc.value}
-                      disabled={!loc.available}
-                      className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+                    <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
+                  </RadioGroup.Item>
+                  {opt.label}
+                </label>
+              ))}
+            </RadioGroup.Root>
+          </Field>
+
+          {values.authBackend === "storage-state" && (
+            <Field
+              label="Storage-state file"
+              error={errors.storageStateFile}
+              required
+              help={
+                <HelpPopover fieldLabel="Storage state file" testId="help-storageStateFile">
+                  <p>
+                    Path to the storage-state JSON captured by{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      bots-app login
+                    </code>
+                    .
+                  </p>
+                  <p className="mt-1">Only used in Storage State mode.</p>
+                </HelpPopover>
+              }
+            >
+              <HistoryInput
+                fieldKey="storageStateFile"
+                value={values.storageStateFile}
+                onChange={(v) => setField("storageStateFile", v)}
+                placeholder="run/auth/alice.json"
+                className={INPUT_CLASS}
+                testId="storage-state-file"
+                ariaInvalid={!!errors.storageStateFile}
+                ariaLabel="Storage-state file path"
+              />
+            </Field>
+          )}
+        </Section>
+
+        {/* Section: Behavior */}
+        <Section title="Behavior" description="How the bot behaves while in the meeting.">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Field
+              label="TTL"
+              required
+              error={errors.ttl}
+              help={
+                <HelpPopover fieldLabel="TTL" testId="help-ttl">
+                  <p>How long the bot stays in the meeting before leaving cleanly.</p>
+                  <p className="mt-1">
+                    Use <code className="font-mono text-[11px]">5m</code>,{" "}
+                    <code className="font-mono text-[11px]">30s</code>,{" "}
+                    <code className="font-mono text-[11px]">2h</code>, or{" "}
+                    <code className="font-mono text-[11px]">infinite</code>.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <HistoryInput
+                fieldKey="ttl"
+                value={values.ttl}
+                onChange={(v) => setField("ttl", v)}
+                placeholder='"5m", "30s", "1h", or "infinite"'
+                className={INPUT_CLASS}
+                testId="ttl"
+                ariaInvalid={!!errors.ttl}
+                ariaLabel="TTL"
+              />
+              <div className="mt-2 flex flex-wrap gap-1">
+                {TTL_SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setField("ttl", s)}
+                    className={`rounded-full border px-2.5 py-0.5 text-xs ${
+                      values.ttl === s
+                        ? "border-sky-300 bg-sky-100 text-sky-700 dark:border-sky-700 dark:bg-sky-900/40 dark:text-sky-200"
+                        : "border-neutral-200 bg-neutral-50 text-neutral-600 hover:bg-neutral-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </Field>
+
+            <Field
+              label="Network profile"
+              error={errors.network}
+              help={
+                <HelpPopover fieldLabel="Network profile" testId="help-network">
+                  <p>Simulated network conditions applied client-side.</p>
+                  <p className="mt-1">
+                    Requires{" "}
+                    <code className="font-mono text-[11px]">videocall-client</code> to be built
+                    with <code className="font-mono text-[11px]">--features netsim</code>. See
+                    the Help page for profile details.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.network}
+                onValueChange={(v) => setField("network", v)}
+                options={NETSIM_PRESETS.map((p) => ({ value: p, label: p }))}
+                testId="network"
+              />
+            </Field>
+          </div>
+
+          <Field
+            label="Headless"
+            help={
+              <HelpPopover fieldLabel="Headless" testId="help-headless">
+                <p>Run Chrome without a visible window.</p>
+                <p className="mt-1">
+                  Less reliable for WebRTC; the default is headed for a reason.
+                </p>
+              </HelpPopover>
+            }
+          >
+            <div className="flex items-center gap-3 py-1">
+              <Switch.Root
+                checked={values.headless}
+                onCheckedChange={(v) => setField("headless", v)}
+                className="relative h-6 w-10 rounded-full bg-neutral-200 data-[state=checked]:bg-sky-500 dark:bg-slate-600 dark:data-[state=checked]:bg-sky-500"
+                data-testid="headless"
+              >
+                <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-4" />
+              </Switch.Root>
+              <span className="text-sm text-neutral-600 dark:text-slate-300">
+                {values.headless ? "Chrome will run headless" : "Chrome will run headed (default)"}
+              </span>
+            </div>
+          </Field>
+        </Section>
+
+        {/* Section: Assets */}
+        <Section title="Assets" description="Optional pre-rendered media inputs.">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Field
+              label="Fake camera (costume)"
+              help={
+                <HelpPopover fieldLabel="Costume" testId="help-costume">
+                  <p>Pre-rendered .y4m fake camera.</p>
+                  <p className="mt-1">
+                    Run{" "}
+                    <code className="font-mono text-[11px]">bots-app prep-assets</code> to
+                    generate options.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.costume}
+                onValueChange={(v) => setField("costume", v)}
+                options={[
+                  { value: "default", label: "Default fake pattern" },
+                  ...(costumesQuery.data ?? []).map((f) => ({ value: f, label: f })),
+                ]}
+                testId="costume"
+              />
+            </Field>
+
+            <Field
+              label="Fake mic (audio)"
+              help={
+                <HelpPopover fieldLabel="Audio" testId="help-audio">
+                  <p>Pre-stitched .wav fake mic.</p>
+                  <p className="mt-1">Same prep step as the costume.</p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.audio}
+                onValueChange={(v) => setField("audio", v)}
+                options={[
+                  { value: "default", label: "Default fake mic" },
+                  ...(audioQuery.data ?? []).map((f) => ({ value: f, label: f })),
+                ]}
+                testId="audio"
+              />
+            </Field>
+          </div>
+        </Section>
+
+        {/* Section: Runtime */}
+        <Section title="Runtime" description="Where the bot's Chrome runs.">
+          <Field
+            label="Run location"
+            error={errors.runLocation}
+            help={
+              <HelpPopover fieldLabel="Run location" testId="help-runLocation">
+                <p>Where the bot&apos;s Chrome runs.</p>
+                <p className="mt-1">
+                  Today only Local is supported; future versions will allow remote VMs / SSH /
+                  Docker.
+                </p>
+              </HelpPopover>
+            }
+          >
+            <RadioGroup.Root
+              value={values.runLocation}
+              onValueChange={(v) => setField("runLocation", v as RunLocation)}
+              className="flex flex-col gap-2"
+            >
+              {RUN_LOCATIONS.map((loc) => (
+                <Tooltip.Root key={loc.value} delayDuration={150}>
+                  <Tooltip.Trigger asChild>
+                    <label
+                      className={`flex items-center gap-2 text-sm ${
+                        loc.available
+                          ? "text-neutral-700 dark:text-slate-200"
+                          : "text-neutral-400 dark:text-slate-500"
+                      }`}
+                      htmlFor={`runloc-${loc.value}`}
                     >
-                      <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
-                    </RadioGroup.Item>
-                    {loc.label}
-                  </label>
-                </Tooltip.Trigger>
-                {!loc.available && (
-                  <Tooltip.Portal>
-                    <Tooltip.Content
-                      side="right"
-                      sideOffset={6}
-                      className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
-                    >
-                      Future feature — see discussion #793
-                      <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
-                    </Tooltip.Content>
-                  </Tooltip.Portal>
-                )}
-              </Tooltip.Root>
-            ))}
-          </RadioGroup.Root>
-        </Field>
+                      <RadioGroup.Item
+                        id={`runloc-${loc.value}`}
+                        value={loc.value}
+                        disabled={!loc.available}
+                        className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+                      >
+                        <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
+                      </RadioGroup.Item>
+                      {loc.label}
+                    </label>
+                  </Tooltip.Trigger>
+                  {!loc.available && (
+                    <Tooltip.Portal>
+                      <Tooltip.Content
+                        side="right"
+                        sideOffset={6}
+                        className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+                      >
+                        Future feature — see discussion #793
+                        <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+                      </Tooltip.Content>
+                    </Tooltip.Portal>
+                  )}
+                </Tooltip.Root>
+              ))}
+            </RadioGroup.Root>
+          </Field>
+        </Section>
 
-        <Field label="Fake camera (costume)">
-          <Select
-            value={values.costume}
-            onValueChange={(v) => setField("costume", v)}
-            options={[
-              { value: "default", label: "Default fake pattern" },
-              ...(costumesQuery.data ?? []).map((f) => ({ value: f, label: f })),
-            ]}
-            testId="costume"
-          />
-        </Field>
-
-        <Field label="Fake mic (audio)">
-          <Select
-            value={values.audio}
-            onValueChange={(v) => setField("audio", v)}
-            options={[
-              { value: "default", label: "Default fake mic" },
-              ...(audioQuery.data ?? []).map((f) => ({ value: f, label: f })),
-            ]}
-            testId="audio"
-          />
-        </Field>
-
-        <div className="md:col-span-2 flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">
+        <div className="flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">
           <button
             type="submit"
             disabled={launchMutation.isPending}
@@ -365,20 +545,47 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
   );
 }
 
+interface SectionProps {
+  title: string;
+  description?: string;
+  children: React.ReactNode;
+}
+
+function Section({ title, description, children }: SectionProps) {
+  return (
+    <fieldset
+      className="rounded-lg border border-neutral-200 bg-neutral-50/40 p-4 dark:border-slate-700 dark:bg-slate-900/30"
+      data-testid={`launch-section-${title.toLowerCase()}`}
+    >
+      <legend className="px-1 text-sm font-semibold tracking-tight text-neutral-800 dark:text-slate-100">
+        {title}
+      </legend>
+      {description && (
+        <p className="mb-3 text-xs text-neutral-500 dark:text-slate-400">{description}</p>
+      )}
+      <div className="flex flex-col gap-4">{children}</div>
+    </fieldset>
+  );
+}
+
 interface FieldProps {
   label: string;
   required?: boolean;
   error?: string;
+  help?: React.ReactNode;
   children: React.ReactNode;
 }
 
-function Field({ label, required, error, children }: FieldProps) {
+function Field({ label, required, error, help, children }: FieldProps) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label className="text-sm font-medium text-neutral-800 dark:text-slate-200">
-        {label}
-        {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
-      </label>
+      <div className="flex items-center gap-1.5">
+        <label className="text-sm font-medium text-neutral-800 dark:text-slate-200">
+          {label}
+          {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
+        </label>
+        {help}
+      </div>
       {children}
       {error && (
         <p className="text-xs text-red-600 dark:text-red-400" role="alert">

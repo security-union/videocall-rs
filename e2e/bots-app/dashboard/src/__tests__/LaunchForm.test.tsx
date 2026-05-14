@@ -83,4 +83,45 @@ describe("<LaunchForm />", () => {
       expect(screen.getByText(/Storage-state file path is required/)).toBeInTheDocument();
     });
   });
+
+  it("renders every form section", () => {
+    renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
+    expect(screen.getByTestId("launch-section-meeting")).toBeInTheDocument();
+    expect(screen.getByTestId("launch-section-identity")).toBeInTheDocument();
+    expect(screen.getByTestId("launch-section-behavior")).toBeInTheDocument();
+    expect(screen.getByTestId("launch-section-assets")).toBeInTheDocument();
+    expect(screen.getByTestId("launch-section-runtime")).toBeInTheDocument();
+  });
+
+  it("exposes a Guest (no auth) radio that the user can select", async () => {
+    const onLaunched = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={onLaunched} onError={vi.fn()} />);
+    const guestRadio = document.getElementById("auth-none") as HTMLElement;
+    expect(guestRadio).not.toBeNull();
+    fireEvent.click(guestRadio);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/Guest" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "guest1" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onLaunched).toHaveBeenCalled();
+    });
+    // No storage-state file field should be visible while Guest is selected.
+    expect(screen.queryByTestId("storage-state-file")).not.toBeInTheDocument();
+  });
+
+  it("renders per-field help triggers", () => {
+    renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // A representative subset — these are the ARIA-described controls.
+    expect(screen.getByTestId("help-meetingURL")).toBeInTheDocument();
+    expect(screen.getByTestId("help-participant")).toBeInTheDocument();
+    expect(screen.getByTestId("help-authBackend")).toBeInTheDocument();
+    expect(screen.getByTestId("help-ttl")).toBeInTheDocument();
+    expect(screen.getByTestId("help-network")).toBeInTheDocument();
+    expect(screen.getByTestId("help-headless")).toBeInTheDocument();
+    expect(screen.getByTestId("help-costume")).toBeInTheDocument();
+    expect(screen.getByTestId("help-audio")).toBeInTheDocument();
+    expect(screen.getByTestId("help-runLocation")).toBeInTheDocument();
+  });
 });

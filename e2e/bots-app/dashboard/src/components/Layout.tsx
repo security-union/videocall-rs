@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Bot, CircleDot, Info } from "lucide-react";
+import { Bot, CircleDot, HelpCircle, Info } from "lucide-react";
 
 import { api } from "../api/client";
 import type { Route } from "../App";
@@ -55,7 +55,11 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
             <span className="text-neutral-600 dark:text-slate-300">
               {daemon ? (
                 <>
-                  ctl :{daemon.port}{" "}
+                  {daemon.mode === "self-hosted" ? (
+                    <>Self-hosted daemon</>
+                  ) : (
+                    <>ctl :{daemon.port}</>
+                  )}{" "}
                   <span className="font-mono text-xs text-neutral-400 dark:text-slate-500">
                     pid {daemon.pid}
                   </span>
@@ -77,6 +81,14 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
                 onClick={() => onNavigate("bots")}
                 icon={<Bot className="h-4 w-4" />}
                 label="Bots"
+              />
+            </li>
+            <li>
+              <NavItem
+                active={currentRoute === "help"}
+                onClick={() => onNavigate("help")}
+                icon={<HelpCircle className="h-4 w-4" />}
+                label="Help"
               />
             </li>
             <li>

@@ -6,23 +6,31 @@ Layers on top of the phase-4 stateful orchestrator + HTTP control API (see
 
 ## Quick start
 
-In one terminal, start an orchestrator with the control API enabled:
-
-```
-cd <repo>/e2e
-npm run bot -- run --participant alice --meeting-url https://app.videocall.fnxlabs.com/meeting/Demo --ctl-port auto --ttl infinite
-```
-
-In a second terminal, start the dashboard:
-
 ```
 cd <repo>/e2e
 npm run bot -- dashboard
 ```
 
-The dashboard auto-discovers the orchestrator's token file under
-`e2e/bots-app/run/ctl-*.token` and opens `http://127.0.0.1:5173/` (Vite dev mode)
-or `http://127.0.0.1:5174/` (built mode) in the browser.
+That's it. The dashboard now spawns the orchestrator + ctl server in-process —
+no separate `bots-app run` terminal needed. The launch form on the Bots page
+adds bots; the table below shows running ones.
+
+The dashboard listens on `http://127.0.0.1:5174/` (built mode) or
+`http://127.0.0.1:5173/` (Vite dev mode). The Layout header shows a
+**Self-hosted daemon** badge with the PID so you know which mode is active.
+
+### Attach mode
+
+If you already have a `bots-app run --ctl-port auto` running and want the
+dashboard to talk to it instead of spawning its own daemon, pass one of:
+
+```
+npm run bot -- dashboard --ctl-token-file run/ctl-12345.token
+# or
+npm run bot -- dashboard --ctl-port 4321 --ctl-token <token>
+```
+
+The Layout header switches to **ctl :<port>** in that mode.
 
 ## Architecture
 
@@ -63,10 +71,10 @@ Two reasons:
 | Flag | Default | Notes |
 |---|---|---|
 | `--port <port>` | `5174` | Dashboard Node sidecar port. `0` lets the kernel pick. |
-| `--ctl-token-file <path>` | auto-discover | Path to a `ctl-*.token` file. |
-| `--ctl-port <port>` | from token file | Override the ctl port. Required with `--ctl-token`. |
-| `--ctl-token <token>` | from token file | Override the bearer token. Required with `--ctl-port`. |
-| `--run-dir <dir>` | `e2e/bots-app/run` | Directory scanned for `ctl-*.token` and asset listings. |
+| `--ctl-token-file <path>` | (self-hosted mode) | Attach to an existing daemon. Setting this (or `--ctl-port`/`--ctl-token`) disables in-process orchestrator spawn. |
+| `--ctl-port <port>` | (self-hosted mode) | Attach mode; combine with `--ctl-token`. |
+| `--ctl-token <token>` | (self-hosted mode) | Attach mode; combine with `--ctl-port`. |
+| `--run-dir <dir>` | `e2e/bots-app/run` | Token files, asset listings, and `<runDir>/profiles/*.json`. |
 | `--no-open` | (open) | Skip auto-opening the dashboard URL in the operator's browser. |
 | `--dist-dir <dir>` | `e2e/bots-app/dashboard/dist` | Where to serve the built UI from. |
 

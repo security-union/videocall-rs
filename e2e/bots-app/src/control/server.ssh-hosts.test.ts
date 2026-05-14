@@ -218,6 +218,108 @@ describe("control server: SSH host registry endpoints", () => {
     expect(res.status).toBe(404);
   });
 
+  describe("POST /hosts/:label/preview-launch", () => {
+    async function seed(label: string): Promise<void> {
+      await fetchJson(handle.port, "/hosts", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          label,
+          host: "my-host.lan:2222",
+          user: "alice",
+          sshKey: null,
+          reposPath: "/home/alice/videocall",
+        },
+      });
+    }
+
+    it("returns argv + display + remoteCommand for a valid spec", async () => {
+      await seed("preview-ok");
+      const res = await fetchJson(handle.port, "/hosts/preview-ok/preview-launch", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice",
+          ttl: "5m",
+          headless: true,
+          network: "none",
+          authBackend: "jwt",
+        },
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { argv: string[]; display: string; remoteCommand: string };
+      expect(Array.isArray(body.argv)).toBe(true);
+      expect(body.argv[0]).toBe("ssh");
+      expect(body.argv).toContain("alice@my-host.lan");
+      expect(body.argv).toContain("-p");
+      expect(body.argv).toContain("2222");
+      expect(body.display).toMatch(/^ssh /);
+      expect(body.display).toContain("ConnectTimeout=10");
+      expect(body.remoteCommand).toContain("npm run bot");
+      expect(body.remoteCommand).toContain("--participant 'alice'");
+      expect(body.remoteCommand).toContain("--ttl '5m'");
+    });
+
+    it("returns 404 when the host is not registered", async () => {
+      const res = await fetchJson(handle.port, "/hosts/ghost/preview-launch", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice",
+          ttl: "5m",
+          headless: true,
+          network: "none",
+          authBackend: "jwt",
+        },
+      });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 400 for an invalid participant", async () => {
+      await seed("preview-bad");
+      const res = await fetchJson(handle.port, "/hosts/preview-bad/preview-launch", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice space",
+          ttl: "5m",
+          headless: true,
+          network: "none",
+          authBackend: "jwt",
+        },
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 for an unknown network preset", async () => {
+      await seed("preview-bad-net");
+      const res = await fetchJson(handle.port, "/hosts/preview-bad-net/preview-launch", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice",
+          ttl: "5m",
+          headless: true,
+          network: "no-such-profile",
+          authBackend: "jwt",
+        },
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects unauthenticated preview requests with 401", async () => {
+      await seed("preview-auth");
+      const res = await fetchJson(handle.port, "/hosts/preview-auth/preview-launch", {
+        method: "POST",
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
   it("GET /bots/:id/log returns empty list for a local bot", async () => {
     const entry = newRegistryEntry(fakeTask());
     surface.registry.set(entry.botId, entry);

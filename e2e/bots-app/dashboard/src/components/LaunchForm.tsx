@@ -1,12 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import * as RadioGroup from "@radix-ui/react-radio-group";
 import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Rocket } from "lucide-react";
+import { Rocket, Wand2 } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
-import type { LaunchRequest, SsoStatusResponse } from "../api/types";
+import type {
+  AssetsManifestParticipant,
+  AssetsManifestResponse,
+  LaunchRequest,
+  SsoStatusResponse,
+} from "../api/types";
 import {
   AUTH_BACKENDS,
   NETSIM_PRESETS,
@@ -56,6 +61,41 @@ const DEFAULT_VALUES: LaunchFormInitial = {
   audio: "default",
 };
 
+/**
+ * Sentinel value the Costume + Audio Selects use for "fall back to
+ * Chrome's default fake pattern". The auto-match logic only overrides
+ * a field whose current value equals this — it never clobbers an
+ * explicit operator selection.
+ */
+const DEFAULT_COSTUME = "default";
+const DEFAULT_AUDIO = "default";
+
+/**
+ * Delay between the operator's last keystroke in the Participant field
+ * and the auto-match check. Long enough that a fast typer doesn't see
+ * the costume/audio fields flicker through partial matches; short
+ * enough that the auto-default feels instant once they pause.
+ */
+const PARTICIPANT_DEBOUNCE_MS = 250;
+
+/**
+ * Look up a manifest participant by case-insensitive trimmed name
+ * match. The launch form normalises both the typed input and the
+ * manifest's `name` before comparing so "Alice", "alice ", and "ALICE"
+ * all resolve to the same row. Returns `null` when no row matches.
+ */
+function findManifestParticipant(
+  manifest: AssetsManifestResponse | undefined,
+  name: string,
+): AssetsManifestParticipant | null {
+  if (!manifest || !Array.isArray(manifest.participants)) return null;
+  const needle = name.trim().toLowerCase();
+  if (needle === "") return null;
+  return (
+    manifest.participants.find((p) => p.name.trim().toLowerCase() === needle) ?? null
+  );
+}
+
 const INPUT_CLASS =
   "w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 shadow-sm placeholder:text-neutral-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:cursor-not-allowed disabled:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-sky-400 dark:focus:ring-sky-400 dark:disabled:bg-slate-900";
 
@@ -64,6 +104,22 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitted, setSubmitted] = useState(false);
   const [ssoPanelOpen, setSsoPanelOpen] = useState(false);
+  // Per-field flags toggled by manual edits to the Costume or Audio
+  // dropdowns. Once flipped, the manifest auto-match logic stops
+  // touching that field until the form is reset via `initialValues`.
+  // Tracked separately from `values` so the auto-match useEffect can
+  // distinguish "operator chose this exact filename" from "we
+  // happened to set this exact filename for them".
+  const [manualTouched, setManualTouched] = useState<{ costume: boolean; audio: boolean }>({
+    costume: false,
+    audio: false,
+  });
+  // True for one "lifetime" — the window between `initialValues`
+  // changing (a duplicate pre-fill) and the operator's first edit.
+  // While set, the manifest auto-match logic is suppressed so the
+  // duplicated bot's explicit settings win. Cleared on any setField
+  // call (including a Participant edit).
+  const [freshlyDuplicated, setFreshlyDuplicated] = useState<boolean>(initialValues !== undefined);
 
   // Surface the captured SSO state in the Identity section when the
   // operator picks JWT auth (which is the path that consumes it). The
@@ -89,6 +145,12 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
       setValues(initialValues);
       setErrors({});
       setSubmitted(false);
+      // The duplicate's existing values must win over manifest
+      // auto-match until the operator makes their first edit. Reset
+      // the per-field "manual touch" tracking too so future edits
+      // get a clean slate.
+      setManualTouched({ costume: false, audio: false });
+      setFreshlyDuplicated(true);
     }
   }, [initialValues]);
 
@@ -106,6 +168,68 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
         .then((r) => r.json() as Promise<{ files: string[] }>)
         .then((j) => j.files ?? []),
   });
+  // Participant → costume / audio mapping. 60s refetch matches the
+  // other asset endpoints — the manifest is sticky during a dashboard
+  // session (operators rerun prep-assets out-of-band).
+  const assetsManifestQuery = useQuery({
+    queryKey: ["assets", "manifest"],
+    queryFn: api.assetsManifest,
+    refetchInterval: 60_000,
+  });
+
+  // Debounced manifest auto-match. When the Participant input matches
+  // a manifest row AND the corresponding Costume / Audio field is
+  // still at its sentinel default AND the operator hasn't manually
+  // pinned that field AND we're not in "freshly duplicated" mode,
+  // populate the field with the manifest's match. Re-typing the same
+  // participant is idempotent; switching to a participant with no
+  // manifest entry is a no-op (the existing value remains).
+  //
+  // The 250ms debounce keeps the costume/audio dropdowns from
+  // flickering through partial matches while the operator is mid-type
+  // (e.g. "ali" → "alic" → "alice" should only fire one match).
+  const manifestMatch = useMemo(
+    () => findManifestParticipant(assetsManifestQuery.data, values.participant),
+    [assetsManifestQuery.data, values.participant],
+  );
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (freshlyDuplicated) return;
+    if (manifestMatch === null) return;
+    // Stash a copy of the current per-field state so the timer
+    // callback runs against the snapshot it was scheduled with.
+    const m = manifestMatch;
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      setValues((prev) => {
+        const next = { ...prev };
+        if (!manualTouched.costume && prev.costume === DEFAULT_COSTUME && m.costumeFile) {
+          next.costume = m.costumeFile;
+        }
+        if (!manualTouched.audio && prev.audio === DEFAULT_AUDIO && m.audioFile) {
+          next.audio = m.audioFile;
+        }
+        return next;
+      });
+    }, PARTICIPANT_DEBOUNCE_MS);
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, [manifestMatch, manualTouched.costume, manualTouched.audio, freshlyDuplicated]);
+
+  // Per-render derivation: is the current Costume / Audio value the
+  // exact manifest default for the current participant? Drives the
+  // small "Auto-matched from manifest" badge next to each Select.
+  // Falls back to false when no participant matches — the badge stays
+  // hidden in that case.
+  const costumeIsAutoMatched =
+    manifestMatch !== null &&
+    manifestMatch.costumeFile !== null &&
+    values.costume === manifestMatch.costumeFile;
+  const audioIsAutoMatched =
+    manifestMatch !== null &&
+    manifestMatch.audioFile !== null &&
+    values.audio === manifestMatch.audioFile;
 
   const launchMutation = useMutation({
     mutationFn: (req: LaunchRequest) => api.launch(req),
@@ -131,6 +255,14 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     if (submitted) {
       setErrors(validateLaunchForm({ ...values, [key]: val }));
     }
+    // Any explicit user edit clears the "freshly duplicated" guard so
+    // subsequent participant edits resume normal auto-match behavior.
+    if (freshlyDuplicated) setFreshlyDuplicated(false);
+    // Explicit picks of Costume / Audio are sticky — the manifest
+    // auto-match must never overwrite the operator's choice from
+    // here on (until `initialValues` resets the form).
+    if (key === "costume") setManualTouched((m) => ({ ...m, costume: true }));
+    if (key === "audio") setManualTouched((m) => ({ ...m, audio: true }));
   };
 
   const handleSubmit: React.FormEventHandler<HTMLFormElement> = (e) => {
@@ -466,6 +598,9 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                   </p>
                 </HelpPopover>
               }
+              badge={
+                costumeIsAutoMatched ? <AutoMatchedBadge testId="costume-auto-matched" /> : null
+              }
             >
               <Select
                 value={values.costume}
@@ -486,6 +621,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                   <p className="mt-1">Same prep step as the costume.</p>
                 </HelpPopover>
               }
+              badge={audioIsAutoMatched ? <AutoMatchedBadge testId="audio-auto-matched" /> : null}
             >
               <Select
                 value={values.audio}
@@ -673,10 +809,17 @@ interface FieldProps {
   required?: boolean;
   error?: string;
   help?: React.ReactNode;
+  /**
+   * Optional inline annotation rendered immediately after the help
+   * popover trigger. Used by the Assets section's Costume + Audio
+   * fields to surface the {@link AutoMatchedBadge} when the current
+   * value equals the manifest's match for the current participant.
+   */
+  badge?: React.ReactNode;
   children: React.ReactNode;
 }
 
-function Field({ label, required, error, help, children }: FieldProps) {
+function Field({ label, required, error, help, badge, children }: FieldProps) {
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-1.5">
@@ -685,6 +828,7 @@ function Field({ label, required, error, help, children }: FieldProps) {
           {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
         </label>
         {help}
+        {badge}
       </div>
       {children}
       {error && (
@@ -693,5 +837,38 @@ function Field({ label, required, error, help, children }: FieldProps) {
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * Tiny "wand" icon + tooltip rendered next to a Select whose value
+ * was auto-defaulted from the manifest mapping. Disappears the moment
+ * the operator picks a different value — the form drops the badge
+ * because `<value> !== manifestMatch.{costume,audio}File` no longer
+ * holds.
+ */
+function AutoMatchedBadge({ testId }: { testId: string }) {
+  return (
+    <Tooltip.Root delayDuration={150}>
+      <Tooltip.Trigger asChild>
+        <span
+          data-testid={testId}
+          aria-label="Auto-matched from manifest"
+          className="inline-flex items-center rounded-full bg-sky-50 px-1.5 py-0.5 text-sky-700 dark:bg-sky-900/40 dark:text-sky-200"
+        >
+          <Wand2 className="h-3 w-3" aria-hidden="true" />
+        </span>
+      </Tooltip.Trigger>
+      <Tooltip.Portal>
+        <Tooltip.Content
+          side="top"
+          sideOffset={6}
+          className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+        >
+          Auto-matched from manifest
+          <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+        </Tooltip.Content>
+      </Tooltip.Portal>
+    </Tooltip.Root>
   );
 }

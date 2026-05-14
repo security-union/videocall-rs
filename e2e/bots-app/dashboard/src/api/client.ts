@@ -1,4 +1,5 @@
 import type {
+  AssetsManifestResponse,
   BotListResponse,
   BotSnapshot,
   DaemonInfo,
@@ -143,4 +144,11 @@ export const api = {
       "DELETE",
       `/api/sso/recapture/${encodeURIComponent(sessionId)}`,
     ),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Participant → costume / audio mapping for the Launch form's
+  // auto-default behavior.
+  // ──────────────────────────────────────────────────────────────────
+  assetsManifest: (): Promise<AssetsManifestResponse> =>
+    request<AssetsManifestResponse>("GET", "/api/assets/manifest"),
 };

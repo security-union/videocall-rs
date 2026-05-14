@@ -701,6 +701,11 @@ program
     "Override the location of the dashboard's built `dist/` directory.",
     join(repoRoot(), "e2e/bots-app/dashboard/dist"),
   )
+  .option(
+    "--manifest <path>",
+    "Path to bot/conversation/manifest.yaml. The dashboard's launch form auto-defaults the costume + audio fields to the manifest-matched assets when an operator types a participant name. Pass an empty string to disable.",
+    join(repoRoot(), "bot/conversation/manifest.yaml"),
+  )
   .action(async (opts: DashboardCommandOptions) => {
     const { startDashboardServer, resolveCtlConfig, spawnViteDev } = await import("./dashboard");
     const port = Number.parseInt(opts.port, 10);
@@ -765,6 +770,11 @@ program
             token,
             tokenFilePath,
             runDir: opts.runDir,
+            // When the operator passed --manifest "" they're opting
+            // out of the auto-match feature entirely; forward as
+            // undefined so the control server's /assets/manifest
+            // endpoint replies with an empty participants array.
+            manifestPath: opts.manifest && opts.manifest !== "" ? opts.manifest : undefined,
             onListen: async ({ port: resolvedPort, token: t }) => {
               await writeTokenFile(tokenFilePath, {
                 port: resolvedPort,
@@ -850,6 +860,7 @@ interface DashboardCommandOptions {
   runDir: string;
   open?: boolean;
   distDir: string;
+  manifest: string;
 }
 
 /**

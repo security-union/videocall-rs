@@ -174,3 +174,22 @@ export interface SsoRecaptureCancelResponse {
   recaptureSessionId: string;
   cancelled: boolean;
 }
+
+/**
+ * One row of the participant → costume / audio mapping the
+ * `/api/assets/manifest` endpoint returns. The Launch form uses this
+ * to auto-default its Costume + Audio dropdowns when the operator
+ * types a participant name that has a manifest entry. `null` fields
+ * mean either "no manifest match" or "manifest mapping exists but the
+ * prep'd file is missing on disk" — the form treats both as "leave the
+ * field at its current value".
+ */
+export interface AssetsManifestParticipant {
+  name: string;
+  costumeFile: string | null;
+  audioFile: string | null;
+}
+
+export interface AssetsManifestResponse {
+  participants: AssetsManifestParticipant[];
+}

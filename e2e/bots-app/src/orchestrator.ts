@@ -51,6 +51,15 @@ export interface RunOptions {
      */
     runDir?: string;
     /**
+     * Optional absolute path to the conversation manifest YAML.
+     * Forwarded to the control server so the `/assets/manifest`
+     * endpoint can build the participant → costume / audio mapping
+     * the dashboard's launch form uses for auto-defaults. Missing /
+     * malformed manifests cause the endpoint to reply with an empty
+     * `participants` array (fail-soft).
+     */
+    manifestPath?: string;
+    /**
      * Optional hook fired once the control server is listening — used
      * by the CLI to write the token file and log the listen line.
      * Receiving the resolved port is useful when `port === 0` (auto).
@@ -266,6 +275,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       token: opts.control.token,
       surface,
       runDir: opts.control.runDir,
+      manifestPath: opts.control.manifestPath,
     });
     console.log(
       `[orchestrator] control server listening on http://127.0.0.1:${controlHandle.port}`,

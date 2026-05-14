@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import * as RadioGroup from "@radix-ui/react-radio-group";
 import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
@@ -10,8 +10,10 @@ import type { MultiLaunchRequest, MultiLaunchResponse } from "../api/types";
 import {
   AUTH_BACKENDS,
   NETSIM_PRESETS,
+  RUN_LOCATIONS,
   TTL_SUGGESTIONS,
   type AuthBackend,
+  type RunLocation,
 } from "../lib/constants";
 import { isValidMeetingUrl } from "../lib/validation";
 import { isValidTtl } from "../lib/ttl";
@@ -38,6 +40,7 @@ interface FormErrors {
   meetingURL?: string;
   ttl?: string;
   storageStateFile?: string;
+  sshHostLabel?: string;
 }
 
 interface MultiLaunchFormValues {
@@ -52,6 +55,9 @@ interface MultiLaunchFormValues {
   authBackend: AuthBackend;
   storageStateFile: string;
   displayNameTemplate: string;
+  /** Per-batch run-location; every spawned bot goes to the same host. */
+  runLocation: RunLocation;
+  sshHostLabel: string;
 }
 
 const DEFAULTS: MultiLaunchFormValues = {
@@ -66,6 +72,8 @@ const DEFAULTS: MultiLaunchFormValues = {
   authBackend: "jwt",
   storageStateFile: "",
   displayNameTemplate: "",
+  runLocation: "local",
+  sshHostLabel: "",
 };
 
 const INPUT_CLASS =
@@ -93,6 +101,9 @@ function validate(values: MultiLaunchFormValues): FormErrors {
   if (values.authBackend === "storage-state" && values.storageStateFile.trim() === "") {
     errors.storageStateFile = "Storage-state file path is required when auth=storage-state";
   }
+  if (values.runLocation === "ssh" && values.sshHostLabel.trim() === "") {
+    errors.sshHostLabel = "Pick a registered SSH host";
+  }
   return errors;
 }
 
@@ -100,6 +111,15 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
   const [values, setValues] = useState<MultiLaunchFormValues>(DEFAULTS);
   const [errors, setErrors] = useState<FormErrors>({});
   const [submitted, setSubmitted] = useState(false);
+
+  // SSH host registry (used to populate the host Select and to gate
+  // the SSH radio option). Same query key as the LaunchForm so the
+  // cache is shared.
+  const hostsQuery = useQuery({
+    queryKey: ["ssh", "hosts"],
+    queryFn: api.listHosts,
+    refetchInterval: 60_000,
+  });
 
   const mutation = useMutation({
     mutationFn: (req: MultiLaunchRequest) => api.launchMulti(req),
@@ -137,6 +157,10 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
       network: values.network,
       headless: values.headless,
       authBackend: values.authBackend,
+      runLocation:
+        values.runLocation === "ssh"
+          ? { kind: "ssh", hostLabel: values.sshHostLabel.trim() }
+          : { kind: "local" },
     };
     if (values.mode === "random") {
       if (values.seed.trim() !== "") {
@@ -495,6 +519,108 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 data-testid="multi-storage-state-file"
                 aria-label="Storage-state file"
                 aria-invalid={!!errors.storageStateFile}
+              />
+            </Field>
+          )}
+        </Section>
+
+        {/* Section: Runtime — all N bots share one runtime / one host. */}
+        <Section title="Runtime" description="Where every spawned bot's Chrome runs.">
+          <Field
+            label="Run location"
+            help={
+              <HelpPopover fieldLabel="Run location" testId="help-multi-run-location">
+                <p>
+                  Local runs the bots in this orchestrator&apos;s own Node process. SSH-able
+                  host runs them all on the same registered remote machine via{" "}
+                  <code className="font-mono text-[11px]">ssh user@host npm run bot …</code>.
+                </p>
+                <p className="mt-1">
+                  v1 does not fan out across hosts; pick one. Cloud VM and Docker remain
+                  future features.
+                </p>
+              </HelpPopover>
+            }
+          >
+            <RadioGroup.Root
+              value={values.runLocation}
+              onValueChange={(v) => setField("runLocation", v as RunLocation)}
+              className="flex flex-col gap-2"
+            >
+              {RUN_LOCATIONS.map((loc) => {
+                const sshUnavailable =
+                  loc.value === "ssh" && (hostsQuery.data?.hosts?.length ?? 0) === 0;
+                const itemDisabled = !loc.available || sshUnavailable;
+                const tooltip = !loc.available
+                  ? "Future feature — see discussion #793"
+                  : sshUnavailable
+                    ? "No hosts registered — add one in Tools"
+                    : null;
+                return (
+                  <Tooltip.Root key={loc.value} delayDuration={150}>
+                    <Tooltip.Trigger asChild>
+                      <label
+                        className={`flex items-center gap-2 text-sm ${
+                          itemDisabled
+                            ? "text-neutral-400 dark:text-slate-500"
+                            : "text-neutral-700 dark:text-slate-200"
+                        }`}
+                        htmlFor={`multi-runloc-${loc.value}`}
+                      >
+                        <RadioGroup.Item
+                          id={`multi-runloc-${loc.value}`}
+                          value={loc.value}
+                          disabled={itemDisabled}
+                          className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
+                        >
+                          <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
+                        </RadioGroup.Item>
+                        {loc.label}
+                      </label>
+                    </Tooltip.Trigger>
+                    {tooltip !== null && (
+                      <Tooltip.Portal>
+                        <Tooltip.Content
+                          side="right"
+                          sideOffset={6}
+                          className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+                        >
+                          {tooltip}
+                          <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+                        </Tooltip.Content>
+                      </Tooltip.Portal>
+                    )}
+                  </Tooltip.Root>
+                );
+              })}
+            </RadioGroup.Root>
+          </Field>
+
+          {values.runLocation === "ssh" && (
+            <Field
+              label="SSH host"
+              required
+              error={errors.sshHostLabel}
+              help={
+                <HelpPopover fieldLabel="SSH host" testId="help-multi-ssh-host">
+                  <p>
+                    All {values.count} bots will be launched on this host. Same v1 caveats
+                    as the single-launch flow.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <Select
+                value={values.sshHostLabel || "__none__"}
+                onValueChange={(v) => setField("sshHostLabel", v === "__none__" ? "" : v)}
+                options={[
+                  { value: "__none__", label: "Pick a host…" },
+                  ...(hostsQuery.data?.hosts ?? []).map((h) => ({
+                    value: h.label,
+                    label: `${h.label}  (${h.user}@${h.host})`,
+                  })),
+                ]}
+                testId="multi-ssh-host-select"
               />
             </Field>
           )}

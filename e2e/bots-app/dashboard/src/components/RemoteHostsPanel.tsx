@@ -438,7 +438,25 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
           </div>
 
           <form className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2" onSubmit={handleSubmit}>
-            <DialogField label="Label" required testIdSuffix="label">
+            <DialogField
+              label="Label"
+              required
+              testIdSuffix="label"
+              help={
+                <HelpPopover fieldLabel="Label" testId="help-label">
+                  <p>
+                    A short identifier for this host (alphanumeric + hyphen). Used everywhere
+                    in the dashboard to refer to this machine.
+                  </p>
+                  <p className="mt-1">
+                    Example:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      lab-mac-1
+                    </code>
+                  </p>
+                </HelpPopover>
+              }
+            >
               <input
                 type="text"
                 value={label}
@@ -450,7 +468,29 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
-            <DialogField label="Host / IP" required testIdSuffix="host">
+            <DialogField
+              label="Host / IP"
+              required
+              testIdSuffix="host"
+              help={
+                <HelpPopover fieldLabel="Host" testId="help-host">
+                  <p>
+                    DNS name or IP of the remote machine. Optionally include the SSH port
+                    after a colon.
+                  </p>
+                  <p className="mt-1">
+                    Example:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      192.168.1.20
+                    </code>{" "}
+                    or{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      my-host.lan:2222
+                    </code>
+                  </p>
+                </HelpPopover>
+              }
+            >
               <input
                 type="text"
                 value={host}
@@ -461,7 +501,23 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
-            <DialogField label="User" testIdSuffix="user">
+            <DialogField
+              label="User"
+              testIdSuffix="user"
+              help={
+                <HelpPopover fieldLabel="User" testId="help-user">
+                  <p>
+                    Username on the remote machine. The dashboard will SSH in as this user.
+                  </p>
+                  <p className="mt-1">
+                    Example:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      alice
+                    </code>
+                  </p>
+                </HelpPopover>
+              }
+            >
               <input
                 type="text"
                 value={user}
@@ -472,7 +528,28 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
-            <DialogField label="SSH key (optional)" testIdSuffix="sshKey">
+            <DialogField
+              label="SSH key (optional)"
+              testIdSuffix="sshKey"
+              help={
+                <HelpPopover fieldLabel="SSH Key" testId="help-sshKey">
+                  <p>
+                    Optional. Absolute path to a private key file. Leave blank to use your
+                    system SSH agent +{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ~/.ssh/config
+                    </code>{" "}
+                    defaults (recommended).
+                  </p>
+                  <p className="mt-1">
+                    Example:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      /Users/alice/.ssh/id_ed25519
+                    </code>
+                  </p>
+                </HelpPopover>
+              }
+            >
               <input
                 type="text"
                 value={sshKey}
@@ -483,7 +560,30 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
-            <DialogField label="Repos path" required testIdSuffix="reposPath" colSpan={2}>
+            <DialogField
+              label="Repos path"
+              required
+              testIdSuffix="reposPath"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Repo path" testId="help-reposPath">
+                  <p>
+                    Absolute path on the remote machine where the videocall repository is
+                    checked out. The dashboard runs{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      cd &lt;reposPath&gt;/e2e &amp;&amp; npm run bot -- run ...
+                    </code>{" "}
+                    there.
+                  </p>
+                  <p className="mt-1">
+                    Example:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      /home/alice/videocall
+                    </code>
+                  </p>
+                </HelpPopover>
+              }
+            >
               <input
                 type="text"
                 value={reposPath}
@@ -494,7 +594,19 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
-            <DialogField label="Notes (optional)" testIdSuffix="notes" colSpan={2}>
+            <DialogField
+              label="Notes (optional)"
+              testIdSuffix="notes"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Notes" testId="help-notes">
+                  <p>
+                    Optional free-form notes about this host — e.g. machine specs, network
+                    role, who owns it. Visible only in the dashboard.
+                  </p>
+                </HelpPopover>
+              }
+            >
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
@@ -547,19 +659,35 @@ interface DialogFieldProps {
   required?: boolean;
   testIdSuffix: string;
   colSpan?: 1 | 2;
+  /**
+   * Optional help-popover trigger rendered next to the label. Mirrors
+   * the `help` slot on {@link LaunchForm}'s {@link Field} component so
+   * each field can carry a `(?)` info button with field-specific copy.
+   */
+  help?: React.ReactNode;
   children: React.ReactNode;
 }
 
-function DialogField({ label, required, testIdSuffix, colSpan = 1, children }: DialogFieldProps) {
+function DialogField({
+  label,
+  required,
+  testIdSuffix,
+  colSpan = 1,
+  help,
+  children,
+}: DialogFieldProps) {
   return (
     <div className={`flex flex-col gap-1.5 ${colSpan === 2 ? "md:col-span-2" : ""}`}>
-      <label
-        className="text-sm font-medium text-neutral-800 dark:text-slate-200"
-        data-testid={`remote-host-dialog-field-${testIdSuffix}`}
-      >
-        {label}
-        {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
-      </label>
+      <div className="flex items-center gap-1.5">
+        <label
+          className="text-sm font-medium text-neutral-800 dark:text-slate-200"
+          data-testid={`remote-host-dialog-field-${testIdSuffix}`}
+        >
+          {label}
+          {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
+        </label>
+        {help}
+      </div>
       {children}
     </div>
   );

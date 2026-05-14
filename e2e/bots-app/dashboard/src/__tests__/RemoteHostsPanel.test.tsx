@@ -194,4 +194,42 @@ describe("RemoteHostsPanel", () => {
       expect(screen.getByTestId("remote-host-test-fail-bad")).toBeInTheDocument();
     });
   });
+
+  it("renders per-field help triggers in the Add host dialog", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    // One trigger per form field — matches the testId="help-<field>" props
+    // wired through DialogField's `help` slot.
+    expect(screen.getByTestId("help-label")).toBeInTheDocument();
+    expect(screen.getByTestId("help-host")).toBeInTheDocument();
+    expect(screen.getByTestId("help-user")).toBeInTheDocument();
+    expect(screen.getByTestId("help-sshKey")).toBeInTheDocument();
+    expect(screen.getByTestId("help-reposPath")).toBeInTheDocument();
+    expect(screen.getByTestId("help-notes")).toBeInTheDocument();
+  });
+
+  it("renders per-field help triggers in the Edit host dialog", async () => {
+    state.hosts = [
+      {
+        label: "edit-me",
+        host: "edit-me.intra",
+        user: "alice",
+        sshKey: null,
+        reposPath: "/home/alice/videocall",
+        notes: null,
+        addedAt: Date.now(),
+      },
+    ];
+    renderPanel();
+    await screen.findByTestId("remote-host-row-edit-me");
+    fireEvent.click(screen.getByTestId("remote-host-edit-edit-me"));
+    await screen.findByTestId("remote-host-dialog");
+    expect(screen.getByTestId("help-label")).toBeInTheDocument();
+    expect(screen.getByTestId("help-host")).toBeInTheDocument();
+    expect(screen.getByTestId("help-user")).toBeInTheDocument();
+    expect(screen.getByTestId("help-sshKey")).toBeInTheDocument();
+    expect(screen.getByTestId("help-reposPath")).toBeInTheDocument();
+    expect(screen.getByTestId("help-notes")).toBeInTheDocument();
+  });
 });

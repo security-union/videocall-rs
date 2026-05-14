@@ -291,6 +291,75 @@ export async function deleteProfile(runDir: string, name: string): Promise<void>
 }
 
 /**
+ * Rename a profile by reading the existing file, updating its `name`
+ * field to the new sanitized name, writing it to the new path, and
+ * finally unlinking the old path.
+ *
+ * Atomicity strategy: write-then-unlink. We deliberately create the
+ * new file BEFORE removing the old one so that a mid-operation failure
+ * leaves a recoverable state on disk:
+ *
+ *   - If the write fails → the old file is still intact; the caller
+ *     sees a 500 and the profile remains under its original name.
+ *   - If the unlink fails → both files exist transiently; the new file
+ *     IS the canonical one (its internal `name` field matches the new
+ *     filename), and the caller sees a 500 noting the stale old file
+ *     for manual cleanup.
+ *
+ * Rejects with `ProfileNotFoundError` when the source profile is
+ * missing, and `ProfileExistsError` when a profile with `newName`
+ * already exists (the operator must delete the conflicting file or
+ * pick a different name; we do not silently overwrite).
+ *
+ * Returns the resulting `RunProfile` (with the renamed `name` field
+ * and the original `savedAt` preserved — renaming is a metadata-only
+ * operation, not a fresh save).
+ */
+export async function renameProfile(
+  runDir: string,
+  oldName: string,
+  newName: string,
+): Promise<RunProfile> {
+  // Path resolution validates both names against `NAME_PATTERN` and
+  // guards against path-escape, throwing `ProfileValidationError` on
+  // bad input.
+  const oldPath = profilePath(runDir, oldName);
+  const newPath = profilePath(runDir, newName);
+  if (oldName === newName) {
+    throw new ProfileValidationError(`profile name "${newName}" is the same as the current name`);
+  }
+  if (!existsSync(oldPath)) {
+    throw new ProfileNotFoundError(oldName);
+  }
+  if (existsSync(newPath)) {
+    throw new ProfileExistsError(newName);
+  }
+  const existing = await readProfileFile(oldPath);
+  const updated: RunProfile = {
+    name: newName,
+    savedAt: existing.savedAt,
+    version: existing.version,
+    bots: existing.bots,
+  };
+  // 1. Write the new file. If this throws the old file is untouched.
+  await writeFile(newPath, JSON.stringify(updated, null, 2), { encoding: "utf8", mode: 0o644 });
+  // 2. Remove the old file. If this throws the new file (canonical)
+  //    is already on disk; we surface the stale-file problem so the
+  //    operator can clean up manually.
+  try {
+    await unlink(oldPath);
+  } catch (e) {
+    throw new Error(
+      `profile rename succeeded but failed to remove stale old file ${oldPath}: ${
+        (e as Error).message
+      } — the new profile "${newName}" is the canonical copy`,
+      { cause: e },
+    );
+  }
+  return updated;
+}
+
+/**
  * Translate a control-API `LaunchSpec` into the persisted
  * `ProfileBotSpec` shape. Drops anything we don't replay.
  */

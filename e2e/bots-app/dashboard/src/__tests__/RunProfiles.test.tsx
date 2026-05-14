@@ -22,6 +22,19 @@ interface FetchState {
   lastSavePayload?: unknown;
   lastLaunched?: string;
   lastDeleted?: string;
+  /**
+   * Maps "<oldName>" → response to return from
+   * `POST /api/profiles/:name/rename`. Default is success (200, with a
+   * synthesized RunProfile). Set a `{ status, body }` entry to force
+   * a specific error (e.g. 409 collision).
+   */
+  renameResponses?: Record<string, { status: number; body: unknown }>;
+  /**
+   * Captured request bodies seen by the rename mock, in arrival order.
+   * Tests assert on the payload to verify the dialog wires the new
+   * name through correctly.
+   */
+  renameCalls?: { oldName: string; body: unknown }[];
 }
 
 function stubFetch(state: FetchState) {
@@ -53,6 +66,30 @@ function stubFetch(state: FetchState) {
           status: 202,
           headers: { "content-type": "application/json" },
         });
+      }
+      const renameMatch = /^\/api\/profiles\/([^/]+)\/rename$/.exec(url);
+      if (renameMatch && init?.method === "POST") {
+        const oldName = decodeURIComponent(renameMatch[1]);
+        const parsedBody = init.body ? JSON.parse(init.body as string) : {};
+        state.renameCalls = state.renameCalls ?? [];
+        state.renameCalls.push({ oldName, body: parsedBody });
+        const forced = state.renameResponses?.[oldName];
+        if (forced) {
+          return new Response(JSON.stringify(forced.body), {
+            status: forced.status,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        const newName = (parsedBody as { newName?: string }).newName ?? "";
+        return new Response(
+          JSON.stringify({
+            name: newName,
+            savedAt: "2026-05-14T01:00:00Z",
+            version: 1,
+            bots: [],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
       }
       const detailMatch = /^\/api\/profiles\/([^/]+)$/.exec(url);
       if (detailMatch && (!init?.method || init.method === "GET")) {
@@ -196,6 +233,105 @@ describe("<RunProfiles />", () => {
     // can verify the right test setup before launching.
     expect(screen.getByTestId("profile-details-meta")).toHaveTextContent("schema v1");
     expect(screen.getByTestId("profile-details-meta")).toHaveTextContent("2 bots");
+  });
+
+  it("Rename button opens the dialog pre-filled with the current name", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "current-name", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    const renameBtn = await screen.findByTestId("run-profile-rename-current-name");
+    fireEvent.click(renameBtn);
+    await waitFor(() => {
+      expect(screen.getByTestId("rename-profile-dialog")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("rename-profile-old-name")).toHaveTextContent("current-name");
+    const input = screen.getByTestId("rename-profile-input") as HTMLInputElement;
+    expect(input.value).toBe("current-name");
+  });
+
+  it("submitting Rename invokes the rename API and surfaces a success toast", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "old-name", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+    };
+    stubFetch(state);
+    const toast = vi.fn();
+    renderWithClient(<RunProfiles hasBots={false} onToast={toast} />);
+    fireEvent.click(await screen.findByTestId("run-profile-rename-old-name"));
+    const input = await screen.findByTestId("rename-profile-input");
+    fireEvent.change(input, { target: { value: "new-name" } });
+    fireEvent.click(screen.getByTestId("rename-profile-submit"));
+    await waitFor(() => {
+      expect(state.renameCalls).toEqual([
+        { oldName: "old-name", body: { newName: "new-name" } },
+      ]);
+    });
+    await waitFor(() => {
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Profile renamed",
+          description: "old-name → new-name",
+          variant: "success",
+        }),
+      );
+    });
+    // Dialog closes after success.
+    await waitFor(() => {
+      expect(screen.queryByTestId("rename-profile-dialog")).not.toBeInTheDocument();
+    });
+  });
+
+  it("shows an inline error and keeps the dialog open when the server responds 409", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "from", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+      renameResponses: {
+        from: {
+          status: 409,
+          body: { error: 'profile "taken" already exists' },
+        },
+      },
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    fireEvent.click(await screen.findByTestId("run-profile-rename-from"));
+    const input = await screen.findByTestId("rename-profile-input");
+    fireEvent.change(input, { target: { value: "taken" } });
+    fireEvent.click(screen.getByTestId("rename-profile-submit"));
+    const err = await screen.findByTestId("rename-profile-error");
+    expect(err).toHaveTextContent("already exists");
+    // Dialog is still open so the operator can fix the value.
+    expect(screen.getByTestId("rename-profile-dialog")).toBeInTheDocument();
+  });
+
+  it("blocks submit and shows an inline error for an invalid new name", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "valid", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    fireEvent.click(await screen.findByTestId("run-profile-rename-valid"));
+    const input = await screen.findByTestId("rename-profile-input");
+    // A leading hyphen violates the server's regex.
+    fireEvent.change(input, { target: { value: "-bad" } });
+    fireEvent.click(screen.getByTestId("rename-profile-submit"));
+    const err = await screen.findByTestId("rename-profile-error");
+    expect(err).toBeInTheDocument();
+    // No network call made — client-side validation short-circuits.
+    expect(state.renameCalls ?? []).toEqual([]);
+  });
+
+  it("blocks submit when the new name is unchanged from the current name", async () => {
+    const state: FetchState = {
+      profiles: [{ name: "same", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    fireEvent.click(await screen.findByTestId("run-profile-rename-same"));
+    fireEvent.click(await screen.findByTestId("rename-profile-submit"));
+    const err = await screen.findByTestId("rename-profile-error");
+    expect(err).toHaveTextContent("differ");
+    expect(state.renameCalls ?? []).toEqual([]);
   });
 
   it("Launch button inside the Details dialog calls the launch endpoint", async () => {

@@ -1,13 +1,22 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Bookmark, Info, Play, Save, Trash2 } from "lucide-react";
+import { Bookmark, Info, Pencil, Play, Save, Trash2 } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type { ProfileBotSpec, ProfileSummary } from "../api/types";
 import { useFieldHistory } from "../lib/fieldHistory";
 import type { ToastEntry } from "./ToastShelf";
 import { ConfirmDialog } from "./ConfirmDialog";
+
+/**
+ * Profile-name regex mirrored from the server's `NAME_PATTERN` in
+ * `e2e/bots-app/src/control/profiles.ts`. The server is the source of
+ * truth (rejection at the API surface is authoritative); we duplicate
+ * it here only for the inline client-side validation that surfaces the
+ * error before the network round-trip.
+ */
+const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 
 interface RunProfilesProps {
   /** True when at least one bot is in the orchestrator's registry. */
@@ -31,6 +40,10 @@ export function RunProfiles({ hasBots, onToast }: RunProfilesProps) {
   // (not by the full summary) so a background refetch can update the
   // dialog's content without re-mounting it.
   const [detailsName, setDetailsName] = useState<string | null>(null);
+  // Name of the profile currently being renamed. `null` keeps the
+  // Rename dialog closed. Like Details we key by name so a background
+  // list refetch does not re-mount the dialog mid-edit.
+  const [renameTarget, setRenameTarget] = useState<string | null>(null);
 
   const launch = useMutation({
     mutationFn: (name: string) => api.launchProfile(name),
@@ -141,6 +154,15 @@ export function RunProfiles({ hasBots, onToast }: RunProfilesProps) {
                 </button>
                 <button
                   type="button"
+                  onClick={() => setRenameTarget(profile.name)}
+                  className="inline-flex items-center rounded-md border border-neutral-200 bg-white p-1.5 text-neutral-700 hover:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                  aria-label={`Rename profile ${profile.name}`}
+                  data-testid={`run-profile-rename-${profile.name}`}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
                   onClick={() => launch.mutate(profile.name)}
                   disabled={launch.isPending}
                   className="inline-flex items-center gap-1 rounded-md bg-sky-500 px-2.5 py-1 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-50"
@@ -204,6 +226,19 @@ export function RunProfiles({ hasBots, onToast }: RunProfilesProps) {
           setConfirmDelete({ name, botCount, savedAt: "" });
         }}
         launchPending={launch.isPending}
+      />
+      <RenameProfileDialog
+        oldName={renameTarget}
+        onClose={() => setRenameTarget(null)}
+        onRenamed={(oldName, newName) => {
+          setRenameTarget(null);
+          onToast({
+            title: "Profile renamed",
+            description: `${oldName} → ${newName}`,
+            variant: "success",
+          });
+          refresh();
+        }}
       />
     </section>
   );
@@ -298,6 +333,181 @@ function SaveProfileDialog({ open, onClose, onSaved, onError, onToast }: SavePro
               data-testid="save-profile-submit"
             >
               {save.isPending ? "Saving…" : "Save profile"}
+            </button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+interface RenameProfileDialogProps {
+  /** Old name of the profile to rename. `null` keeps the dialog closed. */
+  oldName: string | null;
+  onClose: () => void;
+  onRenamed: (oldName: string, newName: string) => void;
+}
+
+/**
+ * Rename-a-profile dialog. Pre-fills the input with the current name
+ * so the operator can edit it inline (arrow keys + selection work as
+ * usual on a text input). Client-side validation mirrors the server's
+ * regex; the server is still the source of truth and a 400/409 surface
+ * inline under the input rather than as a toast — operators recover by
+ * editing the field, not by re-opening the dialog.
+ */
+function RenameProfileDialog({ oldName, onClose, onRenamed }: RenameProfileDialogProps) {
+  const open = oldName !== null;
+  const [newName, setNewName] = useState("");
+  const [inlineError, setInlineError] = useState<string | null>(null);
+
+  // Pre-fill the input with the current name whenever the dialog
+  // opens for a (new) profile. Resetting on close is the operator's
+  // contract: cancel + re-open should not preserve a half-edited
+  // value. Keying the effect on `oldName` makes the reset happen
+  // before the input is rendered visible for the next row.
+  useEffect(() => {
+    if (oldName !== null) {
+      setNewName(oldName);
+      setInlineError(null);
+    } else {
+      setNewName("");
+      setInlineError(null);
+    }
+  }, [oldName]);
+
+  const rename = useMutation({
+    mutationFn: (params: { oldName: string; newName: string }) =>
+      api.renameProfile(params.oldName, params.newName),
+    onSuccess: (_data, vars) => {
+      // The effect on `oldName` resets the form state when the parent
+      // closes the dialog via `onRenamed` — no manual cleanup here.
+      onRenamed(vars.oldName, vars.newName);
+    },
+    onError: (err) => {
+      const msg = err instanceof DashboardApiError ? err.message : (err as Error).message;
+      setInlineError(msg);
+    },
+  });
+
+  const handleOpenChange = (next: boolean) => {
+    if (!next) {
+      setNewName("");
+      setInlineError(null);
+      onClose();
+    }
+  };
+
+  const submit = () => {
+    if (oldName === null) return;
+    const trimmed = newName.trim();
+    if (trimmed === "") {
+      setInlineError("Profile name is required");
+      return;
+    }
+    if (trimmed === oldName) {
+      setInlineError("New name must differ from the current name");
+      return;
+    }
+    if (!PROFILE_NAME_PATTERN.test(trimmed)) {
+      setInlineError(
+        "Profile name must start with a letter or digit, contain only letters, digits, and hyphens, and be at most 64 chars.",
+      );
+      return;
+    }
+    setInlineError(null);
+    rename.mutate({ oldName, newName: trimmed });
+  };
+
+  return (
+    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/40" />
+        <Dialog.Content
+          className="fixed left-1/2 top-1/2 z-50 w-[min(28rem,90vw)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-neutral-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800"
+          data-testid="rename-profile-dialog"
+        >
+          <Dialog.Title className="text-base font-semibold text-neutral-900 dark:text-slate-100">
+            Rename profile
+          </Dialog.Title>
+          <Dialog.Description className="mt-1 text-sm text-neutral-600 dark:text-slate-300">
+            Updates the file under <code>{"<runDir>/profiles/"}</code> and the profile&apos;s
+            internal <code>name</code> field. Other dashboards picking up the list will see the
+            new name on their next refresh.
+          </Dialog.Description>
+          <div className="mt-4 space-y-3">
+            <div>
+              <label className="text-sm font-medium text-neutral-800 dark:text-slate-200">
+                Current name
+              </label>
+              <p
+                className="mt-1 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 font-mono text-sm text-neutral-700 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-300"
+                data-testid="rename-profile-old-name"
+              >
+                {oldName ?? ""}
+              </p>
+            </div>
+            <div>
+              <label
+                className="text-sm font-medium text-neutral-800 dark:text-slate-200"
+                htmlFor="rename-profile-input"
+              >
+                New name
+              </label>
+              <input
+                id="rename-profile-input"
+                autoFocus
+                type="text"
+                value={newName}
+                onFocus={(e) => {
+                  // Pre-select the existing value so the operator can
+                  // overtype immediately if that's what they want, or
+                  // arrow-key to a single-char edit if not. The default
+                  // browser focus behavior leaves the cursor at the end
+                  // which is the wrong default for a "rename" flow.
+                  e.currentTarget.select();
+                }}
+                onChange={(e) => {
+                  setNewName(e.target.value);
+                  if (inlineError !== null) setInlineError(null);
+                }}
+                placeholder={oldName ?? ""}
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+                data-testid="rename-profile-input"
+                pattern="[A-Za-z0-9][A-Za-z0-9-]*"
+                maxLength={64}
+              />
+              <p className="mt-1 text-xs text-neutral-500 dark:text-slate-400">
+                Alphanumeric and hyphens; up to 64 chars.
+              </p>
+              {inlineError !== null && (
+                <p
+                  className="mt-1 text-xs text-red-600 dark:text-red-400"
+                  role="alert"
+                  data-testid="rename-profile-error"
+                >
+                  {inlineError}
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => handleOpenChange(false)}
+              className="rounded-md border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+              data-testid="rename-profile-cancel"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={submit}
+              disabled={rename.isPending}
+              className="rounded-md bg-sky-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+              data-testid="rename-profile-submit"
+            >
+              {rename.isPending ? "Renaming…" : "Rename"}
             </button>
           </div>
         </Dialog.Content>

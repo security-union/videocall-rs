@@ -120,6 +120,12 @@ export const api = {
     ),
   deleteProfile: (name: string): Promise<{ name: string; deleted: boolean }> =>
     request("DELETE", `/api/profiles/${encodeURIComponent(name)}`),
+  renameProfile: (oldName: string, newName: string): Promise<RunProfile> =>
+    request<RunProfile>(
+      "POST",
+      `/api/profiles/${encodeURIComponent(oldName)}/rename`,
+      { newName },
+    ),
 
   // ──────────────────────────────────────────────────────────────────
   // HCL VPN + SSO state management (feat/bots-app-dashboard-sso)

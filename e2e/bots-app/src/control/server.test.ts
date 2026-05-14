@@ -688,6 +688,105 @@ describe("control server: run profiles", () => {
       await otherHandle.close();
     }
   });
+
+  it("POST /profiles/:name/rename moves a saved profile to a new name and updates its name field", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "alice" }));
+    surface.registry.set(entry.botId, entry);
+    const saveRes = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "demo-old", source: "current" },
+    });
+    expect(saveRes.status).toBe(201);
+    const renameRes = await fetchJson(handle.port, `/profiles/demo-old/rename`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { newName: "demo-new" },
+    });
+    expect(renameRes.status).toBe(200);
+    const profile = renameRes.body as { name: string; bots: { participant: string }[] };
+    expect(profile.name).toBe("demo-new");
+    expect(profile.bots[0].participant).toBe("alice");
+
+    // Old name returns 404, new name fetches the same payload.
+    const oldGet = await fetchJson(handle.port, `/profiles/demo-old`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(oldGet.status).toBe(404);
+    const newGet = await fetchJson(handle.port, `/profiles/demo-new`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(newGet.status).toBe(200);
+    expect((newGet.body as { name: string }).name).toBe("demo-new");
+  });
+
+  it("POST /profiles/:name/rename rejects a missing newName with 400", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    surface.registry.set(entry.botId, entry);
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "src", source: "current" },
+    });
+    const res = await fetchJson(handle.port, `/profiles/src/rename`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {},
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /profiles/:name/rename rejects a newName with bad characters with 400", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    surface.registry.set(entry.botId, entry);
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "src", source: "current" },
+    });
+    const res = await fetchJson(handle.port, `/profiles/src/rename`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { newName: "../escape" },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /profiles/:name/rename returns 404 when the source profile is missing", async () => {
+    const res = await fetchJson(handle.port, `/profiles/ghost/rename`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { newName: "ghost-renamed" },
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("POST /profiles/:name/rename returns 409 when newName collides with an existing profile", async () => {
+    const entry = newRegistryEntry(fakeTask({ participant: "alice" }));
+    surface.registry.set(entry.botId, entry);
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "first", source: "current" },
+    });
+    await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "second", source: "current" },
+    });
+    const res = await fetchJson(handle.port, `/profiles/first/rename`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { newName: "second" },
+    });
+    expect(res.status).toBe(409);
+    // Both profiles still listed; no partial-state collision.
+    const list = await fetchJson(handle.port, `/profiles`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const names = (list.body as { profiles: { name: string }[] }).profiles.map((p) => p.name);
+    expect(names.sort()).toEqual(["first", "second"]);
+  });
 });
 
 describe("GET /assets/manifest", () => {

@@ -4,7 +4,7 @@ import { Copy, ExternalLink, LogOut, Mic, MicOff, Monitor, Timer, Trash2, Video,
 
 import { api, DashboardApiError } from "../api/client";
 import type { BotSnapshot } from "../api/types";
-import { STATUS_BADGE_CLASS } from "../lib/constants";
+import { badgeForBot, STATUS_BADGE_CLASS } from "../lib/constants";
 import { formatRemaining } from "../lib/ttl";
 import type { ToastEntry } from "./ToastShelf";
 import { ExtendTtlDialog } from "./ExtendTtlDialog";
@@ -194,13 +194,19 @@ export function RunningBotsTable({
               return (
                 <tr key={b.botId} className="hover:bg-neutral-50 dark:hover:bg-slate-700/50">
                   <td className="px-4 py-2">
-                    <span
-                      className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${
-                        STATUS_BADGE_CLASS[b.status] ?? STATUS_BADGE_CLASS.done
-                      }`}
-                    >
-                      {b.status}
-                    </span>
+                    {(() => {
+                      const { label, badgeKey } = badgeForBot(b);
+                      return (
+                        <span
+                          className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${
+                            STATUS_BADGE_CLASS[badgeKey] ?? STATUS_BADGE_CLASS.done
+                          }`}
+                          title={b.finishReason ? `finishReason: ${b.finishReason}` : undefined}
+                        >
+                          {label}
+                        </span>
+                      );
+                    })()}
                     {b.lastError && (
                       <p
                         className="mt-1 max-w-xs truncate text-xs text-red-600 dark:text-red-400"

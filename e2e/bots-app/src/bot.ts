@@ -7,7 +7,12 @@ import { type AuthBackend, requireStorageState } from "./auth/storage-state";
 import { resolveAssetsForParticipant } from "./assets";
 import { isDevServerNoise } from "./dev-noise";
 import { type Manifest } from "./manifest";
-import { joinMeetingAndEnableMedia, MeetingNavigatedAwayError } from "./meeting-join";
+import {
+  joinMeetingAndEnableMedia,
+  JoinRejectedError,
+  MeetingNavigatedAwayError,
+  WaitingRoomError,
+} from "./meeting-join";
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
@@ -82,11 +87,28 @@ export interface BotRunOptions {
  * Kept as a discriminated union (not a bare string) so callers can carry
  * a structured `cause` along with the reason — and so adding a new
  * variant is a compile-time signal at every callsite.
+ *
+ * Graceful (not counted toward the failure tally):
+ *   - `ttl-expired`     : natural lifetime ran out.
+ *   - `shutdown-signal` : SIGINT/SIGTERM or `ctl-leave`/`ctl-kill`.
+ *   - `user-hangup`     : operator clicked the in-browser HangUp button.
+ *   - `waiting-room`    : meeting page parked us in a Waiting Room or a
+ *                         "host hasn't started yet" lobby; the bot did
+ *                         join, it just has no admit rights here.
+ *
+ * Failure (counts toward the tally):
+ *   - `meeting-rejected`: the host denied our join, OR the page reported
+ *                         a server-side join error (meeting closed,
+ *                         host gone, etc.).
+ *   - `launch-error`    : everything else that prevented the join from
+ *                         completing (timeout, browser crash, ...).
  */
 export type BotExitReason =
   | { kind: "ttl-expired" }
   | { kind: "shutdown-signal" }
   | { kind: "user-hangup" }
+  | { kind: "waiting-room"; variant: "waiting-room" | "waiting-for-host"; detail: string }
+  | { kind: "meeting-rejected"; reason: "rejected" | "error"; detail: string }
   | { kind: "launch-error"; cause: unknown };
 
 export interface BotHandle {
@@ -301,6 +323,16 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
       await browser.close().catch(() => {});
       // Re-throw so the orchestrator's `launchBot` await sees the
       // typed sentinel and can branch on it.
+      throw e;
+    }
+    if (e instanceof WaitingRoomError || e instanceof JoinRejectedError) {
+      // The meeting page reached a terminal-but-non-grid state. The
+      // browser context is still alive but there's nothing for the bot
+      // to do — tear it down and let the orchestrator classify the
+      // exit (graceful for WaitingRoomError, failure for
+      // JoinRejectedError).
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
       throw e;
     }
     throw e;

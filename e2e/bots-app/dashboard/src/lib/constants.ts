@@ -139,6 +139,25 @@ export const STATUS_BADGE_CLASS: Record<string, string> = {
   leaving:
     "bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-800",
   done: "bg-neutral-100 text-neutral-600 border-neutral-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600",
+  "done-waiting":
+    "bg-sky-100 text-sky-800 border-sky-200 dark:bg-sky-900/30 dark:text-sky-300 dark:border-sky-800",
   failed:
     "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800",
 };
+
+/**
+ * Derive the badge label + key for a bot snapshot. Most statuses just
+ * render as themselves; `done` gets a `(waiting)` suffix when the bot
+ * exited because it was parked in a Waiting Room (not a failure, but
+ * worth surfacing visually so operators can tell apart "leave by
+ * design" from "leave because the host never admitted me").
+ */
+export function badgeForBot(snap: {
+  status: string;
+  finishReason?: string;
+}): { label: string; badgeKey: string } {
+  if (snap.status === "done" && snap.finishReason?.startsWith("waiting-room:")) {
+    return { label: "done (waiting)", badgeKey: "done-waiting" };
+  }
+  return { label: snap.status, badgeKey: snap.status };
+}

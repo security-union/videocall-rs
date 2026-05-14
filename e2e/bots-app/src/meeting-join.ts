@@ -16,6 +16,53 @@ export class MeetingNavigatedAwayError extends Error {
 }
 
 /**
+ * Thrown when the bot's join request succeeded at the API level but the
+ * meeting has Waiting Room enabled and the host has not yet admitted us.
+ *
+ * Two sub-states resolve to this error:
+ *   - `MeetingStatus::Waiting` (host's Waiting Room is on and we landed
+ *     in the lobby; identified by `[data-testid="meeting-waiting-room"]`).
+ *   - `MeetingStatus::WaitingForMeeting` (the host hasn't started the
+ *     meeting yet; identified by `[data-testid="meeting-waiting-for-host"]`).
+ *
+ * The orchestrator treats this as a graceful exit (not a failure) — the
+ * bot DID join, it's simply parked. Counting it as an error generates
+ * misleading "ended with an error" tallies for runs where the operator
+ * deliberately joins a meeting they can't admit themselves into.
+ */
+export class WaitingRoomError extends Error {
+  public readonly kind = "waiting-room" as const;
+  public readonly variant: "waiting-room" | "waiting-for-host";
+  constructor(variant: "waiting-room" | "waiting-for-host", message: string) {
+    super(message);
+    this.name = "WaitingRoomError";
+    this.variant = variant;
+  }
+}
+
+/**
+ * Thrown when the join attempt landed on a terminal failure screen:
+ *   - `MeetingStatus::Rejected` (host denied the join request).
+ *   - `MeetingStatus::Error(...)` (server-side join error — meeting closed,
+ *     host left, etc.).
+ *
+ * Surfaces to the orchestrator as a real failure (counts toward the
+ * "ended with an error" tally) but with a clean per-bot diagnostic
+ * instead of the misleading "join button reappeared" message that
+ * the legacy grid-only `waitFor` produced when the page transitioned
+ * to a non-grid terminal state.
+ */
+export class JoinRejectedError extends Error {
+  public readonly kind = "join-rejected" as const;
+  public readonly reason: "rejected" | "error";
+  constructor(reason: "rejected" | "error", message: string) {
+    super(message);
+    this.name = "JoinRejectedError";
+    this.reason = reason;
+  }
+}
+
+/**
  * Steer the bot's Chrome from "just navigated to the meeting URL" into
  * "I'm in the grid with media flowing." Runs as part of the bot's main
  * launch path so the bot doesn't need a human to type a display name or
@@ -156,7 +203,17 @@ export async function joinMeetingAndEnableMedia(args: {
     // button — if the button comes back, the previous click was a
     // no-op (the button was still disabled, the click landed off-target,
     // or the connection failed mid-attempt). Cap retries at 3.
+    //
+    // The race also includes the three non-grid terminal states surfaced
+    // by `dioxus-ui/src/pages/meeting.rs`:
+    //   - `[data-testid="meeting-waiting-room"]`     (Waiting — Waiting Room ON)
+    //   - `[data-testid="meeting-waiting-for-host"]` (WaitingForMeeting — host hasn't started)
+    //   - `[data-testid="meeting-rejected"]`         (Rejected — host denied)
+    //   - `[data-testid="meeting-error"]`            (Error — server-side join failure)
+    // Detection short-circuits the retry loop with a typed error so the
+    // orchestrator can report the right thing.
     await joinWithRetries({
+      page,
       participant,
       joinButton,
       grid,
@@ -266,6 +323,112 @@ async function disableWaitingRoomIfOwner(page: Page, participant: string): Promi
   }
 }
 
+/** Selectors for the non-grid terminal screens rendered by
+ * `dioxus-ui/src/pages/meeting.rs` and `components/waiting_room.rs`.
+ * Centralized so unit tests and the join helper agree on the strings.
+ */
+export const MEETING_STATE_SELECTORS = {
+  waitingRoom: '[data-testid="meeting-waiting-room"]',
+  waitingForHost: '[data-testid="meeting-waiting-for-host"]',
+  rejected: '[data-testid="meeting-rejected"]',
+  error: '[data-testid="meeting-error"]',
+} as const;
+
+type RaceOutcome = "grid" | "waiting-room" | "waiting-for-host" | "rejected" | "error";
+
+/**
+ * Build a `Promise.race` that resolves with the first of the five
+ * post-join terminal-or-success screens to become visible. Resolves
+ * `null` if none appear before `timeout`.
+ *
+ * Note: each child `.waitFor` swallows its own timeout via `.catch`. The
+ * outer race resolves with the first non-null value; if all four
+ * children resolve to `null` the race itself resolves to `null`
+ * (Promise.race + uniformly-resolving promises ⇒ first-to-resolve wins).
+ */
+async function raceJoinOutcome(args: {
+  grid: Locator;
+  waitingRoom: Locator;
+  waitingForHost: Locator;
+  rejected: Locator;
+  errorScreen: Locator;
+  timeout: number;
+}): Promise<RaceOutcome | null> {
+  const { grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
+  return await Promise.race<RaceOutcome | null>([
+    grid
+      .waitFor({ timeout })
+      .then(() => "grid" as const)
+      .catch(() => null),
+    waitingRoom
+      .waitFor({ timeout })
+      .then(() => "waiting-room" as const)
+      .catch(() => null),
+    waitingForHost
+      .waitFor({ timeout })
+      .then(() => "waiting-for-host" as const)
+      .catch(() => null),
+    rejected
+      .waitFor({ timeout })
+      .then(() => "rejected" as const)
+      .catch(() => null),
+    errorScreen
+      .waitFor({ timeout })
+      .then(() => "error" as const)
+      .catch(() => null),
+  ]);
+}
+
+/**
+ * Read the visible error text from the `[data-testid="meeting-error"]`
+ * screen so the bot's log carries the actual server-reported reason
+ * (e.g. "The host has left and no one can admit new participants.").
+ * Falls back to a generic message on read failure.
+ */
+async function readMeetingErrorText(page: Page): Promise<string> {
+  try {
+    const errorBlock = page.locator(MEETING_STATE_SELECTORS.error).first();
+    const text = (await errorBlock.innerText({ timeout: 1_000 })).trim();
+    return text.length > 0 ? text : "meeting page reported an unspecified error";
+  } catch {
+    return "meeting page reached the error screen (text could not be read)";
+  }
+}
+
+/**
+ * Translate a non-grid race outcome into the appropriate typed error.
+ * Centralized so the pre-click + per-attempt paths produce identical
+ * diagnostics.
+ */
+async function throwForOutcome(
+  outcome: Exclude<RaceOutcome, "grid">,
+  participant: string,
+  page: Page,
+): Promise<never> {
+  switch (outcome) {
+    case "waiting-room": {
+      const msg = `parked in waiting room — not a bug, host must admit`;
+      console.log(`[${participant}] ${msg}`);
+      throw new WaitingRoomError("waiting-room", msg);
+    }
+    case "waiting-for-host": {
+      const msg = `waiting for host to start the meeting — not a bug, host hasn't joined yet`;
+      console.log(`[${participant}] ${msg}`);
+      throw new WaitingRoomError("waiting-for-host", msg);
+    }
+    case "rejected": {
+      const msg = "host denied the join request";
+      console.log(`[${participant}] meeting rejected: ${msg}`);
+      throw new JoinRejectedError("rejected", msg);
+    }
+    case "error": {
+      const reportedText = await readMeetingErrorText(page);
+      console.log(`[${participant}] meeting error: ${reportedText}`);
+      throw new JoinRejectedError("error", reportedText);
+    }
+  }
+}
+
 /**
  * Click the (enabled) Join button up to `maxAttempts` times, racing the
  * grid against the Join button reappearing after each click. A
@@ -275,23 +438,46 @@ async function disableWaitingRoomIfOwner(page: Page, participant: string): Promi
  *
  * The grid wait per-attempt is 45s — the netsim'd `lossy_mobile` profile
  * regularly takes 20-35s to bring the WebTransport stream up.
+ *
+ * Each per-attempt wait *also* races against the four non-grid
+ * terminal screens (`meeting-waiting-room`, `meeting-waiting-for-host`,
+ * `meeting-rejected`, `meeting-error`). Detecting any of those throws a
+ * typed error (`WaitingRoomError` / `JoinRejectedError`) instead of
+ * looping the join click — the API already accepted us, the UI is just
+ * telling us we're parked or denied.
  */
 async function joinWithRetries(args: {
+  page: Page;
   participant: string;
   joinButton: Locator;
   grid: Locator;
   isNavigatedAway: () => boolean;
 }): Promise<void> {
-  const { participant, joinButton, grid, isNavigatedAway } = args;
+  const { page, participant, joinButton, grid, isNavigatedAway } = args;
   const maxAttempts = 3;
   const perAttemptGridTimeout = 45_000;
 
+  const waitingRoom = page.locator(MEETING_STATE_SELECTORS.waitingRoom).first();
+  const waitingForHost = page.locator(MEETING_STATE_SELECTORS.waitingForHost).first();
+  const rejected = page.locator(MEETING_STATE_SELECTORS.rejected).first();
+  const errorScreen = page.locator(MEETING_STATE_SELECTORS.error).first();
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (isNavigatedAway()) return; // surfaced by caller's throwIfNavigatedAway
-    // If the grid is already up (rare but possible if we raced past it),
-    // we're done.
-    if (await grid.isVisible({ timeout: 200 }).catch(() => false)) {
-      return;
+
+    // Fast-path: if any of the five post-join screens is already up,
+    // resolve immediately without burning the per-attempt budget.
+    const earlyOutcome = await raceJoinOutcome({
+      grid,
+      waitingRoom,
+      waitingForHost,
+      rejected,
+      errorScreen,
+      timeout: 200,
+    });
+    if (earlyOutcome === "grid") return;
+    if (earlyOutcome !== null) {
+      await throwForOutcome(earlyOutcome, participant, page);
     }
 
     const sawEnabledButton = await joinButton.isVisible({ timeout: 5_000 }).catch(() => false);
@@ -299,8 +485,9 @@ async function joinWithRetries(args: {
       // No enabled join button on screen. Could mean: (a) the click
       // already consumed the form and we're waiting for the grid, or
       // (b) only the disabled variant is showing. Log + fall through
-      // to the grid wait — if the grid never shows, the outer
-      // `grid.waitFor` throws.
+      // to the multi-state race — if no screen shows, throw the
+      // pre-existing "grid did not become visible" error so the
+      // outer behaviour is preserved.
       if (attempt === 1) {
         console.log(`[${participant}] join button not enabled yet, waiting for grid`);
       } else {
@@ -308,14 +495,20 @@ async function joinWithRetries(args: {
           `[${participant}] retrying join click (attempt ${attempt}) — no enabled button visible`,
         );
       }
-      try {
-        await grid.waitFor({ timeout: perAttemptGridTimeout });
-        return;
-      } catch {
-        if (attempt === maxAttempts)
-          throw new Error("grid did not become visible after join click");
-        continue;
+      const noClickOutcome = await raceJoinOutcome({
+        grid,
+        waitingRoom,
+        waitingForHost,
+        rejected,
+        errorScreen,
+        timeout: perAttemptGridTimeout,
+      });
+      if (noClickOutcome === "grid") return;
+      if (noClickOutcome !== null) {
+        await throwForOutcome(noClickOutcome, participant, page);
       }
+      if (attempt === maxAttempts) throw new Error("grid did not become visible after join click");
+      continue;
     }
 
     if (attempt === 1) {
@@ -332,19 +525,44 @@ async function joinWithRetries(args: {
       console.warn(`[${participant}] join-click warning:`, (e as Error).message);
     }
 
-    // Race the grid against a re-appearance of the enabled Join
-    // button. Reappearance ⇒ click was a no-op or the UI rolled back.
-    const outcome = await Promise.race([
-      grid.waitFor({ timeout: perAttemptGridTimeout }).then(() => "grid" as const),
+    // Race the grid + four terminal screens against a re-appearance of
+    // the enabled Join button. Reappearance ⇒ click was a no-op or the
+    // UI rolled back; the four terminal screens short-circuit with a
+    // typed error.
+    type ClickedOutcome = RaceOutcome | "button-reappeared";
+    const outcome = (await Promise.race<ClickedOutcome | null>([
+      grid
+        .waitFor({ timeout: perAttemptGridTimeout })
+        .then(() => "grid" as ClickedOutcome)
+        .catch(() => null),
+      waitingRoom
+        .waitFor({ timeout: perAttemptGridTimeout })
+        .then(() => "waiting-room" as ClickedOutcome)
+        .catch(() => null),
+      waitingForHost
+        .waitFor({ timeout: perAttemptGridTimeout })
+        .then(() => "waiting-for-host" as ClickedOutcome)
+        .catch(() => null),
+      rejected
+        .waitFor({ timeout: perAttemptGridTimeout })
+        .then(() => "rejected" as ClickedOutcome)
+        .catch(() => null),
+      errorScreen
+        .waitFor({ timeout: perAttemptGridTimeout })
+        .then(() => "error" as ClickedOutcome)
+        .catch(() => null),
       joinButton
         .waitFor({ timeout: perAttemptGridTimeout, state: "visible" })
-        .then(() => "button-reappeared" as const)
+        .then(() => "button-reappeared" as ClickedOutcome)
         .catch(() => null),
-    ]).catch(() => null);
+    ])) as ClickedOutcome | null;
 
     if (outcome === "grid") {
       console.log(`[${participant}] join click consumed`);
       return;
+    }
+    if (outcome !== null && outcome !== "button-reappeared") {
+      await throwForOutcome(outcome, participant, page);
     }
     if (outcome === "button-reappeared") {
       if (attempt === maxAttempts) {
@@ -356,7 +574,7 @@ async function joinWithRetries(args: {
       // next iteration so the attempt number is consistent.
       continue;
     }
-    // outcome === null ⇒ neither resolved within the per-attempt
+    // outcome === null ⇒ none resolved within the per-attempt
     // timeout. Treat as failure of this attempt.
     if (attempt === maxAttempts) {
       throw new Error(

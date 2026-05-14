@@ -71,10 +71,18 @@ export interface BotRegistryEntry {
   /** Set when status === "failed". */
   lastError?: string;
   /**
-   * Set on transition to `done`. `"ttl-expired"` / `"shutdown-signal"`
-   * / `"user-hangup"` / `"manual-hangup"` / `"ctl-leave"` /
-   * `"ctl-kill"`. Mirrors `BotExitReason.kind` plus the
-   * control-API-initiated variants.
+   * Set on transition to `done` / `failed`. Mirrors `BotExitReason.kind`
+   * plus the control-API-initiated variants. Known values today:
+   *   - `"ttl-expired"`              (done)
+   *   - `"shutdown-signal"`          (done)
+   *   - `"user-hangup"`              (done)
+   *   - `"waiting-room:waiting-room"`     (done — host's Waiting Room is on)
+   *   - `"waiting-room:waiting-for-host"` (done — host hasn't started yet)
+   *   - `"ctl-leave"`                (done)
+   *   - `"ctl-kill"`                 (done)
+   *   - `"meeting-rejected:rejected"`(failed — host denied)
+   *   - `"meeting-rejected:error"`   (failed — server-reported error)
+   *   - `"launch-error"`             (failed)
    */
   finishReason?: string;
   /** Set when status ∈ {done, failed}; used by the sweeper. */

@@ -11,7 +11,7 @@ import {
   type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
-import { MeetingNavigatedAwayError } from "./meeting-join";
+import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
 
 export interface BotTask extends BotRunOptions {
@@ -393,6 +393,32 @@ async function runSingleBotTask(
         deps.clearMaps(task.botId);
         return { kind: "user-hangup" };
       }
+      if (err instanceof WaitingRoomError) {
+        // The bot DID join — the meeting just parked it in a waiting
+        // room (or "host hasn't started yet" lobby). Not a failure;
+        // surface as a graceful exit so the orchestrator's
+        // failure-tally doesn't paint a misleading picture for runs
+        // where the operator intentionally joins a meeting they can't
+        // self-admit into.
+        console.log(`[${label}] exited cleanly: ${err.message}`);
+        entry.status = "done";
+        entry.finishReason = `waiting-room:${err.variant}`;
+        entry.finishedAt = Date.now();
+        deps.clearMaps(task.botId);
+        return { kind: "waiting-room", variant: err.variant, detail: err.message };
+      }
+      if (err instanceof JoinRejectedError) {
+        // Real failure (host denied us or the server reported an
+        // error) — but report it cleanly instead of the misleading
+        // "join button reappeared after 3 attempts" diagnostic.
+        console.error(`[${label}] join rejected: ${err.message}`);
+        entry.status = "failed";
+        entry.lastError = err.message;
+        entry.finishReason = `meeting-rejected:${err.reason}`;
+        entry.finishedAt = Date.now();
+        deps.clearMaps(task.botId);
+        return { kind: "meeting-rejected", reason: err.reason, detail: err.message };
+      }
       console.error(`[${label}] launch failed:`, (err as Error).message);
       entry.status = "failed";
       entry.lastError = (err as Error).message;
@@ -635,7 +661,18 @@ function defaultDisplayName(participant: string): string {
   return participant.charAt(0).toUpperCase() + participant.slice(1);
 }
 
-function countFailed(registry: Map<string, BotRegistryEntry>): number {
+/**
+ * Number of registry entries that ended in the `failed` state. Drives
+ * the post-run "N/M bot(s) ended with an error" tally. Exported so the
+ * orchestrator's exit-classification rules are unit-testable without
+ * spinning up Playwright — see `orchestrator.test.ts`.
+ *
+ * `done` entries (including the `waiting-room:*` finishReason variants)
+ * are deliberately NOT counted: those bots joined successfully and
+ * exited gracefully when the meeting parked them in a lobby they had
+ * no admit rights for.
+ */
+export function countFailed(registry: Map<string, BotRegistryEntry>): number {
   let n = 0;
   for (const entry of registry.values()) {
     if (entry.status === "failed") n++;

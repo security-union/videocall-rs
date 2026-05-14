@@ -1060,6 +1060,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-aq",
+ "videocall-netsim",
  "videocall-types",
  "web-transport-quinn",
 ]

@@ -36,7 +36,6 @@ pub mod inbound_stats;
 pub mod keyframe_requester;
 pub mod metrics_server;
 pub mod netsim;
-pub mod netsim_profiles;
 pub mod rtt_probe;
 pub mod token;
 pub mod transport;

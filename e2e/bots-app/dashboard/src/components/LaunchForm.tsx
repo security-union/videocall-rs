@@ -55,7 +55,7 @@ const DEFAULT_VALUES: LaunchFormInitial = {
 };
 
 const INPUT_CLASS =
-  "w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+  "w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 shadow-sm placeholder:text-neutral-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:cursor-not-allowed disabled:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-sky-400 dark:focus:ring-sky-400 dark:disabled:bg-slate-900";
 
 export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormProps) {
   const [values, setValues] = useState<LaunchFormInitial>(initialValues ?? DEFAULT_VALUES);
@@ -205,8 +205,8 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 onClick={() => setField("ttl", s)}
                 className={`rounded-full border px-2.5 py-0.5 text-xs ${
                   values.ttl === s
-                    ? "border-sky-300 bg-sky-100 text-sky-700"
-                    : "border-neutral-200 bg-neutral-50 text-neutral-600 hover:bg-neutral-100"
+                    ? "border-sky-300 bg-sky-100 text-sky-700 dark:border-sky-700 dark:bg-sky-900/40 dark:text-sky-200"
+                    : "border-neutral-200 bg-neutral-50 text-neutral-600 hover:bg-neutral-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
                 }`}
               >
                 {s}
@@ -229,12 +229,12 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
             <Switch.Root
               checked={values.headless}
               onCheckedChange={(v) => setField("headless", v)}
-              className="relative h-6 w-10 rounded-full bg-neutral-200 data-[state=checked]:bg-sky-500"
+              className="relative h-6 w-10 rounded-full bg-neutral-200 data-[state=checked]:bg-sky-500 dark:bg-slate-600 dark:data-[state=checked]:bg-sky-500"
               data-testid="headless"
             >
               <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-4" />
             </Switch.Root>
-            <span className="text-sm text-neutral-600">
+            <span className="text-sm text-neutral-600 dark:text-slate-300">
               {values.headless ? "Chrome will run headless" : "Chrome will run headed (default)"}
             </span>
           </div>
@@ -249,15 +249,15 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
             {AUTH_BACKENDS.map((opt) => (
               <label
                 key={opt.value}
-                className="flex items-center gap-2 text-sm text-neutral-700"
+                className="flex items-center gap-2 text-sm text-neutral-700 dark:text-slate-200"
                 htmlFor={`auth-${opt.value}`}
               >
                 <RadioGroup.Item
                   id={`auth-${opt.value}`}
                   value={opt.value}
-                  className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500"
+                  className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400"
                 >
-                  <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500" />
+                  <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
                 </RadioGroup.Item>
                 {opt.label}
               </label>
@@ -291,7 +291,9 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 <Tooltip.Trigger asChild>
                   <label
                     className={`flex items-center gap-2 text-sm ${
-                      loc.available ? "text-neutral-700" : "text-neutral-400"
+                      loc.available
+                        ? "text-neutral-700 dark:text-slate-200"
+                        : "text-neutral-400 dark:text-slate-500"
                     }`}
                     htmlFor={`runloc-${loc.value}`}
                   >
@@ -299,9 +301,9 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                       id={`runloc-${loc.value}`}
                       value={loc.value}
                       disabled={!loc.available}
-                      className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100"
+                      className="flex h-4 w-4 items-center justify-center rounded-full border border-neutral-300 bg-white data-[state=checked]:border-sky-500 disabled:bg-neutral-100 dark:border-slate-500 dark:bg-slate-800 dark:data-[state=checked]:border-sky-400 dark:disabled:bg-slate-900"
                     >
-                      <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500" />
+                      <RadioGroup.Indicator className="h-2 w-2 rounded-full bg-sky-500 dark:bg-sky-400" />
                     </RadioGroup.Item>
                     {loc.label}
                   </label>
@@ -311,10 +313,10 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                     <Tooltip.Content
                       side="right"
                       sideOffset={6}
-                      className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md"
+                      className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
                     >
                       Future feature — see discussion #793
-                      <Tooltip.Arrow className="fill-neutral-900" />
+                      <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
                     </Tooltip.Content>
                   </Tooltip.Portal>
                 )}
@@ -347,11 +349,11 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           />
         </Field>
 
-        <div className="md:col-span-2 flex items-center justify-end gap-3 border-t border-neutral-100 pt-4">
+        <div className="md:col-span-2 flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">
           <button
             type="submit"
             disabled={launchMutation.isPending}
-            className="inline-flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-600 disabled:cursor-not-allowed disabled:bg-neutral-300"
+            className="inline-flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-sky-600 disabled:cursor-not-allowed disabled:bg-neutral-300 dark:disabled:bg-slate-600 dark:disabled:text-slate-400"
             data-testid="launch-button"
           >
             <Rocket className="h-4 w-4" />
@@ -373,13 +375,13 @@ interface FieldProps {
 function Field({ label, required, error, children }: FieldProps) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label className="text-sm font-medium text-neutral-800">
+      <label className="text-sm font-medium text-neutral-800 dark:text-slate-200">
         {label}
-        {required && <span className="ml-0.5 text-red-500">*</span>}
+        {required && <span className="ml-0.5 text-red-500 dark:text-red-400">*</span>}
       </label>
       {children}
       {error && (
-        <p className="text-xs text-red-600" role="alert">
+        <p className="text-xs text-red-600 dark:text-red-400" role="alert">
           {error}
         </p>
       )}

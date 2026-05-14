@@ -4,8 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>videocall bots-app</title>
+    <script>
+      // Resolve persisted theme preference before React mounts so the
+      // first paint matches the user's choice. Kept inline + minimal
+      // to avoid blocking on the bundle.
+      (function () {
+        try {
+          var key = "bots-app-dashboard:theme";
+          var stored = window.localStorage.getItem(key);
+          var mode = stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+          var dark =
+            mode === "dark" ||
+            (mode === "system" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (_) {
+          // localStorage / matchMedia unavailable — fall through to light.
+        }
+      })();
+    </script>
   </head>
-  <body class="bg-neutral-50 text-neutral-900 antialiased">
+  <body class="bg-neutral-50 text-neutral-900 antialiased dark:bg-slate-900 dark:text-slate-100">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

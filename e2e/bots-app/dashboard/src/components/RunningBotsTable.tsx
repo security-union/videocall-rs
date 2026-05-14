@@ -142,7 +142,7 @@ export function RunningBotsTable({
 
   if (error) {
     return (
-      <div className="px-6 py-6 text-sm text-red-700">
+      <div className="px-6 py-6 text-sm text-red-700 dark:text-red-300">
         Could not fetch the bot list:{" "}
         <code className="font-mono text-xs">
           {error instanceof Error ? error.message : String(error)}
@@ -152,12 +152,14 @@ export function RunningBotsTable({
   }
 
   if (isLoading) {
-    return <div className="px-6 py-6 text-sm text-neutral-500">Loading bots…</div>;
+    return (
+      <div className="px-6 py-6 text-sm text-neutral-500 dark:text-slate-400">Loading bots…</div>
+    );
   }
 
   if (sortedBots.length === 0) {
     return (
-      <div className="px-6 py-10 text-center text-sm text-neutral-500">
+      <div className="px-6 py-10 text-center text-sm text-neutral-500 dark:text-slate-400">
         No bots yet. Use the Launch a Bot form above to start one.
       </div>
     );
@@ -167,7 +169,7 @@ export function RunningBotsTable({
     <>
       <div className="overflow-x-auto" data-testid="running-bots-table">
         <table className="w-full text-sm">
-          <thead className="bg-neutral-50 text-xs uppercase tracking-wide text-neutral-500">
+          <thead className="bg-neutral-50 text-xs uppercase tracking-wide text-neutral-500 dark:bg-slate-900 dark:text-slate-400">
             <tr>
               <th className="px-4 py-2 text-left font-medium">Status</th>
               <th className="px-4 py-2 text-left font-medium">Bot</th>
@@ -178,7 +180,7 @@ export function RunningBotsTable({
               <th className="px-4 py-2 text-right font-medium">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-neutral-100">
+          <tbody className="divide-y divide-neutral-100 dark:divide-slate-700">
             {sortedBots.map((b) => {
               const inMeeting = b.status === "in-meeting";
               const terminal = b.status === "done" || b.status === "failed";
@@ -190,7 +192,7 @@ export function RunningBotsTable({
               // which keeps the drift well under the human eye.
               void now;
               return (
-                <tr key={b.botId} className="hover:bg-neutral-50">
+                <tr key={b.botId} className="hover:bg-neutral-50 dark:hover:bg-slate-700/50">
                   <td className="px-4 py-2">
                     <span
                       className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${
@@ -201,32 +203,37 @@ export function RunningBotsTable({
                     </span>
                     {b.lastError && (
                       <p
-                        className="mt-1 max-w-xs truncate text-xs text-red-600"
+                        className="mt-1 max-w-xs truncate text-xs text-red-600 dark:text-red-400"
                         title={b.lastError}
                       >
                         {b.lastError}
                       </p>
                     )}
                   </td>
-                  <td className="px-4 py-2 font-mono text-xs text-neutral-600" title={b.botId}>
+                  <td
+                    className="px-4 py-2 font-mono text-xs text-neutral-600 dark:text-slate-400"
+                    title={b.botId}
+                  >
                     {b.botId.slice(0, 8)}
                   </td>
-                  <td className="px-4 py-2 text-neutral-800">{b.participant}</td>
+                  <td className="px-4 py-2 text-neutral-800 dark:text-slate-200">{b.participant}</td>
                   <td className="px-4 py-2">
                     <a
                       href={b.meetingURL}
                       target="_blank"
                       rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-sky-600 hover:underline"
+                      className="inline-flex items-center gap-1 text-sky-600 hover:underline dark:text-sky-400"
                     >
                       <span className="max-w-xs truncate">{meetingLabel(b.meetingURL)}</span>
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </td>
-                  <td className="px-4 py-2 font-mono text-xs text-neutral-700">
+                  <td className="px-4 py-2 font-mono text-xs text-neutral-700 dark:text-slate-300">
                     {formatRemaining(b.ttlRemainingMs)}
                   </td>
-                  <td className="px-4 py-2 text-xs text-neutral-600">{b.network ?? "—"}</td>
+                  <td className="px-4 py-2 text-xs text-neutral-600 dark:text-slate-400">
+                    {b.network ?? "—"}
+                  </td>
                   <td className="px-4 py-2">
                     <div className="flex justify-end gap-1">
                       <IconButton
@@ -358,13 +365,17 @@ function IconButton({ title, onClick, disabled, active, destructive, children }:
     "inline-flex h-8 w-8 items-center justify-center rounded-md border text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-sky-500";
   let cls: string;
   if (disabled) {
-    cls = "border-neutral-200 bg-neutral-50 text-neutral-300 cursor-not-allowed";
+    cls =
+      "border-neutral-200 bg-neutral-50 text-neutral-300 cursor-not-allowed dark:border-slate-700 dark:bg-slate-800 dark:text-slate-600";
   } else if (destructive) {
-    cls = "border-red-200 bg-white text-red-600 hover:bg-red-50";
+    cls =
+      "border-red-200 bg-white text-red-600 hover:bg-red-50 dark:border-red-800 dark:bg-slate-800 dark:text-red-400 dark:hover:bg-red-900/30";
   } else if (active) {
-    cls = "border-sky-300 bg-sky-50 text-sky-700";
+    cls =
+      "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700 dark:bg-sky-900/40 dark:text-sky-200";
   } else {
-    cls = "border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900";
+    cls =
+      "border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-slate-100";
   }
   return (
     <button

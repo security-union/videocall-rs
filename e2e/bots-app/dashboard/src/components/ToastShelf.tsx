@@ -32,9 +32,11 @@ interface ToastShelfProps {
 }
 
 const VARIANT_STYLES: Record<ToastVariant, string> = {
-  success: "border-emerald-200 bg-emerald-50 text-emerald-900",
-  error: "border-red-200 bg-red-50 text-red-900",
-  info: "border-sky-200 bg-sky-50 text-sky-900",
+  success:
+    "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-100",
+  error:
+    "border-red-200 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-900/30 dark:text-red-100",
+  info: "border-sky-200 bg-sky-50 text-sky-900 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-100",
 };
 
 export function ToastShelf({ entries, onDismiss }: ToastShelfProps) {
@@ -62,7 +64,7 @@ export function ToastShelf({ entries, onDismiss }: ToastShelfProps) {
           </div>
           <Toast.Close
             aria-label="Dismiss"
-            className="shrink-0 rounded p-1 text-neutral-500 hover:bg-white/50"
+            className="shrink-0 rounded p-1 text-neutral-500 hover:bg-white/50 dark:text-slate-300 dark:hover:bg-white/10"
           >
             <X className="h-4 w-4" />
           </Toast.Close>

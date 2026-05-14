@@ -5,6 +5,7 @@ import * as Toast from "@radix-ui/react-toast";
 import { Layout } from "./components/Layout";
 import { BotsPage } from "./pages/BotsPage";
 import { AboutPage } from "./pages/AboutPage";
+import { ThemeProvider } from "./lib/theme";
 
 /**
  * TanStack Query client with conservative defaults for a control-plane
@@ -30,13 +31,15 @@ export type Route = "bots" | "about";
 export function App() {
   const [route, setRoute] = useState<Route>("bots");
   return (
-    <QueryClientProvider client={queryClient}>
-      <Toast.Provider swipeDirection="right" duration={5000}>
-        <Layout currentRoute={route} onNavigate={setRoute}>
-          {route === "bots" ? <BotsPage /> : <AboutPage />}
-        </Layout>
-        <Toast.Viewport className="fixed bottom-4 right-4 z-50 flex w-96 flex-col gap-2 outline-none" />
-      </Toast.Provider>
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <Toast.Provider swipeDirection="right" duration={5000}>
+          <Layout currentRoute={route} onNavigate={setRoute}>
+            {route === "bots" ? <BotsPage /> : <AboutPage />}
+          </Layout>
+          <Toast.Viewport className="fixed bottom-4 right-4 z-50 flex w-96 flex-col gap-2 outline-none" />
+        </Toast.Provider>
+      </QueryClientProvider>
+    </ThemeProvider>
   );
 }

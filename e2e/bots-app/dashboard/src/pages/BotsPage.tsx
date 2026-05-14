@@ -39,7 +39,7 @@ export function BotsPage() {
     <div className="flex flex-col gap-6">
       <section
         aria-label="Launch a Bot"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm"
+        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
       >
         <button
           type="button"
@@ -49,19 +49,21 @@ export function BotsPage() {
           data-testid="launch-form-toggle"
         >
           <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900">Launch a Bot</h2>
-            <p className="text-sm text-neutral-500">
+            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+              Launch a Bot
+            </h2>
+            <p className="text-sm text-neutral-500 dark:text-slate-400">
               Configure a meeting attendee and where it should run.
             </p>
           </div>
           {effectiveOpen ? (
-            <ChevronUp className="h-5 w-5 text-neutral-400" />
+            <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
           ) : (
-            <ChevronDown className="h-5 w-5 text-neutral-400" />
+            <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
           )}
         </button>
         {effectiveOpen && (
-          <div className="border-t border-neutral-200 px-6 py-5">
+          <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
             <LaunchForm
               initialValues={initialValues}
               onLaunched={(botId) => {
@@ -82,21 +84,23 @@ export function BotsPage() {
 
       <section
         aria-label="Running Bots"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm"
+        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
       >
         <div className="flex items-center justify-between px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900">Running Bots</h2>
-            <p className="text-sm text-neutral-500">
+            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+              Running Bots
+            </h2>
+            <p className="text-sm text-neutral-500 dark:text-slate-400">
               Live + recently-finished bots in the orchestrator&apos;s registry. Refreshes every
               2.5s.
             </p>
           </div>
-          <span className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600">
+          <span className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300">
             {liveBots.length} live / {botsQuery.data?.bots.length ?? 0} total
           </span>
         </div>
-        <div className="border-t border-neutral-200">
+        <div className="border-t border-neutral-200 dark:border-slate-700">
           <RunningBotsTable
             isLoading={botsQuery.isLoading}
             error={botsQuery.error}

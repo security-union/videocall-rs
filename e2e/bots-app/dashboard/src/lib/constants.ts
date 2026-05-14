@@ -57,10 +57,15 @@ export type RunLocation = (typeof RUN_LOCATIONS)[number]["value"];
  * tree-shake unused color combinations correctly.
  */
 export const STATUS_BADGE_CLASS: Record<string, string> = {
-  launching: "bg-amber-100 text-amber-800 border-amber-200",
-  joining: "bg-amber-100 text-amber-800 border-amber-200",
-  "in-meeting": "bg-emerald-100 text-emerald-800 border-emerald-200",
-  leaving: "bg-orange-100 text-orange-800 border-orange-200",
-  done: "bg-neutral-100 text-neutral-600 border-neutral-200",
-  failed: "bg-red-100 text-red-800 border-red-200",
+  launching:
+    "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800",
+  joining:
+    "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800",
+  "in-meeting":
+    "bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:border-emerald-800",
+  leaving:
+    "bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-800",
+  done: "bg-neutral-100 text-neutral-600 border-neutral-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600",
+  failed:
+    "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800",
 };

@@ -4,6 +4,12 @@ export function AboutPage() {
       <h2 className="text-xl font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
         About the bots-app dashboard
       </h2>
+      <p
+        data-testid="about-version"
+        className="mt-1 text-sm text-neutral-500 dark:text-slate-400"
+      >
+        Version: <span className="font-mono">v{__APP_VERSION__}</span>
+      </p>
       <p className="mt-3 text-sm text-neutral-700 dark:text-slate-300">
         This UI is a thin client over the{" "}
         <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-xs dark:bg-slate-900 dark:text-slate-200">

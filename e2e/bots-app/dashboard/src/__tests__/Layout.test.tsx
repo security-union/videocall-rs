@@ -90,4 +90,18 @@ describe("<Layout />", () => {
       expect(screen.getByTestId("daemon-status")).toHaveTextContent(/ctl :5555/);
     });
   });
+
+  it("renders a footer with the dashboard version and the discussion #793 link", () => {
+    renderLayout({ port: 1234, pid: 9999, startedAt: "2026-05-13T22:00:00Z", mode: "attached" });
+    const footer = screen.getByTestId("dashboard-footer");
+    expect(footer).toBeInTheDocument();
+    expect(footer).toHaveTextContent(
+      /videocall bots-app dashboard v\d+\.\d+\.\d+(?:[-+][\w.-]+)?/,
+    );
+    const link = screen.getByRole("link", { name: /discussion #793/i });
+    expect(link).toHaveAttribute(
+      "href",
+      "https://github01.hclpnp.com/labs-projects/videocall/discussions/793",
+    );
+  });
 });

@@ -110,6 +110,25 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
         </nav>
         <main className="min-w-0 flex-1">{children}</main>
       </div>
+      <footer
+        data-testid="dashboard-footer"
+        className="border-t border-neutral-200 bg-white text-xs text-neutral-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"
+      >
+        <div className="mx-auto flex max-w-7xl items-center justify-end gap-2 px-6 py-2">
+          <span>
+            videocall bots-app dashboard v{__APP_VERSION__}
+            {" · "}
+            <a
+              className="text-sky-600 hover:underline dark:text-sky-400"
+              href="https://github01.hclpnp.com/labs-projects/videocall/discussions/793"
+              target="_blank"
+              rel="noreferrer"
+            >
+              discussion #793
+            </a>
+          </span>
+        </div>
+      </footer>
     </div>
   );
 }

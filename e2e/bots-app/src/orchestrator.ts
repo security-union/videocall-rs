@@ -8,6 +8,7 @@ import {
 import {
   startControlServer,
   type ControlServerHandle,
+  type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
 import { MeetingNavigatedAwayError } from "./meeting-join";
@@ -38,6 +39,14 @@ export interface RunOptions {
     port: number;
     token: string;
     tokenFilePath: string;
+    /**
+     * Run directory shared with the CLI's `--assets-dir`. Forwarded
+     * to the control server so the `/profiles*` endpoints can read
+     * and write `<runDir>/profiles/`. When omitted those endpoints
+     * reply with 503 (the control surface still works for everything
+     * else).
+     */
+    runDir?: string;
     /**
      * Optional hook fired once the control server is listening — used
      * by the CLI to write the token file and log the listen line.
@@ -109,6 +118,13 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   // transitions to `done`/`failed` only when its promise resolves.
   const registry: Map<string, BotRegistryEntry> = new Map();
   const inFlight: Map<string, Promise<BotExitReason>> = new Map();
+  // When the wait loop is idle (no in-flight bots, control server
+  // attached), it parks itself on a promise that resolves the moment
+  // `registerTask` wakes it. Each call to `registerTask` drains the
+  // queue — the loop re-enters its dispatch race with the new bot
+  // included. Without this, dashboard-launched bots would sit in the
+  // registry but never have their exit promise observed.
+  const inFlightWaiters: Array<() => void> = [];
   // Per-bot mutable scheduling state. Kept outside the registry entry
   // because none of it is safe to serialize over the control API.
   const ttlTimers: Map<string, { cancel: () => void; rearm: (ttl: Ttl) => void }> = new Map();
@@ -119,7 +135,11 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   // the orchestrator can branch on it.
   const ctlSignals: Map<string, { trigger: (reason: CtlReason) => void }> = new Map();
 
-  console.log(`[orchestrator] launching ${initialTasks.length} bot(s)`);
+  if (initialTasks.length > 0) {
+    console.log(`[orchestrator] launching ${initialTasks.length} bot(s)`);
+  } else {
+    console.log("[orchestrator] starting with 0 bots; waiting for dashboard / ctl to add some");
+  }
 
   // Build the control surface up front so we can hand it to the
   // server before any bot finishes — the server can be queried the
@@ -171,6 +191,40 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
       await toggleCamera(entry, cameraOff);
     },
+    setScreenShare: async (botId, share) => {
+      const entry = registry.get(botId);
+      if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
+      await toggleScreenShare(entry, share);
+    },
+    launchOne: async (spec: LaunchSpec) => {
+      const newTask: BotTask = {
+        botId: generateBotId(),
+        meetingURL: spec.meetingURL,
+        participant: spec.participant,
+        displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+        headless: spec.headless,
+        authBackend: spec.authBackend,
+        storageStateFile:
+          spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
+        // Use the same SSO-state convention as the CLI: only consulted
+        // when authBackend === "jwt", and the path resolution mirrors
+        // the legacy `--sso-state-file` default. We can't reach the
+        // CLI's `assetsDir` from here without leaking state into the
+        // surface, so we accept SSO files only at the path the CLI's
+        // default scan covers (callers can pre-stage the file).
+        ssoStateFile: null,
+        manifest: null,
+        runDir: null,
+        ttl: spec.ttl,
+        network: spec.network === "none" ? null : spec.network,
+      };
+      registerTask(newTask);
+      console.log(
+        `[orchestrator] dashboard-launch → ${newTask.participant}@${shortBotId(newTask.botId)}`,
+      );
+      return newTask.botId;
+    },
     duplicateBot: async (sourceBotId, overrides) => {
       const src = registry.get(sourceBotId);
       if (src === undefined) throw new Error(`bot ${sourceBotId} not in registry`);
@@ -198,6 +252,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       port: opts.control.port,
       token: opts.control.token,
       surface,
+      runDir: opts.control.runDir,
     });
     console.log(
       `[orchestrator] control server listening on http://127.0.0.1:${controlHandle.port}`,
@@ -222,17 +277,49 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
         },
       }),
     );
+    // Wake the wait loop if it was parked waiting for new work
+    // (dashboard mode with zero initial tasks). Draining the queue
+    // here is intentional — every parked waiter resolves with the same
+    // "size changed" signal.
+    while (inFlightWaiters.length > 0) {
+      const w = inFlightWaiters.shift();
+      if (w) w();
+    }
   }
 
   for (const task of initialTasks) {
     registerTask(task);
   }
 
-  // Main wait loop: keep racing the in-flight map until it's empty.
+  // Main wait loop: keep racing the in-flight map until it's empty
+  // AND no control server is attached (or the shutdown signal has
+  // fired). When the dashboard launches the orchestrator self-hosted
+  // with zero initial bots, the loop body never enters until the
+  // control server's `launchOne` populates `inFlight`; the
+  // `shutdownRequested` race keeps the process awake in the
+  // meantime.
+  //
   // `Promise.race` returns the first-to-resolve, but we need to know
   // *which* promise it was — so we attach the botId to the value
   // before racing.
-  while (inFlight.size > 0) {
+  while (true) {
+    if (inFlight.size === 0) {
+      // No work currently in flight. If we have a control server
+      // attached, idle until either a new bot is enqueued (which sets
+      // `inFlightChanged`) or a shutdown signal is delivered. When
+      // there's no control server, exit immediately — the legacy
+      // `bots-app run --participant alice` flow finishes the moment
+      // its only bot finishes.
+      if (controlHandle === null) break;
+      if (shuttingDown) break;
+      await Promise.race([
+        shutdownRequested,
+        new Promise<void>((res) => {
+          inFlightWaiters.push(res);
+        }),
+      ]);
+      continue;
+    }
     const winner = await Promise.race(
       Array.from(inFlight, ([id, promise]) =>
         promise.then(
@@ -489,6 +576,31 @@ async function toggleCamera(entry: BotRegistryEntry, cameraOff: boolean): Promis
     ? ["Stop Video", "Stop Camera", "Stop camera"]
     : ["Start Video", "Start Camera", "Start camera"];
   await clickFirstMatchingTooltip(entry, tooltips, cameraOff ? "camera-off" : "camera-on");
+}
+
+/**
+ * Click the in-meeting screen-share toggle. Same pattern as mic/cam:
+ * hover the action bar so the auto-hide doesn't get in the way, then
+ * click the button matching the tooltip text. The matching tooltips
+ * live in `dioxus-ui/src/components/video_control_buttons.rs` —
+ * `"Share Screen"` (idle) and `"Stop Screen Share"` (active).
+ *
+ * Note: the browser's `getDisplayMedia()` prompt cannot be auto-confirmed
+ * by a Playwright click. The bot relies on `--use-fake-ui-for-media-stream`
+ * (already in `CHROME_ARGS`) to bypass the prompt entirely — Chrome
+ * picks the first available source. This is acceptable for bots; for
+ * the human-operator case the operator wouldn't be using a bot.
+ */
+async function toggleScreenShare(entry: BotRegistryEntry, share: boolean): Promise<void> {
+  if (entry.handle === null) return;
+  const { page } = entry.handle;
+  await page
+    .locator(".video-controls-container")
+    .first()
+    .hover()
+    .catch(() => {});
+  const tooltips = share ? ["Share Screen"] : ["Stop Screen Share"];
+  await clickFirstMatchingTooltip(entry, tooltips, share ? "share-start" : "share-stop");
 }
 
 async function clickFirstMatchingTooltip(

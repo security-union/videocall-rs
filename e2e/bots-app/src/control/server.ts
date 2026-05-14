@@ -4,6 +4,16 @@ import { NETSIM_PRESETS } from "../meeting-config";
 import { formatDuration, parseDuration, type Ttl } from "../ttl";
 import { extractBearerToken, tokensMatch } from "./auth";
 import {
+  deleteProfile,
+  listProfiles,
+  ProfileExistsError,
+  ProfileNotFoundError,
+  ProfileValidationError,
+  readProfile,
+  saveProfile,
+  type ProfileBotSpec,
+} from "./profiles";
+import {
   type BotRegistryEntry,
   type BotSnapshot,
   snapshotEntry,
@@ -37,11 +47,38 @@ export interface OrchestratorControlSurface {
   setMicMuted(botId: string, micMuted: boolean): Promise<void>;
   /** Click in-meeting camera on/off. `cameraOff === true` means off. */
   setCameraOff(botId: string, cameraOff: boolean): Promise<void>;
+  /** Click in-meeting screen-share toggle. `share === true` means share active. */
+  setScreenShare(botId: string, share: boolean): Promise<void>;
   /** Spawn a duplicate; returns the new bot's id. */
   duplicateBot(
     sourceBotId: string,
     overrides: { participant?: string; ttl?: Ttl; network?: string },
   ): Promise<string>;
+  /**
+   * Spawn a fresh bot with the supplied fields. Returns the new bot's
+   * id. Used by `POST /launch` from the phase-5 dashboard.
+   *
+   * `participantOverride` is the same handle the legacy CLI accepts —
+   * implementations are responsible for resolving fake-device assets
+   * and JWT subjects exactly as the `bots-app run` command does.
+   */
+  launchOne(spec: LaunchSpec): Promise<string>;
+}
+
+/**
+ * Spec accepted by `OrchestratorControlSurface.launchOne`. Mirrors the
+ * fields the dashboard's launch form sends. Validated by
+ * `server.handleLaunch` before reaching the orchestrator.
+ */
+export interface LaunchSpec {
+  meetingURL: string;
+  participant: string;
+  displayName?: string;
+  ttl: Ttl;
+  headless: boolean;
+  network: string;
+  authBackend: "jwt" | "storage-state" | "none";
+  storageStateFile?: string;
 }
 
 /**
@@ -53,6 +90,12 @@ export interface ControlServerOptions {
   port: number;
   token: string;
   surface: OrchestratorControlSurface;
+  /**
+   * Directory that holds persisted run-profile JSON files (one
+   * per profile, under `<runDir>/profiles/`). When unset, the
+   * `/profiles*` endpoints reply 503. Phase 5.1 feature.
+   */
+  runDir?: string;
 }
 
 export interface ControlServerHandle {
@@ -150,11 +193,23 @@ async function handleRequest(
   sweepStaleEntries(opts.surface.getRegistry());
 
   try {
-    const result = await route(req, opts.surface, pathname, method);
+    const result = await route(req, opts, pathname, method);
     sendJson(res, result.status, result.body);
   } catch (err) {
     if (err instanceof ControlServerError) {
       sendJson(res, err.status, { error: err.message });
+      return;
+    }
+    if (err instanceof ProfileValidationError) {
+      sendJson(res, 400, { error: err.message });
+      return;
+    }
+    if (err instanceof ProfileNotFoundError) {
+      sendJson(res, 404, { error: err.message });
+      return;
+    }
+    if (err instanceof ProfileExistsError) {
+      sendJson(res, 409, { error: err.message });
       return;
     }
     throw err;
@@ -169,12 +224,36 @@ function authenticate(req: IncomingMessage, expected: string): boolean {
 
 async function route(
   req: IncomingMessage,
-  surface: OrchestratorControlSurface,
+  opts: ControlServerOptions,
   pathname: string,
   method: string,
 ): Promise<RouteResult> {
+  const surface = opts.surface;
   if (method === "GET" && pathname === "/bots") {
     return listBots(surface);
+  }
+  if (method === "POST" && pathname === "/launch") {
+    const body = await readJsonBody(req);
+    return launchOne(surface, body);
+  }
+
+  if (pathname === "/profiles") {
+    if (method === "GET") return listProfilesRoute(opts);
+    if (method === "POST") {
+      const body = await readJsonBody(req);
+      return saveProfileRoute(opts, body);
+    }
+  }
+  const profilePath = /^\/profiles\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+  if (profilePath) {
+    const name = decodeURIComponent(profilePath[1]);
+    const sub = profilePath[2];
+    if (sub === undefined) {
+      if (method === "GET") return getProfileRoute(opts, name);
+      if (method === "DELETE") return deleteProfileRoute(opts, name);
+    } else if (sub === "launch" && method === "POST") {
+      return launchProfileRoute(opts, name);
+    }
   }
 
   const botPath = /^\/bots\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
@@ -191,11 +270,188 @@ async function route(
       if (method === "POST" && sub === "network") return changeNetwork(surface, botId, body);
       if (method === "POST" && sub === "mute") return mute(surface, botId, body);
       if (method === "POST" && sub === "video") return video(surface, botId, body);
+      if (method === "POST" && sub === "share") return share(surface, botId, body);
       if (method === "POST" && sub === "duplicate") return duplicate(surface, botId, body);
     }
   }
 
   return { status: 404, body: { error: `no route for ${method} ${pathname}` } };
+}
+
+function requireRunDir(opts: ControlServerOptions): string {
+  if (!opts.runDir) {
+    throw new ControlServerError(
+      503,
+      "profiles unavailable: control server was started without a runDir",
+    );
+  }
+  return opts.runDir;
+}
+
+async function listProfilesRoute(opts: ControlServerOptions): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const profiles = await listProfiles(runDir);
+  return { status: 200, body: { profiles } };
+}
+
+async function getProfileRoute(opts: ControlServerOptions, name: string): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const profile = await readProfile(runDir, name);
+  return { status: 200, body: profile };
+}
+
+async function deleteProfileRoute(opts: ControlServerOptions, name: string): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  await deleteProfile(runDir, name);
+  return { status: 200, body: { name, deleted: true } };
+}
+
+async function saveProfileRoute(
+  opts: ControlServerOptions,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const name = body.name;
+  if (typeof name !== "string" || name === "") {
+    throw new ControlServerError(400, '"name" must be a non-empty string');
+  }
+  const source = body.source;
+  let bots: ProfileBotSpec[];
+  if (source === "current") {
+    bots = snapshotCurrentBotsForProfile(opts.surface);
+    if (bots.length === 0) {
+      throw new ControlServerError(
+        400,
+        "no bots to snapshot — launch some first, then save the profile",
+      );
+    }
+  } else if (
+    source != null &&
+    typeof source === "object" &&
+    !Array.isArray(source) &&
+    Array.isArray((source as { bots?: unknown }).bots)
+  ) {
+    bots = (source as { bots: unknown[] }).bots.map((entry, idx) =>
+      validateBotSpecForSave(entry, `source.bots[${idx}]`),
+    );
+    if (bots.length === 0) {
+      throw new ControlServerError(400, "source.bots must contain at least one bot");
+    }
+  } else {
+    throw new ControlServerError(
+      400,
+      'source must be "current" or an object { bots: BotLaunchSpec[] }',
+    );
+  }
+  const profile = await saveProfile(runDir, name, bots);
+  return { status: 201, body: profile };
+}
+
+async function launchProfileRoute(opts: ControlServerOptions, name: string): Promise<RouteResult> {
+  const runDir = requireRunDir(opts);
+  const profile = await readProfile(runDir, name);
+  const botIds: string[] = [];
+  for (const bot of profile.bots) {
+    let ttl: Ttl;
+    try {
+      ttl = parseDuration(bot.ttl);
+    } catch (e) {
+      throw new ControlServerError(400, `invalid ttl in profile: ${(e as Error).message}`);
+    }
+    const spec: LaunchSpec = {
+      meetingURL: bot.meetingURL,
+      participant: bot.participant,
+      displayName: bot.displayName,
+      ttl,
+      headless: bot.headless,
+      network: bot.network,
+      authBackend: bot.authBackend,
+      storageStateFile: bot.storageStateFile,
+    };
+    const id = await opts.surface.launchOne(spec);
+    botIds.push(id);
+  }
+  return { status: 202, body: { name, botIds } };
+}
+
+/**
+ * Take a point-in-time snapshot of every bot currently live or
+ * recently-finished in the registry, projecting each one's `task`
+ * back into a `ProfileBotSpec` shape that can be re-launched. Strips
+ * runtime-only fields (manifests, runDir, sso state) so the resulting
+ * profile is portable across runs.
+ */
+function snapshotCurrentBotsForProfile(surface: OrchestratorControlSurface): ProfileBotSpec[] {
+  const out: ProfileBotSpec[] = [];
+  for (const entry of surface.getRegistry().values()) {
+    const t = entry.task;
+    out.push({
+      meetingURL: t.meetingURL,
+      participant: t.participant,
+      displayName: t.displayName,
+      ttl: formatDuration(t.ttl),
+      headless: t.headless,
+      network: t.network ?? "none",
+      authBackend: t.authBackend,
+      storageStateFile: t.storageStateFile ?? undefined,
+    });
+  }
+  return out;
+}
+
+function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
+  if (entry == null || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new ControlServerError(400, `${where} must be an object`);
+  }
+  const o = entry as Record<string, unknown>;
+  if (typeof o.meetingURL !== "string") {
+    throw new ControlServerError(400, `${where}.meetingURL must be a string`);
+  }
+  if (typeof o.participant !== "string") {
+    throw new ControlServerError(400, `${where}.participant must be a string`);
+  }
+  if (typeof o.ttl !== "string") {
+    throw new ControlServerError(400, `${where}.ttl must be a string`);
+  }
+  if (typeof o.network !== "string") {
+    throw new ControlServerError(400, `${where}.network must be a string`);
+  }
+  if (typeof o.headless !== "boolean") {
+    throw new ControlServerError(400, `${where}.headless must be a boolean`);
+  }
+  const auth = o.authBackend;
+  if (auth !== "jwt" && auth !== "storage-state" && auth !== "none") {
+    throw new ControlServerError(
+      400,
+      `${where}.authBackend must be "jwt", "storage-state", or "none"`,
+    );
+  }
+  const displayName =
+    o.displayName === undefined
+      ? undefined
+      : typeof o.displayName === "string"
+        ? o.displayName
+        : (() => {
+            throw new ControlServerError(400, `${where}.displayName must be a string`);
+          })();
+  const storageStateFile =
+    o.storageStateFile === undefined
+      ? undefined
+      : typeof o.storageStateFile === "string"
+        ? o.storageStateFile
+        : (() => {
+            throw new ControlServerError(400, `${where}.storageStateFile must be a string`);
+          })();
+  return {
+    meetingURL: o.meetingURL,
+    participant: o.participant,
+    displayName,
+    ttl: o.ttl,
+    headless: o.headless,
+    network: o.network,
+    authBackend: auth,
+    storageStateFile,
+  };
 }
 
 function listBots(surface: OrchestratorControlSurface): RouteResult {
@@ -321,6 +577,115 @@ async function video(
   }
   await surface.setCameraOff(botId, body.camera);
   return { status: 200, body: { botId, camera: body.camera } };
+}
+
+async function share(
+  surface: OrchestratorControlSurface,
+  botId: string,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  requireBot(surface, botId);
+  if (typeof body.share !== "boolean") {
+    throw new ControlServerError(
+      400,
+      '"share" must be a boolean (true=start sharing, false=stop sharing)',
+    );
+  }
+  await surface.setScreenShare(botId, body.share);
+  return { status: 200, body: { botId, share: body.share } };
+}
+
+async function launchOne(
+  surface: OrchestratorControlSurface,
+  body: Record<string, unknown>,
+): Promise<RouteResult> {
+  // Validate each field one at a time so we can return precise error
+  // messages. The dashboard's client-side validation runs the same
+  // checks first, but the server is the source of truth.
+  const meetingURL = body.meetingURL;
+  if (typeof meetingURL !== "string" || meetingURL === "") {
+    throw new ControlServerError(400, '"meetingURL" must be a non-empty string');
+  }
+  let url: URL;
+  try {
+    url = new URL(meetingURL);
+  } catch {
+    throw new ControlServerError(400, `"meetingURL" is not a valid URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new ControlServerError(400, `"meetingURL" must use http or https`);
+  }
+  const participant = body.participant;
+  if (typeof participant !== "string" || participant === "") {
+    throw new ControlServerError(400, '"participant" must be a non-empty string');
+  }
+  if (!/^[A-Za-z0-9._@+-]+$/.test(participant)) {
+    throw new ControlServerError(400, '"participant" contains invalid characters');
+  }
+  const displayName = body.displayName;
+  if (displayName !== undefined && typeof displayName !== "string") {
+    throw new ControlServerError(400, '"displayName" must be a string when provided');
+  }
+  const ttlRaw = body.ttl;
+  if (typeof ttlRaw !== "string") {
+    throw new ControlServerError(400, '"ttl" must be a string');
+  }
+  let ttl: Ttl;
+  try {
+    ttl = parseDuration(ttlRaw);
+  } catch (e) {
+    throw new ControlServerError(400, (e as Error).message);
+  }
+  const headless = body.headless;
+  if (typeof headless !== "boolean") {
+    throw new ControlServerError(400, '"headless" must be a boolean');
+  }
+  const network = body.network;
+  if (typeof network !== "string") {
+    throw new ControlServerError(400, '"network" must be a string');
+  }
+  if (!NETSIM_PRESETS.includes(network)) {
+    throw new ControlServerError(
+      400,
+      `"network" must be one of: ${NETSIM_PRESETS.join(", ")} (got "${network}")`,
+    );
+  }
+  const authBackend = body.authBackend;
+  if (authBackend !== "jwt" && authBackend !== "storage-state" && authBackend !== "none") {
+    throw new ControlServerError(400, '"authBackend" must be "jwt", "storage-state", or "none"');
+  }
+  const storageStateFile = body.storageStateFile;
+  if (storageStateFile !== undefined && typeof storageStateFile !== "string") {
+    throw new ControlServerError(400, '"storageStateFile" must be a string when provided');
+  }
+  if (authBackend === "storage-state" && (!storageStateFile || storageStateFile === "")) {
+    throw new ControlServerError(
+      400,
+      '"storageStateFile" is required when authBackend === "storage-state"',
+    );
+  }
+  // `runLocation` is dashboard-only metadata; we accept it but only
+  // honor "local" today. Anything else is rejected so a future
+  // backend implementation can't be silently downgraded.
+  const runLocation = body.runLocation;
+  if (runLocation !== undefined && runLocation !== "local") {
+    throw new ControlServerError(
+      400,
+      'only "local" runLocation is wired today; see discussion #793',
+    );
+  }
+  const spec: LaunchSpec = {
+    meetingURL,
+    participant,
+    displayName: displayName as string | undefined,
+    ttl,
+    headless,
+    network,
+    authBackend,
+    storageStateFile: storageStateFile as string | undefined,
+  };
+  const newId = await surface.launchOne(spec);
+  return { status: 201, body: { botId: newId } };
 }
 
 async function duplicate(

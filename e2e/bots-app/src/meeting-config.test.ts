@@ -154,6 +154,51 @@ bots:
 `),
     ).toThrow(/meeting\.network, when present, must be a string/);
   });
+
+  it("parses a meeting-level auth: none", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+auth: none
+bots:
+- participant: alice
+`);
+    expect(cfg.auth).toBe("none");
+  });
+
+  it("parses a per-bot auth: jwt", () => {
+    const cfg = parseMeetingConfigText(`
+meeting_url: https://x/y
+bots:
+- participant: alice
+  auth: jwt
+- participant: bob
+  auth: none
+`);
+    expect(cfg.bots[0].auth).toBe("jwt");
+    expect(cfg.bots[1].auth).toBe("none");
+  });
+
+  it("rejects an unknown auth value", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+auth: bogus
+bots:
+- participant: alice
+`),
+    ).toThrow(/meeting\.auth must be one of: .*got "bogus"/s);
+  });
+
+  it("rejects a per-bot auth that isn't a valid backend", () => {
+    expect(() =>
+      parseMeetingConfigText(`
+meeting_url: https://x/y
+bots:
+- participant: alice
+  auth: cookie
+`),
+    ).toThrow(/bots\[0\]\.auth must be one of: .*got "cookie"/s);
+  });
 });
 
 describe("NETSIM_PRESETS", () => {

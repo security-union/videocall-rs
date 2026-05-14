@@ -14,8 +14,15 @@ import { join } from "node:path";
  *   state (cookies + localStorage) from `bots-app login <account>`. The
  *   captured session represents a real Google-authenticated user. Works
  *   anywhere a real user can log in, including `app.videocall.rs`.
+ *
+ * - `"none"` — skip auth entirely; the context launches with no
+ *   pre-injected cookie or storage state. Works only when the target
+ *   meeting allows guest joining (no session cookie required to land
+ *   on `/meeting/<id>`). Useful for testing guest-flow UX, and the
+ *   default surface when the meeting URL is for a public/no-auth
+ *   deployment.
  */
-export type AuthBackend = "jwt" | "storage-state";
+export type AuthBackend = "jwt" | "storage-state" | "none";
 
 /**
  * Hostnames where we can authenticate via JWT-cookie injection (we control

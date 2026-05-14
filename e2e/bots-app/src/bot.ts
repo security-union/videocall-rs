@@ -203,10 +203,16 @@ export async function launchBot(opts: BotRunOptions): Promise<BotHandle> {
         );
       }
     }
-  } else {
+  } else if (opts.authBackend === "storage-state") {
     console.log(
       `[${label}] auth: storage-state (reused captured session from ${opts.storageStateFile})`,
     );
+  } else {
+    // `authBackend === "none"` — guest join. No cookie injection, no
+    // storage-state replay. The browser context launches with a clean
+    // cookie jar; the meeting page must allow guest landing for this
+    // to work.
+    console.log(`[${label}] auth: guest (no session cookie injected)`);
   }
 
   const page = await context.newPage();

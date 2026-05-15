@@ -354,9 +354,15 @@ How it works:
 - When SSH is selected, the orchestrator spawns the local `ssh` binary directly (`child_process.spawn("ssh", [...])`, no shell) and runs a single-line bash command on the remote host:
   ```
   ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new [-i <key>] user@host[:port] \
-    "cd '<reposPath>'/e2e && npm run bot -- run --headless --ttl '<ttl>' --meeting-url '<url>' --participant '<p>' [--network '<net>'] [--auth '<auth>'] [--display-name '<name>']"
+    "<shell> -lc '[ -f <profileFile> ] && . <profileFile>; <preCommand>; cd '\''<reposPath>'\''/e2e && npm run bot -- run --headless --ttl '\''<ttl>'\'' --meeting-url '\''<url>'\'' --participant '\''<p>'\'' [--network '\''<net>'\''] [--auth '\''<auth>'\''] [--display-name '\''<name>'\'']'"
   ```
   Every dynamic substring is shell-escaped via the `shellEscape` helper (POSIX single-quote wrap + `'\''` for embedded quotes).
+- The inner `cd … && npm run …` is wrapped in `<shell> -lc` so the remote shell runs as a **login shell** and sources the operator's profile. `<shell>` is the host's `shell` field (default `bash`); `bash -l` has a POSIX-defined login-shell init chain that always reads `~/.bash_profile`, so it's a safer default than `${SHELL:-/bin/bash}` (which expanded to `/bin/zsh` on zsh-default macOS hosts and missed operators whose nvm setup lived in `~/.bash_profile`).
+- Each host carries three structured fields that shape the wrapper payload:
+  - **`shell`** — bare name (`bash`, `zsh`, `sh`) or absolute path (`/opt/homebrew/bin/zsh`). Defaults to `bash` when unset. Becomes the `<shell>` token in `<shell> -lc …`.
+  - **`profileFile`** — profile sourced via `[ -f <profileFile> ] && . <profileFile>;` before the bot command runs. The `[ -f … ] &&` guard keeps the prefix safe on hosts that lack the file, and the trailing `;` (not `&&`) keeps the rest of the chain running even when the source command returns non-zero. Defaults inferred client-side from the shell: `bash` → `~/.bash_profile`, `zsh` → `~/.zshrc`, `sh` → no source line.
+  - **`preCommand`** — free-form bash run AFTER sourcing the profile, BEFORE the `cd && npm run …` chain. Use this for `nvm` version pinning (`. ~/.nvm/nvm.sh && nvm use 22`), `PATH` exports, etc. Max 512 chars, no embedded newlines or NUL bytes. Terminated with `;` in the emitted prefix so a non-zero exit doesn't abort the bot launch.
+- The Add / Edit Host dialog includes a live **Sample command** preview backed by `POST /hosts/preview` (200ms debounce). The preview shows the exact `ssh` invocation that will run for the unsaved host config — operators see how their structured-field choices shape the wrapper payload before saving.
 - Stdout/stderr from the remote bot are tee'd into the registry entry's rolling log buffer (capped at 200 lines). The dashboard's per-bot "View logs" dialog polls `GET /api/bots/:id/log?since=<n>` every 2.5s.
 - **Leave** sends `SIGTERM` to the local `ssh` ChildProcess (which propagates to the remote bot via the SSH connection). **Force-kill** sends `SIGKILL`.
 

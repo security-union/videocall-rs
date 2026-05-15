@@ -11,6 +11,9 @@ function host(overrides: Partial<SshHost> = {}): SshHost {
     sshKey: null,
     reposPath: "/home/alice/videocall",
     notes: null,
+    shell: null,
+    profileFile: null,
+    preCommand: null,
     addedAt: 0,
     ...overrides,
   };
@@ -61,7 +64,14 @@ describe("spawnRemoteBot", () => {
     const { fn } = stubSpawnFactory();
     spawnRemoteBot(
       {
-        host: host({ host: "example.com:2222", sshKey: "/keys/id" }),
+        host: host({
+          host: "example.com:2222",
+          sshKey: "/keys/id",
+          // Exercise the structured fields end-to-end so the wrapper
+          // payload reflects `<profile source>; <preCommand>; <cd/npm>`.
+          shell: "bash",
+          profileFile: "~/.bash_profile",
+        }),
         ttl: "5m",
         meetingURL: "https://example.com/meeting/X",
         participant: "alice",
@@ -76,7 +86,14 @@ describe("spawnRemoteBot", () => {
     expect(args).toContain("-p");
     expect(args).toContain("2222");
     expect(args).toContain("alice@example.com");
-    expect(args[args.length - 1]).toContain("npm run bot");
+    // The last argv slot is the `<shell> -lc '<inner>'` wrapper. The
+    // inner command (which contains `npm run bot`) lives inside the
+    // single-quoted wrapper payload. With profileFile=~/.bash_profile
+    // the inner is prefixed with `[ -f ~/.bash_profile ] && . ~/.bash_profile; `.
+    const tail = args[args.length - 1] as string;
+    expect(tail.startsWith("bash -lc ")).toBe(true);
+    expect(tail).toContain("npm run bot");
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
   });
 
   it("accumulates stdout lines in recentLog up to REMOTE_LOG_CAP", () => {
@@ -113,7 +130,12 @@ describe("spawnRemoteBot", () => {
     const { fn, last } = stubSpawnFactory();
     const handle = spawnRemoteBot(
       {
-        host: host({ host: "example.com:2222", sshKey: "/keys/id" }),
+        host: host({
+          host: "example.com:2222",
+          sshKey: "/keys/id",
+          shell: "bash",
+          profileFile: "~/.bash_profile",
+        }),
         ttl: "5m",
         meetingURL: "https://example.com/meeting/X",
         participant: "alice",
@@ -128,9 +150,13 @@ describe("spawnRemoteBot", () => {
     expect(firstLine).toContain("alice@example.com");
     expect(firstLine).toContain("ConnectTimeout=10");
     expect(firstLine).toContain("npm run bot");
-    // The remote command lives inside a single-quoted argv slot, so the
-    // inner `--participant 'alice'` shows up with the standard '\\'' dance.
-    expect(firstLine).toContain("--participant '\\''alice'\\''");
+    // The remote command is wrapped in `<shell> -lc '<inner>'` so the
+    // operator's login PATH is loaded on the remote. With
+    // profileFile=~/.bash_profile the inner is prefixed with an
+    // explicit `. ~/.bash_profile` source line.
+    expect(firstLine).toContain("bash -lc");
+    expect(firstLine).toContain(". ~/.bash_profile");
+    expect(firstLine).toContain("alice");
   });
 
   it("resolves exit with the process code and marks finished", async () => {
@@ -232,14 +258,21 @@ describe("buildSshCommand", () => {
       sshKey: null,
       reposPath: "/home/alice/videocall",
       notes: null,
+      shell: null,
+      profileFile: null,
+      preCommand: null,
       addedAt: 0,
       ...overrides,
     };
   }
 
   it("renders argv + display for a minimal spec", () => {
-    const r = buildSshCommand(h(), {
-      host: h(),
+    // Pin profileFile so the wrapper payload includes the source line
+    // we want to assert below. (With all three structured fields
+    // unset the wrapper payload would be just the bare cd/npm chain.)
+    const minimal = h({ profileFile: "~/.bash_profile" });
+    const r = buildSshCommand(minimal, {
+      host: minimal,
       ttl: "5m",
       meetingURL: "https://example.com/meeting/X",
       participant: "alice",
@@ -248,14 +281,26 @@ describe("buildSshCommand", () => {
     expect(r.argv).toContain("-o");
     expect(r.argv).toContain("ConnectTimeout=10");
     expect(r.argv).toContain("alice@my-host.lan");
-    // Last argv slot is the remote bash command.
-    expect(r.argv[r.argv.length - 1]).toBe(r.remoteCommand);
+    // Last argv slot is the wrapped `bash -lc '<inner>'` form;
+    // `remoteCommand` is the inner (unwrapped) `cd && npm` command,
+    // exposed separately so the preview UI can display it on its own.
+    // The structured-prefix source line shows up in the wrapper
+    // payload but NOT in `remoteCommand` — `remoteCommand` stays just
+    // the cd/npm chain so dashboards can show it cleanly.
+    const tail = r.argv[r.argv.length - 1];
+    expect(tail.startsWith("bash -lc ")).toBe(true);
+    expect(tail).toContain(r.remoteCommand.replace(/'/g, "'\\''"));
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
     expect(r.remoteCommand).toContain("npm run bot");
+    expect(r.remoteCommand.startsWith("cd '/home/alice/videocall'/e2e &&")).toBe(true);
+    // `remoteCommand` is the inner cd/npm command only — the structured
+    // prefix is part of the wrapper payload, not the cd/npm chain.
+    expect(r.remoteCommand).not.toContain(".bash_profile");
     expect(r.display).toMatch(/^ssh /);
     expect(r.display).toContain("alice@my-host.lan");
-    // The remote command lives inside a single-quoted argv slot in the
-    // display rendering (it has spaces and shell metacharacters).
-    expect(r.display).toContain("'cd '\\''/home/alice/videocall'\\''/e2e &&");
+    // The wrapper survives display rendering as a single-quoted argv
+    // slot. The shell defaults to `bash` when host.shell is null.
+    expect(r.display).toContain("'bash -lc");
   });
 
   it("emits -i and -p when host has a key + non-default port", () => {
@@ -352,5 +397,104 @@ describe("buildSshCommand", () => {
     });
     expect(a.display).toBe(b.display);
     expect(a.argv).toEqual(b.argv);
+  });
+
+  it("wraps the remote command in <shell> -lc so the login PATH loads", () => {
+    // Regression test for `bash: npm: command not found` on remote
+    // hosts whose node lives in a profile-installed PATH (nvm / fnm /
+    // asdf / homebrew). SSH's default non-interactive non-login shell
+    // does NOT source the operator's profile; wrapping the remote
+    // command in `<shell> -lc` forces a login shell so the profile
+    // is sourced and `npm` is on PATH. The shell defaults to `bash`
+    // when host.shell is null (POSIX-defined login-shell init chain).
+    const fixture = h({ profileFile: "~/.bash_profile" });
+    const r = buildSshCommand(fixture, {
+      host: fixture,
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    // The wrapper is the literal first 9 chars of the argv slot.
+    expect(tail.startsWith("bash -lc ")).toBe(true);
+    // The wrapper payload contains the inner command, with each single
+    // quote in the inner string escaped via the standard `'\''` dance
+    // because the wrapper applies shellEscape to it once. With
+    // profileFile=~/.bash_profile the inner command also includes the
+    // `. ~/.bash_profile` source line.
+    expect(tail).toContain("npm run bot");
+    expect(tail).toContain("cd '\\''/home/alice/videocall'\\''/e2e");
+    expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
+    // The wrapper is also visible in the display rendering — operators
+    // copy-pasting the display string into a terminal reproduce the
+    // exact spawn behaviour.
+    expect(r.display).toContain("bash -lc");
+  });
+
+  it("the inner command is shell-escaped exactly once, not double-escaped", () => {
+    // The remoteCommand field on the render output is the INNER
+    // unwrapped cd/npm string. The wrapper concatenates the structured
+    // prefix + remoteCommand and applies shellEscape exactly once, so
+    // the result is recoverable by stripping the outer single-quote
+    // pair (no `'\''\'\'''\''` triples at the wrapper boundary).
+    const fixture = h({ profileFile: "~/.bash_profile" });
+    const r = buildSshCommand(fixture, {
+      host: fixture,
+      ttl: "5m",
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    // Build what a SINGLE shellEscape of (prefix + remoteCommand)
+    // produces and check it appears verbatim in the tail.
+    const prefix = "[ -f ~/.bash_profile ] && . ~/.bash_profile; ";
+    const inner = prefix + r.remoteCommand;
+    const singleEscaped = "'" + inner.replace(/'/g, "'\\''") + "'";
+    expect(tail).toBe(`bash -lc ${singleEscaped}`);
+    // Sanity: double-escaping would have produced the standard dance
+    // applied twice. Assert that NEVER appears — even one occurrence
+    // would mean we double-wrapped.
+    const doubleEscaped = "'" + singleEscaped.replace(/'/g, "'\\''") + "'";
+    expect(tail).not.toBe(`bash -lc ${doubleEscaped}`);
+  });
+
+  it("uses host.shell to pick the wrapper shell and host.profileFile to source", () => {
+    // Operators whose node install lives in `~/.zshrc` can register a
+    // host with shell=zsh + profileFile=~/.zshrc; the wrapper becomes
+    // `zsh -lc '[ -f ~/.zshrc ] && . ~/.zshrc; <cd/npm>'`.
+    const zshHost = h({ shell: "zsh", profileFile: "~/.zshrc" });
+    const r = buildSshCommand(zshHost, {
+      host: zshHost,
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    expect(tail.startsWith("zsh -lc ")).toBe(true);
+    expect(tail).toContain("[ -f ~/.zshrc ] && . ~/.zshrc;");
+    // The default ~/.bash_profile path MUST NOT appear when the host
+    // picks ~/.zshrc instead.
+    expect(tail).not.toContain(".bash_profile");
+  });
+
+  it("includes host.preCommand after the profile source line", () => {
+    // The structured-prefix order is profile-source THEN preCommand.
+    // Each clause is terminated with `;` (not `&&`) so a non-zero exit
+    // on either doesn't abort the npm chain.
+    const nvmHost = h({
+      profileFile: "~/.bash_profile",
+      preCommand: ". ~/.nvm/nvm.sh && nvm use 22",
+    });
+    const r = buildSshCommand(nvmHost, {
+      host: nvmHost,
+      ttl: "5m",
+      meetingURL: "u",
+      participant: "p",
+    });
+    const tail = r.argv[r.argv.length - 1];
+    // Profile source comes first, then preCommand, then cd/npm.
+    expect(tail).toContain(
+      "[ -f ~/.bash_profile ] && . ~/.bash_profile; . ~/.nvm/nvm.sh && nvm use 22;",
+    );
   });
 });

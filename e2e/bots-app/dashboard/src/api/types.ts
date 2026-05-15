@@ -154,6 +154,14 @@ export interface ProfileBotSpec {
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
+  /**
+   * Where the bot was running when the profile was captured. Re-used
+   * at launch time so a saved profile re-dispatches each bot to the
+   * same host it originally ran on. Optional for forward-compat:
+   * profiles persisted before this field was added decode without
+   * error and fall back to `{ kind: "local" }`.
+   */
+  runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
 }
 
 export interface RunProfile {

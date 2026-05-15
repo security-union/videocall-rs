@@ -42,6 +42,15 @@ export interface ProfileBotSpec {
   network: string;
   authBackend: "jwt" | "storage-state" | "none";
   storageStateFile?: string;
+  /**
+   * Where this bot's Chrome ran when the profile was captured. Re-used
+   * verbatim at launch time so a saved profile re-dispatches each bot
+   * to the same host it originally ran on (local Playwright vs.
+   * registered SSH host). Optional for forward-compat: profiles
+   * persisted before this field was added decode without error and
+   * fall back to `{ kind: "local" }` at launch time.
+   */
+  runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
 }
 
 export interface RunProfile {
@@ -231,6 +240,14 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
     o.storageStateFile === undefined
       ? undefined
       : expectString(o.storageStateFile, `${where}.storageStateFile`);
+  // `runLocation` is optional for forward-compat with profiles
+  // persisted before the field was added. When present we still
+  // validate its shape strictly (kind = "local" | "ssh" with a
+  // non-empty hostLabel on the ssh branch) — a malformed value would
+  // crash the orchestrator at launch time, so it's safer to surface
+  // it now. Absence is treated as "this profile predates the field"
+  // and is filled in with `{ kind: "local" }` by the launch route.
+  const runLocation = parseRunLocationField(o.runLocation, `${where}.runLocation`);
   return {
     meetingURL,
     participant,
@@ -240,7 +257,28 @@ function validateBotSpec(entry: unknown, where: string): ProfileBotSpec {
     network,
     authBackend: auth,
     storageStateFile,
+    runLocation,
   };
+}
+
+function parseRunLocationField(raw: unknown, where: string): ProfileBotSpec["runLocation"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ProfileValidationError(`${where} must be an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  if (o.kind === "local") {
+    return { kind: "local" };
+  }
+  if (o.kind === "ssh") {
+    if (typeof o.hostLabel !== "string" || o.hostLabel.trim() === "") {
+      throw new ProfileValidationError(
+        `${where}.hostLabel must be a non-empty string when kind="ssh"`,
+      );
+    }
+    return { kind: "ssh", hostLabel: o.hostLabel };
+  }
+  throw new ProfileValidationError(`${where}.kind must be "local" or "ssh"`);
 }
 
 function expectString(v: unknown, where: string): string {
@@ -373,5 +411,6 @@ export function launchSpecToProfileBot(spec: LaunchSpec): ProfileBotSpec {
     network: spec.network,
     authBackend: spec.authBackend,
     storageStateFile: spec.storageStateFile,
+    runLocation: spec.runLocation,
   };
 }

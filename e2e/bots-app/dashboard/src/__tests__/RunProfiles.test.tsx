@@ -235,6 +235,66 @@ describe("<RunProfiles />", () => {
     expect(screen.getByTestId("profile-details-meta")).toHaveTextContent("2 bots");
   });
 
+  it("Details dialog renders the Host column for mixed local + ssh bots", async () => {
+    // Profiles capturing the new runLocation field show a per-bot
+    // chip in the Details table — local for `{ kind: "local" }` and
+    // `ssh:<label>` for `{ kind: "ssh", … }`. A third bot without the
+    // field exercises the silent legacy fallback (renders local).
+    const state: FetchState = {
+      profiles: [{ name: "mixed-hosts", savedAt: "2026-05-13T22:00:00Z", botCount: 3 }],
+      profilesByName: {
+        "mixed-hosts": {
+          name: "mixed-hosts",
+          savedAt: "2026-05-13T22:00:00Z",
+          version: 1,
+          bots: [
+            {
+              participant: "alice",
+              meetingURL: "https://example.com/meeting/X",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              runLocation: { kind: "local" },
+            },
+            {
+              participant: "bob",
+              meetingURL: "https://example.com/meeting/X",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              runLocation: { kind: "ssh", hostLabel: "lab-mac-1" },
+            },
+            {
+              participant: "carol",
+              meetingURL: "https://example.com/meeting/X",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              // runLocation omitted -- legacy profile, falls back to local.
+            },
+          ],
+        },
+      },
+    };
+    stubFetch(state);
+    renderWithClient(<RunProfiles hasBots={false} onToast={() => {}} />);
+    fireEvent.click(await screen.findByTestId("run-profile-details-mixed-hosts"));
+    await waitFor(() => {
+      expect(screen.getByTestId("profile-details-table")).toBeInTheDocument();
+    });
+    // Each row's Host column renders the matching chip.
+    const row0 = screen.getByTestId("profile-details-row-0");
+    const row1 = screen.getByTestId("profile-details-row-1");
+    const row2 = screen.getByTestId("profile-details-row-2");
+    expect(row0).toHaveTextContent("local");
+    expect(row1).toHaveTextContent("ssh:lab-mac-1");
+    // Legacy bot with no runLocation falls back to the local chip.
+    expect(row2).toHaveTextContent("local");
+  });
+
   it("Rename button opens the dialog pre-filled with the current name", async () => {
     const state: FetchState = {
       profiles: [{ name: "current-name", savedAt: "2026-05-13T22:00:00Z", botCount: 1 }],

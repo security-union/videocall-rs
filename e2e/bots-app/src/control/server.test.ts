@@ -560,6 +560,32 @@ describe("control server: run profiles", () => {
     expect(profile.bots[0].participant).toBe("alice");
   });
 
+  it("POST /profiles with source=current captures each bot's runLocation from the registry", async () => {
+    // Snapshot must serialize the per-bot host so a later launch can
+    // dispatch the bot back to the same place. Mix local + ssh
+    // entries so both branches are covered.
+    const localEntry = newRegistryEntry(fakeTask({ participant: "alice" }), { kind: "local" });
+    const sshEntry = newRegistryEntry(fakeTask({ participant: "bob" }), {
+      kind: "ssh",
+      hostLabel: "lab-mac-1",
+    });
+    surface.registry.set(localEntry.botId, localEntry);
+    surface.registry.set(sshEntry.botId, sshEntry);
+    const res = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: { name: "mixed-snap", source: "current" },
+    });
+    expect(res.status).toBe(201);
+    const profile = res.body as {
+      bots: { participant: string; runLocation?: { kind: string; hostLabel?: string } }[];
+    };
+    const alice = profile.bots.find((b) => b.participant === "alice");
+    const bob = profile.bots.find((b) => b.participant === "bob");
+    expect(alice?.runLocation).toEqual({ kind: "local" });
+    expect(bob?.runLocation).toEqual({ kind: "ssh", hostLabel: "lab-mac-1" });
+  });
+
   it("POST /profiles rejects source=current when no bots are running", async () => {
     const res = await fetchJson(handle.port, `/profiles`, {
       method: "POST",
@@ -622,6 +648,87 @@ describe("control server: run profiles", () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect((after.body as { profiles: unknown[] }).profiles).toHaveLength(0);
+  });
+
+  it("POST /profiles/:name/launch forwards each bot's runLocation to launchOne", async () => {
+    // Save a profile with mixed local + ssh bots, then verify every
+    // launchOne call receives the captured runLocation verbatim. This
+    // is the fix for the bug where a profile that captured an SSH
+    // bot would re-launch it locally.
+    const saveRes = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        name: "mixed-runloc",
+        source: {
+          bots: [
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "alice",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              runLocation: { kind: "local" },
+            },
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "bob",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              runLocation: { kind: "ssh", hostLabel: "lab-mac-1" },
+            },
+          ],
+        },
+      },
+    });
+    expect(saveRes.status).toBe(201);
+    const launchRes = await fetchJson(handle.port, `/profiles/mixed-runloc/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(launchRes.status).toBe(202);
+    const launches = surface.callLog.filter((l) => l.startsWith("launch:"));
+    expect(launches).toHaveLength(2);
+    expect(launches[0]).toContain('"runLocation":{"kind":"local"}');
+    expect(launches[1]).toContain('"runLocation":{"kind":"ssh","hostLabel":"lab-mac-1"}');
+  });
+
+  it("POST /profiles/:name/launch defaults missing runLocation to local (legacy forward-compat)", async () => {
+    // Forward-compat: a saved profile that predates the runLocation
+    // field still launches successfully; the launch route fills in a
+    // local default so no orchestrator path observes `undefined`.
+    const saveRes = await fetchJson(handle.port, `/profiles`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        name: "legacy-runloc",
+        source: {
+          bots: [
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "alice",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+              // No runLocation -- mirrors a legacy on-disk profile.
+            },
+          ],
+        },
+      },
+    });
+    expect(saveRes.status).toBe(201);
+    const launchRes = await fetchJson(handle.port, `/profiles/legacy-runloc/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(launchRes.status).toBe(202);
+    const launches = surface.callLog.filter((l) => l.startsWith("launch:"));
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toContain('"runLocation":{"kind":"local"}');
   });
 
   it("POST /profiles/:name/launch fans out launchOne for every bot in the profile", async () => {

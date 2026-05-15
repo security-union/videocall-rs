@@ -105,6 +105,14 @@ export const api = {
     request("POST", `/api/bots/${encodeURIComponent(botId)}/leave`),
   kill: (botId: string): Promise<{ botId: string; action: string }> =>
     request("DELETE", `/api/bots/${encodeURIComponent(botId)}`),
+  /**
+   * Drop every `done` / `failed` entry from the orchestrator's registry.
+   * Backing endpoint is idempotent — calling on an empty registry
+   * returns `{ removedCount: 0 }` rather than 404. Running entries are
+   * left untouched. Used by the Terminated Bots "Clear all" button.
+   */
+  clearTerminatedBots: (): Promise<{ removedCount: number }> =>
+    request("DELETE", "/api/bots/terminated"),
   setTtl: (
     botId: string,
     body: { ttl?: string; extendBy?: string },
@@ -137,26 +145,18 @@ export const api = {
   saveProfile: (req: SaveProfileRequest): Promise<RunProfile> =>
     request<RunProfile>("POST", "/api/profiles", req as unknown as Record<string, unknown>),
   launchProfile: (name: string): Promise<LaunchProfileResponse> =>
-    request<LaunchProfileResponse>(
-      "POST",
-      `/api/profiles/${encodeURIComponent(name)}/launch`,
-    ),
+    request<LaunchProfileResponse>("POST", `/api/profiles/${encodeURIComponent(name)}/launch`),
   deleteProfile: (name: string): Promise<{ name: string; deleted: boolean }> =>
     request("DELETE", `/api/profiles/${encodeURIComponent(name)}`),
   renameProfile: (oldName: string, newName: string): Promise<RunProfile> =>
-    request<RunProfile>(
-      "POST",
-      `/api/profiles/${encodeURIComponent(oldName)}/rename`,
-      { newName },
-    ),
+    request<RunProfile>("POST", `/api/profiles/${encodeURIComponent(oldName)}/rename`, { newName }),
 
   // ──────────────────────────────────────────────────────────────────
   // HCL VPN + SSO state management (feat/bots-app-dashboard-sso)
   // ──────────────────────────────────────────────────────────────────
   vpnStatus: (): Promise<VpnStatusResponse> =>
     request<VpnStatusResponse>("GET", "/api/sso/vpn-status"),
-  ssoStatus: (): Promise<SsoStatusResponse> =>
-    request<SsoStatusResponse>("GET", "/api/sso/status"),
+  ssoStatus: (): Promise<SsoStatusResponse> => request<SsoStatusResponse>("GET", "/api/sso/status"),
   ssoRecaptureStart: (req: SsoRecaptureStartRequest = {}): Promise<SsoRecaptureStartResponse> =>
     request<SsoRecaptureStartResponse>(
       "POST",
@@ -199,11 +199,9 @@ export const api = {
       req as unknown as Record<string, unknown>,
     ),
   previewFromConfig: (configYaml: string): Promise<LaunchFromConfigPreviewResponse> =>
-    request<LaunchFromConfigPreviewResponse>(
-      "POST",
-      "/api/launch/from-config/preview",
-      { configYaml },
-    ),
+    request<LaunchFromConfigPreviewResponse>("POST", "/api/launch/from-config/preview", {
+      configYaml,
+    }),
 
   // ──────────────────────────────────────────────────────────────────
   // OAuth session capture (Google OAuth via `bots-app login` equivalent).
@@ -244,10 +242,7 @@ export const api = {
       req as unknown as Record<string, unknown>,
     ),
   prepAssetsStatus: (jobId: string): Promise<PrepAssetsJobStatus> =>
-    request<PrepAssetsJobStatus>(
-      "GET",
-      `/api/assets/prep/${encodeURIComponent(jobId)}`,
-    ),
+    request<PrepAssetsJobStatus>("GET", `/api/assets/prep/${encodeURIComponent(jobId)}`),
   prepAssetsForget: (jobId: string): Promise<{ jobId: string; deleted: boolean }> =>
     request("DELETE", `/api/assets/prep/${encodeURIComponent(jobId)}`),
 
@@ -294,8 +289,5 @@ export const api = {
   // Per-bot log window (used by the log viewer dialog).
   // ──────────────────────────────────────────────────────────────────
   botLog: (botId: string, since = 0): Promise<BotLogResponse> =>
-    request<BotLogResponse>(
-      "GET",
-      `/api/bots/${encodeURIComponent(botId)}/log?since=${since}`,
-    ),
+    request<BotLogResponse>("GET", `/api/bots/${encodeURIComponent(botId)}/log?since=${since}`),
 };

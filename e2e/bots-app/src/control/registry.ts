@@ -49,8 +49,11 @@ export class NotSupportedRemoteError extends Error {
  *
  * `failed` is terminal and only reached when `launchBot` rejects with a
  * non-user-hangup error. Entries in `done` / `failed` are kept around
- * for ~60 seconds (`REGISTRY_RETENTION_MS`) so a follow-up `ctl list`
- * can still show what happened — after that they're swept.
+ * for one hour (`REGISTRY_RETENTION_MS`) so the dashboard's Terminated
+ * Bots section can surface them for post-mortem log inspection — after
+ * that they're swept. The total terminated-entry count is also capped
+ * by `TERMINATED_REGISTRY_CAP` (oldest-finished evicted first) to
+ * prevent unbounded memory growth on long-running daemons.
  */
 export type BotStatus =
   | "priming"
@@ -63,12 +66,25 @@ export type BotStatus =
 
 /**
  * Number of milliseconds a `done` / `failed` registry entry is kept
- * around so a follow-up `ctl list` can observe it. After that the
- * sweeper drops it. Keep this short — operators investigating a crash
- * have logs; the registry is just for "what's still in flight, plus
- * the most recent finish."
+ * around. Bumped to one hour so the dashboard's Terminated Bots section
+ * has a useful post-mortem window — operators routinely click a row,
+ * see "done", then want to read the logs a few minutes later.
+ *
+ * The corresponding rolling log buffer (`recentLog`) lives on the same
+ * entry, so logs stay available for the full retention window.
  */
-export const REGISTRY_RETENTION_MS = 60_000;
+export const REGISTRY_RETENTION_MS = 3_600_000;
+
+/**
+ * Hard cap on the number of terminated (`done` / `failed`) registry
+ * entries kept in memory. Above this cap, `sweepStaleEntries` evicts
+ * the oldest-finished terminated entries until the cap is satisfied.
+ * Prevents unbounded growth on long-running daemons where the operator
+ * launches hundreds of bots over the course of a day.
+ *
+ * Running entries are NEVER evicted by this cap — only terminated ones.
+ */
+export const TERMINATED_REGISTRY_CAP = 100;
 
 /**
  * One bot's entry in the orchestrator's in-process registry.
@@ -135,7 +151,16 @@ export interface BotRegistryEntry {
    *   - `"launch-error"`             (failed)
    */
   finishReason?: string;
-  /** Set when status ∈ {done, failed}; used by the sweeper. */
+  /**
+   * Wall-clock timestamp (ms since epoch) when this entry transitioned
+   * to `done` / `failed`. Set by the orchestrator at each terminal
+   * transition site. Used by:
+   *   - the sweeper, to decide when to drop the entry,
+   *   - the over-cap evictor, to pick the oldest-finished terminated
+   *     entries when the registry exceeds {@link TERMINATED_REGISTRY_CAP},
+   *   - the dashboard's Terminated Bots table, to sort newest-first
+   *     and render a "X minutes ago" relative timestamp.
+   */
   finishedAt?: number;
   /**
    * Rolling log buffer for **local** bots, mirrored over
@@ -167,6 +192,13 @@ export interface BotSnapshot {
   ttlRemainingMs: number | null;
   finishReason?: string;
   lastError?: string;
+  /**
+   * Wall-clock timestamp (ms since epoch) when the bot transitioned to
+   * `done` / `failed`. `null` while the bot is still running. Used by
+   * the dashboard's Terminated Bots table to sort newest-first and to
+   * render a "X minutes ago" relative timestamp.
+   */
+  finishedAt: number | null;
   /**
    * Where the bot is running. Mirrors `BotRegistryEntry.host` 1:1 —
    * the dashboard's bots-table renders a small chip ("local" or
@@ -293,6 +325,7 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
     ttl: formatDuration(entry.ttl),
     ttlRemainingMs,
     host: entry.host,
+    finishedAt: entry.finishedAt ?? null,
   };
   if (entry.finishReason !== undefined) snap.finishReason = entry.finishReason;
   if (entry.lastError !== undefined) snap.lastError = entry.lastError;
@@ -300,13 +333,20 @@ export function snapshotEntry(entry: BotRegistryEntry, now: number = Date.now())
 }
 
 /**
- * Sweep `done` / `failed` entries older than `REGISTRY_RETENTION_MS`
- * out of the registry. Idempotent; cheap (O(N) over registry size).
+ * Drop `done` / `failed` entries older than `REGISTRY_RETENTION_MS`
+ * AND apply the `TERMINATED_REGISTRY_CAP` soft cap (drop oldest-finished
+ * terminated entries until the cap is satisfied). Idempotent;
+ * cheap (O(N) over registry size, plus an O(N log N) sort if the cap
+ * is exceeded — but the cap is tiny so this is fine).
+ *
+ * Running entries (`priming` / `launching` / `joining` / `in-meeting`
+ * / `leaving`) are NEVER dropped — only terminated ones.
  */
 export function sweepStaleEntries(
   registry: Map<string, BotRegistryEntry>,
   now: number = Date.now(),
 ): void {
+  // Pass 1: age-based eviction.
   for (const [id, entry] of registry) {
     if (
       (entry.status === "done" || entry.status === "failed") &&
@@ -314,6 +354,25 @@ export function sweepStaleEntries(
       now - entry.finishedAt > REGISTRY_RETENTION_MS
     ) {
       registry.delete(id);
+    }
+  }
+
+  // Pass 2: enforce the cap. Collect remaining terminated entries and
+  // sort by `finishedAt` ascending — the head of the list is the oldest.
+  // Entries with no `finishedAt` set (shouldn't happen for terminated
+  // entries, but defensive) are treated as "very old" so they're
+  // evicted first.
+  const terminated: BotRegistryEntry[] = [];
+  for (const entry of registry.values()) {
+    if (entry.status === "done" || entry.status === "failed") {
+      terminated.push(entry);
+    }
+  }
+  if (terminated.length > TERMINATED_REGISTRY_CAP) {
+    terminated.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+    const evictCount = terminated.length - TERMINATED_REGISTRY_CAP;
+    for (let i = 0; i < evictCount; i++) {
+      registry.delete(terminated[i].botId);
     }
   }
 }

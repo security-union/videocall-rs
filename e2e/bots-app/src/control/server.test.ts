@@ -278,6 +278,96 @@ describe("control server", () => {
     expect(surface.callLog).toContain(`kill:${entry.botId}`);
   });
 
+  it("DELETE /bots/:id on a done bot is idempotent (200 + drops from registry, no forceKill)", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    entry.status = "done";
+    entry.finishedAt = Date.now();
+    surface.registry.set(entry.botId, entry);
+    const res = await fetchJson(handle.port, `/bots/${entry.botId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ botId: entry.botId, action: "drop", removed: true });
+    expect(surface.registry.has(entry.botId)).toBe(false);
+    expect(surface.callLog.filter((l) => l.startsWith("kill:"))).toHaveLength(0);
+  });
+
+  it("DELETE /bots/:id on a failed bot is idempotent (200 + drops from registry)", async () => {
+    const entry = newRegistryEntry(fakeTask());
+    entry.status = "failed";
+    entry.finishedAt = Date.now();
+    entry.lastError = "join-rejected";
+    surface.registry.set(entry.botId, entry);
+    const res = await fetchJson(handle.port, `/bots/${entry.botId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(surface.registry.has(entry.botId)).toBe(false);
+    expect(surface.callLog.filter((l) => l.startsWith("kill:"))).toHaveLength(0);
+  });
+
+  it("DELETE /bots/terminated removes all done/failed entries and leaves running ones alone", async () => {
+    const running = newRegistryEntry(fakeTask({ participant: "running" }));
+    running.status = "in-meeting";
+    const done = newRegistryEntry(fakeTask({ participant: "done" }));
+    done.status = "done";
+    done.finishedAt = Date.now() - 1_000;
+    const failed = newRegistryEntry(fakeTask({ participant: "failed" }));
+    failed.status = "failed";
+    failed.finishedAt = Date.now() - 2_000;
+    surface.registry.set(running.botId, running);
+    surface.registry.set(done.botId, done);
+    surface.registry.set(failed.botId, failed);
+
+    const res = await fetchJson(handle.port, "/bots/terminated", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ removedCount: 2 });
+    expect(surface.registry.has(running.botId)).toBe(true);
+    expect(surface.registry.has(done.botId)).toBe(false);
+    expect(surface.registry.has(failed.botId)).toBe(false);
+  });
+
+  it("DELETE /bots/terminated on an empty registry is a 200 no-op", async () => {
+    const res = await fetchJson(handle.port, "/bots/terminated", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ removedCount: 0 });
+  });
+
+  it("DELETE /bots/terminated requires the bearer token", async () => {
+    const res = await fetchJson(handle.port, "/bots/terminated", { method: "DELETE" });
+    expect(res.status).toBe(401);
+  });
+
+  it("GET /bots includes finishedAt: null for running bots and a number for terminated bots", async () => {
+    const running = newRegistryEntry(fakeTask({ participant: "running" }));
+    running.status = "in-meeting";
+    const done = newRegistryEntry(fakeTask({ participant: "done" }));
+    done.status = "done";
+    // Anchor the finish to "now - 1s" so the route handler's sweep
+    // doesn't evict the entry as stale before we inspect it.
+    const finishedAt = Date.now() - 1_000;
+    done.finishedAt = finishedAt;
+    surface.registry.set(running.botId, running);
+    surface.registry.set(done.botId, done);
+    const res = await fetchJson(handle.port, "/bots", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { bots: Array<{ botId: string; finishedAt: number | null }> };
+    const runningSnap = body.bots.find((b) => b.botId === running.botId)!;
+    const doneSnap = body.bots.find((b) => b.botId === done.botId)!;
+    expect(runningSnap.finishedAt).toBeNull();
+    expect(doneSnap.finishedAt).toBe(finishedAt);
+  });
+
   it("POST /bots/:id/share requires the `share` boolean", async () => {
     const entry = newRegistryEntry(fakeTask());
     surface.registry.set(entry.botId, entry);

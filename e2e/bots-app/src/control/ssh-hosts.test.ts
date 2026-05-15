@@ -310,6 +310,7 @@ describe("buildSshArgs*", () => {
     shell: null,
     profileFile: null,
     preCommand: null,
+    forwardSsoState: true,
     addedAt: 0,
   };
 
@@ -429,6 +430,7 @@ describe("buildRemoteCommandPrefix", () => {
       shell: null,
       profileFile: null,
       preCommand: null,
+      forwardSsoState: true,
       addedAt: 0,
       ...over,
     };
@@ -553,6 +555,102 @@ describe("validatePreCommandField", () => {
     // 512 exactly is the boundary — must be accepted.
     const exact = "a".repeat(512);
     expect(validatePreCommandField(exact)).toBe(exact);
+  });
+});
+
+describe("forwardSsoState persistence + forward-compat", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = tempDir();
+  });
+
+  it("defaults forwardSsoState to true on a newly-created host when omitted", async () => {
+    const h = await addHost(dir, {
+      label: "default-sso",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+    });
+    expect(h.forwardSsoState).toBe(true);
+    const reloaded = await getHost(dir, "default-sso");
+    expect(reloaded?.forwardSsoState).toBe(true);
+  });
+
+  it("round-trips forwardSsoState=false explicitly through addHost + listHosts", async () => {
+    const h = await addHost(dir, {
+      label: "opt-out",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+      forwardSsoState: false,
+    });
+    expect(h.forwardSsoState).toBe(false);
+    const reloaded = await getHost(dir, "opt-out");
+    expect(reloaded?.forwardSsoState).toBe(false);
+  });
+
+  it("updateHost can flip forwardSsoState OFF and back ON", async () => {
+    await addHost(dir, {
+      label: "flippy",
+      host: "h",
+      user: "alice",
+      reposPath: "/home/alice/videocall",
+    });
+    let patched = await updateHost(dir, "flippy", { forwardSsoState: false });
+    expect(patched.forwardSsoState).toBe(false);
+    patched = await updateHost(dir, "flippy", { forwardSsoState: true });
+    expect(patched.forwardSsoState).toBe(true);
+  });
+
+  it("loads legacy host JSON without forwardSsoState as forwardSsoState=true", async () => {
+    // Forward-compat: registries persisted before this field existed
+    // simply lack the key. They MUST load with `forwardSsoState: true`
+    // — the safer default for most operators, who are running bots
+    // against HCL-SSO-gated meetings.
+    writeFileSync(
+      hostsFilePath(dir),
+      JSON.stringify({
+        version: 1,
+        hosts: [
+          {
+            label: "legacy-no-field",
+            host: "h",
+            user: "alice",
+            sshKey: null,
+            reposPath: "/home/alice/videocall",
+            notes: null,
+            addedAt: 0,
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const all = await listHosts(dir);
+    expect(all).toHaveLength(1);
+    expect(all[0].forwardSsoState).toBe(true);
+  });
+
+  it("rejects a stored row whose forwardSsoState is a non-boolean", async () => {
+    writeFileSync(
+      hostsFilePath(dir),
+      JSON.stringify({
+        version: 1,
+        hosts: [
+          {
+            label: "bad-type",
+            host: "h",
+            user: "alice",
+            sshKey: null,
+            reposPath: "/home/alice/videocall",
+            notes: null,
+            forwardSsoState: "yes",
+            addedAt: 0,
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await expect(listHosts(dir)).rejects.toThrow(SshHostValidationError);
   });
 });
 
@@ -774,6 +872,7 @@ describe("testHost (with stubbed spawn)", () => {
       shell: null,
       profileFile: null,
       preCommand: null,
+      forwardSsoState: true,
       addedAt: 0,
     };
     const fakeSpawn = stubSpawn({ stdout: "different output\n", code: 0 });

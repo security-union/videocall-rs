@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 
 import {
   buildRemoteLaunchCommand,
@@ -6,6 +7,19 @@ import {
   shellEscape,
   type SshHost,
 } from "./ssh-hosts";
+
+/**
+ * Sentinel value the launcher injects as `--sso-state-file <token>` on
+ * the remote npm command line when SSO forwarding is active. The OUTER
+ * remote shell exports `T=$(mktemp)`; the inner `<shell> -lc …` sees
+ * `$T` as an environment variable and expands it to the mktemp path.
+ *
+ * We use the literal `"$T"` (with double quotes) so the path is
+ * expanded in the inner shell — single-quoting would suppress the
+ * expansion and the bot would try to open the four-byte literal
+ * filename `"$T"`, which obviously does not exist.
+ */
+export const SSO_FORWARD_TEMP_TOKEN = '"$T"';
 
 /**
  * Maximum number of stdout/stderr lines we keep per remote bot. Lets
@@ -58,6 +72,43 @@ export interface SshLaunchSpec {
    * set up. Defaults to `true` (the common case).
    */
   headless?: boolean;
+  /**
+   * Absolute path to the LOCAL captured HCL SSO state JSON
+   * (`<runDir>/auth/hcl-sso.json`). When set, the host has
+   * `forwardSsoState !== false`, the file exists, and `authBackend ===
+   * "jwt"`, the launcher wraps the remote command so the file contents
+   * are piped over SSH stdin into a mode-0600 temp file the remote bot
+   * consumes via `--sso-state-file "$T"`. The temp file is removed by
+   * a `trap … EXIT` line on the outer remote shell when the SSH
+   * session ends (clean exit, SIGTERM, SIGKILL).
+   *
+   * Pass `null` / omit to fall back to the un-wrapped command shape
+   * (byte-for-byte identical to today's behaviour).
+   */
+  ssoStateFile?: string | null;
+  /**
+   * Optional `botId` used when emitting the warning log line that
+   * fires when SSO forwarding is requested but the local state file
+   * does not exist. Surfaced in `[<botId>] ssh: …` so operators
+   * correlate the warning with the matching registry entry.
+   */
+  botId?: string;
+}
+
+/**
+ * Build options for {@link buildSshCommand}: ssoWrap flips the
+ * launcher into the wrapped form (outer mktemp + cat to temp file +
+ * trap EXIT + `--sso-state-file "$T"` flag). The dashboard's preview
+ * surface passes `true` when the host has forwardSsoState ON AND a
+ * local state file exists, so operators see exactly what gets run.
+ */
+export interface BuildSshCommandOpts {
+  /**
+   * When `true`, emit the SSO-forward wrapper instead of the bare form.
+   * Caller is responsible for deciding whether forwarding is enabled
+   * (forwardSsoState + local-file-exists + authBackend===jwt).
+   */
+  ssoWrap?: boolean;
 }
 
 export interface SshLaunchDeps {
@@ -95,7 +146,12 @@ export interface SshCommandRender {
  * so a copy-paste of the result reproduces what `child_process.spawn`
  * would actually pass.
  */
-export function buildSshCommand(host: SshHost, spec: SshLaunchSpec): SshCommandRender {
+export function buildSshCommand(
+  host: SshHost,
+  spec: SshLaunchSpec,
+  opts: BuildSshCommandOpts = {},
+): SshCommandRender {
+  const ssoWrap = opts.ssoWrap === true;
   const remoteCommand = buildRemoteLaunchCommand({
     reposPath: host.reposPath,
     ttl: spec.ttl,
@@ -105,8 +161,15 @@ export function buildSshCommand(host: SshHost, spec: SshLaunchSpec): SshCommandR
     authBackend: spec.authBackend ?? null,
     displayName: spec.displayName ?? null,
     headless: spec.headless !== false,
+    // When SSO wrap is on, the bot reads its state from the mktemp
+    // path exported by the outer remote shell. The raw token is
+    // `"$T"` (double-quoted so the inner shell expands it). When the
+    // wrap is off this field stays null and the `--sso-state-file`
+    // flag is omitted entirely — preserving byte-for-byte the un-
+    // wrapped launch command shape operators see today.
+    ssoStateFileRaw: ssoWrap ? SSO_FORWARD_TEMP_TOKEN : null,
   });
-  const argv = ["ssh", ...buildSshArgsForLaunch(host, remoteCommand)];
+  const argv = ["ssh", ...buildSshArgsForLaunch(host, remoteCommand, { ssoWrap })];
   return {
     argv,
     display: renderArgvForDisplay(argv),
@@ -155,13 +218,72 @@ const NEEDS_QUOTING_RE = /[^A-Za-z0-9_@%+=:,./-]/;
  */
 export function spawnRemoteBot(spec: SshLaunchSpec, deps: SshLaunchDeps = {}): SshBotHandle {
   const spawnImpl = deps.spawn ?? spawn;
-  const render = buildSshCommand(spec.host, spec);
+  // Decide whether to enable the SSO-forward wrapper. All three gates
+  // must be on:
+  //   1. The host has `forwardSsoState !== false`.
+  //   2. The launch spec carries an `ssoStateFile` path AND that path
+  //      exists on the local FS (we can't pipe a non-existent file).
+  //   3. The launch spec's `authBackend === "jwt"`. Storage-state and
+  //      Guest auth don't consume SSO state, so wrapping would just
+  //      pipe an unused file and clutter the trace.
+  //
+  // When any gate is off we fall through to the legacy un-wrapped
+  // command shape — the existing local-bot SSH flow is preserved
+  // byte-for-byte for hosts that don't opt in.
+  const forwardEnabled = spec.host.forwardSsoState !== false;
+  const haveLocalFile =
+    typeof spec.ssoStateFile === "string" &&
+    spec.ssoStateFile !== "" &&
+    existsSync(spec.ssoStateFile);
+  const isJwt = spec.authBackend === "jwt";
+  const ssoWrap = forwardEnabled && haveLocalFile && isJwt;
+
+  // Emit a one-line warning (early, before spawn) when the host wants
+  // SSO forwarding AND uses jwt auth AND a local state file is missing.
+  // Operators can run `bots-app sso-login` or recapture via the
+  // dashboard to fix this; we don't want to fail the launch — the bot
+  // may still get through if the remote happens to have a cached
+  // state, and the warning surfaces in the bot's recentLog for context.
+  const ssoMissingWarning =
+    forwardEnabled && isJwt && !haveLocalFile && typeof spec.ssoStateFile === "string"
+      ? `[${spec.botId ?? "ssh"}] ssh: no local SSO state file at ${spec.ssoStateFile} — bot will hit HCL SSO portal if the target sits behind one`
+      : null;
+
+  const render = buildSshCommand(spec.host, spec, { ssoWrap });
   // Slice off the leading "ssh" token — `spawn(cmd, args)` expects the
   // args list NOT to include the program name. buildSshCommand returns
   // the full argv including "ssh" so the display rendering matches what
   // a human would type.
   const args = render.argv.slice(1);
-  const child = spawnImpl("ssh", args, { stdio: ["ignore", "pipe", "pipe"] });
+  // When SSO wrap is on we MUST keep stdin open and writable so we can
+  // pipe the locally-captured state into the remote `cat > "$T"` loop.
+  // Otherwise stdin stays "ignore" exactly as before — a closed stdin
+  // is the safer default for non-interactive remote bots.
+  const stdio: ["ignore" | "pipe", "pipe", "pipe"] = ssoWrap
+    ? ["pipe", "pipe", "pipe"]
+    : ["ignore", "pipe", "pipe"];
+  const child = spawnImpl("ssh", args, { stdio });
+
+  // Pipe the SSO state. Read as a Buffer (binary) — not a UTF-8 string
+  // — so cookie values with non-printable or multi-byte content round-
+  // trip unchanged. The remote `cat > "$T"` blocks on stdin EOF, so we
+  // close immediately after writing the full payload.
+  if (ssoWrap && spec.ssoStateFile !== null && spec.ssoStateFile !== undefined) {
+    try {
+      const bytes = readFileSync(spec.ssoStateFile);
+      child.stdin?.write(bytes);
+    } catch (e) {
+      // We re-check existsSync above, but the file could vanish between
+      // the check and the read on a busy operator workstation. Log the
+      // failure and let the bot continue — the remote will still spin
+      // up but will hit the SSO portal at runtime.
+      console.warn(
+        `[${spec.botId ?? "ssh"}] ssh: failed to pipe SSO state to remote: ${(e as Error).message}`,
+      );
+    } finally {
+      child.stdin?.end();
+    }
+  }
 
   const handle: SshBotHandle = {
     host: spec.host,
@@ -178,6 +300,15 @@ export function spawnRemoteBot(spec: SshLaunchSpec, deps: SshLaunchDeps = {}): S
   // header line from real remote stdout.
   handle.recentLog.push(`$ ${render.display}`);
   handle.totalLines += 1;
+  // Surface the SSO-missing warning right after the command header so
+  // operators reading the per-bot log dialog see it before any remote
+  // stdout. Bookkeeping (totalLines + recentLog) matches pushLine so
+  // the dashboard's incremental-log fetch stays consistent.
+  if (ssoMissingWarning !== null) {
+    console.warn(ssoMissingWarning);
+    handle.recentLog.push(ssoMissingWarning);
+    handle.totalLines += 1;
+  }
 
   const pushLine = (raw: string): void => {
     // Split on newlines; drop trailing empty chunk from a final \n.

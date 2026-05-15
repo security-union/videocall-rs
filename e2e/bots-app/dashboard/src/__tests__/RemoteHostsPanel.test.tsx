@@ -14,6 +14,7 @@ interface StoredHost {
   shell: string | null;
   profileFile: string | null;
   preCommand: string | null;
+  forwardSsoState: boolean;
   addedAt: number;
 }
 
@@ -62,6 +63,7 @@ function stubFetch(state: State) {
           shell: body.shell ?? null,
           profileFile: body.profileFile ?? null,
           preCommand: body.preCommand ?? null,
+          forwardSsoState: body.forwardSsoState ?? true,
           addedAt: Date.now(),
         };
         state.hosts = [...state.hosts, newHost];
@@ -131,6 +133,7 @@ function legacyHost(over: Partial<StoredHost> = {}): StoredHost {
     shell: null,
     profileFile: null,
     preCommand: null,
+    forwardSsoState: true,
     addedAt: Date.now(),
     ...over,
   };
@@ -445,6 +448,81 @@ describe("RemoteHostsPanel", () => {
     );
   });
 
+  it("renders the Forward SSO state toggle defaulting to ON in the Add dialog", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    const toggle = await screen.findByTestId("remote-host-dialog-forwardSsoState");
+    // Radix Switch keeps state on the data-state attribute (not the
+    // checked DOM prop) — `checked` translates to data-state="checked".
+    expect(toggle.getAttribute("data-state")).toBe("checked");
+    // The help popover trigger for the new field must be wired in
+    // exactly like the other field-specific triggers.
+    expect(screen.getByTestId("help-forwardSsoState")).toBeInTheDocument();
+  });
+
+  it("persists forwardSsoState: true by default when the operator submits the Add form", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    fireEvent.change(screen.getByTestId("remote-host-dialog-label"), {
+      target: { value: "sso-default" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-host"), {
+      target: { value: "sso-default.intra" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-reposPath"), {
+      target: { value: "/home/alice/videocall" },
+    });
+    fireEvent.click(screen.getByTestId("remote-host-dialog-submit"));
+    await waitFor(() => {
+      expect(state.lastAdded).toMatchObject({
+        label: "sso-default",
+        forwardSsoState: true,
+      });
+    });
+  });
+
+  it("submits forwardSsoState: false when the operator flips the toggle OFF before saving", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByTestId("remote-hosts-add"));
+    await screen.findByTestId("remote-host-dialog");
+    fireEvent.change(screen.getByTestId("remote-host-dialog-label"), {
+      target: { value: "sso-off" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-host"), {
+      target: { value: "sso-off.intra" },
+    });
+    fireEvent.change(screen.getByTestId("remote-host-dialog-reposPath"), {
+      target: { value: "/home/alice/videocall" },
+    });
+    // Flip the switch — Radix Switch responds to click on its root button.
+    fireEvent.click(screen.getByTestId("remote-host-dialog-forwardSsoState"));
+    fireEvent.click(screen.getByTestId("remote-host-dialog-submit"));
+    await waitFor(() => {
+      expect(state.lastAdded).toMatchObject({
+        label: "sso-off",
+        forwardSsoState: false,
+      });
+    });
+  });
+
+  it("pre-fills the toggle from the existing forwardSsoState when opening the Edit dialog", async () => {
+    state.hosts = [
+      legacyHost({
+        label: "edit-sso-off",
+        host: "edit-sso-off.lan",
+        forwardSsoState: false,
+      }),
+    ];
+    renderPanel();
+    await screen.findByTestId("remote-host-row-edit-sso-off");
+    fireEvent.click(screen.getByTestId("remote-host-edit-edit-sso-off"));
+    await screen.findByTestId("remote-host-dialog");
+    const toggle = screen.getByTestId("remote-host-dialog-forwardSsoState");
+    expect(toggle.getAttribute("data-state")).toBe("unchecked");
+  });
+
   it("renders the live Sample command card and posts /api/hosts/preview as the operator types", async () => {
     renderPanel();
     fireEvent.click(screen.getByTestId("remote-hosts-add"));
@@ -485,6 +563,10 @@ describe("RemoteHostsPanel", () => {
         reposPath: "/home/alice/videocall",
         shell: "bash",
         profileFile: "~/.bash_profile",
+        // The forwardSsoState toggle is part of the preview body so the
+        // server's `/hosts/preview` endpoint applies the same SSO wrap
+        // decision the launcher will, deterministically.
+        forwardSsoState: true,
       }),
     });
   });

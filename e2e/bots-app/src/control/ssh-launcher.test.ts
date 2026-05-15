@@ -1,3 +1,7 @@
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import { buildSshCommand, readLogWindow, REMOTE_LOG_CAP, spawnRemoteBot } from "./ssh-launcher";
@@ -14,6 +18,7 @@ function host(overrides: Partial<SshHost> = {}): SshHost {
     shell: null,
     profileFile: null,
     preCommand: null,
+    forwardSsoState: true,
     addedAt: 0,
     ...overrides,
   };
@@ -25,38 +30,87 @@ interface FakeChild {
   exitCb: ((code: number | null) => void) | null;
   errorCb: ((err: Error) => void) | null;
   kill: ReturnType<typeof vi.fn>;
+  /** Bytes captured from `child.stdin.write(...)`. `null` when stdio
+   *  is set to "ignore" (no stdin stream on the returned ChildProcess). */
+  stdinBytes: Buffer | null;
+  stdinEnded: boolean;
 }
 
 function stubSpawnFactory() {
   const last: { child: FakeChild | null } = { child: null };
-  const fn = vi.fn().mockImplementation(() => {
-    const child: FakeChild = {
-      stdoutCb: null,
-      stderrCb: null,
-      exitCb: null,
-      errorCb: null,
-      kill: vi.fn(),
-    };
-    last.child = child;
-    return {
-      stdout: {
-        on: (event: string, cb: (b: Buffer) => void) => {
-          if (event === "data") child.stdoutCb = cb;
+  const fn = vi
+    .fn()
+    .mockImplementation((_cmd: string, _args: string[], options?: { stdio?: unknown[] }) => {
+      const child: FakeChild = {
+        stdoutCb: null,
+        stderrCb: null,
+        exitCb: null,
+        errorCb: null,
+        kill: vi.fn(),
+        stdinBytes: null,
+        stdinEnded: false,
+      };
+      last.child = child;
+      // Only expose `stdin` on the returned ChildProcess when the launch
+      // path actually opted into a pipe stream — mirrors the real
+      // child_process semantics so the launcher's `child.stdin?.write(...)`
+      // is a no-op when stdio[0] === "ignore".
+      const stdinMode = options?.stdio?.[0];
+      const stdin =
+        stdinMode === "pipe"
+          ? {
+              write: (b: Buffer) => {
+                child.stdinBytes =
+                  child.stdinBytes === null ? Buffer.from(b) : Buffer.concat([child.stdinBytes, b]);
+                return true;
+              },
+              end: () => {
+                child.stdinEnded = true;
+              },
+            }
+          : undefined;
+      return {
+        stdin,
+        stdout: {
+          on: (event: string, cb: (b: Buffer) => void) => {
+            if (event === "data") child.stdoutCb = cb;
+          },
         },
-      },
-      stderr: {
-        on: (event: string, cb: (b: Buffer) => void) => {
-          if (event === "data") child.stderrCb = cb;
+        stderr: {
+          on: (event: string, cb: (b: Buffer) => void) => {
+            if (event === "data") child.stderrCb = cb;
+          },
         },
-      },
-      on: (event: string, cb: (...args: unknown[]) => void) => {
-        if (event === "exit") child.exitCb = cb as (code: number | null) => void;
-        if (event === "error") child.errorCb = cb as (err: Error) => void;
-      },
-      kill: child.kill,
-    };
-  });
+        on: (event: string, cb: (...args: unknown[]) => void) => {
+          if (event === "exit") child.exitCb = cb as (code: number | null) => void;
+          if (event === "error") child.errorCb = cb as (err: Error) => void;
+        },
+        kill: child.kill,
+      };
+    });
   return { fn, last };
+}
+
+/**
+ * Create a temp SSO state file with arbitrary bytes (including a NUL
+ * + high-byte sequence) so tests can assert binary round-tripping
+ * through the stdin pipe — cookies frequently contain non-printable
+ * characters that a UTF-8 string read would silently corrupt.
+ */
+function makeTempSsoState(payload: Buffer): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-launcher-sso-"));
+  const path = join(dir, "hcl-sso.json");
+  writeFileSync(path, payload);
+  return {
+    path,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    },
+  };
 }
 
 describe("spawnRemoteBot", () => {
@@ -201,6 +255,184 @@ describe("spawnRemoteBot", () => {
     expect(handle.finishReason).toBe("ssh-error");
     expect(handle.recentLog.join("\n")).toContain("spawn error: ENOENT");
   });
+
+  // ──────────────────────────────────────────────────────────────────
+  // SSO-state forwarding (stdin pipe + remote temp file)
+  // ──────────────────────────────────────────────────────────────────
+
+  it("wraps the remote command and pipes SSO state to stdin when forwardSsoState=true + local file exists + jwt auth", () => {
+    const payload = Buffer.from("hcl-sso-cookies-payload\0\xffbinary", "binary");
+    const tmp = makeTempSsoState(payload);
+    try {
+      const { fn, last } = stubSpawnFactory();
+      spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: true }),
+          ttl: "5m",
+          meetingURL: "https://example.com/meeting/X",
+          participant: "alice",
+          authBackend: "jwt",
+          ssoStateFile: tmp.path,
+        },
+        { spawn: fn as unknown as typeof import("node:child_process").spawn },
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+      const [, args, opts] = fn.mock.calls[0] as [string, string[], { stdio: unknown[] }];
+      // The launcher MUST opt into a piped stdin so the SSO state can
+      // actually be written; an "ignore" stdin would silently drop the
+      // payload.
+      expect(opts.stdio[0]).toBe("pipe");
+      // The last argv slot carries the OUTER remote shell wrapper
+      // with the mktemp + cat-to-temp + trap-EXIT prefix.
+      const tail = args[args.length - 1] as string;
+      expect(tail.startsWith('export T=$(mktemp); chmod 600 "$T"; cat > "$T"; trap')).toBe(true);
+      expect(tail).toContain('trap "rm -f \\"$T\\"" EXIT');
+      // The inner login-shell invocation should follow the outer
+      // wrapper boilerplate and the npm command should reference the
+      // exported `"$T"` token (double-quoted so the inner shell
+      // expands it at runtime).
+      expect(tail).toContain("bash -lc");
+      expect(tail).toContain('--sso-state-file "$T"');
+      // The stdin pipe must have received the exact bytes we wrote to
+      // the temp file (including the NUL + high byte) and been closed
+      // so the remote `cat > "$T"` sees EOF and unblocks.
+      expect(last.child!.stdinBytes).not.toBeNull();
+      expect(last.child!.stdinBytes!.equals(payload)).toBe(true);
+      expect(last.child!.stdinEnded).toBe(true);
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  it("falls back to the unwrapped form and logs a warning when forwardSsoState=true + local file MISSING + jwt auth", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { fn, last } = stubSpawnFactory();
+      const handle = spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: true }),
+          ttl: "5m",
+          meetingURL: "u",
+          participant: "alice",
+          authBackend: "jwt",
+          ssoStateFile: "/definitely/does/not/exist/hcl-sso.json",
+          botId: "bot-XYZ",
+        },
+        { spawn: fn as unknown as typeof import("node:child_process").spawn },
+      );
+      const [, args, opts] = fn.mock.calls[0] as [string, string[], { stdio: unknown[] }];
+      // No stdin pipe — we have nothing to feed.
+      expect(opts.stdio[0]).toBe("ignore");
+      const tail = args[args.length - 1] as string;
+      // No outer mktemp/cat wrapper — falls back to the legacy
+      // `<shell> -lc '...'` shape.
+      expect(tail.startsWith("bash -lc ")).toBe(true);
+      expect(tail).not.toContain("mktemp");
+      expect(tail).not.toContain("--sso-state-file");
+      // Warning must surface BOTH on console (for ops logs) AND in
+      // recentLog (so the dashboard's per-bot log dialog shows it).
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("[bot-XYZ] ssh: no local SSO state file at");
+      expect(handle.recentLog.join("\n")).toContain("no local SSO state file at");
+      expect(last.child!.stdinBytes).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("falls back to the unwrapped form when forwardSsoState=false regardless of local file presence", () => {
+    const tmp = makeTempSsoState(Buffer.from("payload"));
+    try {
+      const { fn } = stubSpawnFactory();
+      spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: false }),
+          ttl: "5m",
+          meetingURL: "u",
+          participant: "alice",
+          authBackend: "jwt",
+          ssoStateFile: tmp.path,
+        },
+        { spawn: fn as unknown as typeof import("node:child_process").spawn },
+      );
+      const [, args, opts] = fn.mock.calls[0] as [string, string[], { stdio: unknown[] }];
+      expect(opts.stdio[0]).toBe("ignore");
+      const tail = args[args.length - 1] as string;
+      expect(tail.startsWith("bash -lc ")).toBe(true);
+      expect(tail).not.toContain("mktemp");
+      expect(tail).not.toContain("--sso-state-file");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  it("falls back to the unwrapped form when authBackend !== 'jwt' even with forwardSsoState=true + local file", () => {
+    // Storage-state and Guest auth do not consume SSO state — piping it
+    // would just waste bandwidth + clutter the trace.
+    const tmp = makeTempSsoState(Buffer.from("payload"));
+    try {
+      const { fn } = stubSpawnFactory();
+      spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: true }),
+          ttl: "5m",
+          meetingURL: "u",
+          participant: "alice",
+          authBackend: "storage-state",
+          ssoStateFile: tmp.path,
+        },
+        { spawn: fn as unknown as typeof import("node:child_process").spawn },
+      );
+      const [, args, opts] = fn.mock.calls[0] as [string, string[], { stdio: unknown[] }];
+      expect(opts.stdio[0]).toBe("ignore");
+      const tail = args[args.length - 1] as string;
+      expect(tail).not.toContain("mktemp");
+      expect(tail).not.toContain("--sso-state-file");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  it("preserves the legacy un-wrapped command shape byte-for-byte when forwardSsoState=false", () => {
+    // Regression guard: operators with `forwardSsoState: false` must
+    // get the EXACT same `bash -lc '<inner>'` shape as the launcher
+    // emitted before this PR — no mktemp prefix, no stdin pipe, no
+    // `--sso-state-file` flag, no trap EXIT.
+    const tmp = makeTempSsoState(Buffer.from("payload"));
+    try {
+      const opted = stubSpawnFactory();
+      const legacy = stubSpawnFactory();
+      // Opt-out: forwardSsoState=false, jwt auth, file exists.
+      spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: false }),
+          ttl: "5m",
+          meetingURL: "u",
+          participant: "alice",
+          authBackend: "jwt",
+          ssoStateFile: tmp.path,
+        },
+        { spawn: opted.fn as unknown as typeof import("node:child_process").spawn },
+      );
+      // Legacy: no ssoStateFile passed at all, plain authBackend.
+      spawnRemoteBot(
+        {
+          host: host({ forwardSsoState: false }),
+          ttl: "5m",
+          meetingURL: "u",
+          participant: "alice",
+          authBackend: "jwt",
+        },
+        { spawn: legacy.fn as unknown as typeof import("node:child_process").spawn },
+      );
+      const optedArgs = opted.fn.mock.calls[0][1] as string[];
+      const legacyArgs = legacy.fn.mock.calls[0][1] as string[];
+      // Identical argv → identical wire-level SSH command.
+      expect(optedArgs).toEqual(legacyArgs);
+    } finally {
+      tmp.cleanup();
+    }
+  });
 });
 
 describe("readLogWindow", () => {
@@ -261,6 +493,7 @@ describe("buildSshCommand", () => {
       shell: null,
       profileFile: null,
       preCommand: null,
+      forwardSsoState: true,
       addedAt: 0,
       ...overrides,
     };

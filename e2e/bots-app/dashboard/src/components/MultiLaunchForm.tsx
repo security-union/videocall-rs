@@ -3,7 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import * as RadioGroup from "@radix-ui/react-radio-group";
 import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Dices, Users } from "lucide-react";
+import { Dices, RotateCcw, Users } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type { MultiLaunchRequest, MultiLaunchResponse } from "../api/types";
@@ -125,13 +125,33 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
   const mutation = useMutation({
     mutationFn: (req: MultiLaunchRequest) => api.launchMulti(req),
     onSuccess: (data) => {
+      // Keep all field values intact so the operator can immediately
+      // launch another batch with the same shared config (e.g.
+      // "launched 3, want to launch 2 more"). Re-arm by clearing
+      // `submitted` so the next click validates fresh. The parent
+      // emits the success toast via `onLaunched`.
+      setSubmitted(false);
       onLaunched(data);
     },
     onError: (err) => {
+      // Preserve all field values on failure too — operators almost
+      // always want to retry with the same shared config after an
+      // error. The parent emits the error toast.
       const msg = err instanceof DashboardApiError ? err.message : (err as Error).message;
       onError(msg);
     },
   });
+
+  /**
+   * Reset every field to its empty/default value (matches the
+   * `DEFAULTS` constant). Also clears validation errors and re-arms
+   * `submitted`. Disabled while a launch is in-flight.
+   */
+  const handleReset = () => {
+    setValues(DEFAULTS);
+    setErrors({});
+    setSubmitted(false);
+  };
 
   const setField = <K extends keyof MultiLaunchFormValues>(
     key: K,
@@ -647,6 +667,31 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
         </Section>
 
         <div className="flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">
+          <Tooltip.Root delayDuration={300}>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={mutation.isPending}
+                className="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-700 shadow-sm transition-colors hover:bg-neutral-50 disabled:cursor-not-allowed disabled:bg-neutral-100 disabled:text-neutral-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 dark:disabled:bg-slate-900 dark:disabled:text-slate-500"
+                data-testid="multi-reset-button"
+                aria-label="Reset form"
+              >
+                <RotateCcw className="h-4 w-4" />
+                Reset
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content
+                side="top"
+                sideOffset={6}
+                className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+              >
+                Clear all fields and start fresh.
+                <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
           <button
             type="submit"
             disabled={mutation.isPending}

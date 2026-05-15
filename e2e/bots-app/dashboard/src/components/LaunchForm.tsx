@@ -3,7 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import * as RadioGroup from "@radix-ui/react-radio-group";
 import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Rocket, Wand2 } from "lucide-react";
+import { Rocket, RotateCcw, Wand2 } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type {
@@ -259,13 +259,37 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
       if (values.displayName.trim()) displayNameHistory.push(values.displayName);
       ttlHistory.push(variables.ttl);
       if (variables.storageStateFile) storageStateHistory.push(variables.storageStateFile);
+      // Keep all field values intact so the operator can immediately
+      // launch another bot with the same/similar config (e.g. tweak
+      // just the participant and click Launch again). The parent
+      // emits the success toast via `onLaunched`. Re-arm the form by
+      // clearing `submitted` so the next click validates fresh.
+      setSubmitted(false);
       onLaunched(data.botId);
     },
     onError: (err) => {
+      // Preserve all field values on failure too — operators almost
+      // always want to retry with the same config (or a small tweak)
+      // after a launch error. The parent emits the error toast.
       const msg = err instanceof DashboardApiError ? err.message : (err as Error).message;
       onError(msg);
     },
   });
+
+  /**
+   * Reset every field to its empty/default value. Also clears
+   * validation errors and re-arms `submitted` so the next launch
+   * click validates fresh. Available via the dedicated Reset button
+   * next to Launch; disabled while a launch is in-flight to avoid
+   * stomping the in-flight payload.
+   */
+  const handleReset = () => {
+    setValues(DEFAULT_VALUES);
+    setErrors({});
+    setSubmitted(false);
+    setManualTouched({ costume: false, audio: false });
+    setFreshlyDuplicated(false);
+  };
 
   const setField = <K extends keyof LaunchFormInitial>(key: K, val: LaunchFormInitial[K]) => {
     setValues((prev) => ({ ...prev, [key]: val }));
@@ -826,6 +850,31 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
         </Section>
 
         <div className="flex items-center justify-end gap-3 border-t border-neutral-100 pt-4 dark:border-slate-700">
+          <Tooltip.Root delayDuration={300}>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={launchMutation.isPending}
+                className="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-700 shadow-sm transition-colors hover:bg-neutral-50 disabled:cursor-not-allowed disabled:bg-neutral-100 disabled:text-neutral-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 dark:disabled:bg-slate-900 dark:disabled:text-slate-500"
+                data-testid="reset-button"
+                aria-label="Reset form"
+              >
+                <RotateCcw className="h-4 w-4" />
+                Reset
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content
+                side="top"
+                sideOffset={6}
+                className="z-50 rounded-md bg-neutral-900 px-2 py-1 text-xs text-white shadow-md dark:bg-slate-700 dark:text-slate-100"
+              >
+                Clear all fields and start fresh.
+                <Tooltip.Arrow className="fill-neutral-900 dark:fill-slate-700" />
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
           <button
             type="submit"
             disabled={launchMutation.isPending}

@@ -103,6 +103,25 @@ export interface SshHost {
    * doesn't abort the bot launch.
    */
   preCommand: string | null;
+  /**
+   * When `true` (default) the SSH launcher wraps the remote command so
+   * the local dashboard's captured HCL SSO state (`<runDir>/auth/hcl-sso.json`)
+   * is piped to the remote over the SSH stdin channel and written to a
+   * mode-0600 temp file the bot consumes via `--sso-state-file "$T"`.
+   * A `trap "rm -f $T" EXIT` line on the outer remote shell removes the
+   * temp file when the bot's owning SSH session ends (clean exit,
+   * SIGTERM, or SIGKILL).
+   *
+   * Operators who have already captured SSO state on the remote host —
+   * or who are launching against meetings that do NOT sit behind HCL
+   * SSO — can flip this off to fall back to today's un-wrapped command
+   * shape (byte-for-byte identical).
+   *
+   * Legacy host records persisted before this field existed load with
+   * the default `true` (most SSH bots hit SSO-gated meetings, so
+   * opt-out is the safer default for forward compatibility).
+   */
+  forwardSsoState: boolean;
   addedAt: number;
 }
 
@@ -116,6 +135,8 @@ export interface SshHostInput {
   shell?: string | null;
   profileFile?: string | null;
   preCommand?: string | null;
+  /** Defaults to `true` when omitted (see {@link SshHost.forwardSsoState}). */
+  forwardSsoState?: boolean;
 }
 
 export interface SshHostPatch {
@@ -127,6 +148,7 @@ export interface SshHostPatch {
   shell?: string | null;
   profileFile?: string | null;
   preCommand?: string | null;
+  forwardSsoState?: boolean;
 }
 
 export class SshHostValidationError extends Error {
@@ -271,6 +293,10 @@ export async function updateHost(
         : patch.preCommand === null || patch.preCommand === ""
           ? null
           : validatePreCommandField(patch.preCommand),
+    forwardSsoState:
+      patch.forwardSsoState === undefined
+        ? existing.forwardSsoState
+        : validateForwardSsoStateField(patch.forwardSsoState),
   };
   const next = [...all];
   next[idx] = merged;
@@ -387,12 +413,46 @@ export function buildSshArgsForProbe(host: SshHost): string[] {
  *
  * See {@link buildRemoteCommandPrefix} for the prefix builder details.
  */
-export function buildSshArgsForLaunch(host: SshHost, remoteCmd: string): string[] {
+export function buildSshArgsForLaunch(
+  host: SshHost,
+  remoteCmd: string,
+  opts: BuildSshArgsForLaunchOpts = {},
+): string[] {
   const prefix = buildRemoteCommandPrefix(host);
   const inner = `${prefix}${remoteCmd}`;
   const shell = host.shell !== null && host.shell !== "" ? host.shell : DEFAULT_SHELL;
   const wrapped = `${shell} -lc ${shellEscape(inner)}`;
+  // When SSO forwarding is active the outer remote shell exports a
+  // mktemp(1) handle, reads SSO state from stdin into it (chmod 600),
+  // and installs a trap that removes the temp file on shell exit
+  // (clean, SIGTERM, SIGKILL — `trap … EXIT` fires on all of those).
+  // The inner `<shell> -lc …` inherits `$T` via export. We embed the
+  // wrapped login-shell invocation verbatim — it already had its
+  // single-quote escaping applied — so the outer wrapper is fully
+  // composable with the existing prefix + preCommand logic.
+  if (opts.ssoWrap) {
+    const outer =
+      'export T=$(mktemp); chmod 600 "$T"; cat > "$T"; trap "rm -f \\"$T\\"" EXIT; ' + wrapped;
+    return [...buildBaseSshArgs(host, { connectTimeout: 10 }), outer];
+  }
   return [...buildBaseSshArgs(host, { connectTimeout: 10 }), wrapped];
+}
+
+/**
+ * Options for {@link buildSshArgsForLaunch}. `ssoWrap` enables the
+ * outer remote-shell wrapper that reads HCL SSO state from SSH stdin
+ * into a temp file the bot consumes via `--sso-state-file "$T"`.
+ */
+export interface BuildSshArgsForLaunchOpts {
+  /**
+   * When `true`, prepend the outer `T=$(mktemp); chmod 600 "$T"; cat >
+   * "$T"; trap "rm -f \"$T\"" EXIT;` boilerplate so the remote bot
+   * picks up the locally-captured SSO state via stdin → temp file.
+   * The caller is responsible for ensuring the inner remoteCmd
+   * already includes `--sso-state-file "$T"` so the bot reads from
+   * the same temp file. Default `false` (legacy un-wrapped shape).
+   */
+  ssoWrap?: boolean;
 }
 
 /**
@@ -522,6 +582,15 @@ export interface RemoteLaunchCmd {
   authBackend?: string | null;
   displayName?: string | null;
   headless?: boolean;
+  /**
+   * When set, emit `--sso-state-file <value>` on the npm command line.
+   * The value is intentionally NOT shell-escaped — callers building
+   * the SSO-wrap form pass the literal `"$T"` token (with quotes) so
+   * the inner login shell expands `$T` to the mktemp path at runtime.
+   * Callers building local-disk paths should pass a single-quoted /
+   * pre-escaped value.
+   */
+  ssoStateFileRaw?: string | null;
 }
 
 export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
@@ -540,6 +609,9 @@ export function buildRemoteLaunchCommand(spec: RemoteLaunchCmd): string {
   }
   if (spec.displayName) {
     cmd.push("--display-name", shellEscape(spec.displayName));
+  }
+  if (spec.ssoStateFileRaw !== undefined && spec.ssoStateFileRaw !== null) {
+    cmd.push("--sso-state-file", spec.ssoStateFileRaw);
   }
   parts.push(cmd.join(" "));
   return parts.join(" && ");
@@ -616,6 +688,15 @@ function buildHost(spec: SshHostInput, now: number): SshHost {
       spec.preCommand === undefined || spec.preCommand === null || spec.preCommand === ""
         ? null
         : validatePreCommandField(spec.preCommand),
+    // Forward-compat default: legacy/empty inputs treat as `true`. The
+    // vast majority of SSH bots are launched against SSO-gated meetings,
+    // and silently skipping the forward when a captured state DOES
+    // exist would just route bots to the SSO portal at runtime — a much
+    // worse failure mode than an unused stdin pipe.
+    forwardSsoState:
+      spec.forwardSsoState === undefined
+        ? true
+        : validateForwardSsoStateField(spec.forwardSsoState),
     addedAt: now,
   };
 }
@@ -650,6 +731,19 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
     o.preCommand === undefined || o.preCommand === null
       ? null
       : expectString(o.preCommand, `${where}.preCommand`);
+  // Forward-compat read: hosts persisted before the field existed
+  // simply omit it and load with the safer default of `true`. Hosts
+  // with an explicit `false` keep the un-wrapped command shape.
+  const forwardSsoStateRaw = o.forwardSsoState;
+  const forwardSsoState =
+    forwardSsoStateRaw === undefined || forwardSsoStateRaw === null
+      ? true
+      : (() => {
+          if (typeof forwardSsoStateRaw !== "boolean") {
+            throw new SshHostValidationError(`${where}.forwardSsoState must be a boolean`);
+          }
+          return forwardSsoStateRaw;
+        })();
   // Run the same regex/path checks on the stored row — if a malicious
   // operator hand-edited hosts.json to inject shell metacharacters or
   // a relative path, we refuse to load it.
@@ -665,6 +759,7 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
       profileFile === null || profileFile === "" ? null : validateProfileFileField(profileFile),
     preCommand:
       preCommand === null || preCommand === "" ? null : validatePreCommandField(preCommand),
+    forwardSsoState,
     addedAt,
   };
 }
@@ -836,6 +931,19 @@ export function validatePreCommandField(raw: string): string {
   }
   if (raw.length > 512) {
     throw new SshHostValidationError(`preCommand too long (max 512 chars)`);
+  }
+  return raw;
+}
+
+/**
+ * Validate the `forwardSsoState` field. The shape is just `typeof
+ * raw === "boolean"` — no string coercion, no "true"/"false" strings —
+ * because the JSON wire format already differentiates these and a
+ * silent coercion would hide configuration mistakes.
+ */
+export function validateForwardSsoStateField(raw: unknown): boolean {
+  if (typeof raw !== "boolean") {
+    throw new SshHostValidationError(`forwardSsoState must be a boolean (got ${typeof raw})`);
   }
   return raw;
 }

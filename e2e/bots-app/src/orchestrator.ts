@@ -402,6 +402,18 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
     const entry = newRegistryEntry(task, hostKind);
     registry.set(botId, entry);
+    // Resolve the local SSO state path used for the stdin-forward path.
+    // The dashboard's `POST /sso/recapture` writes to
+    // `<runDir>/auth/hcl-sso.json`; we feed that path to the launcher so
+    // SSH-launched bots can pass through the HCL SSO portal without
+    // having to re-capture state on every remote host. When the host
+    // record has `forwardSsoState: false`, the launcher's gate will
+    // short-circuit and the un-wrapped command shape stays intact.
+    const runDirForSso = opts.control?.runDir;
+    const ssoStateFile =
+      spec.authBackend === "jwt"
+        ? (spec.ssoStateFile ?? (runDirForSso ? defaultSsoStatePath(runDirForSso) : null))
+        : null;
     const sshHandle: SshBotHandle = spawnRemoteBot({
       host,
       ttl: formatDuration(ttl),
@@ -411,6 +423,8 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       authBackend: spec.authBackend,
       displayName: task.displayName,
       headless: spec.headless,
+      ssoStateFile,
+      botId,
     });
     entry.sshHandle = sshHandle;
     entry.status = "in-meeting";

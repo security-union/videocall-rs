@@ -708,7 +708,7 @@ async function route(
   // added/edited; nothing is persisted.
   if (pathname === "/hosts/preview" && method === "POST") {
     const body = await readJsonBody(req);
-    return previewHostRoute(body);
+    return previewHostRoute(opts, body);
   }
   const hostPath = /^\/hosts\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
   if (hostPath) {
@@ -2525,16 +2525,28 @@ async function previewLaunchRoute(
   // run-location of { kind: "ssh", hostLabel } from the URL so the
   // operator does not have to repeat it in the body.
   const spec = parseLaunchSpecForPreview(body);
-  const render = buildSshCommand(host, {
+  // Mirror the launcher's SSO-wrap gate so the preview shows EXACTLY
+  // the command the launcher would run: host.forwardSsoState ON,
+  // authBackend === "jwt", and a local SSO state file exists. The
+  // dashboard's "what will execute" promise depends on this match.
+  const ssoWrap =
+    host.forwardSsoState !== false &&
+    spec.authBackend === "jwt" &&
+    existsSync(defaultSsoStatePath(runDir));
+  const render = buildSshCommand(
     host,
-    ttl: formatDuration(spec.ttl),
-    meetingURL: spec.meetingURL,
-    participant: spec.participant,
-    network: spec.network === "none" ? null : spec.network,
-    authBackend: spec.authBackend,
-    displayName: spec.displayName ?? null,
-    headless: spec.headless,
-  });
+    {
+      host,
+      ttl: formatDuration(spec.ttl),
+      meetingURL: spec.meetingURL,
+      participant: spec.participant,
+      network: spec.network === "none" ? null : spec.network,
+      authBackend: spec.authBackend,
+      displayName: spec.displayName ?? null,
+      headless: spec.headless,
+    },
+    { ssoWrap },
+  );
   return {
     status: 200,
     body: {
@@ -2561,7 +2573,7 @@ async function previewLaunchRoute(
  * preview uses visibly-distinct placeholder strings so the operator
  * sees what gets filled in at launch time.
  */
-function previewHostRoute(body: Record<string, unknown>): RouteResult {
+function previewHostRoute(opts: ControlServerOptions, body: Record<string, unknown>): RouteResult {
   const hostBody = body.host;
   if (hostBody === null || typeof hostBody !== "object" || Array.isArray(hostBody)) {
     throw new ControlServerError(400, '"host" must be an object');
@@ -2610,16 +2622,33 @@ function previewHostRoute(body: Record<string, unknown>): RouteResult {
     launchOverride !== null && typeof launchOverride.displayName === "string"
       ? launchOverride.displayName
       : null;
-  const render = buildSshCommand(preview, {
-    host: preview,
-    ttl,
-    meetingURL,
-    participant,
-    network,
-    authBackend,
-    displayName,
-    headless: true,
-  });
+  // Apply the same SSO-wrap decision the real launcher would: only
+  // when the unsaved host has `forwardSsoState !== false`, the
+  // override sets `authBackend === "jwt"`, AND a local SSO state file
+  // exists at the conventional path. The preview endpoint runs
+  // BEFORE the host is saved, so we can't probe a label-scoped state
+  // file — the global `<runDir>/auth/hcl-sso.json` is the canonical
+  // capture target.
+  const ssoWrap =
+    preview.forwardSsoState !== false &&
+    authBackend === "jwt" &&
+    opts.runDir !== undefined &&
+    opts.runDir !== null &&
+    existsSync(defaultSsoStatePath(opts.runDir));
+  const render = buildSshCommand(
+    preview,
+    {
+      host: preview,
+      ttl,
+      meetingURL,
+      participant,
+      network,
+      authBackend,
+      displayName,
+      headless: true,
+    },
+    { ssoWrap },
+  );
   return {
     status: 200,
     body: {
@@ -2741,6 +2770,10 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
   if (preCommand !== undefined && preCommand !== null && typeof preCommand !== "string") {
     throw new ControlServerError(400, '"preCommand" must be a string or null');
   }
+  const forwardSsoState = body.forwardSsoState;
+  if (forwardSsoState !== undefined && typeof forwardSsoState !== "boolean") {
+    throw new ControlServerError(400, '"forwardSsoState" must be a boolean when provided');
+  }
   return {
     label,
     host,
@@ -2751,6 +2784,7 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
     shell: shell === undefined ? undefined : (shell as string | null),
     profileFile: profileFile === undefined ? undefined : (profileFile as string | null),
     preCommand: preCommand === undefined ? undefined : (preCommand as string | null),
+    forwardSsoState: forwardSsoState as boolean | undefined,
   };
 }
 
@@ -2803,6 +2837,12 @@ function parseHostPatch(body: Record<string, unknown>): SshHostPatch {
       throw new ControlServerError(400, '"preCommand" must be a string or null when provided');
     }
     patch.preCommand = body.preCommand as string | null;
+  }
+  if (body.forwardSsoState !== undefined) {
+    if (typeof body.forwardSsoState !== "boolean") {
+      throw new ControlServerError(400, '"forwardSsoState" must be a boolean when provided');
+    }
+    patch.forwardSsoState = body.forwardSsoState;
   }
   return patch;
 }

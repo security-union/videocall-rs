@@ -433,6 +433,19 @@ export interface SshHost {
    * See `e2e/bots-app/src/control/ssh-hosts.ts` for validation rules.
    */
   preCommand: string | null;
+  /**
+   * When `true` (default), the dashboard's locally-captured HCL SSO
+   * state is piped to the remote bot over SSH stdin and written to a
+   * mode-0600 temp file the bot consumes via `--sso-state-file "$T"`.
+   * The temp file is removed via `trap … EXIT` when the remote shell
+   * exits (clean, SIGTERM, SIGKILL). Flip OFF when the remote host
+   * already has its own SSO state captured or the meeting doesn't
+   * sit behind HCL SSO.
+   *
+   * Legacy host records persisted before this field existed load with
+   * `forwardSsoState: true` for forward-compat.
+   */
+  forwardSsoState: boolean;
   addedAt: number;
 }
 
@@ -450,6 +463,8 @@ export interface AddSshHostRequest {
   shell?: string | null;
   profileFile?: string | null;
   preCommand?: string | null;
+  /** Defaults to `true` server-side when omitted. */
+  forwardSsoState?: boolean;
 }
 
 export interface UpdateSshHostRequest {
@@ -461,6 +476,7 @@ export interface UpdateSshHostRequest {
   shell?: string | null;
   profileFile?: string | null;
   preCommand?: string | null;
+  forwardSsoState?: boolean;
 }
 
 export interface TestSshHostResponse {

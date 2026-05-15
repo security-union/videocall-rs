@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Dialog from "@radix-ui/react-dialog";
+import * as Switch from "@radix-ui/react-switch";
 import { Check, Copy, Pencil, PlugZap, Server, Terminal, Trash2, X } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
@@ -356,6 +357,7 @@ export function RemoteHostsPanel({ onToast }: RemoteHostsPanelProps) {
             shell: payload.shell ?? null,
             profileFile: payload.profileFile ?? null,
             preCommand: payload.preCommand ?? null,
+            forwardSsoState: payload.forwardSsoState ?? true,
           };
           updateMutation.mutate({ label: editHost.label, patch });
         }}
@@ -401,6 +403,12 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
   const [shellCustom, setShellCustom] = useState("");
   const [profileFile, setProfileFile] = useState("");
   const [preCommand, setPreCommand] = useState("");
+  // Default ON: most SSH bots launch against HCL-SSO-gated meetings,
+  // and silently skipping the forward when a captured state exists
+  // would just route the bot to the SSO portal at runtime. Operators
+  // who already capture state on the remote can flip this off
+  // explicitly.
+  const [forwardSsoState, setForwardSsoState] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
   // Re-seed inputs when the dialog opens or when the row changes. We
@@ -444,6 +452,11 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       setProfileFile(initial.profileFile ?? "");
     }
     setPreCommand(initial?.preCommand ?? "");
+    // Forward-compat default: when editing an old host record that
+    // pre-dates the field, treat the missing value as `true` (the
+    // server's load path agrees). Add mode (initial === null) also
+    // defaults to true.
+    setForwardSsoState(initial?.forwardSsoState ?? true);
     setError(null);
   }, [open, initial]);
 
@@ -540,6 +553,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       shell: resolvedShell,
       profileFile: trimmedProfileFile === "" ? null : trimmedProfileFile,
       preCommand: trimmedPreCommand === "" ? null : trimmedPreCommand,
+      forwardSsoState,
     });
   };
 
@@ -867,6 +881,43 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
+            <DialogField
+              label="Forward SSO state"
+              testIdSuffix="forwardSsoState"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Forward SSO state" testId="help-forwardSsoState">
+                  <p>
+                    When ON (default), the dashboard&apos;s locally-captured HCL SSO cookies are
+                    forwarded to the remote bot via SSH stdin and written to a temporary file
+                    (mode 0o600, auto-removed on bot exit). This lets the remote bot pass
+                    through the HCL SSO portal without manual setup.
+                  </p>
+                  <p className="mt-1">
+                    Turn OFF only when the remote host already has its own SSO state captured
+                    or the meeting doesn&apos;t sit behind HCL SSO.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <div className="flex items-center gap-3 py-1">
+                <Switch.Root
+                  checked={forwardSsoState}
+                  onCheckedChange={(v) => setForwardSsoState(v)}
+                  className="relative h-6 w-10 rounded-full bg-neutral-200 data-[state=checked]:bg-sky-500 dark:bg-slate-600 dark:data-[state=checked]:bg-sky-500"
+                  data-testid="remote-host-dialog-forwardSsoState"
+                  aria-label="Forward SSO state to remote bot via SSH stdin"
+                >
+                  <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-4" />
+                </Switch.Root>
+                <span className="text-sm text-neutral-600 dark:text-slate-300">
+                  {forwardSsoState
+                    ? "SSO state will be forwarded to the remote bot via SSH stdin"
+                    : "SSO forwarding disabled — bot must find its own SSO state on the remote host"}
+                </span>
+              </div>
+            </DialogField>
+
             <div className="md:col-span-2">
               <SampleCommandPreview
                 label={label.trim()}
@@ -877,6 +928,7 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
                 shell={currentShell}
                 profileFile={profileFile.trim()}
                 preCommand={preCommand.trim()}
+                forwardSsoState={forwardSsoState}
               />
             </div>
 
@@ -965,6 +1017,14 @@ interface SampleCommandPreviewProps {
   shell: string | null;
   profileFile: string;
   preCommand: string;
+  /**
+   * Mirrors the new `forwardSsoState` host field so the live preview
+   * shows the wrapped form (or the legacy un-wrapped form) the same
+   * way the launcher will run it. The server applies the actual wrap
+   * decision based on whether a local SSO state file exists; this
+   * field just controls the host-level opt-out.
+   */
+  forwardSsoState: boolean;
 }
 
 /**
@@ -988,6 +1048,7 @@ function SampleCommandPreview({
   shell,
   profileFile,
   preCommand,
+  forwardSsoState,
 }: SampleCommandPreviewProps) {
   // Build the request payload up-front so the dependency for the
   // debounce effect is a stable object reference.
@@ -1009,9 +1070,10 @@ function SampleCommandPreview({
         shell,
         profileFile: profileFile === "" ? null : profileFile,
         preCommand: preCommand === "" ? null : preCommand,
+        forwardSsoState,
       },
     };
-  }, [label, host, user, sshKey, reposPath, shell, profileFile, preCommand]);
+  }, [label, host, user, sshKey, reposPath, shell, profileFile, preCommand, forwardSsoState]);
 
   // Debounce the payload — bumped after the 200ms quiet window
   // expires. TanStack Query keys off the debounced value so a burst

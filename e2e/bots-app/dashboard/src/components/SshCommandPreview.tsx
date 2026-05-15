@@ -168,6 +168,16 @@ export function SshCommandPreview({
             <strong> Pre-command</strong> field (Tools → Remote Hosts → Edit).
           </p>
           <p className="mt-1">
+            When the host has <strong>Forward SSO state</strong> ON AND a local SSO state file
+            exists, the command is wrapped to pipe that state to a remote temp file (
+            <code className="font-mono text-[11px]">
+              T=$(mktemp); chmod 600 &quot;$T&quot;; cat &gt; &quot;$T&quot;; trap &quot;rm -f
+              \&quot;$T&quot;\&quot;&quot; EXIT
+            </code>
+            ) and the bot reads it via{" "}
+            <code className="font-mono text-[11px]">--sso-state-file &quot;$T&quot;</code>.
+          </p>
+          <p className="mt-1">
             Auto-prime runs locally only; SSH-hosted bots need assets pre-existing on the
             remote host (run{" "}
             <code className="font-mono text-[11px]">bots-app prep-assets</code> there

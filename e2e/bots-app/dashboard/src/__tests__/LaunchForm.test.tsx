@@ -306,6 +306,183 @@ describe("<LaunchForm />", () => {
     );
   });
 
+  it("retains all field values after a successful launch (no auto-reset)", async () => {
+    // v1.4.1: the operator almost always wants to launch another bot
+    // with the same/similar config (e.g. just change participant +
+    // click Launch again). Verify the inputs keep their values after
+    // a successful submit instead of being cleared back to the
+    // defaults.
+    const onLaunched = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={onLaunched} onError={vi.fn()} />);
+    const meetingUrl = "https://app.videocall.fnxlabs.com/meeting/TonyBots";
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: meetingUrl },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.change(screen.getByTestId("display-name"), { target: { value: "Alice" } });
+    fireEvent.change(screen.getByTestId("ttl"), { target: { value: "10m" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onLaunched).toHaveBeenCalled();
+    });
+    // All four user-typed fields must retain their submitted values.
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(meetingUrl);
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("alice");
+    expect((screen.getByTestId("display-name") as HTMLInputElement).value).toBe("Alice");
+    expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe("10m");
+  });
+
+  it("retains all field values after a failed launch", async () => {
+    // Failure path: same retention guarantee. The operator wants to
+    // fix the underlying issue and retry the same payload.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          return new Response(JSON.stringify({ error: "boom" }), {
+            status: 500,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const onError = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={onError} />);
+    const meetingUrl = "https://app.videocall.fnxlabs.com/meeting/TonyBots";
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: meetingUrl },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalled();
+    });
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(meetingUrl);
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("alice");
+  });
+
+  it("renders a Reset button that clears every field to the initial-render state", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    // Capture the initial defaults the user sees on first paint.
+    const initialMeetingUrl = (screen.getByTestId("meeting-url") as HTMLInputElement).value;
+    const initialParticipant = (screen.getByTestId("participant") as HTMLInputElement).value;
+    const initialDisplayName = (screen.getByTestId("display-name") as HTMLInputElement).value;
+    const initialTtl = (screen.getByTestId("ttl") as HTMLInputElement).value;
+    // Fill in some non-default values.
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.change(screen.getByTestId("display-name"), { target: { value: "Alice" } });
+    fireEvent.change(screen.getByTestId("ttl"), { target: { value: "30m" } });
+    // Click Reset.
+    const resetBtn = screen.getByTestId("reset-button");
+    expect(resetBtn).toBeInTheDocument();
+    fireEvent.click(resetBtn);
+    // Every field must be back to its initial-render value.
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(initialMeetingUrl);
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe(initialParticipant);
+    expect((screen.getByTestId("display-name") as HTMLInputElement).value).toBe(initialDisplayName);
+    expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe(initialTtl);
+  });
+
+  it("Reset clears validation errors", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    // Trigger validation errors by submitting empty.
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(screen.getByText(/Meeting URL must be/)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId("reset-button"));
+    expect(screen.queryByText(/Meeting URL must be/)).not.toBeInTheDocument();
+  });
+
+  it("Reset button is disabled while the launch mutation is in-flight", async () => {
+    // Stub /api/launch to hang so the mutation stays in `isPending`.
+    let resolveLaunch: ((value: Response) => void) | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          return new Promise<Response>((resolve) => {
+            resolveLaunch = resolve;
+          });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    // The button text flips to "Launching…" while pending; the Reset
+    // button must be disabled at that moment.
+    await waitFor(() => {
+      expect(screen.getByTestId("launch-button")).toHaveTextContent(/Launching/);
+    });
+    expect(screen.getByTestId("reset-button")).toBeDisabled();
+    // Tidy up the still-pending fetch so it doesn't outlive the test.
+    if (resolveLaunch) {
+      (resolveLaunch as (value: Response) => void)(
+        new Response(JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+  });
+
   it("omits ssoStateFile from the launch payload when auth is not JWT", async () => {
     let captured: Record<string, unknown> | null = null;
     vi.stubGlobal(

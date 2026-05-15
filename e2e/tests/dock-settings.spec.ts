@@ -176,6 +176,115 @@ test.describe("Dock settings", () => {
     });
   });
 
+  test("dock position persists via localStorage", async ({ page }) => {
+    await joinMeeting(page, "persist_position");
+
+    // Switch to Left
+    await openDockMenu(page);
+    await page.locator('.glass-select-option[role="option"]').filter({ hasText: "Left" }).click();
+    await expect(page.locator(".video-controls-container")).toHaveClass(/dock-left/, {
+      timeout: 5_000,
+    });
+
+    // Verify localStorage was set
+    const stored = await page.evaluate(() => localStorage.getItem("vc_dock_position"));
+    expect(stored).toBe("left");
+
+    // Reload and re-join
+    await page.reload();
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const grid = page.locator("#grid-container");
+    const which = await Promise.race([
+      joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+      grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+    ]);
+    if (which === "join") {
+      if ((await joinButton.count()) > 0 && (await joinButton.first().isVisible())) {
+        await joinButton.click().catch(() => {});
+      }
+    }
+    await expect(grid).toBeVisible({ timeout: 15_000 });
+
+    // Dock should still be on the left after reload
+    await expect(page.locator(".video-controls-container")).toHaveClass(/dock-left/, {
+      timeout: 5_000,
+    });
+  });
+
+  test("autohide persists via localStorage", async ({ page }) => {
+    await joinMeeting(page, "persist_autohide");
+
+    // Toggle autohide off
+    await openDockMenu(page);
+    await page
+      .locator('.glass-select-option[role="option"]')
+      .filter({ hasText: "Turn Hiding Off" })
+      .click();
+
+    // Verify localStorage
+    const stored = await page.evaluate(() => localStorage.getItem("vc_dock_autohide"));
+    expect(stored).toBe("false");
+
+    // Reload and re-join
+    await page.reload();
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const grid = page.locator("#grid-container");
+    const which = await Promise.race([
+      joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+      grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+    ]);
+    if (which === "join") {
+      if ((await joinButton.count()) > 0 && (await joinButton.first().isVisible())) {
+        await joinButton.click().catch(() => {});
+      }
+    }
+    await expect(grid).toBeVisible({ timeout: 15_000 });
+
+    // Wait without mouse movement — controls should stay visible (autohide off)
+    await page.waitForTimeout(5_000);
+    await expect(page.locator(".video-controls-container")).not.toHaveClass(/controls-hidden/);
+  });
+
+  test("Appearance panel dock position syncs with action bar", async ({ page }) => {
+    await joinMeeting(page, "appearance_dock_sync");
+
+    // Open Settings → Appearance
+    await openDockMenu(page);
+    await page
+      .locator('.glass-select-option[role="option"]')
+      .filter({ hasText: /Dock Settings/ })
+      .click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".settings-nav-button.active")).toContainText("Appearance");
+
+    // Click Right in the Position segmented control
+    const posGroup = page.locator(
+      '#settings-panel-appearance .transport-segmented[role="radiogroup"][aria-label="Action bar position"]',
+    );
+    await posGroup.locator('button[role="radio"]').filter({ hasText: "Right" }).click();
+
+    // Verify Right is selected
+    await expect(
+      posGroup.locator('button[role="radio"].selected').filter({ hasText: "Right" }),
+    ).toBeVisible({ timeout: 5_000 });
+
+    // Close the modal
+    const closeBtn = page.locator(
+      '.device-settings-modal button[aria-label="Close"], .device-settings-modal .close-button',
+    );
+    if ((await closeBtn.count()) > 0) {
+      await closeBtn.first().click();
+    } else {
+      await page.keyboard.press("Escape");
+    }
+    await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
+
+    // Action bar should now be dock-right
+    await expect(page.locator(".video-controls-container")).toHaveClass(/dock-right/, {
+      timeout: 5_000,
+    });
+  });
+
   test("Dock Settings opens Appearance tab in settings modal", async ({ page }) => {
     await joinMeeting(page, "dock-settings-modal");
 

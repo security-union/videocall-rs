@@ -136,17 +136,27 @@ Launch form can target. Each row is persisted to `<runDir>/hosts.json` (mode
 `0o600`); credentials are sourced from your local `ssh-agent` and
 `~/.ssh/config` — the dashboard does not store private-key material.
 
-The remote command is wrapped in `bash -lc` AND the inner command is prefixed
-with `[ -f ~/.bash_profile ] && . ~/.bash_profile;` so the operator's PATH
-(typically set by nvm / homebrew / asdf) loads on the remote. We hard-code
-`bash` (not `$SHELL`) so the login-shell init chain reliably sources
-`~/.bash_profile` — the previous `$SHELL` form expanded to `/bin/zsh` on
-zsh-default macOS hosts, where `zsh -lc` skips `~/.bash_profile`.
+The remote command is wrapped in `<shell> -lc` so it runs as a login shell on
+the remote. `<shell>` is chosen per-host via the **Shell** radio in the Add /
+Edit Host dialog (`bash` / `zsh` / `sh` / a custom absolute path); it defaults
+to `bash` because `bash -l` has a POSIX-defined login-shell init chain that
+reliably sources `~/.bash_profile`. Each host also carries two complementary
+fields that further shape the wrapper payload:
 
-If your `npm` lives in a different shell init file (e.g. nvm-only-in-zshrc),
-set the host's **Shell init** field (Tools → Remote Hosts → Add / Edit) to a
-snippet like `. ~/.zshrc` or `. ~/.nvm/nvm.sh && nvm use 22`. That snippet
-REPLACES the default `. ~/.bash_profile` prefix.
+- **Profile file** — the path sourced via `[ -f <path> ] && . <path>;` before
+  the bot command runs. Defaults are inferred from the chosen shell:
+  `bash` → `~/.bash_profile`, `zsh` → `~/.zshrc`. The `[ -f … ] &&` guard
+  makes the prefix safe on hosts that lack the file; the trailing `;` (not
+  `&&`) keeps the chain running even if the source returns non-zero.
+- **Pre-command** — free-form bash run AFTER sourcing the profile but BEFORE
+  the `cd && npm run …` chain. Use this for `nvm` version pinning
+  (`. ~/.nvm/nvm.sh && nvm use 22`), `PATH` exports, etc. Max 512 chars, no
+  embedded newlines.
+
+The Add / Edit Host dialog includes a **Sample command** preview that posts
+the unsaved host config to `POST /api/hosts/preview` (200ms debounce) and
+renders the resulting `ssh …` invocation so you can see exactly what will run
+before saving.
 
 v1 limitations:
 

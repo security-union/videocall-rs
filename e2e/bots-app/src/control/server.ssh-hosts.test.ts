@@ -188,7 +188,7 @@ describe("control server: SSH host registry endpoints", () => {
     expect(body.host.host).toBe("new");
   });
 
-  it("POST /hosts persists the shellInit field and surfaces it on GET", async () => {
+  it("POST /hosts persists the structured shell/profileFile/preCommand fields and surfaces them on GET", async () => {
     const post = await fetchJson(handle.port, "/hosts", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -197,23 +197,40 @@ describe("control server: SSH host registry endpoints", () => {
         host: "h",
         user: "alice",
         reposPath: "/home/alice/videocall",
-        shellInit: ". ~/.zshrc",
+        shell: "zsh",
+        profileFile: "~/.zshrc",
+        preCommand: ". ~/.nvm/nvm.sh && nvm use 22",
       },
     });
     expect(post.status).toBe(201);
-    const created = (post.body as { host: { shellInit: string | null } }).host;
-    expect(created.shellInit).toBe(". ~/.zshrc");
+    const created = (
+      post.body as {
+        host: { shell: string | null; profileFile: string | null; preCommand: string | null };
+      }
+    ).host;
+    expect(created.shell).toBe("zsh");
+    expect(created.profileFile).toBe("~/.zshrc");
+    expect(created.preCommand).toBe(". ~/.nvm/nvm.sh && nvm use 22");
     // Round-trip via GET to confirm persistence.
     const list = await fetchJson(handle.port, "/hosts", {
       headers: { authorization: `Bearer ${token}` },
     });
     const found = (
-      list.body as { hosts: Array<{ label: string; shellInit: string | null }> }
+      list.body as {
+        hosts: Array<{
+          label: string;
+          shell: string | null;
+          profileFile: string | null;
+          preCommand: string | null;
+        }>;
+      }
     ).hosts.find((h) => h.label === "zsh-mac");
-    expect(found?.shellInit).toBe(". ~/.zshrc");
+    expect(found?.shell).toBe("zsh");
+    expect(found?.profileFile).toBe("~/.zshrc");
+    expect(found?.preCommand).toBe(". ~/.nvm/nvm.sh && nvm use 22");
   });
 
-  it("POST /hosts defaults shellInit to null when omitted", async () => {
+  it("POST /hosts defaults shell/profileFile/preCommand to null when omitted", async () => {
     const post = await fetchJson(handle.port, "/hosts", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -225,11 +242,17 @@ describe("control server: SSH host registry endpoints", () => {
       },
     });
     expect(post.status).toBe(201);
-    const created = (post.body as { host: { shellInit: string | null } }).host;
-    expect(created.shellInit).toBeNull();
+    const created = (
+      post.body as {
+        host: { shell: string | null; profileFile: string | null; preCommand: string | null };
+      }
+    ).host;
+    expect(created.shell).toBeNull();
+    expect(created.profileFile).toBeNull();
+    expect(created.preCommand).toBeNull();
   });
 
-  it("PUT /hosts/:label updates the shellInit field", async () => {
+  it("PUT /hosts/:label updates the structured fields", async () => {
     await fetchJson(handle.port, "/hosts", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -243,23 +266,35 @@ describe("control server: SSH host registry endpoints", () => {
     const put = await fetchJson(handle.port, "/hosts/patch-init", {
       method: "PUT",
       headers: { authorization: `Bearer ${token}` },
-      body: { shellInit: ". ~/.zshrc" },
+      body: { shell: "zsh", profileFile: "~/.zshrc", preCommand: ". ~/.nvm/nvm.sh" },
     });
     expect(put.status).toBe(200);
-    const patched = (put.body as { host: { shellInit: string | null } }).host;
-    expect(patched.shellInit).toBe(". ~/.zshrc");
-    // Clearing it (`null`) round-trips.
+    const patched = (
+      put.body as {
+        host: { shell: string | null; profileFile: string | null; preCommand: string | null };
+      }
+    ).host;
+    expect(patched.shell).toBe("zsh");
+    expect(patched.profileFile).toBe("~/.zshrc");
+    expect(patched.preCommand).toBe(". ~/.nvm/nvm.sh");
+    // Clearing (`null`) round-trips.
     const cleared = await fetchJson(handle.port, "/hosts/patch-init", {
       method: "PUT",
       headers: { authorization: `Bearer ${token}` },
-      body: { shellInit: null },
+      body: { shell: null, profileFile: null, preCommand: null },
     });
     expect(cleared.status).toBe(200);
-    const clearedHost = (cleared.body as { host: { shellInit: string | null } }).host;
-    expect(clearedHost.shellInit).toBeNull();
+    const clearedHost = (
+      cleared.body as {
+        host: { shell: string | null; profileFile: string | null; preCommand: string | null };
+      }
+    ).host;
+    expect(clearedHost.shell).toBeNull();
+    expect(clearedHost.profileFile).toBeNull();
+    expect(clearedHost.preCommand).toBeNull();
   });
 
-  it("POST /hosts rejects shellInit longer than 512 chars with 400", async () => {
+  it("POST /hosts rejects preCommand longer than 512 chars with 400", async () => {
     const res = await fetchJson(handle.port, "/hosts", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -268,13 +303,13 @@ describe("control server: SSH host registry endpoints", () => {
         host: "h",
         user: "alice",
         reposPath: "/home/alice/videocall",
-        shellInit: "a".repeat(513),
+        preCommand: "a".repeat(513),
       },
     });
     expect(res.status).toBe(400);
   });
 
-  it("POST /hosts rejects shellInit with embedded newlines as 400", async () => {
+  it("POST /hosts rejects preCommand with embedded newlines as 400", async () => {
     const res = await fetchJson(handle.port, "/hosts", {
       method: "POST",
       headers: { authorization: `Bearer ${token}` },
@@ -283,7 +318,22 @@ describe("control server: SSH host registry endpoints", () => {
         host: "h",
         user: "alice",
         reposPath: "/home/alice/videocall",
-        shellInit: ". ~/.zshrc\nrm -rf /",
+        preCommand: ". ~/.zshrc\nrm -rf /",
+      },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /hosts rejects a shell value containing shell metacharacters with 400", async () => {
+    const res = await fetchJson(handle.port, "/hosts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        label: "shell-bad",
+        host: "h",
+        user: "alice",
+        reposPath: "/home/alice/videocall",
+        shell: "bash;rm -rf /",
       },
     });
     expect(res.status).toBe(400);
@@ -418,6 +468,139 @@ describe("control server: SSH host registry endpoints", () => {
         method: "POST",
       });
       expect(res.status).toBe(401);
+    });
+  });
+
+  describe("POST /hosts/preview (unsaved host)", () => {
+    it("returns argv + display + remoteCommand for a valid unsaved host", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          host: {
+            label: "ephemeral",
+            host: "lab.intra",
+            user: "alice",
+            reposPath: "/home/alice/videocall",
+            shell: "bash",
+            profileFile: "~/.bash_profile",
+            preCommand: ". ~/.nvm/nvm.sh && nvm use 22",
+          },
+        },
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { argv: string[]; display: string; remoteCommand: string };
+      expect(Array.isArray(body.argv)).toBe(true);
+      expect(body.argv[0]).toBe("ssh");
+      expect(body.argv).toContain("alice@lab.intra");
+      expect(body.display).toMatch(/^ssh /);
+      // Default placeholder tokens are visible (no real participant /
+      // meeting URL supplied).
+      expect(body.remoteCommand).toContain("--participant '<participant>'");
+      expect(body.remoteCommand).toContain("--meeting-url '<meeting-url>'");
+      // The structured prefix shows up in the wrapper payload (last argv slot).
+      const tail = body.argv[body.argv.length - 1];
+      expect(tail).toContain("[ -f ~/.bash_profile ] && . ~/.bash_profile;");
+      expect(tail).toContain(". ~/.nvm/nvm.sh && nvm use 22;");
+    });
+
+    it("uses the host.shell value as the wrapper shell (zsh)", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          host: {
+            label: "zsh-host",
+            host: "lab.intra",
+            user: "alice",
+            reposPath: "/home/alice/videocall",
+            shell: "zsh",
+            profileFile: "~/.zshrc",
+          },
+        },
+      });
+      expect(res.status).toBe(200);
+      const body = res.body as { argv: string[]; display: string };
+      const tail = body.argv[body.argv.length - 1];
+      expect(tail.startsWith("zsh -lc ")).toBe(true);
+      expect(tail).toContain("[ -f ~/.zshrc ] && . ~/.zshrc;");
+    });
+
+    it("returns 400 when the inner host is missing required fields", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          host: {
+            // Missing `reposPath`.
+            label: "broken",
+            host: "h",
+            user: "alice",
+          },
+        },
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 when the host body is not an object", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: { host: "not-an-object" },
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 when the shell value contains metacharacters", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          host: {
+            label: "evil",
+            host: "h",
+            user: "alice",
+            reposPath: "/home/alice/videocall",
+            shell: "bash;rm -rf /",
+          },
+        },
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects unauthenticated /hosts/preview requests with 401", async () => {
+      const res = await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        body: {
+          host: {
+            label: "anon",
+            host: "h",
+            user: "alice",
+            reposPath: "/home/alice/videocall",
+          },
+        },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it("does NOT persist the previewed host (preview is read-only)", async () => {
+      await fetchJson(handle.port, "/hosts/preview", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: {
+          host: {
+            label: "ghost",
+            host: "h",
+            user: "alice",
+            reposPath: "/home/alice/videocall",
+          },
+        },
+      });
+      // The registry must still be empty after the preview call.
+      const list = await fetchJson(handle.port, "/hosts", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect((list.body as { hosts: unknown[] }).hosts).toEqual([]);
     });
   });
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { MultiLaunchForm } from "../components/MultiLaunchForm";
@@ -198,6 +199,88 @@ describe("MultiLaunchForm", () => {
     });
     fireEvent.click(screen.getByTestId("multi-reset-button"));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("renders the Load previous button next to Reset/Launch (v1.5.0)", () => {
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    expect(screen.getByTestId("multi-load-previous-button")).toBeInTheDocument();
+  });
+
+  it("persists a launched-bot history entry on successful multi-submit (v1.5.0)", async () => {
+    window.localStorage.clear();
+    const onLaunched = vi.fn();
+    renderWithClient(<MultiLaunchForm onLaunched={onLaunched} onError={() => {}} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://example.com/meeting/MultiSave" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "4" } });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+    const raw = window.localStorage.getItem("bots-app-dashboard:launched-bot-history");
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!) as Array<{ participant: string; meetingURL: string }>;
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].meetingURL).toBe("https://example.com/meeting/MultiSave");
+    // The synthetic participant label encodes the batch shape.
+    expect(parsed[0].participant).toMatch(/^multi:first-n-4$/);
+    window.localStorage.clear();
+  });
+
+  it("loads only common fields when a previous launch is picked (v1.5.0)", async () => {
+    // Seed localStorage with a single-bot entry; loading it from
+    // multi-launch must apply meetingURL/ttl/network/headless/etc.
+    // but leave count, mode, seed, displayNameTemplate alone.
+    window.localStorage.clear();
+    const entry = {
+      spec: {
+        meetingURL: "https://example.com/meeting/Past",
+        participant: "carol",
+        displayName: "Carol",
+        ttl: "30m",
+        network: "none",
+        headless: true,
+        authBackend: "jwt",
+        storageStateFile: "",
+        runLocation: "local",
+        sshHostLabel: "",
+        costume: "default",
+        audio: "default",
+      },
+      launchedAt: 1730000000000,
+      meetingURL: "https://example.com/meeting/Past",
+      participant: "carol",
+      runLocationLabel: "local",
+    };
+    window.localStorage.setItem(
+      "bots-app-dashboard:launched-bot-history",
+      JSON.stringify([entry]),
+    );
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // Capture the multi-specific defaults BEFORE the click so we can
+    // assert they didn't change.
+    const initialCount = (screen.getByTestId("multi-count") as HTMLInputElement).value;
+    // Radix DropdownMenu listens to pointerDown (button 0) — clicks
+    // alone don't open it under jsdom. Use the keyboard path instead:
+    // focus the trigger and press Enter, which fires the menu's
+    // onKeyDown handler. (Mirrors the openDropdown helper in
+    // LaunchForm.test.tsx.)
+    const trigger = screen.getByTestId("multi-load-previous-button");
+    trigger.focus();
+    await userEvent.keyboard("{Enter}");
+    const row = await screen.findByTestId(
+      `multi-load-previous-button-entry-${entry.launchedAt}`,
+    );
+    fireEvent.click(row);
+    // Common fields applied.
+    expect((screen.getByTestId("multi-meeting-url") as HTMLInputElement).value).toBe(
+      "https://example.com/meeting/Past",
+    );
+    expect((screen.getByTestId("multi-ttl") as HTMLInputElement).value).toBe("30m");
+    // Headless got mirrored ON from the snapshot.
+    expect(screen.getByTestId("multi-headless")).toHaveAttribute("data-state", "checked");
+    // Multi-specific knob untouched: count stays at its initial value.
+    expect((screen.getByTestId("multi-count") as HTMLInputElement).value).toBe(initialCount);
+    window.localStorage.clear();
   });
 
   it("Reset button is disabled while the launch mutation is in-flight", async () => {

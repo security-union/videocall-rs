@@ -8,6 +8,11 @@ import { Dices, RotateCcw, Users } from "lucide-react";
 import { api, DashboardApiError } from "../api/client";
 import type { MultiLaunchRequest, MultiLaunchResponse } from "../api/types";
 import {
+  recordLaunchedBot,
+  runLocationLabelFor,
+  type LaunchedBotHistoryEntry,
+} from "../lib/botHistory";
+import {
   AUTH_BACKENDS,
   NETSIM_PRESETS,
   RUN_LOCATIONS,
@@ -18,6 +23,7 @@ import {
 import { isValidMeetingUrl } from "../lib/validation";
 import { isValidTtl } from "../lib/ttl";
 import { HelpPopover } from "./ui/HelpPopover";
+import { LoadPreviousButton } from "./LoadPreviousButton";
 import { Select } from "./ui/Select";
 import { SshCommandPreview } from "./SshCommandPreview";
 
@@ -125,6 +131,36 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
   const mutation = useMutation({
     mutationFn: (req: MultiLaunchRequest) => api.launchMulti(req),
     onSuccess: (data) => {
+      // Capture a *common-fields* spec into the shared launched-bot
+      // history. Multi-launch has no single participant, so we
+      // synthesize a `multi:<mode>-<count>` label and leave the
+      // single-bot-only fields (participant, displayName, costume,
+      // audio) at their defaults. When the operator later picks this
+      // entry from the Load-previous dropdown in single-launch, the
+      // common fields pre-fill and they fill in participant by hand;
+      // when picked in multi-launch, only the common subset applies.
+      const syntheticLabel = `multi:${values.mode}-${values.count}`;
+      const spec = {
+        meetingURL: values.meetingURL,
+        participant: "",
+        displayName: "",
+        ttl: values.ttl,
+        network: values.network,
+        headless: values.headless,
+        authBackend: values.authBackend,
+        storageStateFile: values.storageStateFile,
+        runLocation: values.runLocation,
+        sshHostLabel: values.sshHostLabel,
+        costume: "default",
+        audio: "default",
+      };
+      recordLaunchedBot({
+        spec,
+        launchedAt: Date.now(),
+        meetingURL: values.meetingURL,
+        participant: syntheticLabel,
+        runLocationLabel: runLocationLabelFor(spec),
+      });
       // Keep all field values intact so the operator can immediately
       // launch another batch with the same shared config (e.g.
       // "launched 3, want to launch 2 more"). Re-arm by clearing
@@ -149,6 +185,29 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
    */
   const handleReset = () => {
     setValues(DEFAULTS);
+    setErrors({});
+    setSubmitted(false);
+  };
+
+  /**
+   * Pull the *common-fields* subset from a previously-launched bot
+   * (single OR multi) back into the form. The multi-specific knobs
+   * (count, seed, mode, includeObservers, displayNameTemplate) stay
+   * at their current values so the operator's batch shape isn't
+   * disturbed by a load that came from a single-bot snapshot.
+   */
+  const handleLoadPrevious = (entry: LaunchedBotHistoryEntry) => {
+    setValues((prev) => ({
+      ...prev,
+      meetingURL: entry.spec.meetingURL,
+      ttl: entry.spec.ttl,
+      network: entry.spec.network,
+      headless: entry.spec.headless,
+      authBackend: entry.spec.authBackend,
+      storageStateFile: entry.spec.storageStateFile,
+      runLocation: entry.spec.runLocation,
+      sshHostLabel: entry.spec.sshHostLabel,
+    }));
     setErrors({});
     setSubmitted(false);
   };
@@ -692,6 +751,11 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               </Tooltip.Content>
             </Tooltip.Portal>
           </Tooltip.Root>
+          <LoadPreviousButton
+            onSelect={handleLoadPrevious}
+            disabled={mutation.isPending}
+            testId="multi-load-previous-button"
+          />
           <button
             type="submit"
             disabled={mutation.isPending}

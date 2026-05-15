@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { LaunchForm } from "../components/LaunchForm";
@@ -332,6 +333,50 @@ describe("<LaunchForm />", () => {
     expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe("10m");
   });
 
+  it("retains EVERY field (selects + toggles + radios) after a successful launch — v1.5.0 audit", async () => {
+    // v1.5.0 regression: PR #838 + #839 audited the form for any
+    // unintended `setValues(DEFAULT_VALUES)` paths in onSuccess /
+    // onError. This test is the cheap belt-and-suspenders proof that
+    // none crept back in. We exercise more than the four text inputs
+    // covered above: the network Select, the Headless switch, the
+    // Auth-backend radio, and the TTL/displayName/storage-state set
+    // all need to survive a round-trip through the mutation.
+    const onLaunched = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={onLaunched} onError={vi.fn()} />);
+    const meetingUrl = "https://app.videocall.fnxlabs.com/meeting/Vortex";
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: meetingUrl },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "vortex-1" } });
+    fireEvent.change(screen.getByTestId("display-name"), { target: { value: "Vortex" } });
+    fireEvent.change(screen.getByTestId("ttl"), { target: { value: "1h" } });
+    // Flip the Headless toggle ON so we can verify it stays ON after
+    // submit (the default is OFF).
+    fireEvent.click(screen.getByTestId("headless"));
+    // Switch the auth backend to storage-state and fill the path.
+    const storageRadio = document.getElementById("auth-storage-state") as HTMLElement;
+    fireEvent.click(storageRadio);
+    fireEvent.change(screen.getByTestId("storage-state-file"), {
+      target: { value: "run/auth/vortex.json" },
+    });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onLaunched).toHaveBeenCalled();
+    });
+    // Text inputs.
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(meetingUrl);
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("vortex-1");
+    expect((screen.getByTestId("display-name") as HTMLInputElement).value).toBe("Vortex");
+    expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe("1h");
+    expect((screen.getByTestId("storage-state-file") as HTMLInputElement).value).toBe(
+      "run/auth/vortex.json",
+    );
+    // Headless toggle: Radix Switch reflects state via `data-state`.
+    expect(screen.getByTestId("headless")).toHaveAttribute("data-state", "checked");
+    // Storage-state auth radio is still selected.
+    expect(storageRadio).toHaveAttribute("data-state", "checked");
+  });
+
   it("retains all field values after a failed launch", async () => {
     // Failure path: same retention guarantee. The operator wants to
     // fix the underlying issue and retry the same payload.
@@ -384,6 +429,68 @@ describe("<LaunchForm />", () => {
     });
     expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(meetingUrl);
     expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("alice");
+  });
+
+  it("retains EVERY field (selects + toggles + radios) after a failed launch — v1.5.0 audit", async () => {
+    // Same coverage as the success-path v1.5.0 audit test, but with
+    // the launch endpoint stubbed to 500. The mutation's onError path
+    // must not zero any field either.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          return new Response(JSON.stringify({ error: "boom" }), {
+            status: 500,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const onError = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={onError} />);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/Vortex" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "vortex-1" } });
+    fireEvent.change(screen.getByTestId("display-name"), { target: { value: "Vortex" } });
+    fireEvent.change(screen.getByTestId("ttl"), { target: { value: "1h" } });
+    fireEvent.click(screen.getByTestId("headless"));
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalled();
+    });
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(
+      "https://app.videocall.fnxlabs.com/meeting/Vortex",
+    );
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("vortex-1");
+    expect((screen.getByTestId("display-name") as HTMLInputElement).value).toBe("Vortex");
+    expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe("1h");
+    expect(screen.getByTestId("headless")).toHaveAttribute("data-state", "checked");
   });
 
   it("renders a Reset button that clears every field to the initial-render state", async () => {
@@ -795,5 +902,171 @@ describe("<LaunchForm /> manifest auto-match", () => {
       () => expect(screen.getByTestId("costume-auto-matched")).toBeInTheDocument(),
       { timeout: 1500 },
     );
+  });
+});
+
+/**
+ * Radix DropdownMenu wires open/close on `onPointerDown` (button 0)
+ * rather than the synthetic `click`. `fireEvent.click` alone doesn't
+ * toggle the menu under jsdom. The simplest portable trick is the
+ * keyboard path: focusing the trigger then pressing Enter both fires
+ * the DropdownMenu's `onKeyDown` handler AND avoids the pointer-event
+ * dance that jsdom isn't fully spec-compliant about. This mirrors how
+ * an accessibility-tree test would drive the same trigger.
+ */
+async function openDropdown(trigger: HTMLElement) {
+  trigger.focus();
+  await userEvent.keyboard("{Enter}");
+}
+
+describe("<LaunchForm /> load-previous (v1.5.0)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+  });
+
+  it("renders the Load previous button next to Reset/Launch", () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    expect(screen.getByTestId("load-previous-button")).toBeInTheDocument();
+  });
+
+  it("shows the empty-state hint when no launches have been recorded yet", async () => {
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    await openDropdown(screen.getByTestId("load-previous-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("load-previous-button-empty")).toBeInTheDocument();
+    });
+    expect(screen.getByText(/No previous launches yet/i)).toBeInTheDocument();
+  });
+
+  it("persists a launched-bot history entry on successful submit", async () => {
+    const onLaunched = vi.fn();
+    renderWithClient(<LaunchForm onLaunched={onLaunched} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://example.com/meeting/Saved" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+    // The post-submit DOM should now reveal the entry on the dropdown
+    // and the localStorage key should hold it.
+    const raw = window.localStorage.getItem("bots-app-dashboard:launched-bot-history");
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!) as Array<{ participant: string; meetingURL: string }>;
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].participant).toBe("alice");
+    expect(parsed[0].meetingURL).toBe("https://example.com/meeting/Saved");
+  });
+
+  it("loads a previously-launched bot's spec back into the form when its row is clicked", async () => {
+    // Seed localStorage with an entry up front so the dropdown is
+    // pre-populated on first render — that avoids the round-trip
+    // through onSuccess + waiting for state.
+    const entry = {
+      spec: {
+        meetingURL: "https://example.com/meeting/Past",
+        participant: "carol",
+        displayName: "Carol",
+        ttl: "30m",
+        network: "none",
+        headless: false,
+        authBackend: "jwt",
+        storageStateFile: "",
+        runLocation: "local",
+        sshHostLabel: "",
+        costume: "default",
+        audio: "default",
+      },
+      launchedAt: 1730000000000,
+      meetingURL: "https://example.com/meeting/Past",
+      participant: "carol",
+      runLocationLabel: "local",
+    };
+    window.localStorage.setItem(
+      "bots-app-dashboard:launched-bot-history",
+      JSON.stringify([entry]),
+    );
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    await openDropdown(screen.getByTestId("load-previous-button"));
+    // Click the row.
+    const rowId = `load-previous-button-entry-${entry.launchedAt}`;
+    const row = await screen.findByTestId(rowId);
+    fireEvent.click(row);
+    expect((screen.getByTestId("meeting-url") as HTMLInputElement).value).toBe(
+      "https://example.com/meeting/Past",
+    );
+    expect((screen.getByTestId("participant") as HTMLInputElement).value).toBe("carol");
+    expect((screen.getByTestId("display-name") as HTMLInputElement).value).toBe("Carol");
+    expect((screen.getByTestId("ttl") as HTMLInputElement).value).toBe("30m");
+  });
+
+  it("removes a single entry from history when the per-row × is clicked", async () => {
+    const entry = {
+      spec: {
+        meetingURL: "https://example.com/meeting/Past",
+        participant: "carol",
+        displayName: "",
+        ttl: "30m",
+        network: "none",
+        headless: false,
+        authBackend: "jwt",
+        storageStateFile: "",
+        runLocation: "local",
+        sshHostLabel: "",
+        costume: "default",
+        audio: "default",
+      },
+      launchedAt: 1730000000000,
+      meetingURL: "https://example.com/meeting/Past",
+      participant: "carol",
+      runLocationLabel: "local",
+    };
+    window.localStorage.setItem(
+      "bots-app-dashboard:launched-bot-history",
+      JSON.stringify([entry]),
+    );
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    await openDropdown(screen.getByTestId("load-previous-button"));
+    const removeBtn = await screen.findByTestId(
+      `load-previous-button-remove-${entry.launchedAt}`,
+    );
+    fireEvent.click(removeBtn);
+    // After the remove, the empty-state appears.
+    await waitFor(() => {
+      expect(screen.getByTestId("load-previous-button-empty")).toBeInTheDocument();
+    });
+    expect(JSON.parse(window.localStorage.getItem("bots-app-dashboard:launched-bot-history")!)).toEqual([]);
   });
 });

@@ -859,6 +859,13 @@ async function launchProfileRoute(opts: ControlServerOptions, name: string): Pro
       network: bot.network,
       authBackend: bot.authBackend,
       storageStateFile: bot.storageStateFile,
+      // Profiles persisted before the runLocation extension are
+      // re-dispatched locally — that matches the pre-extension
+      // behavior (the orchestrator's launchOne defaults to
+      // `{ kind: "local" }` on a missing field). Profiles captured
+      // after the extension carry the original host verbatim so an
+      // SSH-hosted bot resumes on the same registered host.
+      runLocation: bot.runLocation ?? { kind: "local" },
     };
     const id = await opts.surface.launchOne(spec);
     botIds.push(id);
@@ -886,6 +893,11 @@ function snapshotCurrentBotsForProfile(surface: OrchestratorControlSurface): Pro
       network: t.network ?? "none",
       authBackend: t.authBackend,
       storageStateFile: t.storageStateFile ?? undefined,
+      // Capture where this bot is currently running so the profile
+      // replays each bot on the same host on the next launch. Bots
+      // running locally serialize as `{ kind: "local" }`; SSH bots
+      // serialize with the registered `hostLabel`.
+      runLocation: entry.host,
     });
   }
   return out;
@@ -934,6 +946,11 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
         : (() => {
             throw new ControlServerError(400, `${where}.storageStateFile must be a string`);
           })();
+  // Optional structured run-location. Validate strictly when present
+  // (`{ kind: "local" }` or `{ kind: "ssh", hostLabel: <non-empty> }`)
+  // and pass `undefined` through silently when the caller's bot spec
+  // predates the field — the launch route fills in a local default.
+  const runLocation = parseRunLocationFromSaveBody(o.runLocation, `${where}.runLocation`);
   return {
     meetingURL: o.meetingURL,
     participant: o.participant,
@@ -943,7 +960,29 @@ function validateBotSpecForSave(entry: unknown, where: string): ProfileBotSpec {
     network: o.network,
     authBackend: auth,
     storageStateFile,
+    runLocation,
   };
+}
+
+function parseRunLocationFromSaveBody(raw: unknown, where: string): ProfileBotSpec["runLocation"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ControlServerError(400, `${where} must be an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  if (o.kind === "local") {
+    return { kind: "local" };
+  }
+  if (o.kind === "ssh") {
+    if (typeof o.hostLabel !== "string" || o.hostLabel.trim() === "") {
+      throw new ControlServerError(
+        400,
+        `${where}.hostLabel must be a non-empty string when kind="ssh"`,
+      );
+    }
+    return { kind: "ssh", hostLabel: o.hostLabel };
+  }
+  throw new ControlServerError(400, `${where}.kind must be "local" or "ssh"`);
 }
 
 function listBots(surface: OrchestratorControlSurface): RouteResult {

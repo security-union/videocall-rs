@@ -132,6 +132,103 @@ describe("saveProfile / readProfile / listProfiles / deleteProfile", () => {
     const p = await readProfile(dir, "guest");
     expect(p.bots[0].authBackend).toBe("none");
   });
+
+  it("round-trips runLocation: ssh in saved bots", async () => {
+    // Saving a profile that includes a structured runLocation for a
+    // bot must preserve the kind + hostLabel on read — this is what
+    // lets the launch route fan out each bot back to the same host
+    // it originally ran on.
+    await saveProfile(dir, "ssh-shape", [
+      { ...sampleBot("alice"), runLocation: { kind: "ssh", hostLabel: "lab-mac-1" } },
+    ]);
+    const p = await readProfile(dir, "ssh-shape");
+    expect(p.bots[0].runLocation).toEqual({ kind: "ssh", hostLabel: "lab-mac-1" });
+  });
+
+  it("round-trips runLocation: local in saved bots", async () => {
+    await saveProfile(dir, "local-shape", [
+      { ...sampleBot("bob"), runLocation: { kind: "local" } },
+    ]);
+    const p = await readProfile(dir, "local-shape");
+    expect(p.bots[0].runLocation).toEqual({ kind: "local" });
+  });
+
+  it("decodes legacy profiles without runLocation and leaves the field undefined", async () => {
+    // Forward-compat path: a profile saved before the runLocation
+    // field existed must load successfully. We hand-write the JSON
+    // here so the test exercises the on-disk layout exactly.
+    mkdirSync(join(dir, "profiles"), { recursive: true });
+    const path = profilePath(dir, "legacy");
+    writeFileSync(
+      path,
+      JSON.stringify(
+        {
+          name: "legacy",
+          savedAt: new Date().toISOString(),
+          version: 1,
+          bots: [
+            {
+              meetingURL: "https://example.com/meeting/X",
+              participant: "alice",
+              displayName: "alice",
+              ttl: "5m",
+              headless: false,
+              network: "none",
+              authBackend: "jwt",
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const p = await readProfile(dir, "legacy");
+    expect(p.bots[0].runLocation).toBeUndefined();
+    expect(p.bots[0].participant).toBe("alice");
+  });
+
+  it("rejects a profile whose runLocation has a malformed kind", async () => {
+    mkdirSync(join(dir, "profiles"), { recursive: true });
+    const path = profilePath(dir, "bad-runloc");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: "bad-runloc",
+        savedAt: new Date().toISOString(),
+        version: 1,
+        bots: [
+          {
+            ...sampleBot(),
+            runLocation: { kind: "future-vm" },
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await expect(readProfile(dir, "bad-runloc")).rejects.toThrow(ProfileValidationError);
+  });
+
+  it("rejects a profile whose runLocation: ssh is missing hostLabel", async () => {
+    mkdirSync(join(dir, "profiles"), { recursive: true });
+    const path = profilePath(dir, "bad-ssh");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: "bad-ssh",
+        savedAt: new Date().toISOString(),
+        version: 1,
+        bots: [
+          {
+            ...sampleBot(),
+            runLocation: { kind: "ssh", hostLabel: "" },
+          },
+        ],
+      }),
+      "utf8",
+    );
+    await expect(readProfile(dir, "bad-ssh")).rejects.toThrow(ProfileValidationError);
+  });
 });
 
 describe("renameProfile", () => {

@@ -666,6 +666,7 @@ function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
         <thead>
           <tr className="bg-neutral-50 text-left text-[11px] uppercase tracking-wider text-neutral-500 dark:bg-slate-900/40 dark:text-slate-400">
             <Th>Participant</Th>
+            <Th>Host</Th>
             <Th>Meeting URL</Th>
             <Th>TTL</Th>
             <Th>Network</Th>
@@ -691,6 +692,9 @@ function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
                 className="text-neutral-800 dark:text-slate-200"
               >
                 <Td>{bot.participant}</Td>
+                <Td>
+                  <HostChip runLocation={bot.runLocation} />
+                </Td>
                 <Td>
                   <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
                     {bot.meetingURL}
@@ -721,6 +725,40 @@ function Th({ children }: { children: React.ReactNode }) {
 
 function Td({ children }: { children: React.ReactNode }) {
   return <td className="whitespace-nowrap px-3 py-2 align-top">{children}</td>;
+}
+
+/**
+ * Render the saved bot's `runLocation` as a chip mirroring the
+ * Running Bots table's Host column styling. Profiles persisted before
+ * the `runLocation` extension carry `undefined` here; we render those
+ * as the local chip (the silent forward-compat fallback the launch
+ * route applies in lock-step).
+ */
+function HostChip({
+  runLocation,
+}: {
+  runLocation: ProfileBotSpec["runLocation"];
+}) {
+  if (runLocation?.kind === "ssh") {
+    return (
+      <span
+        className="inline-flex whitespace-nowrap rounded-full border border-violet-200 bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-800 dark:border-violet-800 dark:bg-violet-900/30 dark:text-violet-200"
+        title={`ssh host "${runLocation.hostLabel}"`}
+        data-testid="profile-details-host-chip-ssh"
+      >
+        ssh:{runLocation.hostLabel}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex whitespace-nowrap rounded-full border border-neutral-200 bg-neutral-100 px-2.5 py-0.5 text-xs font-medium text-neutral-700 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-300"
+      title="Local Playwright bot"
+      data-testid="profile-details-host-chip-local"
+    >
+      local
+    </span>
+  );
 }
 
 /**

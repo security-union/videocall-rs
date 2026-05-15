@@ -4,6 +4,7 @@ import { ChevronDown, ChevronUp } from "lucide-react";
 
 import { api } from "../api/client";
 import { LaunchForm, type LaunchFormInitial } from "../components/LaunchForm";
+import { MultiLaunchForm } from "../components/MultiLaunchForm";
 import { RunningBotsTable } from "../components/RunningBotsTable";
 import { RunProfiles } from "../components/RunProfiles";
 import { ToastShelf, useToastShelf } from "../components/ToastShelf";
@@ -36,8 +37,92 @@ export function BotsPage() {
 
   const [initialValues, setInitialValues] = useState<LaunchFormInitial | undefined>(undefined);
 
+  // Multi-launch (first-N + random-N) section. Defaults to collapsed
+  // when bots are already running so the operator's first action on a
+  // return visit is the running-bots table, not yet another form. The
+  // operator can flip it open from the section header at any time.
+  const [multiOpen, setMultiOpen] = useState(false);
+
   return (
     <div className="flex flex-col gap-6">
+      <section
+        aria-label="Multi-launch"
+        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+        data-testid="multi-launch-section"
+      >
+        <button
+          type="button"
+          onClick={() => setMultiOpen((v) => !v)}
+          className="flex w-full items-center justify-between px-6 py-4 text-left"
+          aria-expanded={multiOpen}
+          data-testid="multi-launch-toggle"
+        >
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+              Multi-launch
+            </h2>
+            <p className="text-sm text-neutral-500 dark:text-slate-400">
+              Spawn N bots from the manifest in one click — first-N (deterministic) or
+              random-N (seeded). Matches the CLI&apos;s{" "}
+              <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                bots-app run --users N
+              </code>{" "}
+              and{" "}
+              <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                bots-app gen --count N --seed S
+              </code>
+              .
+            </p>
+          </div>
+          {multiOpen ? (
+            <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+          ) : (
+            <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+          )}
+        </button>
+        {multiOpen && (
+          <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
+            <MultiLaunchForm
+              onLaunched={(resp) => {
+                const launched = resp.botIds.length;
+                const namesList = resp.participants.slice(0, 5).join(", ");
+                const tail =
+                  resp.participants.length > 5
+                    ? `, +${resp.participants.length - 5} more`
+                    : "";
+                const seedLine =
+                  resp.mode === "random" && resp.seed !== null ? ` (seed=${resp.seed})` : "";
+                toast.push({
+                  title:
+                    launched === resp.count
+                      ? `Launched ${launched} bots`
+                      : `Launched ${launched}/${resp.count} bots`,
+                  description: `${namesList}${tail}${seedLine}`,
+                  variant: resp.errors.length > 0 ? "info" : "success",
+                });
+                if (resp.errors.length > 0) {
+                  for (const err of resp.errors) {
+                    toast.push({
+                      title: `Skipped ${err.participant}`,
+                      description: err.message,
+                      variant: "error",
+                    });
+                  }
+                }
+                botsQuery.refetch();
+              }}
+              onError={(message) =>
+                toast.push({
+                  title: "Multi-launch failed",
+                  description: message,
+                  variant: "error",
+                })
+              }
+            />
+          </div>
+        )}
+      </section>
+
       <section
         aria-label="Launch a Bot"
         className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
@@ -122,6 +207,7 @@ export function BotsPage() {
                 authBackend: "jwt",
                 storageStateFile: "",
                 runLocation: "local",
+                sshHostLabel: "",
                 costume: "default",
                 audio: "default",
               });

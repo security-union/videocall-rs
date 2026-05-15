@@ -3,9 +3,11 @@ import { existsSync } from "node:fs";
 import { type BotExitReason, launchBot, type BotRunOptions } from "./bot";
 import { defaultSsoStatePath } from "./auth/storage-state";
 import {
+  type BotHostKind,
   type BotRegistryEntry,
   generateBotId,
   newRegistryEntry,
+  NotSupportedRemoteError,
   shortBotId,
 } from "./control/registry";
 import {
@@ -14,6 +16,8 @@ import {
   type LaunchSpec,
   type OrchestratorControlSurface,
 } from "./control/server";
+import { getHost, type SshHost } from "./control/ssh-hosts";
+import { spawnRemoteBot, type SshBotHandle } from "./control/ssh-launcher";
 import { loadManifest, type Manifest } from "./manifest";
 import { JoinRejectedError, MeetingNavigatedAwayError, WaitingRoomError } from "./meeting-join";
 import { formatDuration, parseDuration, type Ttl } from "./ttl";
@@ -195,11 +199,31 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   const surface: OrchestratorControlSurface = {
     getRegistry: () => registry,
     triggerLeave: async (botId) => {
+      const entry = registry.get(botId);
+      if (entry === undefined) throw new Error(`bot ${botId} not in flight`);
+      // SSH-hosted bots have no in-process `ctlSignals` entry — leave
+      // means SIGTERM the local `ssh` ChildProcess, which propagates
+      // the signal over the SSH connection to the remote bot (which
+      // then runs its own ctl-leave path).
+      if (entry.host.kind === "ssh") {
+        if (entry.sshHandle === null) throw new Error(`bot ${botId} has no ssh handle`);
+        entry.sshHandle.child.kill("SIGTERM");
+        entry.status = "leaving";
+        return;
+      }
       const sig = ctlSignals.get(botId);
       if (sig === undefined) throw new Error(`bot ${botId} not in flight`);
       sig.trigger("ctl-leave");
     },
     forceKill: async (botId) => {
+      const entry = registry.get(botId);
+      if (entry === undefined) throw new Error(`bot ${botId} not in flight`);
+      if (entry.host.kind === "ssh") {
+        if (entry.sshHandle === null) throw new Error(`bot ${botId} has no ssh handle`);
+        entry.sshHandle.child.kill("SIGKILL");
+        entry.status = "leaving";
+        return;
+      }
       const sig = ctlSignals.get(botId);
       if (sig === undefined) throw new Error(`bot ${botId} not in flight`);
       sig.trigger("ctl-kill");
@@ -207,6 +231,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     applyTtl: (botId, newTtl) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("extend-ttl");
       entry.ttl = newTtl;
       entry.ttlDeadline = newTtl === "infinite" ? null : Date.now() + newTtl;
       const timer = ttlTimers.get(botId);
@@ -218,6 +243,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     changeNetwork: async (botId, network) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("tune-network");
       // Stash the new network on the task so the rejoin path below
       // sees it. The actual reconnect is performed by
       // `runSingleBotTask` after the ctl signal fires.
@@ -230,22 +256,40 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     setMicMuted: async (botId, micMuted) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("mute");
       if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
       await toggleMicrophone(entry, micMuted);
     },
     setCameraOff: async (botId, cameraOff) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("camera");
       if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
       await toggleCamera(entry, cameraOff);
     },
     setScreenShare: async (botId, share) => {
       const entry = registry.get(botId);
       if (entry === undefined) throw new Error(`bot ${botId} not in registry`);
+      if (entry.host.kind === "ssh") throw new NotSupportedRemoteError("share");
       if (entry.handle === null) throw new Error(`bot ${botId} is not yet in-meeting`);
       await toggleScreenShare(entry, share);
     },
     launchOne: async (spec: LaunchSpec) => {
+      const runLocation = spec.runLocation ?? { kind: "local" };
+      if (runLocation.kind === "ssh") {
+        const runDir = opts.control?.runDir;
+        if (!runDir) {
+          throw new Error(
+            "SSH launch requires the control server to be started with a runDir (got none)",
+          );
+        }
+        const host = await getHost(runDir, runLocation.hostLabel);
+        if (host === null) {
+          throw new Error(`SSH host "${runLocation.hostLabel}" not in registry`);
+        }
+        const botId = await registerSshTask(spec, host);
+        return botId;
+      }
       const newTask = buildLaunchedBotTask(spec, {
         manifest: dashboardManifest,
         runDir: opts.control?.runDir ?? null,
@@ -259,6 +303,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
     duplicateBot: async (sourceBotId, overrides) => {
       const src = registry.get(sourceBotId);
       if (src === undefined) throw new Error(`bot ${sourceBotId} not in registry`);
+      if (src.host.kind === "ssh") throw new NotSupportedRemoteError("duplicate");
       const newTask: BotTask = {
         ...src.task,
         botId: generateBotId(),
@@ -317,6 +362,69 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       const w = inFlightWaiters.shift();
       if (w) w();
     }
+  }
+
+  /**
+   * Register a bot that runs on a remote SSH host. We bypass
+   * `runSingleBotTask` (it owns Playwright + the in-process bot
+   * lifecycle); instead the entry tracks a `sshHandle` and the
+   * wait-loop observes the SSH ChildProcess's exit promise.
+   *
+   * Returns the new bot's id so the control server can respond with
+   * 201 + the id, same shape as the local path.
+   */
+  async function registerSshTask(spec: LaunchSpec, host: SshHost): Promise<string> {
+    const botId = generateBotId();
+    const ttl = spec.ttl;
+    const task: BotTask = {
+      botId,
+      meetingURL: spec.meetingURL,
+      participant: spec.participant,
+      displayName: spec.displayName ?? defaultDisplayName(spec.participant),
+      headless: spec.headless,
+      authBackend: spec.authBackend,
+      storageStateFile: spec.storageStateFile ?? null,
+      ssoStateFile: spec.ssoStateFile ?? null,
+      manifest: null,
+      runDir: null,
+      costumeOverride: null,
+      audioOverride: null,
+      ttl,
+      network: spec.network === "none" ? null : spec.network,
+    };
+    const hostKind: BotHostKind = { kind: "ssh", hostLabel: host.label };
+    const entry = newRegistryEntry(task, hostKind);
+    registry.set(botId, entry);
+    const sshHandle: SshBotHandle = spawnRemoteBot({
+      host,
+      ttl: formatDuration(ttl),
+      meetingURL: spec.meetingURL,
+      participant: spec.participant,
+      network: task.network,
+      authBackend: spec.authBackend,
+      displayName: task.displayName,
+      headless: spec.headless,
+    });
+    entry.sshHandle = sshHandle;
+    entry.status = "in-meeting";
+    console.log(
+      `[orchestrator] ssh-launch → ${task.participant}@${shortBotId(botId)} → ${host.user}@${host.host}`,
+    );
+    const exitPromise: Promise<BotExitReason> = sshHandle.exit.then((code) => {
+      entry.status = code === 0 ? "done" : "failed";
+      entry.finishReason = code === 0 ? "ssh-exit-ok" : `ssh-exit-${code ?? "killed"}`;
+      entry.finishedAt = Date.now();
+      if (code !== 0 && code !== null) {
+        entry.lastError = `remote bot exited with code ${code}`;
+      }
+      return { kind: "shutdown-signal" } as BotExitReason;
+    });
+    inFlight.set(botId, exitPromise);
+    while (inFlightWaiters.length > 0) {
+      const w = inFlightWaiters.shift();
+      if (w) w();
+    }
+    return botId;
   }
 
   for (const task of initialTasks) {

@@ -1,14 +1,38 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Copy, ExternalLink, LogOut, Mic, MicOff, Monitor, Timer, Trash2, Video, VideoOff } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  Copy,
+  ExternalLink,
+  FileText,
+  LogOut,
+  Mic,
+  MicOff,
+  Monitor,
+  Timer,
+  Trash2,
+  Video,
+  VideoOff,
+} from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
-import type { BotSnapshot } from "../api/types";
+import type { BotSnapshot, SshHost } from "../api/types";
 import { badgeForBot, networkLabel, STATUS_BADGE_CLASS } from "../lib/constants";
 import { formatRemaining } from "../lib/ttl";
 import type { ToastEntry } from "./ToastShelf";
 import { ExtendTtlDialog } from "./ExtendTtlDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { BotLogDialog } from "./BotLogDialog";
+
+const REMOTE_DISABLED_TITLE = "Not available for remote bots (v1)";
+
+/**
+ * True when the bot snapshot is an SSH-hosted bot. Tolerates the
+ * back-compat case where the server omits `host` entirely (which
+ * means "local" in practice).
+ */
+function isRemoteBot(snap: BotSnapshot): boolean {
+  return snap.host?.kind === "ssh";
+}
 
 interface RunningBotsTableProps {
   isLoading: boolean;
@@ -135,6 +159,26 @@ export function RunningBotsTable({
   const [ttlDialogBot, setTtlDialogBot] = useState<BotSnapshot | null>(null);
   const [confirmLeave, setConfirmLeave] = useState<BotSnapshot | null>(null);
   const [confirmKill, setConfirmKill] = useState<BotSnapshot | null>(null);
+  const [logDialogBot, setLogDialogBot] = useState<BotSnapshot | null>(null);
+
+  // Index of registered hosts → label so the Host column's tooltip can
+  // resolve `ssh:<label>` to `<user>@<host>`. Only fetched when at
+  // least one ssh bot is in the list, but the query is cheap enough we
+  // just leave it on for everyone — it shares the cache with the
+  // Launch form's `hostsQuery` and the Tools page.
+  const hostsQuery = useQuery({
+    queryKey: ["ssh", "hosts"],
+    queryFn: api.listHosts,
+    // The query is opportunistic; failures are non-fatal (the chip
+    // tooltip just shows the bare label).
+    retry: false,
+    refetchInterval: 60_000,
+  });
+  const hostsByLabel = useMemo(() => {
+    const map = new Map<string, SshHost>();
+    for (const h of hostsQuery.data?.hosts ?? []) map.set(h.label, h);
+    return map;
+  }, [hostsQuery.data?.hosts]);
 
   const sortedBots = useMemo(() => {
     return [...bots].sort((a, b) => a.startedAt - b.startedAt);
@@ -172,6 +216,7 @@ export function RunningBotsTable({
           <thead className="bg-neutral-50 text-xs uppercase tracking-wide text-neutral-500 dark:bg-slate-900 dark:text-slate-400">
             <tr>
               <th className="px-4 py-2 text-left font-medium">Status</th>
+              <th className="px-4 py-2 text-left font-medium">Host</th>
               <th className="px-4 py-2 text-left font-medium">Bot</th>
               <th className="px-4 py-2 text-left font-medium">Participant</th>
               <th className="px-4 py-2 text-left font-medium">Meeting</th>
@@ -191,8 +236,17 @@ export function RunningBotsTable({
               // tick was last refreshed. The poll runs every 2.5s,
               // which keeps the drift well under the human eye.
               void now;
+              const remote = isRemoteBot(b);
+              const remoteHost =
+                remote && b.host?.kind === "ssh"
+                  ? hostsByLabel.get(b.host.hostLabel) ?? null
+                  : null;
               return (
-                <tr key={b.botId} className="hover:bg-neutral-50 dark:hover:bg-slate-700/50">
+                <tr
+                  key={b.botId}
+                  className="hover:bg-neutral-50 dark:hover:bg-slate-700/50"
+                  data-testid={`bot-row-${b.botId}`}
+                >
                   <td className="px-4 py-2">
                     {(() => {
                       const { label, badgeKey } = badgeForBot(b);
@@ -214,6 +268,29 @@ export function RunningBotsTable({
                       >
                         {b.lastError}
                       </p>
+                    )}
+                  </td>
+                  <td className="px-4 py-2">
+                    {remote && b.host?.kind === "ssh" ? (
+                      <span
+                        className="inline-flex whitespace-nowrap rounded-full border border-violet-200 bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-800 dark:border-violet-800 dark:bg-violet-900/30 dark:text-violet-200"
+                        title={
+                          remoteHost
+                            ? `ssh ${remoteHost.user}@${remoteHost.host}`
+                            : `ssh host "${b.host.hostLabel}" (not in registry)`
+                        }
+                        data-testid={`bot-host-chip-${b.botId}`}
+                      >
+                        ssh:{b.host.hostLabel}
+                      </span>
+                    ) : (
+                      <span
+                        className="inline-flex whitespace-nowrap rounded-full border border-neutral-200 bg-neutral-100 px-2.5 py-0.5 text-xs font-medium text-neutral-700 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-300"
+                        title="Local Playwright bot"
+                        data-testid={`bot-host-chip-${b.botId}`}
+                      >
+                        local
+                      </span>
                     )}
                   </td>
                   <td
@@ -243,28 +320,35 @@ export function RunningBotsTable({
                   <td className="px-4 py-2">
                     <div className="flex justify-end gap-1">
                       <IconButton
-                        title="Extend / set TTL"
+                        title="View logs"
+                        onClick={() => setLogDialogBot(b)}
+                        testId={`bot-view-log-${b.botId}`}
+                      >
+                        <FileText className="h-4 w-4" />
+                      </IconButton>
+                      <IconButton
+                        title={remote ? REMOTE_DISABLED_TITLE : "Extend / set TTL"}
                         onClick={() => setTtlDialogBot(b)}
-                        disabled={terminal}
+                        disabled={terminal || remote}
                       >
                         <Timer className="h-4 w-4" />
                       </IconButton>
                       <IconButton
-                        title={opt.mic ? "Unmute mic" : "Mute mic"}
+                        title={remote ? REMOTE_DISABLED_TITLE : opt.mic ? "Unmute mic" : "Mute mic"}
                         onClick={() =>
                           setMic.mutate({ botId: b.botId, mic: !(opt.mic ?? false) })
                         }
-                        disabled={!inMeeting}
+                        disabled={!inMeeting || remote}
                         active={opt.mic === true}
                       >
                         {opt.mic ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
                       </IconButton>
                       <IconButton
-                        title={opt.camera ? "Camera on" : "Camera off"}
+                        title={remote ? REMOTE_DISABLED_TITLE : opt.camera ? "Camera on" : "Camera off"}
                         onClick={() =>
                           setCamera.mutate({ botId: b.botId, camera: !(opt.camera ?? false) })
                         }
-                        disabled={!inMeeting}
+                        disabled={!inMeeting || remote}
                         active={opt.camera === true}
                       >
                         {opt.camera ? (
@@ -274,18 +358,19 @@ export function RunningBotsTable({
                         )}
                       </IconButton>
                       <IconButton
-                        title={opt.share ? "Stop sharing" : "Share screen"}
+                        title={remote ? REMOTE_DISABLED_TITLE : opt.share ? "Stop sharing" : "Share screen"}
                         onClick={() =>
                           setShare.mutate({ botId: b.botId, share: !(opt.share ?? false) })
                         }
-                        disabled={!inMeeting}
+                        disabled={!inMeeting || remote}
                         active={opt.share === true}
                       >
                         <Monitor className="h-4 w-4" />
                       </IconButton>
                       <IconButton
-                        title="Duplicate (pre-fill launch form)"
+                        title={remote ? REMOTE_DISABLED_TITLE : "Duplicate (pre-fill launch form)"}
                         onClick={() => onDuplicate(b)}
+                        disabled={remote}
                       >
                         <Copy className="h-4 w-4" />
                       </IconButton>
@@ -353,6 +438,7 @@ export function RunningBotsTable({
           setConfirmKill(null);
         }}
       />
+      <BotLogDialog bot={logDialogBot} onClose={() => setLogDialogBot(null)} />
     </>
   );
 }
@@ -363,10 +449,19 @@ interface IconButtonProps {
   disabled?: boolean;
   active?: boolean;
   destructive?: boolean;
+  testId?: string;
   children: React.ReactNode;
 }
 
-function IconButton({ title, onClick, disabled, active, destructive, children }: IconButtonProps) {
+function IconButton({
+  title,
+  onClick,
+  disabled,
+  active,
+  destructive,
+  testId,
+  children,
+}: IconButtonProps) {
   const base =
     "inline-flex h-8 w-8 items-center justify-center rounded-md border text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-sky-500";
   let cls: string;
@@ -390,6 +485,7 @@ function IconButton({ title, onClick, disabled, active, destructive, children }:
       aria-label={title}
       onClick={onClick}
       disabled={disabled}
+      data-testid={testId}
       className={`${base} ${cls}`}
     >
       {children}

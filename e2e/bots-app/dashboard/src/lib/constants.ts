@@ -124,14 +124,18 @@ export const NETSIM_PRESET_META: readonly NetsimPresetMeta[] = [
 ];
 
 /**
- * Where the bot instance runs. Only `"local"` is wired today; the
- * other slots render as disabled with a tooltip pointing at the
- * tracking discussion.
+ * Where the bot instance runs. Two slots are wired today —
+ * `"local"` and `"ssh"`. The remaining slots render as disabled with
+ * a tooltip pointing at the tracking discussion.
+ *
+ * SSH availability ALSO depends on whether the operator has at least
+ * one host registered in the registry — that runtime gating lives in
+ * the LaunchForm itself, not on this static list.
  */
 export const RUN_LOCATIONS = [
   { value: "local", label: "Local machine", available: true },
   { value: "future-vm", label: "Cloud VM (coming soon)", available: false },
-  { value: "future-ssh", label: "SSH-able host (coming soon)", available: false },
+  { value: "ssh", label: "SSH-able host", available: true },
   { value: "future-docker", label: "Docker container (coming soon)", available: false },
 ] as const;
 

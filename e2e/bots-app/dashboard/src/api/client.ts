@@ -1,19 +1,42 @@
 import type {
+  AddSshHostRequest,
   AssetsManifestResponse,
   BotListResponse,
+  BotLogResponse,
   BotSnapshot,
   DaemonInfo,
   HealthResponse,
+  LaunchFromConfigPreviewResponse,
+  LaunchFromConfigRequest,
+  LaunchFromConfigResponse,
   LaunchProfileResponse,
   LaunchRequest,
   LaunchResponse,
+  MultiLaunchRequest,
+  MultiLaunchResponse,
+  OauthCaptureCancelResponse,
+  OauthCaptureStartRequest,
+  OauthCaptureStartResponse,
+  OauthSessionInfo,
+  OauthSessionsResponse,
+  PrepAssetsJobStatus,
+  PrepAssetsStartRequest,
+  PrepAssetsStartResponse,
   ProfileListResponse,
   RunProfile,
   SaveProfileRequest,
+  SshHost,
+  SshHostsResponse,
+  SshPreviewHostRequest,
+  SshPreviewHostResponse,
+  SshPreviewLaunchRequest,
+  SshPreviewLaunchResponse,
   SsoRecaptureCancelResponse,
   SsoRecaptureStartRequest,
   SsoRecaptureStartResponse,
   SsoStatusResponse,
+  TestSshHostResponse,
+  UpdateSshHostRequest,
   VpnStatusResponse,
 } from "./types";
 
@@ -157,4 +180,122 @@ export const api = {
   // ──────────────────────────────────────────────────────────────────
   assetsManifest: (): Promise<AssetsManifestResponse> =>
     request<AssetsManifestResponse>("GET", "/api/assets/manifest"),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Multi-launch (first-N + random-N) and YAML config import. Closes
+  // the CLI-vs-dashboard gap for `bots-app run --users N` and
+  // `bots-app gen` (deterministic random pick).
+  // ──────────────────────────────────────────────────────────────────
+  launchMulti: (req: MultiLaunchRequest): Promise<MultiLaunchResponse> =>
+    request<MultiLaunchResponse>(
+      "POST",
+      "/api/launch/multi",
+      req as unknown as Record<string, unknown>,
+    ),
+  launchFromConfig: (req: LaunchFromConfigRequest): Promise<LaunchFromConfigResponse> =>
+    request<LaunchFromConfigResponse>(
+      "POST",
+      "/api/launch/from-config",
+      req as unknown as Record<string, unknown>,
+    ),
+  previewFromConfig: (configYaml: string): Promise<LaunchFromConfigPreviewResponse> =>
+    request<LaunchFromConfigPreviewResponse>(
+      "POST",
+      "/api/launch/from-config/preview",
+      { configYaml },
+    ),
+
+  // ──────────────────────────────────────────────────────────────────
+  // OAuth session capture (Google OAuth via `bots-app login` equivalent).
+  // Sibling of the HCL SSO recapture flow but per-account; each
+  // captured file lives at <runDir>/auth/<label>.json and is replayed
+  // by storage-state auth.
+  // ──────────────────────────────────────────────────────────────────
+  oauthSessions: (): Promise<OauthSessionsResponse> =>
+    request<OauthSessionsResponse>("GET", "/api/oauth/sessions"),
+  oauthCaptureStart: (req: OauthCaptureStartRequest): Promise<OauthCaptureStartResponse> =>
+    request<OauthCaptureStartResponse>(
+      "POST",
+      "/api/oauth/capture",
+      req as unknown as Record<string, unknown>,
+    ),
+  oauthCaptureComplete: (sessionId: string): Promise<OauthSessionInfo> =>
+    request<OauthSessionInfo>(
+      "POST",
+      `/api/oauth/capture/${encodeURIComponent(sessionId)}/complete`,
+    ),
+  oauthCaptureCancel: (sessionId: string): Promise<OauthCaptureCancelResponse> =>
+    request<OauthCaptureCancelResponse>(
+      "DELETE",
+      `/api/oauth/capture/${encodeURIComponent(sessionId)}`,
+    ),
+  oauthSessionDelete: (label: string): Promise<{ label: string; deleted: boolean }> =>
+    request("DELETE", `/api/oauth/sessions/${encodeURIComponent(label)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // prep-assets background-job lifecycle. The SSE stream is consumed
+  // directly via `new EventSource(...)` rather than through this
+  // typed-request wrapper because EventSource is its own protocol.
+  // ──────────────────────────────────────────────────────────────────
+  prepAssetsStart: (req: PrepAssetsStartRequest = {}): Promise<PrepAssetsStartResponse> =>
+    request<PrepAssetsStartResponse>(
+      "POST",
+      "/api/assets/prep",
+      req as unknown as Record<string, unknown>,
+    ),
+  prepAssetsStatus: (jobId: string): Promise<PrepAssetsJobStatus> =>
+    request<PrepAssetsJobStatus>(
+      "GET",
+      `/api/assets/prep/${encodeURIComponent(jobId)}`,
+    ),
+  prepAssetsForget: (jobId: string): Promise<{ jobId: string; deleted: boolean }> =>
+    request("DELETE", `/api/assets/prep/${encodeURIComponent(jobId)}`),
+
+  // ──────────────────────────────────────────────────────────────────
+  // SSH host registry — CRUD + connectivity probe.
+  // ──────────────────────────────────────────────────────────────────
+  listHosts: (): Promise<SshHostsResponse> => request<SshHostsResponse>("GET", "/api/hosts"),
+  addHost: (req: AddSshHostRequest): Promise<{ host: SshHost }> =>
+    request<{ host: SshHost }>("POST", "/api/hosts", req as unknown as Record<string, unknown>),
+  updateHost: (label: string, req: UpdateSshHostRequest): Promise<{ host: SshHost }> =>
+    request<{ host: SshHost }>(
+      "PUT",
+      `/api/hosts/${encodeURIComponent(label)}`,
+      req as unknown as Record<string, unknown>,
+    ),
+  removeHost: (label: string): Promise<null> =>
+    request<null>("DELETE", `/api/hosts/${encodeURIComponent(label)}`),
+  testHost: (label: string): Promise<TestSshHostResponse> =>
+    request<TestSshHostResponse>("POST", `/api/hosts/${encodeURIComponent(label)}/test`),
+  previewSshLaunch: (
+    label: string,
+    req: SshPreviewLaunchRequest,
+  ): Promise<SshPreviewLaunchResponse> =>
+    request<SshPreviewLaunchResponse>(
+      "POST",
+      `/api/hosts/${encodeURIComponent(label)}/preview-launch`,
+      req as unknown as Record<string, unknown>,
+    ),
+  /**
+   * Preview the SSH command for an UNSAVED host config — used by the
+   * Add/Edit Host dialog's live preview so the operator sees what
+   * command will run BEFORE saving. Body wraps the host config under
+   * `host`; the launch params are placeholder tokens unless callers
+   * pass an explicit `launchSpec` override.
+   */
+  previewSshHost: (req: SshPreviewHostRequest): Promise<SshPreviewHostResponse> =>
+    request<SshPreviewHostResponse>(
+      "POST",
+      "/api/hosts/preview",
+      req as unknown as Record<string, unknown>,
+    ),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-bot log window (used by the log viewer dialog).
+  // ──────────────────────────────────────────────────────────────────
+  botLog: (botId: string, since = 0): Promise<BotLogResponse> =>
+    request<BotLogResponse>(
+      "GET",
+      `/api/bots/${encodeURIComponent(botId)}/log?since=${since}`,
+    ),
 };

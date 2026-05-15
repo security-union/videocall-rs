@@ -200,10 +200,18 @@ function proxyToCtl(
       (upstreamRes) => {
         // Mirror upstream status + content-type only; we never want
         // upstream's `connection: close` or transfer-encoding leaking
-        // into the browser.
+        // into the browser. Also forward cache-control + x-accel-buffering
+        // headers so SSE streams (e.g. /api/assets/prep/:id/stream) bypass
+        // intermediary buffering.
         const passHeaders: Record<string, string> = {};
         if (upstreamRes.headers["content-type"]) {
           passHeaders["content-type"] = upstreamRes.headers["content-type"];
+        }
+        if (upstreamRes.headers["cache-control"]) {
+          passHeaders["cache-control"] = String(upstreamRes.headers["cache-control"]);
+        }
+        if (upstreamRes.headers["x-accel-buffering"]) {
+          passHeaders["x-accel-buffering"] = String(upstreamRes.headers["x-accel-buffering"]);
         }
         res.writeHead(upstreamRes.statusCode ?? 502, passHeaders);
         upstreamRes.pipe(res);

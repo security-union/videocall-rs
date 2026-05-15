@@ -21,10 +21,16 @@ import {
   type AuthBackend,
   type RunLocation,
 } from "../lib/constants";
+import {
+  recordLaunchedBot,
+  runLocationLabelFor,
+  type LaunchedBotHistoryEntry,
+} from "../lib/botHistory";
 import { useFieldHistory } from "../lib/fieldHistory";
 import { type FieldErrors, validateLaunchForm } from "../lib/validation";
 import { HelpPopover } from "./ui/HelpPopover";
 import { HistoryInput } from "./ui/HistoryInput";
+import { LoadPreviousButton } from "./LoadPreviousButton";
 import { Select } from "./ui/Select";
 import { SshCommandPreview } from "./SshCommandPreview";
 import { SsoPanel } from "./SsoPanel";
@@ -259,6 +265,18 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
       if (values.displayName.trim()) displayNameHistory.push(values.displayName);
       ttlHistory.push(variables.ttl);
       if (variables.storageStateFile) storageStateHistory.push(variables.storageStateFile);
+      // Capture the full spec so the operator can reopen this exact
+      // config from the Load-previous dropdown next time. We snapshot
+      // `values` (not `variables`) so the saved entry round-trips
+      // back into the form unchanged — `variables` already strips
+      // optional empty fields for the wire shape.
+      recordLaunchedBot({
+        spec: values,
+        launchedAt: Date.now(),
+        meetingURL: values.meetingURL,
+        participant: values.participant,
+        runLocationLabel: runLocationLabelFor(values),
+      });
       // Keep all field values intact so the operator can immediately
       // launch another bot with the same/similar config (e.g. tweak
       // just the participant and click Launch again). The parent
@@ -289,6 +307,22 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     setSubmitted(false);
     setManualTouched({ costume: false, audio: false });
     setFreshlyDuplicated(false);
+  };
+
+  /**
+   * Pull a previously-launched bot's full spec back into the form.
+   * Mirrors the duplicate flow's internal-state reset so the manifest
+   * auto-match doesn't immediately clobber the loaded costume/audio:
+   * clear validation errors, mark `submitted=false`, drop manual-touch
+   * pins, and set `freshlyDuplicated=true` (the operator's first edit
+   * after the load releases the guard).
+   */
+  const handleLoadPrevious = (entry: LaunchedBotHistoryEntry) => {
+    setValues(entry.spec);
+    setErrors({});
+    setSubmitted(false);
+    setManualTouched({ costume: false, audio: false });
+    setFreshlyDuplicated(true);
   };
 
   const setField = <K extends keyof LaunchFormInitial>(key: K, val: LaunchFormInitial[K]) => {
@@ -875,6 +909,10 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               </Tooltip.Content>
             </Tooltip.Portal>
           </Tooltip.Root>
+          <LoadPreviousButton
+            onSelect={handleLoadPrevious}
+            disabled={launchMutation.isPending}
+          />
           <button
             type="submit"
             disabled={launchMutation.isPending}

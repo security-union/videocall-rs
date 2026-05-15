@@ -63,3 +63,77 @@ pub const DENSITY_MODES: [DensityMode; 4] = [
     DensityMode::Dense,
     DensityMode::Maximum,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_returns_expected_strings() {
+        assert_eq!(DensityMode::Auto.label(), "Auto");
+        assert_eq!(DensityMode::Standard.label(), "Standard");
+        assert_eq!(DensityMode::Dense.label(), "Dense");
+        assert_eq!(DensityMode::Maximum.label(), "Maximum");
+    }
+
+    #[test]
+    fn description_returns_expected_strings() {
+        assert_eq!(DensityMode::Auto.description(), "Optimal");
+        assert_eq!(DensityMode::Standard.description(), "Fewer, larger");
+        assert_eq!(DensityMode::Dense.description(), "More, smaller");
+        assert_eq!(DensityMode::Maximum.description(), "As many as fit");
+    }
+
+    #[test]
+    fn density_modes_array_has_all_variants() {
+        assert_eq!(DENSITY_MODES.len(), 4);
+        assert!(DENSITY_MODES.contains(&DensityMode::Auto));
+        assert!(DENSITY_MODES.contains(&DensityMode::Standard));
+        assert!(DENSITY_MODES.contains(&DensityMode::Dense));
+        assert!(DENSITY_MODES.contains(&DensityMode::Maximum));
+    }
+
+    #[test]
+    fn min_tile_width_desktop_ordering() {
+        let vw = 1366.0;
+        let standard = DensityMode::Standard.min_tile_width(vw);
+        let auto = DensityMode::Auto.min_tile_width(vw);
+        let dense = DensityMode::Dense.min_tile_width(vw);
+        let maximum = DensityMode::Maximum.min_tile_width(vw);
+        assert!(
+            standard > auto && auto > dense && dense > maximum,
+            "Expected Standard ({standard}) > Auto ({auto}) > Dense ({dense}) > Maximum ({maximum})"
+        );
+    }
+
+    #[test]
+    fn min_tile_width_mobile_ordering() {
+        let vw = 375.0;
+        let standard = DensityMode::Standard.min_tile_width(vw);
+        let auto = DensityMode::Auto.min_tile_width(vw);
+        let dense = DensityMode::Dense.min_tile_width(vw);
+        let maximum = DensityMode::Maximum.min_tile_width(vw);
+        assert!(
+            standard > auto && auto > dense && dense > maximum,
+            "Expected Standard ({standard}) > Auto ({auto}) > Dense ({dense}) > Maximum ({maximum})"
+        );
+    }
+
+    #[test]
+    fn min_tile_width_positive() {
+        for &mode in &DENSITY_MODES {
+            let desktop = mode.min_tile_width(1366.0);
+            let mobile = mode.min_tile_width(375.0);
+            assert!(
+                desktop > 0.0,
+                "{:?} desktop min_tile_width should be positive, got {desktop}",
+                mode
+            );
+            assert!(
+                mobile > 0.0,
+                "{:?} mobile min_tile_width should be positive, got {mobile}",
+                mode
+            );
+        }
+    }
+}

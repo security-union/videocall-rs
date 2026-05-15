@@ -41,11 +41,12 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    load_appearance_settings_from_storage, resolve_transport_config,
-    save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DisplayNameCtx, DockPosition,
-    DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap,
-    PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    load_appearance_settings_from_storage, load_density_mode, load_dock_autohide,
+    load_dock_position, resolve_transport_config, save_appearance_settings_to_storage,
+    save_density_mode, save_display_name_to_storage, save_dock_autohide, save_dock_position,
+    validate_display_name, AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DensityModeCtx,
+    DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -530,9 +531,9 @@ pub fn AttendantsComponent(
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
-    let mut dock_position: Signal<DockPosition> = use_signal(|| DockPosition::Bottom);
+    let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
     let mut dock_menu_open = use_signal(|| false);
-    let mut autohide_enabled = use_signal(|| true);
+    let mut autohide_enabled = use_signal(load_dock_autohide);
     let encoder_settings = use_signal(|| None::<String>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
@@ -541,7 +542,7 @@ pub fn AttendantsComponent(
     // Per-peer join time: session_id → first-seen timestamp (ms).
     // Used as fallback ordering when no speech data exists.
     let mut peer_join_time: Signal<HashMap<String, f64>> = use_signal(HashMap::new);
-    let mut density_mode: Signal<DensityMode> = use_signal(|| DensityMode::Auto);
+    let mut density_mode: Signal<DensityMode> = use_signal(load_density_mode);
     let mut density_open = use_signal(|| false);
     // Viewport size signal — updated on window resize so layout recomputes.
     let mut viewport_version = use_signal(|| 0u32);
@@ -1534,6 +1535,7 @@ pub fn AttendantsComponent(
     // the AppearanceSettingsPanel can read/write them.
     use_context_provider(|| DockPositionCtx(dock_position));
     use_context_provider(|| AutohideCtx(autohide_enabled));
+    use_context_provider(|| DensityModeCtx(density_mode));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -1840,14 +1842,6 @@ pub fn AttendantsComponent(
             t -= 1;
         }
         t
-    };
-
-    // Show density selector only when modes would produce different results.
-    // If even Standard (most restrictive) can show all tiles, hide it.
-    let show_density_selector = {
-        let std_min = DensityMode::Standard.min_tile_width(vw);
-        let (_c, _r, tw) = compute_layout(total_tiles, avail_w, avail_h, gap);
-        tw < std_min // Standard can't fit everyone → modes matter
     };
 
     let (visible_tile_count, overflow_count) = if total_tiles > effective_visible {
@@ -2883,7 +2877,7 @@ pub fn AttendantsComponent(
                                                 }
                                             },
                                         }
-                                        if show_density_selector && !has_screen_share {
+                                        if !has_screen_share {
                                             DensityModeButton {
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
@@ -2966,6 +2960,7 @@ pub fn AttendantsComponent(
                                                         onclick: move |e: MouseEvent| {
                                                             e.stop_propagation();
                                                             dock_position.set(DockPosition::Bottom);
+                                                            save_dock_position(DockPosition::Bottom);
                                                             dock_menu_open.set(false);
                                                         },
                                                         "Bottom"
@@ -2976,6 +2971,7 @@ pub fn AttendantsComponent(
                                                         onclick: move |e: MouseEvent| {
                                                             e.stop_propagation();
                                                             dock_position.set(DockPosition::Left);
+                                                            save_dock_position(DockPosition::Left);
                                                             dock_menu_open.set(false);
                                                         },
                                                         "Left"
@@ -2986,6 +2982,7 @@ pub fn AttendantsComponent(
                                                         onclick: move |e: MouseEvent| {
                                                             e.stop_propagation();
                                                             dock_position.set(DockPosition::Right);
+                                                            save_dock_position(DockPosition::Right);
                                                             dock_menu_open.set(false);
                                                         },
                                                         "Right"
@@ -2997,7 +2994,9 @@ pub fn AttendantsComponent(
                                                         role: "option",
                                                         onclick: move |e: MouseEvent| {
                                                             e.stop_propagation();
-                                                            autohide_enabled.set(!autohide_enabled());
+                                                            let new_val = !autohide_enabled();
+                                                            autohide_enabled.set(new_val);
+                                                            save_dock_autohide(new_val);
                                                             dock_menu_open.set(false);
                                                         },
                                                         if autohide_enabled() {
@@ -3279,7 +3278,7 @@ pub fn AttendantsComponent(
                 }
 
                 // Density mode popover
-                if show_density_selector && !has_screen_share && density_open() {
+                if !has_screen_share && density_open() {
                     div { class: "density-popover",
                         for mode in DENSITY_MODES {
                             div {
@@ -3287,6 +3286,7 @@ pub fn AttendantsComponent(
                                 class: if density_mode() == mode { "density-option active" } else { "density-option" },
                                 onclick: move |_| {
                                     density_mode.set(mode);
+                                    save_density_mode(mode);
                                     density_open.set(false);
                                 },
                                 span { class: "density-option-label", "{mode.label()}" }

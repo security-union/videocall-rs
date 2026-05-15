@@ -1,13 +1,32 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp } from "lucide-react";
 
-import { api } from "../api/client";
+import { api, DashboardApiError } from "../api/client";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { LaunchForm, type LaunchFormInitial } from "../components/LaunchForm";
 import { MultiLaunchForm } from "../components/MultiLaunchForm";
 import { RunningBotsTable } from "../components/RunningBotsTable";
 import { RunProfiles } from "../components/RunProfiles";
+import { TerminatedBotsTable } from "../components/TerminatedBotsTable";
 import { ToastShelf, useToastShelf } from "../components/ToastShelf";
+
+/**
+ * Status keys that mean "still running" — used to partition the bots
+ * list between the Running and Terminated sections. Anything NOT in
+ * this set (i.e. `done` / `failed` / any future terminal status the
+ * server might add) is treated as Terminated.
+ */
+const RUNNING_STATUSES = new Set(["priming", "launching", "joining", "in-meeting", "leaving"]);
+
+/**
+ * Soft cap on the number of terminated entries the orchestrator keeps
+ * in memory. Mirrors `TERMINATED_REGISTRY_CAP` on the Node side; used
+ * here purely for the header's `<N>/100` count badge. Drift between
+ * the two surfaces as a confusing UX (badge says "112 / 100") but does
+ * NOT break correctness — the server still enforces the cap.
+ */
+const TERMINATED_CAP = 100;
 
 export function BotsPage() {
   const toast = useToastShelf();
@@ -19,10 +38,42 @@ export function BotsPage() {
     refetchInterval: 2_500,
   });
 
-  const liveBots = (botsQuery.data?.bots ?? []).filter(
-    (b) => b.status !== "done" && b.status !== "failed",
+  // Stable reference for the partition memos. Without this, the
+  // logical-or fallback creates a fresh `[]` on every render and the
+  // memos invalidate every refetch tick.
+  const allBots = useMemo(() => botsQuery.data?.bots ?? [], [botsQuery.data?.bots]);
+  const liveBots = useMemo(() => allBots.filter((b) => RUNNING_STATUSES.has(b.status)), [allBots]);
+  const terminatedBots = useMemo(
+    () =>
+      allBots
+        .filter((b) => !RUNNING_STATUSES.has(b.status))
+        .sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0)),
+    [allBots],
   );
+  const totalBots = liveBots.length + terminatedBots.length;
   const hasLive = liveBots.length > 0;
+
+  const qc = useQueryClient();
+  const clearTerminated = useMutation({
+    mutationFn: () => api.clearTerminatedBots(),
+    onSuccess: (data) => {
+      toast.push({
+        title:
+          data.removedCount === 0
+            ? "No terminated bots to clear"
+            : `Cleared ${data.removedCount} terminated bot${data.removedCount === 1 ? "" : "s"}`,
+        variant: data.removedCount === 0 ? "info" : "success",
+      });
+      void qc.invalidateQueries({ queryKey: ["bots"] });
+    },
+    onError: (err) =>
+      toast.push({
+        title: "Clear failed",
+        description: err instanceof DashboardApiError ? err.message : (err as Error).message,
+        variant: "error",
+      }),
+  });
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
 
   // Collapsible launch form. We collapse it automatically once at
   // least one bot is running so the running-list is what the operator
@@ -62,8 +113,8 @@ export function BotsPage() {
               Multi-launch
             </h2>
             <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Spawn N bots from the manifest in one click — first-N (deterministic) or
-              random-N (seeded). Matches the CLI&apos;s{" "}
+              Spawn N bots from the manifest in one click — first-N (deterministic) or random-N
+              (seeded). Matches the CLI&apos;s{" "}
               <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
                 bots-app run --users N
               </code>{" "}
@@ -87,9 +138,7 @@ export function BotsPage() {
                 const launched = resp.botIds.length;
                 const namesList = resp.participants.slice(0, 5).join(", ");
                 const tail =
-                  resp.participants.length > 5
-                    ? `, +${resp.participants.length - 5} more`
-                    : "";
+                  resp.participants.length > 5 ? `, +${resp.participants.length - 5} more` : "";
                 const seedLine =
                   resp.mode === "random" && resp.seed !== null ? ` (seed=${resp.seed})` : "";
                 toast.push({
@@ -183,19 +232,21 @@ export function BotsPage() {
               Running Bots
             </h2>
             <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Live + recently-finished bots in the orchestrator&apos;s registry. Refreshes every
-              2.5s.
+              Live bots currently in the orchestrator&apos;s registry. Refreshes every 2.5s.
             </p>
           </div>
-          <span className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300">
-            {liveBots.length} live / {botsQuery.data?.bots.length ?? 0} total
+          <span
+            className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
+            data-testid="running-bots-count-badge"
+          >
+            {liveBots.length} live / {totalBots} total
           </span>
         </div>
         <div className="border-t border-neutral-200 dark:border-slate-700">
           <RunningBotsTable
             isLoading={botsQuery.isLoading}
             error={botsQuery.error}
-            bots={botsQuery.data?.bots ?? []}
+            bots={liveBots}
             onDuplicate={(snap) => {
               setInitialValues({
                 meetingURL: snap.meetingURL,
@@ -223,6 +274,59 @@ export function BotsPage() {
           />
         </div>
       </section>
+
+      <section
+        aria-label="Terminated Bots"
+        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+        data-testid="terminated-bots-section"
+      >
+        <div className="flex items-center justify-between px-6 py-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+              Terminated Bots
+            </h2>
+            <p className="text-sm text-neutral-500 dark:text-slate-400">
+              Bots that have ended in the last hour. Logs remain available here for post-mortem
+              inspection.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
+              data-testid="terminated-bots-count-badge"
+            >
+              {terminatedBots.length} / {TERMINATED_CAP}
+            </span>
+            <button
+              type="button"
+              onClick={() => setConfirmClearAll(true)}
+              disabled={terminatedBots.length === 0 || clearTerminated.isPending}
+              data-testid="terminated-bots-clear-all"
+              className="rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+            >
+              Clear all
+            </button>
+          </div>
+        </div>
+        <div className="border-t border-neutral-200 dark:border-slate-700">
+          <TerminatedBotsTable bots={terminatedBots} onToast={(t) => toast.push(t)} />
+        </div>
+      </section>
+
+      <ConfirmDialog
+        open={confirmClearAll}
+        title="Clear all terminated bots?"
+        body={`Drop ${terminatedBots.length} terminated bot${
+          terminatedBots.length === 1 ? "" : "s"
+        } from the registry. Their logs will no longer be available afterwards.`}
+        confirmLabel="Clear all"
+        destructive
+        onCancel={() => setConfirmClearAll(false)}
+        onConfirm={() => {
+          setConfirmClearAll(false);
+          clearTerminated.mutate();
+        }}
+      />
 
       <ToastShelf entries={toast.entries} onDismiss={toast.dismiss} />
     </div>

@@ -40,6 +40,15 @@ export interface BotSnapshot {
    * omits the field — the table renders that as "local".
    */
   host?: BotHostKind;
+  /**
+   * Wall-clock timestamp (ms since epoch) when the bot transitioned to
+   * `done` / `failed`. `null` while the bot is still running. Used by
+   * the Terminated Bots table to sort newest-first and to render a
+   * relative timestamp ("X minutes ago"). Optional for back-compat
+   * with older servers that omit the field; the UI treats missing as
+   * `null`.
+   */
+  finishedAt?: number | null;
 }
 
 export interface BotListResponse {

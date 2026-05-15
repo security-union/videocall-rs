@@ -8,6 +8,7 @@ import {
   shortBotId,
   snapshotEntry,
   sweepStaleEntries,
+  TERMINATED_REGISTRY_CAP,
 } from "./registry";
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -92,9 +93,28 @@ describe("snapshotEntry", () => {
     expect(snap).not.toHaveProperty("handle");
     expect(snap).not.toHaveProperty("task");
   });
+  it("emits finishedAt=null while the bot is running", () => {
+    const e = newRegistryEntry(fakeTask());
+    e.status = "in-meeting";
+    const snap = snapshotEntry(e);
+    expect(snap.finishedAt).toBeNull();
+  });
+  it("emits the finishedAt timestamp once the entry transitions to done", () => {
+    const e = newRegistryEntry(fakeTask());
+    e.status = "done";
+    e.finishedAt = 1_234_567;
+    const snap = snapshotEntry(e);
+    expect(snap.finishedAt).toBe(1_234_567);
+  });
 });
 
 describe("sweepStaleEntries", () => {
+  it("uses a 1-hour retention window", () => {
+    // The Terminated Bots section relies on this being long enough to
+    // be useful for post-mortem inspection. Lock it down to catch
+    // accidental tightening back to the legacy 60s.
+    expect(REGISTRY_RETENTION_MS).toBe(3_600_000);
+  });
   it("drops done entries older than the retention window", () => {
     const reg = new Map();
     const e = newRegistryEntry(fakeTask());
@@ -104,11 +124,30 @@ describe("sweepStaleEntries", () => {
     sweepStaleEntries(reg);
     expect(reg.size).toBe(0);
   });
-  it("keeps done entries within the retention window", () => {
+  it("retains a done entry for the full 1-hour window", () => {
     const reg = new Map();
     const e = newRegistryEntry(fakeTask());
     e.status = "done";
-    e.finishedAt = Date.now() - 1_000;
+    // 59 minutes after finish — still inside the window.
+    e.finishedAt = Date.now() - 59 * 60_000;
+    reg.set(e.botId, e);
+    sweepStaleEntries(reg);
+    expect(reg.size).toBe(1);
+  });
+  it("drops failed entries older than the retention window", () => {
+    const reg = new Map();
+    const e = newRegistryEntry(fakeTask());
+    e.status = "failed";
+    e.finishedAt = Date.now() - REGISTRY_RETENTION_MS - 1_000;
+    reg.set(e.botId, e);
+    sweepStaleEntries(reg);
+    expect(reg.size).toBe(0);
+  });
+  it("retains a failed entry for the full 1-hour window", () => {
+    const reg = new Map();
+    const e = newRegistryEntry(fakeTask());
+    e.status = "failed";
+    e.finishedAt = Date.now() - 59 * 60_000;
     reg.set(e.botId, e);
     sweepStaleEntries(reg);
     expect(reg.size).toBe(1);
@@ -120,5 +159,70 @@ describe("sweepStaleEntries", () => {
     reg.set(e.botId, e);
     sweepStaleEntries(reg);
     expect(reg.size).toBe(1);
+  });
+  it("never drops in-flight entries even when the registry is over the cap", () => {
+    const reg = new Map();
+    // 100 terminated + 5 running. The running ones must survive.
+    const baseFinish = Date.now() - 5_000;
+    for (let i = 0; i < TERMINATED_REGISTRY_CAP + 50; i++) {
+      const e = newRegistryEntry(fakeTask());
+      e.status = "done";
+      e.finishedAt = baseFinish - i;
+      reg.set(e.botId, e);
+    }
+    const runningIds: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const e = newRegistryEntry(fakeTask());
+      e.status = "in-meeting";
+      reg.set(e.botId, e);
+      runningIds.push(e.botId);
+    }
+    sweepStaleEntries(reg);
+    for (const id of runningIds) {
+      expect(reg.has(id)).toBe(true);
+    }
+  });
+  it("evicts oldest-finished terminated entries when over the cap", () => {
+    const reg = new Map();
+    const now = Date.now();
+    const youngestIds: string[] = [];
+    const oldestIds: string[] = [];
+    // 30 over-cap "old" entries — these should get dropped.
+    for (let i = 0; i < 30; i++) {
+      const e = newRegistryEntry(fakeTask());
+      e.status = "done";
+      // Old, but still inside the retention window.
+      e.finishedAt = now - 10 * 60_000 - i;
+      reg.set(e.botId, e);
+      oldestIds.push(e.botId);
+    }
+    // 100 "young" entries — these should be preserved.
+    for (let i = 0; i < TERMINATED_REGISTRY_CAP; i++) {
+      const e = newRegistryEntry(fakeTask());
+      e.status = "done";
+      e.finishedAt = now - 1_000 - i;
+      reg.set(e.botId, e);
+      youngestIds.push(e.botId);
+    }
+    sweepStaleEntries(reg, now);
+    expect(reg.size).toBe(TERMINATED_REGISTRY_CAP);
+    for (const id of youngestIds) {
+      expect(reg.has(id)).toBe(true);
+    }
+    for (const id of oldestIds) {
+      expect(reg.has(id)).toBe(false);
+    }
+  });
+  it("does not evict when under the cap", () => {
+    const reg = new Map();
+    const now = Date.now();
+    for (let i = 0; i < TERMINATED_REGISTRY_CAP - 1; i++) {
+      const e = newRegistryEntry(fakeTask());
+      e.status = "done";
+      e.finishedAt = now - 1_000;
+      reg.set(e.botId, e);
+    }
+    sweepStaleEntries(reg, now);
+    expect(reg.size).toBe(TERMINATED_REGISTRY_CAP - 1);
   });
 });

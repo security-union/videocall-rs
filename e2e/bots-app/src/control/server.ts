@@ -728,6 +728,13 @@ async function route(
     }
   }
 
+  // Bulk-drop of terminated entries. MUST be matched before the
+  // `/bots/:id` regex below — otherwise "terminated" gets parsed as a
+  // bot id and the request 404s on `requireBot`.
+  if (method === "DELETE" && pathname === "/bots/terminated") {
+    return clearTerminatedBots(surface);
+  }
+
   const botPath = /^\/bots\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
   if (botPath) {
     const botId = decodeURIComponent(botPath[1]);
@@ -1009,9 +1016,36 @@ async function leaveBot(surface: OrchestratorControlSurface, botId: string): Pro
 }
 
 async function killBot(surface: OrchestratorControlSurface, botId: string): Promise<RouteResult> {
-  requireBot(surface, botId);
+  const entry = requireBot(surface, botId);
+  // Terminated bots have nothing to kill. The dashboard's Terminated
+  // Bots row reuses this endpoint as a "drop from registry" action, so
+  // treat it as idempotent: remove the entry and return 200. The
+  // running path still 202s through `forceKill` below.
+  if (entry.status === "done" || entry.status === "failed") {
+    surface.getRegistry().delete(botId);
+    return { status: 200, body: { botId, action: "drop", removed: true } };
+  }
   await surface.forceKill(botId);
   return { status: 202, body: { botId, action: "kill" } };
+}
+
+/**
+ * Drop every `done` / `failed` entry from the registry. Idempotent;
+ * returns the number of entries removed. Backs the dashboard's
+ * Terminated Bots "Clear all" button.
+ *
+ * Running entries are left untouched.
+ */
+function clearTerminatedBots(surface: OrchestratorControlSurface): RouteResult {
+  const registry = surface.getRegistry();
+  let removedCount = 0;
+  for (const [id, entry] of registry) {
+    if (entry.status === "done" || entry.status === "failed") {
+      registry.delete(id);
+      removedCount += 1;
+    }
+  }
+  return { status: 200, body: { removedCount } };
 }
 
 function applyTtl(

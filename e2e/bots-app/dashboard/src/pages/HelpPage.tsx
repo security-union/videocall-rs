@@ -43,7 +43,7 @@ export function HelpPage() {
         </ul>
       </Section>
 
-      <Section title="Network profiles">
+      <Section title="Network Conditions">
         <p className="mb-3 text-sm text-neutral-700 dark:text-slate-300">
           Simulated network conditions applied via <Code>?netsim=&lt;profile&gt;</Code>. Requires
           the client to be built with <Code>--features netsim</Code>.

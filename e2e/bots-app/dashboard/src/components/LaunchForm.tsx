@@ -17,6 +17,7 @@ import {
   NETSIM_PRESETS,
   RUN_LOCATIONS,
   TTL_SUGGESTIONS,
+  networkLabel,
   type AuthBackend,
   type RunLocation,
 } from "../lib/constants";
@@ -709,10 +710,10 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
             </Field>
 
             <Field
-              label="Network profile"
+              label="Network Conditions"
               error={errors.network}
               help={
-                <HelpPopover fieldLabel="Network profile" testId="help-network">
+                <HelpPopover fieldLabel="Network Conditions" testId="help-network">
                   <p>Simulated network conditions applied client-side.</p>
                   <p className="mt-1">
                     Requires{" "}
@@ -726,7 +727,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               <Select
                 value={values.network}
                 onValueChange={(v) => setField("network", v)}
-                options={NETSIM_PRESETS.map((p) => ({ value: p, label: p }))}
+                options={NETSIM_PRESETS.map((p) => ({ value: p, label: networkLabel(p) }))}
                 testId="network"
               />
             </Field>

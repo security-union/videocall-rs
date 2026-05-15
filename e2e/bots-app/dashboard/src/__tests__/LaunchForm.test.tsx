@@ -132,6 +132,80 @@ describe("<LaunchForm />", () => {
     expect(screen.queryByTestId("storage-state-file")).not.toBeInTheDocument();
   });
 
+  it("renders the network field with the 'Network Conditions' label", () => {
+    renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // The Field component renders the label as a sibling of the
+    // Select trigger; locating it by text is the closest analogue of
+    // "the user reads the label". The legacy spelling "Network
+    // profile" must be gone.
+    expect(screen.getByText("Network Conditions")).toBeInTheDocument();
+    expect(screen.queryByText("Network profile")).not.toBeInTheDocument();
+  });
+
+  it("renders the passthrough preset as 'as is' on the Network Conditions select trigger", () => {
+    // The form's DEFAULT_VALUES.network is "none" — the passthrough
+    // preset. With the display-only mapping in place the trigger
+    // should surface it as "as is" while the underlying value
+    // remains "none".
+    renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
+    expect(screen.getByTestId("network")).toHaveTextContent("as is");
+    expect(screen.getByTestId("network")).not.toHaveTextContent(/^none$/);
+  });
+
+  it("sends 'none' (not 'as is') to the server when the passthrough preset is selected", async () => {
+    // Display-only mapping: the rendered trigger says "as is", but
+    // the launch payload's `network` field must still carry the
+    // raw preset string the server understands.
+    let captured: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === "/api/assets/manifest") {
+          return new Response(JSON.stringify({ participants: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.startsWith("/api/assets")) {
+          return new Response(JSON.stringify({ files: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: true,
+              capturedAt: Date.now(),
+              ageHours: 1,
+              size: 1024,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/launch") {
+          captured = JSON.parse(init?.body as string);
+          return new Response(
+            JSON.stringify({ botId: "00000000-0000-0000-0000-000000000000" }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    renderWithClient(<LaunchForm onLaunched={vi.fn()} onError={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/TonyBots" },
+    });
+    fireEvent.change(screen.getByTestId("participant"), { target: { value: "alice" } });
+    fireEvent.click(screen.getByTestId("launch-button"));
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    expect((captured as { network?: string } | null)?.network).toBe("none");
+  });
+
   it("renders per-field help triggers", () => {
     renderWithClient(<LaunchForm onLaunched={() => {}} onError={() => {}} />);
     // A representative subset — these are the ARIA-described controls.

@@ -16,7 +16,7 @@ import {
 
 import { api, DashboardApiError } from "../api/client";
 import type { BotSnapshot, SshHost } from "../api/types";
-import { badgeForBot, STATUS_BADGE_CLASS } from "../lib/constants";
+import { badgeForBot, networkLabel, STATUS_BADGE_CLASS } from "../lib/constants";
 import { formatRemaining } from "../lib/ttl";
 import type { ToastEntry } from "./ToastShelf";
 import { ExtendTtlDialog } from "./ExtendTtlDialog";
@@ -315,7 +315,7 @@ export function RunningBotsTable({
                     {formatRemaining(b.ttlRemainingMs)}
                   </td>
                   <td className="px-4 py-2 text-xs text-neutral-600 dark:text-slate-400">
-                    {b.network ?? "—"}
+                    {b.network ? networkLabel(b.network) : "—"}
                   </td>
                   <td className="px-4 py-2">
                     <div className="flex justify-end gap-1">

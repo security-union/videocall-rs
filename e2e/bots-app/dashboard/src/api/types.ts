@@ -404,6 +404,27 @@ export interface SshHost {
   sshKey: string | null;
   reposPath: string;
   notes: string | null;
+  /**
+   * Shell name (`bash`, `zsh`, `sh`) or absolute path used for the
+   * outer `<shell> -lc …` wrapper. `null` defaults to `bash`.
+   */
+  shell: string | null;
+  /**
+   * Profile file sourced on the remote BEFORE the bot command runs.
+   * Emitted as `[ -f <profileFile> ] && . <profileFile>;` so a missing
+   * file is a silent no-op. `null` suppresses the source line entirely.
+   * Defaults are inferred from {@link shell} client-side: bash →
+   * `~/.bash_profile`, zsh → `~/.zshrc`.
+   */
+  profileFile: string | null;
+  /**
+   * Free-form pre-command run AFTER sourcing the profile and BEFORE
+   * the `cd && npm run …` chain. Used for nvm version pinning, PATH
+   * exports, etc. Terminated with `;` in the emitted prefix so a
+   * non-zero exit doesn't abort the bot launch.
+   * See `e2e/bots-app/src/control/ssh-hosts.ts` for validation rules.
+   */
+  preCommand: string | null;
   addedAt: number;
 }
 
@@ -418,6 +439,9 @@ export interface AddSshHostRequest {
   sshKey?: string | null;
   reposPath: string;
   notes?: string | null;
+  shell?: string | null;
+  profileFile?: string | null;
+  preCommand?: string | null;
 }
 
 export interface UpdateSshHostRequest {
@@ -426,6 +450,9 @@ export interface UpdateSshHostRequest {
   sshKey?: string | null;
   reposPath?: string;
   notes?: string | null;
+  shell?: string | null;
+  profileFile?: string | null;
+  preCommand?: string | null;
 }
 
 export interface TestSshHostResponse {
@@ -465,6 +492,34 @@ export interface SshPreviewLaunchResponse {
   display: string;
   remoteCommand: string;
 }
+
+/**
+ * Body shape for `POST /api/hosts/preview` — preview the SSH command
+ * for an UNSAVED host config (used by the Add/Edit Host dialog's live
+ * preview so the operator sees what command will run BEFORE saving).
+ * The `launchSpec` slot lets callers override the default placeholder
+ * tokens (`<participant>`, `<meeting-url>`, etc.) when they have real
+ * values to render.
+ */
+export interface SshPreviewHostRequest {
+  host: AddSshHostRequest;
+  launchSpec?: {
+    meetingURL?: string;
+    participant?: string;
+    displayName?: string;
+    ttl?: string;
+    network?: string;
+    authBackend?: string;
+  };
+}
+
+/**
+ * Response shape for `POST /api/hosts/preview`. Same triple as
+ * {@link SshPreviewLaunchResponse} — the `display` field is the
+ * single-line human-readable rendering the dashboard surfaces in
+ * the Add/Edit Host dialog's "Sample command" card.
+ */
+export type SshPreviewHostResponse = SshPreviewLaunchResponse;
 
 export interface BotLogResponse {
   lines: string[];

@@ -148,13 +148,24 @@ export function SshCommandPreview({
         <span>SSH command preview</span>
         <HelpPopover fieldLabel="SSH command preview" testId={`${testIdPrefix}-help`}>
           <p>
-            Shows the exact <code className="font-mono text-[11px]">ssh</code> command the
-            dashboard will run when you click Launch.
+            Shows the exact <code className="font-mono text-[11px]">ssh</code> command the dashboard
+            will run when you click Launch.
           </p>
           <p className="mt-1">
-            Useful for debugging connection issues — copy-paste this into a terminal to
-            reproduce manually. The same command is also recorded as the first line of the
-            bot&apos;s log after launch.
+            Useful for debugging connection issues — copy-paste this into a terminal to reproduce
+            manually. The same command is also recorded as the first line of the bot&apos;s log
+            after launch.
+          </p>
+          <p className="mt-1">
+            The remote command is wrapped in{" "}
+            <code className="font-mono text-[11px]">&lt;shell&gt; -lc</code> (default{" "}
+            <code className="font-mono text-[11px]">bash</code>) and optionally sources the
+            host&apos;s <strong>profile file</strong> (default{" "}
+            <code className="font-mono text-[11px]">~/.bash_profile</code> for bash) so the
+            operator&apos;s PATH loads on the remote. If{" "}
+            <code className="font-mono text-[11px]">npm</code> needs extra setup (e.g.{" "}
+            <code className="font-mono text-[11px]">nvm use 22</code>), use the host&apos;s
+            <strong> Pre-command</strong> field (Tools → Remote Hosts → Edit).
           </p>
           <p className="mt-1">
             Auto-prime runs locally only; SSH-hosted bots need assets pre-existing on the

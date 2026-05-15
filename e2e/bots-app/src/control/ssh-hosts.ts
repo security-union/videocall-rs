@@ -50,6 +50,21 @@ const USER_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
 // not a shell, but defense-in-depth still applies for misconfigured
 // downstream consumers).
 const HOST_FORBIDDEN_RE = /[\s'"`$;&|<>(){}\\]/;
+// Per-host shell choice. Bare names like `bash`, `zsh`, `sh` or absolute
+// paths like `/opt/homebrew/bin/zsh` are allowed; shell metacharacters
+// are rejected so the resulting `<shell> -lc …` token is safe to embed
+// in the SSH wrapper.
+const SHELL_PATTERN = /^[A-Za-z0-9_/.-]{1,128}$/;
+// Profile file (e.g. `~/.bash_profile`, `~/.zshrc`). Allows `~` prefix,
+// alphanumerics, `_`, `.`, `-`, and `/`. Rejects whitespace and shell
+// metacharacters to keep the `[ -f <path> ] && . <path>` source line safe.
+const PROFILE_FILE_PATTERN = /^[~/A-Za-z0-9_./-]{1,256}$/;
+/**
+ * Default shell name when the host's `shell` field is unset. `bash`
+ * gives us a POSIX-defined login-shell init chain that reliably reads
+ * `~/.bash_profile` regardless of the operator's default shell.
+ */
+export const DEFAULT_SHELL = "bash";
 
 export interface SshHost {
   label: string;
@@ -59,6 +74,35 @@ export interface SshHost {
   sshKey: string | null;
   reposPath: string;
   notes: string | null;
+  /**
+   * Shell to run on the remote host. Either a bare shell name
+   * (`bash`, `zsh`, `sh`) or an absolute path. The outer SSH wrapper
+   * becomes `<shell> -lc '<inner>'`. When `null` defaults to {@link
+   * DEFAULT_SHELL} (`bash`) — bash has a POSIX-defined login-shell
+   * init chain that reliably sources `~/.bash_profile`.
+   */
+  shell: string | null;
+  /**
+   * Profile file the remote shell sources BEFORE the bot command runs.
+   * Emitted as `[ -f <profileFile> ] && . <profileFile>;` so a missing
+   * file is a silent no-op. When `null` no source line is emitted.
+   * Common defaults inferred client-side: `~/.bash_profile` for bash,
+   * `~/.zshrc` for zsh.
+   */
+  profileFile: string | null;
+  /**
+   * Optional pre-command string included AFTER sourcing the profile
+   * and BEFORE the `cd && npm run …` chain. Free-form bash; we trust
+   * the operator (they already have full shell access on the remote).
+   *
+   * Examples:
+   *   ". ~/.nvm/nvm.sh && nvm use 22"
+   *   "export PATH=$HOME/.local/bin:$PATH"
+   *
+   * Terminated with `;` in the emitted prefix so a non-zero exit
+   * doesn't abort the bot launch.
+   */
+  preCommand: string | null;
   addedAt: number;
 }
 
@@ -69,6 +113,9 @@ export interface SshHostInput {
   sshKey?: string | null;
   reposPath: string;
   notes?: string | null;
+  shell?: string | null;
+  profileFile?: string | null;
+  preCommand?: string | null;
 }
 
 export interface SshHostPatch {
@@ -77,6 +124,9 @@ export interface SshHostPatch {
   sshKey?: string | null;
   reposPath?: string;
   notes?: string | null;
+  shell?: string | null;
+  profileFile?: string | null;
+  preCommand?: string | null;
 }
 
 export class SshHostValidationError extends Error {
@@ -203,6 +253,24 @@ export async function updateHost(
         : patch.notes === null || patch.notes === ""
           ? null
           : validateNotesField(patch.notes),
+    shell:
+      patch.shell === undefined
+        ? existing.shell
+        : patch.shell === null || patch.shell === ""
+          ? null
+          : validateShellField(patch.shell),
+    profileFile:
+      patch.profileFile === undefined
+        ? existing.profileFile
+        : patch.profileFile === null || patch.profileFile === ""
+          ? null
+          : validateProfileFileField(patch.profileFile),
+    preCommand:
+      patch.preCommand === undefined
+        ? existing.preCommand
+        : patch.preCommand === null || patch.preCommand === ""
+          ? null
+          : validatePreCommandField(patch.preCommand),
   };
   const next = [...all];
   next[idx] = merged;
@@ -301,9 +369,82 @@ export function buildSshArgsForProbe(host: SshHost): string[] {
  * Build the argv for a real bot launch over SSH. The remote command is
  * a single token (single-line bash) — every dynamic substring is
  * shell-escaped via {@link shellEscape}.
+ *
+ * The inner command is wrapped in `<shell> -lc <escaped>` so the remote
+ * runs as a **login shell**. `<shell>` is the host's `shell` field
+ * (default `bash`). Operators on zsh-default macOS hosts whose nvm
+ * lives in `~/.bash_profile` should leave `shell = bash` (the default);
+ * operators whose PATH lives in `~/.zshrc` can pick `shell = zsh` and
+ * set `profileFile = ~/.zshrc`.
+ *
+ * The prefix prepended to the cd/npm chain is:
+ *
+ *   <[ -f profileFile ] && . profileFile>;  <preCommand>;
+ *
+ * Either half may be omitted when the corresponding host field is
+ * null/empty. Both clauses are terminated with `;` (not `&&`) so the
+ * rest of the chain runs even when the prior command exits non-zero.
+ *
+ * See {@link buildRemoteCommandPrefix} for the prefix builder details.
  */
 export function buildSshArgsForLaunch(host: SshHost, remoteCmd: string): string[] {
-  return [...buildBaseSshArgs(host, { connectTimeout: 10 }), remoteCmd];
+  const prefix = buildRemoteCommandPrefix(host);
+  const inner = `${prefix}${remoteCmd}`;
+  const shell = host.shell !== null && host.shell !== "" ? host.shell : DEFAULT_SHELL;
+  const wrapped = `${shell} -lc ${shellEscape(inner)}`;
+  return [...buildBaseSshArgs(host, { connectTimeout: 10 }), wrapped];
+}
+
+/**
+ * Build the remote-command prefix prepended to the `cd <reposPath>/e2e
+ * && npm run …` chain. The shape is `<source>; <preCommand>; ` where:
+ *
+ *   - `<source>` = `[ -f <profileFile> ] && . <profileFile>` when
+ *     `host.profileFile` is set; omitted otherwise.
+ *   - `<preCommand>` = `host.preCommand` literal; omitted when null.
+ *
+ * Returns an empty string when neither field is set. The trailing
+ * space-after-semicolon shape keeps the joined result readable when
+ * concatenated with the cd/npm chain.
+ *
+ * Examples:
+ *
+ *   profileFile=~/.bash_profile, preCommand=null
+ *     → "[ -f ~/.bash_profile ] && . ~/.bash_profile; "
+ *
+ *   profileFile=~/.zshrc, preCommand=". ~/.nvm/nvm.sh && nvm use 22"
+ *     → "[ -f ~/.zshrc ] && . ~/.zshrc; . ~/.nvm/nvm.sh && nvm use 22; "
+ *
+ *   profileFile=null, preCommand=null
+ *     → ""
+ */
+export function buildRemoteCommandPrefix(host: SshHost): string {
+  const parts: string[] = [];
+  if (host.profileFile !== null && host.profileFile !== "") {
+    parts.push(`[ -f ${host.profileFile} ] && . ${host.profileFile}`);
+  }
+  if (host.preCommand !== null && host.preCommand !== "") {
+    // Trim any trailing terminators the operator may have typed.
+    parts.push(host.preCommand.replace(/[\s;&]+$/, ""));
+  }
+  if (parts.length === 0) return "";
+  return parts.join("; ") + "; ";
+}
+
+/**
+ * Compute the default profile file for a given shell name. Applied
+ * client-side as a hint when the operator picks a shell in the Add
+ * Host dialog; persistence accepts whatever the operator submits
+ * (including `null` to suppress the source line entirely).
+ *
+ * Returns `null` for shells without a well-known convention (POSIX
+ * `sh`, custom absolute paths).
+ */
+export function defaultProfileFileForShell(shell: string | null): string | null {
+  if (shell === null || shell === "") return "~/.bash_profile";
+  if (shell === "bash") return "~/.bash_profile";
+  if (shell === "zsh") return "~/.zshrc";
+  return null;
 }
 
 function buildBaseSshArgs(host: SshHost, opts: { connectTimeout: number }): string[] {
@@ -435,6 +576,20 @@ async function persist(runDir: string, hosts: SshHost[]): Promise<void> {
   }
 }
 
+/**
+ * Validate + materialize a host row from an input spec WITHOUT
+ * persisting. Used by the `/hosts/preview` endpoint to validate
+ * unsaved host configs the same way `addHost` would. Reuses
+ * {@link buildHost} so the validation rules can never drift.
+ *
+ * The `addedAt` timestamp is set to `0` since the row never lands on
+ * disk; callers that need a real timestamp should call `addHost`
+ * instead.
+ */
+export function buildHostForPreview(spec: SshHostInput): SshHost {
+  return buildHost(spec, 0);
+}
+
 function buildHost(spec: SshHostInput, now: number): SshHost {
   return {
     label: validateLabelField(spec.label),
@@ -449,6 +604,18 @@ function buildHost(spec: SshHostInput, now: number): SshHost {
       spec.notes === undefined || spec.notes === null || spec.notes === ""
         ? null
         : validateNotesField(spec.notes),
+    shell:
+      spec.shell === undefined || spec.shell === null || spec.shell === ""
+        ? null
+        : validateShellField(spec.shell),
+    profileFile:
+      spec.profileFile === undefined || spec.profileFile === null || spec.profileFile === ""
+        ? null
+        : validateProfileFileField(spec.profileFile),
+    preCommand:
+      spec.preCommand === undefined || spec.preCommand === null || spec.preCommand === ""
+        ? null
+        : validatePreCommandField(spec.preCommand),
     addedAt: now,
   };
 }
@@ -467,6 +634,22 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
     o.sshKey === undefined || o.sshKey === null ? null : expectString(o.sshKey, `${where}.sshKey`);
   const notes =
     o.notes === undefined || o.notes === null ? null : expectString(o.notes, `${where}.notes`);
+  // Structured shell config. `shell`, `profileFile`, `preCommand` are
+  // forward-compat optional fields — older registries (and any host
+  // file the operator may have created during the previous `shellInit`
+  // iteration of this PR) simply lack the keys, which load as `null`.
+  // Any unknown fields (including legacy `shellInit`) are silently
+  // ignored — no migration logic, just drop and move on.
+  const shell =
+    o.shell === undefined || o.shell === null ? null : expectString(o.shell, `${where}.shell`);
+  const profileFile =
+    o.profileFile === undefined || o.profileFile === null
+      ? null
+      : expectString(o.profileFile, `${where}.profileFile`);
+  const preCommand =
+    o.preCommand === undefined || o.preCommand === null
+      ? null
+      : expectString(o.preCommand, `${where}.preCommand`);
   // Run the same regex/path checks on the stored row — if a malicious
   // operator hand-edited hosts.json to inject shell metacharacters or
   // a relative path, we refuse to load it.
@@ -477,6 +660,11 @@ function validateStoredHost(entry: unknown, where: string): SshHost {
     sshKey: sshKey === null ? null : validateSshKeyField(sshKey, { mustExist: false }),
     reposPath: validateReposPathField(reposPath),
     notes: notes === null ? null : validateNotesField(notes),
+    shell: shell === null || shell === "" ? null : validateShellField(shell),
+    profileFile:
+      profileFile === null || profileFile === "" ? null : validateProfileFileField(profileFile),
+    preCommand:
+      preCommand === null || preCommand === "" ? null : validatePreCommandField(preCommand),
     addedAt,
   };
 }
@@ -576,6 +764,78 @@ export function validateNotesField(raw: string): string {
   }
   if (raw.length > 2048) {
     throw new SshHostValidationError(`notes too long (max 2048 chars)`);
+  }
+  return raw;
+}
+
+/**
+ * Validate the remote `shell` field. Accepts bare shell names
+ * (`bash`, `zsh`, `sh`, `fish`) or absolute paths
+ * (`/opt/homebrew/bin/zsh`). Rejects shell metacharacters so the
+ * `<shell> -lc …` wrapper is safe to embed.
+ */
+export function validateShellField(raw: string): string {
+  if (raw === "") {
+    throw new SshHostValidationError(`shell must be a non-empty string when provided`);
+  }
+  if (raw.includes("\0")) {
+    throw new SshHostValidationError(`shell must not contain NUL bytes`);
+  }
+  if (!SHELL_PATTERN.test(raw)) {
+    throw new SshHostValidationError(`shell must match ${SHELL_PATTERN.source} (got "${raw}")`);
+  }
+  return raw;
+}
+
+/**
+ * Validate the remote `profileFile` field. Accepts `~`-prefixed or
+ * absolute paths (`~/.bash_profile`, `~/.zshrc`, `/etc/profile`).
+ * Rejects shell metacharacters and whitespace so the
+ * `[ -f <path> ] && . <path>` source line is safe to embed.
+ */
+export function validateProfileFileField(raw: string): string {
+  if (raw === "") {
+    throw new SshHostValidationError(`profileFile must be a non-empty string when provided`);
+  }
+  if (raw.includes("\0")) {
+    throw new SshHostValidationError(`profileFile must not contain NUL bytes`);
+  }
+  if (!PROFILE_FILE_PATTERN.test(raw)) {
+    throw new SshHostValidationError(
+      `profileFile must match ${PROFILE_FILE_PATTERN.source} (got "${raw}")`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Validate a free-form `preCommand` snippet. The field is
+ * operator-supplied bash that runs after sourcing the profile and
+ * before the `cd && npm` chain, so we do not try to sandbox it — the
+ * operator already has full shell access to the remote via the SSH
+ * login they configured. We only reject input that is obviously
+ * garbage: NUL bytes, newlines/CRs (the launch command is single-line
+ * bash; embedded newlines would break the argv-quoting contract), and
+ * overlong values.
+ *
+ * Maximum length is 512 chars — enough for a chained
+ * `. ~/.nvm/nvm.sh && nvm use 22 && export PATH=…` recipe but
+ * nowhere near enough to hide a full payload.
+ */
+export function validatePreCommandField(raw: string): string {
+  if (raw === "") {
+    throw new SshHostValidationError(`preCommand must be a non-empty string when provided`);
+  }
+  if (raw.includes("\0")) {
+    throw new SshHostValidationError(`preCommand must not contain NUL bytes`);
+  }
+  if (/[\r\n]/.test(raw)) {
+    throw new SshHostValidationError(
+      `preCommand must not contain newline or carriage-return characters`,
+    );
+  }
+  if (raw.length > 512) {
+    throw new SshHostValidationError(`preCommand too long (max 512 chars)`);
   }
   return raw;
 }

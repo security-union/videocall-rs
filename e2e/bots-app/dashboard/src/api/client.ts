@@ -27,6 +27,8 @@ import type {
   SaveProfileRequest,
   SshHost,
   SshHostsResponse,
+  SshPreviewHostRequest,
+  SshPreviewHostResponse,
   SshPreviewLaunchRequest,
   SshPreviewLaunchResponse,
   SsoRecaptureCancelResponse,
@@ -272,6 +274,19 @@ export const api = {
     request<SshPreviewLaunchResponse>(
       "POST",
       `/api/hosts/${encodeURIComponent(label)}/preview-launch`,
+      req as unknown as Record<string, unknown>,
+    ),
+  /**
+   * Preview the SSH command for an UNSAVED host config — used by the
+   * Add/Edit Host dialog's live preview so the operator sees what
+   * command will run BEFORE saving. Body wraps the host config under
+   * `host`; the launch params are placeholder tokens unless callers
+   * pass an explicit `launchSpec` override.
+   */
+  previewSshHost: (req: SshPreviewHostRequest): Promise<SshPreviewHostResponse> =>
+    request<SshPreviewHostResponse>(
+      "POST",
+      "/api/hosts/preview",
       req as unknown as Record<string, unknown>,
     ),
 

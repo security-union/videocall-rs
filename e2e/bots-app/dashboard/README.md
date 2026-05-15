@@ -136,6 +136,28 @@ Launch form can target. Each row is persisted to `<runDir>/hosts.json` (mode
 `0o600`); credentials are sourced from your local `ssh-agent` and
 `~/.ssh/config` — the dashboard does not store private-key material.
 
+The remote command is wrapped in `<shell> -lc` so it runs as a login shell on
+the remote. `<shell>` is chosen per-host via the **Shell** radio in the Add /
+Edit Host dialog (`bash` / `zsh` / `sh` / a custom absolute path); it defaults
+to `bash` because `bash -l` has a POSIX-defined login-shell init chain that
+reliably sources `~/.bash_profile`. Each host also carries two complementary
+fields that further shape the wrapper payload:
+
+- **Profile file** — the path sourced via `[ -f <path> ] && . <path>;` before
+  the bot command runs. Defaults are inferred from the chosen shell:
+  `bash` → `~/.bash_profile`, `zsh` → `~/.zshrc`. The `[ -f … ] &&` guard
+  makes the prefix safe on hosts that lack the file; the trailing `;` (not
+  `&&`) keeps the chain running even if the source returns non-zero.
+- **Pre-command** — free-form bash run AFTER sourcing the profile but BEFORE
+  the `cd && npm run …` chain. Use this for `nvm` version pinning
+  (`. ~/.nvm/nvm.sh && nvm use 22`), `PATH` exports, etc. Max 512 chars, no
+  embedded newlines.
+
+The Add / Edit Host dialog includes a **Sample command** preview that posts
+the unsaved host config to `POST /api/hosts/preview` (200ms debounce) and
+renders the resulting `ssh …` invocation so you can see exactly what will run
+before saving.
+
 v1 limitations:
 
 - **Asset sync is not performed.** Remote bots fall back to Chrome's default

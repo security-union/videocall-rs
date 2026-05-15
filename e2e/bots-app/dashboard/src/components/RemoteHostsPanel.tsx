@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Pencil, PlugZap, Server, Trash2, X } from "lucide-react";
+import { Check, Copy, Pencil, PlugZap, Server, Terminal, Trash2, X } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type {
   AddSshHostRequest,
   SshHost,
+  SshPreviewHostRequest,
   TestSshHostResponse,
   UpdateSshHostRequest,
 } from "../api/types";
@@ -23,6 +24,39 @@ import { HelpPopover } from "./ui/HelpPopover";
 const LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,62}$/;
 const USER_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
 const HOST_FORBIDDEN_RE = /[\s'"`$;&|<>(){}\\]/;
+const SHELL_PATTERN = /^[A-Za-z0-9_/.-]{1,128}$/;
+const PROFILE_FILE_PATTERN = /^[~/A-Za-z0-9_./-]{1,256}$/;
+
+/**
+ * Debounce window for the live preview fetch. Long enough to absorb
+ * keystroke-by-keystroke edits to the form's text inputs; short enough
+ * that the preview catches up once the operator pauses typing.
+ */
+const PREVIEW_DEBOUNCE_MS = 200;
+
+/**
+ * Default profile file mirrored from {@link defaultProfileFileForShell}
+ * in `ssh-hosts.ts`. Applied client-side as a hint when the operator
+ * picks a shell; not enforced server-side (operators can override).
+ */
+function defaultProfileFileForShell(shell: string): string {
+  if (shell === "bash") return "~/.bash_profile";
+  if (shell === "zsh") return "~/.zshrc";
+  return "";
+}
+
+/**
+ * Shell choices surfaced as radio options in the Add/Edit Host dialog.
+ * `custom` switches the shell input into a free-form text field where
+ * the operator can paste an absolute path (e.g. `/opt/homebrew/bin/zsh`).
+ */
+const SHELL_OPTIONS = [
+  { value: "bash", label: "bash" },
+  { value: "zsh", label: "zsh" },
+  { value: "sh", label: "sh" },
+  { value: "custom", label: "Custom path" },
+] as const;
+type ShellOptionValue = (typeof SHELL_OPTIONS)[number]["value"];
 
 interface RemoteHostsPanelProps {
   onToast: (t: Omit<ToastEntry, "id">) => void;
@@ -319,6 +353,9 @@ export function RemoteHostsPanel({ onToast }: RemoteHostsPanelProps) {
             sshKey: payload.sshKey ?? null,
             reposPath: payload.reposPath,
             notes: payload.notes ?? null,
+            shell: payload.shell ?? null,
+            profileFile: payload.profileFile ?? null,
+            preCommand: payload.preCommand ?? null,
           };
           updateMutation.mutate({ label: editHost.label, patch });
         }}
@@ -355,6 +392,15 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
   const [sshKey, setSshKey] = useState(initial?.sshKey ?? "");
   const [reposPath, setReposPath] = useState(initial?.reposPath ?? "");
   const [notes, setNotes] = useState(initial?.notes ?? "");
+  // The shell selection is a radio between bare names + a `custom`
+  // mode that exposes a free-form text input. We track the radio
+  // choice and the custom-path string separately so toggling between
+  // `custom` and a bare name doesn't clobber the operator's pasted
+  // path.
+  const [shellChoice, setShellChoice] = useState<ShellOptionValue>("bash");
+  const [shellCustom, setShellCustom] = useState("");
+  const [profileFile, setProfileFile] = useState("");
+  const [preCommand, setPreCommand] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   // Re-seed inputs when the dialog opens or when the row changes. We
@@ -370,8 +416,61 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
     setSshKey(initial?.sshKey ?? "");
     setReposPath(initial?.reposPath ?? "");
     setNotes(initial?.notes ?? "");
+    // Map the stored shell string back to one of the radio options.
+    // Bare names that match a built-in choice land on that radio;
+    // anything else (including absolute paths) lands on `custom`.
+    const storedShell = initial?.shell ?? "";
+    if (storedShell === "" || storedShell === "bash") {
+      setShellChoice("bash");
+      setShellCustom("");
+    } else if (storedShell === "zsh") {
+      setShellChoice("zsh");
+      setShellCustom("");
+    } else if (storedShell === "sh") {
+      setShellChoice("sh");
+      setShellCustom("");
+    } else {
+      setShellChoice("custom");
+      setShellCustom(storedShell);
+    }
+    // Add mode (initial === null): pre-populate with the bash default
+    // hint (~/.bash_profile) so the live preview reflects something
+    // sensible on first open. Edit mode: respect whatever the row had,
+    // including a null/empty profileFile (operator may have explicitly
+    // cleared it).
+    if (initial === null) {
+      setProfileFile(defaultProfileFileForShell("bash"));
+    } else {
+      setProfileFile(initial.profileFile ?? "");
+    }
+    setPreCommand(initial?.preCommand ?? "");
     setError(null);
   }, [open, initial]);
+
+  // Resolve the current shell name from the radio + custom-path state.
+  // Returns `null` for an empty custom-path slot so we don't post an
+  // empty string the server would reject.
+  const currentShell = useMemo<string | null>(() => {
+    if (shellChoice === "custom") {
+      return shellCustom.trim() === "" ? null : shellCustom.trim();
+    }
+    return shellChoice;
+  }, [shellChoice, shellCustom]);
+
+  // Hint the canonical profile file when the operator clicks a built-in
+  // shell radio AND the profileFile slot is still empty. Handled inline
+  // on the radio's onChange (not as a `useEffect`) so the hint only fires
+  // in response to a real user click — not as a side effect of the
+  // dialog opening on a row that already has a non-empty profileFile.
+  const hintProfileFileFor = useCallback(
+    (choice: ShellOptionValue) => {
+      if (choice === "custom") return;
+      if (profileFile !== "") return;
+      const hint = defaultProfileFileForShell(choice);
+      if (hint !== "") setProfileFile(hint);
+    },
+    [profileFile],
+  );
 
   const handleSubmit: React.FormEventHandler<HTMLFormElement> = (e) => {
     e.preventDefault();
@@ -380,6 +479,9 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
     const trimmedUser = user.trim();
     const trimmedReposPath = reposPath.trim();
     const trimmedSshKey = sshKey.trim();
+    const trimmedProfileFile = profileFile.trim();
+    const trimmedPreCommand = preCommand.trim();
+    const resolvedShell = currentShell; // already trimmed
 
     if (mode === "add" && !LABEL_PATTERN.test(trimmedLabel)) {
       setError("Label must be alphanumeric + hyphen, 1–63 chars, no leading hyphen.");
@@ -409,6 +511,24 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       setError("SSH key must be an absolute path (or leave empty to use ssh-agent).");
       return;
     }
+    if (resolvedShell !== null && !SHELL_PATTERN.test(resolvedShell)) {
+      setError(
+        "Shell must match a-z, 0-9, '_', '/', '.', '-' (max 128 chars). No metacharacters.",
+      );
+      return;
+    }
+    if (trimmedProfileFile !== "" && !PROFILE_FILE_PATTERN.test(trimmedProfileFile)) {
+      setError("Profile file must be a `~`-prefixed or absolute path; no metacharacters.");
+      return;
+    }
+    if (trimmedPreCommand.length > 512) {
+      setError("Pre-command too long (max 512 chars).");
+      return;
+    }
+    if (/[\r\n]/.test(trimmedPreCommand)) {
+      setError("Pre-command must not contain newlines.");
+      return;
+    }
     setError(null);
     onSubmit({
       label: trimmedLabel,
@@ -417,6 +537,9 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
       sshKey: trimmedSshKey === "" ? null : trimmedSshKey,
       reposPath: trimmedReposPath,
       notes: notes.trim() === "" ? null : notes.trim(),
+      shell: resolvedShell,
+      profileFile: trimmedProfileFile === "" ? null : trimmedProfileFile,
+      preCommand: trimmedPreCommand === "" ? null : trimmedPreCommand,
     });
   };
 
@@ -617,6 +740,146 @@ function HostDialog({ open, mode, initial, submitting, onClose, onSubmit }: Host
               />
             </DialogField>
 
+            <DialogField
+              label="Shell"
+              testIdSuffix="shell"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Shell" testId="help-shell">
+                  <p>
+                    Shell to use on the remote host for the bot launch. Default:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      bash
+                    </code>{" "}
+                    (good for nvm + homebrew). Pick{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      zsh
+                    </code>{" "}
+                    if your PATH lives only in{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ~/.zshrc
+                    </code>
+                    , or specify an absolute path.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <div
+                className="flex flex-wrap items-center gap-3"
+                data-testid="remote-host-dialog-shell"
+                role="radiogroup"
+              >
+                {SHELL_OPTIONS.map((opt) => (
+                  <label
+                    key={opt.value}
+                    className="inline-flex items-center gap-1 text-sm text-neutral-700 dark:text-slate-200"
+                  >
+                    <input
+                      type="radio"
+                      name="shell-choice"
+                      value={opt.value}
+                      checked={shellChoice === opt.value}
+                      onChange={() => {
+                        setShellChoice(opt.value);
+                        hintProfileFileFor(opt.value);
+                      }}
+                      data-testid={`remote-host-dialog-shell-${opt.value}`}
+                    />
+                    <span>{opt.label}</span>
+                  </label>
+                ))}
+                {shellChoice === "custom" && (
+                  <input
+                    type="text"
+                    value={shellCustom}
+                    onChange={(e) => setShellCustom(e.target.value)}
+                    placeholder="/opt/homebrew/bin/zsh"
+                    className={`${DIALOG_INPUT_CLASS} font-mono ml-1 w-72`}
+                    data-testid="remote-host-dialog-shell-custom-path"
+                  />
+                )}
+              </div>
+            </DialogField>
+
+            <DialogField
+              label="Profile file (optional)"
+              testIdSuffix="profileFile"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Profile file" testId="help-profileFile">
+                  <p>
+                    Profile file the remote shell will source before running the bot. The
+                    default depends on the chosen shell (
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ~/.bash_profile
+                    </code>{" "}
+                    for bash,{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ~/.zshrc
+                    </code>{" "}
+                    for zsh). The file is sourced with{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      [ -f &lt;path&gt; ] &amp;&amp; . &lt;path&gt;
+                    </code>{" "}
+                    so a missing file is a silent no-op.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <input
+                type="text"
+                value={profileFile}
+                onChange={(e) => setProfileFile(e.target.value)}
+                placeholder="~/.bash_profile  (or ~/.zshrc / /etc/profile)"
+                className={`${DIALOG_INPUT_CLASS} font-mono`}
+                data-testid="remote-host-dialog-profileFile"
+              />
+            </DialogField>
+
+            <DialogField
+              label="Pre-command (optional)"
+              testIdSuffix="preCommand"
+              colSpan={2}
+              help={
+                <HelpPopover fieldLabel="Pre-command" testId="help-preCommand">
+                  <p>
+                    Optional. Commands to run on the remote AFTER sourcing the profile but
+                    BEFORE the bot launch. Useful for nvm version pinning:{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      . ~/.nvm/nvm.sh &amp;&amp; nvm use 22
+                    </code>
+                    . Terminated with{" "}
+                    <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                      ;
+                    </code>{" "}
+                    so it can&apos;t abort the launch.
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <input
+                type="text"
+                value={preCommand}
+                onChange={(e) => setPreCommand(e.target.value)}
+                placeholder=". ~/.nvm/nvm.sh && nvm use 22"
+                className={`${DIALOG_INPUT_CLASS} font-mono`}
+                data-testid="remote-host-dialog-preCommand"
+              />
+            </DialogField>
+
+            <div className="md:col-span-2">
+              <SampleCommandPreview
+                label={label.trim()}
+                host={host.trim()}
+                user={user.trim()}
+                sshKey={sshKey.trim()}
+                reposPath={reposPath.trim()}
+                shell={currentShell}
+                profileFile={profileFile.trim()}
+                preCommand={preCommand.trim()}
+              />
+            </div>
+
             {error && (
               <p
                 className="md:col-span-2 text-xs text-red-600 dark:text-red-400"
@@ -689,6 +952,194 @@ function DialogField({
         {help}
       </div>
       {children}
+    </div>
+  );
+}
+
+interface SampleCommandPreviewProps {
+  label: string;
+  host: string;
+  user: string;
+  sshKey: string;
+  reposPath: string;
+  shell: string | null;
+  profileFile: string;
+  preCommand: string;
+}
+
+/**
+ * Live "Sample command" card embedded in the Add/Edit Host dialog.
+ * Posts the current form values to `POST /api/hosts/preview` (debounced
+ * 200ms) and renders the resulting `display` string in a copy-able
+ * monospace block.
+ *
+ * The preview uses the new `/hosts/preview` endpoint (which doesn't
+ * require the host to be saved first) so the operator sees their
+ * unsaved edits as they type. Placeholder tokens (`<participant>`,
+ * `<meeting-url>`, etc.) are visible in the rendered command so the
+ * operator understands those slots get filled at launch time.
+ */
+function SampleCommandPreview({
+  label,
+  host,
+  user,
+  sshKey,
+  reposPath,
+  shell,
+  profileFile,
+  preCommand,
+}: SampleCommandPreviewProps) {
+  // Build the request payload up-front so the dependency for the
+  // debounce effect is a stable object reference.
+  const payload = useMemo<SshPreviewHostRequest | null>(() => {
+    // The server rejects empty `host` / `reposPath`; bail out early
+    // so we don't issue a doomed fetch on every keystroke.
+    if (host === "" || reposPath === "") return null;
+    return {
+      host: {
+        // Server-side validation requires a label even though the
+        // preview endpoint doesn't persist anything. Use a stable
+        // sentinel when the operator hasn't typed one yet so the
+        // server's label regex still passes.
+        label: label === "" ? "preview" : label,
+        host,
+        user: user === "" ? undefined : user,
+        sshKey: sshKey === "" ? null : sshKey,
+        reposPath,
+        shell,
+        profileFile: profileFile === "" ? null : profileFile,
+        preCommand: preCommand === "" ? null : preCommand,
+      },
+    };
+  }, [label, host, user, sshKey, reposPath, shell, profileFile, preCommand]);
+
+  // Debounce the payload — bumped after the 200ms quiet window
+  // expires. TanStack Query keys off the debounced value so a burst
+  // of keystrokes coalesces into a single fetch.
+  const [debounced, setDebounced] = useState<SshPreviewHostRequest | null>(payload);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(payload), PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [payload]);
+
+  const previewQuery = useQuery({
+    // Stringify the payload for the cache key — TanStack Query's
+    // structural equality already handles the nested object, but
+    // making the key explicit keeps the devtools output readable.
+    queryKey: ["ssh", "hosts", "preview", debounced],
+    queryFn: () => api.previewSshHost(debounced as SshPreviewHostRequest),
+    enabled: debounced !== null,
+    staleTime: 0,
+    retry: false,
+  });
+
+  const [copied, setCopied] = useState<boolean>(false);
+  useEffect(() => {
+    setCopied(false);
+  }, [previewQuery.data]);
+
+  const display = previewQuery.data?.display ?? "";
+  const errorMsg =
+    previewQuery.error instanceof DashboardApiError
+      ? previewQuery.error.message
+      : previewQuery.error
+        ? (previewQuery.error as Error).message
+        : null;
+
+  const handleCopy = async (): Promise<void> => {
+    if (!display) return;
+    try {
+      await navigator.clipboard.writeText(display);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2_000);
+    } catch {
+      // Clipboard rejections are rare in production (HTTPS + secure
+      // contexts on the dashboard) but still possible in some embed
+      // scenarios; the operator can re-select the text manually.
+    }
+  };
+
+  return (
+    <div
+      className="rounded-lg border border-neutral-200 bg-neutral-50/40 p-3 text-sm dark:border-slate-700 dark:bg-slate-900/30"
+      data-testid="remote-host-dialog-sample-cmd"
+    >
+      <div className="flex items-center gap-2">
+        <Terminal
+          className="h-4 w-4 text-neutral-500 dark:text-slate-400"
+          aria-hidden="true"
+        />
+        <span className="text-sm font-medium text-neutral-800 dark:text-slate-200">
+          Sample command
+        </span>
+        <HelpPopover fieldLabel="Sample command" testId="help-sample-cmd">
+          <p>
+            Shows the exact <code className="font-mono text-[11px]">ssh</code> command the
+            dashboard will run to launch a bot on this host.
+          </p>
+          <p className="mt-1">
+            Placeholders (
+            <code className="font-mono text-[11px]">&lt;participant&gt;</code>,{" "}
+            <code className="font-mono text-[11px]">&lt;meeting-url&gt;</code>, etc.) are
+            filled in from the Launch form at runtime.
+          </p>
+        </HelpPopover>
+      </div>
+      <div className="mt-2 flex flex-col gap-2">
+        {payload === null ? (
+          <p
+            className="text-xs text-neutral-500 dark:text-slate-400"
+            data-testid="remote-host-dialog-sample-cmd-empty"
+          >
+            Fill in <strong>Host</strong> + <strong>Repos path</strong> to see the preview.
+          </p>
+        ) : previewQuery.isPending ? (
+          <p
+            className="text-xs text-neutral-500 dark:text-slate-400"
+            data-testid="remote-host-dialog-sample-cmd-loading"
+          >
+            Building preview…
+          </p>
+        ) : errorMsg !== null ? (
+          <p
+            className="rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900/40 dark:bg-red-900/20 dark:text-red-300"
+            role="alert"
+            data-testid="remote-host-dialog-sample-cmd-error"
+          >
+            {errorMsg}
+          </p>
+        ) : display !== "" ? (
+          <>
+            <pre
+              className="max-h-48 overflow-auto rounded-md bg-neutral-900 px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-100 dark:bg-slate-950"
+              data-testid="remote-host-dialog-sample-cmd-display"
+            >
+              {display}
+            </pre>
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={handleCopy}
+                className="inline-flex items-center gap-1 rounded-md border border-neutral-300 bg-white px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                data-testid="remote-host-dialog-sample-cmd-copy"
+                aria-label="Copy sample command to clipboard"
+              >
+                {copied ? (
+                  <>
+                    <Check className="h-3 w-3" aria-hidden="true" />
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3 w-3" aria-hidden="true" />
+                    Copy
+                  </>
+                )}
+              </button>
+            </div>
+          </>
+        ) : null}
+      </div>
     </div>
   );
 }

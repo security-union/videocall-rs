@@ -5,6 +5,7 @@ import { Bookmark, Info, Pencil, Play, Save, Trash2 } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type { ProfileBotSpec, ProfileSummary } from "../api/types";
+import { networkLabel } from "../lib/constants";
 import { useFieldHistory } from "../lib/fieldHistory";
 import type { ToastEntry } from "./ToastShelf";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -696,7 +697,7 @@ function ProfileBotsTable({ bots }: { bots: readonly ProfileBotSpec[] }) {
                   </code>
                 </Td>
                 <Td>{bot.ttl}</Td>
-                <Td>{bot.network}</Td>
+                <Td>{networkLabel(bot.network)}</Td>
                 <Td>{bot.headless ? "headless" : "headed"}</Td>
                 <Td>{bot.authBackend}</Td>
                 <Td>

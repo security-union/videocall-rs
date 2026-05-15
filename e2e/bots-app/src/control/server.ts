@@ -57,6 +57,7 @@ import {
 } from "./registry";
 import {
   addHost,
+  buildHostForPreview,
   getHost,
   listHosts,
   removeHost,
@@ -700,6 +701,14 @@ async function route(
       const body = await readJsonBody(req);
       return addHostRoute(opts, body);
     }
+  }
+  // `/hosts/preview` — preview the SSH command for an UNSAVED host
+  // (used by the Add / Edit dialog's live preview). The host config
+  // arrives in the request body and is validated as if it were being
+  // added/edited; nothing is persisted.
+  if (pathname === "/hosts/preview" && method === "POST") {
+    const body = await readJsonBody(req);
+    return previewHostRoute(body);
   }
   const hostPath = /^\/hosts\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
   if (hostPath) {
@@ -2498,6 +2507,91 @@ async function previewLaunchRoute(
 }
 
 /**
+ * `POST /hosts/preview` — preview the SSH command for an UNSAVED host
+ * (the Add Host dialog calls this as the operator types so the
+ * displayed command always reflects the form's current state). The
+ * host config arrives in the body and is validated exactly as it
+ * would be on `POST /hosts` — invalid values surface a 400 in the
+ * preview just like they would on save.
+ *
+ * Returns the same `{ argv, display, remoteCommand }` shape as
+ * `/hosts/:label/preview-launch`. Nothing is persisted.
+ *
+ * The optional `launchSpec` field overrides the default placeholder
+ * tokens (`<participant>`, `<meeting-url>`, etc.); when omitted the
+ * preview uses visibly-distinct placeholder strings so the operator
+ * sees what gets filled in at launch time.
+ */
+function previewHostRoute(body: Record<string, unknown>): RouteResult {
+  const hostBody = body.host;
+  if (hostBody === null || typeof hostBody !== "object" || Array.isArray(hostBody)) {
+    throw new ControlServerError(400, '"host" must be an object');
+  }
+  const spec = parseHostInput(hostBody as Record<string, unknown>);
+  // Run validation by building the host (same path as `addHost`), but
+  // without persisting. `buildHost` throws SshHostValidationError on
+  // bad input; the outer error handler translates that to 400.
+  let preview: ReturnType<typeof buildHostForPreview>;
+  try {
+    preview = buildHostForPreview(spec);
+  } catch (e) {
+    if (e instanceof SshHostValidationError) {
+      throw new ControlServerError(400, e.message);
+    }
+    throw e;
+  }
+  // Optional launch overrides. The default placeholder tokens make it
+  // obvious to the operator that those values get filled in at launch
+  // time (`<participant>` is not a real participant name).
+  const launchOverride =
+    typeof body.launchSpec === "object" && body.launchSpec !== null
+      ? (body.launchSpec as Record<string, unknown>)
+      : null;
+  const ttl =
+    launchOverride !== null && typeof launchOverride.ttl === "string" ? launchOverride.ttl : "5m";
+  const meetingURL =
+    launchOverride !== null && typeof launchOverride.meetingURL === "string"
+      ? launchOverride.meetingURL
+      : "<meeting-url>";
+  const participant =
+    launchOverride !== null && typeof launchOverride.participant === "string"
+      ? launchOverride.participant
+      : "<participant>";
+  const authBackend =
+    launchOverride !== null && typeof launchOverride.authBackend === "string"
+      ? launchOverride.authBackend
+      : "<auth>";
+  const network =
+    launchOverride !== null &&
+    typeof launchOverride.network === "string" &&
+    launchOverride.network !== "none"
+      ? launchOverride.network
+      : null;
+  const displayName =
+    launchOverride !== null && typeof launchOverride.displayName === "string"
+      ? launchOverride.displayName
+      : null;
+  const render = buildSshCommand(preview, {
+    host: preview,
+    ttl,
+    meetingURL,
+    participant,
+    network,
+    authBackend,
+    displayName,
+    headless: true,
+  });
+  return {
+    status: 200,
+    body: {
+      argv: render.argv,
+      display: render.display,
+      remoteCommand: render.remoteCommand,
+    },
+  };
+}
+
+/**
  * Validate the subset of {@link LaunchSpec} fields the preview endpoint
  * needs. This mirrors the launch-form validators in `launchOne` but
  * skips fields that do not affect the SSH command shape (costume /
@@ -2596,6 +2690,18 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
   if (notes !== undefined && notes !== null && typeof notes !== "string") {
     throw new ControlServerError(400, '"notes" must be a string or null');
   }
+  const shell = body.shell;
+  if (shell !== undefined && shell !== null && typeof shell !== "string") {
+    throw new ControlServerError(400, '"shell" must be a string or null');
+  }
+  const profileFile = body.profileFile;
+  if (profileFile !== undefined && profileFile !== null && typeof profileFile !== "string") {
+    throw new ControlServerError(400, '"profileFile" must be a string or null');
+  }
+  const preCommand = body.preCommand;
+  if (preCommand !== undefined && preCommand !== null && typeof preCommand !== "string") {
+    throw new ControlServerError(400, '"preCommand" must be a string or null');
+  }
   return {
     label,
     host,
@@ -2603,6 +2709,9 @@ function parseHostInput(body: Record<string, unknown>): SshHostInput {
     user: user as string | undefined,
     sshKey: sshKey === undefined ? undefined : (sshKey as string | null),
     notes: notes === undefined ? undefined : (notes as string | null),
+    shell: shell === undefined ? undefined : (shell as string | null),
+    profileFile: profileFile === undefined ? undefined : (profileFile as string | null),
+    preCommand: preCommand === undefined ? undefined : (preCommand as string | null),
   };
 }
 
@@ -2637,6 +2746,24 @@ function parseHostPatch(body: Record<string, unknown>): SshHostPatch {
       throw new ControlServerError(400, '"notes" must be a string or null when provided');
     }
     patch.notes = body.notes as string | null;
+  }
+  if (body.shell !== undefined) {
+    if (body.shell !== null && typeof body.shell !== "string") {
+      throw new ControlServerError(400, '"shell" must be a string or null when provided');
+    }
+    patch.shell = body.shell as string | null;
+  }
+  if (body.profileFile !== undefined) {
+    if (body.profileFile !== null && typeof body.profileFile !== "string") {
+      throw new ControlServerError(400, '"profileFile" must be a string or null when provided');
+    }
+    patch.profileFile = body.profileFile as string | null;
+  }
+  if (body.preCommand !== undefined) {
+    if (body.preCommand !== null && typeof body.preCommand !== "string") {
+      throw new ControlServerError(400, '"preCommand" must be a string or null when provided');
+    }
+    patch.preCommand = body.preCommand as string | null;
   }
   return patch;
 }

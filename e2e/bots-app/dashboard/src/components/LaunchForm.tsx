@@ -773,6 +773,12 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                     <code className="font-mono text-[11px]">bots-app prep-assets</code> to
                     generate options.
                   </p>
+                  <p className="mt-1">
+                    If the selected file isn&apos;t present in{" "}
+                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot
+                    will auto-prime it on launch (local bots only — SSH bots need assets
+                    pre-staged on the remote).
+                  </p>
                 </HelpPopover>
               }
               badge={
@@ -796,6 +802,12 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 <HelpPopover fieldLabel="Audio" testId="help-audio">
                   <p>Pre-stitched .wav fake mic.</p>
                   <p className="mt-1">Same prep step as the costume.</p>
+                  <p className="mt-1">
+                    If the selected file isn&apos;t present in{" "}
+                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot
+                    will auto-prime it on launch (local bots only — SSH bots need assets
+                    pre-staged on the remote).
+                  </p>
                 </HelpPopover>
               }
               badge={audioIsAutoMatched ? <AutoMatchedBadge testId="audio-auto-matched" /> : null}

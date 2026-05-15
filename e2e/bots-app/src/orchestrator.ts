@@ -2,7 +2,9 @@ import { existsSync } from "node:fs";
 
 import { type BotExitReason, launchBot, type BotRunOptions } from "./bot";
 import { defaultSsoStatePath } from "./auth/storage-state";
+import type { PrimeProgress } from "./auto-prime";
 import {
+  appendLocalLog,
   type BotHostKind,
   type BotRegistryEntry,
   generateBotId,
@@ -174,10 +176,13 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
   // costume / audio dropdown picks still take effect via the override
   // path on launchOne.
   let dashboardManifest: Manifest | null = null;
+  let dashboardManifestDir: string | null = null;
   if (opts.control?.manifestPath) {
     if (existsSync(opts.control.manifestPath)) {
       try {
-        dashboardManifest = loadManifest(opts.control.manifestPath).manifest;
+        const loaded = loadManifest(opts.control.manifestPath);
+        dashboardManifest = loaded.manifest;
+        dashboardManifestDir = loaded.manifestDir;
         console.log(
           `[orchestrator] dashboard manifest loaded from ${opts.control.manifestPath} (${dashboardManifest.participants.length} participant(s))`,
         );
@@ -292,6 +297,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       }
       const newTask = buildLaunchedBotTask(spec, {
         manifest: dashboardManifest,
+        manifestDir: dashboardManifestDir,
         runDir: opts.control?.runDir ?? null,
       });
       registerTask(newTask);
@@ -386,6 +392,7 @@ export async function runBotsToCompletion(arg: readonly BotTask[] | RunOptions):
       storageStateFile: spec.storageStateFile ?? null,
       ssoStateFile: spec.ssoStateFile ?? null,
       manifest: null,
+      manifestDir: null,
       runDir: null,
       costumeOverride: null,
       audioOverride: null,
@@ -514,13 +521,50 @@ async function runSingleBotTask(
   // run again". A `ctl-rejoin` is the only event that takes us back
   // through `launchBot`; everything else exits the loop.
   while (true) {
-    entry.status = "launching";
+    // If the task is eligible for auto-prime (local bot, has a manifest
+    // + manifestDir + runDir), surface a brief `priming` state so the
+    // dashboard can show "Priming assets" in the Running Bots table.
+    // The transition to `launching` happens inside `launchBot` after
+    // the auto-prime resolves (or skips). When the task is not
+    // eligible, we skip straight to `launching` to match the
+    // pre-auto-prime behaviour.
+    const willAutoPrime =
+      entry.task.manifest != null &&
+      entry.task.manifestDir != null &&
+      entry.task.manifestDir !== "" &&
+      entry.task.runDir != null &&
+      entry.task.runDir !== "";
+    if (willAutoPrime) {
+      entry.status = "priming";
+    } else {
+      entry.status = "launching";
+    }
     // Strip the orchestrator-only fields (`ttl`, `botId`) before
     // handing the rest to `launchBot` — and inject `botIdShort` so
     // the bot's log prefix reads `[participant@<id>]`.
     const { ttl, botId, ...rest } = entry.task;
     void botId;
-    const launchOpts = { ...rest, botIdShort: shortBotId(task.botId) };
+    const launchOpts = {
+      ...rest,
+      botIdShort: shortBotId(task.botId),
+      onPrimeProgress: willAutoPrime
+        ? (p: PrimeProgress): void => {
+            // Mirror the CLI's prefix format so the dashboard log
+            // dialog reads consistently with stdout-tail debugging.
+            const line = `[${label}] auto-prime: ${p.step} — ${p.message}`;
+            appendLocalLog(entry, line);
+            console.log(line);
+            // Transition out of `priming` the moment the helper
+            // signals `done` / `failed`; `launching` already feels
+            // distinct enough in the UI (amber → amber, same family)
+            // that this is just for completeness — the actual chrome
+            // launch starts right after.
+            if (p.step === "done" || p.step === "failed") {
+              entry.status = "launching";
+            }
+          }
+        : null,
+    };
     let bot;
     try {
       bot = await launchBot(launchOpts);
@@ -840,7 +884,7 @@ export function countFailed(registry: Map<string, BotRegistryEntry>): number {
  */
 export function buildLaunchedBotTask(
   spec: LaunchSpec,
-  deps: { manifest: Manifest | null; runDir: string | null },
+  deps: { manifest: Manifest | null; manifestDir?: string | null; runDir: string | null },
 ): BotTask {
   let ssoStateFile: string | null = null;
   if (spec.authBackend === "jwt") {
@@ -865,6 +909,7 @@ export function buildLaunchedBotTask(
     storageStateFile: spec.authBackend === "storage-state" ? (spec.storageStateFile ?? null) : null,
     ssoStateFile,
     manifest: deps.manifest,
+    manifestDir: deps.manifestDir ?? null,
     runDir: deps.runDir,
     costumeOverride,
     audioOverride,

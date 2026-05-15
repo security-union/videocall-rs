@@ -51,6 +51,7 @@ import {
   type BotRegistryEntry,
   type BotSnapshot,
   NotSupportedRemoteError,
+  readLocalLogWindow,
   snapshotEntry,
   sweepStaleEntries,
 } from "./registry";
@@ -2792,9 +2793,11 @@ function botLogRoute(surface: OrchestratorControlSurface, botId: string, url: UR
   if (entry.sshHandle !== null) {
     return { status: 200, body: readLogWindow(entry.sshHandle, since) };
   }
-  // Local bot — no rolling buffer (yet). Return an empty window so
-  // the dashboard's polling loop is a no-op.
-  return { status: 200, body: { lines: [], totalLines: 0 } };
+  // Local bot — read the orchestrator-side rolling buffer. Currently
+  // populated by the auto-prime helper (priming progress events) and
+  // empty otherwise. Returns the same wire shape as the SSH path so
+  // the dashboard's polling loop is transport-agnostic.
+  return { status: 200, body: readLocalLogWindow(entry, since) };
 }
 
 function countLiveBots(registry: Map<string, BotRegistryEntry>): number {

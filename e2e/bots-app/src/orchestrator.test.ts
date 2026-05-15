@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import { buildLaunchedBotTask, countFailed } from "./orchestrator";
-import { newRegistryEntry, type BotRegistryEntry } from "./control/registry";
+import {
+  appendLocalLog,
+  newRegistryEntry,
+  readLocalLogWindow,
+  type BotRegistryEntry,
+  type BotStatus,
+} from "./control/registry";
 import type { LaunchSpec } from "./control/server";
 import { parseManifestText } from "./manifest";
 import type { BotTask } from "./orchestrator";
@@ -230,5 +236,97 @@ lines:
       { manifest: null, runDir: null },
     );
     expect(task.storageStateFile).toBeNull();
+  });
+
+  it("threads the orchestrator-loaded manifestDir into the BotTask for auto-prime", () => {
+    const manifest = parseManifestText(MANIFEST_FIXTURE);
+    const task = buildLaunchedBotTask(baseSpec(), {
+      manifest,
+      manifestDir: "/repo/bot/conversation",
+      runDir: "/tmp/bots-app-run",
+    });
+    expect(task.manifestDir).toBe("/repo/bot/conversation");
+  });
+
+  it("defaults manifestDir to null when omitted by the caller (back-compat)", () => {
+    const task = buildLaunchedBotTask(baseSpec(), {
+      manifest: null,
+      runDir: null,
+    });
+    expect(task.manifestDir).toBeNull();
+  });
+});
+
+describe("registry priming lifecycle", () => {
+  it("BotStatus includes 'priming' as a valid value (auto-prime transition)", () => {
+    // Type-level assertion: the union must permit 'priming'. Failing
+    // this compile guards against accidental removal of the variant
+    // during refactors.
+    const s: BotStatus = "priming";
+    expect(s).toBe("priming");
+  });
+
+  it("appendLocalLog populates a bot's rolling buffer (used by the auto-prime path)", () => {
+    const e = newRegistryEntry({
+      botId: "00000000-0000-0000-0000-000000000001",
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+      displayName: "Alice",
+      headless: true,
+      authBackend: "jwt",
+      ttl: 60_000,
+    });
+    expect(e.recentLog).toEqual([]);
+    expect(e.totalLines).toBe(0);
+    appendLocalLog(e, "[alice] auto-prime: checking — looking at the on-disk state");
+    appendLocalLog(e, "[alice] auto-prime: priming-audio — stitching 4 line(s)");
+    appendLocalLog(e, "[alice] auto-prime: done — prime complete");
+    expect(e.recentLog).toHaveLength(3);
+    expect(e.totalLines).toBe(3);
+    const window = readLocalLogWindow(e, 1);
+    expect(window.lines).toHaveLength(2);
+    expect(window.totalLines).toBe(3);
+  });
+
+  it("registry entries start in 'launching' state; priming is opt-in via the orchestrator", () => {
+    const e = newRegistryEntry({
+      botId: "00000000-0000-0000-0000-000000000002",
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+      displayName: "Alice",
+      headless: true,
+      authBackend: "jwt",
+      ttl: 60_000,
+    });
+    // newRegistryEntry stays in 'launching'; the orchestrator's
+    // `runSingleBotTask` flips it to 'priming' when the auto-prime
+    // helper is going to run. This guarantees back-compat for the
+    // SSH path (which sets status to 'in-meeting' directly and never
+    // sees a 'priming' transition).
+    expect(e.status).toBe("launching");
+  });
+
+  it("can transition through the documented priming → launching → joining → in-meeting → leaving → done chain", () => {
+    const e: BotRegistryEntry = newRegistryEntry({
+      botId: "00000000-0000-0000-0000-000000000003",
+      meetingURL: "https://example.com/meeting/X",
+      participant: "alice",
+      displayName: "Alice",
+      headless: true,
+      authBackend: "jwt",
+      ttl: 60_000,
+    });
+    const sequence: BotStatus[] = [
+      "priming",
+      "launching",
+      "joining",
+      "in-meeting",
+      "leaving",
+      "done",
+    ];
+    for (const status of sequence) {
+      e.status = status;
+      expect(e.status).toBe(status);
+    }
   });
 });

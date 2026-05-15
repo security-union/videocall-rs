@@ -40,14 +40,26 @@ export class NotSupportedRemoteError extends Error {
  * Ordering of the variants is the canonical forward progression for a
  * healthy bot:
  *
- *   `launching` → `joining` → `in-meeting` → `leaving` → `done`
+ *   `priming` → `launching` → `joining` → `in-meeting` → `leaving` → `done`
+ *
+ * `priming` only fires for local bots that have a manifest + runDir
+ * attached; when the auto-prime is skipped (SSH bots, no manifest,
+ * everything already cached) the entry transitions straight into
+ * `launching`.
  *
  * `failed` is terminal and only reached when `launchBot` rejects with a
  * non-user-hangup error. Entries in `done` / `failed` are kept around
  * for ~60 seconds (`REGISTRY_RETENTION_MS`) so a follow-up `ctl list`
  * can still show what happened — after that they're swept.
  */
-export type BotStatus = "launching" | "joining" | "in-meeting" | "leaving" | "done" | "failed";
+export type BotStatus =
+  | "priming"
+  | "launching"
+  | "joining"
+  | "in-meeting"
+  | "leaving"
+  | "done"
+  | "failed";
 
 /**
  * Number of milliseconds a `done` / `failed` registry entry is kept
@@ -125,6 +137,18 @@ export interface BotRegistryEntry {
   finishReason?: string;
   /** Set when status ∈ {done, failed}; used by the sweeper. */
   finishedAt?: number;
+  /**
+   * Rolling log buffer for **local** bots, mirrored over
+   * `GET /bots/:id/log`. Populated by the orchestrator's
+   * `appendLocalLog` helper — currently just auto-prime progress
+   * events, but the buffer is general-purpose so future
+   * orchestrator-side log lines (e.g. launch errors) can land here
+   * too. SSH-hosted bots use `sshHandle.recentLog` instead — see
+   * `botLogRoute` in `control/server.ts` for the unified read path.
+   */
+  recentLog: string[];
+  /** Total log lines pushed since the bot was registered (local bots). */
+  totalLines: number;
 }
 
 /**
@@ -200,6 +224,50 @@ export function newRegistryEntry(
     ttl: task.ttl,
     ttlDeadline,
     network: task.network ?? null,
+    recentLog: [],
+    totalLines: 0,
+  };
+}
+
+/**
+ * Cap on the per-bot {@link BotRegistryEntry.recentLog} buffer. Mirrors
+ * the SSH path's {@link ../control/ssh-launcher.REMOTE_LOG_CAP} so the
+ * dashboard's log dialog renders the same volume of lines for either
+ * local or SSH bots.
+ */
+export const LOCAL_LOG_CAP = 200;
+
+/**
+ * Append a line to a local bot's rolling log buffer, dropping the
+ * oldest entry when the cap is exceeded. Idempotent on empty input.
+ *
+ * Mirrors the SSH `pushLine` helper in `ssh-launcher.ts` so the
+ * server-side log buffer semantics are identical for both bot kinds.
+ */
+export function appendLocalLog(entry: BotRegistryEntry, line: string): void {
+  if (line === "") return;
+  entry.recentLog.push(line);
+  entry.totalLines += 1;
+  if (entry.recentLog.length > LOCAL_LOG_CAP) {
+    entry.recentLog.splice(0, entry.recentLog.length - LOCAL_LOG_CAP);
+  }
+}
+
+/**
+ * Read a window of recentLog lines starting from `since` (zero-based
+ * absolute line number, matching `entry.totalLines`). Mirrors
+ * `ssh-launcher::readLogWindow` so the server's log route can use
+ * one shape regardless of the underlying bot kind.
+ */
+export function readLocalLogWindow(
+  entry: BotRegistryEntry,
+  since: number,
+): { lines: string[]; totalLines: number } {
+  const firstLineNumber = entry.totalLines - entry.recentLog.length;
+  const startIndex = Math.max(0, since - firstLineNumber);
+  return {
+    lines: entry.recentLog.slice(startIndex),
+    totalLines: entry.totalLines,
   };
 }
 

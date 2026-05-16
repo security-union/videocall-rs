@@ -1,4 +1,12 @@
-import { type Page, type Locator } from "@playwright/test";
+import {
+  type Page,
+  type Locator,
+  type ConsoleMessage,
+  type Request,
+  type Response,
+} from "@playwright/test";
+
+import { isDevServerNoise } from "./dev-noise";
 
 /**
  * The mode the pre-join card was rendered in:
@@ -516,6 +524,166 @@ async function throwForOutcome(
 }
 
 /**
+ * Hard cap on captured-event counters. Prevents a noisy SPA (or a
+ * pathological infinite-error loop) from filling the bot's log with
+ * hundreds of repeats of the same diagnostic when only the first few
+ * carry signal. 20 is enough to see distinct root causes; anything
+ * beyond is overwhelmingly likely to be the same error re-firing.
+ */
+const CLICK_DIAGNOSTICS_CAP = 20;
+
+/**
+ * Per-attempt diagnostic bag, filled by `installClickDiagnostics` for
+ * the duration of a single click + wait iteration in `joinWithRetries`.
+ * Emitted via `logPostClickDiagnostics` only when the attempt fails
+ * (button reappeared) — successful joins stay quiet.
+ */
+export interface ClickAttemptDiagnostics {
+  /** `Date.now()` at the moment the recorder was installed. */
+  startedAt: number;
+  /** `page.url()` just before the click was issued. */
+  startUrl: string;
+  /**
+   * Up to `CLICK_DIAGNOSTICS_CAP` filtered `console.error` lines
+   * observed since the click. Dioxus dev-server cosmetic noise is
+   * filtered via `isDevServerNoise` so real server-side errors aren't
+   * drowned out.
+   */
+  consoleErrors: string[];
+  /**
+   * Up to `CLICK_DIAGNOSTICS_CAP` failed network events: hard transport
+   * failures (Playwright `requestfailed`) and HTTP responses with
+   * status >= 400. Both surface the WHY behind a non-transitioning
+   * click — the meeting-api 4xx case is the canonical example.
+   */
+  failedRequests: Array<{ url: string; status?: number; failure?: string }>;
+}
+
+/**
+ * Install per-attempt event listeners on the Playwright Page that
+ * capture the post-click failure signal: filtered `console.error` lines,
+ * `requestfailed` events, and HTTP >= 400 responses.
+ *
+ * Caller MUST call the returned `teardown` exactly once (typically in a
+ * `finally`) so the listeners don't leak across retry attempts.
+ *
+ * The dev-noise filter from `dev-noise.ts` is applied to console events
+ * so trunk-serve cosmetic errors (PR #808) don't displace real
+ * diagnostics from the 20-entry budget.
+ *
+ * Exported so the unit tests can drive it with a fake Page emitter.
+ */
+export function installClickDiagnostics(page: Page): {
+  diag: ClickAttemptDiagnostics;
+  teardown: () => void;
+} {
+  const diag: ClickAttemptDiagnostics = {
+    startedAt: Date.now(),
+    startUrl: page.url(),
+    consoleErrors: [],
+    failedRequests: [],
+  };
+
+  const onConsole = (msg: ConsoleMessage): void => {
+    if (msg.type() !== "error") return;
+    if (diag.consoleErrors.length >= CLICK_DIAGNOSTICS_CAP) return;
+    const text = msg.text();
+    if (isDevServerNoise(text, { pageUrl: page.url() })) return;
+    diag.consoleErrors.push(text);
+  };
+  const onRequestFailed = (req: Request): void => {
+    if (diag.failedRequests.length >= CLICK_DIAGNOSTICS_CAP) return;
+    diag.failedRequests.push({
+      url: req.url(),
+      failure: req.failure()?.errorText,
+    });
+  };
+  const onResponse = (resp: Response): void => {
+    if (resp.status() < 400) return;
+    if (diag.failedRequests.length >= CLICK_DIAGNOSTICS_CAP) return;
+    diag.failedRequests.push({
+      url: resp.url(),
+      status: resp.status(),
+    });
+  };
+
+  page.on("console", onConsole);
+  page.on("requestfailed", onRequestFailed);
+  page.on("response", onResponse);
+
+  return {
+    diag,
+    teardown: () => {
+      page.off("console", onConsole);
+      page.off("requestfailed", onRequestFailed);
+      page.off("response", onResponse);
+    },
+  };
+}
+
+/**
+ * Emit a structured, one-line-per-piece-of-evidence diagnostic block to
+ * the bot's log when a click attempt failed to transition to the grid.
+ *
+ * The shape is fixed (not free-form) so the dashboard's View Logs
+ * dialog renders it cleanly without dominating the panel. The lines
+ * are intentionally prefixed with `[participant]` so log demuxing in
+ * the orchestrator pipeline keeps them attributed to the right bot.
+ *
+ * Fires the meeting-api hint when a `/api/v1/meetings/<id>/join` URL
+ * with status >= 400 is captured — that's the canonical "server
+ * rejected the join" pattern operators need to pivot away from "the
+ * bot is broken" debugging.
+ *
+ * Exported for the unit tests; in production this is called from
+ * `joinWithRetries` after a `button-reappeared` outcome.
+ */
+export function logPostClickDiagnostics(
+  participant: string,
+  attempt: number,
+  diag: ClickAttemptDiagnostics,
+  currentUrl: string,
+): void {
+  const elapsedMs = Date.now() - diag.startedAt;
+  const urlChanged = currentUrl !== diag.startUrl;
+
+  console.log(
+    `[${participant}] attempt ${attempt} diagnostics: ${elapsedMs}ms elapsed since click; url ${urlChanged ? `CHANGED to ${currentUrl}` : `unchanged (${currentUrl})`}`,
+  );
+  if (diag.consoleErrors.length > 0) {
+    console.log(`[${participant}]   captured ${diag.consoleErrors.length} console.error(s):`);
+    diag.consoleErrors.forEach((err, i) => {
+      console.log(`[${participant}]     [${i + 1}] ${err}`);
+    });
+  } else {
+    console.log(`[${participant}]   captured 0 console.error(s)`);
+  }
+  if (diag.failedRequests.length > 0) {
+    console.log(`[${participant}]   captured ${diag.failedRequests.length} failed request(s):`);
+    diag.failedRequests.forEach((req, i) => {
+      const detail =
+        req.status !== undefined ? `HTTP ${req.status}` : (req.failure ?? "unknown failure");
+      console.log(`[${participant}]     [${i + 1}] ${detail}  ${req.url}`);
+    });
+  } else {
+    console.log(`[${participant}]   captured 0 failed request(s)`);
+  }
+
+  // Server-side hint: if the meeting-api itself rejected the join,
+  // surface it explicitly so operators know to look at the meeting-api
+  // logs instead of treating the bot as broken. The URL pattern is
+  // intentionally narrow — only `/api/v1/meetings/.../join` qualifies.
+  const meetingApiFailure = diag.failedRequests.find(
+    (r) => r.url.includes("/api/v1/meetings/") && r.url.includes("/join") && (r.status ?? 0) >= 400,
+  );
+  if (meetingApiFailure !== undefined) {
+    console.log(
+      `[${participant}]   meeting-api join request failed with HTTP ${meetingApiFailure.status} — this is why the page didn't transition. Check the meeting-api server-side logs for the matching request.`,
+    );
+  }
+}
+
+/**
  * Click the (enabled) Join button up to `maxAttempts` times, racing the
  * grid against the Join button reappearing after each click. A
  * reappearance signals the previous click was consumed by the UI but
@@ -531,6 +699,13 @@ async function throwForOutcome(
  * typed error (`WaitingRoomError` / `JoinRejectedError`) instead of
  * looping the join click — the API already accepted us, the UI is just
  * telling us we're parked or denied.
+ *
+ * On `button-reappeared` outcomes the per-attempt diagnostic recorder
+ * (`installClickDiagnostics` / `logPostClickDiagnostics`) emits a
+ * structured block of captured console errors, failed requests, and
+ * the URL diff so operators can see WHY the click didn't transition
+ * (commonly: a meeting-api 4xx response). Diagnostics fire ONLY on
+ * retry triggers; successful joins stay quiet.
  */
 async function joinWithRetries(args: {
   page: Page;
@@ -622,70 +797,85 @@ async function joinWithRetries(args: {
       }
       console.log(`[${participant}] retrying join click (attempt ${attempt})`);
     }
-    // Playwright's auto-waiting + actionability checks effectively
-    // cover "stable" — the locator already has `:not([disabled])` and
-    // Playwright waits for the element to be stable before clicking.
+    // Install the per-attempt diagnostic recorder BEFORE the click so
+    // any `console.error` / `requestfailed` / >=400 response between
+    // here and the race outcome is captured. Teardown in `finally` so
+    // listeners never leak across attempts.
+    const { diag, teardown } = installClickDiagnostics(page);
     try {
-      await joinButton.click({ timeout: 5_000 });
-    } catch (e) {
-      console.warn(`[${participant}] join-click warning:`, (e as Error).message);
-    }
+      // Playwright's auto-waiting + actionability checks effectively
+      // cover "stable" — the locator already has `:not([disabled])` and
+      // Playwright waits for the element to be stable before clicking.
+      try {
+        await joinButton.click({ timeout: 5_000 });
+      } catch (e) {
+        console.warn(`[${participant}] join-click warning:`, (e as Error).message);
+      }
 
-    // Race the grid + four terminal screens against a re-appearance of
-    // the enabled Join button. Reappearance ⇒ click was a no-op or the
-    // UI rolled back; the four terminal screens short-circuit with a
-    // typed error.
-    type ClickedOutcome = RaceOutcome | "button-reappeared";
-    const outcome = (await Promise.race<ClickedOutcome | null>([
-      grid
-        .waitFor({ timeout: perAttemptGridTimeout })
-        .then(() => "grid" as ClickedOutcome)
-        .catch(() => null),
-      waitingRoom
-        .waitFor({ timeout: perAttemptGridTimeout })
-        .then(() => "waiting-room" as ClickedOutcome)
-        .catch(() => null),
-      waitingForHost
-        .waitFor({ timeout: perAttemptGridTimeout })
-        .then(() => "waiting-for-host" as ClickedOutcome)
-        .catch(() => null),
-      rejected
-        .waitFor({ timeout: perAttemptGridTimeout })
-        .then(() => "rejected" as ClickedOutcome)
-        .catch(() => null),
-      errorScreen
-        .waitFor({ timeout: perAttemptGridTimeout })
-        .then(() => "error" as ClickedOutcome)
-        .catch(() => null),
-      joinButton
-        .waitFor({ timeout: perAttemptGridTimeout, state: "visible" })
-        .then(() => "button-reappeared" as ClickedOutcome)
-        .catch(() => null),
-    ])) as ClickedOutcome | null;
+      // Race the grid + four terminal screens against a re-appearance of
+      // the enabled Join button. Reappearance ⇒ click was a no-op or the
+      // UI rolled back; the four terminal screens short-circuit with a
+      // typed error.
+      type ClickedOutcome = RaceOutcome | "button-reappeared";
+      const outcome = (await Promise.race<ClickedOutcome | null>([
+        grid
+          .waitFor({ timeout: perAttemptGridTimeout })
+          .then(() => "grid" as ClickedOutcome)
+          .catch(() => null),
+        waitingRoom
+          .waitFor({ timeout: perAttemptGridTimeout })
+          .then(() => "waiting-room" as ClickedOutcome)
+          .catch(() => null),
+        waitingForHost
+          .waitFor({ timeout: perAttemptGridTimeout })
+          .then(() => "waiting-for-host" as ClickedOutcome)
+          .catch(() => null),
+        rejected
+          .waitFor({ timeout: perAttemptGridTimeout })
+          .then(() => "rejected" as ClickedOutcome)
+          .catch(() => null),
+        errorScreen
+          .waitFor({ timeout: perAttemptGridTimeout })
+          .then(() => "error" as ClickedOutcome)
+          .catch(() => null),
+        joinButton
+          .waitFor({ timeout: perAttemptGridTimeout, state: "visible" })
+          .then(() => "button-reappeared" as ClickedOutcome)
+          .catch(() => null),
+      ])) as ClickedOutcome | null;
 
-    if (outcome === "grid") {
-      console.log(`[${participant}] join click consumed`);
-      return;
-    }
-    if (outcome !== null && outcome !== "button-reappeared") {
-      await throwForOutcome(outcome, participant, page);
-    }
-    if (outcome === "button-reappeared") {
+      if (outcome === "grid") {
+        console.log(`[${participant}] join click consumed`);
+        return;
+      }
+      if (outcome !== null && outcome !== "button-reappeared") {
+        await throwForOutcome(outcome, participant, page);
+      }
+      if (outcome === "button-reappeared") {
+        // Surface the captured diagnostics BEFORE the retry decision
+        // so operators can see WHY the click didn't transition. Fires
+        // ONLY on the retry trigger — successful joins (outcome ===
+        // "grid") and graceful terminal outcomes (handled above) stay
+        // quiet.
+        logPostClickDiagnostics(participant, attempt, diag, page.url());
+        if (attempt === maxAttempts) {
+          throw new Error(
+            `join button reappeared after ${maxAttempts} click attempts — grid never became visible (see logs for captured console + network errors)`,
+          );
+        }
+        // Loop and retry. The retry log line fires at the top of the
+        // next iteration so the attempt number is consistent.
+        continue;
+      }
+      // outcome === null ⇒ none resolved within the per-attempt
+      // timeout. Treat as failure of this attempt.
       if (attempt === maxAttempts) {
         throw new Error(
-          `join button reappeared after ${maxAttempts} click attempts — grid never became visible`,
+          `grid did not become visible within ${perAttemptGridTimeout}ms after join click`,
         );
       }
-      // Loop and retry. The retry log line fires at the top of the
-      // next iteration so the attempt number is consistent.
-      continue;
-    }
-    // outcome === null ⇒ none resolved within the per-attempt
-    // timeout. Treat as failure of this attempt.
-    if (attempt === maxAttempts) {
-      throw new Error(
-        `grid did not become visible within ${perAttemptGridTimeout}ms after join click`,
-      );
+    } finally {
+      teardown();
     }
   }
 }

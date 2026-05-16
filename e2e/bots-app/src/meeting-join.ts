@@ -1,6 +1,54 @@
 import { type Page, type Locator } from "@playwright/test";
 
 /**
+ * The mode the pre-join card was rendered in:
+ *   - "start" — the bot is the meeting owner. Button label is "Start Meeting"
+ *     and the Waiting Room toggle is visible (and defaults to ON).
+ *   - "join"  — the bot is joining an existing meeting. Button label is
+ *     "Join Meeting"; no Waiting Room toggle is rendered.
+ *   - "unknown" — locator returned text that doesn't match either label.
+ *     Bot falls through and clicks the matched button anyway (legacy
+ *     behaviour) so a future relabel doesn't strand the bot.
+ *
+ * Centralized so the helper, the orchestrator logs, and the unit tests
+ * all agree on the discriminator strings.
+ */
+export type JoinMode = "start" | "join" | "unknown";
+
+/**
+ * Inspect the visible text of the (already-resolved enabled) join
+ * button and return whether it's rendering in Start or Join mode.
+ *
+ * The pre-join card in `dioxus-ui/src/components/pre_join_settings_card.rs`
+ * uses the label "Start Meeting" when `is_owner = true` and "Join Meeting"
+ * otherwise. The button label is the **only** signal in the DOM that's
+ * stable across renders — `is_owner` itself is Rust-side state and the
+ * Waiting Room toggle only exists in Start mode (so its absence is a
+ * weaker signal than the button text).
+ *
+ * Exported so unit tests can exercise the regex without spinning up
+ * Chrome.
+ */
+export async function detectJoinMode(joinButton: Locator): Promise<JoinMode> {
+  const text = await joinButton.innerText().catch(() => "");
+  return classifyJoinModeText(text);
+}
+
+/**
+ * Pure function for the join-mode classification — split out so the
+ * test harness can drive it with literal strings instead of mocking a
+ * full Locator. The label match is anchored at the start of the
+ * trimmed string and case-insensitive so the bot tolerates a future
+ * trailing-icon or trailing-text change to the button.
+ */
+export function classifyJoinModeText(rawText: string): JoinMode {
+  const normalized = rawText.trim();
+  if (/^Start Meeting/i.test(normalized)) return "start";
+  if (/^Join Meeting/i.test(normalized)) return "join";
+  return "unknown";
+}
+
+/**
  * Sentinel thrown by `joinMeetingAndEnableMedia` when the page navigates
  * away from `/meeting/...` while we're still trying to enter the grid —
  * almost always because the user clicked the in-browser HangUp control.
@@ -182,17 +230,36 @@ export async function joinMeetingAndEnableMedia(args: {
 
     throwIfNavigatedAway(navigatedAway, participant);
 
-    // Best-effort: if this bot is the meeting owner (first participant
-    // in a non-existing meeting), the pre-join card renders a
-    // "Waiting Room" toggle that defaults to ON. Leaving it on would
-    // park every subsequent peer in a waiting room the bot has no
-    // admit logic for. Disable it before clicking Join. The toggle is
-    // only present when `is_owner = true` — see
-    // `dioxus-ui/src/components/pre_join_settings_card.rs:102-159` —
-    // so this is a no-op (skipped silently) when joining an existing
-    // meeting.
+    // Detect whether the bot is about to click "Start Meeting" (bot is
+    // the meeting owner — Waiting Room toggle is visible and defaults
+    // ON) or "Join Meeting" (joining an existing meeting — no toggle).
+    // The detection is done once here, BEFORE the click, so the log
+    // explicitly records which path the bot took. In Start mode we
+    // also verify (and if necessary flip) the Waiting Room toggle to
+    // OFF — leaving it ON would strand every subsequent peer (human or
+    // bot) because the bot has no admit logic.
+    //
+    // `mode` is "unknown" when the matched button's label doesn't
+    // match either canonical string — almost certainly a future
+    // relabel. The bot still clicks the button (legacy behaviour) so
+    // a label rename doesn't immediately strand the bot; it just
+    // skips the Waiting Room verification because the toggle's
+    // presence is correlated with the Start label.
+    let mode: JoinMode = "unknown";
     if (await joinButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      await disableWaitingRoomIfOwner(page, participant);
+      mode = await detectJoinMode(joinButton);
+      if (mode === "start") {
+        console.log(
+          `[${participant}] detected mode: Start Meeting (bot is meeting owner — verifying Waiting Room is OFF before starting)`,
+        );
+        await ensureWaitingRoomOff(page, participant);
+      } else if (mode === "join") {
+        console.log(`[${participant}] detected mode: Join Meeting (joining existing meeting)`);
+      } else {
+        console.log(
+          `[${participant}] detected mode: unknown — falling back to clicking the matched button as-is`,
+        );
+      }
     }
 
     throwIfNavigatedAway(navigatedAway, participant);
@@ -217,6 +284,7 @@ export async function joinMeetingAndEnableMedia(args: {
       participant,
       joinButton,
       grid,
+      mode,
       isNavigatedAway: () => navigatedAway,
     });
 
@@ -260,8 +328,17 @@ function throwIfNavigatedAway(navigatedAway: boolean, participant: string): void
 }
 
 /**
- * Best-effort attempt to flip the pre-join card's "Waiting Room" toggle
- * to OFF when the bot is the meeting owner.
+ * Verify (and if necessary flip) the pre-join card's "Waiting Room"
+ * toggle to OFF before the bot clicks Start Meeting.
+ *
+ * Replaces the v1.6.x `disableWaitingRoomIfOwner` helper. The behaviour
+ * is the same on the happy path (toggle present + ON → click → wait
+ * for `aria-checked="false"`), but the post-condition assertion + log
+ * lines are explicit so operators can tell from the bot's log whether
+ * the toggle was already off, was just flipped off, or wasn't present
+ * at all. Without this an operator reading the log can't distinguish
+ * "Start mode, toggle was already off" from "Join mode, toggle never
+ * existed" — both produced the same log silence before.
  *
  * Context: the toggle renders only when `is_owner = true` in
  * `dioxus-ui/src/components/pre_join_settings_card.rs` (lines 102-159).
@@ -275,46 +352,55 @@ function throwIfNavigatedAway(navigatedAway: boolean, participant: string): void
  * The toggle is the `ToggleSwitch` component
  * (`dioxus-ui/src/components/toggle_switch.rs`), which renders as a
  * `<button role="switch" aria-checked="true|false">`. Clicking it triggers
- * an async PATCH against the meeting settings API, so we wait ~300ms for
- * the save to settle.
+ * an async PATCH against the meeting settings API; we wait for
+ * `aria-checked` to flip to `"false"` (up to 5s) as the post-condition.
  *
  * This step is best-effort: a missing toggle (the common case where the
- * bot is joining an existing meeting), a click failure, or a `aria-checked`
- * read failure must not block the join. We log a warning and move on.
+ * bot is joining an existing meeting), a click failure, or an
+ * `aria-checked` read failure must not block the join. We log a warning
+ * and move on.
+ *
+ * Exported so the caller's pre-Start verification path can short-circuit
+ * cleanly without duplicating the locator query.
  */
-async function disableWaitingRoomIfOwner(page: Page, participant: string): Promise<void> {
+export async function ensureWaitingRoomOff(page: Page, participant: string): Promise<void> {
   const waitingRoomRow = page.locator(".settings-option-row").filter({ hasText: "Waiting Room" });
-  const waitingRoomToggle = waitingRoomRow.locator('[role="switch"]').first();
+  const toggle = waitingRoomRow.locator('[role="switch"]').first();
 
   // Short visibility timeout: in the common case the toggle isn't
   // present (bot is joining an existing meeting), we don't want to
-  // burn 30s waiting on a UI element that won't appear.
-  const toggleVisible = await waitingRoomToggle.isVisible({ timeout: 2_000 }).catch(() => false);
+  // burn 30s waiting on a UI element that won't appear. Absent toggle
+  // ⇒ not in Start mode ⇒ nothing to do; not an error.
+  const toggleVisible = await toggle.isVisible({ timeout: 2_000 }).catch(() => false);
   if (!toggleVisible) {
-    console.log(
-      `[${participant}] Waiting Room toggle not present — skipping (bot is not meeting owner)`,
-    );
+    console.log(`[${participant}] Waiting Room toggle not present — skipping`);
     return;
   }
 
   try {
-    const ariaChecked = await waitingRoomToggle.getAttribute("aria-checked");
-    if (ariaChecked === "false") {
-      // Already off — nothing to do.
+    const current = await toggle.getAttribute("aria-checked");
+    if (current === "false") {
+      console.log(`[${participant}] Waiting Room is already OFF`);
       return;
     }
-    if (ariaChecked !== "true") {
+    if (current !== "true") {
       console.warn(
-        `[${participant}] Waiting Room toggle has unexpected aria-checked="${ariaChecked}" — skipping`,
+        `[${participant}] Waiting Room toggle has unexpected aria-checked="${current}" — skipping`,
       );
       return;
     }
-    console.log(`[${participant}] disabling Waiting Room (bot is meeting owner)`);
-    await waitingRoomToggle.click({ timeout: 2_000 });
-    // The toggle's onclick triggers an async PATCH against the meeting
-    // settings API (see pre_join_settings_card.rs:127-156). Give it a
-    // moment to settle so the click isn't lost to a re-render.
-    await page.waitForTimeout(300);
+    console.log(`[${participant}] Waiting Room is ON — disabling`);
+    await toggle.click({ timeout: 2_000 });
+    // Wait for `aria-checked` to flip. This is the explicit
+    // post-condition: the click only matters if it lands the toggle
+    // in the OFF state. The async PATCH against the meeting settings
+    // API (see pre_join_settings_card.rs:127-156) settles inside
+    // this window.
+    await waitingRoomRow
+      .locator('[role="switch"][aria-checked="false"]')
+      .first()
+      .waitFor({ timeout: 5_000 });
+    console.log(`[${participant}] Waiting Room is now OFF`);
   } catch (e) {
     console.warn(
       `[${participant}] could not disable Waiting Room toggle (proceeding with join):`,
@@ -451,9 +537,10 @@ async function joinWithRetries(args: {
   participant: string;
   joinButton: Locator;
   grid: Locator;
+  mode: JoinMode;
   isNavigatedAway: () => boolean;
 }): Promise<void> {
-  const { page, participant, joinButton, grid, isNavigatedAway } = args;
+  const { page, participant, joinButton, grid, mode, isNavigatedAway } = args;
   const maxAttempts = 3;
   const perAttemptGridTimeout = 45_000;
 
@@ -461,6 +548,16 @@ async function joinWithRetries(args: {
   const waitingForHost = page.locator(MEETING_STATE_SELECTORS.waitingForHost).first();
   const rejected = page.locator(MEETING_STATE_SELECTORS.rejected).first();
   const errorScreen = page.locator(MEETING_STATE_SELECTORS.error).first();
+
+  // The Waiting Room toggle is verified once, BEFORE this loop (see
+  // the caller in `joinMeetingAndEnableMedia`). On retries 2 + 3 the
+  // bot is still in the Start Meeting flow, but the meeting page may
+  // already have transitioned past the pre-join card — re-checking
+  // the toggle would either no-op silently or hit the disabled
+  // post-card state. Track the flag here so future refactors that
+  // move verification inside the loop short-circuit cleanly and so
+  // the log makes the skip explicit for "start" mode.
+  const waitingRoomVerified = mode === "start";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (isNavigatedAway()) return; // surfaced by caller's throwIfNavigatedAway
@@ -512,8 +609,17 @@ async function joinWithRetries(args: {
     }
 
     if (attempt === 1) {
-      console.log(`[${participant}] clicking Join Meeting`);
+      // Log the button label that's actually being clicked so the
+      // operator can tell from the log which mode the bot saw. Falls
+      // back to "Join Meeting" when the detection was inconclusive
+      // (preserves the legacy log shape for the unknown-label path).
+      const label =
+        mode === "start" ? "Start Meeting" : mode === "join" ? "Join Meeting" : "Join Meeting";
+      console.log(`[${participant}] clicking ${label}`);
     } else {
+      if (mode === "start" && waitingRoomVerified) {
+        console.log(`[${participant}] Waiting Room already verified — skipping on retry`);
+      }
       console.log(`[${participant}] retrying join click (attempt ${attempt})`);
     }
     // Playwright's auto-waiting + actionability checks effectively

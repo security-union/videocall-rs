@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 
 import {
+  type ClickAttemptDiagnostics,
   JoinRejectedError,
   MEETING_STATE_SELECTORS,
   MeetingNavigatedAwayError,
@@ -8,7 +9,9 @@ import {
   classifyJoinModeText,
   detectJoinMode,
   ensureWaitingRoomOff,
+  installClickDiagnostics,
   joinMeetingAndEnableMedia,
+  logPostClickDiagnostics,
 } from "./meeting-join";
 
 // `joinMeetingAndEnableMedia` itself is Playwright-driven and would
@@ -353,5 +356,366 @@ describe("ensureWaitingRoomOff", () => {
     expect(calls.flipWait).toBe(1);
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+// `installClickDiagnostics` is the per-attempt event recorder that
+// surfaces WHY a join click didn't transition. We build a tiny event
+// emitter shaped like Playwright's Page (.on/.off + .url) so each
+// captured-event branch is exercised without spinning up Chrome.
+//
+// Coverage targets:
+//   - console.error events of type "error" are captured.
+//   - console messages of other types are ignored.
+//   - requestfailed events are captured with the failure text.
+//   - response events with status >= 400 are captured.
+//   - response events with status < 400 are ignored.
+//   - The 20-entry cap is enforced for both console + request lanes.
+//   - Dev-server cosmetic noise is filtered out so it doesn't displace
+//     real errors.
+//   - teardown removes all installed listeners.
+
+type EventName = "console" | "requestfailed" | "response";
+type AnyListener = (arg: unknown) => void;
+
+interface FakePage {
+  url: () => string;
+  on: (event: EventName, listener: AnyListener) => void;
+  off: (event: EventName, listener: AnyListener) => void;
+  emit: (event: EventName, arg: unknown) => void;
+  listenerCount: (event: EventName) => number;
+}
+
+function makeFakePage(url: string): FakePage {
+  const listeners: Record<EventName, Set<AnyListener>> = {
+    console: new Set(),
+    requestfailed: new Set(),
+    response: new Set(),
+  };
+  return {
+    url: () => url,
+    on: (event, listener) => {
+      listeners[event].add(listener);
+    },
+    off: (event, listener) => {
+      listeners[event].delete(listener);
+    },
+    emit: (event, arg) => {
+      for (const fn of listeners[event]) fn(arg);
+    },
+    listenerCount: (event) => listeners[event].size,
+  };
+}
+
+function fakeConsoleMessage(
+  type: string,
+  text: string,
+): { type: () => string; text: () => string } {
+  return { type: () => type, text: () => text };
+}
+
+function fakeRequest(
+  url: string,
+  errorText?: string,
+): {
+  url: () => string;
+  failure: () => { errorText: string } | null;
+} {
+  return {
+    url: () => url,
+    failure: () => (errorText !== undefined ? { errorText } : null),
+  };
+}
+
+function fakeResponse(url: string, status: number): { url: () => string; status: () => number } {
+  return { url: () => url, status: () => status };
+}
+
+describe("installClickDiagnostics", () => {
+  it('captures console.error events of type "error" into diag.consoleErrors', () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("console", fakeConsoleMessage("error", "TypeError: cannot read property"));
+    page.emit("console", fakeConsoleMessage("error", "another error"));
+
+    expect(diag.consoleErrors).toEqual(["TypeError: cannot read property", "another error"]);
+    teardown();
+  });
+
+  it("ignores console messages of non-error types", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("console", fakeConsoleMessage("log", "just a log"));
+    page.emit("console", fakeConsoleMessage("warning", "a warning"));
+    page.emit("console", fakeConsoleMessage("info", "info line"));
+
+    expect(diag.consoleErrors).toHaveLength(0);
+    teardown();
+  });
+
+  it("captures requestfailed events with the failure text", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("requestfailed", fakeRequest("https://api.example.com/foo", "net::ERR_FAILED"));
+
+    expect(diag.failedRequests).toEqual([
+      { url: "https://api.example.com/foo", failure: "net::ERR_FAILED" },
+    ]);
+    teardown();
+  });
+
+  it("captures requestfailed events with undefined failure when none is reported", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("requestfailed", fakeRequest("https://api.example.com/foo"));
+
+    expect(diag.failedRequests).toEqual([
+      { url: "https://api.example.com/foo", failure: undefined },
+    ]);
+    teardown();
+  });
+
+  it("captures HTTP >= 400 responses into diag.failedRequests with the status code", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("response", fakeResponse("https://api.example.com/api/v1/meetings/Foo/join", 403));
+    page.emit("response", fakeResponse("https://api.example.com/api/v1/meetings/Foo/join", 500));
+
+    expect(diag.failedRequests).toEqual([
+      { url: "https://api.example.com/api/v1/meetings/Foo/join", status: 403 },
+      { url: "https://api.example.com/api/v1/meetings/Foo/join", status: 500 },
+    ]);
+    teardown();
+  });
+
+  it("ignores HTTP < 400 responses (success / redirects are not failures)", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    page.emit("response", fakeResponse("https://api.example.com/ok", 200));
+    page.emit("response", fakeResponse("https://api.example.com/redirect", 302));
+    page.emit("response", fakeResponse("https://api.example.com/not-modified", 304));
+
+    expect(diag.failedRequests).toHaveLength(0);
+    teardown();
+  });
+
+  it("enforces the 20-entry cap on consoleErrors (extra events are dropped)", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    for (let i = 0; i < 30; i++) {
+      page.emit("console", fakeConsoleMessage("error", `error #${i}`));
+    }
+
+    expect(diag.consoleErrors).toHaveLength(20);
+    // First 20 are kept; the rest are dropped.
+    expect(diag.consoleErrors[0]).toBe("error #0");
+    expect(diag.consoleErrors[19]).toBe("error #19");
+    teardown();
+  });
+
+  it("enforces the 20-entry cap on failedRequests across both lanes combined", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    for (let i = 0; i < 15; i++) {
+      page.emit("response", fakeResponse(`https://api/${i}`, 500));
+    }
+    for (let i = 0; i < 15; i++) {
+      page.emit("requestfailed", fakeRequest(`https://api/fail/${i}`, "net::ERR_FAILED"));
+    }
+
+    // Cap applies to the combined budget — first 20 wins regardless of lane.
+    expect(diag.failedRequests).toHaveLength(20);
+    teardown();
+  });
+
+  it("filters Dioxus dev-server cosmetic noise so it doesn't displace real errors", () => {
+    const page = makeFakePage("http://localhost:3001/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    // Dev-server noise (filtered)
+    page.emit("console", fakeConsoleMessage("error", "Unexpected token '<'"));
+    page.emit(
+      "console",
+      fakeConsoleMessage(
+        "error",
+        "WebSocket connection to 'ws://localhost:3001/_dioxus?build_id=0' failed",
+      ),
+    );
+    // Real error (kept)
+    page.emit("console", fakeConsoleMessage("error", "Failed to fetch meeting config"));
+
+    expect(diag.consoleErrors).toEqual(["Failed to fetch meeting config"]);
+    teardown();
+  });
+
+  it("records startUrl + startedAt at install time so the diff is accurate", () => {
+    const before = Date.now();
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { diag, teardown } = installClickDiagnostics(page as never);
+
+    expect(diag.startUrl).toBe("https://example.com/meeting/Foo");
+    expect(diag.startedAt).toBeGreaterThanOrEqual(before);
+    expect(diag.startedAt).toBeLessThanOrEqual(Date.now());
+    teardown();
+  });
+
+  it("teardown removes every installed listener so retries don't leak", () => {
+    const page = makeFakePage("https://example.com/meeting/Foo");
+    const { teardown } = installClickDiagnostics(page as never);
+
+    expect(page.listenerCount("console")).toBe(1);
+    expect(page.listenerCount("requestfailed")).toBe(1);
+    expect(page.listenerCount("response")).toBe(1);
+
+    teardown();
+
+    expect(page.listenerCount("console")).toBe(0);
+    expect(page.listenerCount("requestfailed")).toBe(0);
+    expect(page.listenerCount("response")).toBe(0);
+  });
+});
+
+describe("logPostClickDiagnostics", () => {
+  let logs: string[] = [];
+  const logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  });
+
+  afterEach(() => {
+    logs = [];
+    logSpy.mockClear();
+  });
+
+  function makeDiag(overrides: Partial<ClickAttemptDiagnostics> = {}): ClickAttemptDiagnostics {
+    return {
+      startedAt: Date.now() - 2_000,
+      startUrl: "https://example.com/meeting/Foo",
+      consoleErrors: [],
+      failedRequests: [],
+      ...overrides,
+    };
+  }
+
+  it("logs '0 console.error(s)' + '0 failed request(s)' when nothing was captured", () => {
+    const diag = makeDiag();
+    logPostClickDiagnostics("bot-1", 2, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("attempt 2 diagnostics"))).toBe(true);
+    expect(logs.some((l) => l.includes("url unchanged"))).toBe(true);
+    expect(logs.some((l) => l.includes("captured 0 console.error(s)"))).toBe(true);
+    expect(logs.some((l) => l.includes("captured 0 failed request(s)"))).toBe(true);
+    // No hint line should fire when no failures were captured.
+    expect(logs.some((l) => l.includes("meeting-api join request failed"))).toBe(false);
+  });
+
+  it("logs each captured console.error on its own indented line", () => {
+    const diag = makeDiag({
+      consoleErrors: ["TypeError: cannot read property", "WebSocket closed unexpectedly"],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("captured 2 console.error(s)"))).toBe(true);
+    expect(logs.some((l) => l.includes("[1] TypeError: cannot read property"))).toBe(true);
+    expect(logs.some((l) => l.includes("[2] WebSocket closed unexpectedly"))).toBe(true);
+  });
+
+  it("logs each captured failed request with HTTP status when present", () => {
+    const diag = makeDiag({
+      failedRequests: [
+        { url: "https://api.example.com/api/v1/meetings/Foo/join", status: 403 },
+        { url: "https://cdn.example.com/asset.png", status: 404 },
+      ],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("captured 2 failed request(s)"))).toBe(true);
+    expect(
+      logs.some((l) => l.includes("HTTP 403") && l.includes("/api/v1/meetings/Foo/join")),
+    ).toBe(true);
+    expect(logs.some((l) => l.includes("HTTP 404") && l.includes("asset.png"))).toBe(true);
+  });
+
+  it("logs failure text for transport-level errors when there's no HTTP status", () => {
+    const diag = makeDiag({
+      failedRequests: [{ url: "https://api.example.com/foo", failure: "net::ERR_FAILED" }],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("net::ERR_FAILED"))).toBe(true);
+  });
+
+  it("falls back to 'unknown failure' when neither status nor failure text is set", () => {
+    const diag = makeDiag({
+      failedRequests: [{ url: "https://api.example.com/foo" }],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("unknown failure"))).toBe(true);
+  });
+
+  it("marks the URL as CHANGED when the page navigated since the click", () => {
+    const diag = makeDiag({ startUrl: "https://example.com/meeting/Foo" });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/");
+
+    expect(logs.some((l) => l.includes("url CHANGED to https://example.com/"))).toBe(true);
+  });
+
+  it("fires the meeting-api hint when a /api/v1/meetings/.../join URL is 4xx", () => {
+    const diag = makeDiag({
+      failedRequests: [{ url: "https://api.example.com/api/v1/meetings/Foo/join", status: 403 }],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(
+      logs.some(
+        (l) =>
+          l.includes("meeting-api join request failed with HTTP 403") &&
+          l.includes("server-side logs"),
+      ),
+    ).toBe(true);
+  });
+
+  it("fires the meeting-api hint for 500-class server errors too", () => {
+    const diag = makeDiag({
+      failedRequests: [{ url: "https://api.example.com/api/v1/meetings/Foo/join", status: 503 }],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("meeting-api join request failed with HTTP 503"))).toBe(
+      true,
+    );
+  });
+
+  it("does NOT fire the meeting-api hint for unrelated failed URLs", () => {
+    const diag = makeDiag({
+      failedRequests: [
+        { url: "https://cdn.example.com/asset.png", status: 404 },
+        { url: "https://api.example.com/api/v1/users/me", status: 401 },
+      ],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("meeting-api join request failed"))).toBe(false);
+  });
+
+  it("does NOT fire the meeting-api hint when the join URL is < 400 (success)", () => {
+    const diag = makeDiag({
+      failedRequests: [
+        // A 200 wouldn't actually be captured by installClickDiagnostics,
+        // but we want defense-in-depth on the hint logic itself.
+        { url: "https://api.example.com/api/v1/meetings/Foo/join", status: 200 },
+      ],
+    });
+    logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
+
+    expect(logs.some((l) => l.includes("meeting-api join request failed"))).toBe(false);
   });
 });

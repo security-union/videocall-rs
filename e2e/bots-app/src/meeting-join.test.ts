@@ -12,6 +12,8 @@ import {
   installClickDiagnostics,
   joinMeetingAndEnableMedia,
   logPostClickDiagnostics,
+  racePhaseAClickConsumed,
+  racePhaseBPostClick,
 } from "./meeting-join";
 
 // `joinMeetingAndEnableMedia` itself is Playwright-driven and would
@@ -717,5 +719,472 @@ describe("logPostClickDiagnostics", () => {
     logPostClickDiagnostics("bot-1", 1, diag, "https://example.com/meeting/Foo");
 
     expect(logs.some((l) => l.includes("meeting-api join request failed"))).toBe(false);
+  });
+});
+
+// `racePhaseAClickConsumed` and `racePhaseBPostClick` are the two new
+// race helpers that replaced the v1.7.2 single-race `joinWithRetries`
+// loop. The v1.7.2 implementation raced
+// `joinButton.waitFor({state: "visible"})` against a locator that was
+// already visible — Playwright resolves "already in target state"
+// immediately, so all three retries fired in ~250ms total (each
+// "attempt" took ~80ms instead of the intended 45,000ms).
+//
+// The mocked-locator shape below models Playwright's waitFor exactly
+// enough to drive each branch: we record (1) which `state` option was
+// passed (so we can prove Phase A asks for "hidden", not "visible"), and
+// (2) we let each locator's waitFor be controlled by the test (resolve
+// after a given delay, or reject with a Playwright-style timeout error).
+// `vi.useFakeTimers` lets the suite verify the "click-not-consumed" path
+// genuinely waits the full per-attempt budget instead of collapsing.
+
+interface FakeWaitForOptions {
+  timeout: number;
+  state?: "attached" | "detached" | "visible" | "hidden";
+}
+
+interface FakeLocator {
+  waitFor: (opts: FakeWaitForOptions) => Promise<void>;
+  /** Test-visible record of every `waitFor` call. */
+  calls: FakeWaitForOptions[];
+}
+
+type FakeOutcome =
+  | { kind: "resolve"; afterMs: number }
+  | { kind: "reject"; afterMs: number }
+  | { kind: "never" };
+
+/**
+ * Build a fake Locator whose `waitFor` resolves or rejects after the
+ * configured delay. Reject is modeled to match Playwright's
+ * locator.waitFor timeout shape (the test never inspects the error
+ * message, only the promise rejection).
+ *
+ * `outcomeByState` lets a single locator respond differently to
+ * `state: "visible"` vs `state: "hidden"` — needed because the join
+ * button is a single locator that's "currently visible" but eventually
+ * "hidden".
+ */
+function makeFakeLocator(args: {
+  outcome?: FakeOutcome;
+  outcomeByState?: Partial<Record<NonNullable<FakeWaitForOptions["state"]>, FakeOutcome>>;
+}): FakeLocator {
+  const calls: FakeWaitForOptions[] = [];
+  return {
+    calls,
+    waitFor: (opts: FakeWaitForOptions): Promise<void> => {
+      calls.push(opts);
+      const stateKey = opts.state;
+      const resolved = (stateKey !== undefined ? args.outcomeByState?.[stateKey] : undefined) ??
+        args.outcome ?? { kind: "never" };
+      if (resolved.kind === "never") {
+        return new Promise<void>(() => {
+          /* never resolves; the outer race resolves first via timeout */
+        });
+      }
+      if (resolved.kind === "resolve") {
+        return new Promise<void>((resolve) => setTimeout(resolve, resolved.afterMs));
+      }
+      return new Promise<void>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("locator.waitFor: Timeout exceeded.")), resolved.afterMs),
+      );
+    },
+  };
+}
+
+/**
+ * Build the standard {joinButton, grid, waitingRoom, waitingForHost,
+ * rejected, errorScreen} bundle. By default every locator "never
+ * resolves" — the test then configures only the ones it wants firing.
+ *
+ * The join button defaults to "reject on visible / never on hidden" so
+ * the Phase A race times out unless the test overrides it; this mirrors
+ * the production scenario where the click is a no-op and the button
+ * stays visible.
+ */
+interface FakeLocatorBundle {
+  joinButton: FakeLocator;
+  grid: FakeLocator;
+  waitingRoom: FakeLocator;
+  waitingForHost: FakeLocator;
+  rejected: FakeLocator;
+  errorScreen: FakeLocator;
+}
+
+function makeLocatorBundle(overrides: Partial<FakeLocatorBundle> = {}): FakeLocatorBundle {
+  return {
+    joinButton: overrides.joinButton ?? makeFakeLocator({ outcome: { kind: "never" } }),
+    grid: overrides.grid ?? makeFakeLocator({ outcome: { kind: "never" } }),
+    waitingRoom: overrides.waitingRoom ?? makeFakeLocator({ outcome: { kind: "never" } }),
+    waitingForHost: overrides.waitingForHost ?? makeFakeLocator({ outcome: { kind: "never" } }),
+    rejected: overrides.rejected ?? makeFakeLocator({ outcome: { kind: "never" } }),
+    errorScreen: overrides.errorScreen ?? makeFakeLocator({ outcome: { kind: "never" } }),
+  };
+}
+
+/**
+ * Thin wrappers that perform the FakeLocator→Locator cast once each, so
+ * the test bodies read cleanly while still type-checking against the
+ * production helpers. The cast is safe — the race helpers only call
+ * `.waitFor(...)` on the locators they're given, which FakeLocator fully
+ * implements.
+ */
+function runPhaseA(
+  args: FakeLocatorBundle & { timeout: number },
+): ReturnType<typeof racePhaseAClickConsumed> {
+  return racePhaseAClickConsumed(args as never);
+}
+function runPhaseB(
+  args: FakeLocatorBundle & { timeout: number },
+): ReturnType<typeof racePhaseBPostClick> {
+  return racePhaseBPostClick(args as never);
+}
+
+describe("racePhaseAClickConsumed", () => {
+  // The per-attempt timeout the production code uses (45s). The fake
+  // timers in this suite never actually wait wall-clock time, so it
+  // doesn't matter what value we pick — but matching production keeps
+  // the assertions readable.
+  const TIMEOUT = 45_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('races against joinButton.waitFor({state: "hidden"}), NOT visible — proves the bug fix', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      // Button never hides — but the call itself MUST request hidden.
+      joinButton: makeFakeLocator({ outcome: { kind: "never" } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    // Drain microtasks so each branch's waitFor is invoked.
+    await vi.advanceTimersByTimeAsync(0);
+
+    const stateOpts = bundle.joinButton.calls.map((c) => c.state);
+    expect(stateOpts).toContain("hidden");
+    expect(stateOpts).not.toContain("visible");
+
+    // Resolve the race by hiding the button so the promise settles —
+    // otherwise vitest's open-handle detector complains.
+    vi.useRealTimers();
+    void racePromise;
+  });
+
+  it("returns null when nothing resolves before the timeout (click-not-consumed path)", async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      // All six waitFors reject after exactly the timeout — this is the
+      // canonical Playwright behaviour when nothing happens.
+      joinButton: makeFakeLocator({
+        outcomeByState: {
+          hidden: { kind: "reject", afterMs: TIMEOUT },
+        },
+      }),
+      grid: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingRoom: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingForHost: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      rejected: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      errorScreen: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(TIMEOUT + 1);
+    const outcome = await racePromise;
+    expect(outcome).toBeNull();
+  });
+
+  it("genuinely waits the full timeout when the click is not consumed (no early ~80ms collapse)", async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const bundle = makeLocatorBundle({
+      // Button stays visible — Phase A's hidden-wait rejects at the
+      // timeout boundary. This is exactly the bug scenario: in v1.7.2
+      // the race resolved in ~80ms because it raced state:"visible" on
+      // an already-visible button. Now it correctly waits the full
+      // budget.
+      joinButton: makeFakeLocator({
+        outcomeByState: { hidden: { kind: "reject", afterMs: TIMEOUT } },
+      }),
+      grid: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingRoom: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingForHost: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      rejected: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      errorScreen: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    // Halfway through: nothing should have resolved yet.
+    await vi.advanceTimersByTimeAsync(TIMEOUT / 2);
+    let settled = false;
+    void racePromise.then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    // Drive to (just past) the boundary.
+    await vi.advanceTimersByTimeAsync(TIMEOUT / 2 + 1);
+    const outcome = await racePromise;
+    const elapsed = Date.now() - start;
+    expect(outcome).toBeNull();
+    // The fake-timers clock should report a full timeout — proves the
+    // race did NOT short-circuit on an "already visible" button.
+    expect(elapsed).toBeGreaterThanOrEqual(TIMEOUT);
+  });
+
+  it('resolves to "grid" when the grid appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      grid: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 1_000 } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await racePromise).toBe("grid");
+  });
+
+  it('resolves to "button-hidden" when the button hides first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      joinButton: makeFakeLocator({
+        outcomeByState: { hidden: { kind: "resolve", afterMs: 500 } },
+      }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("button-hidden");
+  });
+
+  it('resolves to "waiting-room" when the waiting-room screen appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      waitingRoom: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 500 } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("waiting-room");
+  });
+
+  it('resolves to "waiting-for-host" when the waiting-for-host screen appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      waitingForHost: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 500 } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("waiting-for-host");
+  });
+
+  it('resolves to "rejected" when the rejected screen appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      rejected: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 500 } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("rejected");
+  });
+
+  it('resolves to "error" when the error screen appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      errorScreen: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 500 } }),
+    });
+    const racePromise = runPhaseA({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("error");
+  });
+});
+
+describe("racePhaseBPostClick", () => {
+  const TIMEOUT = 45_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('races against joinButton.waitFor({state: "visible"}) — the legitimate reappearance signal', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle();
+    const racePromise = runPhaseB({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const stateOpts = bundle.joinButton.calls.map((c) => c.state);
+    expect(stateOpts).toContain("visible");
+    expect(stateOpts).not.toContain("hidden");
+
+    vi.useRealTimers();
+    void racePromise;
+  });
+
+  it("returns null when nothing resolves before the timeout (click-consumed-no-followup path)", async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      joinButton: makeFakeLocator({
+        outcomeByState: { visible: { kind: "reject", afterMs: TIMEOUT } },
+      }),
+      grid: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingRoom: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      waitingForHost: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      rejected: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+      errorScreen: makeFakeLocator({ outcome: { kind: "reject", afterMs: TIMEOUT } }),
+    });
+    const racePromise = runPhaseB({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(TIMEOUT + 1);
+    expect(await racePromise).toBeNull();
+  });
+
+  it('resolves to "grid" when the grid appears first', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      grid: makeFakeLocator({ outcome: { kind: "resolve", afterMs: 1_000 } }),
+    });
+    const racePromise = runPhaseB({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await racePromise).toBe("grid");
+  });
+
+  it('resolves to "button-reappeared" when the join button comes back', async () => {
+    vi.useFakeTimers();
+    const bundle = makeLocatorBundle({
+      joinButton: makeFakeLocator({
+        outcomeByState: { visible: { kind: "resolve", afterMs: 500 } },
+      }),
+    });
+    const racePromise = runPhaseB({ ...bundle, timeout: TIMEOUT });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await racePromise).toBe("button-reappeared");
+  });
+
+  it("propagates each non-grid terminal screen (waiting-room / waiting-for-host / rejected / error)", async () => {
+    const cases = [
+      { key: "waitingRoom", expected: "waiting-room" },
+      { key: "waitingForHost", expected: "waiting-for-host" },
+      { key: "rejected", expected: "rejected" },
+      { key: "errorScreen", expected: "error" },
+    ] as const;
+
+    for (const c of cases) {
+      vi.useFakeTimers();
+      const fast = makeFakeLocator({ outcome: { kind: "resolve", afterMs: 500 } });
+      const bundle = makeLocatorBundle({ [c.key]: fast } as Record<string, FakeLocator>);
+      const racePromise = runPhaseB({ ...bundle, timeout: TIMEOUT });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await racePromise).toBe(c.expected);
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Phase A + Phase B compose into the new joinWithRetries control flow.
+// These tests model the composition at the *outcome* level (without
+// invoking the production `joinWithRetries`, which would require driving
+// a real Playwright Page + the diagnostic recorder). The composition
+// table here is what the production loop maps to error messages — keep
+// it in lockstep with the switch in `joinWithRetries`.
+describe("two-phase outcome composition (joinWithRetries control flow)", () => {
+  type PhaseA =
+    | "grid"
+    | "waiting-room"
+    | "waiting-for-host"
+    | "rejected"
+    | "error"
+    | "button-hidden"
+    | null;
+  type PhaseB =
+    | "grid"
+    | "waiting-room"
+    | "waiting-for-host"
+    | "rejected"
+    | "error"
+    | "button-reappeared"
+    | null;
+  type Disposition =
+    | "success"
+    | "retry-click-not-consumed"
+    | "retry-button-reappeared"
+    | "retry-no-followup"
+    | "throw-waiting-room"
+    | "throw-waiting-for-host"
+    | "throw-rejected"
+    | "throw-error";
+
+  function compose(a: PhaseA, b: PhaseB | undefined): Disposition {
+    if (a === null) return "retry-click-not-consumed";
+    if (a === "grid") return "success";
+    if (a === "waiting-room") return "throw-waiting-room";
+    if (a === "waiting-for-host") return "throw-waiting-for-host";
+    if (a === "rejected") return "throw-rejected";
+    if (a === "error") return "throw-error";
+    // a === "button-hidden" — run Phase B.
+    if (b === undefined)
+      throw new Error("test bug: Phase B must be defined when Phase A is button-hidden");
+    if (b === null) return "retry-no-followup";
+    if (b === "grid") return "success";
+    if (b === "waiting-room") return "throw-waiting-room";
+    if (b === "waiting-for-host") return "throw-waiting-for-host";
+    if (b === "rejected") return "throw-rejected";
+    if (b === "error") return "throw-error";
+    return "retry-button-reappeared";
+  }
+
+  it("Phase A timeout (button stays visible) → retry-click-not-consumed", () => {
+    expect(compose(null, undefined)).toBe("retry-click-not-consumed");
+  });
+
+  it('Phase A "grid" → success (no Phase B)', () => {
+    expect(compose("grid", undefined)).toBe("success");
+  });
+
+  it('Phase A "button-hidden" + Phase B "grid" → success', () => {
+    expect(compose("button-hidden", "grid")).toBe("success");
+  });
+
+  it('Phase A "button-hidden" + Phase B "button-reappeared" → retry-button-reappeared', () => {
+    expect(compose("button-hidden", "button-reappeared")).toBe("retry-button-reappeared");
+  });
+
+  it('Phase A "button-hidden" + Phase B timeout (null) → retry-no-followup', () => {
+    expect(compose("button-hidden", null)).toBe("retry-no-followup");
+  });
+
+  // Every non-grid terminal outcome must short-circuit with a typed
+  // error regardless of which phase saw it.
+  it('Phase A "waiting-room" → throw-waiting-room', () => {
+    expect(compose("waiting-room", undefined)).toBe("throw-waiting-room");
+  });
+  it('Phase A "waiting-for-host" → throw-waiting-for-host', () => {
+    expect(compose("waiting-for-host", undefined)).toBe("throw-waiting-for-host");
+  });
+  it('Phase A "rejected" → throw-rejected', () => {
+    expect(compose("rejected", undefined)).toBe("throw-rejected");
+  });
+  it('Phase A "error" → throw-error', () => {
+    expect(compose("error", undefined)).toBe("throw-error");
+  });
+  it('Phase A "button-hidden" + Phase B "waiting-room" → throw-waiting-room', () => {
+    expect(compose("button-hidden", "waiting-room")).toBe("throw-waiting-room");
+  });
+  it('Phase A "button-hidden" + Phase B "waiting-for-host" → throw-waiting-for-host', () => {
+    expect(compose("button-hidden", "waiting-for-host")).toBe("throw-waiting-for-host");
+  });
+  it('Phase A "button-hidden" + Phase B "rejected" → throw-rejected', () => {
+    expect(compose("button-hidden", "rejected")).toBe("throw-rejected");
+  });
+  it('Phase A "button-hidden" + Phase B "error" → throw-error', () => {
+    expect(compose("button-hidden", "error")).toBe("throw-error");
+  });
+
+  // The full set of distinguishable outcomes after the fix. v1.7.2
+  // collapsed "click-not-consumed" into "button-reappeared" — listing
+  // both here is the regression guard.
+  it("all 7 terminal dispositions are uniquely distinguishable", () => {
+    const dispositions: Disposition[] = [
+      compose("grid", undefined),
+      compose("waiting-room", undefined),
+      compose("waiting-for-host", undefined),
+      compose("rejected", undefined),
+      compose("error", undefined),
+      compose(null, undefined),
+      compose("button-hidden", "button-reappeared"),
+    ];
+    expect(new Set(dispositions).size).toBe(7);
   });
 });

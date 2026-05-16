@@ -684,28 +684,169 @@ export function logPostClickDiagnostics(
 }
 
 /**
- * Click the (enabled) Join button up to `maxAttempts` times, racing the
- * grid against the Join button reappearing after each click. A
- * reappearance signals the previous click was consumed by the UI but
- * the join did not complete (e.g. transient connection error,
- * disabled-mid-click, blocked-card switch).
+ * Phase-A race outcome: either the click was *not* consumed (button
+ * stayed visible the full timeout — caller retries) or it was consumed
+ * (`button-hidden`), in which case the caller runs Phase B. The four
+ * non-grid terminal screens + `grid` short-circuit the loop entirely.
+ */
+type PhaseAOutcome = RaceOutcome | "button-hidden";
+
+/**
+ * Phase-B race outcome: the click WAS consumed in Phase A; we now wait
+ * for one of the five post-join screens or for the button to reappear
+ * (genuine retry signal — UI rolled back the click).
+ */
+type PhaseBOutcome = RaceOutcome | "button-reappeared";
+
+/**
+ * Race Phase A: wait for any post-join terminal/success screen, OR for
+ * the click to be visibly consumed by the page (the join button goes
+ * from visible to hidden / detached). Resolves to `null` if NONE of the
+ * conditions resolve within `timeout` — that's the "click did not
+ * transition the page" signal which used to be silently mis-detected as
+ * "button-reappeared" before this fix.
  *
- * The grid wait per-attempt is 45s — the netsim'd `lossy_mobile` profile
- * regularly takes 20-35s to bring the WebTransport stream up.
+ * IMPORTANT: this races `joinButton.waitFor({state: "hidden"})`, not
+ * `state: "visible"`. The previous implementation raced
+ * `state: "visible"` against a locator that was *already* visible (the
+ * just-clicked button); Playwright resolves "already in target state"
+ * immediately, which collapsed the entire 45s budget to ~80ms.
  *
- * Each per-attempt wait *also* races against the four non-grid
- * terminal screens (`meeting-waiting-room`, `meeting-waiting-for-host`,
- * `meeting-rejected`, `meeting-error`). Detecting any of those throws a
- * typed error (`WaitingRoomError` / `JoinRejectedError`) instead of
- * looping the join click — the API already accepted us, the UI is just
- * telling us we're parked or denied.
+ * Exported so the unit tests can drive it with mocked locators.
+ */
+export async function racePhaseAClickConsumed(args: {
+  joinButton: Locator;
+  grid: Locator;
+  waitingRoom: Locator;
+  waitingForHost: Locator;
+  rejected: Locator;
+  errorScreen: Locator;
+  timeout: number;
+}): Promise<PhaseAOutcome | null> {
+  const { joinButton, grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
+  return await Promise.race<PhaseAOutcome | null>([
+    grid
+      .waitFor({ timeout })
+      .then(() => "grid" as const)
+      .catch(() => null),
+    waitingRoom
+      .waitFor({ timeout })
+      .then(() => "waiting-room" as const)
+      .catch(() => null),
+    waitingForHost
+      .waitFor({ timeout })
+      .then(() => "waiting-for-host" as const)
+      .catch(() => null),
+    rejected
+      .waitFor({ timeout })
+      .then(() => "rejected" as const)
+      .catch(() => null),
+    errorScreen
+      .waitFor({ timeout })
+      .then(() => "error" as const)
+      .catch(() => null),
+    // CORRECT: wait for the button to go HIDDEN / detached, not for it
+    // to "still be visible". The latter form (`state: "visible"`) was
+    // the bug we're fixing — Playwright treats an already-visible
+    // locator as success and resolves immediately, defeating the whole
+    // race.
+    joinButton
+      .waitFor({ timeout, state: "hidden" })
+      .then(() => "button-hidden" as const)
+      .catch(() => null),
+  ]);
+}
+
+/**
+ * Race Phase B: the click was already consumed (Phase A saw the button
+ * go hidden). We now wait for one of the five post-join screens OR for
+ * the button to *reappear* — the UI rolled back the click (e.g. a
+ * transient connection error flipped the pre-join card back on).
  *
- * On `button-reappeared` outcomes the per-attempt diagnostic recorder
- * (`installClickDiagnostics` / `logPostClickDiagnostics`) emits a
- * structured block of captured console errors, failed requests, and
+ * Resolves to `null` if nothing resolves within `timeout` — "click was
+ * consumed but no grid/waiting/error state followed", which is the
+ * unusual-but-distinct failure mode caller surfaces with a dedicated
+ * error message.
+ *
+ * Exported so the unit tests can drive it with mocked locators.
+ */
+export async function racePhaseBPostClick(args: {
+  joinButton: Locator;
+  grid: Locator;
+  waitingRoom: Locator;
+  waitingForHost: Locator;
+  rejected: Locator;
+  errorScreen: Locator;
+  timeout: number;
+}): Promise<PhaseBOutcome | null> {
+  const { joinButton, grid, waitingRoom, waitingForHost, rejected, errorScreen, timeout } = args;
+  return await Promise.race<PhaseBOutcome | null>([
+    grid
+      .waitFor({ timeout })
+      .then(() => "grid" as const)
+      .catch(() => null),
+    waitingRoom
+      .waitFor({ timeout })
+      .then(() => "waiting-room" as const)
+      .catch(() => null),
+    waitingForHost
+      .waitFor({ timeout })
+      .then(() => "waiting-for-host" as const)
+      .catch(() => null),
+    rejected
+      .waitFor({ timeout })
+      .then(() => "rejected" as const)
+      .catch(() => null),
+    errorScreen
+      .waitFor({ timeout })
+      .then(() => "error" as const)
+      .catch(() => null),
+    joinButton
+      .waitFor({ timeout, state: "visible" })
+      .then(() => "button-reappeared" as const)
+      .catch(() => null),
+  ]);
+}
+
+/**
+ * Click the (enabled) Join button up to `maxAttempts` times. Per
+ * attempt, run a two-phase wait so the helper can correctly distinguish
+ * "click did nothing" from "click went through but the UI rolled back".
+ *
+ * **Phase A (click-consumption check).** After the click, race for:
+ *   - one of the five post-join terminal/success screens
+ *     (`grid`, `waiting-room`, `waiting-for-host`, `rejected`, `error`),
+ *     OR
+ *   - the join button going hidden / detached.
+ * Times out at `perAttemptGridTimeout` (45s). If Phase A times out with
+ * the button still visible, the click was a no-op — we retry.
+ *
+ * **Phase B (button-reappearance check).** Only runs when Phase A
+ * resolved with `button-hidden` (the click DID transition the page).
+ * Race for the same five post-join screens against a re-appearance of
+ * the (enabled) join button. Reappearance ⇒ the UI rolled back the
+ * click; we retry. Any of the four non-grid terminal screens short-
+ * circuits with a typed error.
+ *
+ * The grid wait per-attempt is 45s — the netsim'd `lossy_mobile`
+ * profile regularly takes 20-35s to bring the WebTransport stream up.
+ *
+ * On retry-trigger outcomes (`button-reappeared` and the
+ * `click-not-consumed` Phase-A timeout) the per-attempt diagnostic
+ * recorder (`installClickDiagnostics` / `logPostClickDiagnostics`) emits
+ * a structured block of captured console errors, failed requests, and
  * the URL diff so operators can see WHY the click didn't transition
  * (commonly: a meeting-api 4xx response). Diagnostics fire ONLY on
  * retry triggers; successful joins stay quiet.
+ *
+ * Background: the v1.7.2 implementation raced
+ * `joinButton.waitFor({state: "visible"})` against a locator that was
+ * already visible (the just-clicked button). Playwright resolves
+ * "already in target state" immediately, so the race collapsed to
+ * ~80ms per attempt and the helper triple-retried in under 250ms total.
+ * The two-phase wait above fixes that by checking for the button going
+ * HIDDEN as the click-consumption signal, then separately watching for
+ * a hide→reappear cycle as the genuine retry signal.
  */
 async function joinWithRetries(args: {
   page: Page;
@@ -812,51 +953,80 @@ async function joinWithRetries(args: {
         console.warn(`[${participant}] join-click warning:`, (e as Error).message);
       }
 
-      // Race the grid + four terminal screens against a re-appearance of
-      // the enabled Join button. Reappearance ⇒ click was a no-op or the
-      // UI rolled back; the four terminal screens short-circuit with a
-      // typed error.
-      type ClickedOutcome = RaceOutcome | "button-reappeared";
-      const outcome = (await Promise.race<ClickedOutcome | null>([
-        grid
-          .waitFor({ timeout: perAttemptGridTimeout })
-          .then(() => "grid" as ClickedOutcome)
-          .catch(() => null),
-        waitingRoom
-          .waitFor({ timeout: perAttemptGridTimeout })
-          .then(() => "waiting-room" as ClickedOutcome)
-          .catch(() => null),
-        waitingForHost
-          .waitFor({ timeout: perAttemptGridTimeout })
-          .then(() => "waiting-for-host" as ClickedOutcome)
-          .catch(() => null),
-        rejected
-          .waitFor({ timeout: perAttemptGridTimeout })
-          .then(() => "rejected" as ClickedOutcome)
-          .catch(() => null),
-        errorScreen
-          .waitFor({ timeout: perAttemptGridTimeout })
-          .then(() => "error" as ClickedOutcome)
-          .catch(() => null),
-        joinButton
-          .waitFor({ timeout: perAttemptGridTimeout, state: "visible" })
-          .then(() => "button-reappeared" as ClickedOutcome)
-          .catch(() => null),
-      ])) as ClickedOutcome | null;
+      // ── Phase A: click-consumption check ────────────────────────────
+      // Race the five post-join screens against the button going
+      // HIDDEN. If Phase A times out with the button still visible the
+      // click was a no-op — diagnostics + retry.
+      const phaseA = await racePhaseAClickConsumed({
+        joinButton,
+        grid,
+        waitingRoom,
+        waitingForHost,
+        rejected,
+        errorScreen,
+        timeout: perAttemptGridTimeout,
+      });
 
-      if (outcome === "grid") {
+      if (phaseA === null) {
+        // 45s elapsed, button still visible, no terminal state
+        // reached. Click did nothing. This is the bug-fix path: the
+        // v1.7.2 implementation would have resolved in ~80ms here via
+        // the broken `state: "visible"` race and triple-retried in
+        // under 250ms total. Now we genuinely waited the full budget.
+        logPostClickDiagnostics(participant, attempt, diag, page.url());
+        if (attempt === maxAttempts) {
+          throw new Error(
+            `click did not transition the page after ${maxAttempts} attempts of ${perAttemptGridTimeout}ms each — see captured diagnostics`,
+          );
+        }
+        continue;
+      }
+      if (phaseA === "grid") {
         console.log(`[${participant}] join click consumed`);
         return;
       }
-      if (outcome !== null && outcome !== "button-reappeared") {
-        await throwForOutcome(outcome, participant, page);
+      if (phaseA !== "button-hidden") {
+        // Non-grid terminal outcome (waiting-room / waiting-for-host /
+        // rejected / error) — short-circuit with a typed error.
+        await throwForOutcome(phaseA, participant, page);
       }
-      if (outcome === "button-reappeared") {
-        // Surface the captured diagnostics BEFORE the retry decision
-        // so operators can see WHY the click didn't transition. Fires
-        // ONLY on the retry trigger — successful joins (outcome ===
-        // "grid") and graceful terminal outcomes (handled above) stay
-        // quiet.
+
+      // ── Phase B: button-reappearance check ──────────────────────────
+      // Phase A saw the button go hidden. The click WAS consumed by the
+      // UI. Now race the five post-join screens against a re-appearance
+      // of the (enabled) join button. Reappearance ⇒ the UI rolled
+      // back — genuine retry signal.
+      const phaseB = await racePhaseBPostClick({
+        joinButton,
+        grid,
+        waitingRoom,
+        waitingForHost,
+        rejected,
+        errorScreen,
+        timeout: perAttemptGridTimeout,
+      });
+
+      if (phaseB === null) {
+        // Click was consumed but the page settled in a state that
+        // isn't any of the five screens we expect. Unusual; surface
+        // diagnostics + a dedicated error message so the operator
+        // can tell this apart from the "click did nothing" path.
+        logPostClickDiagnostics(participant, attempt, diag, page.url());
+        if (attempt === maxAttempts) {
+          throw new Error(
+            `click consumed but no grid/waiting/error state reached within ${perAttemptGridTimeout}ms — see diagnostics`,
+          );
+        }
+        continue;
+      }
+      if (phaseB === "grid") {
+        console.log(`[${participant}] join click consumed`);
+        return;
+      }
+      if (phaseB === "button-reappeared") {
+        // The actual scenario the v1.7.2 "button-reappeared" branch
+        // was trying to detect: a real hide-then-reappear cycle. Now
+        // it only fires when there's an actual transition + rollback.
         logPostClickDiagnostics(participant, attempt, diag, page.url());
         if (attempt === maxAttempts) {
           throw new Error(
@@ -867,13 +1037,8 @@ async function joinWithRetries(args: {
         // next iteration so the attempt number is consistent.
         continue;
       }
-      // outcome === null ⇒ none resolved within the per-attempt
-      // timeout. Treat as failure of this attempt.
-      if (attempt === maxAttempts) {
-        throw new Error(
-          `grid did not become visible within ${perAttemptGridTimeout}ms after join click`,
-        );
-      }
+      // Non-grid terminal outcome.
+      await throwForOutcome(phaseB, participant, page);
     } finally {
       teardown();
     }

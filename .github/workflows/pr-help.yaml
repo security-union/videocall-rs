@@ -48,7 +48,6 @@ jobs:
             | \`/deploy\` | Deploy preview environment (images must exist) | ~3-5 min |
             | \`/build-and-deploy\` | Build images and deploy in one step | ~15-20 min |
             | \`/undeploy\` | Tear down the preview environment | ~1-2 min |
-            | \`/run-e2e\` | Run E2E tests against this PR branch | ~20-30 min |
             | \`/help\` | Show this help message | — |
 
             ### Typical workflow

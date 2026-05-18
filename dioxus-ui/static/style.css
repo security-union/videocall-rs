@@ -69,7 +69,7 @@ canvas {
   background-color: var(--color-surface-elevated);
   color: var(--text-primary);
   transition: left 0.3s ease;
-  z-index: 20;
+  z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
@@ -395,6 +395,7 @@ h3 {
 #grid-container {
   position: absolute;
   inset: 0;
+  z-index: 0;
   display: grid;
   grid-template-columns: repeat(4, 1fr); /* fallback; Rust overrides */
   grid-template-rows: repeat(3, 1fr);    /* fallback; Rust overrides */
@@ -479,7 +480,7 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 1000 !important;
+    z-index: 9300 !important;
     overflow-y: auto !important;
     transform: translateX(-100%) !important;
     box-shadow: none !important;
@@ -499,7 +500,7 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 1000 !important;
+    z-index: 9300 !important;
     overflow-y: auto !important;
     transform: translateX(100%) !important;
     box-shadow: none !important;
@@ -920,7 +921,7 @@ select {
   background-color: var(--surface-elevated);
   color: white;
   transition: right 0.3s ease;
-  z-index: 20;
+  z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
@@ -5000,7 +5001,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   border: 1px solid var(--signal-popup-border);
   border-radius: var(--radius-lg);
   padding: 16px;
-  z-index: 20;
+  z-index: 10;
   box-shadow: var(--signal-popup-shadow);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -5356,7 +5357,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
-  z-index: 1000000;
+  z-index: 9100;
   min-width: 200px;
   backdrop-filter: blur(16px) saturate(1.1);
   -webkit-backdrop-filter: blur(16px) saturate(1.1);
@@ -5434,7 +5435,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   padding: 12px;
   display: flex;
   gap: 8px;
-  z-index: 30;
+  z-index: 9100;
   backdrop-filter: blur(16px) saturate(1.1);
   -webkit-backdrop-filter: blur(16px) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);

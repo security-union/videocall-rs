@@ -32,12 +32,12 @@ Backend is auto-picked by hostname unless `--auth` is set.
 
 The bots-app stack is engineered to keep its footprint in the shipping Dioxus UI to an absolute minimum. The **only** prod-UI changes required for the bots to work are four `data-testid` markers the bot's Playwright driver uses to detect waiting-room / rejection / error states:
 
-| File                                            | Line | `data-testid` value           |
-| ----------------------------------------------- | ---- | ----------------------------- |
-| `dioxus-ui/src/pages/meeting.rs`                | 574  | `meeting-waiting-for-host`    |
-| `dioxus-ui/src/pages/meeting.rs`                | 602  | `meeting-rejected`            |
-| `dioxus-ui/src/pages/meeting.rs`                | 630  | `meeting-error`               |
-| `dioxus-ui/src/components/waiting_room.rs`      | 420  | `meeting-waiting-room`        |
+| File                                       | Line | `data-testid` value        |
+| ------------------------------------------ | ---- | -------------------------- |
+| `dioxus-ui/src/pages/meeting.rs`           | 574  | `meeting-waiting-for-host` |
+| `dioxus-ui/src/pages/meeting.rs`           | 602  | `meeting-rejected`         |
+| `dioxus-ui/src/pages/meeting.rs`           | 630  | `meeting-error`            |
+| `dioxus-ui/src/components/waiting_room.rs` | 420  | `meeting-waiting-room`     |
 
 (Each marker is preceded by a `// data-testid added for the bots-app …` comment so the intent is visible in the source.)
 

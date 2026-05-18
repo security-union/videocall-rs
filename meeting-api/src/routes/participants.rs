@@ -975,7 +975,6 @@ mod tests {
                 0,
             )),
             search: None,
-            allow_anonymous: false,
             display_name_rate_limit_disabled: disabled,
             dev_user: None,
         }

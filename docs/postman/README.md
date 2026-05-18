@@ -28,8 +28,19 @@ This directory contains Postman collection and environment files for testing the
 
 2. Select **Local Development** environment in Postman
 
-3. Obtain a JWT session token:
-   - Complete the OAuth login flow in your browser at `http://localhost:8081/login`
+3. Obtain a JWT session token. Choose one method:
+
+   **Option A — Dev auto-login (no OAuth required, recommended for local testing)**
+
+   Requires OAuth disabled (`OAUTH_CLIENT_ID` unset). `DEV_USER` defaults to `dev@local.test:Dev User` in `docker-compose.yaml` — no `.env` editing needed unless you want a different identity. Then run:
+   ```bash
+   curl -s -o /dev/null -c /tmp/cookies.txt http://localhost:8081/api/v1/dev/auto-login
+   awk '$6 == "session" {print $7}' /tmp/cookies.txt
+   ```
+   Paste the printed JWT into the `session_token` variable in Postman.
+
+   **Option B — OAuth browser flow**
+   - Visit `http://localhost:8081/login` and complete the OAuth login
    - Copy the `session` cookie value from your browser's DevTools
    - Paste it into the `session_token` environment variable in Postman
 
@@ -75,10 +86,7 @@ All endpoints require a JWT session token passed via the `Authorization` header:
 Authorization: Bearer <session_token>
 ```
 
-To obtain a session token:
-1. Complete the OAuth login flow in a browser
-2. Copy the `session` cookie value from your browser's DevTools
-3. Set it as the `session_token` variable in your Postman environment
+To obtain a session token for local development, use `DEV_USER` auto-login (see [Local Development Setup](#local-development-setup) above). For production or OAuth-enabled environments, complete the browser OAuth flow and copy the `session` cookie from DevTools.
 
 For the attendee workflow, obtain a second token from a different user session and set it as `participant_session_token`.
 

@@ -4,9 +4,13 @@
  */
 
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
+use crate::components::color_picker::HsvColorPicker;
+use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
-    load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
-    AppearanceSettingsCtx, GlowColor, Theme, ThemePreferenceCtx, MAX_CUSTOM_COLORS,
+    load_custom_colors_from_storage, save_custom_colors_to_storage, save_density_mode,
+    save_dock_autohide, save_dock_position, AppearanceSettings, AppearanceSettingsCtx, AutohideCtx,
+    DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
+    MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
@@ -27,6 +31,17 @@ fn focus_add_btn() {
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
     let mut appearance_ctx = use_context::<AppearanceSettingsCtx>();
+    // Fallback signals for when contexts are not provided (e.g. in tests).
+    // Hooks must be called unconditionally, so we always create them.
+    let fallback_dock = use_signal(|| DockPosition::Bottom);
+    let fallback_autohide = use_signal(|| true);
+    let fallback_density = use_signal(|| DensityMode::Auto);
+    let mut dock_position_ctx =
+        try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
+    let mut autohide_ctx =
+        try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
+    let mut density_ctx =
+        try_use_context::<DensityModeCtx>().unwrap_or(DensityModeCtx(fallback_density));
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style =
@@ -268,7 +283,10 @@ pub fn AppearanceSettingsPanel() -> Element {
                                     let open = !show_picker();
                                     show_picker.set(open);
                                     if open {
-                                        color_input.set(String::new());
+                                        // Seed the hex input with the currently selected
+                                        // glow color so the picker opens on a sensible spot
+                                        // instead of jumping to red.
+                                        color_input.set(appearance.glow_color.to_hex());
                                         input_error.set(false);
                                     }
                                 },
@@ -287,82 +305,144 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                         }
                     }
-                    // Inline custom color popover
+                    // Custom color modal dialog (centered overlay with backdrop)
                     if show_picker() {
-                        // Click-outside overlay (behind the popover)
                         div {
-                            class: "settings-overlay-backdrop",
+                            class: "custom-color-modal-overlay",
+                            role: "presentation",
                             onmousedown: move |_| {
+                                // Backdrop click closes the modal
                                 show_picker.set(false);
+                                color_input.set(String::new());
+                                input_error.set(false);
                                 focus_add_btn();
                             },
-                        }
-                        div {
-                            class: "custom-color-popover settings-popover-surface",
-                            onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
-                            {
-                                let preview_color = GlowColor::from_hex(&color_input());
-                                rsx! {
-                                    div { class: "custom-color-popover-row",
-                                        if let Some(c) = preview_color {
-                                            div {
-                                                class: "custom-color-preview",
-                                                style: format!("--glow-color: {}", c.to_hex()),
-                                            }
-                                        }
-                                        input {
-                                            class: if input_error() {
-                                                "custom-color-input error"
-                                            } else {
-                                                "custom-color-input"
-                                            },
-                                            r#type: "text",
-                                            placeholder: "#RRGGBB",
-                                            maxlength: "7",
-                                            spellcheck: "false",
-                                            autocomplete: "off",
-                                            value: "{color_input}",
-                                            oninput: move |evt: Event<FormData>| {
-                                                color_input.set(evt.value());
-                                                input_error.set(false);
-                                            },
-                                            onkeydown: move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::Escape {
-                                                    show_picker.set(false);
-                                                    focus_add_btn();
+                            onkeydown: move |evt: KeyboardEvent| {
+                                if evt.key() == Key::Escape {
+                                    show_picker.set(false);
+                                    color_input.set(String::new());
+                                    input_error.set(false);
+                                    focus_add_btn();
+                                }
+                            },
+                            div {
+                                class: "custom-color-popover custom-color-modal",
+                                role: "dialog",
+                                "aria-modal": "true",
+                                "aria-labelledby": "custom-color-modal-title",
+                                onmousedown: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                onkeydown: move |evt: KeyboardEvent| {
+                                    if evt.key() == Key::Escape {
+                                        show_picker.set(false);
+                                        color_input.set(String::new());
+                                        input_error.set(false);
+                                        focus_add_btn();
+                                    }
+                                },
+                                {
+                                    // Seed the picker's HSV state from whichever color was
+                                    // selected when the modal opened. Once mounted the
+                                    // picker owns the marker positions and writes back into
+                                    // `color_input` directly.
+                                    let initial_rgb = appearance.glow_color.to_rgb();
+                                    rsx! {
+                                        div { class: "custom-color-modal-header",
+                                            div { class: "custom-color-modal-heading",
+                                                h3 {
+                                                    id: "custom-color-modal-title",
+                                                    class: "custom-color-modal-title",
+                                                    "Choose Custom Color"
                                                 }
-                                            },
-                                        }
-                                        button {
-                                            class: "custom-color-add-btn",
-                                            onclick: move |evt: Event<MouseData>| {
-                                                evt.stop_propagation();
-                                                if let Some(new_color) = GlowColor::from_hex(&color_input()) {
-                                                    let colors = custom_colors();
-                                                    if !colors.contains(&new_color) {
-                                                        let mut colors = colors;
-                                                        colors.push(new_color);
-                                                        save_custom_colors_to_storage(&colors);
-                                                        custom_colors.set(colors);
-                                                    }
-                                                    appearance_ctx.0.set(AppearanceSettings {
-                                                        glow_color: new_color,
-                                                        ..appearance_ctx.0()
-                                                    });
+                                                p { class: "custom-color-modal-subtitle",
+                                                    "Select a color for the glow highlight."
+                                                }
+                                            }
+                                            button {
+                                                class: "custom-color-modal-close",
+                                                r#type: "button",
+                                                "aria-label": "Close",
+                                                onclick: move |evt: Event<MouseData>| {
+                                                    evt.stop_propagation();
                                                     show_picker.set(false);
                                                     color_input.set(String::new());
                                                     input_error.set(false);
-                                                } else {
-                                                    input_error.set(true);
+                                                    focus_add_btn();
+                                                },
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    width: "16",
+                                                    height: "16",
+                                                    "aria-hidden": "true",
+                                                    path {
+                                                        d: "M6 6L18 18M18 6L6 18",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                    }
                                                 }
-                                            },
-                                            "Add"
+                                            }
                                         }
-                                    }
-                                    if input_error() {
-                                        p {
-                                            class: "input-error-message",
-                                            "Invalid format - use #RRGGBB (e.g. #FF5500)"
+                                        div { class: "custom-color-modal-body",
+                                            HsvColorPicker {
+                                                initial_rgb,
+                                                hex_input: color_input,
+                                                input_error,
+                                            }
+                                            // Reserved 18px error slot — keep the height
+                                            // even when no error to avoid layout shift.
+                                            div {
+                                                id: "color-picker-hex-error",
+                                                class: "input-error-slot",
+                                                if input_error() {
+                                                    p {
+                                                        class: "input-error-message",
+                                                        "Invalid format - use #RRGGBB (e.g. #FF5500)" // @token-exempt: example hex in format hint
+                                                    }
+                                                }
+                                            }
+                                            div { class: "custom-color-modal-actions",
+                                                button {
+                                                    class: "custom-color-cancel-btn",
+                                                    r#type: "button",
+                                                    onclick: move |evt: Event<MouseData>| {
+                                                        evt.stop_propagation();
+                                                        show_picker.set(false);
+                                                        color_input.set(String::new());
+                                                        input_error.set(false);
+                                                        focus_add_btn();
+                                                    },
+                                                    "Cancel"
+                                                }
+                                                button {
+                                                    class: "custom-color-add-btn",
+                                                    r#type: "button",
+                                                    disabled: GlowColor::from_hex(&color_input()).is_none(),
+                                                    onclick: move |evt: Event<MouseData>| {
+                                                        evt.stop_propagation();
+                                                        if let Some(new_color) = GlowColor::from_hex(&color_input()) {
+                                                            let colors = custom_colors();
+                                                            if !colors.contains(&new_color) {
+                                                                let mut colors = colors;
+                                                                colors.push(new_color);
+                                                                save_custom_colors_to_storage(&colors);
+                                                                custom_colors.set(colors);
+                                                            }
+                                                            appearance_ctx.0.set(AppearanceSettings {
+                                                                glow_color: new_color,
+                                                                ..appearance_ctx.0()
+                                                            });
+                                                            show_picker.set(false);
+                                                            color_input.set(String::new());
+                                                            input_error.set(false);
+                                                            focus_add_btn();
+                                                        } else {
+                                                            input_error.set(true);
+                                                        }
+                                                    },
+                                                    "Add"
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -437,6 +517,88 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
                         }
                     }
+            }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 3: Dock Settings ─────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Dock Settings" }
+                }
+
+                // Position selector — reuses transport-segmented styling
+                div { class: "device-setting-group",
+                    span { class: "transport-segmented-label", "Position" }
+                    div {
+                        class: "transport-segmented",
+                        role: "radiogroup",
+                        "aria-label": "Action bar position",
+                        for (pos, label) in [(DockPosition::Bottom, "Bottom"), (DockPosition::Left, "Left"), (DockPosition::Right, "Right")] {
+                            button {
+                                r#type: "button",
+                                role: "radio",
+                                "aria-checked": if dock_position_ctx.0() == pos { "true" } else { "false" },
+                                class: if dock_position_ctx.0() == pos { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                onclick: move |_| {
+                                    dock_position_ctx.0.set(pos);
+                                    save_dock_position(pos);
+                                },
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+
+                // Autohide toggle
+                div { class: "appearance-section-header dock-autohide-row",
+                    label { class: "appearance-section-title appearance-section-title--sm", "Auto-hide" }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle action bar auto-hide",
+                        input {
+                            r#type: "checkbox",
+                            checked: autohide_ctx.0(),
+                            onchange: move |evt: Event<FormData>| {
+                                let checked = evt.checked();
+                                autohide_ctx.0.set(checked);
+                                save_dock_autohide(checked);
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
+            }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 4: Tiling ────────────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Tiling" }
+                }
+
+                div { class: "device-setting-group",
+                    span { class: "transport-segmented-label", "Density" }
+                    div {
+                        class: "transport-segmented",
+                        role: "radiogroup",
+                        "aria-label": "Tile density mode",
+                        for mode in DENSITY_MODES {
+                            button {
+                                r#type: "button",
+                                role: "radio",
+                                "aria-checked": if density_ctx.0() == mode { "true" } else { "false" },
+                                class: if density_ctx.0() == mode { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                onclick: move |_| {
+                                    density_ctx.0.set(mode);
+                                    save_density_mode(mode);
+                                },
+                                "{mode.label()}"
+                            }
+                        }
+                    }
+                }
             }
             }
         }

@@ -66,7 +66,7 @@ async function hostStartsMeeting(
   });
   await hostPage.waitForTimeout(1500);
 
-  const joinButton = hostPage.getByText(/Start Meeting|Join Meeting/);
+  const joinButton = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await joinButton.waitFor({ timeout: 20_000 });
   await hostPage.waitForTimeout(1000);
   await joinButton.click();
@@ -199,7 +199,7 @@ test.describe("Guest join flow", () => {
       // Guest should be admitted directly (no waiting room).
       // The AttendantsComponent renders either a "Join Meeting"/"Start Meeting"
       // button or goes straight to the grid.
-      const joinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+      const joinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const grid = guestPage.locator("#grid-container");
 
       const guestResult = await Promise.race([
@@ -264,7 +264,7 @@ test.describe("Guest join flow", () => {
       await hostPage.waitForTimeout(3000);
 
       // Guest should transition to admitted state
-      const guestJoinButton = guestPage.getByText(/Join Meeting|Start Meeting/);
+      const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const guestGrid = guestPage.locator("#grid-container");
 
       const postAdmit = await Promise.race([
@@ -343,7 +343,9 @@ test.describe("Guest join flow", () => {
       await expect(hostAdmitAdmittedGuest).toBeVisible({ timeout: 20_000 });
       await hostAdmitAdmittedGuest.dispatchEvent("click");
 
-      const admittedGuestJoinButton = admittedGuestPage.getByText(/Join Meeting|Start Meeting/);
+      const admittedGuestJoinButton = admittedGuestPage.getByRole("button", {
+        name: /Join Meeting|Start Meeting/,
+      });
       const admittedGuestGrid = admittedGuestPage.locator("#grid-container");
       const admittedTransition = await Promise.race([
         admittedGuestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
@@ -393,7 +395,9 @@ test.describe("Guest join flow", () => {
       await expect(admittedGuestAdmitButton).toBeVisible({ timeout: 60_000 });
       await admittedGuestAdmitButton.dispatchEvent("click");
 
-      const waitingGuestJoinButton = waitingGuestPage.getByText(/Join Meeting|Start Meeting/);
+      const waitingGuestJoinButton = waitingGuestPage.getByRole("button", {
+        name: /Join Meeting|Start Meeting/,
+      });
       const waitingGuestGrid = waitingGuestPage.locator("#grid-container");
       const waitingTransition = await Promise.race([
         waitingGuestJoinButton.waitFor({ timeout: 60_000 }).then(() => "join" as const),
@@ -467,8 +471,12 @@ test.describe("Guest join flow", () => {
       await guestPage.waitForTimeout(1500);
 
       // Page title
-      await expect(guestPage.getByText("Join as Guest")).toBeVisible({ timeout: 5_000 });
-      await expect(guestPage.getByText("Join Meeting as Guest")).toBeVisible({ timeout: 5_000 });
+      await expect(guestPage.getByRole("heading", { name: "Join as Guest" })).toBeVisible({
+        timeout: 5_000,
+      });
+      await expect(guestPage.getByRole("heading", { name: "Join Meeting as Guest" })).toBeVisible({
+        timeout: 5_000,
+      });
 
       // Meeting ID is displayed
       await expect(guestPage.getByText(meetingId)).toBeVisible({ timeout: 5_000 });

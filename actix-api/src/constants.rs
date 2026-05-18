@@ -68,11 +68,21 @@ pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000)
 /// `Outbound channel full` drops over the meeting (~480 inbound
 /// msg/sec/receiver into a 256-slot queue).
 ///
-/// 1024 gives ~4x headroom for typical 17-peer meetings; the value
-/// can be raised further at deploy-time via the
-/// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable for larger
-/// meetings.
-pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 1024;
+/// 4096 codifies the value Jay applied manually via
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` on the HCL daily deployment after a
+/// follow-up 2026-05-11 incident where the previous 1024 default still
+/// bottomed out under fan-out bursts. Setting it as the default removes
+/// the requirement for each cluster operator to know to override the
+/// env var. The value can still be raised further at deploy-time via
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` for exceptionally large meetings.
+///
+/// **Stopgap, not the real fix.** Priority-aware dropping (Discussion
+/// #699 recommendation #1, tracked in Issue 1) is the proper solution
+/// — under load the queue should shed low-priority video before audio
+/// or media-info packets rather than rely on raw queue depth alone.
+/// Bumping the bound here trades a 4x worst-case per-session memory
+/// increase for fewer drops until that work lands.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 4096;
 
 /// Resolve the WebTransport outbound channel capacity from the
 /// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable, falling back
@@ -135,6 +145,36 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
 /// provides ~6.4MB max queue depth.
 pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
+/// Bounded channel capacity for the WebTransport **datagram** outbound queue.
+///
+/// As of the Phase 2 WT-freeze fix (discussion #756), the per-session
+/// outbound channel is split into two: a unistream channel and a
+/// datagram channel. Splitting the channels is the architectural change;
+/// the unistream side keeps the env-tunable
+/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (currently 4096) since it
+/// continues to absorb video + screen + oversized control packets, while
+/// the datagram side is sized small on purpose:
+///
+/// * Datagram traffic is small (~80 audio packets/sec/sender at ~80B
+///   each, plus heartbeats / RTT echoes / non-media control under MTU).
+/// * Datagrams are independent: there is no QUIC flow-control coupling
+///   between them, so a slow receiver cannot stall the queue.
+/// * `session.send_datagram` returns immediately on the wire (UDP-style
+///   semantics inside the QUIC connection), so the queue exists only to
+///   absorb actor-side bursts during scheduling jitter — not to buffer
+///   for receiver congestion.
+///
+/// 512 slots ≈ 10 seconds of headroom at 50 audio pps (the dominant
+/// datagram rate per session); more than enough for actor / writer
+/// scheduling jitter, and small enough that a misrouted video burst
+/// (oversized audio mis-classified as datagram) would not balloon
+/// per-session memory.
+///
+/// This value is NOT env-tunable today. If a future workload genuinely
+/// needs a larger datagram queue (e.g. very chatty diagnostics), promote
+/// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
+pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
+
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------
@@ -185,8 +225,20 @@ mod tests {
 
     #[test]
     fn resolve_wt_outbound_channel_capacity_valid_value_used_verbatim() {
+        // Sample values intentionally chosen so neither equals
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` — otherwise the assertion
+        // would pass even if the env value were silently ignored.
         assert_eq!(resolve_wt_outbound_channel_capacity(Some("512")), 512);
-        assert_eq!(resolve_wt_outbound_channel_capacity(Some("4096")), 4096);
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn wt_outbound_channel_capacity_default_is_4096() {
+        // Sentinel test pinning the documented stopgap value. If this needs
+        // to change, update the doc comment on
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays)
+        // first, then this assertion.
+        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 4096);
     }
 
     #[test]

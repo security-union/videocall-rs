@@ -85,6 +85,7 @@ pub fn PeerTile(
     };
     let show_signal_popup = use_signal(|| false);
     let show_tile_menu = use_signal(|| false);
+
     // Counter that increments each time a sample is pushed. Reading this
     // Dioxus Signal triggers re-renders, compensating for the fact that
     // Rc<RefCell<PeerSignalHistory>> is not reactive.
@@ -258,6 +259,35 @@ pub fn PeerTile(
         } else {
             None
         };
+    // Only show disable-video button when: viewer is host, peer is not self, peer's camera is on.
+    let on_disable_video: Option<EventHandler<()>> =
+        if is_current_user_host && !is_self_peer && video_enabled() {
+            if let Some(ref meeting_id) = room_id {
+                let meeting_id = meeting_id.clone();
+                let peer_uid = peer_uid_for_mute.clone();
+                Some(EventHandler::new(move |_: ()| {
+                    let meeting_id = meeting_id.clone();
+                    let peer_uid = peer_uid.clone();
+                    spawn(async move {
+                        match crate::constants::meeting_api_client() {
+                            Ok(api_client) => {
+                                if let Err(e) = api_client
+                                    .disable_video_participant(&meeting_id, &peer_uid)
+                                    .await
+                                {
+                                    log::warn!("disable_video_participant failed: {e}");
+                                }
+                            }
+                            Err(e) => log::warn!("meeting_api_client error: {e}"),
+                        }
+                    });
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     generate_for_peer(
         &client,
@@ -282,6 +312,7 @@ pub fn PeerTile(
         show_signal_popup,
         show_tile_menu,
         on_mute,
+        on_disable_video,
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,

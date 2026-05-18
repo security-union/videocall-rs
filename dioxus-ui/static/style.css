@@ -69,7 +69,7 @@ canvas {
   background-color: var(--color-surface-elevated);
   color: var(--text-primary);
   transition: left 0.3s ease;
-  z-index: 20;
+  z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
@@ -351,9 +351,7 @@ h3 {
 }
 
 .grid-item:hover .tile-mute-btn,
-.split-peer-tile:hover .tile-mute-btn,
-.grid-item.speaking-tile .tile-mute-btn,
-.split-peer-tile.speaking-tile .tile-mute-btn {
+.split-peer-tile:hover .tile-mute-btn {
   visibility: visible;
 }
 
@@ -397,6 +395,7 @@ h3 {
 #grid-container {
   position: absolute;
   inset: 0;
+  z-index: 0;
   display: grid;
   grid-template-columns: repeat(4, 1fr); /* fallback; Rust overrides */
   grid-template-rows: repeat(3, 1fr);    /* fallback; Rust overrides */
@@ -481,7 +480,7 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 1000 !important;
+    z-index: 9300 !important;
     overflow-y: auto !important;
     transform: translateX(-100%) !important;
     box-shadow: none !important;
@@ -501,7 +500,7 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 1000 !important;
+    z-index: 9300 !important;
     overflow-y: auto !important;
     transform: translateX(100%) !important;
     box-shadow: none !important;
@@ -922,7 +921,7 @@ select {
   background-color: var(--surface-elevated);
   color: white;
   transition: right 0.3s ease;
-  z-index: 20;
+  z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
@@ -3485,6 +3484,12 @@ select {
   opacity: 0.6;
 }
 
+.glass-select-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--glass-border);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .glass-select-trigger {
     transition: none;
@@ -3852,6 +3857,10 @@ select {
   margin: 0;
 }
 
+.dock-autohide-row {
+  margin-top: 18px;
+}
+
 .appearance-section-title {
   margin: 0;
   font-size: 1.55rem;
@@ -3860,6 +3869,13 @@ select {
   line-height: 1.2;
   color: var(--text-primary);
 }
+
+.appearance-section-title--sm {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+/* Action Bar settings inside Appearance panel */
 
 .appearance-section-helper {
   margin: 0;
@@ -4120,6 +4136,317 @@ select {
 .custom-color-add-btn:hover {
   background: var(--add-color-btn-bg-hover);
   border-color: var(--add-color-btn-border-hover);
+}
+
+/* ── Custom color modal dialog ───────────────────────────────────────────── */
+/* Centered modal opened from the "+" button in the Speaker Highlight palette.
+   Sits above .device-settings-modal-overlay (z-index 9500). */
+.custom-color-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  box-sizing: border-box;
+  /* Solid dark scrim with a subtle film-grain noise overlay (no blur). */
+  background-color: rgba(0, 0, 0, 0.78); /* @token-exempt: nested-modal scrim */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.35 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.25'/></svg>"); /* @token-exempt: noise texture */
+  background-repeat: repeat;
+  background-size: 160px 160px;
+}
+
+.custom-color-modal {
+  position: relative;
+  margin-top: 0;
+  min-width: 300px;
+  width: 100%;
+  max-width: min(400px, calc(100vw - 32px));
+  padding: 14px 16px 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); /* @token-exempt: modal elevation */
+}
+
+/* Header row: title + subtitle on the left, close button on the right. */
+.custom-color-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.custom-color-modal-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.custom-color-modal-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+
+.custom-color-modal-subtitle {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+/* Floating close (✕) button — same shape as .settings-modal-close.
+   Negative margins pull the 32×32 hit area into the title's optical line so
+   the icon's center lines up with the title text rather than sitting low. */
+.custom-color-modal-close {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  margin: -6px -6px 0 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.custom-color-modal-close:hover {
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08)); /* @token-exempt: var() fallback */
+  color: var(--text-primary);
+}
+
+.custom-color-modal-close:focus-visible {
+  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline-offset: 2px;
+}
+
+.custom-color-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ── Custom HSV color picker ─────────────────────────────────────────────── */
+/* Replaces the native <input type="color">. Vertical stack of:
+     1. Top row: SV (saturation/value) square + vertical hue slider
+     2. Preview-row card: swatch + hex label/input + copy button
+   See dioxus-ui/src/components/color_picker.rs for the Dioxus component. */
+.color-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.color-picker-top-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
+}
+
+.color-picker-sv-square {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 170px;
+  border-radius: 10px;
+  cursor: pointer;
+  touch-action: none;
+  box-shadow: inset 0 0 0 1px var(--glass-border);
+  /* The inline `style` attribute provides the layered hue gradient. */
+}
+
+.color-picker-sv-square:focus-visible {
+  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline-offset: 4px;
+}
+
+.color-picker-sv-marker {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid #fff; /* @token-exempt: marker chrome, must contrast with any hue */
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45), /* @token-exempt: marker chrome */
+    0 2px 6px rgba(0, 0, 0, 0.35); /* @token-exempt: marker chrome */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* Vertical hue slider sits to the right of the SV square. The wrap padding
+   provides a wider invisible hit area for touch users. */
+.color-picker-hue-wrap--vertical {
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  padding: 0 8px;
+  margin: 0 -8px;
+}
+
+.color-picker-hue-track--vertical {
+  width: 14px;
+  height: auto;
+  align-self: stretch;
+  border-radius: 7px;
+  cursor: pointer;
+  touch-action: none;
+  box-shadow: inset 0 0 0 1px var(--glass-border);
+  background: linear-gradient(to bottom, #f00 0%, #ff0 16.667%, #0f0 33.333%, #0ff 50%, #00f 66.667%, #f0f 83.333%, #f00 100%); /* @token-exempt: full-spectrum hue ramp */
+  position: relative;
+}
+
+.color-picker-hue-track:focus-visible {
+  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline-offset: 4px;
+}
+
+/* Vertical hue thumb: positioned by `top:` from the inline style. Centered
+   horizontally over the 14px track. */
+.color-picker-hue-thumb {
+  position: absolute;
+  left: 50%;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff; /* @token-exempt: thumb chrome */
+  border: 2px solid #fff; /* @token-exempt: thumb chrome */
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45), /* @token-exempt: thumb chrome */
+    0 2px 6px rgba(0, 0, 0, 0.35); /* @token-exempt: thumb chrome */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  /* Inner pure-hue dot. */
+  background-image: radial-gradient(circle, var(--hue-pure-color, #f00) 0, var(--hue-pure-color, #f00) 4px, #fff 4px, #fff 100%); /* @token-exempt: thumb chrome */
+}
+
+/* Preview-row card: rounded subtle-glass panel containing the swatch,
+   hex label/input stack, and copy-to-clipboard button. */
+.color-picker-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface-hover, rgba(255, 255, 255, 0.04)); /* @token-exempt: var() fallback for subtle-glass tint */
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+}
+
+.color-picker-preview-swatch {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 1px var(--glass-border);
+}
+
+.color-picker-hex-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.color-picker-hex-label {
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.color-picker-preview-row .custom-color-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.color-picker-copy-btn {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.color-picker-copy-btn:hover {
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08)); /* @token-exempt: var() fallback */
+  color: var(--text-primary);
+  border-color: var(--glass-border-hover, var(--glass-border));
+}
+
+.color-picker-copy-btn:focus-visible {
+  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline-offset: 2px;
+}
+
+/* Reserved error slot to prevent layout shift when the error message appears.
+   Collapses to zero height when empty so it doesn't add bottom padding. */
+.input-error-slot {
+  display: flex;
+  align-items: center;
+}
+.input-error-slot:not(:empty) {
+  min-height: 16px;
+}
+.input-error-slot .input-error-message {
+  margin: 0;
+}
+
+/* Visually hidden but available to assistive technologies. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.custom-color-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 0;
+}
+
+.custom-color-cancel-btn {
+  padding: 6px 14px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--add-color-btn-border);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.custom-color-cancel-btn:hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--add-color-btn-border-hover);
+  color: var(--text-primary);
 }
 
 /* Settings panel overlay (click-outside) — no pointer events */
@@ -4674,7 +5001,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   border: 1px solid var(--signal-popup-border);
   border-radius: var(--radius-lg);
   padding: 16px;
-  z-index: 20;
+  z-index: 10;
   box-shadow: var(--signal-popup-shadow);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -5023,16 +5350,18 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .mock-peers-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--mock-popover-bg) /* @token-exempt: dark near-opaque, themed via token */;
-  border: 1px solid var(--glass-border);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
-  z-index: 1000000;
+  z-index: 9100;
   min-width: 200px;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .mock-peers-popover-header {
@@ -5097,16 +5426,19 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .density-popover {
   position: fixed;
-  bottom: 90px;
+  bottom: 104px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--surface-elevated);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
   padding: 12px;
   display: flex;
   gap: 8px;
-  z-index: 30;
-  box-shadow: var(--shadow-md);
+  z-index: 9100;
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
 }
 
 .density-option {
@@ -5114,10 +5446,9 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  padding: 10px 16px;
+  padding: 8px 12px;
   border-radius: 8px;
-  border: 2px solid transparent;
-  background: var(--border);
+  background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
   transition: all 0.15s ease;
@@ -5125,13 +5456,12 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 }
 
 .density-option:hover {
-  background: var(--density-option-hover-bg);
+  background: var(--settings-ghost-bg-hover);
   color: var(--text-primary);
 }
 
 .density-option.active {
-  border-color: var(--accent);
-  background: var(--density-option-active-bg);
+  background: var(--settings-ghost-bg-selected);
   color: var(--text-primary);
 }
 

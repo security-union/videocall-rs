@@ -68,6 +68,8 @@ env:
     value: "https://app.videocall.rs"
   - name: ALLOWED_REDIRECT_URLS
     value: "https://app.videocall.rs"
+  - name: NATS_URL
+    value: "nats://nats:4222"
   - name: SERVICE_VERSION_URLS
     value: ""
 resources:

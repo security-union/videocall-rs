@@ -40,6 +40,8 @@ export const BROWSER_ARGS: string[] = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--renderer-process-limit=1",
 ];
 
 // ---------------------------------------------------------------------------

@@ -383,6 +383,11 @@ impl SessionLogic {
     /// Returns the action the transport should take.
     /// Observer sessions can still send RTT and health packets but all media
     /// data packets are silently dropped.
+    ///
+    /// This is the **inbound** half of the waiting-room isolation enforcement.
+    /// The **outbound** half lives in `ChatServer::handle_msg()` which drops all
+    /// non-allowlisted packets before they reach observer sessions.
+    /// See `handle_msg` doc comment for the full three-layer enforcement model.
     pub fn handle_inbound(&mut self, data: &[u8]) -> InboundAction {
         // Track received data
         RELAY_ROOM_BYTES_TOTAL

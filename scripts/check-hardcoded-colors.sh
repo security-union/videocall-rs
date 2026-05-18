@@ -73,7 +73,7 @@ if ! collect_added_lines | awk '
       next
     }
     if (line ~ /@token-exempt/) { next }
-    if (line ~ /#[0-9A-Fa-f]{3,8}([[:space:][:punct:]]|$)|rgba?[[:space:]]*\([^)]*\)|hsla?[[:space:]]*\([^)]*\)/) {
+    if (line ~ /(^|[^A-Za-z_0-9#])#[0-9A-Fa-f]{3,8}([[:space:][:punct:]]|$)|(^|[^A-Za-z_0-9])rgba?[[:space:]]*\([^)]*\)|(^|[^A-Za-z_0-9])hsla?[[:space:]]*\([^)]*\)/) {
       key = file ":" line
       if (!(key in seen)) {
         printf("%s: %s\n", file, line)

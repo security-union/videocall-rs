@@ -12,13 +12,16 @@
  */
 
 //! Host-only meeting controls.
-//! Mute a single participant or mute all. Only the meeting host may call these endpoints.
+//! Mute or disable video for a single participant or for all. Only the meeting host may call these endpoints.
 
 use axum::{
     extract::{Path, State},
     Json,
 };
-use videocall_meeting_types::{requests::MuteParticipantRequest, responses::APIResponse};
+use videocall_meeting_types::{
+    requests::{DisableVideoParticipantRequest, MuteParticipantRequest},
+    responses::APIResponse,
+};
 
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
@@ -107,6 +110,78 @@ pub async fn mute_all(
         .map_err(|e| {
             tracing::error!("NATS publish failed for HOST_MUTE_ALL in room {meeting_id}: {e}");
             AppError::internal("failed to broadcast mute event")
+        })?;
+    Ok(Json(APIResponse::ok(())))
+}
+
+/// `POST /api/v1/meetings/{meeting_id}/disable-video`.
+///
+/// Host requests that a single participant disable their camera. The server
+/// publishes a single `HOST_DISABLE_VIDEO` NATS event with the target user ID.
+pub async fn disable_video_participant(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<DisableVideoParticipantRequest>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_found(&meeting_id));
+    }
+    require_host(&state, meeting.id, &user_id).await?;
+
+    if body.user_id.is_empty() {
+        return Err(AppError::bad_request(
+            "user_id must not be empty; use /disable-video-all to disable video for everyone",
+        ));
+    }
+
+    const MAX_USER_ID_LEN: usize = 254;
+
+    if body.user_id.len() > MAX_USER_ID_LEN {
+        return Err(AppError::bad_request("user_id too long"));
+    }
+    if body.user_id == user_id {
+        return Err(AppError::bad_request(
+            "cannot disable your own video via host action",
+        ));
+    }
+
+    nats_events::publish_host_disable_video(state.nats.as_ref(), &meeting_id, &body.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("NATS publish failed for HOST_DISABLE_VIDEO in room {meeting_id}: {e}");
+            AppError::internal("failed to broadcast disable-video event")
+        })?;
+    Ok(Json(APIResponse::ok(())))
+}
+
+/// `POST /api/v1/meetings/{meeting_id}/disable-video-all`.
+///
+/// Host requests that every participant disable their camera. Implemented as
+/// a single NATS broadcast with an empty `target_user_id`.
+pub async fn disable_video_all(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_found(&meeting_id));
+    }
+    require_host(&state, meeting.id, &user_id).await?;
+
+    nats_events::publish_host_disable_video(state.nats.as_ref(), &meeting_id, "")
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "NATS publish failed for HOST_DISABLE_VIDEO_ALL in room {meeting_id}: {e}"
+            );
+            AppError::internal("failed to broadcast disable-video event")
         })?;
     Ok(Json(APIResponse::ok(())))
 }

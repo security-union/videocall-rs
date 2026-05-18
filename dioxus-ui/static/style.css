@@ -5445,10 +5445,9 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  padding: 10px 16px;
+  padding: 8px 12px;
   border-radius: 8px;
-  border: 2px solid transparent;
-  background: var(--border);
+  background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
   transition: all 0.15s ease;
@@ -5456,13 +5455,12 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 }
 
 .density-option:hover {
-  background: var(--density-option-hover-bg);
+  background: var(--settings-ghost-bg-hover);
   color: var(--text-primary);
 }
 
 .density-option.active {
-  border-color: var(--accent);
-  background: var(--density-option-active-bg);
+  background: var(--settings-ghost-bg-selected);
   color: var(--text-primary);
 }
 

@@ -5,10 +5,12 @@
 
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
 use crate::components::color_picker::HsvColorPicker;
+use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
-    load_custom_colors_from_storage, save_custom_colors_to_storage, AppearanceSettings,
-    AppearanceSettingsCtx, AutohideCtx, DockPosition, DockPositionCtx, GlowColor, Theme,
-    ThemePreferenceCtx, MAX_CUSTOM_COLORS,
+    load_custom_colors_from_storage, save_custom_colors_to_storage, save_density_mode,
+    save_dock_autohide, save_dock_position, AppearanceSettings, AppearanceSettingsCtx, AutohideCtx,
+    DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
+    MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
@@ -33,10 +35,13 @@ pub fn AppearanceSettingsPanel() -> Element {
     // Hooks must be called unconditionally, so we always create them.
     let fallback_dock = use_signal(|| DockPosition::Bottom);
     let fallback_autohide = use_signal(|| true);
+    let fallback_density = use_signal(|| DensityMode::Auto);
     let mut dock_position_ctx =
         try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
     let mut autohide_ctx =
         try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
+    let mut density_ctx =
+        try_use_context::<DensityModeCtx>().unwrap_or(DensityModeCtx(fallback_density));
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style =
@@ -535,7 +540,10 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 role: "radio",
                                 "aria-checked": if dock_position_ctx.0() == pos { "true" } else { "false" },
                                 class: if dock_position_ctx.0() == pos { "transport-segmented-option selected" } else { "transport-segmented-option" },
-                                onclick: move |_| dock_position_ctx.0.set(pos),
+                                onclick: move |_| {
+                                    dock_position_ctx.0.set(pos);
+                                    save_dock_position(pos);
+                                },
                                 "{label}"
                             }
                         }
@@ -552,10 +560,43 @@ pub fn AppearanceSettingsPanel() -> Element {
                             r#type: "checkbox",
                             checked: autohide_ctx.0(),
                             onchange: move |evt: Event<FormData>| {
-                                autohide_ctx.0.set(evt.checked());
+                                let checked = evt.checked();
+                                autohide_ctx.0.set(checked);
+                                save_dock_autohide(checked);
                             },
                         }
                         span { class: "glow-switch-track" }
+                    }
+                }
+            }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 4: Tiling ────────────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Tiling" }
+                }
+
+                div { class: "device-setting-group",
+                    span { class: "transport-segmented-label", "Density" }
+                    div {
+                        class: "transport-segmented",
+                        role: "radiogroup",
+                        "aria-label": "Tile density mode",
+                        for mode in DENSITY_MODES {
+                            button {
+                                r#type: "button",
+                                role: "radio",
+                                "aria-checked": if density_ctx.0() == mode { "true" } else { "false" },
+                                class: if density_ctx.0() == mode { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                onclick: move |_| {
+                                    density_ctx.0.set(mode);
+                                    save_density_mode(mode);
+                                },
+                                "{mode.label()}"
+                            }
+                        }
                     }
                 }
             }

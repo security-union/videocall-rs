@@ -52,6 +52,93 @@ pub struct DockPositionCtx(pub Signal<DockPosition>);
 #[derive(Clone, Copy)]
 pub struct AutohideCtx(pub Signal<bool>);
 
+// ---------------------------------------------------------------------------
+// Dock position & autohide persistence
+// ---------------------------------------------------------------------------
+
+const DOCK_POSITION_KEY: &str = "vc_dock_position";
+const DOCK_AUTOHIDE_KEY: &str = "vc_dock_autohide";
+
+/// Load dock position from localStorage. Defaults to Bottom.
+pub fn load_dock_position() -> DockPosition {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_POSITION_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "left" => DockPosition::Left,
+            "right" => DockPosition::Right,
+            _ => DockPosition::Bottom,
+        })
+        .unwrap_or(DockPosition::Bottom)
+}
+
+/// Load dock autohide from localStorage. Defaults to true.
+pub fn load_dock_autohide() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten())
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
+/// Persist dock position to localStorage.
+pub fn save_dock_position(pos: DockPosition) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match pos {
+            DockPosition::Bottom => "bottom",
+            DockPosition::Left => "left",
+            DockPosition::Right => "right",
+        };
+        let _ = storage.set_item(DOCK_POSITION_KEY, val);
+    }
+}
+
+/// Persist dock autohide to localStorage.
+pub fn save_dock_autohide(enabled: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(DOCK_AUTOHIDE_KEY, if enabled { "true" } else { "false" });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Density mode persistence
+// ---------------------------------------------------------------------------
+
+use crate::components::density::DensityMode;
+
+/// Context for the tile density mode.
+#[derive(Clone, Copy)]
+pub struct DensityModeCtx(pub Signal<DensityMode>);
+
+const DENSITY_MODE_KEY: &str = "vc_density_mode";
+
+/// Load density mode from localStorage. Defaults to Auto.
+pub fn load_density_mode() -> DensityMode {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DENSITY_MODE_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "standard" => DensityMode::Standard,
+            "dense" => DensityMode::Dense,
+            "maximum" => DensityMode::Maximum,
+            _ => DensityMode::Auto,
+        })
+        .unwrap_or(DensityMode::Auto)
+}
+
+/// Persist density mode to localStorage.
+pub fn save_density_mode(mode: DensityMode) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match mode {
+            DensityMode::Auto => "auto",
+            DensityMode::Standard => "standard",
+            DensityMode::Dense => "dense",
+            DensityMode::Maximum => "maximum",
+        };
+        let _ = storage.set_item(DENSITY_MODE_KEY, val);
+    }
+}
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
@@ -866,5 +953,39 @@ mod tests {
         let start = DockPosition::Bottom;
         let result = start.next().next().next();
         assert_eq!(result, start);
+    }
+
+    #[test]
+    fn density_mode_labels() {
+        assert_eq!(DensityMode::Auto.label(), "Auto");
+        assert_eq!(DensityMode::Standard.label(), "Standard");
+        assert_eq!(DensityMode::Dense.label(), "Dense");
+        assert_eq!(DensityMode::Maximum.label(), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_debug_impl() {
+        assert_eq!(format!("{:?}", DensityMode::Auto), "Auto");
+        assert_eq!(format!("{:?}", DensityMode::Standard), "Standard");
+        assert_eq!(format!("{:?}", DensityMode::Dense), "Dense");
+        assert_eq!(format!("{:?}", DensityMode::Maximum), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_clone_and_eq() {
+        let original = DensityMode::Dense;
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DensityMode::Auto, DensityMode::Standard);
+        assert_ne!(DensityMode::Dense, DensityMode::Maximum);
+        assert_ne!(DensityMode::Auto, DensityMode::Maximum);
+    }
+
+    #[test]
+    fn density_mode_ctx_clone() {
+        // Compile-time check that DensityModeCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DensityModeCtx>();
     }
 }

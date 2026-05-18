@@ -79,7 +79,7 @@ export function Layout({ currentRoute, onNavigate, children }: LayoutProps) {
       </header>
       <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} />
 
-      <div className="mx-auto flex w-full max-w-7xl flex-1 gap-6 px-6 py-6">
+      <div className="mx-auto flex w-full max-w-screen-2xl flex-1 gap-6 px-6 py-6">
         <nav aria-label="Primary" className="w-44 shrink-0">
           <ul className="flex flex-col gap-1">
             <li>

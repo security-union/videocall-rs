@@ -2871,9 +2871,14 @@ pub fn AttendantsComponent(
                                         PeerListButton {
                                             open: peer_list_open(),
                                             onclick: move |_| {
-                                                peer_list_open.set(!peer_list_open());
-                                                if peer_list_open() {
+                                                let opening = !peer_list_open();
+                                                peer_list_open.set(opening);
+                                                if opening {
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
@@ -2882,7 +2887,13 @@ pub fn AttendantsComponent(
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
                                                 onclick: move |_| {
-                                                    density_open.set(!density_open());
+                                                    let opening = !density_open();
+                                                    density_open.set(opening);
+                                                    if opening {
+                                                        dock_menu_open.set(false);
+                                                        mock_peers_open.set(false);
+
+                                                    }
                                                 },
                                             }
                                         }
@@ -2890,16 +2901,27 @@ pub fn AttendantsComponent(
                                             MockPeersButton {
                                                 open: mock_peers_open(),
                                                 onclick: move |_| {
-                                                    mock_peers_open.set(!mock_peers_open());
+                                                    let opening = !mock_peers_open();
+                                                    mock_peers_open.set(opening);
+                                                    if opening {
+                                                        density_open.set(false);
+                                                        dock_menu_open.set(false);
+
+                                                    }
                                                 },
                                             }
                                         }
                                         DiagnosticsButton {
                                             open: diagnostics_open(),
                                             onclick: move |_| {
-                                                diagnostics_open.set(!diagnostics_open());
-                                                if diagnostics_open() {
+                                                let opening = !diagnostics_open();
+                                                diagnostics_open.set(opening);
+                                                if opening {
                                                     peer_list_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
@@ -2914,6 +2936,10 @@ pub fn AttendantsComponent(
                                                         .set(device_settings_generation() + 1);
                                                     peer_list_open.set(false);
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
@@ -2929,7 +2955,13 @@ pub fn AttendantsComponent(
                                                 "aria-expanded": if dock_menu_open() { "true" } else { "false" },
                                                 onclick: move |e| {
                                                     e.stop_propagation();
-                                                    dock_menu_open.set(!dock_menu_open());
+                                                    let opening = !dock_menu_open();
+                                                    dock_menu_open.set(opening);
+                                                    if opening {
+                                                        density_open.set(false);
+                                                        mock_peers_open.set(false);
+
+                                                    }
                                                 },
                                                 svg {
                                                     xmlns: "http://www.w3.org/2000/svg",

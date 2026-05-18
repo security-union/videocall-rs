@@ -85,6 +85,7 @@ pub fn PeerTile(
     };
     let show_signal_popup = use_signal(|| false);
     let show_tile_menu = use_signal(|| false);
+
     // Counter that increments each time a sample is pushed. Reading this
     // Dioxus Signal triggers re-renders, compensating for the fact that
     // Rc<RefCell<PeerSignalHistory>> is not reactive.

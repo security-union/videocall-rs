@@ -1837,6 +1837,24 @@ async function launchMultiRoute(
   const includeObservers =
     typeof body.includeObservers === "boolean" ? body.includeObservers : false;
 
+  // Per-spawn pacing knob (added v1.7.5). The dashboard surfaces this
+  // as "Delay between launches (seconds)" with a default of 2. Server
+  // accepts 0..60 seconds; anything outside that window is rejected.
+  // We sleep *between* iterations only (not before the first), so the
+  // total added wait for N bots is `(N - 1) * spawnDelaySeconds`.
+  let spawnDelayMs = 0;
+  if (body.spawnDelaySeconds !== undefined && body.spawnDelaySeconds !== null) {
+    if (
+      typeof body.spawnDelaySeconds !== "number" ||
+      !Number.isFinite(body.spawnDelaySeconds) ||
+      body.spawnDelaySeconds < 0 ||
+      body.spawnDelaySeconds > 60
+    ) {
+      throw new ControlServerError(400, '"spawnDelaySeconds" must be a number between 0 and 60');
+    }
+    spawnDelayMs = Math.floor(body.spawnDelaySeconds * 1000);
+  }
+
   // Load the manifest. We reuse `opts.manifestPath` (the same path the
   // /assets/manifest endpoint caches against) so behavior matches the
   // dashboard's auto-match Select.
@@ -1868,7 +1886,15 @@ async function launchMultiRoute(
 
   const botIds: string[] = [];
   const errors: Array<{ participant: string; message: string }> = [];
-  for (const participant of picked) {
+  for (let i = 0; i < picked.length; i++) {
+    // Pace consecutive spawns. Skip the wait before the first bot so a
+    // batch of N has total added latency `(N - 1) * spawnDelayMs`, not
+    // `N * spawnDelayMs`. A wait of 0 is the legacy "as fast as
+    // possible" path.
+    if (i > 0 && spawnDelayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, spawnDelayMs));
+    }
+    const participant = picked[i];
     const spec: LaunchSpec = {
       meetingURL,
       participant,

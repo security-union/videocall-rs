@@ -338,6 +338,70 @@ describe("POST /launch/multi", () => {
     expect(body.errors).toHaveLength(1);
     expect(body.errors[0].participant).toBe("alice");
   });
+
+  it("paces consecutive spawns by spawnDelaySeconds (v1.7.5)", async () => {
+    // Measure wall-clock elapsed across the batch. With count=3 and
+    // delay=1s the server should sleep ~1s between each pair of
+    // spawns, so total elapsed is ≥ ~2s. We assert ≥ 1.5s to give
+    // CI a comfortable margin (timers + event loop wobble) while
+    // still ruling out the "no wait at all" path.
+    const start = Date.now();
+    const res = await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        mode: "first-n",
+        count: 3,
+        meetingURL: "https://example.com/meeting/X",
+        ttl: "5m",
+        spawnDelaySeconds: 1,
+      },
+    });
+    const elapsedMs = Date.now() - start;
+    expect(res.status).toBe(202);
+    expect(elapsedMs).toBeGreaterThanOrEqual(1500);
+    expect(surface.launchSpecs).toHaveLength(3);
+  });
+
+  it("does not delay when spawnDelaySeconds is 0 (v1.7.5)", async () => {
+    // The 0 path is the legacy "fire back-to-back" behavior; total
+    // elapsed must be near-instant. We pick a generous upper bound
+    // (500ms) so the mock-surface launch overhead doesn't trigger a
+    // false positive on a slow CI runner. The real signal is "well
+    // under one full delay interval" — anything ≥ 1s would mean the
+    // wait fired regardless.
+    const start = Date.now();
+    const res = await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        mode: "first-n",
+        count: 3,
+        meetingURL: "https://example.com/meeting/X",
+        ttl: "5m",
+        spawnDelaySeconds: 0,
+      },
+    });
+    const elapsedMs = Date.now() - start;
+    expect(res.status).toBe(202);
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  it("rejects an out-of-range spawnDelaySeconds with 400 (v1.7.5)", async () => {
+    const res = await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        mode: "first-n",
+        count: 2,
+        meetingURL: "https://example.com/meeting/X",
+        ttl: "5m",
+        spawnDelaySeconds: 999,
+      },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/spawnDelaySeconds/);
+  });
 });
 
 describe("POST /launch/from-config", () => {

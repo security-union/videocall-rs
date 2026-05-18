@@ -185,9 +185,7 @@ describe("MultiLaunchForm", () => {
     );
     expect((screen.getByTestId("multi-count") as HTMLInputElement).value).toBe(initialCount);
     expect((screen.getByTestId("multi-ttl") as HTMLInputElement).value).toBe(initialTtl);
-    expect(
-      (screen.getByTestId("multi-display-name-template") as HTMLInputElement).value,
-    ).toBe("");
+    expect((screen.getByTestId("multi-display-name-template") as HTMLInputElement).value).toBe("");
   });
 
   it("Reset clears validation errors", async () => {
@@ -251,10 +249,7 @@ describe("MultiLaunchForm", () => {
       participant: "carol",
       runLocationLabel: "local",
     };
-    window.localStorage.setItem(
-      "bots-app-dashboard:launched-bot-history",
-      JSON.stringify([entry]),
-    );
+    window.localStorage.setItem("bots-app-dashboard:launched-bot-history", JSON.stringify([entry]));
     renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
     // Capture the multi-specific defaults BEFORE the click so we can
     // assert they didn't change.
@@ -267,9 +262,7 @@ describe("MultiLaunchForm", () => {
     const trigger = screen.getByTestId("multi-load-previous-button");
     trigger.focus();
     await userEvent.keyboard("{Enter}");
-    const row = await screen.findByTestId(
-      `multi-load-previous-button-entry-${entry.launchedAt}`,
-    );
+    const row = await screen.findByTestId(`multi-load-previous-button-entry-${entry.launchedAt}`);
     fireEvent.click(row);
     // Common fields applied.
     expect((screen.getByTestId("multi-meeting-url") as HTMLInputElement).value).toBe(
@@ -281,6 +274,99 @@ describe("MultiLaunchForm", () => {
     // Multi-specific knob untouched: count stays at its initial value.
     expect((screen.getByTestId("multi-count") as HTMLInputElement).value).toBe(initialCount);
     window.localStorage.clear();
+  });
+
+  it("defaults the spawn-delay field to 2 seconds (v1.7.5)", () => {
+    // The dashboard's "Delay between launches (seconds)" knob (added
+    // v1.7.5) must render with a default of 2 so a fresh form click
+    // produces the staggered behavior the operator now expects without
+    // any manual tweaking. Changing this constant requires updating
+    // bots-app/dashboard release notes — operators rely on the default.
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    const field = screen.getByTestId("multi-spawn-delay-seconds") as HTMLInputElement;
+    expect(field).toBeInTheDocument();
+    expect(field.value).toBe("2");
+  });
+
+  it("submits the spawn-delay value on the multi-launch request (v1.7.5)", async () => {
+    // The default value of 2 must reach the server unchanged; this
+    // pins the client-side wire format so a future refactor that
+    // accidentally drops the field is caught immediately.
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.spawnDelaySeconds).toBe(2);
+  });
+
+  it("propagates an edited spawn-delay value (v1.7.5)", async () => {
+    // Mutating the field must flow through to the request body. This
+    // is the smoking gun for the un-fixed code path: if the wiring
+    // breaks (form value not threaded into `req`), the request still
+    // succeeds with the default 2 and a user-set "5" never reaches
+    // the server.
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "3" } });
+    fireEvent.change(screen.getByTestId("multi-spawn-delay-seconds"), {
+      target: { value: "5" },
+    });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.spawnDelaySeconds).toBe(5);
+  });
+
+  it("accepts spawn-delay of 0 (no artificial wait) and sends it explicitly (v1.7.5)", async () => {
+    // Setting the delay to 0 must be a *valid* submission (not a
+    // validation error) and must land on the wire as 0 — server
+    // treats 0 as the legacy "fire back-to-back" path. We assert on
+    // the explicit 0 rather than `undefined` so a future change that
+    // drops the field on 0 (treating it as "omit") is caught.
+    const onError = vi.fn();
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={onError} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+    fireEvent.change(screen.getByTestId("multi-spawn-delay-seconds"), {
+      target: { value: "0" },
+    });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.spawnDelaySeconds).toBe(0);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("rejects an out-of-range spawn-delay with a validation error (v1.7.5)", async () => {
+    // The dashboard caps the knob at 60s to match the server's
+    // accepted range; submitting a higher value must fail client-side
+    // with a visible alert and never hit `/api/launch/multi`.
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-spawn-delay-seconds"), {
+      target: { value: "999" },
+    });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+    expect(state.multiLaunchCalls).toHaveLength(0);
   });
 
   it("Reset button is disabled while the launch mutation is in-flight", async () => {

@@ -35,6 +35,15 @@ import { SshCommandPreview } from "./SshCommandPreview";
  */
 const DEFAULT_COUNT = 3;
 const MAX_USERS = 10;
+/**
+ * Default seconds to wait between consecutive bot spawns. Picked to
+ * give each Chrome instance enough headroom to boot + register with
+ * NATS before the next one hits the orchestrator — empirically 2s is
+ * the sweet spot on a typical SSH host. Operators who want
+ * back-to-back behavior can set this to 0.
+ */
+const DEFAULT_SPAWN_DELAY_SECONDS = 2;
+const MAX_SPAWN_DELAY_SECONDS = 60;
 
 interface MultiLaunchFormProps {
   onLaunched: (response: MultiLaunchResponse) => void;
@@ -48,6 +57,7 @@ interface FormErrors {
   ttl?: string;
   storageStateFile?: string;
   sshHostLabel?: string;
+  spawnDelaySeconds?: string;
 }
 
 interface MultiLaunchFormValues {
@@ -65,6 +75,12 @@ interface MultiLaunchFormValues {
   /** Per-batch run-location; every spawned bot goes to the same host. */
   runLocation: RunLocation;
   sshHostLabel: string;
+  /**
+   * Seconds to wait between consecutive bot spawns. Sent to the
+   * server which paces the launch loop; the delay is applied
+   * *between* iterations only (no delay before the first bot).
+   */
+  spawnDelaySeconds: number;
 }
 
 const DEFAULTS: MultiLaunchFormValues = {
@@ -81,6 +97,7 @@ const DEFAULTS: MultiLaunchFormValues = {
   displayNameTemplate: "",
   runLocation: "local",
   sshHostLabel: "",
+  spawnDelaySeconds: DEFAULT_SPAWN_DELAY_SECONDS,
 };
 
 const INPUT_CLASS =
@@ -110,6 +127,13 @@ function validate(values: MultiLaunchFormValues): FormErrors {
   }
   if (values.runLocation === "ssh" && values.sshHostLabel.trim() === "") {
     errors.sshHostLabel = "Pick a registered SSH host";
+  }
+  if (
+    !Number.isFinite(values.spawnDelaySeconds) ||
+    values.spawnDelaySeconds < 0 ||
+    values.spawnDelaySeconds > MAX_SPAWN_DELAY_SECONDS
+  ) {
+    errors.spawnDelaySeconds = `Delay must be between 0 and ${MAX_SPAWN_DELAY_SECONDS} seconds`;
   }
   return errors;
 }
@@ -241,6 +265,9 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
         values.runLocation === "ssh"
           ? { kind: "ssh", hostLabel: values.sshHostLabel.trim() }
           : { kind: "local" },
+      // Always send; server treats 0 as "no delay" and any positive
+      // value as a between-iteration wait. Default is 2 in the UI.
+      spawnDelaySeconds: values.spawnDelaySeconds,
     };
     if (values.mode === "random") {
       if (values.seed.trim() !== "") {
@@ -270,13 +297,13 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
             help={
               <HelpPopover fieldLabel="Run location" testId="help-multi-run-location">
                 <p>
-                  Local runs the bots in this orchestrator&apos;s own Node process. SSH-able
-                  host runs them all on the same registered remote machine via{" "}
+                  Local runs the bots in this orchestrator&apos;s own Node process. SSH-able host
+                  runs them all on the same registered remote machine via{" "}
                   <code className="font-mono text-[11px]">ssh user@host npm run bot …</code>.
                 </p>
                 <p className="mt-1">
-                  v1 does not fan out across hosts; pick one. Cloud VM and Docker remain
-                  future features.
+                  v1 does not fan out across hosts; pick one. Cloud VM and Docker remain future
+                  features.
                 </p>
               </HelpPopover>
             }
@@ -343,8 +370,8 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               help={
                 <HelpPopover fieldLabel="SSH host" testId="help-multi-ssh-host">
                   <p>
-                    All {values.count} bots will be launched on this host. Same v1 caveats
-                    as the single-launch flow.
+                    All {values.count} bots will be launched on this host. Same v1 caveats as the
+                    single-launch flow.
                   </p>
                 </HelpPopover>
               }
@@ -382,10 +409,7 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
         </Section>
 
         {/* Section: Pick mode */}
-        <Section
-          title="Pick mode"
-          description="How to choose participants from the manifest."
-        >
+        <Section title="Pick mode" description="How to choose participants from the manifest.">
           <Field
             label="Mode"
             help={
@@ -393,13 +417,13 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 <p>How participants are chosen from the manifest:</p>
                 <ul className="mt-1 list-disc space-y-0.5 pl-4">
                   <li>
-                    <strong>First-N:</strong> deterministic; pick the first N named
-                    participants in manifest order (alice, bob, carol, …). Matches{" "}
+                    <strong>First-N:</strong> deterministic; pick the first N named participants in
+                    manifest order (alice, bob, carol, …). Matches{" "}
                     <code className="font-mono text-[11px]">bots-app run --users N</code>.
                   </li>
                   <li>
-                    <strong>Random N:</strong> seeded shuffle of eligible participants.
-                    Matches <code className="font-mono text-[11px]">bots-app gen --count N --seed S</code>.
+                    <strong>Random N:</strong> seeded shuffle of eligible participants. Matches{" "}
+                    <code className="font-mono text-[11px]">bots-app gen --count N --seed S</code>.
                   </li>
                 </ul>
               </HelpPopover>
@@ -466,6 +490,42 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               />
             </Field>
 
+            <Field
+              label="Delay between launches (seconds)"
+              error={errors.spawnDelaySeconds}
+              help={
+                <HelpPopover fieldLabel="Delay between launches" testId="help-multi-spawn-delay">
+                  <p>
+                    Seconds to wait between consecutive bot spawns. The orchestrator paces the
+                    launch loop so each Chrome instance has headroom to boot and register before the
+                    next one starts.
+                  </p>
+                  <p className="mt-1">
+                    Total added wait is{" "}
+                    <code className="font-mono text-[11px]">(count − 1) × delay</code> — e.g. count
+                    5, delay 2 = ~8s of staggering. Set to 0 to fire spawns back-to-back (legacy
+                    behavior).
+                  </p>
+                </HelpPopover>
+              }
+            >
+              <input
+                type="number"
+                min={0}
+                max={MAX_SPAWN_DELAY_SECONDS}
+                step={1}
+                value={values.spawnDelaySeconds}
+                onChange={(e) => {
+                  const n = Number.parseInt(e.target.value, 10);
+                  setField("spawnDelaySeconds", Number.isFinite(n) ? n : 0);
+                }}
+                className={INPUT_CLASS}
+                data-testid="multi-spawn-delay-seconds"
+                aria-label="Delay between launches in seconds"
+                aria-invalid={!!errors.spawnDelaySeconds}
+              />
+            </Field>
+
             {values.mode === "random" && (
               <Field
                 label="Seed (optional)"
@@ -501,9 +561,9 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               help={
                 <HelpPopover fieldLabel="Include observers" testId="help-multi-observers">
                   <p>
-                    By default the random shuffle only picks costumed participants (named
-                    characters with a y4m + WAV). Enable to allow observer-NN slots — useful
-                    for meetings with many receive-only seats.
+                    By default the random shuffle only picks costumed participants (named characters
+                    with a y4m + WAV). Enable to allow observer-NN slots — useful for meetings with
+                    many receive-only seats.
                   </p>
                 </HelpPopover>
               }
@@ -628,9 +688,8 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 <p>
                   Optional template applied to every spawned bot. Use{" "}
                   <code className="font-mono text-[11px]">{"{participant}"}</code> to insert the
-                  handle (e.g.{" "}
-                  <code className="font-mono text-[11px]">{"Bot {participant}"}</code> →{" "}
-                  <code className="font-mono text-[11px]">Bot alice</code>).
+                  handle (e.g. <code className="font-mono text-[11px]">{"Bot {participant}"}</code>{" "}
+                  → <code className="font-mono text-[11px]">Bot alice</code>).
                 </p>
               </HelpPopover>
             }
@@ -705,8 +764,8 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               help={
                 <HelpPopover fieldLabel="Storage-state file" testId="help-multi-storage">
                   <p>
-                    Shared storage-state JSON for every spawned bot. For per-bot OAuth use
-                    the YAML config import or single-bot launch flow.
+                    Shared storage-state JSON for every spawned bot. For per-bot OAuth use the YAML
+                    config import or single-bot launch flow.
                   </p>
                 </HelpPopover>
               }

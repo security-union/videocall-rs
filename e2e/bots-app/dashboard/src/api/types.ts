@@ -297,6 +297,14 @@ export interface MultiLaunchRequest {
    * the one chosen host.
    */
   runLocation?: { kind: "local" } | { kind: "ssh"; hostLabel: string };
+  /**
+   * Seconds to wait between consecutive bot spawns server-side. The
+   * delay is applied *between* iterations (no delay before the first
+   * bot), so for N bots the total added wait is `(N - 1) *
+   * spawnDelaySeconds`. Default is 2 in the dashboard UI; omit or set
+   * to 0 to fire spawns back-to-back. Min 0, max 60.
+   */
+  spawnDelaySeconds?: number;
 }
 
 export interface MultiLaunchResponse {

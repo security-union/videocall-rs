@@ -410,7 +410,7 @@ pub fn generate_for_peer(
                             rsx! {
                                 button {
                                     onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                     CropIcon {}
                                 }
                             }
@@ -504,7 +504,7 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
@@ -712,7 +712,7 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
@@ -897,7 +897,7 @@ pub fn generate_for_peer(
                         rsx! {
                             button {
                                 onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                 CropIcon {}
                             }
                         }
@@ -982,7 +982,7 @@ pub fn generate_for_peer(
                                     rsx! {
                                         button {
                                             onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                             CropIcon {}
                                         }
                                     }
@@ -1106,9 +1106,9 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     });
 
     let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
-        "cropped"
-    } else {
         "uncropped"
+    } else {
+        "cropped"
     };
 
     rsx! {
@@ -1142,9 +1142,9 @@ fn ScreenCanvas(peer_id: String) -> Element {
     });
 
     let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
-        "cropped"
-    } else {
         "uncropped"
+    } else {
+        "cropped"
     };
 
     rsx! {

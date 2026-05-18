@@ -346,10 +346,19 @@ struct Inner {
     session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
-    /// messages, so we deduplicate by (event_type, target_user_id) within a
-    /// short time window to avoid firing duplicate toast notifications.
-    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
-    recent_peer_events: HashMap<(String, String), f64>,
+    /// messages, so we deduplicate within a short time window to avoid firing
+    /// duplicate toast notifications.
+    ///
+    /// Per-session events (PARTICIPANT_JOINED, PARTICIPANT_LEFT) key on
+    /// `(event_type, target_user_id, Some(session_id))` so that two distinct
+    /// sessions of the same authenticated user (HCL issue #828) are NOT
+    /// dedup'd as one. Only the *same* session arriving over both WS and WT
+    /// gets suppressed.
+    ///
+    /// Per-user events (which do not have a meaningful session_id at this
+    /// layer) key on `(event_type, target_user_id, None)`.
+    /// Key: (event_type_str, target_user_id, session_id), Value: timestamp_ms
+    recent_peer_events: HashMap<(String, String, Option<u64>), f64>,
     /// Recently processed host action events for deduplication across
     /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
     /// shorter window than `recent_peer_events` because host actions are
@@ -1550,9 +1559,24 @@ impl Inner {
     /// schedule (which can exceed 5 seconds).  A shorter window would allow
     /// stale "existing member" PARTICIPANT_JOINED events to slip through
     /// after a reconnect because the dedup entry had already expired.
-    fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
+    ///
+    /// HCL issue #828: when the same authenticated user joins from two tabs,
+    /// the backend now broadcasts two PARTICIPANT_JOINED events with the same
+    /// `target_user_id` but different `session_id`s. The dedup key therefore
+    /// includes `session_id` for per-session events so both joins are
+    /// delivered to the UI as distinct toast notifications.
+    fn is_duplicate_peer_event(
+        &mut self,
+        event_type: &str,
+        target_user_id: &str,
+        session_id: Option<u64>,
+    ) -> bool {
         let now = js_sys::Date::now();
-        let key = (event_type.to_string(), target_user_id.to_string());
+        let key = (
+            event_type.to_string(),
+            target_user_id.to_string(),
+            session_id,
+        );
 
         // Evict stale entries (older than 30 seconds).
         self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
@@ -1911,10 +1935,22 @@ impl Inner {
                             // update the local user's own name signal on reconnect.
                             // on_display_name_changed is reserved for PARTICIPANT_DISPLAY_NAME_CHANGED.
 
+                            // HCL #828: include session_id in the dedup key so
+                            // two distinct sessions of the same authenticated
+                            // user (e.g. same Google account in two tabs) are
+                            // both delivered as separate join events. A
+                            // session_id of 0 means "unknown" — fall back to
+                            // user-id-only dedup to preserve the original
+                            // WS+WT collapse semantics in that case.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("joined", &target_str);
+                                && !self.is_duplicate_peer_event("joined", &target_str, dedup_sid);
 
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
@@ -1945,10 +1981,19 @@ impl Inner {
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            // HCL #828: scope the dedup key to session_id so a
+                            // PARTICIPANT_LEFT for one session of a multi-
+                            // session user does not suppress the second
+                            // session's leave event later.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("left", &target_str);
+                                && !self.is_duplicate_peer_event("left", &target_str, dedup_sid);
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
@@ -2400,6 +2445,168 @@ mod disconnect_tests {
         assert!(
             !inner.peer_decode_manager.has_send_packet_callback(),
             "send_packet must be cleared after disconnect()"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dedup_tests {
+    //! Regression tests for HCL issue #828 — "same authed user multiple
+    //! times not shown as separate instance in same meeting".
+    //!
+    //! Backend fix: `actix-api` no longer evicts an existing session when a
+    //! new session of the *same* `user_id` joins a room. After that fix the
+    //! server broadcasts two PARTICIPANT_JOINED events for the same user_id
+    //! — one per session, each with a distinct `session_id`.
+    //!
+    //! Frontend contract these tests lock in:
+    //!  1. Two PARTICIPANT_JOINED events for the same `user_id` with
+    //!     *different* `session_id`s must BOTH be delivered (no dedup).
+    //!  2. Two PARTICIPANT_JOINED events for the same `(user_id, session_id)`
+    //!     pair (the WS+WT dual-transport case) must be dedup'd as one.
+    //!  3. Two HOST_MUTE events for the same `target_user_id` (different
+    //!     transports) must still be dedup'd as one — the original purpose
+    //!     of dual-transport collapse is preserved.
+    use super::*;
+    use videocall_types::Callback as VcCallback;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn build_dedup_test_options() -> VideoCallClientOptions {
+        VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            user_id: "dedup_test_user".to_string(),
+            display_name: "Dedup Tester".to_string(),
+            is_guest: false,
+            meeting_id: "dedup-test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_peer_added: VcCallback::noop(),
+            on_peer_first_frame: VcCallback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| id),
+            on_connected: VcCallback::noop(),
+            on_connection_lost: VcCallback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            decode_media: true,
+            allow_post_rebase_retry: true,
+        }
+    }
+
+    /// HCL #828: two PARTICIPANT_JOINED events for the same `user_id` with
+    /// distinct `session_id`s must NOT be collapsed. Both sessions are
+    /// legitimate, separate joiners and the UI must learn about both.
+    #[wasm_bindgen_test]
+    fn participant_joined_distinct_sessions_are_not_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let first = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1001));
+        let second = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1002));
+
+        assert!(
+            !first,
+            "first PARTICIPANT_JOINED for session 1001 must NOT be a duplicate"
+        );
+        assert!(
+            !second,
+            "second PARTICIPANT_JOINED for session 1002 (same user_id) must NOT be \
+             dedup'd against session 1001 — they are distinct sessions per HCL #828"
+        );
+    }
+
+    /// Dual-transport WS+WT delivery of the *same* PARTICIPANT_JOINED
+    /// (same `user_id` AND same `session_id`) must collapse to a single
+    /// UI event. This is the original purpose of the dedup helper.
+    #[wasm_bindgen_test]
+    fn participant_joined_same_session_over_two_transports_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+        let from_wt = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+
+        assert!(
+            !from_ws,
+            "first PARTICIPANT_JOINED (e.g. via WS) must be delivered"
+        );
+        assert!(
+            from_wt,
+            "second PARTICIPANT_JOINED for the SAME (user_id, session_id) \
+             (e.g. via WT) must be suppressed to avoid duplicate toast"
+        );
+    }
+
+    /// Dual-transport delivery of the same PARTICIPANT_LEFT (same session)
+    /// must dedup, but two different sessions of the same user leaving
+    /// must NOT — symmetric to the joined case.
+    #[wasm_bindgen_test]
+    fn participant_left_dedup_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        // Same session over two transports → second is duplicate.
+        let first_ws = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        let first_wt = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        assert!(!first_ws);
+        assert!(
+            first_wt,
+            "duplicate transport delivery for same session must dedup"
+        );
+
+        // Different session of the same user → NOT duplicate.
+        let other_session = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3002));
+        assert!(
+            !other_session,
+            "PARTICIPANT_LEFT for a different session of the same user must \
+             not be dedup'd against the first session's leave"
+        );
+    }
+
+    /// HOST_MUTE_PARTICIPANT dedup is user-scoped on purpose: a host muting
+    /// `antonio@hcl` legitimately mutes ALL of his sessions, and both
+    /// transports must collapse to one local effect. This guards against
+    /// any future "let's session-scope every dedup" refactor accidentally
+    /// breaking the dual-transport collapse for host actions.
+    #[wasm_bindgen_test]
+    fn host_mute_same_user_dual_transport_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+        let from_wt = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+
+        assert!(!from_ws, "first HOST_MUTE must be delivered");
+        assert!(
+            from_wt,
+            "second HOST_MUTE for the same target_user_id within the dual-\
+             transport window must be suppressed — host actions are user-scoped"
         );
     }
 }

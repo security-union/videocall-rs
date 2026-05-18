@@ -20,9 +20,11 @@ import {
   type AuthBackend,
   type RunLocation,
 } from "../lib/constants";
+import { useFieldHistory } from "../lib/fieldHistory";
 import { isValidMeetingUrl } from "../lib/validation";
 import { isValidTtl } from "../lib/ttl";
 import { HelpPopover } from "./ui/HelpPopover";
+import { HistoryInput } from "./ui/HistoryInput";
 import { LoadPreviousButton } from "./LoadPreviousButton";
 import { Select } from "./ui/Select";
 import { SshCommandPreview } from "./SshCommandPreview";
@@ -152,9 +154,35 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     refetchInterval: 60_000,
   });
 
+  // Per-field history controllers, mirroring the single-bot LaunchForm
+  // wiring so the multi-launch form's free-text inputs remember what
+  // the operator has previously typed. Three keys (`meetingURL`, `ttl`,
+  // `storageStateFile`) are *shared* with LaunchForm — same semantics
+  // means a value entered in one form surfaces as a suggestion in the
+  // other. Two keys (`displayNameTemplate`, `seed`) are multi-only;
+  // they have different semantics from the single-bot equivalents
+  // (template vs. exact name, seed integer vs. n/a) and would pollute
+  // the shared bucket if reused.
+  const meetingUrlHistory = useFieldHistory("meetingURL");
+  const ttlHistory = useFieldHistory("ttl");
+  const storageStateHistory = useFieldHistory("storageStateFile");
+  const displayNameTemplateHistory = useFieldHistory("displayNameTemplate");
+  const seedHistory = useFieldHistory("seed");
+
   const mutation = useMutation({
     mutationFn: (req: MultiLaunchRequest) => api.launchMulti(req),
     onSuccess: (data) => {
+      // Persist the submitted free-text values into each field's
+      // history (mirrors LaunchForm). Optional fields (storageStateFile,
+      // displayNameTemplate, seed) are pushed only when non-empty so we
+      // don't poison the suggestion list with blanks. meetingURL and
+      // ttl are required, so they're always pushed on success.
+      meetingUrlHistory.push(values.meetingURL);
+      ttlHistory.push(values.ttl);
+      if (values.storageStateFile.trim()) storageStateHistory.push(values.storageStateFile);
+      if (values.displayNameTemplate.trim())
+        displayNameTemplateHistory.push(values.displayNameTemplate);
+      if (values.mode === "random" && values.seed.trim()) seedHistory.push(values.seed);
       // Capture a *common-fields* spec into the shared launched-bot
       // history. Multi-launch has no single participant, so we
       // synthesize a `multi:<mode>-<count>` label and leave the
@@ -540,16 +568,16 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                   </HelpPopover>
                 }
               >
-                <input
-                  type="text"
-                  inputMode="numeric"
+                <HistoryInput
+                  fieldKey="seed"
                   value={values.seed}
-                  onChange={(e) => setField("seed", e.target.value)}
-                  className={INPUT_CLASS}
+                  onChange={(v) => setField("seed", v)}
                   placeholder="e.g. 42"
-                  data-testid="multi-seed"
-                  aria-label="Seed"
-                  aria-invalid={!!errors.seed}
+                  className={INPUT_CLASS}
+                  testId="multi-seed"
+                  ariaInvalid={!!errors.seed}
+                  ariaLabel="Seed"
+                  inputMode="numeric"
                 />
               </Field>
             )}
@@ -606,15 +634,16 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               </HelpPopover>
             }
           >
-            <input
-              type="url"
+            <HistoryInput
+              fieldKey="meetingURL"
               value={values.meetingURL}
-              onChange={(e) => setField("meetingURL", e.target.value)}
-              className={INPUT_CLASS}
+              onChange={(v) => setField("meetingURL", v)}
               placeholder="https://app.videocall.fnxlabs.com/meeting/TonyBots"
-              data-testid="multi-meeting-url"
-              aria-label="Meeting URL"
-              aria-invalid={!!errors.meetingURL}
+              className={INPUT_CLASS}
+              testId="multi-meeting-url"
+              ariaInvalid={!!errors.meetingURL}
+              ariaLabel="Meeting URL"
+              type="url"
             />
           </Field>
 
@@ -636,15 +665,15 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 </HelpPopover>
               }
             >
-              <input
-                type="text"
+              <HistoryInput
+                fieldKey="ttl"
                 value={values.ttl}
-                onChange={(e) => setField("ttl", e.target.value)}
-                className={INPUT_CLASS}
+                onChange={(v) => setField("ttl", v)}
                 placeholder='"5m", "30s", "1h", or "infinite"'
-                data-testid="multi-ttl"
-                aria-label="TTL"
-                aria-invalid={!!errors.ttl}
+                className={INPUT_CLASS}
+                testId="multi-ttl"
+                ariaInvalid={!!errors.ttl}
+                ariaLabel="TTL"
               />
               <div className="mt-2 flex flex-wrap gap-1">
                 {TTL_SUGGESTIONS.map((s) => (
@@ -694,14 +723,14 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
               </HelpPopover>
             }
           >
-            <input
-              type="text"
+            <HistoryInput
+              fieldKey="displayNameTemplate"
               value={values.displayNameTemplate}
-              onChange={(e) => setField("displayNameTemplate", e.target.value)}
-              className={INPUT_CLASS}
+              onChange={(v) => setField("displayNameTemplate", v)}
               placeholder="Bot {participant}"
-              data-testid="multi-display-name-template"
-              aria-label="Display name template"
+              className={INPUT_CLASS}
+              testId="multi-display-name-template"
+              ariaLabel="Display name template"
             />
           </Field>
 
@@ -770,15 +799,15 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
                 </HelpPopover>
               }
             >
-              <input
-                type="text"
+              <HistoryInput
+                fieldKey="storageStateFile"
                 value={values.storageStateFile}
-                onChange={(e) => setField("storageStateFile", e.target.value)}
-                className={INPUT_CLASS}
+                onChange={(v) => setField("storageStateFile", v)}
                 placeholder="run/auth/alice.json"
-                data-testid="multi-storage-state-file"
-                aria-label="Storage-state file"
-                aria-invalid={!!errors.storageStateFile}
+                className={INPUT_CLASS}
+                testId="multi-storage-state-file"
+                ariaInvalid={!!errors.storageStateFile}
+                ariaLabel="Storage-state file"
               />
             </Field>
           )}

@@ -410,4 +410,136 @@ describe("MultiLaunchForm", () => {
       );
     }
   });
+
+  // --- Per-field history (v1.8.1) ------------------------------------
+  //
+  // MultiLaunchForm's free-text inputs must mirror the single-bot
+  // LaunchForm's per-field-history behavior so an operator who has
+  // typed a meeting URL once doesn't have to re-type it the next time
+  // they spawn a batch. Storage keys for the three *shared-semantics*
+  // fields (`meetingURL`, `ttl`, `storageStateFile`) are intentionally
+  // identical to LaunchForm's so suggestions cross-pollinate between
+  // the two forms. The two multi-specific fields (`displayNameTemplate`
+  // and `seed`) get their own buckets because their values are not
+  // interchangeable with the single-bot equivalents.
+  describe("per-field history (v1.8.1)", () => {
+    function historyKey(field: string): string {
+      return `bots-app-dashboard:history:${field}`;
+    }
+    function seedHistory(field: string, values: string[]): void {
+      const entries = values.map((value, i) => ({ value, lastUsed: 1000 + i }));
+      entries.sort((a, b) => b.lastUsed - a.lastUsed);
+      window.localStorage.setItem(historyKey(field), JSON.stringify(entries));
+    }
+    function readHistoryValues(field: string): string[] {
+      const raw = window.localStorage.getItem(historyKey(field));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as Array<{ value: string }>;
+      return parsed.map((e) => e.value);
+    }
+
+    beforeEach(() => {
+      window.localStorage.clear();
+    });
+
+    it("shows a pre-seeded meetingURL suggestion on focus", async () => {
+      // Pre-populate the *shared* meetingURL bucket — same key used by
+      // LaunchForm so launching one bot with a URL elsewhere makes it
+      // available here. The popover should open on focus and the
+      // seeded value should appear in the suggestion list.
+      seedHistory("meetingURL", ["https://example.com/meeting/Seeded"]);
+      renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+      const input = screen.getByTestId("multi-meeting-url");
+      fireEvent.focus(input);
+      await waitFor(() =>
+        expect(screen.getByTestId("multi-meeting-url-history")).toBeInTheDocument(),
+      );
+      expect(screen.getByText("https://example.com/meeting/Seeded")).toBeInTheDocument();
+    });
+
+    it("pushes meetingURL + ttl to history on successful submit", async () => {
+      const onLaunched = vi.fn();
+      renderWithClient(<MultiLaunchForm onLaunched={onLaunched} onError={() => {}} />);
+      fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+        target: { value: "https://example.com/meeting/Pushed" },
+      });
+      fireEvent.change(screen.getByTestId("multi-ttl"), { target: { value: "15m" } });
+      fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+      fireEvent.click(screen.getByTestId("multi-launch-button"));
+      await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+      // Both required free-text fields land in their shared buckets.
+      expect(readHistoryValues("meetingURL")).toContain("https://example.com/meeting/Pushed");
+      expect(readHistoryValues("ttl")).toContain("15m");
+    });
+
+    it("does NOT push to history when validation fails", async () => {
+      // Submit with no meeting URL — validator must fire, request
+      // must not go out, and nothing should land in history. This
+      // pins the convention that history mirrors *server-confirmed*
+      // submissions only, not failed attempts.
+      renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+      // Mutate ttl to a unique value so we can prove it wasn't pushed.
+      fireEvent.change(screen.getByTestId("multi-ttl"), { target: { value: "999h" } });
+      fireEvent.click(screen.getByTestId("multi-launch-button"));
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(state.multiLaunchCalls).toHaveLength(0);
+      expect(readHistoryValues("ttl")).toEqual([]);
+      expect(readHistoryValues("meetingURL")).toEqual([]);
+    });
+
+    it("pushes displayNameTemplate to its own bucket (not displayName)", async () => {
+      // Template semantics differ from single-bot display names, so
+      // they MUST live in a dedicated bucket. Asserting on both keys
+      // catches a future refactor that accidentally aliases them.
+      const onLaunched = vi.fn();
+      renderWithClient(<MultiLaunchForm onLaunched={onLaunched} onError={() => {}} />);
+      fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+        target: { value: "https://example.com/meeting/X" },
+      });
+      fireEvent.change(screen.getByTestId("multi-display-name-template"), {
+        target: { value: "Bot {participant}" },
+      });
+      fireEvent.click(screen.getByTestId("multi-launch-button"));
+      await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+      expect(readHistoryValues("displayNameTemplate")).toContain("Bot {participant}");
+      // The single-bot `displayName` bucket must remain untouched.
+      expect(readHistoryValues("displayName")).toEqual([]);
+    });
+
+    it("pushes seed to its own bucket only when mode=random and value non-empty", async () => {
+      // Seeds are only meaningful in random mode — pushing one from
+      // first-n would surface a number that the operator can't even
+      // see in the UI (the seed field is hidden). Wire the push
+      // accordingly and pin both halves of the contract here.
+      const onLaunched = vi.fn();
+      renderWithClient(<MultiLaunchForm onLaunched={onLaunched} onError={() => {}} />);
+      // Switch to random mode so the seed input is rendered.
+      fireEvent.click(screen.getByLabelText(/Random N/i));
+      fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+        target: { value: "https://example.com/meeting/X" },
+      });
+      fireEvent.change(screen.getByTestId("multi-seed"), { target: { value: "1729" } });
+      fireEvent.click(screen.getByTestId("multi-launch-button"));
+      await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+      expect(readHistoryValues("seed")).toEqual(["1729"]);
+      // None of the shared-key buckets should pick up the seed string.
+      expect(readHistoryValues("displayName")).toEqual([]);
+      expect(readHistoryValues("participant")).toEqual([]);
+    });
+
+    it("does NOT push an empty optional field (storageStateFile) on success", async () => {
+      // Optional fields left blank must stay out of history so the
+      // suggestion list never surfaces an empty row. The auth backend
+      // stays at the default `jwt` here so the storage-state input
+      // isn't even rendered — but the push guard must hold either way.
+      const onLaunched = vi.fn();
+      renderWithClient(<MultiLaunchForm onLaunched={onLaunched} onError={() => {}} />);
+      fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+        target: { value: "https://example.com/meeting/X" },
+      });
+      fireEvent.click(screen.getByTestId("multi-launch-button"));
+      await waitFor(() => expect(onLaunched).toHaveBeenCalled());
+      expect(readHistoryValues("storageStateFile")).toEqual([]);
+    });
+  });
 });

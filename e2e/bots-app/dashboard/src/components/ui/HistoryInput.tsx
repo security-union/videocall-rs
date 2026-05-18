@@ -24,6 +24,13 @@ interface HistoryInputProps {
   disabled?: boolean;
   /** Max number of suggestions to retain (defaults to 10). */
   maxEntries?: number;
+  /**
+   * Forwarded to the underlying `<input inputMode=…>` to hint the
+   * on-screen keyboard layout (e.g. `"numeric"` for integer-only
+   * fields like seeds). Does not enforce numeric input — the input
+   * still accepts free-text so operators can clear/edit by hand.
+   */
+  inputMode?: "text" | "decimal" | "numeric" | "tel" | "search" | "email" | "url";
 }
 
 export interface HistoryInputHandle {
@@ -60,6 +67,7 @@ export const HistoryInput = forwardRef<HistoryInputHandle, HistoryInputProps>(fu
     id,
     disabled,
     maxEntries,
+    inputMode,
   },
   ref,
 ) {
@@ -167,6 +175,7 @@ export const HistoryInput = forwardRef<HistoryInputHandle, HistoryInputProps>(fu
           aria-controls={open && hasSuggestions ? `${fieldKey}-history-list` : undefined}
           autoComplete="off"
           disabled={disabled}
+          inputMode={inputMode}
         />
       </Popover.Anchor>
       <Popover.Portal>

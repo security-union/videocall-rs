@@ -67,6 +67,34 @@ Two reasons:
    bearer; the next dashboard request just goes through the new token attached
    by the sidecar's latest discovery.
 
+### Accessing the dashboard remotely
+
+The dashboard sidecar binds to `127.0.0.1` **only** — there is no in-product
+remote-access surface (no remote-auth login screen, no exposed listening
+socket, no published port). This is by design: the security model relies on
+"if you're on the loopback, you're already authorized."
+
+To reach a dashboard running on a different machine, use **SSH local
+forwarding** (or a VPN — same effect):
+
+```bash
+# operator's laptop → host-X where the dashboard is running
+ssh -L 5174:127.0.0.1:5174 host-X
+# then open http://127.0.0.1:5174/ in the laptop's browser
+```
+
+The forwarded connection terminates on the remote host's loopback, so the
+dashboard still sees `127.0.0.1` and the security model is preserved. VPN
+works identically — once you've routed onto the host's loopback, the binding
+choice doesn't change. Cloudflare Tunnel, Tailscale Funnel, and any other
+"expose loopback to the internet" tool **will** work mechanically but
+intentionally bypass the security model; if you stand one up, you own the
+authentication layer that has to live in front of it.
+
+The [Remote hosts (SSH)](#remote-hosts-ssh) feature below is the inverse of
+this — it's the **outbound** registry of remote machines this dashboard knows
+how to launch bots on, not an inbound auth surface for the dashboard itself.
+
 ## CLI flags
 
 | Flag                      | Default                       | Notes                                                                                                              |

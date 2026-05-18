@@ -3265,6 +3265,10 @@ pub fn AttendantsComponent(
 
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| mock_peers_open.set(false),
+                    }
                     div { class: "mock-peers-popover",
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
@@ -3309,8 +3313,20 @@ pub fn AttendantsComponent(
                     }
                 }
 
+                // Dock menu backdrop (rendered outside action bar so click-outside works)
+                if dock_menu_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| dock_menu_open.set(false),
+                    }
+                }
+
                 // Density mode popover
                 if !has_screen_share && density_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| density_open.set(false),
+                    }
                     div { class: "density-popover",
                         for mode in DENSITY_MODES {
                             div {

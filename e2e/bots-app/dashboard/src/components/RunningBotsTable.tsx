@@ -18,6 +18,7 @@ import { api, DashboardApiError } from "../api/client";
 import type { BotSnapshot, SshHost } from "../api/types";
 import { badgeForBot, networkLabel, STATUS_BADGE_CLASS } from "../lib/constants";
 import { formatRemaining } from "../lib/ttl";
+import type { OptimisticState } from "./BulkActionsToolbar";
 import type { ToastEntry } from "./ToastShelf";
 import { ExtendTtlDialog } from "./ExtendTtlDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -40,6 +41,15 @@ interface RunningBotsTableProps {
   bots: BotSnapshot[];
   onDuplicate: (snap: BotSnapshot) => void;
   onToast: (t: Omit<ToastEntry, "id">) => void;
+  /**
+   * Optimistic mic/camera/share state — owned by the parent
+   * (`BotsPage`) so the bulk-actions toolbar and these per-row
+   * buttons agree on what state each bot is in. Without lifting this,
+   * a "Mute all" from the toolbar would leave the per-row mic icons
+   * still showing "unmuted".
+   */
+  optimistic: OptimisticState;
+  setOptimistic: React.Dispatch<React.SetStateAction<OptimisticState>>;
 }
 
 export function RunningBotsTable({
@@ -48,6 +58,8 @@ export function RunningBotsTable({
   bots,
   onDuplicate,
   onToast,
+  optimistic,
+  setOptimistic,
 }: RunningBotsTableProps) {
   // Local ticker so the TTL countdown updates between server polls.
   const [now, setNow] = useState(() => Date.now());
@@ -55,14 +67,6 @@ export function RunningBotsTable({
     const handle = setInterval(() => setNow(Date.now()), 1_000);
     return () => clearInterval(handle);
   }, []);
-
-  // Per-bot "what action did we just dispatch" tracking. The
-  // mute/video/share endpoints don't echo state back beyond the value
-  // we sent in, so the optimistic UI state is kept locally and
-  // reconciled on the next poll via `bots[].status`.
-  const [optimistic, setOptimistic] = useState<
-    Record<string, { mic?: boolean; camera?: boolean; share?: boolean }>
-  >({});
 
   const qc = useQueryClient();
   const refreshBots = () => qc.invalidateQueries({ queryKey: ["bots"] });
@@ -239,7 +243,7 @@ export function RunningBotsTable({
               const remote = isRemoteBot(b);
               const remoteHost =
                 remote && b.host?.kind === "ssh"
-                  ? hostsByLabel.get(b.host.hostLabel) ?? null
+                  ? (hostsByLabel.get(b.host.hostLabel) ?? null)
                   : null;
               return (
                 <tr
@@ -299,7 +303,9 @@ export function RunningBotsTable({
                   >
                     {b.botId.slice(0, 8)}
                   </td>
-                  <td className="px-4 py-2 text-neutral-800 dark:text-slate-200">{b.participant}</td>
+                  <td className="px-4 py-2 text-neutral-800 dark:text-slate-200">
+                    {b.participant}
+                  </td>
                   <td className="px-4 py-2">
                     <a
                       href={b.meetingURL}
@@ -335,16 +341,16 @@ export function RunningBotsTable({
                       </IconButton>
                       <IconButton
                         title={remote ? REMOTE_DISABLED_TITLE : opt.mic ? "Unmute mic" : "Mute mic"}
-                        onClick={() =>
-                          setMic.mutate({ botId: b.botId, mic: !(opt.mic ?? false) })
-                        }
+                        onClick={() => setMic.mutate({ botId: b.botId, mic: !(opt.mic ?? false) })}
                         disabled={!inMeeting || remote}
                         active={opt.mic === true}
                       >
                         {opt.mic ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
                       </IconButton>
                       <IconButton
-                        title={remote ? REMOTE_DISABLED_TITLE : opt.camera ? "Camera on" : "Camera off"}
+                        title={
+                          remote ? REMOTE_DISABLED_TITLE : opt.camera ? "Camera on" : "Camera off"
+                        }
                         onClick={() =>
                           setCamera.mutate({ botId: b.botId, camera: !(opt.camera ?? false) })
                         }
@@ -358,7 +364,13 @@ export function RunningBotsTable({
                         )}
                       </IconButton>
                       <IconButton
-                        title={remote ? REMOTE_DISABLED_TITLE : opt.share ? "Stop sharing" : "Share screen"}
+                        title={
+                          remote
+                            ? REMOTE_DISABLED_TITLE
+                            : opt.share
+                              ? "Stop sharing"
+                              : "Share screen"
+                        }
                         onClick={() =>
                           setShare.mutate({ botId: b.botId, share: !(opt.share ?? false) })
                         }

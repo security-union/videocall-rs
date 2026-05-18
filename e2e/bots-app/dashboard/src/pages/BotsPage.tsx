@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
+import { BulkActionsToolbar, type OptimisticState } from "../components/BulkActionsToolbar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { LaunchForm, type LaunchFormInitial } from "../components/LaunchForm";
 import { MultiLaunchForm } from "../components/MultiLaunchForm";
@@ -93,6 +94,12 @@ export function BotsPage() {
   // return visit is the running-bots table, not yet another form. The
   // operator can flip it open from the section header at any time.
   const [multiOpen, setMultiOpen] = useState(false);
+
+  // Optimistic per-bot mic/camera/share state. Owned here (rather
+  // than inside `RunningBotsTable`) so the `BulkActionsToolbar` and
+  // the per-row icons share a single source of truth — a "Mute all"
+  // from the toolbar flips the per-row mic icons immediately.
+  const [optimistic, setOptimistic] = useState<OptimisticState>({});
 
   return (
     <div className="flex flex-col gap-6">
@@ -242,11 +249,19 @@ export function BotsPage() {
             {liveBots.length} live / {totalBots} total
           </span>
         </div>
+        <BulkActionsToolbar
+          bots={liveBots}
+          optimistic={optimistic}
+          setOptimistic={setOptimistic}
+          onToast={(t) => toast.push(t)}
+        />
         <div className="border-t border-neutral-200 dark:border-slate-700">
           <RunningBotsTable
             isLoading={botsQuery.isLoading}
             error={botsQuery.error}
             bots={liveBots}
+            optimistic={optimistic}
+            setOptimistic={setOptimistic}
             onDuplicate={(snap) => {
               setInitialValues({
                 meetingURL: snap.meetingURL,

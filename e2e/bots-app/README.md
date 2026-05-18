@@ -28,6 +28,21 @@ The bot:
 
 Backend is auto-picked by hostname unless `--auth` is set.
 
+## Production-UI touchpoints (invariant)
+
+The bots-app stack is engineered to keep its footprint in the shipping Dioxus UI to an absolute minimum. The **only** prod-UI changes required for the bots to work are four `data-testid` markers the bot's Playwright driver uses to detect waiting-room / rejection / error states:
+
+| File                                            | Line | `data-testid` value           |
+| ----------------------------------------------- | ---- | ----------------------------- |
+| `dioxus-ui/src/pages/meeting.rs`                | 574  | `meeting-waiting-for-host`    |
+| `dioxus-ui/src/pages/meeting.rs`                | 602  | `meeting-rejected`            |
+| `dioxus-ui/src/pages/meeting.rs`                | 630  | `meeting-error`               |
+| `dioxus-ui/src/components/waiting_room.rs`      | 420  | `meeting-waiting-room`        |
+
+(Each marker is preceded by a `// data-testid added for the bots-app …` comment so the intent is visible in the source.)
+
+**This is the documented invariant.** Anything beyond these four attributes — runtime hooks, conditional rendering, exported globals, debug surfaces — does **not** belong in `dioxus-ui` for bots-app's sake. The bot exercises the same WASM / WebCodecs / WebTransport code path a human peer would; if it needs more visibility into a state, the right move is usually to add a stable `data-testid` on UI that already exists, not to add new prod code paths. Reviewers and future contributors: please preserve this scope. If a change to `bots-app` looks like it requires more than a new `data-testid`, flag it for design discussion before landing.
+
 ## Usage
 
 ```bash

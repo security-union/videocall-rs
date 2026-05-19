@@ -1244,13 +1244,9 @@ pub fn AttendantsComponent(
                 ))
             },
             on_display_name_changed: Some(VcCallback::from({
-                // HCL #828: capture the client cell so the closure can read
-                // the local tab's own session_id at the moment the event
-                // fires. The client is installed into this cell after
-                // `VideoCallClient::new` returns (`*client_for_reconnect
-                // .borrow_mut() = Some(client.clone())`), so it is guaranteed
-                // to be `Some` by the time any PARTICIPANT_DISPLAY_NAME_CHANGED
-                // broadcast arrives.
+                // The client is installed into this cell after
+                // `VideoCallClient::new` returns, so it is guaranteed to be
+                // `Some` by the time any DISPLAY_NAME_CHANGED broadcast arrives.
                 let client_cell = client_for_reconnect.clone();
                 move |(changed_user_id, new_display_name, event_session_id): (
                     String,
@@ -1276,16 +1272,10 @@ pub fn AttendantsComponent(
                             .as_deref()
                             .and_then(|s| s.parse::<u64>().ok());
 
-                        // HCL #828: gate the local-self update on session_id.
-                        // - `event_session_id == 0` is the legacy broadcast
-                        //   path (rename applies to all sessions of this
-                        //   user_id) — preserve the old behaviour.
-                        // - `event_session_id != 0` is the per-session
-                        //   broadcast added by PR #851 — ONLY apply when it
-                        //   matches the local tab's own session_id. This
-                        //   prevents sibling tabs of the same authenticated
-                        //   user from overwriting their own self display name
-                        //   when another tab renames.
+                        // Gate the local-self update on session_id so sibling
+                        // tabs of the same authenticated user don't overwrite
+                        // their own self display name. `event_session_id == 0`
+                        // is the legacy broadcast (applies to all sessions).
                         let is_for_this_session = if event_session_id == 0 {
                             true
                         } else {
@@ -1970,14 +1960,9 @@ pub fn AttendantsComponent(
     // The visible portion of the unified tile list (used by the normal grid layout).
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
 
-    // Build the peer-list sidebar entries keyed by `session_id`. Each row in
-    // the sidebar represents one open browser tab / connection — so multiple
-    // sessions of the same authenticated `user_id` (e.g. one user with three
-    // tabs in the same meeting) render as three distinct rows, each with
-    // their own per-tab display name. The `user_id` is carried alongside the
-    // session_id only for host-action callbacks (mute / disable video) which
-    // remain per-user by design (PR #556's HOST_MUTE_PARTICIPANT contract).
-    // See HCL #828 follow-up.
+    // Build the peer-list sidebar entries keyed by `session_id` so each open
+    // browser tab is its own row. `user_id` is carried alongside only for
+    // host-action callbacks (mute / disable video), which remain per-user.
     let peers_for_display: Vec<PeerListEntry> = display_peers
         .iter()
         .map(|session_id| {

@@ -29,21 +29,15 @@ use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 
 /// One row in the peer-list sidebar.
 ///
-/// Keyed by `session_id` (unique per browser tab / WebTransport or WebSocket
-/// connection), so multiple sessions belonging to the same authenticated
-/// `user_id` render as multiple rows — one per tab. Pre-dating this struct
-/// the prop was `Vec<user_id>`, which collapsed N same-user sessions into a
-/// single row whose display name was non-deterministic (the HashMap collect
-/// kept whichever entry inserted last). See HCL #828 follow-up.
+/// Keyed by `session_id` so multiple sessions belonging to the same
+/// authenticated `user_id` render as separate rows — one per tab.
 #[derive(Clone, PartialEq, Debug)]
 pub struct PeerListEntry {
-    /// The peer's session_id — the unique per-connection key used to look up
-    /// per-session state (display name, audio/video/speaking maps).
     pub session_id: String,
-    /// The peer's authenticated `user_id`. Multiple entries may share the
-    /// same `user_id` when one user is connected from multiple tabs. Host
-    /// actions (mute / disable video) still apply at the `user_id` level by
-    /// design — see PR #556.
+    /// Authenticated user id. Multiple entries may share the same `user_id`
+    /// when one user is connected from multiple tabs. Host actions
+    /// (mute / disable video) apply at the `user_id` level — every session
+    /// of a muted user gets muted server-side.
     pub user_id: String,
 }
 
@@ -370,11 +364,8 @@ pub fn PeerList(
                                         .get(sid)
                                         .copied()
                                         .unwrap_or(false);
-                                    // Host actions (mute / disable video) apply per
-                                    // user_id by design — clicking on any row of a
-                                    // multi-session user mutes all of their sessions
-                                    // server-side (PR #556's HOST_MUTE_PARTICIPANT
-                                    // contract).
+                                    // Host actions are per-user: muting any row of a
+                                    // multi-session user mutes all their sessions.
                                     let on_mute = if is_current_user_host && !muted {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();
@@ -473,17 +464,8 @@ pub fn PeerList(
 
 /// Filter a session-keyed peer list against the search box.
 ///
-/// Pure helper extracted so the dedup-collapsing-bug regression can be
-/// unit-tested without spinning up a full `VideoCallClientCtx` (which would
-/// require a WebTransport / WebSocket connection). Matches if the query is
-/// a substring (case-insensitive) of any of: display name, user_id, or
-/// session_id.
-///
-/// Pre-fix this filtering step was keyed by user_id and built a
-/// `HashMap<user_id, session_id>` whose `collect` collapsed N same-user
-/// sessions into one entry. By taking a `&[PeerListEntry]` and iterating
-/// without dedup, every session survives — N tabs of one user produce N
-/// rows. See HCL #828 follow-up.
+/// Matches if the query is a substring (case-insensitive) of display name,
+/// user_id, or session_id.
 fn filter_peers_for_search<F>(
     peers: &[PeerListEntry],
     query: &str,
@@ -591,13 +573,8 @@ mod tests {
         move |sid: &str| map.get(sid).cloned()
     }
 
-    /// HCL #828 follow-up regression test: three sessions of the SAME user_id
-    /// must survive the filter step as three distinct rows, each with their
-    /// own display name. The pre-fix code collected user_id -> session_id
-    /// into a HashMap before filtering, which dropped two of the three
-    /// sessions because HashMap::collect on duplicate keys keeps the last
-    /// value. With the new session-keyed entry shape this is a non-issue
-    /// and the filter is a straight `Vec` walk.
+    /// Three sessions of the SAME user_id must survive the filter as three
+    /// distinct rows, each with their own display name.
     #[test]
     fn filter_peers_keeps_all_same_user_sessions() {
         let peers = vec![

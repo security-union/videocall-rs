@@ -25,7 +25,7 @@ use crate::components::{
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
-    peer_list::PeerList,
+    peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
@@ -1109,7 +1109,7 @@ pub fn AttendantsComponent(
             },
             on_peer_left: {
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
+                    move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
                         let mut toast_counter = toast_counter;
@@ -1153,8 +1153,13 @@ pub fn AttendantsComponent(
             on_peer_joined: {
                 let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
-                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    move |(display_name, user_id, session_id): (String, String, String)| {
+                        log::debug!(
+                            "TOAST-RX: peer joined: {} ({}, session={})",
+                            display_name,
+                            user_id,
+                            session_id
+                        );
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -1163,9 +1168,30 @@ pub fn AttendantsComponent(
                                     user_id
                                 );
                                 true
-                            } else if client.has_peer_with_user_id(&user_id) {
+                            } else if !session_id.is_empty()
+                                && client.has_peer_with_session_id(&session_id)
+                            {
+                                // Suppress when THIS exact session is already
+                                // tracked — e.g. a reconnect replays the
+                                // PARTICIPANT_JOINED for an existing session
+                                // we still hold in the peer list. Sibling
+                                // same-user sessions have a distinct
+                                // session_id and therefore still surface a
+                                // toast (HCL issue 828).
                                 log::debug!(
-                                    "Suppressing join toast for {} (already in peer list)",
+                                    "Suppressing join toast for {} (session {} already in peer list)",
+                                    user_id,
+                                    session_id
+                                );
+                                true
+                            } else if session_id.is_empty()
+                                && client.has_peer_with_user_id(&user_id)
+                            {
+                                // Legacy fallback: if the server didn't stamp
+                                // a session_id, fall back to user-id-only
+                                // suppression to preserve pre-issue-828 behaviour.
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list, no session_id)",
                                     user_id
                                 );
                                 true
@@ -1217,44 +1243,82 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
-            on_display_name_changed: Some(VcCallback::from(
-                move |(changed_user_id, new_display_name): (String, String)| {
+            on_display_name_changed: Some(VcCallback::from({
+                // The client is installed into this cell after
+                // `VideoCallClient::new` returns, so it is guaranteed to be
+                // `Some` by the time any DISPLAY_NAME_CHANGED broadcast arrives.
+                let client_cell = client_for_reconnect.clone();
+                move |(changed_user_id, new_display_name, event_session_id): (
+                    String,
+                    String,
+                    u64,
+                )| {
                     log::info!(
-                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\" session_id={}",
                         changed_user_id,
                         new_display_name,
+                        event_session_id,
                     );
 
                     if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
                     {
-                        match validate_display_name(&new_display_name) {
-                            Ok(validated_name) => {
-                                log::info!(
-                                    "DIOXUS-UI: Local user display name confirmed by server: {}",
-                                    validated_name
-                                );
-                                save_display_name_to_storage(&validated_name);
-                                let mut current_display_name = current_display_name;
-                                current_display_name.set(validated_name.clone());
-                                let mut dn_ctx = display_name_ctx_signal;
-                                dn_ctx.set(Some(validated_name));
-                                log::debug!("DIOXUS-UI: current_display_name signal updated");
+                        // Resolve the local tab's own session_id (assigned by
+                        // SESSION_ASSIGNED). Parsed to u64 to compare against
+                        // the wire-format session_id from the meeting packet.
+                        let own_session_id: Option<u64> = client_cell
+                            .borrow()
+                            .as_ref()
+                            .and_then(|c| c.get_own_session_id())
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        // Gate the local-self update on session_id so sibling
+                        // tabs of the same authenticated user don't overwrite
+                        // their own self display name. `event_session_id == 0`
+                        // is the legacy broadcast (applies to all sessions).
+                        let is_for_this_session = if event_session_id == 0 {
+                            true
+                        } else {
+                            own_session_id == Some(event_session_id)
+                        };
+
+                        if is_for_this_session {
+                            match validate_display_name(&new_display_name) {
+                                Ok(validated_name) => {
+                                    log::info!(
+                                        "DIOXUS-UI: Local user display name confirmed by server (session match): {}",
+                                        validated_name
+                                    );
+                                    save_display_name_to_storage(&validated_name);
+                                    let mut current_display_name = current_display_name;
+                                    current_display_name.set(validated_name.clone());
+                                    let mut dn_ctx = display_name_ctx_signal;
+                                    dn_ctx.set(Some(validated_name));
+                                    log::debug!("DIOXUS-UI: current_display_name signal updated");
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
+                                        new_display_name,
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
-                                    new_display_name,
-                                    e
-                                );
-                            }
+                        } else {
+                            log::info!(
+                                "DIOXUS-UI: Skipping local-self update — rename event \
+                                 targets sibling session {} (our session: {:?})",
+                                event_session_id,
+                                own_session_id,
+                            );
                         }
                     }
 
                     let mut v = peer_display_name_version;
                     v.set(v() + 1);
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
-                },
-            )),
+                }
+            })),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
             // Honour user transport preference: only allow the connection
@@ -1896,13 +1960,19 @@ pub fn AttendantsComponent(
     // The visible portion of the unified tile list (used by the normal grid layout).
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
 
-    // Map session IDs to user IDs for display (peer list sidebar — real peers only).
-    let peers_for_display: Vec<String> = display_peers
+    // Build the peer-list sidebar entries keyed by `session_id` so each open
+    // browser tab is its own row. `user_id` is carried alongside only for
+    // host-action callbacks (mute / disable video), which remain per-user.
+    let peers_for_display: Vec<PeerListEntry> = display_peers
         .iter()
         .map(|session_id| {
-            client
+            let user_id = client
                 .get_peer_user_id(session_id)
-                .unwrap_or_else(|| session_id.clone())
+                .unwrap_or_else(|| session_id.clone());
+            PeerListEntry {
+                session_id: session_id.clone(),
+                user_id,
+            }
         })
         .collect();
 
@@ -2258,6 +2328,15 @@ pub fn AttendantsComponent(
         meeting_start_time: meeting_start_time_server(),
     });
 
+    // Snapshot the local session_id once per render so every PeerTile can pin
+    // self-identification on session_id instead of user_id. Two tabs of the
+    // same authenticated user share a user_id but always have distinct
+    // session_ids — a user-id compare collapses sibling tabs into one "self"
+    // tile in split layouts and screen-share paths (HCL issue 828). May be `None`
+    // before SESSION_ASSIGNED is received; in that case no tile is treated as
+    // self until the assignment arrives.
+    let my_session_id: Option<String> = client.get_own_session_id();
+
     info!("Rendering meeting view with {} peers", display_peers.len());
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
@@ -2494,7 +2573,7 @@ pub fn AttendantsComponent(
                                             full_bleed: true,
                                             host_user_id: host_user_id.clone(),
                                             render_mode: TileMode::ScreenOnly,
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
@@ -2529,7 +2608,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         on_toggle_pin: move |_: String| {},
                                                     }
                                                 }
@@ -2541,7 +2620,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
@@ -2577,7 +2656,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed: false,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             on_toggle_pin: move |_: String| {},
                                         }
                                     }
@@ -2588,7 +2667,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),
@@ -3228,6 +3307,16 @@ pub fn AttendantsComponent(
                     UpdateDisplayNameModal {
                         current_display_name: current_display_name(),
                         meeting_id: id.clone(),
+                        // HCL issue 828 follow-up: parse the local session_id
+                        // (a numeric string from the client) into u64 so the
+                        // rename REST request can identify this tab. Falls back
+                        // to None when the session has not yet been assigned or
+                        // the value is unparseable — the server then renames
+                        // every session of the caller's user_id (legacy
+                        // behaviour).
+                        session_id: my_session_id
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok()),
                         on_close: move |_| {
                             display_name_modal_open.set(false);
                         },

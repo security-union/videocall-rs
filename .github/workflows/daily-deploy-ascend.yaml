@@ -411,6 +411,8 @@ jobs:
             --set "env[15].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
             --set "env[16].name=TOKEN_TTL_SECS" \
             --set-string "env[16].value=86400" \
+            --set "env[17].name=NATS_URL" \
+            --set "env[17].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
             --set resources.requests.cpu=100m \
             --set resources.requests.memory=128Mi \
             --set resources.limits.cpu=500m \

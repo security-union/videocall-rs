@@ -623,4 +623,195 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       await closeSameUserContext(sessionB.context);
     }
   });
+
+  /**
+   * Regression for HCL #828 follow-up (user-reported, observed live):
+   * "the attendee list has a mixture of the last name changed and the host's
+   * display name." Three tabs of the same authed user join the same meeting
+   * and each renames itself to a distinct name (A / B / C). The Attendants
+   * sidebar on any one tab must then show one row per *session* — three
+   * distinct rows with three distinct names — NOT a single collapsed row
+   * keyed by user_id.
+   *
+   * Root cause: in `dioxus-ui/src/components/peer_list.rs` the `peers` prop
+   * was `Vec<user_id>` and the component built a
+   * `HashMap<user_id, session_id>` via `collect`. With N same-user sessions
+   * that HashMap held only the LAST-inserted session_id, so the per-row
+   * display-name lookup keyed off the wrong session — every row showed
+   * whichever session's broadcast arrived last, producing the "mixture of
+   * the last name changed and the host's display name" symptom.
+   *
+   * Fix: the prop became `Vec<PeerListEntry { session_id, user_id }>` and
+   * the render loop reads display name / audio / video / speaking state by
+   * session_id directly — no dedup step. `attendants.rs` (line ~1974) now
+   * emits one entry per session (per `display_peers` entry, which is
+   * already session-keyed).
+   *
+   * Pre-fix this spec fails: only one peer row appears in Tab A's attendants
+   * list (or two rows that share the same display name), not three rows
+   * with three distinct names.
+   */
+  test("three same-user sessions render as three distinct rows with distinct names in the attendants panel", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_same_user_attendants_${Date.now()}`;
+
+    const sessionA = await openSameUserContext(uiURL);
+    const sessionB = await openSameUserContext(uiURL);
+    const sessionC = await openSameUserContext(uiURL);
+
+    try {
+      // ---- All three sessions join the meeting as the SAME authed user ----
+      await navigateToMeeting(sessionA.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionA.page);
+      await expect(sessionA.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      await navigateToMeeting(sessionB.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionB.page);
+      await expect(sessionB.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      await navigateToMeeting(sessionC.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionC.page);
+      await expect(sessionC.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Wait for peer discovery on all three tabs before any rename.
+      await expect(sessionA.page.locator(PEER_TILE_SELECTOR).first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(sessionB.page.locator(PEER_TILE_SELECTOR).first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(sessionC.page.locator(PEER_TILE_SELECTOR).first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Let any join toasts clear before clicking peer-list buttons.
+      await sessionA.page.waitForTimeout(9_000);
+
+      // ---- Rename Tab B to a unique name (session-scoped). ----
+      const nameB = `TabB_${Date.now()}`;
+      await renameSelf(sessionB.page, nameB);
+
+      // ---- Rename Tab C to a unique name (session-scoped). ----
+      const nameC = `TabC_${Date.now()}`;
+      await renameSelf(sessionC.page, nameC);
+
+      // Give the PARTICIPANT_DISPLAY_NAME_CHANGED broadcasts time to fan
+      // out to Tab A. Without this, Tab A may have only seen Tab B's
+      // rename by the time we open its peer list and assert on names.
+      await sessionA.page.waitForTimeout(3_000);
+
+      // ---- Open Tab A's peer list and inspect the rendered rows. ----
+      const openPeersA = sessionA.page.locator("button.video-control-button", {
+        has: sessionA.page.locator(".tooltip", { hasText: "Open Peers" }),
+      });
+      await expect(openPeersA).toBeVisible({ timeout: 10_000 });
+      await openPeersA.click();
+
+      // Wait for the peer list panel itself.
+      await expect(sessionA.page.locator("#peer-list-container")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // The peer-list contains one <li> per session — self + (N-1) peers.
+      // PeerListItem renders `.peer_item` inside each row. With three
+      // same-user sessions, Tab A must see THREE rows (its own self-row
+      // plus the two sibling sessions). The exact count locks in that the
+      // pre-fix user_id-keyed HashMap dedup is gone — a single row would
+      // mean both peers collapsed into one, which is the regression.
+      const rowItems = sessionA.page.locator("#peer-list-container .peer-list ul > li .peer_item");
+      await expect(rowItems).toHaveCount(3, { timeout: 15_000 });
+
+      // Each row's name container must show a distinct text. With the
+      // bug, two peer rows would either be missing OR share the same
+      // display name (the "last session's name overwrites all peers"
+      // symptom from the user report).
+      const rowTexts = await sessionA.page
+        .locator("#peer-list-container .peer-list ul > li .peer_item_name_container")
+        .evaluateAll((els) => els.map((e) => (e.textContent ?? "").trim()));
+
+      // Strip indicator suffixes like "(You)" / "(Host)" so we compare
+      // pure display names. The indicator is rendered inside the same
+      // container via `<span class="peer-indicator">…</span>`.
+      const cleanedRowTexts = rowTexts.map((t) =>
+        t
+          .replace(/\(You\/Host\)|\(You\)|\(Host\)/g, "")
+          .replace(/Guest/g, "")
+          .trim(),
+      );
+
+      expect(cleanedRowTexts.length, "exactly three rows must be rendered (self + 2 peers)").toBe(
+        3,
+      );
+
+      // Tab B's renamed display name must appear exactly once in Tab A's
+      // attendants panel — pre-fix the row was either missing (collapsed
+      // into Tab C's session_id lookup) or appeared as Tab C's name
+      // (last-inserted HashMap value).
+      const matchesB = cleanedRowTexts.filter((t) => t.includes(nameB));
+      const matchesC = cleanedRowTexts.filter((t) => t.includes(nameC));
+      expect(
+        matchesB.length,
+        `Tab B's renamed display name must appear exactly once in Tab A's attendants list. cleaned rows = ${JSON.stringify(cleanedRowTexts)}`,
+      ).toBe(1);
+      expect(
+        matchesC.length,
+        `Tab C's renamed display name must appear exactly once in Tab A's attendants list. cleaned rows = ${JSON.stringify(cleanedRowTexts)}`,
+      ).toBe(1);
+
+      // The three rendered names must be distinct (no duplicate name
+      // across rows — that would be the collapse symptom).
+      const uniqueRowTexts = new Set(cleanedRowTexts);
+      expect(
+        uniqueRowTexts.size,
+        `all three rows must have distinct display names; got ${JSON.stringify(cleanedRowTexts)}`,
+      ).toBe(3);
+    } finally {
+      await closeSameUserContext(sessionA.context);
+      await closeSameUserContext(sessionB.context);
+      await closeSameUserContext(sessionC.context);
+    }
+  });
 });
+
+/**
+ * Drive the self-rename UI on a single page: open the peer list, click the
+ * edit-pencil on the self row, fill the modal with `newName`, and submit.
+ * Mirrors the steps in the existing rename test above. Used by the
+ * three-distinct-rows attendants regression to set distinct names on each
+ * tab before inspecting the attendants panel.
+ */
+async function renameSelf(page: Page, newName: string): Promise<void> {
+  const openPeers = page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Open Peers" }),
+  });
+  await expect(openPeers).toBeVisible({ timeout: 10_000 });
+  await openPeers.click();
+
+  const editBtn = page.locator("button.peer_item_edit_btn");
+  await expect(editBtn).toBeVisible({ timeout: 10_000 });
+  await editBtn.click();
+
+  const nameInput = page.locator("input.input-apple");
+  await expect(nameInput).toBeVisible({ timeout: 10_000 });
+  await nameInput.fill("");
+  await nameInput.pressSequentially(newName, { delay: 30 });
+
+  const saveBtn = page.getByRole("button", { name: "Save" });
+  await expect(saveBtn).toBeEnabled({ timeout: 5_000 });
+  await saveBtn.click();
+
+  // The renamed name should be visible somewhere on this tab's own UI
+  // (self-tile floating-name or self peer-list row). Wait for it so the
+  // PARTICIPANT_DISPLAY_NAME_CHANGED broadcast actually fired before the
+  // caller proceeds.
+  await expect(page.locator(".floating-name", { hasText: newName }).first()).toBeVisible({
+    timeout: 15_000,
+  });
+
+  // Close the peer list panel by clicking the toggle button again so the
+  // caller starts from a known state.
+  await openPeers.click();
+}

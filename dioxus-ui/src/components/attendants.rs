@@ -25,7 +25,7 @@ use crate::components::{
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
-    peer_list::PeerList,
+    peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
@@ -1970,13 +1970,24 @@ pub fn AttendantsComponent(
     // The visible portion of the unified tile list (used by the normal grid layout).
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
 
-    // Map session IDs to user IDs for display (peer list sidebar — real peers only).
-    let peers_for_display: Vec<String> = display_peers
+    // Build the peer-list sidebar entries keyed by `session_id`. Each row in
+    // the sidebar represents one open browser tab / connection — so multiple
+    // sessions of the same authenticated `user_id` (e.g. one user with three
+    // tabs in the same meeting) render as three distinct rows, each with
+    // their own per-tab display name. The `user_id` is carried alongside the
+    // session_id only for host-action callbacks (mute / disable video) which
+    // remain per-user by design (PR #556's HOST_MUTE_PARTICIPANT contract).
+    // See HCL #828 follow-up.
+    let peers_for_display: Vec<PeerListEntry> = display_peers
         .iter()
         .map(|session_id| {
-            client
+            let user_id = client
                 .get_peer_user_id(session_id)
-                .unwrap_or_else(|| session_id.clone())
+                .unwrap_or_else(|| session_id.clone());
+            PeerListEntry {
+                session_id: session_id.clone(),
+                user_id,
+            }
         })
         .collect();
 

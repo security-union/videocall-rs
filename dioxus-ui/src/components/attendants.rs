@@ -1177,7 +1177,7 @@ pub fn AttendantsComponent(
                                 // we still hold in the peer list. Sibling
                                 // same-user sessions have a distinct
                                 // session_id and therefore still surface a
-                                // toast (HCL #828).
+                                // toast (HCL issue 828).
                                 log::debug!(
                                     "Suppressing join toast for {} (session {} already in peer list)",
                                     user_id,
@@ -2288,7 +2288,7 @@ pub fn AttendantsComponent(
     // self-identification on session_id instead of user_id. Two tabs of the
     // same authenticated user share a user_id but always have distinct
     // session_ids — a user-id compare collapses sibling tabs into one "self"
-    // tile in split layouts and screen-share paths (HCL #828). May be `None`
+    // tile in split layouts and screen-share paths (HCL issue 828). May be `None`
     // before SESSION_ASSIGNED is received; in that case no tile is treated as
     // self until the assignment arrives.
     let my_session_id: Option<String> = client.get_own_session_id();

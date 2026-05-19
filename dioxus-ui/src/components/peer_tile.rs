@@ -40,7 +40,7 @@ pub fn PeerTile(
     #[props(default)] render_mode: TileMode,
     /// The local user's session_id. Used to identify which tile is the local
     /// user's own. Keyed on session_id, not user_id, so sibling same-user
-    /// sessions (HCL #828) are not mis-classified as self.
+    /// sessions (HCL issue 828) are not mis-classified as self.
     #[props(default)]
     my_session_id: Option<String>,
     #[props(default)] pinned_peer_id: Option<String>,
@@ -234,7 +234,7 @@ pub fn PeerTile(
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
     // Self-identification keys on session_id (`peer_id`), not user_id, so a host
     // viewing their own sibling same-user session still sees the mute control on
-    // the sibling (HCL #828) — only their own tile hides it.
+    // the sibling (HCL issue 828) — only their own tile hides it.
     let peer_uid_for_mute = client
         .get_peer_user_id(&peer_id)
         .unwrap_or_else(|| peer_id.clone());

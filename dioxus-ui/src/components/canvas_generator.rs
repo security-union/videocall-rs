@@ -291,7 +291,7 @@ pub struct AudioLevels {
 /// `my_session_id` is the LOCAL session_id (from `VideoCallClient::get_own_session_id`). It is
 /// compared against `key` (the peer's session_id) to detect the local user's own tile. Prior
 /// versions of this function used the local user_id, which caused sibling same-user sessions to
-/// be misidentified as "self" (HCL #828): each tab of the same authenticated user has its own
+/// be misidentified as "self" (HCL issue 828): each tab of the same authenticated user has its own
 /// distinct session_id but a shared user_id, so a user-id compare collapses sibling tabs into a
 /// single "self" tile in split layouts and screen-share paths.
 #[allow(clippy::too_many_arguments)]
@@ -365,7 +365,7 @@ pub fn generate_for_peer(
     // ---- Split-layout: screen-share left panel --------------------------------
     // Self-identification keys on session_id, not user_id: two tabs/devices of
     // the same authenticated user share a user_id but have distinct session_ids,
-    // and a sibling session must not be treated as "self" (HCL #828).
+    // and a sibling session must not be treated as "self" (HCL issue 828).
     if matches!(mode, TileMode::ScreenOnly) {
         // Don't render the local user's own screen share
         if !is_screen_share_enabled_for_peer || my_session_id == Some(key.as_str()) {
@@ -877,7 +877,7 @@ pub fn generate_for_peer(
 
     // Derive flat &str values so the rsx! condition is a simple != comparison.
     // Self-identification keys on session_id (`key`), not user_id, so sibling
-    // same-user sessions get their own screen-share canvas (HCL #828).
+    // same-user sessions get their own screen-share canvas (HCL issue 828).
     let peer_session_id = key.as_str();
     let my_session_id_str = my_session_id.unwrap_or("");
 

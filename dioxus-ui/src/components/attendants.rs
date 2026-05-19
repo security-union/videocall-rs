@@ -1243,44 +1243,92 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
-            on_display_name_changed: Some(VcCallback::from(
-                move |(changed_user_id, new_display_name): (String, String)| {
+            on_display_name_changed: Some(VcCallback::from({
+                // HCL #828: capture the client cell so the closure can read
+                // the local tab's own session_id at the moment the event
+                // fires. The client is installed into this cell after
+                // `VideoCallClient::new` returns (`*client_for_reconnect
+                // .borrow_mut() = Some(client.clone())`), so it is guaranteed
+                // to be `Some` by the time any PARTICIPANT_DISPLAY_NAME_CHANGED
+                // broadcast arrives.
+                let client_cell = client_for_reconnect.clone();
+                move |(changed_user_id, new_display_name, event_session_id): (
+                    String,
+                    String,
+                    u64,
+                )| {
                     log::info!(
-                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\" session_id={}",
                         changed_user_id,
                         new_display_name,
+                        event_session_id,
                     );
 
                     if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
                     {
-                        match validate_display_name(&new_display_name) {
-                            Ok(validated_name) => {
-                                log::info!(
-                                    "DIOXUS-UI: Local user display name confirmed by server: {}",
-                                    validated_name
-                                );
-                                save_display_name_to_storage(&validated_name);
-                                let mut current_display_name = current_display_name;
-                                current_display_name.set(validated_name.clone());
-                                let mut dn_ctx = display_name_ctx_signal;
-                                dn_ctx.set(Some(validated_name));
-                                log::debug!("DIOXUS-UI: current_display_name signal updated");
+                        // Resolve the local tab's own session_id (assigned by
+                        // SESSION_ASSIGNED). Parsed to u64 to compare against
+                        // the wire-format session_id from the meeting packet.
+                        let own_session_id: Option<u64> = client_cell
+                            .borrow()
+                            .as_ref()
+                            .and_then(|c| c.get_own_session_id())
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        // HCL #828: gate the local-self update on session_id.
+                        // - `event_session_id == 0` is the legacy broadcast
+                        //   path (rename applies to all sessions of this
+                        //   user_id) — preserve the old behaviour.
+                        // - `event_session_id != 0` is the per-session
+                        //   broadcast added by PR #851 — ONLY apply when it
+                        //   matches the local tab's own session_id. This
+                        //   prevents sibling tabs of the same authenticated
+                        //   user from overwriting their own self display name
+                        //   when another tab renames.
+                        let is_for_this_session = if event_session_id == 0 {
+                            true
+                        } else {
+                            own_session_id == Some(event_session_id)
+                        };
+
+                        if is_for_this_session {
+                            match validate_display_name(&new_display_name) {
+                                Ok(validated_name) => {
+                                    log::info!(
+                                        "DIOXUS-UI: Local user display name confirmed by server (session match): {}",
+                                        validated_name
+                                    );
+                                    save_display_name_to_storage(&validated_name);
+                                    let mut current_display_name = current_display_name;
+                                    current_display_name.set(validated_name.clone());
+                                    let mut dn_ctx = display_name_ctx_signal;
+                                    dn_ctx.set(Some(validated_name));
+                                    log::debug!("DIOXUS-UI: current_display_name signal updated");
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
+                                        new_display_name,
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
-                                    new_display_name,
-                                    e
-                                );
-                            }
+                        } else {
+                            log::info!(
+                                "DIOXUS-UI: Skipping local-self update — rename event \
+                                 targets sibling session {} (our session: {:?})",
+                                event_session_id,
+                                own_session_id,
+                            );
                         }
                     }
 
                     let mut v = peer_display_name_version;
                     v.set(v() + 1);
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
-                },
-            )),
+                }
+            })),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
             // Honour user transport preference: only allow the connection

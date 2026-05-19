@@ -247,8 +247,15 @@ pub struct VideoCallClientOptions {
     pub on_peer_left: Option<Callback<(String, String, String)>>,
 
     /// Callback triggered when a participant changes their display name.
-    /// Emits `(user_id, new_display_name)`.
-    pub on_display_name_changed: Option<Callback<(String, String)>>,
+    /// Emits `(user_id, new_display_name, session_id)` where `session_id` is
+    /// the server-assigned u64 session_id of the renaming participant — or
+    /// `0` for legacy broadcasts that did not carry a session_id (rename
+    /// applies to all sessions of `user_id`). UIs that maintain a local-self
+    /// display-name signal MUST gate their self-update on
+    /// `session_id == own_session_id` so a sibling tab of the same
+    /// authenticated user (same `user_id`, different `session_id`) does not
+    /// overwrite its own self-name when another tab renames. See HCL #828.
+    pub on_display_name_changed: Option<Callback<(String, String, u64)>>,
 
     /// Callback triggered when a remote participant joins the meeting.
     /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_JOINED
@@ -325,7 +332,7 @@ struct InnerOptions {
     on_host_disable_video: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
-    on_display_name_changed: Option<Callback<(String, String)>>,
+    on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
 
@@ -2188,10 +2195,16 @@ impl Inner {
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(
-                                    "Emitting on_display_name_changed callback for {}",
-                                    target_str
+                                    "Emitting on_display_name_changed callback for user={} session_id={}",
+                                    target_str, meeting_packet.session_id
                                 );
-                                cb.emit((target_str, new_display_name));
+                                // HCL #828: include the renaming session's
+                                // session_id so the UI can scope the
+                                // local-self update to the renaming tab only.
+                                // A value of 0 indicates a legacy broadcast
+                                // without a session_id; consumers must treat
+                                // it as "apply to all sessions of user_id".
+                                cb.emit((target_str, new_display_name, meeting_packet.session_id));
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
@@ -2745,6 +2758,95 @@ mod dedup_tests {
             from_wt,
             "second HOST_MUTE for the same target_user_id within the dual-\
              transport window must be suppressed — host actions are user-scoped"
+        );
+    }
+
+    /// HCL #828 follow-up: the `on_display_name_changed` callback must
+    /// receive the `session_id` of the renaming participant so the UI can
+    /// scope its local-self update to the renaming tab only. Two tabs of
+    /// the same authenticated user (same `user_id`, different
+    /// `session_id`s) would otherwise all match the user_id-only gate at
+    /// `attendants.rs:1254` and overwrite their own self-name signal when
+    /// any sibling tab renames — the exact bug observed live for HCL #828.
+    ///
+    /// This test pushes a synthetic `PARTICIPANT_DISPLAY_NAME_CHANGED`
+    /// meeting packet through `on_inbound_media` with a non-zero
+    /// `session_id`, and asserts the callback fires with that same
+    /// `session_id` as the third tuple element. If the emit site reverts
+    /// to a 2-tuple or drops the session_id, this test fails.
+    #[wasm_bindgen_test]
+    fn display_name_change_callback_carries_session_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // Capture every (user_id, new_name, session_id) tuple the
+        // callback is invoked with.
+        let received: Rc<RefCell<Vec<(String, String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let received_for_cb = received.clone();
+
+        let mut opts = build_dedup_test_options();
+        opts.on_display_name_changed = Some(VcCallback::from(
+            move |(user_id, name, session_id): (String, String, u64)| {
+                received_for_cb
+                    .borrow_mut()
+                    .push((user_id, name, session_id));
+            },
+        ));
+        let client = VideoCallClient::new(opts);
+
+        // Build a PARTICIPANT_DISPLAY_NAME_CHANGED meeting packet for a
+        // sibling session of the local user (different session_id from
+        // anything the local client thinks is its own — the dedup_test
+        // client has no own_session_id assigned, which is fine: the
+        // contract under test is the *callback shape*, not the consumer's
+        // local-self gate. The consumer-side gate is exercised by the
+        // dioxus-ui callsite at `components/attendants.rs`.)
+        let renaming_session_id: u64 = 11_909_780_505_735_931_018;
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "TonyBots".to_string(),
+            target_user_id: b"tester1.estrada@gmail.com".to_vec(),
+            session_id: renaming_session_id,
+            display_name: b"Tester 1".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: b"tester1.estrada@gmail.com".to_vec(),
+            // PacketWrapper.session_id is 0 for MEETING packets; the
+            // renaming session is carried inside the inner MeetingPacket.
+            session_id: 0,
+            data: meeting_packet
+                .write_to_bytes()
+                .expect("MeetingPacket must serialise"),
+            ..Default::default()
+        };
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner.on_inbound_media(wrapper);
+        }
+
+        let captured = received.borrow();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one on_display_name_changed emit expected; got {:?}",
+            *captured
+        );
+        let (got_user, got_name, got_session) = &captured[0];
+        assert_eq!(got_user, "tester1.estrada@gmail.com");
+        assert_eq!(got_name, "Tester 1");
+        assert_eq!(
+            *got_session, renaming_session_id,
+            "callback must carry the renaming participant's session_id \
+             so the consumer (dioxus-ui) can scope its local-self update \
+             to the renaming tab only — sibling tabs of the same authed \
+             user must NOT overwrite their own display name signal. \
+             Regression guard for HCL #828."
         );
     }
 }

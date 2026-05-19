@@ -30,6 +30,17 @@ window.__APP_CONFIG = Object.freeze({
 });
 EOF
 
+# Stage the developer's optional config.local.js into dist/ so the dev server
+# can serve it. The Trunk.toml post_build hook also copies it on every build,
+# but trunk doesn't watch files that didn't exist when `trunk serve` started,
+# so a config.local.js created after the first build wouldn't auto-stage. This
+# copy at container startup makes the docker workflow predictable: if the file
+# exists on the host bind-mount at container-up time, it's available.
+if [ -f /app/dioxus-ui/scripts/config.local.js ]; then
+    mkdir -p /app/dioxus-ui/dist
+    cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
+fi
+
 tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
 
 exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-3001}" --poll

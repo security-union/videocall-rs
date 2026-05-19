@@ -21,9 +21,33 @@
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
         <script src="/config.js"></script>
         <!-- Optional local developer overrides. Create dioxus-ui/scripts/config.local.js
-             (gitignored) to patch defaults for local development. The onerror handler
-             silently removes the tag when the file is absent so it doesn't log a 404. -->
-        <script src="/config.local.js" onerror="this.remove()"></script>
+             (gitignored) to patch defaults for local development; Trunk.toml's post_build
+             hook copies it into dist/ so the dev server can serve it.
+
+             We fetch it via a sync XHR + first-byte sniff rather than `<script src=...>`
+             because dev servers (trunk serve / dx serve) return the SPA index.html
+             fallback for missing paths instead of a 404 — so the naive `<script>` tag's
+             `onerror` never fires and the browser tries to parse HTML as JS, throwing
+             `Unexpected token '<'` and silently leaving overrides un-applied.
+
+             This loader inspects the response: only executes JS-shaped bodies, silently
+             skips empty bodies and HTML fallbacks. Sync XHR is intentional — the
+             overrides must apply before the dioxus app reads window.__APP_CONFIG. -->
+        <script>
+            (function () {
+                try {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/config.local.js", false);
+                    xhr.send(null);
+                    if (xhr.status !== 200) return;
+                    var body = (xhr.responseText || "").trim();
+                    if (!body || body.charAt(0) === "<") return;
+                    new Function(body)();
+                } catch (e) {
+                    /* config.local.js is optional — silent */
+                }
+            })();
+        </script>
         <script src="/console-log-collector.js"></script>
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
         <link

@@ -3062,7 +3062,7 @@ impl ConnectionManager {
                             {
                                 if let Some(bytes) = limit.as_f64() {
                                     metrics
-                                        .push(metric!("heap_total_mb", bytes / (1024.0 * 1024.0)));
+                                        .push(metric!("heap_limit_mb", bytes / (1024.0 * 1024.0)));
                                 }
                             }
                         }

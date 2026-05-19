@@ -252,8 +252,6 @@ jobs:
             --set-string "env[11].value=2" \
             --set "env[12].name=WT_OUTBOUND_CHANNEL_CAPACITY" \
             --set-string "env[12].value=4096" \
-            --set "env[13].name=WT_OUTBOUND_SHEDDING_THRESHOLD" \
-            --set-string "env[13].value=512" \
             --set resources.requests.cpu=200m \
             --set resources.requests.memory=256Mi \
             --set resources.limits.cpu=2000m \

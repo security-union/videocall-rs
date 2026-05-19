@@ -658,13 +658,6 @@ lazy_static! {
     )
     .expect("Failed to create videocall_outbound_channel_drops_total metric");
 
-    pub(crate) static ref OUTBOUND_CHANNEL_SHED_TOTAL: CounterVec = register_counter_vec!(
-        "videocall_outbound_channel_shed_total",
-        "Packets proactively shed (video/screen dropped to protect audio) when outbound buffer is low",
-        &["transport", "kind"]
-    )
-    .expect("Failed to create videocall_outbound_channel_shed_total metric");
-
     // ===== CLIENT TELEMETRY: TELEM-7, TELEM-8, TELEM-9 =====
 
     /// TELEM-7: Static per-session client metadata (value always 1, info in labels)

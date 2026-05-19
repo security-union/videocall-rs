@@ -1109,7 +1109,7 @@ pub fn AttendantsComponent(
             },
             on_peer_left: {
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
+                    move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
                         let mut toast_counter = toast_counter;
@@ -1153,8 +1153,13 @@ pub fn AttendantsComponent(
             on_peer_joined: {
                 let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
-                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    move |(display_name, user_id, session_id): (String, String, String)| {
+                        log::debug!(
+                            "TOAST-RX: peer joined: {} ({}, session={})",
+                            display_name,
+                            user_id,
+                            session_id
+                        );
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -1163,9 +1168,30 @@ pub fn AttendantsComponent(
                                     user_id
                                 );
                                 true
-                            } else if client.has_peer_with_user_id(&user_id) {
+                            } else if !session_id.is_empty()
+                                && client.has_peer_with_session_id(&session_id)
+                            {
+                                // Suppress when THIS exact session is already
+                                // tracked — e.g. a reconnect replays the
+                                // PARTICIPANT_JOINED for an existing session
+                                // we still hold in the peer list. Sibling
+                                // same-user sessions have a distinct
+                                // session_id and therefore still surface a
+                                // toast (HCL #828).
                                 log::debug!(
-                                    "Suppressing join toast for {} (already in peer list)",
+                                    "Suppressing join toast for {} (session {} already in peer list)",
+                                    user_id,
+                                    session_id
+                                );
+                                true
+                            } else if session_id.is_empty()
+                                && client.has_peer_with_user_id(&user_id)
+                            {
+                                // Legacy fallback: if the server didn't stamp
+                                // a session_id, fall back to user-id-only
+                                // suppression to preserve pre-#828 behaviour.
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list, no session_id)",
                                     user_id
                                 );
                                 true
@@ -2258,6 +2284,15 @@ pub fn AttendantsComponent(
         meeting_start_time: meeting_start_time_server(),
     });
 
+    // Snapshot the local session_id once per render so every PeerTile can pin
+    // self-identification on session_id instead of user_id. Two tabs of the
+    // same authenticated user share a user_id but always have distinct
+    // session_ids — a user-id compare collapses sibling tabs into one "self"
+    // tile in split layouts and screen-share paths (HCL #828). May be `None`
+    // before SESSION_ASSIGNED is received; in that case no tile is treated as
+    // self until the assignment arrives.
+    let my_session_id: Option<String> = client.get_own_session_id();
+
     info!("Rendering meeting view with {} peers", display_peers.len());
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
@@ -2494,7 +2529,7 @@ pub fn AttendantsComponent(
                                             full_bleed: true,
                                             host_user_id: host_user_id.clone(),
                                             render_mode: TileMode::ScreenOnly,
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
@@ -2529,7 +2564,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         on_toggle_pin: move |_: String| {},
                                                     }
                                                 }
@@ -2541,7 +2576,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
@@ -2577,7 +2612,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed: false,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             on_toggle_pin: move |_: String| {},
                                         }
                                     }
@@ -2588,7 +2623,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),

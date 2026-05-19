@@ -320,4 +320,163 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       await closeSameUserContext(sessionC.context);
     }
   });
+
+  /**
+   * Regression for HCL #828 follow-up: `is_self_peer` in
+   * `dioxus-ui/src/components/canvas_generator.rs` previously compared the
+   * local **user_id** against `peer_user_id`, which collapsed sibling
+   * same-user sessions into "self" in the split layouts. In `TileMode::ScreenOnly`
+   * the buggy code returned `Empty` for the sibling's screen-share tile,
+   * leaving the left split panel blank for every same-user viewer.
+   *
+   * After the fix `is_self_peer` keys on `session_id` (the per-tab unique id):
+   * Session A shares its screen, Session B (same user_id, different
+   * session_id) must render Session A's screen-share canvas in the left
+   * panel (`.split-screen-tile`).
+   *
+   * If the fix regresses, `.split-screen-tile` will fail to appear on
+   * Session B — the screen-share would still be visible on the sharer's own
+   * side (since the local-self check applies only to the canvas-generator
+   * remote rendering path), but the sibling tab would never see it.
+   */
+  test("sibling same-user session renders the other session's screen-share in the ScreenOnly split panel", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_same_user_ss_${Date.now()}`;
+
+    // Launch with the extra Chromium flag that auto-accepts the
+    // getDisplayMedia() system picker; without it the screen-share button
+    // click never produces a stream and the split layout never appears.
+    const browserA = await chromium.launch({
+      args: [...BROWSER_ARGS, "--auto-select-desktop-capture-source=Entire screen"],
+    });
+    const browserB = await chromium.launch({
+      args: [...BROWSER_ARGS, "--auto-select-desktop-capture-source=Entire screen"],
+    });
+
+    try {
+      const contextA = await createAuthenticatedContext(
+        browserA,
+        SAME_USER_EMAIL,
+        SAME_USER_NAME,
+        uiURL,
+      );
+      const contextB = await createAuthenticatedContext(
+        browserB,
+        SAME_USER_EMAIL,
+        SAME_USER_NAME,
+        uiURL,
+      );
+      const pageA = await contextA.newPage();
+      const pageB = await contextB.newPage();
+
+      // ---- Both sessions join the meeting ----
+      await navigateToMeeting(pageA, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(pageA);
+      await navigateToMeeting(pageB, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(pageB);
+
+      // Both sides must see at least 2 tiles (self + sibling) before we
+      // proceed — guards against a race where the sharer starts screen
+      // share before its peer is known on the other side.
+      await expect(pageA.locator(PEER_TILE_SELECTOR).first()).toBeVisible({ timeout: 30_000 });
+      await expect(pageB.locator(PEER_TILE_SELECTOR).first()).toBeVisible({ timeout: 30_000 });
+      await pageA.waitForTimeout(3_000);
+
+      // ---- Session A starts screen sharing ----
+      // The Share Screen button auto-hides; nudge the mouse to reveal the
+      // control bar before clicking.
+      await pageA.mouse.move(400, 400);
+      await pageA.waitForTimeout(300);
+      const shareButton = pageA.locator("button.video-control-button", {
+        has: pageA.locator(".tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareButton).toBeVisible({ timeout: 10_000 });
+      await shareButton.click();
+
+      // ---- Session B (sibling same-user session) must see the split layout
+      // with the screen-share canvas in the left panel. With the pre-fix
+      // user_id-based is_self_peer comparison this would be empty.
+      await expect(pageB.locator(".split-screen-tile")).toBeVisible({ timeout: 20_000 });
+
+      // The sibling should also see its own video tile in the split right
+      // panel via TileMode::VideoOnly (which is unaffected by is_self_peer
+      // but doubles as a sanity check that the split layout activated end
+      // to end).
+      const splitPeerTiles = pageB.locator(".split-peer-tile");
+      await expect(splitPeerTiles.first()).toBeVisible({ timeout: 10_000 });
+
+      // ---- The sharer (Session A) must also see at least their sibling's
+      // video tile in the split right panel — locks in that the same fix
+      // applied symmetrically.
+      await expect(pageA.locator(".split-peer-tile").first()).toBeVisible({ timeout: 10_000 });
+    } finally {
+      await browserA.close().catch(() => undefined);
+      await browserB.close().catch(() => undefined);
+    }
+  });
+
+  /**
+   * Regression for HCL #828 follow-up: the join-toast suppression in
+   * `dioxus-ui/src/components/attendants.rs` previously used
+   * `client.has_peer_with_user_id(user_id)`, which short-circuited the
+   * toast for the SECOND session of a same-user joiner because the FIRST
+   * session was already in the peer list. The result: when a second tab
+   * of the same authenticated user joined, no idle existing session ever
+   * surfaced a "joined the meeting" toast for the new tab.
+   *
+   * After the fix the suppression keys on `session_id` (via
+   * `has_peer_with_session_id`), so each distinct session surfaces its own
+   * toast even when sibling sessions share a user_id.
+   *
+   * Setup: Session A joins first and sits idle on the meeting. Session B
+   * joins as the same user. Session A's UI must render a
+   * `.peer-toast.toast-joined` element. With the regression in place no
+   * toast appears (the suppression filter eats the second join event).
+   */
+  test("idle same-user session receives a join toast when a sibling session joins", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_same_user_toast_${Date.now()}`;
+
+    const sessionA = await openSameUserContext(uiURL);
+    const sessionB = await openSameUserContext(uiURL);
+
+    try {
+      // ---- Session A joins first and waits in the meeting ----
+      await navigateToMeeting(sessionA.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionA.page);
+      await expect(sessionA.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Start watching for the joined toast BEFORE Session B actually
+      // joins — PARTICIPANT_JOINED can fire fast enough that polling
+      // started afterwards races the 8s auto-dismiss.
+      const joinedToast = sessionA.page.locator(".peer-toast.toast-joined");
+      const toastPromise = expect(joinedToast.first()).toBeVisible({ timeout: 30_000 });
+
+      // ---- Session B joins as the SAME user ----
+      await navigateToMeeting(sessionB.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionB.page);
+      await expect(sessionB.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ---- Session A must see a join toast for the sibling session ----
+      // Pre-fix: has_peer_with_user_id(user_id) was true (Session A's own
+      // session was already tracked, since it's our own user_id), so the
+      // toast was suppressed and the first .toast-joined never appeared.
+      await toastPromise;
+
+      // Toast structure check: line 1 carries the display name, line 2
+      // contains "joined the meeting".
+      const firstJoined = joinedToast.first();
+      await expect(firstJoined.locator(".toast-name")).toContainText(SAME_USER_NAME);
+      await expect(firstJoined.locator(".toast-action")).toContainText("joined the meeting");
+    } finally {
+      await closeSameUserContext(sessionA.context);
+      await closeSameUserContext(sessionB.context);
+    }
+  });
 });

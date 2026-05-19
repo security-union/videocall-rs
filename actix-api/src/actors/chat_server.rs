@@ -56,6 +56,11 @@ struct ExecutePendingDeparture {
     session: SessionId,
     room: String,
     user_id: String,
+    /// Second component of the `pending_departures` HashMap key — the
+    /// client-instance identifier captured at `Disconnect` time. The handler
+    /// MUST use this when looking up its own entry, because `(room, user_id)`
+    /// is no longer unique across same-user multi-session participants.
+    instance_key: String,
     display_name: String,
     is_host: bool,
     end_on_host_leave: bool,
@@ -234,10 +239,23 @@ pub struct ChatServer {
     /// reconnect. Read by [`ChatServer::leave_rooms`] when deciding whether
     /// to broadcast `MEETING_ENDED`. See [`RoomPolicy`].
     room_policy: HashMap<String, RoomPolicy>,
-    /// Pending departures keyed by `(room_id, user_id)`. When a session disconnects
-    /// we defer the PARTICIPANT_LEFT broadcast by [`RECONNECT_GRACE_PERIOD`]. If the
-    /// same user reconnects before the timer fires, the departure is cancelled
-    /// silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is sent.
+    /// Pending departures keyed by `(room_id, instance_key)`.
+    ///
+    /// `instance_key` is the client's `instance_id` when one was provided at
+    /// `JoinRoom` time (the common path — sourced from per-tab sessionStorage),
+    /// or a per-session sentinel (`"__session__:<session_id>"`) when no
+    /// `instance_id` is available. This is the **per-tab / per-client-instance**
+    /// identifier and intentionally NOT keyed on `user_id`: PR #851 lifted the
+    /// "one session per user per room" invariant, so two concurrent sessions of
+    /// the same `user_id` (e.g. two browser tabs of the same authenticated
+    /// account) must each have independent pending-departure state.
+    ///
+    /// When a session disconnects we defer the PARTICIPANT_LEFT broadcast by
+    /// [`RECONNECT_GRACE_PERIOD`]. If the SAME tab reconnects (same
+    /// `instance_id`) before the timer fires, the departure is cancelled
+    /// silently — no PARTICIPANT_LEFT or PARTICIPANT_JOINED is sent. A fresh
+    /// second session of the same user (different `instance_id`) does NOT match
+    /// this key and is correctly treated as a real new join.
     pending_departures: HashMap<(String, String), PendingDepartureState>,
     /// Sessions that should NOT have PARTICIPANT_JOINED broadcast at activation.
     /// This is used for reconnection sessions: the user never "left" from peers'
@@ -563,10 +581,14 @@ impl ChatServer {
     }
 
     /// Tear down all per-session state for `session_id` and cancel any
-    /// pending departure for `(room, user_id)`. Shared by both eviction
-    /// paths so the cleanup surface stays in lockstep — if a new
-    /// per-session HashMap is added to [`ChatServer`], it MUST be cleaned
-    /// up here.
+    /// pending departure for this session's `(room, instance_key)`. Shared
+    /// by both eviction paths so the cleanup surface stays in lockstep — if
+    /// a new per-session HashMap is added to [`ChatServer`], it MUST be
+    /// cleaned up here.
+    ///
+    /// `user_id` is retained as a parameter for log readability only — the
+    /// pending-departure key is **not** derived from it (see
+    /// [`Self::pending_departures`]).
     ///
     /// Does NOT broadcast `PARTICIPANT_LEFT` — both eviction paths are
     /// silent (the new session that triggered the eviction will set
@@ -579,6 +601,10 @@ impl ChatServer {
         user_id: &str,
         ctx: &mut Context<Self>,
     ) {
+        // Resolve the pending-departure key BEFORE removing session_instance
+        // so the lookup still finds this session's instance_id.
+        let instance_key = self.pending_departure_instance_key(session_id);
+
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
@@ -595,12 +621,16 @@ impl ChatServer {
         let _ = self.suppress_join_broadcast.remove(&session_id);
         let _ = self.session_is_guest.remove(&session_id);
 
-        // Cancel any deferred PARTICIPANT_LEFT for this user. If we evict
-        // them while a departure is pending, we want the new session to
+        // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
+        // evict them while a departure is pending, we want the new session to
         // pick up cleanly without the old one's deferred broadcast firing.
-        let departure_key = (room.to_string(), user_id.to_string());
+        let departure_key = (room.to_string(), instance_key);
         if let Some(pending) = self.pending_departures.remove(&departure_key) {
             ctx.cancel_future(pending.spawn_handle);
+            info!(
+                "Cancelled pending departure during forget_session for user {} in room {}",
+                user_id, room
+            );
         }
 
         // instance_index uses instance_id as the key, so we look it up via
@@ -611,6 +641,20 @@ impl ChatServer {
             if self.instance_index.get(&iid).copied() == Some(session_id) {
                 self.instance_index.remove(&iid);
             }
+        }
+    }
+
+    /// Build the second component of the [`Self::pending_departures`] key for
+    /// a session that has registered an `instance_id` (the common path for
+    /// every client coming through `JoinRoom` with a fresh sessionStorage
+    /// UUID). Falls back to a per-session sentinel when no `instance_id` is
+    /// known — this guarantees that even legacy clients without an
+    /// `instance_id` cannot collide on the key with sibling sessions of the
+    /// same `user_id`.
+    fn pending_departure_instance_key(&self, session: SessionId) -> String {
+        match self.session_instance.get(&session) {
+            Some(iid) => iid.clone(),
+            None => format!("__session__:{session}"),
         }
     }
 }
@@ -780,9 +824,10 @@ impl Handler<Disconnect> for ChatServer {
             task.abort();
         }
 
-        // If there is already a pending departure for this (room, user_id),
-        // cancel the old timer and replace it. This handles the edge case of
-        // rapid disconnect-reconnect-disconnect cycles.
+        // If there is already a pending departure for THIS tab / client
+        // instance (same `(room, instance_key)`), cancel the old timer and
+        // replace it. This handles the edge case of rapid
+        // disconnect-reconnect-disconnect cycles within a single tab.
         //
         // BUG FIX (introduced by 0844f062 / batch merge of PRs #793 et al.):
         // The original code cancelled the old timer but did NOT remove the
@@ -794,7 +839,17 @@ impl Handler<Disconnect> for ChatServer {
         // period expires. The earlier sessions become permanent orphans in
         // room_members, appearing as phantom peers that trigger PLI storms
         // and freeze real participants' video.
-        let key = (room.clone(), user_id.clone());
+        //
+        // BUG FIX (issue #852, absorbed into #851): the key used to be
+        // `(room, user_id)`, which collided across distinct sessions of the
+        // same `user_id` after PR #851 allowed multi-session-per-user. A
+        // disconnect of session B then incorrectly cancelled session A's
+        // grace timer and silently dropped A from `room_members`. The key is
+        // now `(room, instance_key)` where `instance_key` is the per-tab
+        // identifier — sibling sessions of the same user get distinct
+        // entries, but same-tab refresh still collapses cleanly.
+        let instance_key = self.pending_departure_instance_key(session);
+        let key = (room.clone(), instance_key.clone());
         if let Some(old) = self.pending_departures.remove(&key) {
             ctx.cancel_future(old.spawn_handle);
             // Clean up the replaced session's room_members entry to prevent
@@ -803,15 +858,16 @@ impl Handler<Disconnect> for ChatServer {
                 members.retain(|m| m.session != old.old_session);
             }
             info!(
-                "Replaced existing pending departure for user {} in room {} (old session {})",
-                user_id, room, old.old_session
+                "Replaced existing pending departure for instance {} (user {}) in \
+                 room {} (old session {})",
+                instance_key, user_id, room, old.old_session
             );
         }
 
         info!(
-            "Deferring PARTICIPANT_LEFT for user {} (session {}) in room {} — \
-             grace period {:?}",
-            user_id, session, room, RECONNECT_GRACE_PERIOD
+            "Deferring PARTICIPANT_LEFT for instance {} (user {}, session {}) in \
+             room {} — grace period {:?}",
+            instance_key, user_id, session, room, RECONNECT_GRACE_PERIOD
         );
 
         let handle = ctx.notify_later(
@@ -819,6 +875,7 @@ impl Handler<Disconnect> for ChatServer {
                 session,
                 room: room.clone(),
                 user_id: user_id.clone(),
+                instance_key: instance_key.clone(),
                 display_name,
                 is_host,
                 end_on_host_leave,
@@ -849,16 +906,26 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        // Cancel any pending departure for this (room, user_id) to avoid a
-        // duplicate PARTICIPANT_LEFT when the grace-period timer fires later.
+        // Cancel any pending departure for THIS session's tab / client
+        // instance (`(room, instance_key)`) to avoid a duplicate
+        // PARTICIPANT_LEFT when the grace-period timer fires later.
         // We don't need ctx.cancel_future() because ExecutePendingDeparture::handle
         // already checks whether the entry exists in pending_departures — once
         // removed, the timer becomes a no-op.
-        let key = (room.clone(), user_id.clone());
+        //
+        // BUG FIX (issue #852, absorbed into #851): keying by
+        // `(room, user_id)` here used to let an explicit Leave from session A
+        // silently cancel session B's pending grace timer when both sessions
+        // belonged to the same `user_id`. The key now uses the per-tab
+        // `instance_key` so an explicit Leave only cancels its own session's
+        // pending state, never a sibling's.
+        let instance_key = self.pending_departure_instance_key(session);
+        let key = (room.clone(), instance_key.clone());
         if self.pending_departures.remove(&key).is_some() {
             info!(
-                "Cancelled pending departure for user {} in room {} — explicit Leave received",
-                user_id, room
+                "Cancelled pending departure for instance {} (user {}) in room {} — \
+                 explicit Leave received",
+                instance_key, user_id, room
             );
         }
 
@@ -1167,13 +1234,17 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             session,
             room,
             user_id,
+            instance_key,
             display_name,
             is_host,
             end_on_host_leave,
         }: ExecutePendingDeparture,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        let key = (room.clone(), user_id.clone());
+        // Use the instance_key captured at Disconnect time, NOT the user_id —
+        // see the doc comment on `ChatServer::pending_departures` for why
+        // user_id is no longer unique enough to identify a pending entry.
+        let key = (room.clone(), instance_key);
 
         // Only execute if this departure is still pending. It may have been
         // cancelled by a reconnection or replaced by a newer disconnect.
@@ -1383,37 +1454,46 @@ impl Handler<JoinRoom> for ChatServer {
         //
         // Downstream invariants that previously assumed `(room, user_id)`
         // uniqueness:
-        //   - `pending_departures` is keyed by `(room, user_id)`. With
-        //     multi-session-per-user, two concurrent sessions of the same
-        //     user disconnecting in sequence can collide on this key. That
-        //     pre-existing edge case is tracked separately; it was
-        //     previously unreachable because the eviction collapsed
-        //     duplicates at JoinRoom time.
+        //   - `pending_departures` is now keyed by `(room, instance_key)`
+        //     where `instance_key` is the per-tab `instance_id` (or a
+        //     per-session sentinel when none is supplied). This rekeying
+        //     (issue #852, absorbed into #851) prevents distinct sibling
+        //     sessions of the same `user_id` from colliding on the key.
         //   - `PARTICIPANT_JOINED` / `PARTICIPANT_LEFT` packets carry
         //     `session_id` (see `SessionManager::build_peer_joined_packet`),
         //     so the client can already key on session and render distinct
         //     tiles for the same user_id.
 
         // --- Reconnection grace period: cancel pending departure ---
-        // If the same user_id is reconnecting to the same room within
-        // the grace window, suppress both PARTICIPANT_LEFT (already deferred)
-        // and the PARTICIPANT_JOINED that would normally follow.
-        let departure_key = (room.clone(), user_id.clone());
-        let is_reconnection = if let Some(pending) = self.pending_departures.remove(&departure_key)
-        {
-            ctx.cancel_future(pending.spawn_handle);
+        // If the SAME TAB (same `instance_id`) is reconnecting to the same
+        // room within the grace window, suppress both PARTICIPANT_LEFT
+        // (already deferred) and the PARTICIPANT_JOINED that would normally
+        // follow. A fresh second session of the same user (different
+        // `instance_id`) will NOT match this lookup — it is a real new
+        // participant and must be announced.
+        //
+        // Joins with no `instance_id` cannot be classified as a reconnection
+        // because they have no stable identity that could match a prior
+        // session's pending entry — they always fall through as fresh joins.
+        let is_reconnection = if let Some(ref iid) = instance_id {
+            let departure_key = (room.clone(), iid.clone());
+            if let Some(pending) = self.pending_departures.remove(&departure_key) {
+                ctx.cancel_future(pending.spawn_handle);
 
-            // Clean up stale room_members entry from the old session
-            if let Some(members) = self.room_members.get_mut(&room) {
-                members.retain(|m| m.session != pending.old_session);
+                // Clean up stale room_members entry from the old session
+                if let Some(members) = self.room_members.get_mut(&room) {
+                    members.retain(|m| m.session != pending.old_session);
+                }
+
+                info!(
+                    "Reconnection detected for instance {} (user {}) in room {} — cancelled \
+                     pending PARTICIPANT_LEFT (old session {}, new session {})",
+                    iid, user_id, room, pending.old_session, session
+                );
+                true
+            } else {
+                false
             }
-
-            info!(
-                "Reconnection detected for user {} in room {} — cancelled pending \
-                 PARTICIPANT_LEFT (old session {}, new session {})",
-                user_id, room, pending.old_session, session
-            );
-            true
         } else {
             false
         };
@@ -5184,6 +5264,10 @@ mod tests {
             .expect("Failed to subscribe to internal subject");
 
         // First session: connect + join + activate.
+        // Carries a stable `instance_id` so the new (room, instance_id)
+        // pending-departure key (issue #852) can match the reconnecting
+        // session below — modelling real client behaviour where
+        // sessionStorage preserves the UUID across an in-tab reconnect.
         chat_server
             .send(Connect {
                 id: session_id_1,
@@ -5199,7 +5283,7 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                instance_id: None,
+                instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
             })
@@ -5229,8 +5313,9 @@ mod tests {
             .await
             .expect("Disconnect should succeed");
 
-        // Reconnect with the SAME (room, user_id) BEFORE the grace period
-        // elapses. Grace is 3s; we wait 1s to be safely inside the window.
+        // Reconnect with the SAME instance_id BEFORE the grace period
+        // elapses (same-tab refresh). Grace is 3s; we wait 1s to be safely
+        // inside the window.
         sleep(Duration::from_secs(1)).await;
         chat_server
             .send(Connect {
@@ -5247,7 +5332,7 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                instance_id: None,
+                instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
             })
@@ -5968,16 +6053,19 @@ mod tests {
     // ------------------------------------------------------------------
     // Sequence: session A joins + activates as host, then disconnects
     // (schedules ExecutePendingDeparture for the grace window), then
-    // session B joins as host with a FRESH instance_id BEFORE the grace
-    // expires. The reconnection-grace-period path (matching on
-    // `(room, user_id)` in `pending_departures`) cancels the pending
-    // departure so the deferred MEETING_ENDED + PARTICIPANT_LEFT
-    // broadcasts NEVER fire — peers see a seamless host presence.
+    // session B joins as host with the SAME `instance_id` BEFORE the grace
+    // expires (modelling a same-tab refresh / back-navigation that
+    // restores `instance_id` from sessionStorage). The
+    // reconnection-grace-period path (matching on `(room, instance_id)`
+    // in `pending_departures`) cancels the pending departure so the
+    // deferred MEETING_ENDED + PARTICIPANT_LEFT broadcasts NEVER fire —
+    // peers see a seamless host presence.
     //
-    // Note (#828): this path uses `pending_departures` lookup, NOT the
-    // removed `evict_same_user_session` helper. It is unaffected by the
-    // multi-session-per-user policy change because it only acts on
-    // _disconnected_ sessions in the grace window.
+    // Note (#828 / #852): the grace path was rekeyed from `(room, user_id)`
+    // to `(room, instance_id)` so that distinct sibling sessions of the
+    // same `user_id` (different tabs) are no longer misclassified as
+    // reconnections. Same-tab refresh keeps the instance_id and therefore
+    // still matches — that's the path this test exercises.
     #[actix_rt::test]
     #[serial]
     async fn reconnection_grace_cancels_pending_departure() {
@@ -6066,7 +6154,10 @@ mod tests {
                 display_name: user.to_string(),
                 is_guest: false,
                 observer: false,
-                instance_id: Some("iid-B-fresh".to_string()),
+                // Same instance_id as session A — models a same-tab refresh
+                // / back-navigation, the only path that legitimately matches
+                // a pending departure after the #852 rekey.
+                instance_id: Some("iid-A".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
             })
@@ -6080,23 +6171,23 @@ mod tests {
 
         // Wait beyond the grace period. Even though it elapsed, the
         // pending departure should have been cancelled by the
-        // (room, user_id) eviction during JoinRoom B — so no broadcast
+        // (room, instance_id) match during JoinRoom B — so no broadcast
         // and no DB event should land.
         let (saw_ended, saw_left) =
             collect_meeting_events(&mut system_sub, Duration::from_secs(5)).await;
         assert!(
             !saw_ended,
-            "Cross-iid rejoin within grace must cancel deferred MEETING_ENDED"
+            "Same-iid rejoin within grace must cancel deferred MEETING_ENDED"
         );
         assert!(
             !saw_left,
-            "Cross-iid rejoin within grace must cancel deferred PARTICIPANT_LEFT"
+            "Same-iid rejoin within grace must cancel deferred PARTICIPANT_LEFT"
         );
 
         let db_payload = wait_for_first(&mut db_sub, Duration::from_secs(1)).await;
         assert!(
             db_payload.is_none(),
-            "Cross-iid rejoin within grace must cancel internal.meeting_ended_by_host"
+            "Same-iid rejoin within grace must cancel internal.meeting_ended_by_host"
         );
 
         // Single survivor in room_members — session B.
@@ -6108,6 +6199,484 @@ mod tests {
             .expect("GetRoomMembers should succeed");
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].session, session_b);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Tests for issue #852 — pending_departures rekey from (room, user_id)
+    // to (room, instance_id). Each test below fails on the pre-fix code
+    // (where two sessions of the same user_id collide on the HashMap key)
+    // and passes after the rekey.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Test-only helper: report the number of `pending_departures` entries
+    /// for a given `room`. Used by the #852 multi-session tests to confirm
+    /// that two sibling sessions of the same user each get an independent
+    /// entry instead of overwriting one another.
+    #[derive(ActixMessage)]
+    #[rtype(result = "usize")]
+    struct CountPendingDeparturesForRoom {
+        room: String,
+    }
+
+    impl Handler<CountPendingDeparturesForRoom> for ChatServer {
+        type Result = usize;
+        fn handle(
+            &mut self,
+            msg: CountPendingDeparturesForRoom,
+            _ctx: &mut Self::Context,
+        ) -> Self::Result {
+            self.pending_departures
+                .keys()
+                .filter(|(r, _)| r == &msg.room)
+                .count()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Disconnect of one same-user session does not remove the
+    //       sibling session from room_members (#852, site A).
+    // ------------------------------------------------------------------
+    // Pre-fix behaviour: under the `(room, user_id)` key, A's Disconnect
+    // registered a pending entry for `(room, user)`; B's Disconnect then
+    // *replaced* that entry, and the replacement path used
+    // `members.retain(|m| m.session != old.old_session)` to silently
+    // drop A from `room_members`. With the new `(room, instance_id)`
+    // key, A and B get independent pending entries — B's disconnect
+    // cannot reach A's room_members row.
+    #[actix_rt::test]
+    #[serial]
+    async fn disconnect_of_one_session_does_not_remove_sibling_same_user_session() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_810;
+        let session_b: SessionId = 9_811;
+        let room = "issue-852-disconnect-sibling";
+        let user = "tony@example.com";
+
+        // Both sessions of the same user join with distinct instance_ids.
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect A");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-laptop".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Delivery A")
+            .expect("JoinRoom A");
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("Activate A");
+
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect B");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-phone".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Delivery B")
+            .expect("JoinRoom B");
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("Activate B");
+        sleep(Duration::from_millis(150)).await;
+
+        // Session B disconnects mid-call. With the pre-fix key, this would
+        // cancel A's (nonexistent) pending entry by colliding on user_id,
+        // and worse: if A had also disconnected first, A's row in
+        // room_members would be retain-removed here. We model the simpler
+        // case (only B disconnects) to assert that A is untouched.
+        chat_server
+            .send(Disconnect {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect B");
+
+        // A must still be present in room_members and in the sessions map.
+        let members = chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers");
+        let sessions: std::collections::HashSet<_> = members.iter().map(|m| m.session).collect();
+        assert!(
+            sessions.contains(&session_a),
+            "Session A must remain in room_members after sibling B disconnects \
+             (got sessions {sessions:?})"
+        );
+        let has_a = chat_server
+            .send(HasSession { session: session_a })
+            .await
+            .expect("HasSession A");
+        assert!(has_a, "Session A's transport entry must be preserved");
+        let has_sub_a = chat_server
+            .send(HasActiveSub { session: session_a })
+            .await
+            .expect("HasActiveSub A");
+        assert!(
+            has_sub_a,
+            "Session A's NATS subscription must NOT have been aborted by B's Disconnect"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Two same-user disconnects produce two independent grace
+    //       entries (#852, site A).
+    // ------------------------------------------------------------------
+    // Pre-fix: A's Disconnect inserts one entry; B's Disconnect REPLACES
+    // it (same `(room, user_id)`) — leaving exactly one entry and only
+    // one grace timer. After the rekey, both disconnects produce
+    // independent `(room, instance_id)` entries and each fires its own
+    // PARTICIPANT_LEFT broadcast.
+    #[actix_rt::test]
+    #[serial]
+    async fn disconnect_of_both_same_user_sessions_creates_two_independent_grace_entries() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_820;
+        let session_b: SessionId = 9_821;
+        let room = "issue-852-two-grace-entries";
+        let user = "tony@example.com";
+
+        for (sid, iid) in [(session_a, "iid-A"), (session_b, "iid-B")] {
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect");
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: user.to_string(),
+                    display_name: user.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    instance_id: Some(iid.to_string()),
+                    is_host: false,
+                    end_on_host_leave: true,
+                })
+                .await
+                .expect("Delivery")
+                .expect("JoinRoom");
+            chat_server
+                .send(ActivateConnection { session: sid })
+                .await
+                .expect("Activate");
+        }
+        sleep(Duration::from_millis(150)).await;
+
+        // Both same-user sessions disconnect in rapid succession.
+        for sid in [session_a, session_b] {
+            chat_server
+                .send(Disconnect {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: user.to_string(),
+                    display_name: user.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    is_host: false,
+                    end_on_host_leave: true,
+                })
+                .await
+                .expect("Disconnect");
+        }
+
+        let count = chat_server
+            .send(CountPendingDeparturesForRoom {
+                room: room.to_string(),
+            })
+            .await
+            .expect("CountPendingDeparturesForRoom");
+        assert_eq!(
+            count, 2,
+            "Two same-user disconnects must produce two independent pending_departures \
+             entries (got {count}); on the pre-fix code this returned 1 because the \
+             second Disconnect collided on (room, user_id) and replaced the first."
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: Explicit Leave of one same-user session does not cancel a
+    //       sibling's pending grace (#852, site B).
+    // ------------------------------------------------------------------
+    // Pre-fix: B's POST /leave executed
+    //   `pending_departures.remove(&(room, user_id))`
+    // which could yank A's pending entry instead of B's. After the
+    // rekey, Leave looks up its own session's instance_id and only
+    // removes its own entry.
+    #[actix_rt::test]
+    #[serial]
+    async fn explicit_leave_of_one_session_does_not_cancel_sibling_grace() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_830;
+        let session_b: SessionId = 9_831;
+        let room = "issue-852-leave-sibling";
+        let user = "tony@example.com";
+
+        for (sid, iid) in [(session_a, "iid-A"), (session_b, "iid-B")] {
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect");
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: user.to_string(),
+                    display_name: user.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    instance_id: Some(iid.to_string()),
+                    is_host: false,
+                    end_on_host_leave: true,
+                })
+                .await
+                .expect("Delivery")
+                .expect("JoinRoom");
+            chat_server
+                .send(ActivateConnection { session: sid })
+                .await
+                .expect("Activate");
+        }
+        sleep(Duration::from_millis(150)).await;
+
+        // A disconnects -> A enters grace.
+        chat_server
+            .send(Disconnect {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect A");
+        // Sanity: one pending entry exists for the room.
+        let before = chat_server
+            .send(CountPendingDeparturesForRoom {
+                room: room.to_string(),
+            })
+            .await
+            .expect("Count before");
+        assert_eq!(before, 1, "Pre-condition: A's grace entry must be present");
+
+        // B explicitly leaves. Pre-fix, this `remove(&(room, user_id))`
+        // would silently consume A's pending entry. Post-fix, B's leave
+        // lookup uses B's own instance_id and finds nothing.
+        chat_server
+            .send(Leave {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+            })
+            .await
+            .expect("Leave B");
+
+        let after = chat_server
+            .send(CountPendingDeparturesForRoom {
+                room: room.to_string(),
+            })
+            .await
+            .expect("Count after");
+        assert_eq!(
+            after, 1,
+            "B's explicit Leave must NOT cancel A's pending grace entry \
+             (got {after} pending entries; pre-fix yielded 0 because the \
+             (room, user_id) lookup collided on A's entry)."
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TEST: A fresh second session of the same user is NOT misclassified
+    //       as a reconnection (#852, site C).
+    // ------------------------------------------------------------------
+    // Pre-fix: B's JoinRoom matched A's pending entry at `(room,
+    // user_id)`, cancelled A's grace timer, removed A from
+    // room_members, and suppressed B's own PARTICIPANT_JOINED. With
+    // the new `(room, instance_id)` lookup, B's fresh instance_id
+    // does not match A's entry — B is announced as a real join and
+    // A's pending state is left untouched.
+    #[actix_rt::test]
+    #[serial]
+    async fn fresh_second_session_of_same_user_is_not_misclassified_as_reconnection() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+        let dummy = EohlDummySession.start();
+        let session_a: SessionId = 9_840;
+        let session_b: SessionId = 9_841;
+        let room = "issue-852-fresh-second";
+        let user = "tony@example.com";
+
+        // A: active in the room. We disconnect A so it enters grace —
+        // this is the state under which the bug fires (B's JoinRoom
+        // matches A's pending entry on the `(room, user_id)` key).
+        chat_server
+            .send(Connect {
+                id: session_a,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect A");
+        chat_server
+            .send(JoinRoom {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-A".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Delivery A")
+            .expect("JoinRoom A");
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("Activate A");
+        sleep(Duration::from_millis(150)).await;
+
+        chat_server
+            .send(Disconnect {
+                session: session_a,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect A");
+
+        // Inside the grace window, B (fresh instance_id, same user) joins.
+        chat_server
+            .send(Connect {
+                id: session_b,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect B");
+        chat_server
+            .send(JoinRoom {
+                session: session_b,
+                room: room.to_string(),
+                user_id: user.to_string(),
+                display_name: user.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-B-fresh".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Delivery B")
+            .expect("JoinRoom B");
+        sleep(Duration::from_millis(150)).await;
+
+        // B must NOT be suppressed — peers should see a real
+        // PARTICIPANT_JOINED for this distinct session.
+        let suppressed_b = chat_server
+            .send(IsSuppressedJoinBroadcast { session: session_b })
+            .await
+            .expect("IsSuppressedJoinBroadcast B");
+        assert!(
+            !suppressed_b,
+            "B's fresh instance_id must NOT trigger the reconnection-grace \
+             suppression path — it is a real new session, not a reconnect."
+        );
+
+        // A's pending grace entry must still be present (B did not consume it).
+        let count = chat_server
+            .send(CountPendingDeparturesForRoom {
+                room: room.to_string(),
+            })
+            .await
+            .expect("CountPendingDeparturesForRoom");
+        assert_eq!(
+            count, 1,
+            "A's pending grace must survive B's join (got {count} entries; \
+             pre-fix dropped to 0 because B's JoinRoom matched A's entry on \
+             (room, user_id))."
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────

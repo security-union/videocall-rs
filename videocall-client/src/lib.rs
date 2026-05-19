@@ -76,8 +76,8 @@
 //!     on_participant_rejected: None,
 //!     on_waiting_room_updated: None,
 //!     on_meeting_settings_updated: None,
-//!     on_peer_left: None,    // Option<Callback<(String, String)>> -- (display_name, user_id)
-//!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
+//!     on_peer_left: None,    // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
+//!     on_peer_joined: None,  // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_display_name_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,

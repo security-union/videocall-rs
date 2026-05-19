@@ -240,16 +240,22 @@ pub struct VideoCallClientOptions {
     pub on_host_disable_video: Option<Callback<()>>,
 
     /// Callback triggered when a remote participant leaves the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
-    pub on_peer_left: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_left: Option<Callback<(String, String, String)>>,
 
     /// Callback triggered when a participant changes their display name.
     /// Emits `(user_id, new_display_name)`.
     pub on_display_name_changed: Option<Callback<(String, String)>>,
 
     /// Callback triggered when a remote participant joins the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
-    pub on_peer_joined: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_JOINED
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_joined: Option<Callback<(String, String, String)>>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -317,8 +323,8 @@ struct InnerOptions {
     on_meeting_settings_updated: Option<Callback<()>>,
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
-    on_peer_left: Option<Callback<(String, String)>>,
-    on_peer_joined: Option<Callback<(String, String)>>,
+    on_peer_left: Option<Callback<(String, String, String)>>,
+    on_peer_joined: Option<Callback<(String, String, String)>>,
     on_display_name_changed: Option<Callback<(String, String)>>,
     decode_media: bool,
 }
@@ -1276,6 +1282,26 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns `true` if a peer with the given `session_id` (as a decimal
+    /// string, matching the form emitted by `on_peer_joined`) is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is the session-id-keyed counterpart to `has_peer_with_user_id`.
+    /// The UI uses it to suppress the join-toast for a PARTICIPANT_JOINED
+    /// that replays a session we already know about (e.g. on reconnect),
+    /// without collapsing sibling same-user sessions into a single toast
+    /// (HCL #828). A non-numeric or empty `session_id` returns `false` —
+    /// the legacy "unknown session" path falls back to the user-id helper.
+    pub fn has_peer_with_session_id(&self, session_id: &str) -> bool {
+        let Ok(sid) = session_id.parse::<u64>() else {
+            return false;
+        };
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get(&sid).is_some(),
+            Err(_) => false,
+        }
+    }
+
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -1955,7 +1981,16 @@ impl Inner {
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_joined {
-                                    cb.emit((display_name, target_str));
+                                    // Empty string for session_id 0 keeps the
+                                    // legacy "unknown session" path observable
+                                    // without forcing every consumer to thread
+                                    // an Option<String>.
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             } else {
                                 debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str);
@@ -2002,7 +2037,12 @@ impl Inner {
                                         &meeting_packet,
                                         &target_str,
                                     );
-                                    cb.emit((display_name, target_str));
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             }
                         }
@@ -2586,6 +2626,32 @@ mod dedup_tests {
             !other_session,
             "PARTICIPANT_LEFT for a different session of the same user must \
              not be dedup'd against the first session's leave"
+        );
+    }
+
+    /// HCL #828 follow-up: `has_peer_with_session_id` is the session-id-keyed
+    /// counterpart that the join-toast suppression uses to avoid collapsing
+    /// sibling same-user sessions into a single toast. With no peers tracked
+    /// the helper must return `false` for any session_id, including the
+    /// empty-string and non-numeric inputs (the legacy "unknown session"
+    /// path). The positive case is covered end-to-end by the
+    /// `same-user-multi-session.spec.ts` E2E spec, which exercises the helper
+    /// via a real PARTICIPANT_JOINED → peer_decode_manager round trip.
+    #[wasm_bindgen_test]
+    fn has_peer_with_session_id_empty_state_returns_false() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        assert!(
+            !client.has_peer_with_session_id("4001"),
+            "untracked session_id must report absent"
+        );
+        assert!(
+            !client.has_peer_with_session_id(""),
+            "empty session_id must report absent (legacy unknown-session path)"
+        );
+        assert!(
+            !client.has_peer_with_session_id("not-a-number"),
+            "non-numeric session_id must report absent"
         );
     }
 

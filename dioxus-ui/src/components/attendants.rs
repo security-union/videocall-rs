@@ -3263,6 +3263,16 @@ pub fn AttendantsComponent(
                     UpdateDisplayNameModal {
                         current_display_name: current_display_name(),
                         meeting_id: id.clone(),
+                        // HCL issue #828 follow-up: parse the local session_id
+                        // (a numeric string from the client) into u64 so the
+                        // rename REST request can identify this tab. Falls back
+                        // to None when the session has not yet been assigned or
+                        // the value is unparseable — the server then renames
+                        // every session of the caller's user_id (legacy
+                        // behaviour).
+                        session_id: my_session_id
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok()),
                         on_close: move |_| {
                             display_name_modal_open.set(false);
                         },

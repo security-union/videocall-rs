@@ -142,15 +142,22 @@ impl MeetingApiClient {
     ///
     /// Calls `PUT /api/v1/meetings/{meeting_id}/display-name`.
     ///
-    /// The display name change is broadcast to all connected participants.
+    /// `session_id` identifies the specific tab/session performing the rename.
+    /// When provided, the server scopes the rename and its broadcast to that
+    /// single session — sibling tabs of the same authenticated user keep their
+    /// own names (HCL issue #828 follow-up). Pass `None` for legacy/global
+    /// renames that should apply to every session sharing the caller's
+    /// `user_id`.
     pub async fn update_display_name(
         &self,
         meeting_id: &str,
         display_name: &str,
+        session_id: Option<u64>,
     ) -> Result<ParticipantStatusResponse, ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/display-name");
         let body = UpdateDisplayNameRequest {
             display_name: display_name.to_string(),
+            session_id,
         };
         let response = self.put(&path).json(&body).send().await?;
         parse_api_response(response).await

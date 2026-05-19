@@ -479,4 +479,148 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       await closeSameUserContext(sessionB.context);
     }
   });
+
+  /**
+   * Regression for HCL #828 follow-up (user-reported bug): when a user with
+   * multiple same-user sessions in a meeting renames Tab A via the UI, the
+   * rename was broadcast keyed by `user_id` only — so Tab B's display name
+   * changed too. Expected: only Tab A's name changes; Tab B keeps its own.
+   *
+   * Root cause: the client never sent its `session_id` on the rename REST
+   * request, so the server had no way to know which session was renaming.
+   * Fixes:
+   *  - Client (`videocall-meeting-client/src/participants.rs`) now sends
+   *    `session_id: Option<u64>` on `PUT /display-name`, threaded through the
+   *    Dioxus UI via `UpdateDisplayNameModal`'s `session_id` prop (see
+   *    `attendants.rs:3262-3292`).
+   *  - Server scopes the rename + `PARTICIPANT_DISPLAY_NAME_CHANGED`
+   *    broadcast to the renaming session_id only.
+   *  - Receive path (`videocall-client/src/client/video_call_client.rs:
+   *    2173-2177`) already routes session-id-scoped renames through
+   *    `set_peer_display_name(session_id, name)` — the
+   *    `display_name_change_with_session_id_is_session_scoped` wasm test
+   *    locks that helper down.
+   *
+   * Setup: Tab A and Tab B authenticate as the SAME user (same JWT `sub`),
+   * join the same meeting, and Tab A opens the rename modal and submits a
+   * new name. Assert:
+   *  - Tab A's floating-name shows the new name (its own self-tile and on
+   *    Tab B's peer view of Tab A both render the new name).
+   *  - Tab B's own floating-name (its self-tile) STILL shows the original
+   *    name — proving the rename was scoped to Tab A's session_id only.
+   *
+   * Pre-fix the assertion on Tab B fails because the server broadcast
+   * carried session_id=0 → the receive path's user-id-keyed fallback fires
+   * → both peers of the same user_id get renamed.
+   */
+  test("renaming one same-user session does not change a sibling session's display name", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_same_user_rename_${Date.now()}`;
+
+    const sessionA = await openSameUserContext(uiURL);
+    const sessionB = await openSameUserContext(uiURL);
+
+    try {
+      // ---- Both sessions join the meeting as the SAME authed user ----
+      await navigateToMeeting(sessionA.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionA.page);
+      await expect(sessionA.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      await navigateToMeeting(sessionB.page, meetingId, SAME_USER_NAME);
+      await joinMeetingFromPage(sessionB.page);
+      await expect(sessionB.page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Both sides should see at least 2 tiles (self + sibling) before we
+      // attempt the rename — guards against a race where the rename fires
+      // before peer discovery completes.
+      await expect(sessionA.page.locator(PEER_TILE_SELECTOR).first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(sessionB.page.locator(PEER_TILE_SELECTOR).first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Let join toasts clear so they don't intercept the peer-list-button
+      // click below.
+      await sessionA.page.waitForTimeout(9_000);
+
+      // ---- Tab A opens the peer list and clicks the edit pencil ----
+      // PeerListButton's tooltip text identifies the toggle ("Open Peers"
+      // when closed). The edit pencil on the self-row has
+      // class="peer_item_edit_btn" and title="Edit your display name"
+      // (see `peer_list_item.rs:88-95`).
+      const openPeers = sessionA.page.locator("button.video-control-button", {
+        has: sessionA.page.locator(".tooltip", { hasText: "Open Peers" }),
+      });
+      await expect(openPeers).toBeVisible({ timeout: 10_000 });
+      await openPeers.click();
+
+      const editBtn = sessionA.page.locator("button.peer_item_edit_btn");
+      await expect(editBtn).toBeVisible({ timeout: 10_000 });
+      await editBtn.click();
+
+      // ---- Tab A enters a new name and submits the modal form ----
+      const renamedName = `RenamedTabA_${Date.now()}`;
+      const nameInput = sessionA.page.locator("input.input-apple");
+      await expect(nameInput).toBeVisible({ timeout: 10_000 });
+      await nameInput.fill("");
+      await nameInput.pressSequentially(renamedName, { delay: 30 });
+
+      const saveBtn = sessionA.page.getByRole("button", { name: "Save" });
+      await expect(saveBtn).toBeEnabled({ timeout: 5_000 });
+      await saveBtn.click();
+
+      // ---- Tab A's UI must show the renamed name in at least one
+      // floating-name (the self-tile or peer-list self-row) ----
+      await expect(
+        sessionA.page.locator(".floating-name", { hasText: renamedName }).first(),
+      ).toBeVisible({ timeout: 20_000 });
+
+      // ---- Tab B (sibling same-user session) must NOT have its OWN
+      // display name changed. The sibling has its own self-tile and a
+      // peer-tile representing Tab A. Tab A's peer tile on Tab B WILL show
+      // the renamed name (server broadcasts session-scoped rename for
+      // Tab A's session_id). What must remain is Tab B's OWN floating-name
+      // showing the original name. ----
+      //
+      // We check by opening Tab B's peer list and asserting the local self
+      // row still shows the original SAME_USER_NAME. The peer-list local
+      // self row's display name is sourced from `current_display_name()`
+      // in attendants.rs (a per-tab signal), so it is the cleanest proof
+      // that Tab B's identity was not collapsed into Tab A's rename.
+      const openPeersB = sessionB.page.locator("button.video-control-button", {
+        has: sessionB.page.locator(".tooltip", { hasText: "Open Peers" }),
+      });
+      await expect(openPeersB).toBeVisible({ timeout: 10_000 });
+      await openPeersB.click();
+
+      // The self row carries the edit pencil; we use its sibling
+      // .peer-name-text or the row's text content. Inspect the row that
+      // contains the edit pencil and assert it does NOT contain the
+      // renamed name.
+      const selfRowB = sessionB.page
+        .locator("#peer-list-container li")
+        .filter({ has: sessionB.page.locator("button.peer_item_edit_btn") });
+      await expect(selfRowB).toHaveCount(1, { timeout: 10_000 });
+      const selfRowTextB = (await selfRowB.first().textContent()) ?? "";
+      expect(
+        selfRowTextB.includes(renamedName),
+        "Tab B's OWN display name must not have been renamed by Tab A's " +
+          "session-scoped rename. The presence of the renamed name in Tab B's " +
+          "self row would indicate the server broadcast was not session-scoped " +
+          "(carried session_id=0) and the receive-path user-id fallback fired.",
+      ).toBe(false);
+      expect(
+        selfRowTextB.includes(SAME_USER_NAME),
+        "Tab B's self row must still show the original display name after " +
+          "Tab A renames its sibling session.",
+      ).toBe(true);
+    } finally {
+      await closeSameUserContext(sessionA.context);
+      await closeSameUserContext(sessionB.context);
+    }
+  });
 });

@@ -97,6 +97,14 @@ pub struct GuestJoinRequest {
 pub struct UpdateDisplayNameRequest {
     /// New display name for the participant.
     pub display_name: String,
+    /// Optional session_id of the renaming tab. When provided, the server
+    /// scopes the rename and its `PARTICIPANT_DISPLAY_NAME_CHANGED` broadcast
+    /// to this single session, so sibling tabs of the same authenticated
+    /// user keep their own display names (HCL issue #828 follow-up). When
+    /// omitted (legacy clients), the server falls back to renaming every
+    /// session that shares the caller's `user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/admit`

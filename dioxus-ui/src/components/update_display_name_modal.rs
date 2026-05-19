@@ -18,6 +18,12 @@ use dioxus::prelude::*;
 pub fn UpdateDisplayNameModal(
     current_display_name: String,
     meeting_id: String,
+    /// The local session_id of this tab. Threaded through to the rename REST
+    /// request so the server can scope the broadcast to this single session
+    /// — sibling tabs of the same authenticated user keep their own names
+    /// (HCL issue #828 follow-up). `None` falls back to the legacy
+    /// rename-all-sessions behaviour.
+    session_id: Option<u64>,
     on_close: EventHandler<()>,
     on_success: EventHandler<String>,
 ) -> Element {
@@ -81,14 +87,19 @@ pub fn UpdateDisplayNameModal(
                                     Ok(valid_name) => {
                                         let meeting_id = meeting_id.clone();
                                         let valid_name_clone = valid_name.clone();
+                                        let session_id_for_request = session_id;
 
                                         is_updating.set(true);
                                         error_message.set(None);
 
                                         wasm_bindgen_futures::spawn_local(async move {
-                                            log::info!("RENAME: API CALL INITIATED for: {}", valid_name_clone);
+                                            log::info!(
+                                                "RENAME: API CALL INITIATED for: {} (session_id: {:?})",
+                                                valid_name_clone,
+                                                session_id_for_request
+                                            );
 
-                                            match crate::meeting_api::update_display_name(&meeting_id, &valid_name_clone).await {
+                                            match crate::meeting_api::update_display_name(&meeting_id, &valid_name_clone, session_id_for_request).await {
                                                 Ok(_) => {
                                                     log::info!("RENAME: API CALL SUCCESS");
 

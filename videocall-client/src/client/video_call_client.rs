@@ -2655,6 +2655,78 @@ mod dedup_tests {
         );
     }
 
+    /// HCL #828 follow-up: when a `PARTICIPANT_DISPLAY_NAME_CHANGED` event
+    /// carries a non-zero `session_id`, the handler at
+    /// `video_call_client.rs:2173-2177` routes it through the session-scoped
+    /// `set_peer_display_name(session_id, name)` — NOT the user-id-keyed
+    /// fallback `set_peer_display_name_by_user_id`. This guarantees that two
+    /// tabs of the same authenticated user (same `user_id`, different
+    /// `session_id`s) can rename independently: only the renaming tab's
+    /// display name on that session updates.
+    ///
+    /// The test seeds two peers via the persistent `display_name_cache`
+    /// (which `set_peer_display_name` writes into unconditionally, even
+    /// without a `connected_peers` entry — see
+    /// `peer_decode_manager.rs:1325-1326`), then renames one and verifies
+    /// the other is untouched.
+    #[wasm_bindgen_test]
+    fn display_name_change_with_session_id_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        // Two sibling sessions of the same authenticated user. In production
+        // these would be two tabs of `antonio@hcl` with distinct session_ids
+        // assigned by the server's SESSION_ASSIGNED handshake.
+        let sid_a: u64 = 5001;
+        let sid_b: u64 = 5002;
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (tab A)".to_string());
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_b, "antonio (tab B)".to_string());
+        }
+
+        // Sanity: both peers report their seeded names before the rename.
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (tab A)".to_string()),
+            "session A must read back its seeded display name"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B must read back its seeded display name"
+        );
+
+        // Simulate the server broadcast for tab A's rename arriving via the
+        // `session_id != 0` branch of the
+        // `PARTICIPANT_DISPLAY_NAME_CHANGED` handler. The handler calls
+        // `set_peer_display_name(sid_a, "antonio (renamed)")`.
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (renamed)".to_string());
+        }
+
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (renamed)".to_string()),
+            "session A's display name must update to the renamed value"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B's display name must be UNTOUCHED — the rename was \
+             scoped to session_id=sid_a, and a session-scoped update must \
+             never reach sibling sessions of the same user. If this fails, \
+             the handler has reverted to the user-id-keyed fallback."
+        );
+    }
+
     /// HOST_MUTE_PARTICIPANT dedup is user-scoped on purpose: a host muting
     /// `antonio@hcl` legitimately mutes ALL of his sessions, and both
     /// transports must collapse to one local effect. This guards against

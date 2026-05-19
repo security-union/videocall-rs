@@ -151,12 +151,25 @@ struct UpdateRoomPolicy(MeetingSettingsUpdatePayload);
 /// Internal actix message to update a room member's display name.
 /// Sent from the per-session NATS subscription loop when a
 /// PARTICIPANT_DISPLAY_NAME_CHANGED event is received.
+///
+/// `session_id == 0` is the legacy "no session scoping" sentinel that mirrors
+/// the proto-3 default for `MeetingPacket.session_id` — older clients that
+/// haven't been updated for HCL issue #828 still send rename requests without
+/// a session_id, and the handler falls back to updating every member row
+/// matching `user_id`. When `session_id != 0`, the handler updates only the
+/// single row whose `(session, user_id)` pair matches and silently no-ops
+/// (with a `warn!`) when no such row exists — preventing a forged or stale
+/// session_id from controlling whose name gets rewritten.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct UpdateMemberDisplayName {
     room_id: String,
     user_id: String,
     display_name: String,
+    /// `0` means "legacy, no session scoping — rename all rows for this user".
+    /// Non-zero means "scope the rename to this single session; require it
+    /// already belong to `user_id` in `room_members`".
+    session_id: u64,
 }
 
 /// State stored while a departure is pending (waiting for possible reconnection).
@@ -1089,6 +1102,21 @@ impl Handler<ActivateConnection> for ChatServer {
 
 /// Handle in-memory display-name updates triggered by NATS
 /// PARTICIPANT_DISPLAY_NAME_CHANGED events.
+///
+/// Two paths:
+///
+/// * **Session-scoped (`msg.session_id != 0`, HCL issue #828):** rename the
+///   single `room_members` row whose `(session, user_id)` pair matches.
+///   Sibling sessions sharing the same `user_id` (e.g. another browser tab of
+///   the same authenticated account) keep their existing names. When no row
+///   matches — stale, forged, or cross-user `session_id` — the handler logs a
+///   `warn!` and no-ops; it never falls through to the user-id-wide path,
+///   because doing so would let an untrusted session_id control whose name
+///   gets rewritten.
+///
+/// * **Legacy / user-id-wide (`msg.session_id == 0`):** preserves the pre-#828
+///   behaviour for clients that haven't been updated yet — rename every row
+///   matching `user_id`. This is the proto-3 default sentinel.
 impl Handler<UpdateMemberDisplayName> for ChatServer {
     type Result = ();
 
@@ -1103,7 +1131,33 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
                 return;
             }
         };
-        if let Some(members) = self.room_members.get_mut(&msg.room_id) {
+        let Some(members) = self.room_members.get_mut(&msg.room_id) else {
+            return;
+        };
+
+        if msg.session_id != 0 {
+            // Session-scoped rename. Require the `(session, user_id)` pair to
+            // exist in this room — otherwise the session_id is stale, forged,
+            // or belongs to a different user, and we must not fall through to
+            // the user-id-wide path.
+            let mut updated = false;
+            for member in members.iter_mut() {
+                if member.session == msg.session_id && member.user_id == msg.user_id {
+                    member.display_name.clone_from(&validated_name);
+                    updated = true;
+                    break;
+                }
+            }
+            if !updated {
+                warn!(
+                    "UpdateMemberDisplayName: session_id {} does not belong to user {} in room {}, ignoring rename (stale, forged, or cross-user session_id)",
+                    msg.session_id, msg.user_id, msg.room_id
+                );
+            }
+        } else {
+            // Legacy pre-#828 path: rename every session of this user. Kept
+            // for backward compatibility with clients that don't yet supply
+            // `session_id` in the REST request body.
             for member in members.iter_mut() {
                 if member.user_id == msg.user_id {
                     member.display_name.clone_from(&validated_name);
@@ -1808,6 +1862,13 @@ fn try_intercept_display_name_change(
         );
     }
 
+    // Capture the wire-level `session_id` before re-serialising so the
+    // chat_server in-memory rename uses the same scoping the broadcast
+    // packet carries. `0` is the proto-3 default and means "legacy /
+    // user-id-wide rename"; non-zero values are interpreted by the handler
+    // as session-scoped renames and validated against `room_members`.
+    let packet_session_id = inner.session_id;
+
     // do_send is intentional here: display-name changes are rare
     // and low-priority. Mailbox backpressure on the actor is
     // unlikely; if it occurs the rename is silently skipped rather
@@ -1818,10 +1879,13 @@ fn try_intercept_display_name_change(
         room_id: room_id.to_string(),
         user_id: target.clone(),
         display_name: validated_name.clone(),
+        session_id: packet_session_id,
     });
 
     // Always rebuild the packet with the authoritative room_id and validated
-    // display_name so raw NATS payloads are never forwarded verbatim.
+    // display_name so raw NATS payloads are never forwarded verbatim. The
+    // `session_id` field is preserved as-published by `meeting-api` so peers
+    // can route the rename to the correct per-session tile.
     inner.room_id = room_id.to_string();
     inner.target_user_id = target.into_bytes();
     inner.display_name = validated_name.into_bytes();
@@ -6676,6 +6740,245 @@ mod tests {
             "A's pending grace must survive B's join (got {count} entries; \
              pre-fix dropped to 0 because B's JoinRoom matched A's entry on \
              (room, user_id))."
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // UpdateMemberDisplayName — HCL issue #828 follow-up
+    // ──────────────────────────────────────────────────────────────────────
+    // These tests pin the session-scoped rename semantics introduced after
+    // PR #851. The bug being fixed: a user with two tabs in the same meeting
+    // (same `user_id`, distinct `session` ids) renames Tab A, and Tab B's
+    // name also changes because the chat_server iterated all `room_members`
+    // matching `msg.user_id`. The fix keys the rename on `(session, user_id)`
+    // when `msg.session_id != 0`, and falls back to the legacy user-id-wide
+    // path only when the wire packet carried `session_id == 0` (the proto-3
+    // default emitted by older clients).
+    //
+    // Test helper: spin up two sessions of the same `user_id`, send a single
+    // `UpdateMemberDisplayName`, and assert exactly which row(s) changed.
+
+    /// Convenience helper for the four rename tests below.
+    /// Starts a ChatServer, registers `sessions` against it (each as a
+    /// distinct `DummySession`), and returns the actor address plus a vec
+    /// of the joined session ids in input order.
+    async fn setup_chat_with_sessions(
+        room: &str,
+        sessions: &[(SessionId, &str)], // (session_id, user_id) pairs
+    ) -> actix::Addr<ChatServer> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        for (sid, uid) in sessions {
+            let dummy = DummySession.start();
+            connect_and_join(&chat_server, *sid, room, uid, dummy.recipient(), None).await;
+        }
+        // Allow async JoinRoom tasks to populate room_members.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        chat_server
+    }
+
+    async fn get_members(chat_server: &actix::Addr<ChatServer>, room: &str) -> Vec<RoomMemberInfo> {
+        chat_server
+            .send(GetRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .expect("GetRoomMembers should succeed")
+    }
+
+    /// Two sessions of the same `user_id` join the same room. A rename
+    /// scoped to session A's id MUST update only A's row — B keeps the
+    /// display_name it had at JoinRoom time.
+    #[actix_rt::test]
+    #[serial]
+    async fn rename_one_session_only_updates_that_sessions_room_members_row() {
+        let room = "rename-scoped-room";
+        let user_id = "twin-tabs@example.com";
+        let session_a: SessionId = 9001;
+        let session_b: SessionId = 9002;
+
+        let chat_server =
+            setup_chat_with_sessions(room, &[(session_a, user_id), (session_b, user_id)]).await;
+
+        let pre = get_members(&chat_server, room).await;
+        assert_eq!(pre.len(), 2, "both sessions must be tracked");
+        let pre_b_name = pre
+            .iter()
+            .find(|m| m.session == session_b)
+            .map(|m| m.display_name.clone())
+            .expect("B must be present");
+
+        // Rename A only.
+        chat_server
+            .send(UpdateMemberDisplayName {
+                room_id: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: "Tab A renamed".to_string(),
+                session_id: session_a,
+            })
+            .await
+            .expect("UpdateMemberDisplayName delivery");
+
+        let post = get_members(&chat_server, room).await;
+        let a = post
+            .iter()
+            .find(|m| m.session == session_a)
+            .expect("A still present");
+        let b = post
+            .iter()
+            .find(|m| m.session == session_b)
+            .expect("B still present");
+        assert_eq!(
+            a.display_name, "Tab A renamed",
+            "session A's display_name must reflect the rename"
+        );
+        assert_eq!(
+            b.display_name, pre_b_name,
+            "session B's display_name must NOT be touched by a session-scoped \
+             rename targeting A (HCL issue #828)"
+        );
+    }
+
+    /// When the wire packet carries `session_id == 0` (legacy/older client),
+    /// the handler must fall back to the pre-#828 behaviour and rename every
+    /// row matching `user_id`. This is the regression lock-in for older
+    /// clients that haven't been updated yet.
+    #[actix_rt::test]
+    #[serial]
+    async fn rename_with_session_id_zero_falls_back_to_user_id_wide_update() {
+        let room = "rename-legacy-room";
+        let user_id = "legacy-twin@example.com";
+        let session_a: SessionId = 9101;
+        let session_b: SessionId = 9102;
+
+        let chat_server =
+            setup_chat_with_sessions(room, &[(session_a, user_id), (session_b, user_id)]).await;
+
+        chat_server
+            .send(UpdateMemberDisplayName {
+                room_id: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: "Legacy Renamed".to_string(),
+                session_id: 0,
+            })
+            .await
+            .expect("UpdateMemberDisplayName delivery");
+
+        let post = get_members(&chat_server, room).await;
+        assert!(
+            post.iter().all(|m| m.display_name == "Legacy Renamed"),
+            "session_id=0 must rename every row matching user_id, got: {:?}",
+            post.iter()
+                .map(|m| (m.session, m.display_name.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A stale or invalid `session_id` (one that doesn't exist in the room)
+    /// must produce a no-op — NOT a silent fallback to the user-id-wide
+    /// path. This is the defence against a forged session_id changing the
+    /// authenticated user's name.
+    #[actix_rt::test]
+    #[serial]
+    async fn rename_with_stale_session_id_no_ops_with_warn() {
+        let room = "rename-stale-room";
+        let user_id = "stale-twin@example.com";
+        let session_a: SessionId = 9201;
+        let session_b: SessionId = 9202;
+
+        let chat_server =
+            setup_chat_with_sessions(room, &[(session_a, user_id), (session_b, user_id)]).await;
+        let pre = get_members(&chat_server, room).await;
+        let pre_snapshot: Vec<(SessionId, String)> = pre
+            .iter()
+            .map(|m| (m.session, m.display_name.clone()))
+            .collect();
+
+        // session_id that doesn't exist in the room at all.
+        chat_server
+            .send(UpdateMemberDisplayName {
+                room_id: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: "Should Be Ignored".to_string(),
+                session_id: 7777,
+            })
+            .await
+            .expect("UpdateMemberDisplayName delivery");
+
+        let post = get_members(&chat_server, room).await;
+        let post_snapshot: Vec<(SessionId, String)> = post
+            .iter()
+            .map(|m| (m.session, m.display_name.clone()))
+            .collect();
+        assert_eq!(
+            pre_snapshot, post_snapshot,
+            "stale session_id must NOT change any room_members row — silent \
+             no-op (with warn log) is mandatory; falling through to the \
+             user-id-wide path would let a forged session_id rewrite the \
+             authenticated user's name"
+        );
+    }
+
+    /// A `session_id` that exists in the room but belongs to a *different*
+    /// user (not the one in `msg.user_id`) must also produce a no-op. This
+    /// defends against a request that smuggled a session_id from another
+    /// participant — neither the smuggling user's name nor the unrelated
+    /// participant's name may change.
+    #[actix_rt::test]
+    #[serial]
+    async fn rename_with_session_id_belonging_to_different_user_no_ops() {
+        let room = "rename-cross-user-room";
+        let user_alice = "alice@example.com";
+        let user_bob = "bob@example.com";
+        let session_alice: SessionId = 9301;
+        let session_bob: SessionId = 9302;
+
+        let chat_server = setup_chat_with_sessions(
+            room,
+            &[(session_alice, user_alice), (session_bob, user_bob)],
+        )
+        .await;
+
+        let pre = get_members(&chat_server, room).await;
+        let pre_snapshot: Vec<(SessionId, String, String)> = pre
+            .iter()
+            .map(|m| (m.session, m.user_id.clone(), m.display_name.clone()))
+            .collect();
+
+        // Alice submits the rename but smuggles in Bob's session_id.
+        chat_server
+            .send(UpdateMemberDisplayName {
+                room_id: room.to_string(),
+                user_id: user_alice.to_string(),
+                display_name: "Hijack Attempt".to_string(),
+                session_id: session_bob,
+            })
+            .await
+            .expect("UpdateMemberDisplayName delivery");
+
+        let post = get_members(&chat_server, room).await;
+        let post_snapshot: Vec<(SessionId, String, String)> = post
+            .iter()
+            .map(|m| (m.session, m.user_id.clone(), m.display_name.clone()))
+            .collect();
+        assert_eq!(
+            pre_snapshot, post_snapshot,
+            "cross-user session_id must NOT mutate any row — Bob's row must \
+             survive untouched, and Alice's row must NOT silently fall \
+             through to the user-id-wide path"
         );
     }
 

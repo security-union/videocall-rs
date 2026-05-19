@@ -1189,7 +1189,7 @@ pub fn AttendantsComponent(
                             {
                                 // Legacy fallback: if the server didn't stamp
                                 // a session_id, fall back to user-id-only
-                                // suppression to preserve pre-#828 behaviour.
+                                // suppression to preserve pre-issue-828 behaviour.
                                 log::debug!(
                                     "Suppressing join toast for {} (already in peer list, no session_id)",
                                     user_id

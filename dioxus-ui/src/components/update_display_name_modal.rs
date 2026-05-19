@@ -21,7 +21,7 @@ pub fn UpdateDisplayNameModal(
     /// The local session_id of this tab. Threaded through to the rename REST
     /// request so the server can scope the broadcast to this single session
     /// — sibling tabs of the same authenticated user keep their own names
-    /// (HCL issue #828 follow-up). `None` falls back to the legacy
+    /// (HCL issue 828 follow-up). `None` falls back to the legacy
     /// rename-all-sessions behaviour.
     session_id: Option<u64>,
     on_close: EventHandler<()>,

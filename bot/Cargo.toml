@@ -26,6 +26,11 @@ tokio = { version = "1.28.1", features = ["full"] }
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
 videocall-aq = { path = "../videocall-aq", version = "0.1.0" }
+# Network-impairment shim and named presets. Originally lived in `bot/src/`;
+# was lifted into its own crate so the wasm consumer (`videocall-client`) can
+# share the same admission algorithm. The bot keeps a thin `BotNetSimShim`
+# wrapper that adds Prometheus metric hooks the wasm consumer doesn't need.
+videocall-netsim = { path = "../videocall-netsim", version = "0.1.0" }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"

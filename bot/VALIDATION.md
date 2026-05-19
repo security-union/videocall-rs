@@ -150,8 +150,9 @@ date -u -d '2026-05-06T14:57:00 EDT' +%s
 
 ## Related files
 
-- `bot/src/netsim.rs` — shim core (token bucket, drop, jitter, delay)
-- `bot/src/netsim_profiles.rs` — preset definitions
+- `bot/src/netsim.rs` — thin `BotNetSimShim` wrapper around the shared `videocall-netsim` crate (adds Prometheus metric hooks)
+- `videocall-netsim/src/shim.rs` — shim core (token bucket, drop, jitter, delay)
+- `videocall-netsim/src/profiles.rs` — preset definitions
 - `bot/src/aq_controller.rs` — BotAq wrapper around videocall-aq
 - `bot/src/health_reporter.rs` — tier fields populated here (see V13)
 - `bot/tests/aq_degradation.rs` — deterministic in-process integration test

@@ -59,12 +59,15 @@ enum MessageType {
 
 impl WebMedia<WebTransportTask> for WebTransportTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebTransportTask> {
-        // Phase 3b: stash the optional netsim shim in the per-tab
-        // thread-local before constructing the transport task. See
-        // `connection/netsim_hook.rs` for the design notes (Option
-        // A — thread-local hook + re-entrancy flag).
-        #[cfg(feature = "netsim")]
-        super::netsim_hook::install_hook(options.netsim_hook.clone());
+        // Phase 3c: the netsim shim is installed once-per-tab from
+        // `?netsim=<profile>` by `Connection::connect` via
+        // `super::netsim_url::try_install_from_url`. We deliberately do
+        // **not** install or clear the hook here — doing so would
+        // overwrite the URL-driven slot with the unused, hardcoded
+        // `ConnectOptions::netsim_hook` placeholder and silently
+        // disable the simulator on every reconnect. See
+        // `connection/netsim_hook.rs` for the full design (Option A —
+        // thread-local hook + re-entrancy flag).
 
         let on_datagram = {
             let callback = options.on_inbound_media.clone();

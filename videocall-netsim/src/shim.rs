@@ -26,8 +26,19 @@
 //! [`NetworkProfile::is_passthrough`] let the caller skip all channel
 //! hops and task plumbing so the hot path is unchanged.
 
-use std::sync::Mutex;
 use std::time::Duration;
+
+// Interior mutability strategy is platform-dependent — see the
+// `NetSimShim` doc comment for the full rationale. On wasm32 we use
+// `RefCell` so a panic while a borrow is held cannot poison the
+// shim for the rest of the tab. On native targets the bot wraps the
+// shim in `Arc` and shares it across tokio worker threads, so we
+// need `Sync` and therefore use `Mutex` (with poison-recovery, not
+// `.expect()`, so a panic still cannot wedge the simulator).
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell as ShimCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex as ShimCell;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -170,13 +181,32 @@ pub enum Admission {
 }
 
 /// Per-direction network-impairment shim. One instance shapes one byte
-/// stream; wrap in `Arc` for cross-task sharing.
+/// stream; wrap in `Arc` (native, cross-thread) or `Rc` (wasm32) for
+/// sharing.
+///
+/// ## Interior mutability strategy (PR #811 finding 2)
+///
+/// - **wasm32**: `RefCell`. The browser runtime is single-threaded so
+///   `Sync` is irrelevant, and a panic while a borrow is held cannot
+///   silently poison the simulator for the rest of the tab. The
+///   previous `Mutex<T>` made this a footgun: any panic in the admit
+///   path would poison the lock and every subsequent `.lock()` call
+///   would panic with `"netsim ... poisoned"`, silently disabling all
+///   shaping.
+/// - **native**: `Mutex`. The bot wraps the shim in `Arc` and shares
+///   it across tokio worker threads, so `Sync` is required.
+///   Poison-safety is restored at the borrow sites by using
+///   `PoisonError::into_inner()` instead of `.expect("poisoned")` —
+///   a panic still propagates, but a *subsequent* `admit()` call
+///   recovers the bucket / RNG state and continues shaping. Matches
+///   the wasm32 behavior of "panics are loud but never wedge the
+///   simulator."
 #[derive(Debug)]
 pub struct NetSimShim {
     profile: NetworkProfile,
     direction: Direction,
-    rng: Mutex<StdRng>,
-    bucket: Mutex<Option<TokenBucket>>,
+    rng: ShimCell<StdRng>,
+    bucket: ShimCell<Option<TokenBucket>>,
 }
 
 impl NetSimShim {
@@ -207,8 +237,8 @@ impl NetSimShim {
         Self {
             profile,
             direction,
-            rng: Mutex::new(rng),
-            bucket: Mutex::new(bucket),
+            rng: ShimCell::new(rng),
+            bucket: ShimCell::new(bucket),
         }
     }
 
@@ -222,14 +252,45 @@ impl NetSimShim {
         self.direction
     }
 
+    /// Borrow the RNG. On wasm32 this is an infallible `RefCell`
+    /// borrow; on native it is a `Mutex::lock()` that recovers from
+    /// poison via `PoisonError::into_inner()` so a previous panic
+    /// can never wedge the simulator (PR #811 finding 2).
+    #[cfg(target_arch = "wasm32")]
+    fn rng_borrow(&self) -> std::cell::RefMut<'_, StdRng> {
+        self.rng.borrow_mut()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rng_borrow(&self) -> std::sync::MutexGuard<'_, StdRng> {
+        self.rng
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Borrow the token bucket. Same poison-recovery contract as
+    /// [`Self::rng_borrow`].
+    #[cfg(target_arch = "wasm32")]
+    fn bucket_borrow(&self) -> std::cell::RefMut<'_, Option<TokenBucket>> {
+        self.bucket.borrow_mut()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bucket_borrow(&self) -> std::sync::MutexGuard<'_, Option<TokenBucket>> {
+        self.bucket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Decide how a packet of `size_bytes` should be handled under the
-    /// current profile and bucket state. Thread-safe.
+    /// current profile and bucket state. Thread-safe on native;
+    /// single-thread-safe on wasm32.
     pub fn admit(&self, size_bytes: usize) -> Admission {
         if self.profile.is_passthrough() {
             return Admission::Pass;
         }
 
-        let mut rng = self.rng.lock().expect("netsim RNG poisoned");
+        let mut rng = self.rng_borrow();
 
         // Step 1: loss.
         if self.profile.loss_pct > 0.0 {
@@ -242,12 +303,13 @@ impl NetSimShim {
         let mut total_delay = Duration::ZERO;
 
         // Step 2: bandwidth / token bucket.
-        // We take the RNG lock first and the bucket lock second; no
-        // other code path takes both in the opposite order, so deadlock
-        // is not possible. The clamp on `extra_delay` caps pathological
-        // queueing.
+        // We hold the RNG borrow across the bucket borrow; no other
+        // code path borrows in the opposite order, so neither a
+        // `RefCell` double-borrow panic (wasm32) nor a lock-order
+        // deadlock (native) is possible. The clamp on `extra_delay`
+        // caps pathological queueing.
         {
-            let mut bucket_guard = self.bucket.lock().expect("netsim bucket poisoned");
+            let mut bucket_guard = self.bucket_borrow();
             if let Some(bucket) = bucket_guard.as_mut() {
                 let extra = bucket.consume(size_bytes);
                 // Cap to 5 seconds so a single oversize packet cannot

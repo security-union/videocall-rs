@@ -230,13 +230,35 @@ fn shape_uplink(bytes: &[u8], route: RawRoute) -> ShapeOutcome {
             true
         }
         Admission::DelayAndDuplicate(d) => {
-            // `Admission::DelayAndDuplicate(Duration)` carries a
-            // single delay applied to both copies — see
-            // `videocall_netsim::shim`. The duplicate is a second
-            // send of the byte-identical payload after the same
-            // delay; the server's de-dup / sequence handling
-            // decides what to do with it.
+            // `Admission::DelayAndDuplicate(Duration)` carries the
+            // base delay computed by `videocall_netsim::shim` (loss,
+            // latency, jitter, bandwidth, reorder). The primary copy
+            // is sent at exactly that delay; the duplicate is sent
+            // `dup_jitter_ms` later, where `dup_jitter_ms` is a
+            // freshly sampled value in `[5, 50]`.
+            //
+            // The jitter is here, not in the shim's
+            // `Admission::DelayAndDuplicate` payload, because it
+            // models *inter-copy spacing* on the wire — a property
+            // of how the duplicate is *emitted*, not of the
+            // admission decision. Without it, both copies fire in
+            // the same wasm32 macrotask batch and the server's
+            // dedup absorbs them with no exercised code path,
+            // making `DelayAndDuplicate` indistinguishable from
+            // plain `Delay` in integration tests.
+            //
+            // RNG source: `js_sys::Math::random()`. The shim's
+            // deterministic `StdRng` would have to be plumbed
+            // across the crate boundary through the per-tab hook
+            // thread-local — and a 5..=50ms jitter offset is an
+            // impairment-test path where non-determinism is
+            // acceptable (and arguably realistic — real-world
+            // jitter is non-deterministic too). Acceptance criteria
+            // for issue #848 is `dup_arrival_ms - primary_arrival_ms
+            // ∈ [5, 50]`, which a uniform sample satisfies by
+            // construction.
             let ms = duration_to_millis_u32(d);
+            let dup_jitter_ms = sample_dup_jitter_ms();
             let primary = bytes.to_vec();
             let dup = bytes.to_vec();
             wasm_bindgen_futures::spawn_local(async move {
@@ -244,7 +266,7 @@ fn shape_uplink(bytes: &[u8], route: RawRoute) -> ShapeOutcome {
                 raw_send(primary, route);
             });
             wasm_bindgen_futures::spawn_local(async move {
-                gloo_timers::future::TimeoutFuture::new(ms).await;
+                gloo_timers::future::TimeoutFuture::new(ms.saturating_add(dup_jitter_ms)).await;
                 raw_send(dup, route);
             });
             true
@@ -259,7 +281,40 @@ fn duration_to_millis_u32(d: Duration) -> u32 {
     d.as_millis().min(u32::MAX as u128) as u32
 }
 
-// Compile-only marker confirming the feature gate links cleanly.
+/// Sample the duplicate's inter-copy spacing in milliseconds.
+///
+/// Returns a uniform integer in `[5, 50]`. Called by the
+/// `DelayAndDuplicate` arm of [`shape_uplink`] so the duplicate
+/// arrives at a deterministically-different macrotask from the
+/// primary — see the comment block in that arm for the rationale.
+///
+/// `js_sys::Math::random()` is used here rather than the shim's
+/// `StdRng` because the latter is owned by the per-tab hook
+/// thread-local and threading it out would inflate the surface
+/// area for a 5..=50ms perturbation that does not need to be
+/// reproducible.
+fn sample_dup_jitter_ms() -> u32 {
+    // `Math.random()` returns f64 ∈ [0.0, 1.0). Map to integer
+    // milliseconds in [5, 50] inclusive: span = 46 values, then
+    // shift up by 5.
+    let r = js_sys::Math::random();
+    // r * 46.0 ∈ [0.0, 46.0); floor → 0..=45; + 5 → 5..=50.
+    let offset = (r * 46.0) as u32;
+    5 + offset
+}
+
+/// Test-only inspector: returns `true` iff the per-tab hook slot is
+/// currently populated with a shim. Used by the unit tests below and
+/// by the wasm-bindgen test that guards against regressions of the
+/// PR #811 finding-1 "options.netsim_hook clobbers the URL slot" bug.
+#[cfg(test)]
+pub(super) fn hook_is_installed_for_tests() -> bool {
+    NETSIM_HOOK.with(|slot| slot.borrow().is_some())
+}
+
+// Compile-only marker confirming the feature gate links cleanly,
+// plus regression tests for PR #811 review findings 1 and 3.
+//
 // The hook module is wasm32-only in practice (its send-path bodies
 // touch `gloo_timers` / `wasm_bindgen_futures`), but the symbols
 // declared here compile on native too — and the test runner only
@@ -269,8 +324,128 @@ fn duration_to_millis_u32(d: Duration) -> u32 {
 // integration test in phase 3d. (Folded in from PR-3b code review.)
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use super::*;
+    use videocall_netsim::{Direction, NetSimShim, NetworkProfile};
+
     #[test]
     fn netsim_feature_links() {
         // If this compiles, the feature gate is correctly wired.
+    }
+
+    /// PR #811 finding 1: an installed shim must survive subsequent
+    /// `install_hook(None)` patterns being absent from the transport
+    /// connect paths. We can't drive `Task::connect` on native, but
+    /// we *can* directly exercise the invariant that the hook slot
+    /// is exclusively driven by `install_hook` and never by an
+    /// implicit clobber elsewhere — i.e. once `install_hook(Some(_))`
+    /// is called, only an explicit `install_hook(None)` /
+    /// `clear_hook()` undoes it. This catches a regression where a
+    /// future contributor re-adds `install_hook(options.netsim_hook)`
+    /// (always `None`) in `websocket.rs` / `webtransport.rs`,
+    /// silently disabling the URL-installed shim.
+    ///
+    /// Strategy: install a shim, then call the only other code path
+    /// that *should* touch the slot (`install_task` — which does
+    /// not), then assert the shim is still there.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 NetSimShim is !Sync; Arc is fine in a single-threaded runtime — see NetSimShim doc.
+    fn url_installed_shim_survives_install_task() {
+        // Clean slate.
+        clear_hook();
+        assert!(!hook_is_installed_for_tests());
+
+        // Mimic phase-3c URL install.
+        let shim = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                latency_ms: 50,
+                jitter_ms: 10,
+                seed: Some(1),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Up,
+        ));
+        install_hook(Some(shim));
+        assert!(
+            hook_is_installed_for_tests(),
+            "shim should be installed after install_hook(Some(_))"
+        );
+
+        // The task slot is the other thread-local; touching it
+        // must not clobber the hook slot.
+        install_task(None);
+        assert!(
+            hook_is_installed_for_tests(),
+            "install_task(None) must not clear the hook slot — \
+             regression of PR #811 finding 1"
+        );
+
+        // Cleanup so the next test starts clean.
+        clear_hook();
+        assert!(!hook_is_installed_for_tests());
+    }
+
+    // The `sample_dup_jitter_ms()` companion test lives in the
+    // wasm-bindgen test module below — it depends on
+    // `js_sys::Math::random()`, which is only available under
+    // wasm32. See `wasm_tests::dup_jitter_ms_in_range`.
+}
+
+// wasm-bindgen-test counterpart: same survival assertion, but
+// executed in the actual browser-shaped wasm32 environment where
+// the thread-local is allocated by the wasm runtime. `wasm-pack
+// test --node videocall-client -- --features netsim` runs this.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use videocall_netsim::{Direction, NetSimShim, NetworkProfile};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// Regression test for PR #811 finding 1: once a shim is
+    /// installed (e.g. by phase-3c URL plumbing), nothing in the
+    /// transport-connect path should clear it. We can't construct a
+    /// real `WebSocketTask` / `WebTransportTask` from a unit test,
+    /// but `install_task` is the only other thread-local-touching
+    /// helper called by `Connection::connect`, and it must leave
+    /// the hook slot alone.
+    #[wasm_bindgen_test]
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 NetSimShim is !Sync; Arc is fine in a single-threaded runtime — see NetSimShim doc.
+    fn netsim_url_install_survives_install_task() {
+        clear_hook();
+        assert!(!hook_is_installed_for_tests());
+
+        let shim = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                latency_ms: 25,
+                seed: Some(7),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Up,
+        ));
+        install_hook(Some(shim));
+        assert!(hook_is_installed_for_tests());
+
+        install_task(None);
+        assert!(
+            hook_is_installed_for_tests(),
+            "install_task must not clear the per-tab netsim hook"
+        );
+
+        clear_hook();
+    }
+
+    /// PR #811 finding 3: the duplicate's inter-copy jitter offset
+    /// is sampled in `[5, 50]` ms inclusive. 256 samples is enough
+    /// to catch a buggy mapping that drifts out of range. This test
+    /// is wasm32-only because `sample_dup_jitter_ms` calls
+    /// `js_sys::Math::random()`.
+    #[wasm_bindgen_test]
+    fn dup_jitter_ms_in_range() {
+        for _ in 0..256 {
+            let v = sample_dup_jitter_ms();
+            assert!(
+                (5..=50).contains(&v),
+                "sample_dup_jitter_ms() returned {v}, expected [5, 50]"
+            );
+        }
     }
 }

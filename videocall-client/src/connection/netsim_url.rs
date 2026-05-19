@@ -92,7 +92,17 @@ pub(super) fn try_install_from_url() -> bool {
 
     info!("netsim: installing profile '{name}' from URL");
     let shim = NetSimShim::new(profile, Direction::Up);
-    install_hook(Some(Arc::new(shim)));
+    // `NetSimShim` is `!Sync` on wasm32 (uses `RefCell` for poison
+    // safety — see PR #811 finding 2 and the `NetSimShim` doc
+    // comment) but the wasm runtime is single-threaded, so an
+    // `Arc<NetSimShim>` here is safe. The thread-local in
+    // `netsim_hook` stores `Option<Arc<NetSimShim>>` so it can hand
+    // out `Arc` clones without taking ownership; switching to `Rc`
+    // would force every consumer to change, when the actual
+    // multi-thread sharing risk is zero on wasm32.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let arc = Arc::new(shim);
+    install_hook(Some(arc));
     true
 }
 

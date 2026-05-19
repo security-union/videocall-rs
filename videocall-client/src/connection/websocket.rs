@@ -30,13 +30,15 @@ use videocall_types::Callback;
 
 impl WebMedia<WebSocketTask> for WebSocketTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebSocketTask> {
-        // Phase 3b: stash the optional netsim shim in the per-tab
-        // thread-local before constructing the transport task. The
-        // hook is consulted by `send_bytes` below; the
-        // `Connection::connect` caller separately registers the
+        // Phase 3c: the netsim shim is installed once-per-tab from
+        // `?netsim=<profile>` by `Connection::connect` via
+        // `super::netsim_url::try_install_from_url`. We deliberately do
+        // **not** install or clear the hook here — doing so would
+        // overwrite the URL-driven slot with the unused, hardcoded
+        // `ConnectOptions::netsim_hook` placeholder and silently
+        // disable the simulator on every reconnect. The
+        // `Connection::connect` caller still registers the
         // `Weak<Task>` used by the async-delay path.
-        #[cfg(feature = "netsim")]
-        super::netsim_hook::install_hook(options.netsim_hook.clone());
 
         // Track whether the handshake (Opened event) has completed, so that
         // subsequent Close/Error events can be classified correctly.

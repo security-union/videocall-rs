@@ -924,7 +924,11 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           </button>
         </div>
       </form>
-      <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} />
+      <SsoPanel
+        open={ssoPanelOpen}
+        onOpenChange={setSsoPanelOpen}
+        meetingURL={values.meetingURL}
+      />
     </Tooltip.Provider>
   );
 }

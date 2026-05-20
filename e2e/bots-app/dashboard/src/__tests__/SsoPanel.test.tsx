@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-import { SsoPanel, deriveSsoTone } from "../components/SsoPanel";
+import { SsoPanel, deriveSsoStartUrl, deriveSsoTone } from "../components/SsoPanel";
 
 interface MockedRoute {
   url: string;
@@ -11,7 +11,10 @@ interface MockedRoute {
   body: unknown;
 }
 
-function setupFetch(routes: MockedRoute[], onCall?: (call: { url: string; method: string }) => void) {
+function setupFetch(
+  routes: MockedRoute[],
+  onCall?: (call: { url: string; method: string }) => void,
+) {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
@@ -32,7 +35,11 @@ function setupFetch(routes: MockedRoute[], onCall?: (call: { url: string; method
   );
 }
 
-function renderPanel(open = true, toast?: (t: { title: string; variant: string }) => void) {
+function renderPanel(
+  open = true,
+  toast?: (t: { title: string; variant: string }) => void,
+  meetingURL?: string,
+) {
   const qc = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -41,10 +48,39 @@ function renderPanel(open = true, toast?: (t: { title: string; variant: string }
   });
   return render(
     <QueryClientProvider client={qc}>
-      <SsoPanel open={open} onOpenChange={() => {}} onToast={toast} />
+      <SsoPanel open={open} onOpenChange={() => {}} onToast={toast} meetingURL={meetingURL} />
     </QueryClientProvider>,
   );
 }
+
+describe("deriveSsoStartUrl", () => {
+  // Locks the contract used by the LaunchForm-scoped SsoPanel to
+  // auto-derive the SSO capture target from the meeting URL the
+  // operator has typed. Critical because a fnxlabs-captured
+  // `hcl-sso.json` cannot authenticate a localhost or preview-deploy
+  // launch (cookie domain mismatch); this helper closes that gap.
+  it("returns null for undefined or empty inputs (falls back to server default)", () => {
+    expect(deriveSsoStartUrl(undefined)).toBeNull();
+    expect(deriveSsoStartUrl("")).toBeNull();
+    expect(deriveSsoStartUrl("   ")).toBeNull();
+  });
+
+  it("returns null for malformed URLs", () => {
+    expect(deriveSsoStartUrl("not-a-url")).toBeNull();
+    expect(deriveSsoStartUrl("ftp://example.com/")).toBeNull();
+    expect(deriveSsoStartUrl("javascript:alert(1)")).toBeNull();
+  });
+
+  it("returns the origin with a trailing slash for valid http(s) URLs", () => {
+    expect(deriveSsoStartUrl("https://app.videocall.fnxlabs.com/meeting/xyz")).toBe(
+      "https://app.videocall.fnxlabs.com/",
+    );
+    expect(deriveSsoStartUrl("http://localhost:8080/meeting/abc")).toBe("http://localhost:8080/");
+    expect(
+      deriveSsoStartUrl("https://app.videocall-pr-123.preview.videocall.fnxlabs.com/meeting/x"),
+    ).toBe("https://app.videocall-pr-123.preview.videocall.fnxlabs.com/");
+  });
+});
 
 describe("deriveSsoTone", () => {
   it("is red when data is missing or file does not exist", () => {
@@ -118,7 +154,7 @@ describe("<SsoPanel />", () => {
     expect(screen.getByTestId("sso-panel-state")).toHaveTextContent(/hcl-sso\.json/);
   });
 
-  it('shows a missing-state warning when the file does not exist', async () => {
+  it("shows a missing-state warning when the file does not exist", async () => {
     setupFetch([
       {
         url: "/api/sso/vpn-status",
@@ -212,10 +248,7 @@ describe("<SsoPanel />", () => {
             { status: 201, headers: { "content-type": "application/json" } },
           );
         }
-        if (
-          url === "/api/sso/recapture/session-abc/complete" &&
-          method === "POST"
-        ) {
+        if (url === "/api/sso/recapture/session-abc/complete" && method === "POST") {
           ssoStateBody = {
             filePath: "/runDir/auth/hcl-sso.json",
             exists: true,
@@ -246,9 +279,164 @@ describe("<SsoPanel />", () => {
       // the new file path.
       expect(screen.queryByTestId("sso-recapture-active")).not.toBeInTheDocument();
     });
-    expect(onToast).toHaveBeenCalledWith(
-      expect.objectContaining({ variant: "success" }),
+    expect(onToast).toHaveBeenCalledWith(expect.objectContaining({ variant: "success" }));
+  });
+
+  it("recapture POST body carries derived startUrl when meetingURL is provided", async () => {
+    // Closes the gap that produced the symptom: operator captured
+    // against fnxlabs (server's hardcoded default), then launched
+    // against localhost — the captured cookies were scoped to
+    // `.fnxlabs.com` and didn't apply at localhost, so the Google
+    // account picker reappeared. With the meetingURL wired through,
+    // the capture navigates to the same origin the bot will launch
+    // against, so the captured cookies match by construction.
+    const captured: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (url === "/api/sso/vpn-status") {
+          return new Response(
+            JSON.stringify({ status: "up", checkedAt: Date.now(), responseTimeMs: 5 }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/sso/recapture" && method === "POST") {
+          captured.push({ url, body: init?.body ? JSON.parse(init.body as string) : null });
+          return new Response(
+            JSON.stringify({
+              recaptureSessionId: "session-localhost",
+              startUrl: "http://localhost:8080/",
+              startedAt: Date.now(),
+            }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 500 });
+      }),
     );
+    renderPanel(true, undefined, "http://localhost:8080/meeting/abc");
+    await waitFor(() => screen.getByTestId("sso-recapture-start"));
+    fireEvent.click(screen.getByTestId("sso-recapture-start"));
+    await waitFor(() => expect(captured).toHaveLength(1));
+    expect(captured[0].body).toEqual({ startUrl: "http://localhost:8080/" });
+  });
+
+  it("recapture POST body omits startUrl when no meetingURL is supplied (falls back to server default)", async () => {
+    // The header-chip's global SsoPanel never has a meeting URL
+    // context — it must continue to use the server-side fnxlabs
+    // default. Locks this so a future refactor doesn't accidentally
+    // require meetingURL.
+    const captured: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (url === "/api/sso/vpn-status") {
+          return new Response(
+            JSON.stringify({ status: "up", checkedAt: Date.now(), responseTimeMs: 5 }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/sso/status") {
+          return new Response(
+            JSON.stringify({
+              filePath: "/runDir/auth/hcl-sso.json",
+              exists: false,
+              capturedAt: null,
+              ageHours: null,
+              size: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/sso/recapture" && method === "POST") {
+          captured.push({ url, body: init?.body ? JSON.parse(init.body as string) : null });
+          return new Response(
+            JSON.stringify({
+              recaptureSessionId: "session-default",
+              startUrl: "https://app.videocall.fnxlabs.com/",
+              startedAt: Date.now(),
+            }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 500 });
+      }),
+    );
+    renderPanel(true, undefined, undefined);
+    await waitFor(() => screen.getByTestId("sso-recapture-start"));
+    fireEvent.click(screen.getByTestId("sso-recapture-start"));
+    await waitFor(() => expect(captured).toHaveLength(1));
+    expect(captured[0].body).toEqual({});
+  });
+
+  it("renders the derived capture target so the operator can verify before clicking Start", async () => {
+    setupFetch([
+      {
+        url: "/api/sso/vpn-status",
+        method: "GET",
+        status: 200,
+        body: { status: "up", checkedAt: Date.now(), responseTimeMs: 5 },
+      },
+      {
+        url: "/api/sso/status",
+        method: "GET",
+        status: 200,
+        body: {
+          filePath: "/runDir/auth/hcl-sso.json",
+          exists: false,
+          capturedAt: null,
+          ageHours: null,
+          size: null,
+        },
+      },
+    ]);
+    renderPanel(true, undefined, "http://localhost:8080/meeting/abc");
+    await waitFor(() => {
+      expect(screen.getByTestId("sso-capture-target")).toHaveTextContent("http://localhost:8080/");
+    });
+  });
+
+  it("falls back to the (default) label in the capture-target line when no meetingURL is supplied", async () => {
+    setupFetch([
+      {
+        url: "/api/sso/vpn-status",
+        method: "GET",
+        status: 200,
+        body: { status: "up", checkedAt: Date.now(), responseTimeMs: 5 },
+      },
+      {
+        url: "/api/sso/status",
+        method: "GET",
+        status: 200,
+        body: {
+          filePath: "/runDir/auth/hcl-sso.json",
+          exists: false,
+          capturedAt: null,
+          ageHours: null,
+          size: null,
+        },
+      },
+    ]);
+    renderPanel(true, undefined, undefined);
+    await waitFor(() => {
+      expect(screen.getByTestId("sso-capture-target")).toHaveTextContent(
+        "https://app.videocall.fnxlabs.com/ (default)",
+      );
+    });
   });
 
   it("recapture cancel hits DELETE and clears the active state", async () => {

@@ -7,6 +7,11 @@ import { Dices, RotateCcw, Users } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type { MultiLaunchRequest, MultiLaunchResponse } from "../api/types";
+// Shared `sso/status` query — same cache key as LaunchForm + SsoChip +
+// SsoPanel, so opening the multi-launch tab does NOT add a duplicate
+// network call. The wire-through below mirrors the single-launch path
+// added in v1.5.0 so dashboard-spawned multi-launch bots also pick up
+// the captured `<runDir>/auth/hcl-sso.json` automatically.
 import {
   recordLaunchedBot,
   runLocationLabelFor,
@@ -154,6 +159,20 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     refetchInterval: 60_000,
   });
 
+  // Captured SSO state status. Shares its cache with the header chip,
+  // SsoPanel, and LaunchForm so this hook does NOT trigger an extra
+  // network call. The submit handler below reads `data.filePath` to
+  // forward the captured `<runDir>/auth/hcl-sso.json` to every spawned
+  // bot when `authBackend === "jwt"` — same behavior as single-launch.
+  // Without this, multi-launch bots would silently ignore the captured
+  // SSO state even though the file existed (matching the v1.4.x
+  // pre-fix single-launch regression).
+  const ssoStatusQuery = useQuery({
+    queryKey: ["sso", "status"],
+    queryFn: api.ssoStatus,
+    refetchInterval: 60_000,
+  });
+
   // Per-field history controllers, mirroring the single-bot LaunchForm
   // wiring so the multi-launch form's free-text inputs remember what
   // the operator has previously typed. Three keys (`meetingURL`, `ttl`,
@@ -281,6 +300,19 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     setErrors(v);
     if (Object.keys(v).length > 0) return;
 
+    // When the operator is using JWT auth and we have a captured SSO
+    // state file on disk, forward its path so every spawned bot's
+    // BrowserContext loads its cookies before the JWT session cookie
+    // is injected. This is the multi-launch counterpart of the
+    // single-launch wire-through added in v1.5.0 — without it,
+    // multi-launch bots ignore `<runDir>/auth/hcl-sso.json` even when
+    // the file exists, and the page-load hits the HCL SSO portal on
+    // every spawn (which is exactly the bug the user reported).
+    const ssoStateFile =
+      values.authBackend === "jwt" && ssoStatusQuery.data?.exists
+        ? ssoStatusQuery.data.filePath
+        : undefined;
+
     const req: MultiLaunchRequest = {
       mode: values.mode,
       count: values.count,
@@ -289,6 +321,7 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
       network: values.network,
       headless: values.headless,
       authBackend: values.authBackend,
+      ssoStateFile,
       runLocation:
         values.runLocation === "ssh"
           ? { kind: "ssh", hostLabel: values.sshHostLabel.trim() }

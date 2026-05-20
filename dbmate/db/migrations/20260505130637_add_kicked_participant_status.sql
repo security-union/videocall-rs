@@ -5,5 +5,6 @@ ALTER TABLE meeting_participants ADD CONSTRAINT chk_participant_status
 
 -- migrate:down
 ALTER TABLE meeting_participants DROP CONSTRAINT chk_participant_status;
+UPDATE meeting_participants SET status = 'left' WHERE status = 'kicked';
 ALTER TABLE meeting_participants ADD CONSTRAINT chk_participant_status
     CHECK (status IN ('waiting','admitted','rejected','left'));

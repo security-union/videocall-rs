@@ -347,6 +347,10 @@ test.describe("Host mute controls", () => {
    * After the host mutes the guest, the guest's on_host_mute callback sets
    * mic_enabled=false. The guest can re-enable their mic by clicking the
    * "Unmute" button (same toggle they use for self-mute).
+   *
+   * This test uses the per-tile mute path (canvas_generator.rs) — see the
+   * "Host mute via peer-list sidebar" describe block below for coverage of
+   * the alternative sidebar surface (peer_list_item.rs).
    */
   test("participant can self-unmute after being muted by host", async ({ baseURL }) => {
     test.setTimeout(120_000);
@@ -423,6 +427,267 @@ test.describe("Host mute controls", () => {
           has: guestPage.locator("span.tooltip", { hasText: "Mute" }),
         }),
       ).toBeVisible({ timeout: 10_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Helpers — peer-list sidebar
+// ---------------------------------------------------------------------------
+
+/**
+ * Open the peer-list sidebar from the controls bar.
+ *
+ * The secondary controls bar collapses after ~1 s of inactivity (auto-hide).
+ * Hovering the container keeps it expanded so "Open Peers" stays clickable.
+ */
+async function openPeerList(page: Page): Promise<void> {
+  await page.locator(".video-controls-container").hover();
+  await page.mouse.move(400, 400);
+  await page.waitForTimeout(300);
+  const openPeersBtn = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Open Peers" }),
+  });
+  await expect(openPeersBtn).toBeVisible({ timeout: 10_000 });
+  await openPeersBtn.click();
+  await page.waitForTimeout(1000);
+}
+
+/**
+ * Mute a remote peer via the sidebar peer-list three-dot ("More options") menu.
+ *
+ * The `.peer_item_menu_btn` renders for any peer row that has at least one
+ * action handler wired (on_mute, on_disable_video, or on_kick).  When the
+ * viewer is the host, on_kick is always wired for non-self rows, so the
+ * button is present regardless of mic state.  The "Mute" context-menu item
+ * only appears once diagnostics report audio_enabled=true (can take ~1–2 s
+ * after the guest enables their mic).
+ *
+ * The host's own self row never receives action handlers and therefore never
+ * renders `.peer_item_menu_btn`, making `.peer-list li:has(.peer_item_menu_btn)`
+ * a reliable selector for the first non-self peer row.
+ */
+async function hostMutePeerViaSidebar(hostPage: Page): Promise<void> {
+  const guestRow = hostPage.locator(".peer-list li:has(.peer_item_menu_btn)").first();
+  await expect(guestRow).toBeVisible({ timeout: 15_000 });
+
+  await guestRow.locator(".peer_item_menu_btn").click();
+
+  const contextMenu = guestRow.locator(".peer_item_context_menu");
+  await expect(contextMenu).toBeVisible({ timeout: 5_000 });
+
+  // The "Mute" item only renders once on_mute is Some, which happens after
+  // the peer's diagnostics report audio_enabled=true.  Use a generous timeout
+  // to absorb the diagnostics propagation delay (~1 s at 1000 ms interval).
+  const muteItem = contextMenu.locator("button.context-menu-item", { hasText: "Mute" });
+  await expect(muteItem).toBeVisible({ timeout: 15_000 });
+  await muteItem.click();
+}
+
+// ---------------------------------------------------------------------------
+// Peer-list sidebar mute tests (PR #556 follow-up)
+// ---------------------------------------------------------------------------
+
+test.describe("Host mute via peer-list sidebar", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * Happy path: host mutes a single participant via the sidebar peer-list
+   * three-dot ("More options") menu (peer_list_item.rs).
+   *
+   * Rendering gates verified:
+   *   - Guest row renders `.peer_item_menu_btn` once their mic is detected as on.
+   *   - Clicking it opens `.peer_item_context_menu` containing a "Mute" item.
+   *   - Clicking "Mute" delivers exactly one "Host muted your microphone" toast
+   *     to the guest — the dual-transport dedup at video_call_client.rs:1407–1421
+   *     prevents a second delivery even when both transports are active.
+   *   - After muting, re-opening the menu shows no "Mute" item (on_mute is now
+   *     None because muted=true, so the item is not rendered).
+   */
+  test("host mutes a participant via the sidebar peer-list menu", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_sidebar_mute_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-sidebar-mute@videocall.rs",
+        "SidebarMuteHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-sidebar-mute@videocall.rs",
+        "SidebarMuteGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // ---- Both users join the meeting ----
+      await navigateToMeeting(hostPage, meetingId, "SidebarMuteHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      await navigateToMeeting(guestPage, meetingId, "SidebarMuteGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      // Wait for the peer connection to establish (host sees guest's tile).
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Guest enables their mic so diagnostics report audio_enabled=true →
+      // the host's sidebar computes muted=false → on_mute becomes Some →
+      // the "Mute" item appears in the guest row's context menu.
+      await enableMic(guestPage);
+
+      // ---- Host opens the peer list and mutes the guest via the sidebar ----
+      await openPeerList(hostPage);
+      await hostMutePeerViaSidebar(hostPage);
+
+      // ---- Guest receives the host-mute NATS event and sees the toast ----
+      const guestMuteToast = guestPage.locator(".peer-toast .toast-name", {
+        hasText: "Host muted your microphone",
+      });
+      await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
+
+      // ---- Dedup guard: exactly one toast, not two ----
+      // is_duplicate_host_action prevents the sidebar action from being
+      // processed twice even when WebSocket and WebTransport are both active.
+      await expect(guestMuteToast).toHaveCount(1);
+
+      // ---- "Mute" item is absent from the context menu after muting ----
+      // on_mute is now None (muted=true) so the item is no longer rendered.
+      // The three-dot button itself stays (on_kick is still wired).
+      const guestRow = hostPage.locator(".peer-list li:has(.peer_item_menu_btn)").first();
+      await guestRow.locator(".peer_item_menu_btn").click();
+      const contextMenuAfterMute = guestRow.locator(".peer_item_context_menu");
+      await expect(contextMenuAfterMute).toBeVisible({ timeout: 5_000 });
+      await expect(
+        contextMenuAfterMute.locator("button.context-menu-item", { hasText: "Mute" }),
+      ).toHaveCount(0);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  /**
+   * Negative rendering cases for the peer-list sidebar mute controls.
+   *
+   * Three properties are verified within a single meeting setup:
+   *
+   * 1. The host's own peer-list row has no `.peer_item_menu_btn`.
+   *    The self row is constructed without action handlers (on_mute / on_kick /
+   *    on_disable_video are not passed), so `.peer_item_menu_wrapper` is never
+   *    rendered.  The row is identified by the `.peer-indicator` "(You/Host)"
+   *    span that PeerListItem renders for is_self=true, is_host=true.
+   *
+   * 2. When the guest's mic is OFF, opening the three-dot menu shows no "Mute"
+   *    item.  on_mute=None when muted=true, so the button is absent even though
+   *    the menu itself renders (on_kick is wired for all non-self host rows).
+   *
+   * 3. A non-host viewer (the guest) sees no `.peer_item_menu_btn` anywhere
+   *    in the peer list.  All three action handlers require is_current_user_host,
+   *    which is false for the guest, so every row has None for all three
+   *    handlers and `.peer_item_menu_wrapper` is never rendered.
+   */
+  test("peer-list sidebar mute controls render correctly for negative cases", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_sidebar_neg_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-sidebar-neg@videocall.rs",
+        "SidebarNegHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-sidebar-neg@videocall.rs",
+        "SidebarNegGuest",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // ---- Both users join the meeting (guest mic stays OFF throughout) ----
+      await navigateToMeeting(hostPage, meetingId, "SidebarNegHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      await navigateToMeeting(guestPage, meetingId, "SidebarNegGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      // Wait for the peer connection to establish.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // ---- Negative 1: host's own row has no .peer_item_menu_btn ----
+      await openPeerList(hostPage);
+
+      // The self row always renders first.  Filter by ".peer-indicator" text
+      // so the assertion doesn't couple to list order.
+      const hostOwnRow = hostPage.locator(".peer-list li").filter({
+        has: hostPage.locator(".peer-indicator", { hasText: "(You/Host)" }),
+      });
+      await expect(hostOwnRow).toBeVisible({ timeout: 10_000 });
+      await expect(hostOwnRow.locator(".peer_item_menu_btn")).toHaveCount(0);
+
+      // ---- Negative 2: mic OFF — "Mute" item absent in the context menu ----
+      // The guest has not enabled their mic so muted=true and on_mute=None.
+      // on_kick is Some (host always wires kick for non-self rows), so the
+      // three-dot button renders — but "Mute" must not appear inside the menu.
+      const guestRowNoMic = hostPage.locator(".peer-list li:has(.peer_item_menu_btn)").first();
+      await expect(guestRowNoMic).toBeVisible({ timeout: 10_000 });
+      await guestRowNoMic.locator(".peer_item_menu_btn").click();
+      const contextMenuNoMic = guestRowNoMic.locator(".peer_item_context_menu");
+      await expect(contextMenuNoMic).toBeVisible({ timeout: 5_000 });
+      await expect(
+        contextMenuNoMic.locator("button.context-menu-item", { hasText: "Mute" }),
+      ).toHaveCount(0);
+
+      // Dismiss the open context menu by clicking the full-viewport fixed
+      // overlay (the `position: fixed; inset: 0; z-index: 999` backdrop that
+      // PeerListItem renders behind the context menu).
+      await hostPage.mouse.click(5, 5);
+      await hostPage.waitForTimeout(300);
+
+      // ---- Negative 3: non-host viewer sees no .peer_item_menu_btn anywhere ----
+      // The guest (is_current_user_host=false) has all three action handlers
+      // as None for every row, so .peer_item_menu_wrapper is never rendered.
+      await openPeerList(guestPage);
+      const guestPeerList = guestPage.locator(".peer-list");
+      await expect(guestPeerList).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator(".peer-list .peer_item_menu_btn")).toHaveCount(0);
     } finally {
       await browser1.close();
       await browser2.close();

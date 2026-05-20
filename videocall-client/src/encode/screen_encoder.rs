@@ -1530,6 +1530,7 @@ mod tests {
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
+            on_participant_kicked: None,
             decode_media: true,
             is_guest: false,
             allow_post_rebase_retry: true,

@@ -308,7 +308,9 @@ test.describe("Host mute controls", () => {
       await openPeersBtn.click();
       await hostPage.waitForTimeout(1000);
 
-      const hostActionsBtn = hostPage.locator('button[aria-label="Host actions"]');
+      const hostActionsBtn = hostPage
+        .locator(".peer-list")
+        .locator('button[aria-label="Host actions"]');
       await expect(hostActionsBtn).toBeVisible({ timeout: 10_000 });
       await hostActionsBtn.click();
 

@@ -226,6 +226,7 @@ pub fn WaitingRoom(
                 on_meeting_settings_updated: None,
                 on_host_mute: None,
                 on_host_disable_video: None,
+                on_participant_kicked: None,
                 on_speaking_changed: None,
                 on_audio_level_changed: None,
                 vad_threshold: None,

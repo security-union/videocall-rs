@@ -239,6 +239,9 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host requests this client disable its camera.
     pub on_host_disable_video: Option<Callback<()>>,
 
+    /// Callback triggered when the host removes this client from the meeting.
+    pub on_participant_kicked: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
     /// meeting event. `session_id` is the server-assigned session_id as a
@@ -330,6 +333,7 @@ struct InnerOptions {
     on_meeting_settings_updated: Option<Callback<()>>,
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
+    on_participant_kicked: Option<Callback<()>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
@@ -545,6 +549,7 @@ impl VideoCallClient {
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
+                    on_participant_kicked: options.on_participant_kicked.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -2163,6 +2168,29 @@ impl Inner {
                                 }
                             }
                         }
+                        Ok(MeetingEventType::PARTICIPANT_KICKED) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_targeted_at_self =
+                                target.as_slice() == self.options.user_id.as_bytes();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            info!(
+                                "Received PARTICIPANT_KICKED: room={}, target=\"{}\", is_targeted_at_self={}",
+                                meeting_packet.room_id, target_str, is_targeted_at_self
+                            );
+                            if is_targeted_at_self {
+                                if !self.is_duplicate_host_action("participant_kicked", &target_str)
+                                {
+                                    if let Some(cb) = &self.options.on_participant_kicked {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate PARTICIPANT_KICKED for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -2404,6 +2432,7 @@ mod disconnect_tests {
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
+            on_participant_kicked: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }
@@ -2567,6 +2596,7 @@ mod dedup_tests {
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
+            on_participant_kicked: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

@@ -84,12 +84,12 @@ async function admitGuestIfNeeded(
 }
 
 /**
- * Enable the local camera by clicking the "Start camera" control button.
+ * Enable the local camera by clicking the "Start Video" control button.
  * Mirrors `enableMic` in host-mute.spec.ts.
  */
 async function enableCamera(page: Page): Promise<void> {
   const startCamBtn = page.locator("button.video-control-button", {
-    has: page.locator("span.tooltip", { hasText: "Start camera" }),
+    has: page.locator("span.tooltip", { hasText: "Start Video" }),
   });
   await expect(startCamBtn).toBeVisible({ timeout: 10_000 });
   await startCamBtn.click();
@@ -389,9 +389,9 @@ test.describe("Host disable-video controls", () => {
       });
       await expect(guestVideoOffToast.first()).toBeVisible({ timeout: 15_000 });
 
-      // Guest's camera button now shows "Start camera" (camera is off).
+      // Guest's camera button now shows "Start Video" (camera is off).
       const guestStartCamBtn = guestPage.locator("button.video-control-button", {
-        has: guestPage.locator("span.tooltip", { hasText: "Start camera" }),
+        has: guestPage.locator("span.tooltip", { hasText: "Start Video" }),
       });
       await expect(guestStartCamBtn).toBeVisible({ timeout: 10_000 });
 

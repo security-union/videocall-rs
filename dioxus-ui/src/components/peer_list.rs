@@ -241,6 +241,10 @@ pub fn PeerList(
                                             }
                                         }
                                         if show_incall_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 999;",
+                                                onclick: move |_| show_incall_menu.set(false),
+                                            }
                                             div { class: "context-menu",
                                                 button {
                                                     class: "context-menu-item",
@@ -434,6 +438,39 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
+                                    // Kick: shown whenever the local user is host.
+                                    let on_kick = if is_current_user_host {
+                                        let meeting_id = room_id.clone();
+                                        let peer_user_id = user_id.clone();
+                                        Some(EventHandler::new(move |_| {
+                                            let meeting_id = meeting_id.clone();
+                                            let peer_user_id = peer_user_id.clone();
+                                            spawn(async move {
+                                                match meeting_api_client() {
+                                                    Ok(client) => {
+                                                        if let Err(e) = client
+                                                            .kick_participant(
+                                                                &meeting_id,
+                                                                &peer_user_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::warn!(
+                                                                "kick_participant failed: {e}"
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "meeting_api_client error: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }))
+                                    } else {
+                                        None
+                                    };
                                     let row_key = peer.session_id.clone();
                                     let tooltip_user_id = user_id.clone();
                                     rsx! {
@@ -449,6 +486,7 @@ pub fn PeerList(
                                                 speaking: speaking,
                                                 on_mute: on_mute,
                                                 on_disable_video: on_disable_video,
+                                                on_kick: on_kick,
                                             }
                                         }
                                     }

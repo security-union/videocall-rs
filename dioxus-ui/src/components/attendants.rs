@@ -830,6 +830,7 @@ pub fn AttendantsComponent(
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
+        let client_for_kick = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
 
@@ -1105,6 +1106,22 @@ pub fn AttendantsComponent(
                         show_video_off_toast.set(false);
                         video_off_toast_timer.set(None);
                     })));
+                }))
+            },
+            on_participant_kicked: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("PARTICIPANT_KICKED: removed from meeting by host");
+                    if let Some(client) = client_for_kick.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+                        }
+                    }
+                    let mut meeting_ended_message = meeting_ended_message;
+                    meeting_ended_message.set(Some(
+                        "You have been removed from the meeting by the host.".to_string(),
+                    ));
                 }))
             },
             on_peer_left: {

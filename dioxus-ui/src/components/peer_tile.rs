@@ -232,13 +232,16 @@ pub fn PeerTile(
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
-    // Self-identification keys on session_id (`peer_id`), not user_id, so a host
-    // viewing their own sibling same-user session still sees the mute control on
-    // the sibling (HCL issue 828) — only their own tile hides it.
+    // `is_self_peer` is true either when the tile's session_id matches the local
+    // session_id, OR when the tile's user_id matches the current user's user_id —
+    // the latter covers sibling sessions of the same account (e.g. a host with two
+    // browser tabs open), so host controls never appear on any of the current
+    // user's own tiles.
     let peer_uid_for_mute = client
         .get_peer_user_id(&peer_id)
         .unwrap_or_else(|| peer_id.clone());
-    let is_self_peer = my_session_id.as_deref() == Some(peer_id.as_str());
+    let is_self_peer = my_session_id.as_deref() == Some(peer_id.as_str())
+        || peer_uid_for_mute == *client.user_id();
     let on_mute: Option<EventHandler<()>> =
         if is_current_user_host && !is_self_peer && audio_enabled() {
             if let Some(ref meeting_id) = room_id {

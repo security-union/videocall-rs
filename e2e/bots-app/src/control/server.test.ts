@@ -470,6 +470,57 @@ describe("control server", () => {
     expect(launch!).toContain(`"authBackend":"none"`);
   });
 
+  it("POST /launch substitutes {participant} in displayName template", async () => {
+    // Matches the multi-launch behaviour (server.ts: templateDisplayName).
+    // Operators reasonably expect the same `{participant}` syntax to
+    // work on the single-bot launch form's displayName field. Without
+    // server-side substitution the literal `{` and `}` reach the
+    // dioxus UI's validate_display_name (an ASCII-alphanumeric +
+    // space/_/-/' allowlist) and get rejected, stranding the bot's
+    // in-meeting rename modal open. This test pins the substitution
+    // so the regression can't sneak back.
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        displayName: "Bot {participant}",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    expect(launch!).toContain(`"displayName":"Bot alice"`);
+    expect(launch!).not.toContain("{participant}");
+  });
+
+  it("POST /launch passes a non-templated displayName through unchanged", async () => {
+    // Strict superset of the prior behaviour — the template
+    // substitution must not corrupt literal strings.
+    const res = await fetchJson(handle.port, `/launch`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        meetingURL: "https://example.com/meeting/X",
+        participant: "alice",
+        displayName: "Alice Wonderland",
+        ttl: "5m",
+        headless: false,
+        network: "none",
+        authBackend: "jwt",
+      },
+    });
+    expect(res.status).toBe(201);
+    const launch = surface.callLog.find((l) => l.startsWith("launch:"));
+    expect(launch).toBeDefined();
+    expect(launch!).toContain(`"displayName":"Alice Wonderland"`);
+  });
+
   it("POST /launch forwards costume + audio overrides to surface.launchOne", async () => {
     const res = await fetchJson(handle.port, `/launch`, {
       method: "POST",

@@ -1066,6 +1066,19 @@ async function joinWithRetries(args: {
 }
 
 /**
+ * Regex matching characters the dioxus UI's `validate_display_name`
+ * accepts (defined in `videocall-types/src/validation.rs`): ASCII
+ * letters, numbers, spaces, underscores, hyphens, and apostrophes.
+ * Anything else is rejected at form submission with an inline error,
+ * leaving the rename modal stuck open. We pre-check the displayName
+ * here so the bot doesn't even try (and doesn't leave the modal in a
+ * stranded state).
+ *
+ * Exported for the unit-test that pins the contract.
+ */
+export const ALLOWED_DISPLAY_NAME_CHARS_RE = /^[a-zA-Z0-9 _'-]+$/;
+
+/**
  * Set the bot's display name via the in-meeting attendee-list edit
  * button. Used as a fallback for the case where the bot landed on
  * "Join Meeting" without the display-name prompt rendering — e.g.
@@ -1083,14 +1096,25 @@ async function joinWithRetries(args: {
  *   1. Toggle the peer-list panel via the action-bar button whose
  *      tooltip reads "Open Peers" (sourced from
  *      `dioxus-ui/src/components/peer_list_button.rs`).
- *   2. Click the edit pencil on the self-row
- *      (`button.peer_item_edit_btn`, defined at
- *      `dioxus-ui/src/components/peer_list_item.rs:88-95`). The
- *      pencil renders ONLY on the local self-row, so the selector is
- *      unambiguous on its own — no extra filter needed.
+ *   2. Identify the self-row by the `(You)` / `(You/Host)` text
+ *      indicator (sourced from `peer_list_item.rs:64-69` —
+ *      `is_self == true` renders one of those labels) AND the
+ *      presence of the edit pencil. The double-filter is defensive:
+ *      when multiple sessions of the same authenticated user are in
+ *      the meeting, every row carries the same `name` text but only
+ *      one row (the local self-row) has `is_self == true`. Filtering
+ *      by `(You)` text gives a stable, name-independent identifier
+ *      for "this is MY row" regardless of how many siblings share
+ *      the user_id.
  *   3. Fill the modal input (`input.input-apple`) with the desired
  *      name and click the "Save" button.
- *   4. Toggle the peer-list panel closed so the bot starts the
+ *   4. Verify the modal actually closed — `validate_display_name` in
+ *      `videocall-types/src/validation.rs` rejects any character
+ *      outside `[a-zA-Z0-9 _'-]` and leaves the modal OPEN with an
+ *      inline error message. We catch that case and close the modal
+ *      via Escape (the Cancel-equivalent) so the bot's next step
+ *      doesn't fight a stuck modal.
+ *   5. Toggle the peer-list panel closed so the bot starts the
  *      enable-media step from a known state.
  */
 export async function ensureDisplayNameInMeeting(args: {
@@ -1102,6 +1126,22 @@ export async function ensureDisplayNameInMeeting(args: {
 
   if (displayName.trim() === "") {
     console.log(`[${participant}] in-meeting rename: skipped (no displayName supplied)`);
+    return;
+  }
+
+  // Pre-validate: if displayName contains characters the dioxus UI
+  // will reject, skip the rename entirely instead of stranding the
+  // modal open. The most common cause of this is a `{participant}`
+  // template that wasn't substituted on the server side — typically
+  // means an older bots-app version that doesn't apply template
+  // substitution to the single-bot launch path.
+  if (!ALLOWED_DISPLAY_NAME_CHARS_RE.test(displayName)) {
+    console.warn(
+      `[${participant}] in-meeting rename: skipped — displayName "${displayName}" ` +
+        `contains characters the meeting UI rejects (allowed: ASCII letters, ` +
+        `numbers, spaces, '_', '-', apostrophe). If you typed a "{participant}" ` +
+        `template, make sure the server-side substitution applied.`,
+    );
     return;
   }
 
@@ -1123,12 +1163,20 @@ export async function ensureDisplayNameInMeeting(args: {
     return;
   }
 
-  // Read the self-row's current display-name text. The self-row is
-  // identified by the presence of the edit pencil (`peer_item_edit_btn`),
-  // which is rendered only for the local user's row.
+  // Identify the self-row by the `(You)` / `(You/Host)` indicator AND
+  // the presence of the edit pencil. The text-marker filter is the
+  // robust signal — when multiple same-auth sessions are in the room
+  // their `peer_item_name_container`s carry the same display-name
+  // text but only the local self-row has the `.peer-indicator` text
+  // matching one of the You-variants. The edit-pencil filter is the
+  // belt-and-suspenders check (also self-only per
+  // `peer_list_item.rs:87`).
   const selfRow = page
     .locator("#peer-list-container li")
-    .filter({ has: page.locator("button.peer_item_edit_btn") });
+    .filter({ has: page.locator("button.peer_item_edit_btn") })
+    .filter({
+      has: page.locator(".peer-indicator", { hasText: /\(You(?:\/Host)?\)/ }),
+    });
 
   try {
     await selfRow.waitFor({ state: "visible", timeout: 5_000 });
@@ -1158,7 +1206,10 @@ export async function ensureDisplayNameInMeeting(args: {
 
   console.log(`[${participant}] in-meeting rename: "${cleaned}" → "${displayName}"`);
 
-  const editBtn = page.locator("button.peer_item_edit_btn");
+  // Click the edit pencil INSIDE the identified self-row (not the
+  // page-wide locator) so a hypothetical future render that places a
+  // pencil on more than one row can't misfire here.
+  const editBtn = selfRow.locator("button.peer_item_edit_btn").first();
   try {
     await editBtn.click({ timeout: 5_000 });
   } catch (e) {
@@ -1169,20 +1220,44 @@ export async function ensureDisplayNameInMeeting(args: {
     return;
   }
 
-  const nameInput = page.locator("input.input-apple");
+  // Scope the input + Save selectors to the rename modal's backdrop
+  // (`.glass-backdrop` per `update_display_name_modal.rs:36`) so we
+  // can't accidentally match a different modal that also uses
+  // `.input-apple` / a "Save" button somewhere on the page.
+  const modal = page.locator(".glass-backdrop").last();
+  const nameInput = modal.locator("input.input-apple");
+  const saveBtn = modal.getByRole("button", { name: "Save" });
+
   try {
     await nameInput.waitFor({ state: "visible", timeout: 5_000 });
     await nameInput.fill("");
     await nameInput.pressSequentially(displayName, { delay: 30 });
 
-    const saveBtn = page.getByRole("button", { name: "Save" });
     await saveBtn.waitFor({ state: "visible", timeout: 5_000 });
     await saveBtn.click();
-    console.log(`[${participant}] in-meeting rename submitted`);
+
+    // Verify the modal closed — the onsubmit handler in
+    // `update_display_name_modal.rs:86-125` keeps the modal open and
+    // renders an inline error when `validate_display_name` rejects
+    // the input. If we reach the post-click state with the modal
+    // still visible, the rename did NOT succeed; close the modal via
+    // Escape so the bot doesn't fight it on the next step.
+    try {
+      await nameInput.waitFor({ state: "hidden", timeout: 5_000 });
+      console.log(`[${participant}] in-meeting rename submitted (modal closed)`);
+    } catch {
+      console.warn(
+        `[${participant}] in-meeting rename: modal still open after Save click — ` +
+          `validation likely rejected "${displayName}". Closing modal via Escape.`,
+      );
+      await page.keyboard.press("Escape").catch(() => undefined);
+    }
   } catch (e) {
     console.warn(
       `[${participant}] in-meeting rename: modal interaction failed (${(e as Error).message})`,
     );
+    // Best-effort: try to close any stuck modal before continuing.
+    await page.keyboard.press("Escape").catch(() => undefined);
   }
 
   // Close the peer-list panel so the enable-media step starts from a

@@ -1,30 +1,20 @@
-/*
- * Copyright 2025 Security Union LLC
- *
- * Licensed under either of
- *
- * * Apache License, Version 2.0
- *   (http://www.apache.org/licenses/LICENSE-2.0)
- * * MIT license
- *   (http://opensource.org/licenses/MIT)
- *
- * at your option.
- */
-
 //! Named network-impairment presets.
 //!
-//! These are the human-friendly handles exposed to both the conversation
-//! manifest (`network: { profile: "..." }`) and the CLI overrides
-//! (`--impair-all` / `--impair-name`). All numeric values are round-number
-//! plausibility sketches, not measurements — they are intended to give a
-//! load test a repeatable shape, not to reproduce any specific carrier.
+//! These are the human-friendly handles exposed to both the bot's
+//! configuration files (`network: <profile>`) and the CLI overrides
+//! (`--impair-all` / `--impair-name` in the Rust bot; `network:
+//! <profile>` in the bots-app browser bot's meeting-config YAML — see
+//! discussion #793). All numeric values are round-number plausibility
+//! sketches, not measurements — they are intended to give a load test
+//! a repeatable shape, not to reproduce any specific carrier.
 //!
 //! Convention reminder: total one-way delay is drawn from
-//! `[latency_ms, latency_ms + 2 * jitter_ms]`. See [`crate::netsim`].
+//! `[latency_ms, latency_ms + 2 * jitter_ms]`. See [`crate::shim`].
 
-use crate::netsim::NetworkProfile;
+use crate::shim::NetworkProfile;
 
-/// Names of built-in presets, in the order they should appear in CLI help.
+/// Names of built-in presets, in the order they should appear in CLI
+/// help.
 pub const PRESET_NAMES: &[&str] = &[
     "none",
     "good_wifi",
@@ -35,8 +25,8 @@ pub const PRESET_NAMES: &[&str] = &[
     "dialup",
 ];
 
-/// Expose the preset names in a stable order (for `--help`, error messages,
-/// etc.).
+/// Expose the preset names in a stable order (for `--help`, error
+/// messages, etc.).
 pub fn list_profiles() -> &'static [&'static str] {
     PRESET_NAMES
 }
@@ -97,7 +87,7 @@ pub fn resolve_profile(name: &str) -> Option<NetworkProfile> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
@@ -118,6 +108,6 @@ mod tests {
 
     #[test]
     fn unknown_preset_is_none() {
-        assert!(resolve_profile("no_such_preset").is_none());
+        assert!(resolve_profile("not-a-real-profile").is_none());
     }
 }

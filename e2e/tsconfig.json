@@ -9,5 +9,6 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["tests/**/*.ts", "helpers/**/*.ts", "playwright.config.ts"]
+  "include": ["tests/**/*.ts", "helpers/**/*.ts", "bots-app/**/*.ts", "playwright.config.ts"],
+  "exclude": ["node_modules", "bots-app/dashboard"]
 }

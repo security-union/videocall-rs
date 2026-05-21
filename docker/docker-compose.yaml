@@ -83,7 +83,13 @@ services:
       - LISTEN_ADDR=0.0.0.0:8081
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
-      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-60}
+      # TOKEN_TTL_SECS=60 is hostile to local development: the cookie persists
+      # for SESSION_TTL_SECS (10 years) but the JWT inside expires in 1 minute,
+      # so any UI navigation after the first minute hits 401 with a
+      # still-attached but stale cookie. Default bumped to 24h for local dev,
+      # matching what the daily-deploy workflows ship (env[16].value=86400).
+      # Production callers can still override via the env-var path.
+      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-86400}
       - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
       - COOKIE_SECURE=false
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}

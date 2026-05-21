@@ -23,7 +23,7 @@ use std::fs;
 use url::Url;
 
 use crate::netsim::NetworkProfile;
-use crate::netsim_profiles::{list_profiles, resolve_profile};
+use videocall_netsim::{list_profiles, resolve_profile};
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -460,7 +460,7 @@ pub struct Participant {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipantNetwork {
-    /// Name of a preset from [`crate::netsim_profiles`].
+    /// Name of a preset from [`videocall_netsim::profiles`].
     pub profile: Option<String>,
     pub latency_ms: Option<u32>,
     pub jitter_ms: Option<u32>,

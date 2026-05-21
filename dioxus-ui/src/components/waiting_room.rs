@@ -413,7 +413,11 @@ pub fn WaitingRoom(
     }
 
     rsx! {
-        div { class: "waiting-room-container",
+        // `data-testid` added for the bots-app waiting-room detection
+        // path (see e2e/bots-app/src/meeting-join.ts). The bot uses it
+        // to distinguish "parked waiting for host admission" from the
+        // post-admit grid. Behaviourally inert.
+        div { class: "waiting-room-container", "data-testid": "meeting-waiting-room",
             div { class: "waiting-room-card card-apple",
                 div { class: "waiting-room-icon",
                     svg {

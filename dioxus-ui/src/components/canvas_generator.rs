@@ -287,6 +287,13 @@ pub struct AudioLevels {
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+///
+/// `my_session_id` is the LOCAL session_id (from `VideoCallClient::get_own_session_id`). It is
+/// compared against `key` (the peer's session_id) to detect the local user's own tile. Prior
+/// versions of this function used the local user_id, which caused sibling same-user sessions to
+/// be misidentified as "self" (HCL issue 828): each tab of the same authenticated user has its own
+/// distinct session_id but a shared user_id, so a user-id compare collapses sibling tabs into a
+/// single "self" tile in split layouts and screen-share paths.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_for_peer(
     client: &VideoCallClient,
@@ -295,7 +302,7 @@ pub fn generate_for_peer(
     audio_levels: AudioLevels,
     host_user_id: Option<&str>,
     mode: TileMode,
-    my_peer_id: Option<&str>,
+    my_session_id: Option<&str>,
     signal_info: SignalInfo,
     mut show_signal_popup: Signal<bool>,
     mut show_tile_menu: Signal<bool>,
@@ -356,15 +363,18 @@ pub fn generate_for_peer(
     let mic_inline_style = mic_style(visible_mic_level, visible_audio_level, appearance);
 
     // ---- Split-layout: screen-share left panel --------------------------------
+    // Self-identification keys on session_id, not user_id: two tabs/devices of
+    // the same authenticated user share a user_id but have distinct session_ids,
+    // and a sibling session must not be treated as "self" (HCL issue 828).
     if matches!(mode, TileMode::ScreenOnly) {
         // Don't render the local user's own screen share
-        if !is_screen_share_enabled_for_peer || my_peer_id == Some(peer_user_id.as_str()) {
+        if !is_screen_share_enabled_for_peer || my_session_id == Some(key.as_str()) {
             return rsx! {};
         }
     }
 
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
-    let is_self_peer = my_peer_id == Some(peer_user_id.as_str());
+    let is_self_peer = my_session_id == Some(key.as_str());
     let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
 
     if decision == TileDecision::Empty {
@@ -866,12 +876,14 @@ pub fn generate_for_peer(
     };
 
     // Derive flat &str values so the rsx! condition is a simple != comparison.
-    let peer_id = peer_user_id.as_str();
-    let my_peer_id = my_peer_id.unwrap_or("");
+    // Self-identification keys on session_id (`key`), not user_id, so sibling
+    // same-user sessions get their own screen-share canvas (HCL issue 828).
+    let peer_session_id = key.as_str();
+    let my_session_id_str = my_session_id.unwrap_or("");
 
     rsx! {
         // Canvas for Screen share.
-        if peer_id != my_peer_id && is_screen_share_enabled_for_peer {
+        if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",

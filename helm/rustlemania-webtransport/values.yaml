@@ -48,19 +48,10 @@ env:
   # WT outbound mpsc capacity per session. Default in code is 4096 (up
   # from 1024 to absorb 17+ peer fan-out bursts; codifies the value Jay
   # applied manually on the HCL daily deployment after the 2026-05-11
-  # incident, per Discussion #699). The shedding threshold below
-  # (WT_OUTBOUND_SHEDDING_THRESHOLD=512) depends on this 4096 capacity
-  # to provide ~2 seconds of audio-only runway before total buffer
-  # exhaustion. Stopgap until priority-aware dropping (Issue 1) lands.
-  # Override here only for exceptionally large meetings.
+  # incident, per Discussion #699). Override here only for
+  # exceptionally large meetings.
   # - name: WT_OUTBOUND_CHANNEL_CAPACITY
   #   value: "8192"
-  # Priority-shedding threshold (Issue 1 / PR #700 work): when fewer
-  # than this many slots remain free in the outbound channel, video
-  # frames are shed first to preserve audio. 512 ≈ 12.5% of the 4096
-  # default, giving ~2 seconds of audio-only runway before exhaustion.
-  - name: WT_OUTBOUND_SHEDDING_THRESHOLD
-    value: "512"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET

@@ -308,7 +308,11 @@ test.describe("Host mute controls", () => {
       await openPeersBtn.click();
       await hostPage.waitForTimeout(1000);
 
-      const hostActionsBtn = hostPage.locator('button[aria-label="Host actions"]');
+      // Scope to `.in-call-menu-wrapper` so we match the peer-list panel's
+      // "Host actions" button, not the per-tile button (same aria-label).
+      const hostActionsBtn = hostPage.locator(
+        '.in-call-menu-wrapper button[aria-label="Host actions"]',
+      );
       await expect(hostActionsBtn).toBeVisible({ timeout: 10_000 });
       await hostActionsBtn.click();
 

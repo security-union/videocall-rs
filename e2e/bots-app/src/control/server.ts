@@ -1278,10 +1278,24 @@ async function launchOne(
   // `{ kind: "local" }` / `{ kind: "ssh", hostLabel }`. We accept
   // either shape for back-compat and normalize to the structured one.
   const runLocation = parseRunLocationField(body.runLocation);
+  // `displayName` accepts the same `{participant}` template syntax that
+  // the multi-launch form's `displayNameTemplate` field uses (see
+  // `templateDisplayName` further down). When the operator types e.g.
+  // `"Bot {participant}"` in the single-bot LaunchForm's displayName
+  // input, substitute the participant name in BEFORE the value reaches
+  // the bot. Without this substitution the literal `{participant}` (with
+  // its `{` `}` chars) reaches `validate_display_name` on the dioxus
+  // side, which rejects it as an invalid character. Untemplated strings
+  // pass through unchanged, so this is a strict superset of the prior
+  // behaviour.
+  const resolvedDisplayName =
+    typeof displayName === "string"
+      ? (templateDisplayName(displayName, participant) ?? displayName)
+      : (displayName as string | undefined);
   const spec: LaunchSpec = {
     meetingURL,
     participant,
-    displayName: displayName as string | undefined,
+    displayName: resolvedDisplayName,
     ttl,
     headless,
     network,

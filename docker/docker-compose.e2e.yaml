@@ -157,6 +157,13 @@ services:
       # (see e2e/playwright.config.ts) so the browser resolves the wasm
       # client's `https://127.0.0.1:4433` target to this UDP listener.
       - "4433:4433/udp"
+      # TCP — health/metrics HTTP server bound by `webtransport_server` from
+      # `HEALTH_LISTEN_URL` (see `actix-api/src/bin/webtransport_server.rs`).
+      # Exposed so `e2e/helpers/wait-for-services.ts` can probe
+      # `http://localhost:5321/healthz` before any spec runs. A UDP socket
+      # has no portable "is it bound" readiness probe; the TCP health
+      # endpoint is the supported signal that the WT server is up.
+      - "5321:5321"
     volumes:
       - type: bind
         source: ../

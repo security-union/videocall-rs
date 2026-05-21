@@ -157,6 +157,7 @@ export function BotsPage() {
           {multiOpen && (
             <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
               <MultiLaunchForm
+                onToast={(t) => toast.push(t)}
                 onLaunched={(resp) => {
                   const launched = resp.botIds.length;
                   const namesList = resp.participants.slice(0, 5).join(", ");
@@ -224,6 +225,7 @@ export function BotsPage() {
             <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
               <LaunchForm
                 initialValues={initialValues}
+                onToast={(t) => toast.push(t)}
                 onLaunched={(botId) => {
                   toast.push({
                     title: "Bot launched",

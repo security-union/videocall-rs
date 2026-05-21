@@ -1146,16 +1146,27 @@ export async function ensureDisplayNameInMeeting(args: {
   }
 
   // The action bar auto-hides; nudge the mouse to reveal it so the
-  // "Open Peers" toggle is interactable.
+  // peer-list toggle is interactable.
   await page.mouse.move(400, 400).catch(() => {});
   await page.waitForTimeout(300);
 
-  const openPeers = page.locator("button.video-control-button", {
+  // The peer-list toggle is a SINGLE button whose tooltip swaps text
+  // based on panel state:
+  //   - panel closed → tooltip "Open Peers"
+  //   - panel open   → tooltip "Close Peers"
+  // (see `dioxus-ui/src/components/video_control_buttons.rs:200-242`).
+  // Scope by intent so we don't accidentally click the "close" target
+  // when we mean to open, or vice versa. Without this discriminator
+  // the action-bar's `button.video-control-button` set matches many
+  // buttons (mic, camera, screen-share, …) and Playwright would
+  // refuse with a strict-mode violation. The close path is handled
+  // by the dedicated `closePeerList` helper further down.
+  const openPeersBtn = page.locator("button.video-control-button", {
     has: page.locator(".tooltip", { hasText: "Open Peers" }),
   });
 
   try {
-    await openPeers.click({ timeout: 5_000 });
+    await openPeersBtn.click({ timeout: 5_000 });
   } catch (e) {
     console.warn(
       `[${participant}] in-meeting rename: could not open peer list (${(e as Error).message}) — skipping`,
@@ -1182,7 +1193,7 @@ export async function ensureDisplayNameInMeeting(args: {
     await selfRow.waitFor({ state: "visible", timeout: 5_000 });
   } catch {
     console.warn(`[${participant}] in-meeting rename: self-row not visible — skipping`);
-    await openPeers.click().catch(() => undefined);
+    await closePeerList(page, participant);
     return;
   }
 
@@ -1200,7 +1211,7 @@ export async function ensureDisplayNameInMeeting(args: {
     console.log(
       `[${participant}] in-meeting rename: display name already "${displayName}" — skipping`,
     );
-    await openPeers.click().catch(() => undefined);
+    await closePeerList(page, participant);
     return;
   }
 
@@ -1216,7 +1227,7 @@ export async function ensureDisplayNameInMeeting(args: {
     console.warn(
       `[${participant}] in-meeting rename: edit-pencil click failed (${(e as Error).message})`,
     );
-    await openPeers.click().catch(() => undefined);
+    await closePeerList(page, participant);
     return;
   }
 
@@ -1260,9 +1271,74 @@ export async function ensureDisplayNameInMeeting(args: {
     await page.keyboard.press("Escape").catch(() => undefined);
   }
 
-  // Close the peer-list panel so the enable-media step starts from a
-  // known state.
-  await openPeers.click().catch(() => undefined);
+  // Close the peer-list panel so the subsequent enable-media step has
+  // unobstructed access to the action-bar mic / camera buttons. See
+  // `closePeerList` — uses the tooltip-state-aware "Close Peers"
+  // locator AND verifies the panel actually disappeared.
+  await closePeerList(page, participant);
+}
+
+/**
+ * Close the in-meeting peer-list panel if it's currently open. Used
+ * by {@link ensureDisplayNameInMeeting} at every exit point so the
+ * subsequent enable-media step never has to fight a still-open panel
+ * blocking the action-bar buttons.
+ *
+ * Two failure modes the simple "click the toggle again" pattern hit
+ * in production:
+ *
+ *   1. **Tooltip text swaps with state** —
+ *      `dioxus-ui/src/components/video_control_buttons.rs:200-242`
+ *      renders `"Open Peers"` when closed and `"Close Peers"` when
+ *      open on the SAME button. Reusing the "Open Peers" locator for
+ *      both the initial open AND the final close (the pre-fix
+ *      behavior) silently failed on the close — the locator didn't
+ *      match the "Close Peers" tooltip, the click was a no-op, the
+ *      panel stayed open, and the next `clickWhenVisible` call for
+ *      the mic / camera buttons couldn't reach them because the
+ *      panel overlay was still on top.
+ *
+ *   2. **Action bar may have auto-hidden** during the rename modal's
+ *      lifetime. We nudge the mouse + brief wait before the click to
+ *      re-reveal the action bar (matches the same pre-click pattern
+ *      `joinMeetingAndEnableMedia` uses for mic / camera enable).
+ *
+ * Idempotent + tolerant: if the panel is already closed (no
+ * "Close Peers" button visible), the `waitFor` times out cleanly,
+ * the catch logs a debug line, and we return. Post-condition: panel
+ * is closed (or was already closed when we entered).
+ */
+async function closePeerList(page: Page, participant: string): Promise<void> {
+  // Re-reveal the action bar in case it auto-hid while the rename
+  // modal was open.
+  await page.mouse.move(400, 400).catch(() => undefined);
+  await page.waitForTimeout(150);
+
+  const closePeersBtn = page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Close Peers" }),
+  });
+
+  try {
+    // `isVisible` returns false (rather than throwing) when the
+    // button isn't there — that's the "panel already closed" path.
+    if (!(await closePeersBtn.isVisible({ timeout: 1_000 }).catch(() => false))) {
+      return;
+    }
+    await closePeersBtn.click({ timeout: 5_000 });
+
+    // Verify the panel actually closed by waiting for the "Close
+    // Peers" tooltip to disappear (and the "Open Peers" tooltip to
+    // reappear in its place per the toggle's state swap). Without
+    // this check, a click that landed off-target would leave the
+    // panel open and silently block the next step.
+    await closePeersBtn.waitFor({ state: "hidden", timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: peer-list close did not confirm ` +
+        `(${(e as Error).message}). The subsequent enable-media step may have ` +
+        `to fight a still-open panel — check the bot's mic / camera enable logs.`,
+    );
+  }
 }
 
 async function clickWhenVisible(

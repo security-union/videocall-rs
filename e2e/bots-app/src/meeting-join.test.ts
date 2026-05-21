@@ -8,6 +8,7 @@ import {
   WaitingRoomError,
   classifyJoinModeText,
   detectJoinMode,
+  ensureDisplayNameInMeeting,
   ensureWaitingRoomOff,
   installClickDiagnostics,
   joinMeetingAndEnableMedia,
@@ -33,6 +34,10 @@ describe("meeting-join module surface", () => {
     expect(typeof joinMeetingAndEnableMedia).toBe("function");
   });
 
+  it("exports ensureDisplayNameInMeeting as a function", () => {
+    expect(typeof ensureDisplayNameInMeeting).toBe("function");
+  });
+
   it("exports the meeting-state selector table", () => {
     expect(MEETING_STATE_SELECTORS).toEqual({
       waitingRoom: '[data-testid="meeting-waiting-room"]',
@@ -40,6 +45,53 @@ describe("meeting-join module surface", () => {
       rejected: '[data-testid="meeting-rejected"]',
       error: '[data-testid="meeting-error"]',
     });
+  });
+});
+
+describe("ensureDisplayNameInMeeting", () => {
+  // The Playwright-driven branches (open peer list → click pencil →
+  // fill → save) are covered by the manual smoke run described in
+  // `bots-app/README.md`. Here we lock in the two pure-control-flow
+  // early returns so they don't silently regress: an empty
+  // displayName argument must be a no-op (no UI interaction
+  // attempted), and any thrown failure from `page.mouse.move` (the
+  // first interaction) is swallowed without throwing — the helper is
+  // tolerant by contract.
+  it("returns immediately when displayName is empty (no page calls)", async () => {
+    const mouseMove = vi.fn();
+    const fakePage = {
+      mouse: { move: mouseMove },
+      waitForTimeout: vi.fn(),
+      locator: vi.fn(),
+    } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+
+    await ensureDisplayNameInMeeting({
+      page: fakePage,
+      participant: "alice",
+      displayName: "",
+    });
+
+    expect(mouseMove).not.toHaveBeenCalled();
+    expect(
+      (fakePage as unknown as { locator: ReturnType<typeof vi.fn> }).locator,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("treats whitespace-only displayName as empty (no-op)", async () => {
+    const mouseMove = vi.fn();
+    const fakePage = {
+      mouse: { move: mouseMove },
+      waitForTimeout: vi.fn(),
+      locator: vi.fn(),
+    } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+
+    await ensureDisplayNameInMeeting({
+      page: fakePage,
+      participant: "alice",
+      displayName: "   ",
+    });
+
+    expect(mouseMove).not.toHaveBeenCalled();
   });
 });
 

@@ -64,9 +64,7 @@ export function LoadPreviousButton({
   // Re-read on every menu open so cross-tab launches show up without a
   // page reload. Cheap — the worst case is parsing a 20-entry JSON
   // blob — and avoids the complexity of subscribing to `storage`.
-  const [entries, setEntries] = useState<LaunchedBotHistoryEntry[]>(() =>
-    loadLaunchedBotHistory(),
-  );
+  const [entries, setEntries] = useState<LaunchedBotHistoryEntry[]>(() => loadLaunchedBotHistory());
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
   const refresh = () => setEntries(loadLaunchedBotHistory());
@@ -114,16 +112,20 @@ export function LoadPreviousButton({
                 className="px-3 py-4 text-xs text-neutral-500 dark:text-slate-400"
                 data-testid={`${testId}-empty`}
               >
-                No previous launches yet. Launch a bot, and it&apos;ll appear here next
-                time.
+                No previous launches yet. Launch a bot, and it&apos;ll appear here next time.
               </div>
             ) : (
               <>
                 {entries.map((entry) => (
                   <DropdownMenu.Item
                     key={entry.launchedAt}
-                    onSelect={(ev) => {
-                      ev.preventDefault();
+                    onSelect={() => {
+                      // Let Radix's default behaviour close the menu
+                      // after a row is selected — the operator's next
+                      // action is editing the just-loaded form, not
+                      // picking another history row. The parent's
+                      // `onSelect` callback handles the form pre-fill
+                      // and surfaces a confirmation toast.
                       onSelect(entry);
                     }}
                     data-testid={`${testId}-entry-${entry.launchedAt}`}

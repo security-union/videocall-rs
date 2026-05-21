@@ -55,6 +55,19 @@ const MAX_SPAWN_DELAY_SECONDS = 60;
 interface MultiLaunchFormProps {
   onLaunched: (response: MultiLaunchResponse) => void;
   onError: (message: string) => void;
+  /**
+   * Optional toast hook used by `handleLoadPrevious` to confirm
+   * which previous bot config was loaded into the form. Lets the
+   * parent surface a "Loaded previous config" toast so the operator
+   * has a visible signal that the click landed and the form was
+   * repopulated. When omitted (e.g. tests), the load proceeds
+   * silently.
+   */
+  onToast?: (t: {
+    title: string;
+    description?: string;
+    variant: "success" | "info" | "error";
+  }) => void;
 }
 
 interface FormErrors {
@@ -145,7 +158,7 @@ function validate(values: MultiLaunchFormValues): FormErrors {
   return errors;
 }
 
-export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
+export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFormProps) {
   const [values, setValues] = useState<MultiLaunchFormValues>(DEFAULTS);
   const [errors, setErrors] = useState<FormErrors>({});
   const [submitted, setSubmitted] = useState(false);
@@ -281,6 +294,16 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     }));
     setErrors({});
     setSubmitted(false);
+    // Surface a confirmation toast naming the loaded config so the
+    // operator has a visible signal that the click landed. Multi-only
+    // fields (count, seed, mode, includeObservers, displayNameTemplate)
+    // stay as-is — the toast description reflects ONLY the shared
+    // fields actually loaded, so the operator knows what changed.
+    onToast?.({
+      title: "Loaded previous bot config (shared fields only)",
+      description: `${entry.meetingURL}`,
+      variant: "info",
+    });
   };
 
   const setField = <K extends keyof MultiLaunchFormValues>(

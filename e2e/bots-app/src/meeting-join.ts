@@ -300,7 +300,27 @@ export async function joinMeetingAndEnableMedia(args: {
 
     console.log(`[${participant}] in-meeting (grid visible)`);
 
-    // ── Step 2: enable mic + camera so the prep'd fake devices flow ───
+    // ── Step 2: ensure display name is set via the in-meeting rename ───
+    //
+    // The display-name prompt branch at the top of this function only
+    // fires when the bot lands in `meeting-name-prompt` state — i.e.
+    // when the bot is the first participant and the prompt actually
+    // renders. When the meeting has already been started by another
+    // participant (e.g. the operator pressed Start Meeting themselves
+    // and then launched the bot to join), the bot lands on the
+    // "Join Meeting" button directly and the prompt is never shown.
+    // In that case the prompt-fill branch above never ran, and the
+    // bot ends up in the grid with no display name set — visible to
+    // every other peer as the user_id-derived default.
+    //
+    // Use the in-meeting attendee-list edit button to guarantee the
+    // bot's display name matches `opts.displayName` regardless of how
+    // it entered the meeting. Idempotent: reads the current self-row's
+    // display name first and skips the rename if it already matches.
+    // Tolerant of all failure modes — never blocks the launch.
+    await ensureDisplayNameInMeeting({ page, participant, displayName });
+
+    // ── Step 3: enable mic + camera so the prep'd fake devices flow ───
 
     // The action bar auto-hides by default; hover it so the buttons are
     // visible to Playwright's isVisible check.
@@ -1043,6 +1063,131 @@ async function joinWithRetries(args: {
       teardown();
     }
   }
+}
+
+/**
+ * Set the bot's display name via the in-meeting attendee-list edit
+ * button. Used as a fallback for the case where the bot landed on
+ * "Join Meeting" without the display-name prompt rendering — e.g.
+ * the operator started the meeting themselves and the bot joined as a
+ * guest. In that case the prompt-fill branch in
+ * {@link joinMeetingAndEnableMedia} never fired and the bot has no
+ * display name set.
+ *
+ * Idempotent: reads the current self-row's display name first and
+ * skips the rename if it already matches `displayName`. Tolerant of
+ * every failure mode — logs a warning and returns; never throws.
+ *
+ * UI surface used (matches the rename flow exercised by
+ * `same-user-multi-session.spec.ts`):
+ *   1. Toggle the peer-list panel via the action-bar button whose
+ *      tooltip reads "Open Peers" (sourced from
+ *      `dioxus-ui/src/components/peer_list_button.rs`).
+ *   2. Click the edit pencil on the self-row
+ *      (`button.peer_item_edit_btn`, defined at
+ *      `dioxus-ui/src/components/peer_list_item.rs:88-95`). The
+ *      pencil renders ONLY on the local self-row, so the selector is
+ *      unambiguous on its own — no extra filter needed.
+ *   3. Fill the modal input (`input.input-apple`) with the desired
+ *      name and click the "Save" button.
+ *   4. Toggle the peer-list panel closed so the bot starts the
+ *      enable-media step from a known state.
+ */
+export async function ensureDisplayNameInMeeting(args: {
+  page: Page;
+  participant: string;
+  displayName: string;
+}): Promise<void> {
+  const { page, participant, displayName } = args;
+
+  if (displayName.trim() === "") {
+    console.log(`[${participant}] in-meeting rename: skipped (no displayName supplied)`);
+    return;
+  }
+
+  // The action bar auto-hides; nudge the mouse to reveal it so the
+  // "Open Peers" toggle is interactable.
+  await page.mouse.move(400, 400).catch(() => {});
+  await page.waitForTimeout(300);
+
+  const openPeers = page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Open Peers" }),
+  });
+
+  try {
+    await openPeers.click({ timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: could not open peer list (${(e as Error).message}) — skipping`,
+    );
+    return;
+  }
+
+  // Read the self-row's current display-name text. The self-row is
+  // identified by the presence of the edit pencil (`peer_item_edit_btn`),
+  // which is rendered only for the local user's row.
+  const selfRow = page
+    .locator("#peer-list-container li")
+    .filter({ has: page.locator("button.peer_item_edit_btn") });
+
+  try {
+    await selfRow.waitFor({ state: "visible", timeout: 5_000 });
+  } catch {
+    console.warn(`[${participant}] in-meeting rename: self-row not visible — skipping`);
+    await openPeers.click().catch(() => undefined);
+    return;
+  }
+
+  const rawText =
+    (await selfRow
+      .first()
+      .textContent()
+      .catch(() => null)) ?? "";
+  // Strip indicator suffixes the row template appends — "(You)",
+  // "(Host)", "(You/Host)", and "Guest" — so the comparison is on the
+  // raw display-name text only.
+  const cleaned = rawText.replace(/\(You\/Host\)|\(You\)|\(Host\)|Guest/g, "").trim();
+
+  if (cleaned === displayName) {
+    console.log(
+      `[${participant}] in-meeting rename: display name already "${displayName}" — skipping`,
+    );
+    await openPeers.click().catch(() => undefined);
+    return;
+  }
+
+  console.log(`[${participant}] in-meeting rename: "${cleaned}" → "${displayName}"`);
+
+  const editBtn = page.locator("button.peer_item_edit_btn");
+  try {
+    await editBtn.click({ timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: edit-pencil click failed (${(e as Error).message})`,
+    );
+    await openPeers.click().catch(() => undefined);
+    return;
+  }
+
+  const nameInput = page.locator("input.input-apple");
+  try {
+    await nameInput.waitFor({ state: "visible", timeout: 5_000 });
+    await nameInput.fill("");
+    await nameInput.pressSequentially(displayName, { delay: 30 });
+
+    const saveBtn = page.getByRole("button", { name: "Save" });
+    await saveBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await saveBtn.click();
+    console.log(`[${participant}] in-meeting rename submitted`);
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: modal interaction failed (${(e as Error).message})`,
+    );
+  }
+
+  // Close the peer-list panel so the enable-media step starts from a
+  // known state.
+  await openPeers.click().catch(() => undefined);
 }
 
 async function clickWhenVisible(

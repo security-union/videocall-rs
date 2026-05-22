@@ -709,12 +709,26 @@ pub async fn update_display_name(
             .await?
             .ok_or_else(AppError::not_in_meeting)?;
 
-    // Broadcast the display name change to all participants in the meeting
+    // Broadcast the display name change to all participants in the meeting.
+    //
+    // `session_id` is threaded through from the request body so the chat_server
+    // consumer and downstream peers can scope the rename to the originating
+    // tab (HCL issue #828 follow-up). Legacy clients omit the field, in which
+    // case `session_id=None` produces a proto-default `0` on the wire and
+    // every consumer falls back to the user-id-keyed rename path.
+    //
+    // The server does not validate that `session_id` belongs to the
+    // authenticated `user_id` here — the chat_server's
+    // `UpdateMemberDisplayName` handler verifies the `(session_id, user_id)`
+    // pair against its authoritative `room_members` table and silently no-ops
+    // (with a `warn!`) on mismatch. That keeps validation in the actor that
+    // owns the state instead of round-tripping through a cross-actor RPC.
     nats_events::publish_participant_display_name_changed(
         state.nats.as_ref(),
         &meeting_id,
         &user_id,
         &validated_name,
+        body.session_id,
     )
     .await;
 

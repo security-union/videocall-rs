@@ -38,7 +38,11 @@ pub fn PeerTile(
     #[props(default = false)] full_bleed: bool,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] render_mode: TileMode,
-    #[props(default)] my_peer_id: Option<String>,
+    /// The local user's session_id. Used to identify which tile is the local
+    /// user's own. Keyed on session_id, not user_id, so sibling same-user
+    /// sessions (HCL issue 828) are not mis-classified as self.
+    #[props(default)]
+    my_session_id: Option<String>,
     #[props(default)] pinned_peer_id: Option<String>,
     #[props(default)] room_id: Option<String>,
     #[props(default = false)] is_current_user_host: bool,
@@ -228,10 +232,16 @@ pub fn PeerTile(
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
+    // `is_self_peer` is true either when the tile's session_id matches the local
+    // session_id, OR when the tile's user_id matches the current user's user_id —
+    // the latter covers sibling sessions of the same account (e.g. a host with two
+    // browser tabs open), so host controls never appear on any of the current
+    // user's own tiles.
     let peer_uid_for_mute = client
         .get_peer_user_id(&peer_id)
         .unwrap_or_else(|| peer_id.clone());
-    let is_self_peer = my_peer_id.as_deref() == Some(peer_uid_for_mute.as_str());
+    let is_self_peer = my_session_id.as_deref() == Some(peer_id.as_str())
+        || peer_uid_for_mute == *client.user_id();
     let on_mute: Option<EventHandler<()>> =
         if is_current_user_host && !is_self_peer && audio_enabled() {
             if let Some(ref meeting_id) = room_id {
@@ -288,6 +298,33 @@ pub fn PeerTile(
         } else {
             None
         };
+    // Show kick button when: viewer is host, peer is not self (no media state check).
+    let on_kick: Option<EventHandler<()>> = if is_current_user_host && !is_self_peer {
+        if let Some(ref meeting_id) = room_id {
+            let meeting_id = meeting_id.clone();
+            let peer_uid = peer_uid_for_mute.clone();
+            Some(EventHandler::new(move |_: ()| {
+                let meeting_id = meeting_id.clone();
+                let peer_uid = peer_uid.clone();
+                spawn(async move {
+                    match crate::constants::meeting_api_client() {
+                        Ok(api_client) => {
+                            if let Err(e) =
+                                api_client.kick_participant(&meeting_id, &peer_uid).await
+                            {
+                                log::warn!("kick_participant failed: {e}");
+                            }
+                        }
+                        Err(e) => log::warn!("meeting_api_client error: {e}"),
+                    }
+                });
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     generate_for_peer(
         &client,
@@ -299,7 +336,7 @@ pub fn PeerTile(
         },
         host_uid,
         render_mode,
-        my_peer_id.as_deref(),
+        my_session_id.as_deref(),
         SignalInfo {
             level: sig_level,
             history: sig_samples,
@@ -313,6 +350,7 @@ pub fn PeerTile(
         show_tile_menu,
         on_mute,
         on_disable_video,
+        on_kick,
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,

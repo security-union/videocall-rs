@@ -72,6 +72,28 @@ impl Connection {
         options: ConnectOptions,
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
+        // Phase 3c (discussion #793): on the first call per tab,
+        // parse `?netsim=<profile>` from `window.location` and
+        // install the matching `NetSimShim` in the per-tab hook slot.
+        // `std::sync::Once` makes this idempotent across reconnects —
+        // a re-election or session drop that calls `Connection::connect`
+        // again must not reinstall and reset the hook. Safe on
+        // `wasm32-unknown-unknown` because (a) a browser tab is
+        // single-threaded, so `Once`'s "first call wins" is race-free
+        // and maps to "first connect per tab wins", and (b)
+        // `window.location` query params are immutable for the tab
+        // lifetime (a real URL change is a navigation that tears down
+        // this wasm instance), so re-parsing on reconnect would yield
+        // the same profile — skipping it is an optimization, not a
+        // behavior change. See `connection/netsim_url.rs`.
+        #[cfg(feature = "netsim")]
+        {
+            static NETSIM_URL_INSTALL: std::sync::Once = std::sync::Once::new();
+            NETSIM_URL_INSTALL.call_once(|| {
+                let _ = super::netsim_url::try_install_from_url();
+            });
+        }
+
         let mut new_options = options.clone();
         let status = Rc::new(Cell::new(Status::Connecting));
 
@@ -102,8 +124,18 @@ impl Connection {
             TransportType::TRANSPORT_WEBSOCKET
         };
 
+        let task = Rc::new(task);
+
+        // Phase 3b (discussion #793): register a `Weak<Task>` with
+        // the per-tab netsim hook so the async `Delay` /
+        // `DelayAndDuplicate` paths can re-enter the send pipeline
+        // after the simulated delay. See
+        // `connection/netsim_hook.rs` for the full design.
+        #[cfg(feature = "netsim")]
+        super::netsim_hook::install_task(Some(Rc::downgrade(&task)));
+
         let connection = Self {
-            task: Rc::new(task),
+            task,
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
                 monitor.emit(());

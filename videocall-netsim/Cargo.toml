@@ -1,0 +1,23 @@
+[package]
+name = "videocall-netsim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Transport-layer network-condition simulator (loss, latency, jitter, bandwidth shaping, duplicate, reorder) for videocall.rs clients and synthetic bots. Builds for both native and wasm32-unknown-unknown."
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["network-simulator", "netem", "videocall", "wasm"]
+categories = ["multimedia", "network-programming", "simulation"]
+
+[dependencies]
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+web-time = "1.1.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.20"

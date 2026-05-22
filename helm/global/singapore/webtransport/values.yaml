@@ -46,8 +46,6 @@ rustlemania-webtransport:
       value: "2"  # Small pool for blocking crypto operations
     - name: WT_OUTBOUND_CHANNEL_CAPACITY
       value: "4096"
-    - name: WT_OUTBOUND_SHEDDING_THRESHOLD
-      value: "512"
 
   resources:
     limits:

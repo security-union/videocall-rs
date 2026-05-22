@@ -93,11 +93,11 @@ async function admitGuestIfNeeded(
 
 /**
  * Open the per-tile host actions menu on a remote peer and click the inner
- * "Remove from call" item.
+ * "Remove from meeting" item.
  *
  * The per-tile menu is rendered inside the canvas grid (see
  * `canvas_generator.rs`). Unlike Mute / Disable-video — which are gated on
- * the peer's audio/video state — the "Remove from call" item is rendered whenever the
+ * the peer's audio/video state — the "Remove from meeting" item is rendered whenever the
  * viewer is the host and the peer is not themselves (see `peer_tile.rs`:
  * `is_current_user_host && !is_self_peer`). The toggle
  * (`title="Host actions"`, class `.tile-mute-btn`) is hidden via
@@ -106,8 +106,8 @@ async function admitGuestIfNeeded(
  *
  * The flow is two-step:
  *   1. Click the toggle to open the tile context menu.
- *   2. Click the inner "Remove from call" item (a `.tile-context-menu-item` with the
- *      `--danger` modifier), which invokes the host kick action — the server
+ *   2. Click the inner "Remove from meeting" item (a `.tile-context-menu-item`),
+ *      which invokes the host kick action — the server
  *      sets the participant's DB status to `'kicked'` and publishes a
  *      `PARTICIPANT_KICKED` NATS event.
  *
@@ -126,8 +126,8 @@ async function hostKickPeerViaTile(page: Page): Promise<void> {
   await expect(hostActionsToggle).toBeVisible({ timeout: 15_000 });
   await hostActionsToggle.click();
 
-  // The "Remove from call" item carries the danger modifier class. Match by text inside
-  // `.tile-context-menu-item` (which also matches the danger variant).
+  // Match by text inside
+  // `.tile-context-menu-item`.
   const kickItem = guestTile.locator(".tile-context-menu-item", {
     hasText: "Remove from meeting",
   });
@@ -147,12 +147,12 @@ test.describe("Host kick controls", () => {
   /**
    * Test 1: Host removes a participant via the per-tile three-dot menu.
    *
-   * Unlike Mute / Disable-video, the "Remove from call" item is NOT gated on the peer's
+   * Unlike Mute / Disable-video, the "Remove from meeting" item is NOT gated on the peer's
    * audio/video state — it is rendered as soon as the viewer is the host and
    * the tile is not their own. So we do not need to enable mic/camera on the
    * guest before exercising the menu.
    *
-   * When the host clicks "Remove from call": the server sets the participant's DB status to
+   * When the host clicks "Remove from meeting": the server sets the participant's DB status to
    * `'kicked'` and publishes a `PARTICIPANT_KICKED` NATS event. The kicked
    * participant's UI receives the event and shows the `MeetingEndedOverlay`
    * with the kicked-by-host message.
@@ -199,7 +199,7 @@ test.describe("Host kick controls", () => {
         timeout: 30_000,
       });
 
-      // ---- Host opens the tile menu and clicks "Remove from call" ----
+      // ---- Host opens the tile menu and clicks "Remove from meeting" ----
       await hostKickPeerViaTile(hostPage);
 
       // ---- Guest receives PARTICIPANT_KICKED: client disconnects immediately

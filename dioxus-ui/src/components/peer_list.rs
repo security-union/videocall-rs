@@ -438,7 +438,7 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
-                                    // Kick: shown whenever the local user is host.
+                                    // Remove from meeting: shown whenever the local user is host.
                                     let on_kick = if is_current_user_host && user_id != current_user_id_val {
                                         let meeting_id = room_id.clone();
                                         let peer_user_id = user_id.clone();

@@ -17,7 +17,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *    session_id matches the local session_id, OR the tile's user_id matches
  *    the local user_id. The user_id branch catches the case where the host
  *    has two tabs open authenticated as the same account — the second tab's
- *    tile must not show Mute / Disable video / Kick on the first tab.
+ *    tile must not show Mute / Disable video / Remove from meeting on the first tab.
  */
 
 // ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ test.describe("Host context menus — click-outside-to-close", () => {
 
   /**
    * Behavior 2: a host with two browser tabs (same user_id, different
-   * session_id) does NOT see Mute / Disable video / Kick on their own
+   * session_id) does NOT see Mute / Disable video / Remove from meeting on their own
    * sibling-session tile.
    *
    * `is_self_peer` in `peer_tile.rs` is now true when EITHER the tile's
@@ -239,7 +239,9 @@ test.describe("Host context menus — click-outside-to-close", () => {
    * `.tile-mute-btn` because its session_id differs from the viewing tab's
    * session_id. This test fails if the user_id branch is reverted.
    */
-  test("host's sibling-tab tile does not show Mute / Disable video / Kick", async ({ baseURL }) => {
+  test("host's sibling-tab tile does not show Mute / Disable video / Remove from meeting", async ({
+    baseURL,
+  }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_host_self_sibling_${Date.now()}`;

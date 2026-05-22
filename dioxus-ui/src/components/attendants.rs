@@ -830,6 +830,7 @@ pub fn AttendantsComponent(
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
+        let client_for_kick = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
 
@@ -1000,8 +1001,18 @@ pub fn AttendantsComponent(
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
                     let mut meeting_start_time_server = meeting_start_time_server;
                     let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
                     meeting_start_time_server.set(Some(end_time_ms));
                     meeting_ended_message.set(Some(message));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
                 },
             )),
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
@@ -1105,6 +1116,32 @@ pub fn AttendantsComponent(
                         show_video_off_toast.set(false);
                         video_off_toast_timer.set(None);
                     })));
+                }))
+            },
+            on_participant_kicked: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
+                    meeting_ended_message.set(Some(
+                        "You have been removed from the meeting by the host.".to_string(),
+                    ));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
+                    log::info!("PARTICIPANT_KICKED: removed from meeting by host");
+                    if let Some(client) = client_for_kick.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+                        }
+                    }
                 }))
             },
             on_peer_left: {

@@ -12,14 +12,15 @@
  */
 
 //! Host-only meeting controls.
-//! Mute or disable video for a single participant or for all. Only the meeting host may call these endpoints.
+//! Mute, disable video, or kick a single participant; mute/disable-video for all.
+//! Only the meeting host may call these endpoints.
 
 use axum::{
     extract::{Path, State},
     Json,
 };
 use videocall_meeting_types::{
-    requests::{DisableVideoParticipantRequest, MuteParticipantRequest},
+    requests::{DisableVideoParticipantRequest, KickParticipantRequest, MuteParticipantRequest},
     responses::APIResponse,
 };
 
@@ -182,6 +183,60 @@ pub async fn disable_video_all(
                 "NATS publish failed for HOST_DISABLE_VIDEO_ALL in room {meeting_id}: {e}"
             );
             AppError::internal("failed to broadcast disable-video event")
+        })?;
+    Ok(Json(APIResponse::ok(())))
+}
+
+/// `POST /api/v1/meetings/{meeting_id}/kick`.
+///
+/// Host removes a single participant from the meeting. The server:
+///   1. Marks the participant's DB row as `status='kicked'`.
+///   2. Publishes a `PARTICIPANT_KICKED` NATS event with the target user ID.
+///
+/// The kicked participant's client receives the event, shows a toast, and
+/// disconnects. They may rejoin by navigating to the meeting URL again (they
+/// go through the normal join/waiting-room flow).
+pub async fn kick_participant(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<KickParticipantRequest>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_found(&meeting_id));
+    }
+    require_host(&state, meeting.id, &user_id).await?;
+
+    if body.user_id.is_empty() {
+        return Err(AppError::bad_request("user_id must not be empty"));
+    }
+
+    const MAX_USER_ID_LEN: usize = 254;
+    if body.user_id.len() > MAX_USER_ID_LEN {
+        return Err(AppError::bad_request("user_id too long"));
+    }
+    if body.user_id == user_id {
+        return Err(AppError::bad_request("cannot kick yourself"));
+    }
+
+    db_participants::kick(&state.db, meeting.id, &body.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "DB kick failed for user {} in room {meeting_id}: {e}",
+                body.user_id
+            );
+            AppError::internal("failed to update participant status")
+        })?;
+
+    nats_events::publish_host_kick(state.nats.as_ref(), &meeting_id, &body.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("NATS publish failed for PARTICIPANT_KICKED in room {meeting_id}: {e}");
+            AppError::internal("failed to broadcast kick event")
         })?;
     Ok(Json(APIResponse::ok(())))
 }

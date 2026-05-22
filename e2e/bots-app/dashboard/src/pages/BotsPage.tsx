@@ -102,231 +102,264 @@ export function BotsPage() {
   const [optimistic, setOptimistic] = useState<OptimisticState>({});
 
   return (
-    <div className="flex flex-col gap-6">
-      <section
-        aria-label="Multi-launch"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
-        data-testid="multi-launch-section"
+    <div className="flex flex-col gap-8">
+      {/* ─── Launching group ───────────────────────────────────────────
+          The two launch surfaces (multi-launch + single-launch) form
+          a "compose what to spawn" mental block. Grouping them under a
+          shared eyebrow label + a subtle background tint visually
+          separates "actions you take" from "things currently
+          happening" (the running group further down). The wrapper is
+          purely structural — section-level data-testids / aria-labels
+          on each form remain at their established locations so any
+          existing E2E selectors stay valid. */}
+      <div
+        className="flex flex-col gap-6 rounded-xl bg-sky-50/40 p-4 dark:bg-slate-900/40"
+        data-testid="launching-group"
       >
-        <button
-          type="button"
-          onClick={() => setMultiOpen((v) => !v)}
-          className="flex w-full items-center justify-between px-6 py-4 text-left"
-          aria-expanded={multiOpen}
-          data-testid="multi-launch-toggle"
+        <h2 className="px-1 text-xs font-semibold uppercase tracking-wider text-sky-700 dark:text-sky-300">
+          Launching
+        </h2>
+        <section
+          aria-label="Multi-launch"
+          className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+          data-testid="multi-launch-section"
         >
-          <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
-              Multi-launch
-            </h2>
-            <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Spawn N bots from the manifest in one click — first-N (deterministic) or random-N
-              (seeded). Matches the CLI&apos;s{" "}
-              <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
-                bots-app run --users N
-              </code>{" "}
-              and{" "}
-              <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
-                bots-app gen --count N --seed S
-              </code>
-              .
-            </p>
-          </div>
-          {multiOpen ? (
-            <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
-          ) : (
-            <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
-          )}
-        </button>
-        {multiOpen && (
-          <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
-            <MultiLaunchForm
-              onLaunched={(resp) => {
-                const launched = resp.botIds.length;
-                const namesList = resp.participants.slice(0, 5).join(", ");
-                const tail =
-                  resp.participants.length > 5 ? `, +${resp.participants.length - 5} more` : "";
-                const seedLine =
-                  resp.mode === "random" && resp.seed !== null ? ` (seed=${resp.seed})` : "";
-                toast.push({
-                  title:
-                    launched === resp.count
-                      ? `Launched ${launched} bots`
-                      : `Launched ${launched}/${resp.count} bots`,
-                  description: `${namesList}${tail}${seedLine}`,
-                  variant: resp.errors.length > 0 ? "info" : "success",
-                });
-                if (resp.errors.length > 0) {
-                  for (const err of resp.errors) {
-                    toast.push({
-                      title: `Skipped ${err.participant}`,
-                      description: err.message,
-                      variant: "error",
-                    });
-                  }
-                }
-                botsQuery.refetch();
-              }}
-              onError={(message) =>
-                toast.push({
-                  title: "Multi-launch failed",
-                  description: message,
-                  variant: "error",
-                })
-              }
-            />
-          </div>
-        )}
-      </section>
-
-      <section
-        aria-label="Launch a Bot"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
-      >
-        <button
-          type="button"
-          onClick={handleToggle}
-          className="flex w-full items-center justify-between px-6 py-4 text-left"
-          aria-expanded={effectiveOpen}
-          data-testid="launch-form-toggle"
-        >
-          <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
-              Launch a Bot
-            </h2>
-            <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Configure a meeting attendee and where it should run.
-            </p>
-          </div>
-          {effectiveOpen ? (
-            <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
-          ) : (
-            <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
-          )}
-        </button>
-        {effectiveOpen && (
-          <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
-            <LaunchForm
-              initialValues={initialValues}
-              onLaunched={(botId) => {
-                toast.push({
-                  title: "Bot launched",
-                  description: `Bot ${botId.slice(0, 8)} is starting…`,
-                  variant: "success",
-                });
-                botsQuery.refetch();
-              }}
-              onError={(message) =>
-                toast.push({ title: "Launch failed", description: message, variant: "error" })
-              }
-            />
-          </div>
-        )}
-      </section>
-
-      <RunProfiles
-        hasBots={(botsQuery.data?.bots ?? []).length > 0}
-        onToast={(t) => toast.push(t)}
-      />
-
-      <section
-        aria-label="Running Bots"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
-      >
-        <div className="flex items-center justify-between px-6 py-4">
-          <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
-              Running Bots
-            </h2>
-            <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Live bots currently in the orchestrator&apos;s registry. Refreshes every 2.5s.
-            </p>
-          </div>
-          <span
-            className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
-            data-testid="running-bots-count-badge"
+          <button
+            type="button"
+            onClick={() => setMultiOpen((v) => !v)}
+            className="flex w-full items-center justify-between px-6 py-4 text-left"
+            aria-expanded={multiOpen}
+            data-testid="multi-launch-toggle"
           >
-            {liveBots.length} live / {totalBots} total
-          </span>
-        </div>
-        <BulkActionsToolbar
-          bots={liveBots}
-          optimistic={optimistic}
-          setOptimistic={setOptimistic}
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+                Multi-launch
+              </h2>
+              <p className="text-sm text-neutral-500 dark:text-slate-400">
+                Spawn N bots from the manifest in one click — first-N (deterministic) or random-N
+                (seeded). Matches the CLI&apos;s{" "}
+                <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                  bots-app run --users N
+                </code>{" "}
+                and{" "}
+                <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px] dark:bg-slate-900">
+                  bots-app gen --count N --seed S
+                </code>
+                .
+              </p>
+            </div>
+            {multiOpen ? (
+              <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+            ) : (
+              <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+            )}
+          </button>
+          {multiOpen && (
+            <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
+              <MultiLaunchForm
+                onToast={(t) => toast.push(t)}
+                onLaunched={(resp) => {
+                  const launched = resp.botIds.length;
+                  const namesList = resp.participants.slice(0, 5).join(", ");
+                  const tail =
+                    resp.participants.length > 5 ? `, +${resp.participants.length - 5} more` : "";
+                  const seedLine =
+                    resp.mode === "random" && resp.seed !== null ? ` (seed=${resp.seed})` : "";
+                  toast.push({
+                    title:
+                      launched === resp.count
+                        ? `Launched ${launched} bots`
+                        : `Launched ${launched}/${resp.count} bots`,
+                    description: `${namesList}${tail}${seedLine}`,
+                    variant: resp.errors.length > 0 ? "info" : "success",
+                  });
+                  if (resp.errors.length > 0) {
+                    for (const err of resp.errors) {
+                      toast.push({
+                        title: `Skipped ${err.participant}`,
+                        description: err.message,
+                        variant: "error",
+                      });
+                    }
+                  }
+                  botsQuery.refetch();
+                }}
+                onError={(message) =>
+                  toast.push({
+                    title: "Multi-launch failed",
+                    description: message,
+                    variant: "error",
+                  })
+                }
+              />
+            </div>
+          )}
+        </section>
+
+        <section
+          aria-label="Launch a Bot"
+          className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+        >
+          <button
+            type="button"
+            onClick={handleToggle}
+            className="flex w-full items-center justify-between px-6 py-4 text-left"
+            aria-expanded={effectiveOpen}
+            data-testid="launch-form-toggle"
+          >
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+                Launch a Bot
+              </h2>
+              <p className="text-sm text-neutral-500 dark:text-slate-400">
+                Configure a meeting attendee and where it should run.
+              </p>
+            </div>
+            {effectiveOpen ? (
+              <ChevronUp className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+            ) : (
+              <ChevronDown className="h-5 w-5 text-neutral-400 dark:text-slate-500" />
+            )}
+          </button>
+          {effectiveOpen && (
+            <div className="border-t border-neutral-200 px-6 py-5 dark:border-slate-700">
+              <LaunchForm
+                initialValues={initialValues}
+                onToast={(t) => toast.push(t)}
+                onLaunched={(botId) => {
+                  toast.push({
+                    title: "Bot launched",
+                    description: `Bot ${botId.slice(0, 8)} is starting…`,
+                    variant: "success",
+                  });
+                  botsQuery.refetch();
+                }}
+                onError={(message) =>
+                  toast.push({ title: "Launch failed", description: message, variant: "error" })
+                }
+              />
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* ─── Running group ─────────────────────────────────────────────
+          "Things currently happening" — saved run profiles, live
+          bots, and recently-terminated bots. Distinct background tint
+          from the launching group above so the operator can visually
+          jump straight to either half without having to read the
+          section headers. */}
+      <div
+        className="flex flex-col gap-6 rounded-xl bg-emerald-50/30 p-4 dark:bg-slate-900/40"
+        data-testid="running-group"
+      >
+        <h2 className="px-1 text-xs font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-300">
+          Running
+        </h2>
+        <RunProfiles
+          hasBots={(botsQuery.data?.bots ?? []).length > 0}
           onToast={(t) => toast.push(t)}
         />
-        <div className="border-t border-neutral-200 dark:border-slate-700">
-          <RunningBotsTable
-            isLoading={botsQuery.isLoading}
-            error={botsQuery.error}
+
+        <section
+          aria-label="Running Bots"
+          className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+        >
+          <div className="flex items-center justify-between px-6 py-4">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+                Running Bots
+              </h2>
+              <p className="text-sm text-neutral-500 dark:text-slate-400">
+                Live bots currently in the orchestrator&apos;s registry. Refreshes every 2.5s.
+              </p>
+            </div>
+            <span
+              className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
+              data-testid="running-bots-count-badge"
+            >
+              {liveBots.length} live / {totalBots} total
+            </span>
+          </div>
+          <BulkActionsToolbar
             bots={liveBots}
             optimistic={optimistic}
             setOptimistic={setOptimistic}
-            onDuplicate={(snap) => {
-              setInitialValues({
-                meetingURL: snap.meetingURL,
-                participant: snap.participant,
-                displayName: snap.participant,
-                ttl: snap.ttl,
-                network: snap.network ?? "none",
-                headless: false,
-                authBackend: "jwt",
-                storageStateFile: "",
-                runLocation: "local",
-                sshHostLabel: "",
-                costume: "default",
-                audio: "default",
-              });
-              setUserOverride(true);
-              setLaunchOpen(true);
-              toast.push({
-                title: "Form pre-filled",
-                description: `Tweak any field then click Launch Bot to spawn a copy of ${snap.participant}.`,
-                variant: "info",
-              });
-            }}
             onToast={(t) => toast.push(t)}
           />
-        </div>
-      </section>
+          <div className="border-t border-neutral-200 dark:border-slate-700">
+            <RunningBotsTable
+              isLoading={botsQuery.isLoading}
+              error={botsQuery.error}
+              bots={liveBots}
+              optimistic={optimistic}
+              setOptimistic={setOptimistic}
+              onDuplicate={(snap) => {
+                setInitialValues({
+                  meetingURL: snap.meetingURL,
+                  participant: snap.participant,
+                  displayName: snap.participant,
+                  ttl: snap.ttl,
+                  network: snap.network ?? "none",
+                  headless: false,
+                  authBackend: "jwt",
+                  storageStateFile: "",
+                  runLocation: "local",
+                  sshHostLabel: "",
+                  costume: "default",
+                  audio: "default",
+                });
+                setUserOverride(true);
+                setLaunchOpen(true);
+                toast.push({
+                  title: "Form pre-filled",
+                  description: `Tweak any field then click Launch Bot to spawn a copy of ${snap.participant}.`,
+                  variant: "info",
+                });
+              }}
+              onToast={(t) => toast.push(t)}
+            />
+          </div>
+        </section>
 
-      <section
-        aria-label="Terminated Bots"
-        className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
-        data-testid="terminated-bots-section"
-      >
-        <div className="flex items-center justify-between px-6 py-4">
-          <div>
-            <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
-              Terminated Bots
-            </h2>
-            <p className="text-sm text-neutral-500 dark:text-slate-400">
-              Bots that have ended in the last hour. Logs remain available here for post-mortem
-              inspection.
-            </p>
+        <section
+          aria-label="Terminated Bots"
+          className="rounded-lg border border-neutral-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800"
+          data-testid="terminated-bots-section"
+        >
+          <div className="flex items-center justify-between px-6 py-4">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-slate-100">
+                Terminated Bots
+              </h2>
+              <p className="text-sm text-neutral-500 dark:text-slate-400">
+                Bots that have ended in the last hour. Logs remain available here for post-mortem
+                inspection.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
+                data-testid="terminated-bots-count-badge"
+              >
+                {terminatedBots.length} / {TERMINATED_CAP}
+              </span>
+              <button
+                type="button"
+                onClick={() => setConfirmClearAll(true)}
+                disabled={terminatedBots.length === 0 || clearTerminated.isPending}
+                data-testid="terminated-bots-clear-all"
+                className="rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+              >
+                Clear all
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span
-              className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 font-mono text-xs text-neutral-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
-              data-testid="terminated-bots-count-badge"
-            >
-              {terminatedBots.length} / {TERMINATED_CAP}
-            </span>
-            <button
-              type="button"
-              onClick={() => setConfirmClearAll(true)}
-              disabled={terminatedBots.length === 0 || clearTerminated.isPending}
-              data-testid="terminated-bots-clear-all"
-              className="rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
-            >
-              Clear all
-            </button>
+          <div className="border-t border-neutral-200 dark:border-slate-700">
+            <TerminatedBotsTable bots={terminatedBots} onToast={(t) => toast.push(t)} />
           </div>
-        </div>
-        <div className="border-t border-neutral-200 dark:border-slate-700">
-          <TerminatedBotsTable bots={terminatedBots} onToast={(t) => toast.push(t)} />
-        </div>
-      </section>
+        </section>
+      </div>
 
       <ConfirmDialog
         open={confirmClearAll}

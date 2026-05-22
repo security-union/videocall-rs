@@ -2,12 +2,14 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 
 import {
   type ClickAttemptDiagnostics,
+  ALLOWED_DISPLAY_NAME_CHARS_RE,
   JoinRejectedError,
   MEETING_STATE_SELECTORS,
   MeetingNavigatedAwayError,
   WaitingRoomError,
   classifyJoinModeText,
   detectJoinMode,
+  ensureDisplayNameInMeeting,
   ensureWaitingRoomOff,
   installClickDiagnostics,
   joinMeetingAndEnableMedia,
@@ -33,6 +35,10 @@ describe("meeting-join module surface", () => {
     expect(typeof joinMeetingAndEnableMedia).toBe("function");
   });
 
+  it("exports ensureDisplayNameInMeeting as a function", () => {
+    expect(typeof ensureDisplayNameInMeeting).toBe("function");
+  });
+
   it("exports the meeting-state selector table", () => {
     expect(MEETING_STATE_SELECTORS).toEqual({
       waitingRoom: '[data-testid="meeting-waiting-room"]',
@@ -40,6 +46,124 @@ describe("meeting-join module surface", () => {
       rejected: '[data-testid="meeting-rejected"]',
       error: '[data-testid="meeting-error"]',
     });
+  });
+});
+
+describe("ALLOWED_DISPLAY_NAME_CHARS_RE", () => {
+  // Locks the regex against the rules in
+  // `videocall-types/src/validation.rs::is_allowed_display_name_char` —
+  // ASCII letters, numbers, spaces, underscore, hyphen, apostrophe.
+  // If those server-side rules change, this regex (and the dioxus UI's
+  // `validate_display_name`) need to change together. The bot's
+  // pre-check would otherwise let through values the meeting UI then
+  // rejects, leaving the rename modal stuck.
+  it("accepts the canonical allowed alphabet", () => {
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("Alice")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("ALICE")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("Alice 1")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice_1")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice-bob")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("O'Neil")).toBe(true);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("Bot alice")).toBe(true);
+  });
+
+  it("rejects the template literal that was the original bug-trigger", () => {
+    // The user-reported case: typing `Bot {participant}` in the
+    // single-bot displayName field. Without the server-side
+    // templateDisplayName substitution (added alongside this regex),
+    // the literal `{` and `}` reach the meeting UI's validator and
+    // get rejected. The bot's pre-check must short-circuit before
+    // typing — otherwise the modal opens but never closes.
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("Bot {participant}")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("{participant}")).toBe(false);
+  });
+
+  it("rejects other disallowed characters", () => {
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice@example.com")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice/bob")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice<bob>")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice!")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice.bob")).toBe(false);
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("alice🙂")).toBe(false);
+  });
+
+  it("rejects the empty string (no characters to validate)", () => {
+    expect(ALLOWED_DISPLAY_NAME_CHARS_RE.test("")).toBe(false);
+  });
+});
+
+describe("ensureDisplayNameInMeeting", () => {
+  // The Playwright-driven branches (open peer list → click pencil →
+  // fill → save) are covered by the manual smoke run described in
+  // `bots-app/README.md`. Here we lock in the pure-control-flow early
+  // returns so they don't silently regress: an empty displayName
+  // argument must be a no-op (no UI interaction attempted), and a
+  // displayName containing characters the meeting UI rejects (e.g.
+  // an unsubstituted `{participant}` template) must short-circuit
+  // BEFORE we open the peer list — otherwise the modal opens and
+  // gets stuck on the inline validation error.
+  it("returns immediately when displayName is empty (no page calls)", async () => {
+    const mouseMove = vi.fn();
+    const fakePage = {
+      mouse: { move: mouseMove },
+      waitForTimeout: vi.fn(),
+      locator: vi.fn(),
+    } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+
+    await ensureDisplayNameInMeeting({
+      page: fakePage,
+      participant: "alice",
+      displayName: "",
+    });
+
+    expect(mouseMove).not.toHaveBeenCalled();
+    expect(
+      (fakePage as unknown as { locator: ReturnType<typeof vi.fn> }).locator,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("treats whitespace-only displayName as empty (no-op)", async () => {
+    const mouseMove = vi.fn();
+    const fakePage = {
+      mouse: { move: mouseMove },
+      waitForTimeout: vi.fn(),
+      locator: vi.fn(),
+    } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+
+    await ensureDisplayNameInMeeting({
+      page: fakePage,
+      participant: "alice",
+      displayName: "   ",
+    });
+
+    expect(mouseMove).not.toHaveBeenCalled();
+  });
+
+  it("returns without touching the page when displayName contains invalid chars", async () => {
+    // The user-reported failure path: bot received a literal
+    // `Bot {participant}` (server-side substitution didn't happen).
+    // The pre-check must short-circuit BEFORE opening the peer list
+    // — otherwise the modal would open with the invalid value typed
+    // in, validation would reject it, and the modal would stay open
+    // blocking the bot's subsequent steps.
+    const mouseMove = vi.fn();
+    const fakePage = {
+      mouse: { move: mouseMove },
+      waitForTimeout: vi.fn(),
+      locator: vi.fn(),
+    } as unknown as Parameters<typeof ensureDisplayNameInMeeting>[0]["page"];
+
+    await ensureDisplayNameInMeeting({
+      page: fakePage,
+      participant: "alice",
+      displayName: "Bot {participant}",
+    });
+
+    expect(mouseMove).not.toHaveBeenCalled();
+    expect(
+      (fakePage as unknown as { locator: ReturnType<typeof vi.fn> }).locator,
+    ).not.toHaveBeenCalled();
   });
 });
 

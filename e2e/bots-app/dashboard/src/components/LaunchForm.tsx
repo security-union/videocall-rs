@@ -58,6 +58,20 @@ interface LaunchFormProps {
   initialValues?: LaunchFormInitial;
   onLaunched: (botId: string) => void;
   onError: (message: string) => void;
+  /**
+   * Optional toast hook used by `handleLoadPrevious` to confirm
+   * which previous bot config was loaded into the form. Lets the
+   * parent surface a "Loaded previous config" feedback toast so the
+   * operator has a visible signal that the click landed and the
+   * form was repopulated (the form change itself is easy to miss if
+   * the new values overlap with whatever was already typed). When
+   * omitted (e.g. tests), the load proceeds silently.
+   */
+  onToast?: (t: {
+    title: string;
+    description?: string;
+    variant: "success" | "info" | "error";
+  }) => void;
 }
 
 const DEFAULT_VALUES: LaunchFormInitial = {
@@ -105,15 +119,13 @@ function findManifestParticipant(
   if (!manifest || !Array.isArray(manifest.participants)) return null;
   const needle = name.trim().toLowerCase();
   if (needle === "") return null;
-  return (
-    manifest.participants.find((p) => p.name.trim().toLowerCase() === needle) ?? null
-  );
+  return manifest.participants.find((p) => p.name.trim().toLowerCase() === needle) ?? null;
 }
 
 const INPUT_CLASS =
   "w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 shadow-sm placeholder:text-neutral-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:cursor-not-allowed disabled:bg-neutral-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-sky-400 dark:focus:ring-sky-400 dark:disabled:bg-slate-900";
 
-export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormProps) {
+export function LaunchForm({ initialValues, onLaunched, onError, onToast }: LaunchFormProps) {
   const [values, setValues] = useState<LaunchFormInitial>(initialValues ?? DEFAULT_VALUES);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitted, setSubmitted] = useState(false);
@@ -323,6 +335,16 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     setSubmitted(false);
     setManualTouched({ costume: false, audio: false });
     setFreshlyDuplicated(true);
+    // Surface a confirmation toast naming the loaded config so the
+    // operator has a visible signal that the click landed and the
+    // form was repopulated. The dropdown closes by itself (Radix
+    // default behaviour now that the menu item's onSelect no longer
+    // calls preventDefault).
+    onToast?.({
+      title: "Loaded previous bot config",
+      description: `${entry.participant} · ${entry.meetingURL}`,
+      variant: "info",
+    });
   };
 
   const setField = <K extends keyof LaunchFormInitial>(key: K, val: LaunchFormInitial[K]) => {
@@ -364,8 +386,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
     // sentinel `"default"` (and the empty string) collapse to
     // `undefined` so the server doesn't run the basename regex on a
     // non-file value.
-    const costume =
-      values.costume && values.costume !== "default" ? values.costume : undefined;
+    const costume = values.costume && values.costume !== "default" ? values.costume : undefined;
     const audio = values.audio && values.audio !== "default" ? values.audio : undefined;
 
     // Translate the radio + sub-Select into the structured wire
@@ -414,13 +435,13 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               <HelpPopover fieldLabel="Run location" testId="help-runLocation">
                 <p>Where the bot&apos;s Chrome runs.</p>
                 <p className="mt-1">
-                  Local and SSH are supported; Cloud VM and Docker slots remain disabled until
-                  those backends ship.
+                  Local and SSH are supported; Cloud VM and Docker slots remain disabled until those
+                  backends ship.
                 </p>
                 <p className="mt-1">
-                  SSH-able host requires at least one entry in the host registry (Tools page).
-                  Asset prep + most ctl actions are not proxied for remote bots in v1 — see the
-                  panel under the radio for the action matrix.
+                  SSH-able host requires at least one entry in the host registry (Tools page). Asset
+                  prep + most ctl actions are not proxied for remote bots in v1 — see the panel
+                  under the radio for the action matrix.
                 </p>
               </HelpPopover>
             }
@@ -490,15 +511,16 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                   <p>
                     Picks one of the hosts registered under Tools → Remote Hosts. The bot is
                     launched via{" "}
-                    <code className="font-mono text-[11px]">ssh user@host &apos;npm run bot …&apos;</code>
+                    <code className="font-mono text-[11px]">
+                      ssh user@host &apos;npm run bot …&apos;
+                    </code>
                     .
                   </p>
                   <p className="mt-1">
-                    v1 limitations: assets are NOT rsync&apos;d to the remote host (the bot
-                    falls back to Chrome&apos;s default fake patterns unless you&apos;ve prep&apos;d
-                    them out-of-band), and Mute / Camera / Share / Tune-network / Duplicate /
-                    Extend-TTL are not proxied — Leave + Force-kill ARE wired (via SIGTERM /
-                    SIGKILL over SSH).
+                    v1 limitations: assets are NOT rsync&apos;d to the remote host (the bot falls
+                    back to Chrome&apos;s default fake patterns unless you&apos;ve prep&apos;d them
+                    out-of-band), and Mute / Camera / Share / Tune-network / Duplicate / Extend-TTL
+                    are not proxied — Leave + Force-kill ARE wired (via SIGTERM / SIGKILL over SSH).
                   </p>
                 </HelpPopover>
               }
@@ -508,10 +530,12 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 onValueChange={(v) => setField("sshHostLabel", v === "__none__" ? "" : v)}
                 options={[
                   { value: "__none__", label: "Pick a host…" },
-                  ...(hostsQuery.data?.hosts ?? []).map((h: { label: string; user: string; host: string }) => ({
-                    value: h.label,
-                    label: `${h.label}  (${h.user}@${h.host})`,
-                  })),
+                  ...(hostsQuery.data?.hosts ?? []).map(
+                    (h: { label: string; user: string; host: string }) => ({
+                      value: h.label,
+                      label: `${h.label}  (${h.user}@${h.host})`,
+                    }),
+                  ),
                 ]}
                 testId="ssh-host-select"
               />
@@ -682,10 +706,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           </Field>
 
           {values.authBackend === "jwt" && (
-            <SsoStateLine
-              data={ssoStatusQuery.data}
-              onConfigure={() => setSsoPanelOpen(true)}
-            />
+            <SsoStateLine data={ssoStatusQuery.data} onConfigure={() => setSsoPanelOpen(true)} />
           )}
 
           {values.authBackend === "storage-state" && (
@@ -774,9 +795,8 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 <HelpPopover fieldLabel="Network Conditions" testId="help-network">
                   <p>Simulated network conditions applied client-side.</p>
                   <p className="mt-1">
-                    Requires{" "}
-                    <code className="font-mono text-[11px]">videocall-client</code> to be built
-                    with <code className="font-mono text-[11px]">--features netsim</code>. See
+                    Requires <code className="font-mono text-[11px]">videocall-client</code> to be
+                    built with <code className="font-mono text-[11px]">--features netsim</code>. See
                     the Help page for profile details.
                   </p>
                 </HelpPopover>
@@ -827,15 +847,14 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                 <HelpPopover fieldLabel="Costume" testId="help-costume">
                   <p>Pre-rendered .y4m fake camera.</p>
                   <p className="mt-1">
-                    Run{" "}
-                    <code className="font-mono text-[11px]">bots-app prep-assets</code> to
+                    Run <code className="font-mono text-[11px]">bots-app prep-assets</code> to
                     generate options.
                   </p>
                   <p className="mt-1">
                     If the selected file isn&apos;t present in{" "}
-                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot
-                    will auto-prime it on launch (local bots only — SSH bots need assets
-                    pre-staged on the remote).
+                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot will
+                    auto-prime it on launch (local bots only — SSH bots need assets pre-staged on
+                    the remote).
                   </p>
                 </HelpPopover>
               }
@@ -862,9 +881,9 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
                   <p className="mt-1">Same prep step as the costume.</p>
                   <p className="mt-1">
                     If the selected file isn&apos;t present in{" "}
-                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot
-                    will auto-prime it on launch (local bots only — SSH bots need assets
-                    pre-staged on the remote).
+                    <code className="font-mono text-[11px]">&lt;runDir&gt;</code>, the bot will
+                    auto-prime it on launch (local bots only — SSH bots need assets pre-staged on
+                    the remote).
                   </p>
                 </HelpPopover>
               }
@@ -909,10 +928,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
               </Tooltip.Content>
             </Tooltip.Portal>
           </Tooltip.Root>
-          <LoadPreviousButton
-            onSelect={handleLoadPrevious}
-            disabled={launchMutation.isPending}
-          />
+          <LoadPreviousButton onSelect={handleLoadPrevious} disabled={launchMutation.isPending} />
           <button
             type="submit"
             disabled={launchMutation.isPending}
@@ -924,7 +940,7 @@ export function LaunchForm({ initialValues, onLaunched, onError }: LaunchFormPro
           </button>
         </div>
       </form>
-      <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} />
+      <SsoPanel open={ssoPanelOpen} onOpenChange={setSsoPanelOpen} meetingURL={values.meetingURL} />
     </Tooltip.Provider>
   );
 }
@@ -944,10 +960,7 @@ interface SsoStateLineProps {
 function SsoStateLine({ data, onConfigure }: SsoStateLineProps) {
   if (data === undefined) {
     return (
-      <p
-        className="text-xs text-neutral-500 dark:text-slate-400"
-        data-testid="launch-sso-line"
-      >
+      <p className="text-xs text-neutral-500 dark:text-slate-400" data-testid="launch-sso-line">
         Checking SSO state…
       </p>
     );

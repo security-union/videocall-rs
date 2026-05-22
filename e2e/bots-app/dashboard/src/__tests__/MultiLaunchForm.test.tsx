@@ -15,6 +15,20 @@ function renderWithClient(ui: React.ReactElement) {
 interface FetchState {
   multiLaunchCalls: unknown[];
   multiLaunchResponse?: { status: number; body: unknown };
+  /**
+   * Optional override for the `/api/sso/status` response. When unset
+   * the stub replies with `exists: false` (the safe default that
+   * mirrors a fresh worktree where the operator hasn't captured the
+   * HCL SSO state yet). Tests that exercise the SSO wire-through pass
+   * `{ exists: true, filePath, ... }` here.
+   */
+  ssoStatusResponse?: {
+    filePath: string;
+    exists: boolean;
+    capturedAt: number | null;
+    ageHours: number | null;
+    size: number | null;
+  };
 }
 
 function stubFetch(state: FetchState) {
@@ -36,6 +50,23 @@ function stubFetch(state: FetchState) {
         };
         return new Response(JSON.stringify(resp.body), {
           status: resp.status,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // The form's `ssoStatusQuery` (added v1.8.2) fires on every
+      // render regardless of auth backend. Stub a default "no captured
+      // SSO state" reply so tests that don't care about SSO don't see
+      // an unhandled-fetch warning in the console.
+      if (url === "/api/sso/status") {
+        const body = state.ssoStatusResponse ?? {
+          filePath: "/runDir/auth/hcl-sso.json",
+          exists: false,
+          capturedAt: null,
+          ageHours: null,
+          size: null,
+        };
+        return new Response(JSON.stringify(body), {
+          status: 200,
           headers: { "content-type": "application/json" },
         });
       }
@@ -367,6 +398,97 @@ describe("MultiLaunchForm", () => {
       expect(screen.getByRole("alert")).toBeInTheDocument();
     });
     expect(state.multiLaunchCalls).toHaveLength(0);
+  });
+
+  // --- SSO state wire-through (v1.8.2) -------------------------------
+  //
+  // The single-launch form gained an SSO state wire-through in v1.5.0
+  // so dashboard-spawned JWT bots pick up the captured
+  // `<runDir>/auth/hcl-sso.json` without the operator having to
+  // re-capture per launch. Multi-launch was missing the same hook —
+  // batches spawned via this form ignored the captured SSO state and
+  // their browsers hit the HCL SSO portal on every page-load. v1.8.2
+  // ports the same pattern into MultiLaunchForm; the two tests below
+  // pin the wire shape so a future refactor that accidentally drops
+  // the field is caught immediately.
+
+  it("forwards ssoStateFile in the multi-launch payload when JWT + SSO file exists (v1.8.2)", async () => {
+    state.ssoStatusResponse = {
+      filePath: "/run/auth/hcl-sso.json",
+      exists: true,
+      capturedAt: Date.now(),
+      ageHours: 1.25,
+      size: 3210,
+    };
+    stubFetch(state);
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // Wait for the SSO status query to settle before clicking Launch
+    // so the submit handler sees `ssoStatusQuery.data.exists === true`.
+    await waitFor(() => {
+      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls.some((c) => c[0] === "/api/sso/status")).toBe(true);
+    });
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://app.videocall.fnxlabs.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.ssoStateFile).toBe("/run/auth/hcl-sso.json");
+  });
+
+  it("omits ssoStateFile from the multi-launch payload when auth is not JWT (v1.8.2)", async () => {
+    // Mirror of LaunchForm.test.tsx's "omits ssoStateFile when auth is
+    // not JWT" guard. Even when the SSO file exists, switching the
+    // batch to Guest auth must drop the field — otherwise we'd be
+    // pushing the SSO state to bots that don't need it (and that the
+    // server would pre-load uselessly into every spawned context).
+    state.ssoStatusResponse = {
+      filePath: "/run/auth/hcl-sso.json",
+      exists: true,
+      capturedAt: Date.now(),
+      ageHours: 1,
+      size: 1024,
+    };
+    stubFetch(state);
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    // Switch auth to Guest (none). Radix RadioGroup items are
+    // accessible by their generated id (`multi-auth-none`).
+    const guestRadio = document.getElementById("multi-auth-none") as HTMLElement;
+    fireEvent.click(guestRadio);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://example.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.ssoStateFile).toBeUndefined();
+  });
+
+  it("omits ssoStateFile from the multi-launch payload when no SSO file is captured (v1.8.2)", async () => {
+    // Default ssoStatusResponse is `exists: false`. A JWT batch under
+    // that condition must still submit cleanly with the field
+    // *absent* (not `null`, not the empty string) — the server's
+    // validator rejects non-string `ssoStateFile`, and a no-SSO env
+    // (fresh checkout, expired capture) is the steady-state for
+    // first-run operators.
+    renderWithClient(<MultiLaunchForm onLaunched={() => {}} onError={() => {}} />);
+    fireEvent.change(screen.getByTestId("multi-meeting-url"), {
+      target: { value: "https://example.com/meeting/X" },
+    });
+    fireEvent.change(screen.getByTestId("multi-count"), { target: { value: "2" } });
+    fireEvent.click(screen.getByTestId("multi-launch-button"));
+    await waitFor(() => {
+      expect(state.multiLaunchCalls).toHaveLength(1);
+    });
+    const sent = state.multiLaunchCalls[0] as Record<string, unknown>;
+    expect(sent.ssoStateFile).toBeUndefined();
   });
 
   it("Reset button is disabled while the launch mutation is in-flight", async () => {

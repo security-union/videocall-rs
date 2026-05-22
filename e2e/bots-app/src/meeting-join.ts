@@ -300,7 +300,27 @@ export async function joinMeetingAndEnableMedia(args: {
 
     console.log(`[${participant}] in-meeting (grid visible)`);
 
-    // ── Step 2: enable mic + camera so the prep'd fake devices flow ───
+    // ── Step 2: ensure display name is set via the in-meeting rename ───
+    //
+    // The display-name prompt branch at the top of this function only
+    // fires when the bot lands in `meeting-name-prompt` state — i.e.
+    // when the bot is the first participant and the prompt actually
+    // renders. When the meeting has already been started by another
+    // participant (e.g. the operator pressed Start Meeting themselves
+    // and then launched the bot to join), the bot lands on the
+    // "Join Meeting" button directly and the prompt is never shown.
+    // In that case the prompt-fill branch above never ran, and the
+    // bot ends up in the grid with no display name set — visible to
+    // every other peer as the user_id-derived default.
+    //
+    // Use the in-meeting attendee-list edit button to guarantee the
+    // bot's display name matches `opts.displayName` regardless of how
+    // it entered the meeting. Idempotent: reads the current self-row's
+    // display name first and skips the rename if it already matches.
+    // Tolerant of all failure modes — never blocks the launch.
+    await ensureDisplayNameInMeeting({ page, participant, displayName });
+
+    // ── Step 3: enable mic + camera so the prep'd fake devices flow ───
 
     // The action bar auto-hides by default; hover it so the buttons are
     // visible to Playwright's isVisible check.
@@ -1042,6 +1062,282 @@ async function joinWithRetries(args: {
     } finally {
       teardown();
     }
+  }
+}
+
+/**
+ * Regex matching characters the dioxus UI's `validate_display_name`
+ * accepts (defined in `videocall-types/src/validation.rs`): ASCII
+ * letters, numbers, spaces, underscores, hyphens, and apostrophes.
+ * Anything else is rejected at form submission with an inline error,
+ * leaving the rename modal stuck open. We pre-check the displayName
+ * here so the bot doesn't even try (and doesn't leave the modal in a
+ * stranded state).
+ *
+ * Exported for the unit-test that pins the contract.
+ */
+export const ALLOWED_DISPLAY_NAME_CHARS_RE = /^[a-zA-Z0-9 _'-]+$/;
+
+/**
+ * Set the bot's display name via the in-meeting attendee-list edit
+ * button. Used as a fallback for the case where the bot landed on
+ * "Join Meeting" without the display-name prompt rendering — e.g.
+ * the operator started the meeting themselves and the bot joined as a
+ * guest. In that case the prompt-fill branch in
+ * {@link joinMeetingAndEnableMedia} never fired and the bot has no
+ * display name set.
+ *
+ * Idempotent: reads the current self-row's display name first and
+ * skips the rename if it already matches `displayName`. Tolerant of
+ * every failure mode — logs a warning and returns; never throws.
+ *
+ * UI surface used (matches the rename flow exercised by
+ * `same-user-multi-session.spec.ts`):
+ *   1. Toggle the peer-list panel via the action-bar button whose
+ *      tooltip reads "Open Peers" (sourced from
+ *      `dioxus-ui/src/components/peer_list_button.rs`).
+ *   2. Identify the self-row by the `(You)` / `(You/Host)` text
+ *      indicator (sourced from `peer_list_item.rs:64-69` —
+ *      `is_self == true` renders one of those labels) AND the
+ *      presence of the edit pencil. The double-filter is defensive:
+ *      when multiple sessions of the same authenticated user are in
+ *      the meeting, every row carries the same `name` text but only
+ *      one row (the local self-row) has `is_self == true`. Filtering
+ *      by `(You)` text gives a stable, name-independent identifier
+ *      for "this is MY row" regardless of how many siblings share
+ *      the user_id.
+ *   3. Fill the modal input (`input.input-apple`) with the desired
+ *      name and click the "Save" button.
+ *   4. Verify the modal actually closed — `validate_display_name` in
+ *      `videocall-types/src/validation.rs` rejects any character
+ *      outside `[a-zA-Z0-9 _'-]` and leaves the modal OPEN with an
+ *      inline error message. We catch that case and close the modal
+ *      via Escape (the Cancel-equivalent) so the bot's next step
+ *      doesn't fight a stuck modal.
+ *   5. Toggle the peer-list panel closed so the bot starts the
+ *      enable-media step from a known state.
+ */
+export async function ensureDisplayNameInMeeting(args: {
+  page: Page;
+  participant: string;
+  displayName: string;
+}): Promise<void> {
+  const { page, participant, displayName } = args;
+
+  if (displayName.trim() === "") {
+    console.log(`[${participant}] in-meeting rename: skipped (no displayName supplied)`);
+    return;
+  }
+
+  // Pre-validate: if displayName contains characters the dioxus UI
+  // will reject, skip the rename entirely instead of stranding the
+  // modal open. The most common cause of this is a `{participant}`
+  // template that wasn't substituted on the server side — typically
+  // means an older bots-app version that doesn't apply template
+  // substitution to the single-bot launch path.
+  if (!ALLOWED_DISPLAY_NAME_CHARS_RE.test(displayName)) {
+    console.warn(
+      `[${participant}] in-meeting rename: skipped — displayName "${displayName}" ` +
+        `contains characters the meeting UI rejects (allowed: ASCII letters, ` +
+        `numbers, spaces, '_', '-', apostrophe). If you typed a "{participant}" ` +
+        `template, make sure the server-side substitution applied.`,
+    );
+    return;
+  }
+
+  // The action bar auto-hides; nudge the mouse to reveal it so the
+  // peer-list toggle is interactable.
+  await page.mouse.move(400, 400).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // The peer-list toggle is a SINGLE button whose tooltip swaps text
+  // based on panel state:
+  //   - panel closed → tooltip "Open Peers"
+  //   - panel open   → tooltip "Close Peers"
+  // (see `dioxus-ui/src/components/video_control_buttons.rs:200-242`).
+  // Scope by intent so we don't accidentally click the "close" target
+  // when we mean to open, or vice versa. Without this discriminator
+  // the action-bar's `button.video-control-button` set matches many
+  // buttons (mic, camera, screen-share, …) and Playwright would
+  // refuse with a strict-mode violation. The close path is handled
+  // by the dedicated `closePeerList` helper further down.
+  const openPeersBtn = page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Open Peers" }),
+  });
+
+  try {
+    await openPeersBtn.click({ timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: could not open peer list (${(e as Error).message}) — skipping`,
+    );
+    return;
+  }
+
+  // Identify the self-row by the `(You)` / `(You/Host)` indicator AND
+  // the presence of the edit pencil. The text-marker filter is the
+  // robust signal — when multiple same-auth sessions are in the room
+  // their `peer_item_name_container`s carry the same display-name
+  // text but only the local self-row has the `.peer-indicator` text
+  // matching one of the You-variants. The edit-pencil filter is the
+  // belt-and-suspenders check (also self-only per
+  // `peer_list_item.rs:87`).
+  const selfRow = page
+    .locator("#peer-list-container li")
+    .filter({ has: page.locator("button.peer_item_edit_btn") })
+    .filter({
+      has: page.locator(".peer-indicator", { hasText: /\(You(?:\/Host)?\)/ }),
+    });
+
+  try {
+    await selfRow.waitFor({ state: "visible", timeout: 5_000 });
+  } catch {
+    console.warn(`[${participant}] in-meeting rename: self-row not visible — skipping`);
+    await closePeerList(page, participant);
+    return;
+  }
+
+  const rawText =
+    (await selfRow
+      .first()
+      .textContent()
+      .catch(() => null)) ?? "";
+  // Strip indicator suffixes the row template appends — "(You)",
+  // "(Host)", "(You/Host)", and "Guest" — so the comparison is on the
+  // raw display-name text only.
+  const cleaned = rawText.replace(/\(You\/Host\)|\(You\)|\(Host\)|Guest/g, "").trim();
+
+  if (cleaned === displayName) {
+    console.log(
+      `[${participant}] in-meeting rename: display name already "${displayName}" — skipping`,
+    );
+    await closePeerList(page, participant);
+    return;
+  }
+
+  console.log(`[${participant}] in-meeting rename: "${cleaned}" → "${displayName}"`);
+
+  // Click the edit pencil INSIDE the identified self-row (not the
+  // page-wide locator) so a hypothetical future render that places a
+  // pencil on more than one row can't misfire here.
+  const editBtn = selfRow.locator("button.peer_item_edit_btn").first();
+  try {
+    await editBtn.click({ timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: edit-pencil click failed (${(e as Error).message})`,
+    );
+    await closePeerList(page, participant);
+    return;
+  }
+
+  // Scope the input + Save selectors to the rename modal's backdrop
+  // (`.glass-backdrop` per `update_display_name_modal.rs:36`) so we
+  // can't accidentally match a different modal that also uses
+  // `.input-apple` / a "Save" button somewhere on the page.
+  const modal = page.locator(".glass-backdrop").last();
+  const nameInput = modal.locator("input.input-apple");
+  const saveBtn = modal.getByRole("button", { name: "Save" });
+
+  try {
+    await nameInput.waitFor({ state: "visible", timeout: 5_000 });
+    await nameInput.fill("");
+    await nameInput.pressSequentially(displayName, { delay: 30 });
+
+    await saveBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await saveBtn.click();
+
+    // Verify the modal closed — the onsubmit handler in
+    // `update_display_name_modal.rs:86-125` keeps the modal open and
+    // renders an inline error when `validate_display_name` rejects
+    // the input. If we reach the post-click state with the modal
+    // still visible, the rename did NOT succeed; close the modal via
+    // Escape so the bot doesn't fight it on the next step.
+    try {
+      await nameInput.waitFor({ state: "hidden", timeout: 5_000 });
+      console.log(`[${participant}] in-meeting rename submitted (modal closed)`);
+    } catch {
+      console.warn(
+        `[${participant}] in-meeting rename: modal still open after Save click — ` +
+          `validation likely rejected "${displayName}". Closing modal via Escape.`,
+      );
+      await page.keyboard.press("Escape").catch(() => undefined);
+    }
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: modal interaction failed (${(e as Error).message})`,
+    );
+    // Best-effort: try to close any stuck modal before continuing.
+    await page.keyboard.press("Escape").catch(() => undefined);
+  }
+
+  // Close the peer-list panel so the subsequent enable-media step has
+  // unobstructed access to the action-bar mic / camera buttons. See
+  // `closePeerList` — uses the tooltip-state-aware "Close Peers"
+  // locator AND verifies the panel actually disappeared.
+  await closePeerList(page, participant);
+}
+
+/**
+ * Close the in-meeting peer-list panel if it's currently open. Used
+ * by {@link ensureDisplayNameInMeeting} at every exit point so the
+ * subsequent enable-media step never has to fight a still-open panel
+ * blocking the action-bar buttons.
+ *
+ * Two failure modes the simple "click the toggle again" pattern hit
+ * in production:
+ *
+ *   1. **Tooltip text swaps with state** —
+ *      `dioxus-ui/src/components/video_control_buttons.rs:200-242`
+ *      renders `"Open Peers"` when closed and `"Close Peers"` when
+ *      open on the SAME button. Reusing the "Open Peers" locator for
+ *      both the initial open AND the final close (the pre-fix
+ *      behavior) silently failed on the close — the locator didn't
+ *      match the "Close Peers" tooltip, the click was a no-op, the
+ *      panel stayed open, and the next `clickWhenVisible` call for
+ *      the mic / camera buttons couldn't reach them because the
+ *      panel overlay was still on top.
+ *
+ *   2. **Action bar may have auto-hidden** during the rename modal's
+ *      lifetime. We nudge the mouse + brief wait before the click to
+ *      re-reveal the action bar (matches the same pre-click pattern
+ *      `joinMeetingAndEnableMedia` uses for mic / camera enable).
+ *
+ * Idempotent + tolerant: if the panel is already closed (no
+ * "Close Peers" button visible), the `waitFor` times out cleanly,
+ * the catch logs a debug line, and we return. Post-condition: panel
+ * is closed (or was already closed when we entered).
+ */
+async function closePeerList(page: Page, participant: string): Promise<void> {
+  // Re-reveal the action bar in case it auto-hid while the rename
+  // modal was open.
+  await page.mouse.move(400, 400).catch(() => undefined);
+  await page.waitForTimeout(150);
+
+  const closePeersBtn = page.locator("button.video-control-button", {
+    has: page.locator(".tooltip", { hasText: "Close Peers" }),
+  });
+
+  try {
+    // `isVisible` returns false (rather than throwing) when the
+    // button isn't there — that's the "panel already closed" path.
+    if (!(await closePeersBtn.isVisible({ timeout: 1_000 }).catch(() => false))) {
+      return;
+    }
+    await closePeersBtn.click({ timeout: 5_000 });
+
+    // Verify the panel actually closed by waiting for the "Close
+    // Peers" tooltip to disappear (and the "Open Peers" tooltip to
+    // reappear in its place per the toggle's state swap). Without
+    // this check, a click that landed off-target would leave the
+    // panel open and silently block the next step.
+    await closePeersBtn.waitFor({ state: "hidden", timeout: 5_000 });
+  } catch (e) {
+    console.warn(
+      `[${participant}] in-meeting rename: peer-list close did not confirm ` +
+        `(${(e as Error).message}). The subsequent enable-media step may have ` +
+        `to fight a still-open panel — check the bot's mic / camera enable logs.`,
+    );
   }
 }
 

@@ -4,11 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { CircleDot, Loader2, ShieldCheck, ShieldAlert, X } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
-import type {
-  SsoRecaptureStartResponse,
-  SsoStatusResponse,
-  VpnStatusResponse,
-} from "../api/types";
+import type { SsoRecaptureStartResponse, SsoStatusResponse, VpnStatusResponse } from "../api/types";
 
 /**
  * Polling cadences. The VPN check is light (one server-side `fetch`),
@@ -24,7 +20,45 @@ export const SSO_POLL_INTERVAL_MS = 60_000;
 interface SsoPanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onToast?: (t: { title: string; description?: string; variant: "success" | "error" | "info" }) => void;
+  onToast?: (t: {
+    title: string;
+    description?: string;
+    variant: "success" | "error" | "info";
+  }) => void;
+  /**
+   * Optional meeting URL the operator is planning to launch against.
+   * When provided and parseable, the SSO capture flow navigates the
+   * headed Chrome to that URL's origin instead of the hardcoded
+   * fnxlabs default — so the captured `hcl-sso.json` cookies are
+   * scoped to the same host the bot will eventually launch against.
+   *
+   * Without this prop (e.g. when the panel is opened from the header
+   * chip), the server-side default (`DEFAULT_SSO_START_URL`, fnxlabs)
+   * still applies.
+   */
+  meetingURL?: string;
+}
+
+/**
+ * Pure helper: extract the origin from a user-supplied meeting URL so
+ * the SSO capture flow can navigate to the same host the bot will
+ * launch against (the captured `hcl-sso.json` cookies are scoped to
+ * the navigated host, so a fnxlabs-captured file can't authenticate a
+ * localhost or preview-deploy launch). Returns `null` if the input is
+ * empty, not a valid URL, or uses a non-http(s) protocol — callers
+ * fall back to the server-side default in that case.
+ *
+ * Exported for unit testing.
+ */
+export function deriveSsoStartUrl(meetingURL: string | undefined): string | null {
+  if (meetingURL === undefined || meetingURL.trim() === "") return null;
+  try {
+    const u = new URL(meetingURL);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return `${u.origin}/`;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -50,9 +84,10 @@ interface SsoPanelProps {
  *      logged in, save" after that returns a 404 + the panel surfaces
  *      "session expired — start over".
  */
-export function SsoPanel({ open, onOpenChange, onToast }: SsoPanelProps) {
+export function SsoPanel({ open, onOpenChange, onToast, meetingURL }: SsoPanelProps) {
   const queryClient = useQueryClient();
   const [activeSession, setActiveSession] = useState<SsoRecaptureStartResponse | null>(null);
+  const derivedStartUrl = useMemo(() => deriveSsoStartUrl(meetingURL), [meetingURL]);
 
   const vpnQuery = useQuery({
     queryKey: ["sso", "vpn-status"],
@@ -77,7 +112,8 @@ export function SsoPanel({ open, onOpenChange, onToast }: SsoPanelProps) {
   }, [open, queryClient]);
 
   const startMutation = useMutation({
-    mutationFn: () => api.ssoRecaptureStart({}),
+    mutationFn: () =>
+      api.ssoRecaptureStart(derivedStartUrl !== null ? { startUrl: derivedStartUrl } : {}),
     onSuccess: (data) => {
       setActiveSession(data);
       onToast?.({
@@ -155,8 +191,8 @@ export function SsoPanel({ open, onOpenChange, onToast }: SsoPanelProps) {
                 HCL VPN &amp; SSO
               </Dialog.Title>
               <Dialog.Description className="mt-1 text-xs text-neutral-500 dark:text-slate-400">
-                VPN reachability and the captured SSO state file the bots use to
-                pass HCL SSO without an interactive login each run.
+                VPN reachability and the captured SSO state file the bots use to pass HCL SSO
+                without an interactive login each run.
               </Dialog.Description>
             </div>
             <Dialog.Close className="rounded p-1 text-neutral-400 hover:bg-neutral-100 dark:text-slate-500 dark:hover:bg-slate-700">
@@ -176,6 +212,7 @@ export function SsoPanel({ open, onOpenChange, onToast }: SsoPanelProps) {
               starting={startMutation.isPending}
               saving={completeMutation.isPending}
               cancelling={cancelMutation.isPending}
+              captureStartUrl={derivedStartUrl}
             />
           </div>
         </Dialog.Content>
@@ -222,6 +259,13 @@ interface SsoSectionProps {
   starting: boolean;
   saving: boolean;
   cancelling: boolean;
+  /**
+   * Origin derived from the launch context's meeting URL. When
+   * present, the recapture flow navigates here; otherwise the server
+   * uses its hardcoded fnxlabs default. `null` indicates "no meeting
+   * URL provided" — falls back to the server default.
+   */
+  captureStartUrl: string | null;
 }
 
 function SsoSection({
@@ -234,6 +278,7 @@ function SsoSection({
   starting,
   saving,
   cancelling,
+  captureStartUrl,
 }: SsoSectionProps) {
   const ageHours = data?.ageHours ?? null;
   const tone = useMemo(() => deriveSsoTone(data), [data]);
@@ -253,7 +298,10 @@ function SsoSection({
       ) : data.exists ? (
         <dl className="mt-2 grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-xs">
           <dt className="text-neutral-500 dark:text-slate-400">File</dt>
-          <dd className="font-mono text-neutral-700 dark:text-slate-200" data-testid="sso-file-path">
+          <dd
+            className="font-mono text-neutral-700 dark:text-slate-200"
+            data-testid="sso-file-path"
+          >
             {data.filePath}
           </dd>
           <dt className="text-neutral-500 dark:text-slate-400">Age</dt>
@@ -266,14 +314,25 @@ function SsoSection({
           </dd>
         </dl>
       ) : (
-        <p
-          className="mt-1 text-xs text-red-600 dark:text-red-400"
-          data-testid="sso-missing"
-        >
-          No SSO state captured yet. Bots will hit the HCL SSO portal on every launch
-          until you capture one.
+        <p className="mt-1 text-xs text-red-600 dark:text-red-400" data-testid="sso-missing">
+          No SSO state captured yet. Bots will hit the HCL SSO portal on every launch until you
+          capture one.
         </p>
       )}
+
+      <p
+        className="mt-2 text-xs text-neutral-600 dark:text-slate-300"
+        data-testid="sso-capture-target"
+      >
+        Capture target:{" "}
+        <span className="font-mono text-neutral-800 dark:text-slate-100">
+          {/* Keep this fallback string in sync with `DEFAULT_SSO_START_URL`
+              in `e2e/bots-app/src/auth/sso-capture.ts`. Display-only — the
+              actual nav uses whatever the server's default resolves to;
+              if these drift, the operator just sees a stale preview. */}
+          {captureStartUrl ?? "https://app.videocall.fnxlabs.com/ (default)"}
+        </span>
+      </p>
 
       {activeSession === null ? (
         <button
@@ -301,9 +360,9 @@ function SsoSection({
         >
           <p className="font-medium">Chrome opened.</p>
           <p className="mt-1">
-            Complete the HCL SSO login in that window. Once you&apos;re back at the videocall
-            app, click <strong>I&apos;m logged in, save</strong> below. Closing the Chrome
-            window without saving will trigger an auto-cancel after the idle timeout.
+            Complete the HCL SSO login in that window. Once you&apos;re back at the videocall app,
+            click <strong>I&apos;m logged in, save</strong> below. Closing the Chrome window without
+            saving will trigger an auto-cancel after the idle timeout.
           </p>
           <div className="mt-2 flex gap-2">
             <button

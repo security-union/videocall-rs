@@ -320,6 +320,33 @@ describe("POST /launch/multi", () => {
     expect(surface.launchSpecs[1].displayName).toBe("Bot bob");
   });
 
+  it("forwards ssoStateFile to every spawned launchOne spec (v1.8.2)", async () => {
+    // Dashboard multi-launch now wires through `ssoStateFile` so JWT
+    // bots in a batch pick up the captured `<runDir>/auth/hcl-sso.json`.
+    // The server must hand that path to every individual launchOne
+    // call so the orchestrator's per-bot SSO load gate fires — the
+    // existing single-launch path was already wired (see launchSpec
+    // construction in server.ts:1290), but multi-launch needed the
+    // same propagation through the `for (let i = 0; i < picked.length; …)`
+    // loop. This locks the wire shape so a future refactor that drops
+    // the field on the per-iteration spec is caught.
+    await fetchJson(handle.port, "/launch/multi", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: {
+        mode: "first-n",
+        count: 2,
+        meetingURL: "https://example.com/meeting/X",
+        ttl: "5m",
+        authBackend: "jwt",
+        ssoStateFile: "/run/auth/hcl-sso.json",
+      },
+    });
+    expect(surface.launchSpecs).toHaveLength(2);
+    expect(surface.launchSpecs[0].ssoStateFile).toBe("/run/auth/hcl-sso.json");
+    expect(surface.launchSpecs[1].ssoStateFile).toBe("/run/auth/hcl-sso.json");
+  });
+
   it("collects errors mid-batch but keeps already-spawned bots", async () => {
     surface.failNextNLaunches = 1; // fail the first one only
     const res = await fetchJson(handle.port, "/launch/multi", {

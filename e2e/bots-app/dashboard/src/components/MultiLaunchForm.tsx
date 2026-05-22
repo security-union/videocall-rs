@@ -7,6 +7,11 @@ import { Dices, RotateCcw, Users } from "lucide-react";
 
 import { api, DashboardApiError } from "../api/client";
 import type { MultiLaunchRequest, MultiLaunchResponse } from "../api/types";
+// Shared `sso/status` query — same cache key as LaunchForm + SsoChip +
+// SsoPanel, so opening the multi-launch tab does NOT add a duplicate
+// network call. The wire-through below mirrors the single-launch path
+// added in v1.5.0 so dashboard-spawned multi-launch bots also pick up
+// the captured `<runDir>/auth/hcl-sso.json` automatically.
 import {
   recordLaunchedBot,
   runLocationLabelFor,
@@ -50,6 +55,19 @@ const MAX_SPAWN_DELAY_SECONDS = 60;
 interface MultiLaunchFormProps {
   onLaunched: (response: MultiLaunchResponse) => void;
   onError: (message: string) => void;
+  /**
+   * Optional toast hook used by `handleLoadPrevious` to confirm
+   * which previous bot config was loaded into the form. Lets the
+   * parent surface a "Loaded previous config" toast so the operator
+   * has a visible signal that the click landed and the form was
+   * repopulated. When omitted (e.g. tests), the load proceeds
+   * silently.
+   */
+  onToast?: (t: {
+    title: string;
+    description?: string;
+    variant: "success" | "info" | "error";
+  }) => void;
 }
 
 interface FormErrors {
@@ -140,7 +158,7 @@ function validate(values: MultiLaunchFormValues): FormErrors {
   return errors;
 }
 
-export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
+export function MultiLaunchForm({ onLaunched, onError, onToast }: MultiLaunchFormProps) {
   const [values, setValues] = useState<MultiLaunchFormValues>(DEFAULTS);
   const [errors, setErrors] = useState<FormErrors>({});
   const [submitted, setSubmitted] = useState(false);
@@ -151,6 +169,20 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
   const hostsQuery = useQuery({
     queryKey: ["ssh", "hosts"],
     queryFn: api.listHosts,
+    refetchInterval: 60_000,
+  });
+
+  // Captured SSO state status. Shares its cache with the header chip,
+  // SsoPanel, and LaunchForm so this hook does NOT trigger an extra
+  // network call. The submit handler below reads `data.filePath` to
+  // forward the captured `<runDir>/auth/hcl-sso.json` to every spawned
+  // bot when `authBackend === "jwt"` — same behavior as single-launch.
+  // Without this, multi-launch bots would silently ignore the captured
+  // SSO state even though the file existed (matching the v1.4.x
+  // pre-fix single-launch regression).
+  const ssoStatusQuery = useQuery({
+    queryKey: ["sso", "status"],
+    queryFn: api.ssoStatus,
     refetchInterval: 60_000,
   });
 
@@ -262,6 +294,16 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     }));
     setErrors({});
     setSubmitted(false);
+    // Surface a confirmation toast naming the loaded config so the
+    // operator has a visible signal that the click landed. Multi-only
+    // fields (count, seed, mode, includeObservers, displayNameTemplate)
+    // stay as-is — the toast description reflects ONLY the shared
+    // fields actually loaded, so the operator knows what changed.
+    onToast?.({
+      title: "Loaded previous bot config (shared fields only)",
+      description: `${entry.meetingURL}`,
+      variant: "info",
+    });
   };
 
   const setField = <K extends keyof MultiLaunchFormValues>(
@@ -281,6 +323,19 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
     setErrors(v);
     if (Object.keys(v).length > 0) return;
 
+    // When the operator is using JWT auth and we have a captured SSO
+    // state file on disk, forward its path so every spawned bot's
+    // BrowserContext loads its cookies before the JWT session cookie
+    // is injected. This is the multi-launch counterpart of the
+    // single-launch wire-through added in v1.5.0 — without it,
+    // multi-launch bots ignore `<runDir>/auth/hcl-sso.json` even when
+    // the file exists, and the page-load hits the HCL SSO portal on
+    // every spawn (which is exactly the bug the user reported).
+    const ssoStateFile =
+      values.authBackend === "jwt" && ssoStatusQuery.data?.exists
+        ? ssoStatusQuery.data.filePath
+        : undefined;
+
     const req: MultiLaunchRequest = {
       mode: values.mode,
       count: values.count,
@@ -289,6 +344,7 @@ export function MultiLaunchForm({ onLaunched, onError }: MultiLaunchFormProps) {
       network: values.network,
       headless: values.headless,
       authBackend: values.authBackend,
+      ssoStateFile,
       runLocation:
         values.runLocation === "ssh"
           ? { kind: "ssh", hostLabel: values.sshHostLabel.trim() }

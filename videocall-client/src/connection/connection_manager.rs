@@ -3037,6 +3037,40 @@ impl ConnectionManager {
             *self.main_thread_drift_ms.borrow()
         ));
 
+        // Chrome-only: report WASM heap usage for memory pressure diagnosis.
+        // Firefox/Safari don't expose performance.memory, so this gracefully
+        // produces no metrics on those browsers.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use js_sys::Reflect;
+            use wasm_bindgen::JsValue;
+            if let Some(window) = web_sys::window() {
+                if let Some(perf) = window.performance() {
+                    let perf_js: &JsValue = perf.as_ref();
+                    if let Ok(memory) = Reflect::get(perf_js, &JsValue::from_str("memory")) {
+                        if !memory.is_undefined() {
+                            if let Ok(used) =
+                                Reflect::get(&memory, &JsValue::from_str("usedJSHeapSize"))
+                            {
+                                if let Some(bytes) = used.as_f64() {
+                                    metrics
+                                        .push(metric!("heap_used_mb", bytes / (1024.0 * 1024.0)));
+                                }
+                            }
+                            if let Ok(limit) =
+                                Reflect::get(&memory, &JsValue::from_str("jsHeapSizeLimit"))
+                            {
+                                if let Some(bytes) = limit.as_f64() {
+                                    metrics
+                                        .push(metric!("heap_limit_mb", bytes / (1024.0 * 1024.0)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         metrics
     }
 

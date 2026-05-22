@@ -275,9 +275,9 @@ test.describe("Host disable-video controls", () => {
       await enableCamera(guestPage);
       await enableCamera(hostPage);
 
-      // Confirm host camera is currently on — "Stop camera" tooltip = active.
+      // Confirm host camera is currently on — "Stop Video" tooltip = active.
       const hostActiveCamBtn = hostPage.locator("button.video-control-button", {
-        has: hostPage.locator("span.tooltip", { hasText: "Stop camera" }),
+        has: hostPage.locator("span.tooltip", { hasText: "Stop Video" }),
       });
       await expect(hostActiveCamBtn).toBeVisible({ timeout: 5_000 });
 
@@ -293,7 +293,11 @@ test.describe("Host disable-video controls", () => {
       await openPeersBtn.click();
       await hostPage.waitForTimeout(1000);
 
-      const hostActionsBtn = hostPage.locator('button[aria-label="Host actions"]');
+      // Scope to `.in-call-menu-wrapper` so we match the peer-list panel's
+      // "Host actions" button, not the per-tile button (same aria-label).
+      const hostActionsBtn = hostPage.locator(
+        '.in-call-menu-wrapper button[aria-label="Host actions"]',
+      );
       await expect(hostActionsBtn).toBeVisible({ timeout: 10_000 });
       await hostActionsBtn.click();
 
@@ -329,7 +333,7 @@ test.describe("Host disable-video controls", () => {
    *
    * After the host disables video, the guest's on_host_disable_video callback
    * sets video_enabled=false. The guest can re-enable by clicking the "Start
-   * camera" button (the same toggle used for self-disable).
+   * Video" button (the same toggle used for self-disable).
    */
   test("participant can self-enable camera after being disabled by host", async ({ baseURL }) => {
     test.setTimeout(120_000);
@@ -374,9 +378,9 @@ test.describe("Host disable-video controls", () => {
       // Guest enables their camera.
       await enableCamera(guestPage);
 
-      // Confirm guest camera is on ("Stop camera" tooltip visible).
+      // Confirm guest camera is on ("Stop Video" tooltip visible).
       const guestStopCamBtn = guestPage.locator("button.video-control-button", {
-        has: guestPage.locator("span.tooltip", { hasText: "Stop camera" }),
+        has: guestPage.locator("span.tooltip", { hasText: "Stop Video" }),
       });
       await expect(guestStopCamBtn).toBeVisible({ timeout: 5_000 });
 
@@ -398,10 +402,10 @@ test.describe("Host disable-video controls", () => {
       // Guest self-enables the camera.
       await guestStartCamBtn.click();
 
-      // Camera is on again — "Stop camera" button reappears.
+      // Camera is on again — "Stop Video" button reappears.
       await expect(
         guestPage.locator("button.video-control-button", {
-          has: guestPage.locator("span.tooltip", { hasText: "Stop camera" }),
+          has: guestPage.locator("span.tooltip", { hasText: "Stop Video" }),
         }),
       ).toBeVisible({ timeout: 10_000 });
     } finally {

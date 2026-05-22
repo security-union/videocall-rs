@@ -195,7 +195,7 @@ pub fn PeerListItem(
                             }
                             if let Some(on_kick) = on_kick {
                                 button {
-                                    class: "context-menu-item context-menu-item--danger",
+                                    class: "context-menu-item",
                                     onclick: move |e: MouseEvent| {
                                         e.stop_propagation();
                                         peer_menu_open.set(false);
@@ -215,7 +215,7 @@ pub fn PeerListItem(
                                         polyline { points: "17 8 21 12 17 16" }
                                         line { x1: "21", y1: "12", x2: "9", y2: "12" }
                                     }
-                                    "Kick"
+                                    "Remove from meeting"
                                 }
                             }
                         }

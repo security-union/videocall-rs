@@ -609,7 +609,7 @@ pub fn generate_for_peer(
                                                 }
                                                 if let Some(cb) = on_kick_clone {
                                                     button {
-                                                        class: "tile-context-menu-item tile-context-menu-item--danger",
+                                                        class: "tile-context-menu-item",
                                                         onclick: move |_| {
                                                             show_tile_menu.set(false);
                                                             cb.call(());
@@ -628,7 +628,7 @@ pub fn generate_for_peer(
                                                             polyline { points: "17 8 21 12 17 16" }
                                                             line { x1: "21", y1: "12", x2: "9", y2: "12" }
                                                         }
-                                                        "Kick"
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -846,7 +846,7 @@ pub fn generate_for_peer(
                                                 }
                                                 if let Some(cb) = on_kick_clone {
                                                     button {
-                                                        class: "tile-context-menu-item tile-context-menu-item--danger",
+                                                        class: "tile-context-menu-item",
                                                         onclick: move |_| {
                                                             show_tile_menu.set(false);
                                                             cb.call(());
@@ -865,7 +865,7 @@ pub fn generate_for_peer(
                                                             polyline { points: "17 8 21 12 17 16" }
                                                             line { x1: "21", y1: "12", x2: "9", y2: "12" }
                                                         }
-                                                        "Kick"
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -1147,7 +1147,7 @@ pub fn generate_for_peer(
                                                     }
                                                     if let Some(cb) = on_kick_clone {
                                                         button {
-                                                            class: "tile-context-menu-item tile-context-menu-item--danger",
+                                                            class: "tile-context-menu-item",
                                                             onclick: move |_| {
                                                                 show_tile_menu.set(false);
                                                                 cb.call(());
@@ -1166,7 +1166,7 @@ pub fn generate_for_peer(
                                                                 polyline { points: "17 8 21 12 17 16" }
                                                                 line { x1: "21", y1: "12", x2: "9", y2: "12" }
                                                             }
-                                                            "Kick"
+                                                            "Remove from meeting"
                                                         }
                                                     }
                                                 }

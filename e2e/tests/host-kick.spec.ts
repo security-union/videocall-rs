@@ -93,11 +93,11 @@ async function admitGuestIfNeeded(
 
 /**
  * Open the per-tile host actions menu on a remote peer and click the inner
- * "Kick" item.
+ * "Remove from call" item.
  *
  * The per-tile menu is rendered inside the canvas grid (see
  * `canvas_generator.rs`). Unlike Mute / Disable-video — which are gated on
- * the peer's audio/video state — the "Kick" item is rendered whenever the
+ * the peer's audio/video state — the "Remove from call" item is rendered whenever the
  * viewer is the host and the peer is not themselves (see `peer_tile.rs`:
  * `is_current_user_host && !is_self_peer`). The toggle
  * (`title="Host actions"`, class `.tile-mute-btn`) is hidden via
@@ -106,7 +106,7 @@ async function admitGuestIfNeeded(
  *
  * The flow is two-step:
  *   1. Click the toggle to open the tile context menu.
- *   2. Click the inner "Kick" item (a `.tile-context-menu-item` with the
+ *   2. Click the inner "Remove from call" item (a `.tile-context-menu-item` with the
  *      `--danger` modifier), which invokes the host kick action — the server
  *      sets the participant's DB status to `'kicked'` and publishes a
  *      `PARTICIPANT_KICKED` NATS event.
@@ -126,10 +126,10 @@ async function hostKickPeerViaTile(page: Page): Promise<void> {
   await expect(hostActionsToggle).toBeVisible({ timeout: 15_000 });
   await hostActionsToggle.click();
 
-  // The "Kick" item carries the danger modifier class. Match by text inside
+  // The "Remove from call" item carries the danger modifier class. Match by text inside
   // `.tile-context-menu-item` (which also matches the danger variant).
   const kickItem = guestTile.locator(".tile-context-menu-item", {
-    hasText: "Kick",
+    hasText: "Remove from meeting",
   });
   await expect(kickItem).toBeVisible({ timeout: 5_000 });
   await kickItem.click();
@@ -145,19 +145,19 @@ test.describe("Host kick controls", () => {
   });
 
   /**
-   * Test 1: Host kicks a participant via the per-tile three-dot menu.
+   * Test 1: Host removes a participant via the per-tile three-dot menu.
    *
-   * Unlike Mute / Disable-video, the "Kick" item is NOT gated on the peer's
+   * Unlike Mute / Disable-video, the "Remove from call" item is NOT gated on the peer's
    * audio/video state — it is rendered as soon as the viewer is the host and
    * the tile is not their own. So we do not need to enable mic/camera on the
    * guest before exercising the menu.
    *
-   * When the host clicks Kick: the server sets the participant's DB status to
+   * When the host clicks "Remove from call": the server sets the participant's DB status to
    * `'kicked'` and publishes a `PARTICIPANT_KICKED` NATS event. The kicked
    * participant's UI receives the event and shows the `MeetingEndedOverlay`
    * with the kicked-by-host message.
    */
-  test("host kicks a participant", async ({ baseURL }) => {
+  test("host removes a participant", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_hostkick_single_${Date.now()}`;
@@ -199,7 +199,7 @@ test.describe("Host kick controls", () => {
         timeout: 30_000,
       });
 
-      // ---- Host opens the tile menu and clicks "Kick" ----
+      // ---- Host opens the tile menu and clicks "Remove from call" ----
       await hostKickPeerViaTile(hostPage);
 
       // ---- Guest receives PARTICIPANT_KICKED: client disconnects immediately
@@ -216,10 +216,19 @@ test.describe("Host kick controls", () => {
         }),
       ).toBeVisible({ timeout: 5_000 });
 
-      // The meeting controls (hang-up button etc.) must not be active —
-      // immediate disconnect sets is_active=false which hides the in-call UI.
-      await expect(guestPage.locator(".video-controls-container")).toHaveCount(0, {
+      // The overlay sits above the in-call controls — verify the "Return to
+      // Home" button (only present on the overlay) is interactable, confirming
+      // the overlay is the top-most interactive layer.
+      await expect(guestPage.locator("button.meeting-ended-home-btn")).toBeVisible({
         timeout: 5_000,
+      });
+
+      // ---- Host's grid loses the kicked guest's tile: on_peer_left fires on
+      // the host session once the server broadcasts PEER_LEFT. Without this
+      // assertion a regression in the PEER_LEFT broadcast path would pass
+      // silently (the overlay check only verifies the guest-side path). ----
+      await expect(hostPage.locator(".grid-item:has(.tile-mute-btn)")).toHaveCount(0, {
+        timeout: 20_000,
       });
 
       // ---- Host does NOT see the kicked overlay (host is never kicked by
@@ -338,8 +347,8 @@ test.describe("Host kick controls", () => {
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
-        "host-kickself@videocall.rs",
-        "KickSelfHost",
+        "host-removefromcallself@videocall.rs",
+        "RemoveFromCallSelfHost",
         uiURL,
       );
 

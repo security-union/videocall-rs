@@ -2421,8 +2421,11 @@ html[data-theme="light"] #invite-overlay p {
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
 .split-peer-tile .canvas-container canvas.cropped {
+  width: auto !important;
+  height: 100% !important;
+  min-width: 100% !important;
   object-fit: cover !important;
-  object-position: center top !important;
+  object-position: center center !important;
 }
 
 .grid-item .canvas-container canvas.uncropped,

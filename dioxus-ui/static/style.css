@@ -574,13 +574,15 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 canvas {
-  width: 100%;
+  width: auto;
   height: 100%;
+  min-width: 100%;
   object-fit: cover;
-  object-position: center top;
+  object-position: center center;
 }
 
 /* ============================================================

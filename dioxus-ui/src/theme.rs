@@ -26,7 +26,6 @@ pub mod color {
     pub const TOOLTIP_DIVIDER: &str = "rgba(255,255,255,0.15)";
 
     pub const PREVIEW_AVATAR_BG: &str = "#3a3a3a";
-    pub const PREVIEW_AVATAR_RING: &str = "rgba(0,0,0,0.62)";
 
     pub const NETEQ_BUFFER: &str = "#8ef";
     pub const NETEQ_JITTER: &str = "#ff8";

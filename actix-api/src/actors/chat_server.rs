@@ -1755,6 +1755,7 @@ impl Handler<JoinRoom> for ChatServer {
                             room_clone.clone(),
                             session_clone,
                             observer,
+                            user_id_clone.clone(),
                         )(msg)
                         {
                             error!("Error handling message: {}", e);
@@ -1949,12 +1950,14 @@ fn handle_msg(
     room: String,
     session: SessionId,
     observer: bool,
+    receiver_user_id: String,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         // Parse the PacketWrapper once and reuse the result for every
         // payload-aware decision below (self-skip carve-out, observer
-        // allowlist). Unparseable payloads fall through with `None`, which
-        // every downstream check treats as the "fail-closed" default.
+        // allowlist, PEER_EVENT unicast filter). Unparseable payloads fall
+        // through with `None`, which every downstream check treats as the
+        // "fail-closed" default.
         let parsed = PacketWrapper::parse_from_bytes(&msg.payload).ok();
 
         let is_congestion = parsed
@@ -1993,6 +1996,45 @@ fn handle_msg(
 
         if (subject_self || inner_session_self) && !is_congestion {
             return Ok(());
+        }
+
+        // PEER_EVENT packets are unicast at the application layer: the
+        // publisher addresses one specific peer via `target_peer_id` in the
+        // inner `PeerEvent` payload. Because the NATS subject fan-out
+        // delivers every published packet to every session in the room, we
+        // filter here so that only the addressed session sees the event.
+        //
+        // Drop policy:
+        //   - Unparseable PacketWrapper: drop (already-failed self-skip
+        //     branch above handles `None` parse via the default `false`).
+        //   - Unparseable inner PeerEvent: drop (cannot determine target).
+        //   - target_peer_id != receiver_user_id: drop.
+        // PEER_EVENT is additive — its absence from the observer allowlist
+        // below means observers never see it, which is the desired
+        // fail-closed default.
+        let is_peer_event = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::PEER_EVENT.into())
+            .unwrap_or(false);
+        if is_peer_event {
+            // Parse failure or target mismatch is silently dropped; the
+            // publisher does not need an error path because this is best-
+            // effort confirmation feedback.
+            let target_match = parsed
+                .as_ref()
+                .and_then(|pw| {
+                    videocall_types::protos::peer_event::PeerEvent::parse_from_bytes(&pw.data).ok()
+                })
+                .map(|pe| pe.target_peer_id.as_slice() == receiver_user_id.as_bytes())
+                .unwrap_or(false);
+            if !target_match {
+                trace!(
+                    "Dropping PEER_EVENT for session {} (room {}): target_peer_id does not match",
+                    session,
+                    room
+                );
+                return Ok(());
+            }
         }
 
         // Observer sessions (waiting room) only need meeting-control packets.
@@ -3541,6 +3583,7 @@ mod tests {
             "room1".to_string(),
             9001,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3570,6 +3613,7 @@ mod tests {
             "room2".to_string(),
             9002,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3599,6 +3643,7 @@ mod tests {
             "room3".to_string(),
             9003,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3628,6 +3673,7 @@ mod tests {
             "room4".to_string(),
             9004,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3657,6 +3703,7 @@ mod tests {
             "room5".to_string(),
             9005,
             true, // observer
+            "recv-user".to_string(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -3687,6 +3734,7 @@ mod tests {
             "room7".to_string(),
             9007,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3716,6 +3764,7 @@ mod tests {
             "room8".to_string(),
             9008,
             true, // observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3745,6 +3794,7 @@ mod tests {
             "room6".to_string(),
             9006,
             false, // NOT an observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3788,6 +3838,7 @@ mod tests {
             "selfskip-room".to_string(),
             7777,
             false, // not an observer
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3817,7 +3868,13 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(actor.recipient(), "reconnect-room".to_string(), 8888, false);
+        let handler = handle_msg(
+            actor.recipient(),
+            "reconnect-room".to_string(),
+            8888,
+            false,
+            "recv-user".to_string(),
+        );
 
         // Subject points at a DIFFERENT session id; payload session_id is
         // ours. Pre-fix, this packet was forwarded.
@@ -3852,6 +3909,7 @@ mod tests {
             "congestion-room".to_string(),
             5555,
             false,
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3886,6 +3944,7 @@ mod tests {
             "congestion-inner-room".to_string(),
             6666,
             false,
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3919,6 +3978,7 @@ mod tests {
             "media-self-room".to_string(),
             4242,
             false,
+            "recv-user".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3949,7 +4009,13 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(actor.recipient(), "zero-session-room".to_string(), 0, false);
+        let handler = handle_msg(
+            actor.recipient(),
+            "zero-session-room".to_string(),
+            0,
+            false,
+            "recv-user".to_string(),
+        );
 
         let nats_msg = make_nats_message(
             "room.zero-session-room.peer",
@@ -3964,6 +4030,152 @@ mod tests {
             "Zero session_id must NOT trigger the inner-session self-filter"
         );
     }
+
+    /// Build a `PacketWrapper` carrying a serialized `PeerEvent` whose
+    /// `target_peer_id` is set to `target`. Used by the PEER_EVENT routing
+    /// tests below.
+    fn make_peer_event_packet_bytes(target: &str) -> Vec<u8> {
+        let mut pe = videocall_types::protos::peer_event::PeerEvent::new();
+        pe.source_peer_id = b"some-source".to_vec();
+        pe.target_peer_id = target.as_bytes().to_vec();
+        pe.event_type = videocall_types::PEER_EVENT_SCREEN_DECODE_STARTED.to_string();
+        let inner = pe
+            .write_to_bytes()
+            .expect("PeerEvent serialization should succeed");
+
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::PEER_EVENT.into();
+        pw.user_id = b"some-source".to_vec();
+        pw.data = inner;
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_peer_event_delivered_to_target() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "peer-event-room".to_string(),
+            1111,
+            false,
+            "alice".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.peer-event-room.peer",
+            make_peer_event_packet_bytes("alice"),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "PEER_EVENT addressed to receiver MUST be delivered"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_peer_event_dropped_for_non_target() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "peer-event-room".to_string(),
+            2222,
+            false,
+            "bob".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.peer-event-room.peer",
+            make_peer_event_packet_bytes("alice"),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "PEER_EVENT addressed to another peer MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_peer_event_observer_drops() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "peer-event-room".to_string(),
+            3333,
+            true,
+            "alice".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.peer-event-room.peer",
+            make_peer_event_packet_bytes("alice"),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "PEER_EVENT must never reach observer sessions, even when targeted"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_peer_event_unparseable_inner_dropped() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "peer-event-room".to_string(),
+            4444,
+            false,
+            "alice".to_string(),
+        );
+
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::PEER_EVENT.into();
+        pw.user_id = b"some-source".to_vec();
+        pw.data = vec![0xff, 0xfe, 0xfd];
+        let nats_msg = make_nats_message(
+            "room.peer-event-room.peer",
+            pw.write_to_bytes()
+                .expect("PacketWrapper serialization should succeed"),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "PEER_EVENT with unparseable inner payload MUST be dropped"
+        );
+    }
+
     /// Returns all RoomMemberInfo entries for a given room.
     #[derive(ActixMessage)]
     #[rtype(result = "Vec<RoomMemberInfo>")]

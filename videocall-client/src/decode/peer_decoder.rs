@@ -136,6 +136,41 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
 pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
 pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
 
+/// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
+/// [`CanvasRenderer`] inside [`VideoPeerDecoder::set_canvas`].
+///
+/// Two real-world orderings have to converge here:
+///
+/// 1. Canvas attached *before* `set_stream_context` (camera path: the
+///    `<canvas>` element exists at peer-tile mount, before the first packet
+///    arrives). The renderer was created with `(None, None)`, then
+///    `set_stream_context` populated it directly. Subsequent re-attachments
+///    must preserve that pair.
+/// 2. Canvas attached *after* `set_stream_context` (screen-share path: the
+///    `ScreenCanvas` tile only mounts once the peer's screen-share is
+///    advertised, which is after the first media packet — and the first
+///    packet is what triggers `set_stream_context`). The prior renderer is
+///    either absent or carries `(None, None)` and we must seed the new
+///    renderer from the decoder-level `stream_context` instead, otherwise
+///    `render_to_canvas_cached` cannot emit `video_resolution` diag events
+///    (it gates on `renderer.to_peer.is_some()`) and the screen-share
+///    resolution stays hidden in the Signal Quality tooltip for the whole
+///    session. This was the #883 regression.
+fn resolve_renderer_context(
+    prior_renderer_ctx: Option<(Option<String>, Option<String>)>,
+    decoder_stream_ctx: Option<&(String, String)>,
+) -> (Option<String>, Option<String>) {
+    if let Some((fp, tp)) = prior_renderer_ctx {
+        if fp.is_some() || tp.is_some() {
+            return (fp, tp);
+        }
+    }
+    match decoder_stream_ctx {
+        Some((fp, tp)) => (Some(fp.clone()), Some(tp.clone())),
+        None => (None, None),
+    }
+}
+
 impl VideoPeerDecoder {
     /// Create a new video decoder with optional canvas element.
     /// Use `set_canvas()` to provide the canvas if not available at construction time.
@@ -198,11 +233,11 @@ impl VideoPeerDecoder {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let mut guard = self.canvas_renderer.borrow_mut();
-        // Preserve existing peer context when the canvas is swapped.
-        let (from_peer, to_peer) = guard
+        let prior_ctx = guard
             .as_ref()
-            .map(|r| (r.from_peer.clone(), r.to_peer.clone()))
-            .unwrap_or_default();
+            .map(|r| (r.from_peer.clone(), r.to_peer.clone()));
+        let (from_peer, to_peer) =
+            resolve_renderer_context(prior_ctx, self.stream_context.borrow().as_ref());
         *guard = Some(CanvasRenderer {
             canvas,
             context,
@@ -535,5 +570,73 @@ impl PeerDecode for StandardAudioPeerDecoder {
             _rendered: true,
             first_frame,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Camera path: canvas was attached first, so the renderer already carries
+    /// a valid `(from_peer, to_peer)`. Even if `stream_context` is populated,
+    /// we must keep the prior pair — overwriting it would erase a peer-id swap
+    /// that landed via `set_stream_context` after the renderer was constructed.
+    #[test]
+    fn resolve_renderer_context_keeps_prior_pair_when_present() {
+        let prior = Some((Some("alice".to_string()), Some("session-1".to_string())));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Screen-share path: the first packet arrives before the dioxus
+    /// `ScreenCanvas` tile mounts, so `set_stream_context` populates the
+    /// decoder-level `stream_context` while the renderer is still absent. When
+    /// the tile finally calls `set_canvas`, we have to seed the new renderer
+    /// from `stream_context` — otherwise `render_to_canvas_cached`'s
+    /// `video_resolution` broadcast stays gated on `to_peer.is_some()` and
+    /// never fires. This is the #883 regression.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_renderer_absent() {
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(None, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Renderer existed but was created before `set_stream_context` ran (canvas
+    /// passed at construction time, peer-id pair plumbed in later). Both
+    /// fields are `None`, so we must fall back to `stream_context`.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_prior_pair_empty() {
+        let prior = Some((None, None));
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Neither source has data — return `(None, None)` so the renderer
+    /// remains in an un-tagged state until `set_stream_context` runs.
+    #[test]
+    fn resolve_renderer_context_returns_none_when_both_empty() {
+        let (fp, tp) = resolve_renderer_context(None, None);
+        assert!(fp.is_none());
+        assert!(tp.is_none());
+    }
+
+    /// Partial prior context (only `from_peer` or only `to_peer` known) is
+    /// still preserved — never overwritten by `stream_context`. This avoids
+    /// accidentally clobbering a half-set state during a canvas swap, which
+    /// can happen if `set_canvas` is called twice in a row by Dioxus
+    /// `use_effect` re-runs.
+    #[test]
+    fn resolve_renderer_context_preserves_partial_prior() {
+        let prior = Some((Some("alice".to_string()), None));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert!(tp.is_none());
     }
 }

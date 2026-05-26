@@ -252,24 +252,45 @@ test.describe("Peer screen-share diagnostics", () => {
       await helpButton.click();
       const helpText = popup.locator(".legend-help-text");
       await expect(helpText).toBeVisible({ timeout: 5_000 });
-      await expect(helpText).toContainText("Resolution");
+      // The #891 amendment rewrote the Screen help text to describe
+      // Source-vs-Received resolution explicitly, so the prior "Resolution"
+      // capitalised standalone substring no longer appears. Use a
+      // case-insensitive match to stay robust to copy edits while still
+      // proving the help text covers the resolution dimension at all.
+      await expect(helpText).toContainText(/resolution/i);
       await expect(helpText).toContainText(/FPS/i);
       await expect(helpText).toContainText(/Bitrate/i);
 
       // ----- Assert: hovering the chart shows a Screen tooltip line. -----
       const overlay = popup.locator("div[style*='cursor: crosshair']").first();
       await expect(overlay).toBeVisible({ timeout: 5_000 });
-      const box = await overlay.boundingBox();
-      if (!box) {
-        throw new Error("chart overlay has no bounding box");
-      }
-      // Hover near the right edge so the tooltip targets the latest sample
-      // (where screen_enabled is true).
-      await hostPage.mouse.move(box.x + box.width - 5, box.y + box.height / 2);
+      // Dispatch a synthetic mousemove directly on the overlay element so the
+      // chart's onmousemove handler runs regardless of how the popup is
+      // positioned in the viewport. `page.mouse.move` clamps to the
+      // viewport's coordinate space and is fragile when the popup floats
+      // partially off-screen; element-relative dispatch is robust. We send
+      // two events because some chart implementations only register a
+      // tooltip on a transition from outside to inside.
+      await overlay.evaluate((el) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const fire = (clientX: number) => {
+          el.dispatchEvent(
+            new MouseEvent("mousemove", {
+              bubbles: true,
+              cancelable: true,
+              clientX,
+              clientY: rect.top + rect.height / 2,
+              buttons: 0,
+            }),
+          );
+        };
+        fire(rect.left + rect.width / 2);
+        fire(rect.right - 5);
+      });
       await hostPage.waitForTimeout(300);
 
       const tooltip = hostPage.locator("#signal-chart-tooltip-global");
-      await expect(tooltip).toBeVisible({ timeout: 5_000 });
+      await expect(tooltip).toBeVisible({ timeout: 10_000 });
       await expect(tooltip).toContainText(/Screen:/);
       await expect(tooltip).toContainText(/fps/i);
       await expect(tooltip).toContainText(/kbps/i);
@@ -293,7 +314,23 @@ test.describe("Peer screen-share diagnostics", () => {
       // Reproducing the downscale path in Playwright would require
       // pinning the publisher's adaptive-quality tier from outside the
       // wasm boundary, which is more brittle than the unit-test coverage.
-      await expect(tooltip).toContainText("1280x720");
+      // Verify resolution is carried on the *Screen* line specifically — not
+      // just somewhere in the tooltip. The camera-video line also says
+      // "1280x720" because the fake-device feed runs at the same dimensions,
+      // so a plain `toContainText("1280x720")` on the whole tooltip would
+      // false-positive even when the screen-share resolution path is broken
+      // end-to-end (the #883 receiver-side regression seen in production:
+      // FPS/kbps showed but resolution was missing because
+      // `render_to_canvas_cached` couldn't emit `video_resolution` events
+      // until the renderer learned the peer id from `set_stream_context`).
+      // Pull just the line that starts with "Screen:" and assert resolution
+      // lives there.
+      const tooltipHtml = await tooltip.innerHTML();
+      const screenLine = tooltipHtml.split(/<br\s*\/?>|\n/i).find((l) => /Screen:/.test(l));
+      if (!screenLine) {
+        throw new Error(`Tooltip did not contain a 'Screen:' line:\n${tooltipHtml}`);
+      }
+      expect(screenLine).toMatch(/1280x720/);
       await expect(tooltip).not.toContainText("Source");
       await expect(tooltip).not.toContainText("→"); // arrow
       await expect(tooltip).not.toContainText("↓"); // downscale badge

@@ -538,6 +538,26 @@ fn infer_video_tier(resolution: &str) -> &'static str {
     }
 }
 
+/// Compact tier label used by the Screen tooltip line. The Screen tooltip
+/// has been tightened to fit on one row alongside the resolution numbers,
+/// so we substitute the most common labels for their standard
+/// abbreviations (`Full HD` → `FHD`, `Quad HD` → `QHD`, `4K UHD` → `UHD`).
+/// `HD` and the lower-density labels (`Medium`, `Low`, `Very Low`, etc.)
+/// stay as-is because they're already short or have no widely-understood
+/// abbreviation.
+///
+/// The camera-video tooltip line continues to use [`infer_video_tier`]
+/// because that row has more horizontal real estate and the full label is
+/// easier to scan when only a single value is shown.
+fn infer_video_tier_short(resolution: &str) -> &'static str {
+    match infer_video_tier(resolution) {
+        "Full HD" => "FHD",
+        "Quad HD" => "QHD",
+        "4K UHD" => "UHD",
+        other => other,
+    }
+}
+
 /// Parse a `"WxH"` resolution string into `(width, height)`. Returns `None`
 /// when either side is missing, non-numeric, or zero. Used by the
 /// degradation-ratio helper below.
@@ -603,19 +623,26 @@ fn screen_downscale_color(pct: u32) -> &'static str {
 /// DOM. Returns an empty string when the screen share isn't active or the
 /// caller has disabled the screen series.
 ///
-/// Shape rules:
-///   - Received unknown -> `Screen: N fps | M kbps` (legacy fallback).
-///   - Source unknown or Source == Received -> `Screen: WxH (tier) | N fps | M kbps`.
-///   - Source != Received -> `Screen: Source AxB (tier) → Received CxD (tier)` plus
-///     a colored `↓X% pixel area` badge when the publisher's encoder downscaled
-///     in transit, plus the trailing `| N fps | M kbps`.
+/// Shape rules (post-#903 tightening — drop the colon after `Screen`, use // @token-exempt: issue ref, not a color
+/// middle-dot separators, join units to numbers, abbreviate tier names):
+///   - Received unknown → `Screen · Nfps · Mkbps` (legacy fallback).
+///   - Source unknown or Source == Received → `Screen WxH (tier) · Nfps · Mkbps`.
+///   - Source != Received → `Screen AxB → CxD ↓P%` plus `· Nfps · Mkbps`.
+///     The `Source` / `Received` labels are dropped (the arrow already conveys
+///     direction); tier names are dropped from the expanded form because the
+///     resolution numbers are what matters when comparing the two; the
+///     `pixel area` suffix is dropped because the `%` already implies it.
 fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String {
     if !show_screen || !sample.screen_enabled {
         return String::new();
     }
 
+    // Compact metrics tail used by every branch. `·` (U+00B7 MIDDLE DOT)
+    // replaces the previous `|` pipe so the row reads less like a CSV.
+    // No space between number and unit (`850kbps`, `12.5fps`) — the user's
+    // tightening spec called this out explicitly.
     let metrics_suffix = format!(
-        " | {:.1} fps | {:.0} kbps",
+        " \u{00B7} {:.1}fps \u{00B7} {:.0}kbps",
         sample.screen_fps, sample.screen_bitrate_kbps
     );
 
@@ -627,7 +654,7 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
         // Nothing to attribute. Same single-line shape used by older clients
         // before #883 introduced received-resolution tracking. // @token-exempt: issue ref, not a color
         return format!(
-            "<span style='color:{}'>Screen:{}</span>",
+            "<span style='color:{}'>Screen{}</span>",
             theme_color::SIGNAL_SCREEN,
             metrics_suffix
         );
@@ -638,17 +665,17 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
         // or the encoder hit no tier constraint and shipped the native size.
         // In both cases collapse to a single value — there is nothing to
         // compare against.
-        let tier = infer_video_tier(&sample.screen_resolution);
+        let tier = infer_video_tier_short(&sample.screen_resolution);
         return if tier.is_empty() {
             format!(
-                "<span style='color:{}'>Screen: {}{}</span>",
+                "<span style='color:{}'>Screen {}{}</span>",
                 theme_color::SIGNAL_SCREEN,
                 sample.screen_resolution,
                 metrics_suffix
             )
         } else {
             format!(
-                "<span style='color:{}'>Screen: {} ({}){}</span>",
+                "<span style='color:{}'>Screen {} ({}){}</span>",
                 theme_color::SIGNAL_SCREEN,
                 sample.screen_resolution,
                 tier,
@@ -658,27 +685,19 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
     }
 
     // Source != Received. Show both with the arrow separator so it's
-    // immediately legible that downscaling happened.
-    let source_tier = infer_video_tier(&sample.screen_source_resolution);
-    let received_tier = infer_video_tier(&sample.screen_resolution);
-    let source_label = if source_tier.is_empty() {
-        sample.screen_source_resolution.clone()
-    } else {
-        format!("{} ({})", sample.screen_source_resolution, source_tier)
-    };
-    let received_label = if received_tier.is_empty() {
-        sample.screen_resolution.clone()
-    } else {
-        format!("{} ({})", sample.screen_resolution, received_tier)
-    };
+    // immediately legible that downscaling happened. Tier names are dropped
+    // from the expanded form per the #903 tightening — the resolution // @token-exempt: issue ref, not a color
+    // numbers are the comparison data, the tier names add noise.
 
     // Optional degradation badge when the encoder downscaled in transit.
     // U+2193 DOWNWARDS ARROW is the icon, the pct is bucketed for severity.
+    // We drop the previous " pixel area" suffix — the % already implies
+    // it and the row is tight enough as-is.
     let badge = if let Some(pct) =
         screen_downscale_percent(&sample.screen_source_resolution, &sample.screen_resolution)
     {
         format!(
-            " <span style='color:{}'>\u{2193}{}% pixel area</span>",
+            " <span style='color:{}'>\u{2193}{}%</span>",
             screen_downscale_color(pct),
             pct
         )
@@ -687,10 +706,10 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
     };
 
     format!(
-        "<span style='color:{}'>Screen: Source {} \u{2192} Received {}</span>{}{}",
+        "<span style='color:{}'>Screen {} \u{2192} {}</span>{}{}",
         theme_color::SIGNAL_SCREEN,
-        source_label,
-        received_label,
+        sample.screen_source_resolution,
+        sample.screen_resolution,
         badge,
         format_args!(
             "<span style='color:{}'>{}</span>",
@@ -704,15 +723,19 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
 /// encoder downscaled in transit (issue #903). The line is sourced from the // @token-exempt: issue ref, not a color
 /// publisher-stamped `VideoMetadata` fields
 /// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint` and renders
-/// in one of three shapes:
+/// in one of these compact shapes (post-#903 tightening — drop "encoder // @token-exempt: issue ref, not a color
+/// target", "limited by", "adaptive-quality"; join units to numbers; use
+/// middle-dot separators):
 ///
-///   1. **Primary** — bitrate + tier present:
-///      `Cause: encoder target bitrate <N> kbps (limited by adaptive-quality
-///      tier '<tier>')`
-///   2. **Combined** — all three present:
-///      `Cause: <cause_hint> — encoder target bitrate <N> kbps, tier '<tier>'`
+///   1. **Combined** — all three present:
+///      `Cause: <cause_hint> · <N>kbps · tier '<tier>'`
+///   2. **Primary** — bitrate + tier present:
+///      `Cause: <N>kbps · tier '<tier>'`
 ///   3. **Hint-only fallback** — only `cause_hint`:
 ///      `Cause: <cause_hint>`
+///
+/// `tier` is preserved as a literal word because users may not recognise a
+/// bare `'low'` / `'medium'` / `'high'` label without that cue.
 ///
 /// Returns an empty string when:
 /// * the screen series is hidden or `screen_enabled` is false, OR
@@ -740,27 +763,26 @@ fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
         return String::new();
     }
 
+    // Use U+00B7 MIDDLE DOT as the inline separator, matching the Screen
+    // tooltip line's tightened style. Each branch builds the trailing
+    // evidence list once with the same dot-joining rule.
     let body = match (has_bitrate, has_tier, has_hint) {
-        // Combined: hint + bitrate + tier. Most informative — show the
-        // hint first as the human-readable summary, then the concrete
-        // numbers as parenthetical-style evidence.
-        (true, true, true) => format!(
-            "Cause: {hint} \u{2014} encoder target bitrate {bitrate} kbps, tier '{tier}'"
-        ),
-        // Primary: bitrate + tier without a hint. Mirrors the example from
-        // issue #903 verbatim so the UI copy is reviewable against the spec. // @token-exempt: issue ref, not a color
-        (true, true, false) => format!(
-            "Cause: encoder target bitrate {bitrate} kbps (limited by adaptive-quality tier '{tier}')"
-        ),
-        // Bitrate + hint (no tier) — also useful, surface both.
-        (true, false, true) => {
-            format!("Cause: {hint} \u{2014} encoder target bitrate {bitrate} kbps")
+        // Combined: hint + bitrate + tier. Most informative — lead with
+        // the hint summary, then dot-join the concrete signals.
+        (true, true, true) => {
+            format!("Cause: {hint} \u{00B7} {bitrate}kbps \u{00B7} tier '{tier}'")
         }
+        // Primary: bitrate + tier without a hint.
+        (true, true, false) => {
+            format!("Cause: {bitrate}kbps \u{00B7} tier '{tier}'")
+        }
+        // Bitrate + hint (no tier).
+        (true, false, true) => format!("Cause: {hint} \u{00B7} {bitrate}kbps"),
         // Tier + hint (no bitrate).
-        (false, true, true) => format!("Cause: {hint} \u{2014} tier '{tier}'"),
+        (false, true, true) => format!("Cause: {hint} \u{00B7} tier '{tier}'"),
         // Single signal fallbacks.
-        (true, false, false) => format!("Cause: encoder target bitrate {bitrate} kbps"),
-        (false, true, false) => format!("Cause: adaptive-quality tier '{tier}'"),
+        (true, false, false) => format!("Cause: {bitrate}kbps"),
+        (false, true, false) => format!("Cause: tier '{tier}'"),
         (false, false, true) => format!("Cause: {hint}"),
         (false, false, false) => return String::new(),
     };
@@ -1531,12 +1553,27 @@ mod tests {
 
     #[test]
     fn infer_video_tier_classifies_screen_resolutions() {
-        // The same tier helper is used for camera and screen lines.
+        // Long-form tier name is used by the camera-video line and as the
+        // input to the short-form lookup below.
         assert_eq!(infer_video_tier("1920x1080"), "Full HD");
         assert_eq!(infer_video_tier("1280x720"), "HD");
         assert_eq!(infer_video_tier("640x480"), "Medium");
         assert_eq!(infer_video_tier(""), "");
         assert_eq!(infer_video_tier("garbage"), "");
+    }
+
+    #[test]
+    fn infer_video_tier_short_abbreviates_common_labels() {
+        // Screen tooltip uses the abbreviated form so the row stays narrow.
+        // FHD / QHD / UHD are the only abbreviations applied; HD and the
+        // lower tiers are already compact and keep their long form.
+        assert_eq!(infer_video_tier_short("1920x1080"), "FHD");
+        assert_eq!(infer_video_tier_short("1280x720"), "HD");
+        assert_eq!(infer_video_tier_short("960x540"), "Standard");
+        assert_eq!(infer_video_tier_short("640x480"), "Medium");
+        // Unknown / empty inputs pass through.
+        assert_eq!(infer_video_tier_short(""), "");
+        assert_eq!(infer_video_tier_short("garbage"), "");
     }
 
     // -----------------------------------------------------------------
@@ -1606,10 +1643,16 @@ mod tests {
 
     #[test]
     fn tooltip_collapses_when_source_equals_received() {
+        // Post-#903 tightening: `Screen ` (no colon), abbreviated tier name, // @token-exempt: issue ref, not a color
+        // middle-dot separators, joined units. // @token-exempt: issue ref, not a color
         let s = screen_sample("1920x1080", "1920x1080");
         let line = build_screen_tooltip_line(&s, true);
-        assert!(line.contains("Screen: 1920x1080"));
-        assert!(line.contains("(Full HD)"));
+        assert!(line.contains("Screen 1920x1080"));
+        assert!(line.contains("(FHD)"));
+        // No legacy noise.
+        assert!(!line.contains("Screen:"));
+        assert!(!line.contains("(Full HD)"));
+        assert!(!line.contains(" | "));
         // Single value — no arrow, no badge.
         assert!(!line.contains("Source"));
         assert!(!line.contains("\u{2192}"));
@@ -1617,26 +1660,31 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_shows_source_arrow_received_when_different() {
+    fn tooltip_shows_arrow_when_source_differs_from_received() {
         let s = screen_sample("1280x720", "2560x1440");
         let line = build_screen_tooltip_line(&s, true);
-        assert!(line.contains("Source 2560x1440"));
-        assert!(line.contains("Received 1280x720"));
-        assert!(line.contains("\u{2192}")); // arrow
-                                            // 2560x1440 -> 1280x720 = 75% pixel-area loss, danger color.
-        assert!(line.contains("\u{2193}75% pixel area"));
+        // Post-tightening: bare numbers + arrow, no "Source" / "Received"
+        // labels, no tier names in the expanded form.
+        assert!(line.contains("Screen 2560x1440 \u{2192} 1280x720"));
+        assert!(!line.contains("Source 2560x1440"));
+        assert!(!line.contains("Received 1280x720"));
+        assert!(!line.contains("(HD)"));
+        assert!(!line.contains("(Full HD)"));
+        // 2560x1440 -> 1280x720 = 75% pixel-area loss, danger color.
+        // Compact badge: no "pixel area" suffix.
+        assert!(line.contains("\u{2193}75%"));
+        assert!(!line.contains("pixel area"));
         assert!(line.contains(theme_color::ERROR_TEXT));
     }
 
     #[test]
     fn tooltip_uses_warning_color_for_moderate_downscale() {
-        // 1920x1080 -> 1280x720 = 56% loss -> danger (since >= 50%).
-        // Use a smaller delta to land in 25-49%.
-        // 1920x1080 -> 1600x900 = 30.6% loss -> warning.
+        // 1920x1080 -> 1600x900 = 30.6% loss -> warning. Compact badge.
         let s = screen_sample("1600x900", "1920x1080");
         let line = build_screen_tooltip_line(&s, true);
         assert!(line.contains(theme_color::WARNING_TEXT));
-        assert!(line.contains("\u{2193}31% pixel area"));
+        assert!(line.contains("\u{2193}31%"));
+        assert!(!line.contains("pixel area"));
     }
 
     #[test]
@@ -1646,14 +1694,18 @@ mod tests {
         let line = build_screen_tooltip_line(&s, true);
         assert!(line.contains(theme_color::TEXT_MUTED));
         assert!(line.contains("\u{2193}"));
+        assert!(!line.contains("pixel area"));
     }
 
     #[test]
     fn tooltip_received_only_when_source_unknown() {
         let s = screen_sample("1280x720", "");
         let line = build_screen_tooltip_line(&s, true);
-        assert!(line.contains("Screen: 1280x720"));
+        // Source unknown collapses to the single-value shape; HD stays
+        // long-form because it has no widely-known shorter abbreviation.
+        assert!(line.contains("Screen 1280x720"));
         assert!(line.contains("(HD)"));
+        assert!(!line.contains("Screen:"));
         // Older publisher -> no arrow, no badge.
         assert!(!line.contains("Source"));
         assert!(!line.contains("\u{2192}"));
@@ -1663,14 +1715,17 @@ mod tests {
     #[test]
     fn tooltip_legacy_shape_when_received_unknown() {
         // Both unknown -> fall back to no-resolution shape (pre-#891 baseline). // @token-exempt: issue ref, not a color
+        // Post-tightening: `Screen` with no colon, dot-joined metrics tail.
         let s = screen_sample("", "");
         let line = build_screen_tooltip_line(&s, true);
         assert!(line.starts_with("<span"));
-        assert!(line.contains("Screen:"));
-        assert!(line.contains("8.0 fps"));
-        assert!(line.contains("720 kbps"));
+        assert!(line.contains("Screen"));
+        assert!(!line.contains("Screen:"));
+        // Compact units: `8.0fps`, `720kbps` (no space).
+        assert!(line.contains("8.0fps"));
+        assert!(line.contains("720kbps"));
         assert!(!line.contains("Source"));
-        assert!(!line.contains("Received "));
+        assert!(!line.contains("Received"));
     }
 
     #[test]
@@ -1682,23 +1737,21 @@ mod tests {
 
     #[test]
     fn tooltip_metrics_suffix_always_present() {
-        // Source == Received branch
-        let s_eq = screen_sample("1280x720", "1280x720");
-        let line_eq = build_screen_tooltip_line(&s_eq, true);
-        assert!(line_eq.contains("8.0 fps"));
-        assert!(line_eq.contains("720 kbps"));
-
-        // Source != Received branch
-        let s_diff = screen_sample("1280x720", "1920x1080");
-        let line_diff = build_screen_tooltip_line(&s_diff, true);
-        assert!(line_diff.contains("8.0 fps"));
-        assert!(line_diff.contains("720 kbps"));
-
-        // Received-only branch
-        let s_no_src = screen_sample("1280x720", "");
-        let line_no_src = build_screen_tooltip_line(&s_no_src, true);
-        assert!(line_no_src.contains("8.0 fps"));
-        assert!(line_no_src.contains("720 kbps"));
+        // All three branches use the dot-joined compact metrics tail.
+        for (recv, src) in [
+            ("1280x720", "1280x720"),
+            ("1280x720", "1920x1080"),
+            ("1280x720", ""),
+        ] {
+            let s = screen_sample(recv, src);
+            let line = build_screen_tooltip_line(&s, true);
+            assert!(line.contains("8.0fps"), "missing 8.0fps in {line}");
+            assert!(line.contains("720kbps"), "missing 720kbps in {line}");
+            assert!(
+                line.contains("\u{00B7}"),
+                "missing middle-dot separator in {line}"
+            );
+        }
     }
 
     #[test]
@@ -1706,22 +1759,21 @@ mod tests {
         // <0.5% downscale rounds to 0 — we must NOT render "↓0%".
         let s = screen_sample("1919x1080", "1920x1080");
         let line = build_screen_tooltip_line(&s, true);
-        // Source and Received differ as strings, so we still see both rows…
-        assert!(line.contains("Source"));
-        assert!(line.contains("Received"));
-        // …but no badge because the area delta rounds to 0.
+        // The two resolutions differ as strings so the expanded shape
+        // still fires (we get the arrow), but no badge because the area
+        // delta rounds to 0.
+        assert!(line.contains("\u{2192}"));
         assert!(!line.contains("\u{2193}"));
         assert!(!line.contains("pixel area"));
     }
 
     // -----------------------------------------------------------------
-    // Issue #903: Cause line rendering. The cause line is now sourced // @token-exempt: issue ref, not a color
-    // from publisher-stamped `VideoMetadata` fields rather than a
-    // placeholder, so the tests below exercise each rendering shape:
+    // Issue #903: Cause line rendering. Sourced from publisher-stamped // @token-exempt: issue ref, not a color
+    // `VideoMetadata` fields. Post-tightening copy is compact:
     //   * No data → empty (older publisher or unconstrained tier).
-    //   * Bitrate + tier → primary "(limited by ...)" phrasing.
-    //   * Cause hint only → fallback "Cause: <hint>".
-    //   * All three → combined "Cause: <hint> — encoder target ..."
+    //   * Bitrate + tier → `Cause: <N>kbps · tier '<tier>'`.
+    //   * Cause hint only → `Cause: <hint>`.
+    //   * All three → `Cause: <hint> · <N>kbps · tier '<tier>'`.
     // The Screen line wrapper drops the row entirely when the helper
     // returns an empty string, so it is load-bearing that `""` and
     // not a placeholder is returned for the no-data cases.
@@ -1741,47 +1793,49 @@ mod tests {
 
     #[test]
     fn cause_line_primary_shape_with_bitrate_and_tier() {
-        // Bitrate + tier with no hint → the primary "(limited by adaptive-
-        // quality tier '<tier>')" shape spec'd in the issue body verbatim.
+        // Bitrate + tier with no hint → compact "Cause: 800kbps · tier 'low'".
         let mut s = screen_sample("1280x720", "1920x1080");
         s.screen_encoder_target_bitrate_kbps = 800;
         s.screen_adaptive_tier = "low".to_string();
         let line = build_screen_cause_line(&s, true);
-        assert!(line.contains("Cause:"));
-        assert!(line.contains("encoder target bitrate 800 kbps"));
-        assert!(line.contains("(limited by adaptive-quality tier 'low')"));
+        assert!(line.contains("Cause: 800kbps \u{00B7} tier 'low'"));
+        // Wordy phrasing must be gone.
+        assert!(!line.contains("encoder target"));
+        assert!(!line.contains("limited by"));
+        assert!(!line.contains("adaptive-quality"));
         assert!(line.contains(theme_color::TEXT_MUTED));
     }
 
     #[test]
     fn cause_line_hint_only_fallback() {
-        // Older / partial publisher only stamps cause_hint. Verify the
-        // fallback shape — bare "Cause: <hint>" — and that we still
-        // render even without bitrate/tier.
+        // Older / partial publisher only stamps cause_hint. Compact
+        // fallback: bare "Cause: <hint>" — no bitrate, no tier word.
         let mut s = screen_sample("1280x720", "1920x1080");
         s.screen_cause_hint = "cpu-pressure".to_string();
         let line = build_screen_cause_line(&s, true);
         assert!(line.contains("Cause: cpu-pressure"));
-        assert!(!line.contains("bitrate"));
+        assert!(!line.contains("kbps"));
         assert!(!line.contains("tier"));
         assert!(line.contains(theme_color::TEXT_MUTED));
     }
 
     #[test]
     fn cause_line_combined_shape_with_all_three() {
-        // Most-informative shape: hint + bitrate + tier combined into a
-        // single line. The hint reads as the human summary, the numbers
-        // and tier name come after the em-dash as concrete evidence.
+        // All three present → `Cause: <hint> · <N>kbps · tier '<tier>'`.
+        // Hint leads as the human summary; the dot-joined evidence
+        // follows for users who want the concrete numbers.
         let mut s = screen_sample("1280x720", "2560x1440");
         s.screen_encoder_target_bitrate_kbps = 500;
         s.screen_adaptive_tier = "low".to_string();
         s.screen_cause_hint = "network-rtt".to_string();
         let line = build_screen_cause_line(&s, true);
-        assert!(line.contains("Cause: network-rtt"));
-        assert!(line.contains("encoder target bitrate 500 kbps"));
-        assert!(line.contains("tier 'low'"));
-        // em-dash separator joins hint and evidence.
-        assert!(line.contains("\u{2014}"));
+        assert!(
+            line.contains("Cause: network-rtt \u{00B7} 500kbps \u{00B7} tier 'low'"),
+            "unexpected combined cause line: {line}"
+        );
+        // No legacy wordy phrasing.
+        assert!(!line.contains("encoder target"));
+        assert!(!line.contains("\u{2014}")); // em-dash gone, dot is the joiner
     }
 
     #[test]

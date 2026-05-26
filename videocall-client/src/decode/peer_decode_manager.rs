@@ -17,7 +17,7 @@
  */
 
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
+use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
@@ -381,8 +381,8 @@ impl Peer {
     > {
         // Create decoders without canvas (will be set later via set_canvas)
         // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None)?;
-        let screen_decoder = VideoPeerDecoder::new(None)?;
+        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA)?;
+        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN)?;
 
         // Attempt to set canvas immediately if available in DOM
         if let Some(window) = web_sys::window() {

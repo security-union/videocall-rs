@@ -81,6 +81,11 @@ struct CanvasRenderer {
 pub struct VideoPeerDecoder {
     decoder: Box<dyn VideoFrameDecoder>,
     canvas_renderer: Rc<RefCell<Option<CanvasRenderer>>>,
+    /// Discriminator tag emitted on diagnostics events so consumers can tell
+    /// camera-video resolution events apart from screen-share ones. Mirrors
+    /// the `media_type` metric already carried by the FPS/bitrate events
+    /// (`"VIDEO"` or `"SCREEN"`).
+    media_type: &'static str,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -113,10 +118,25 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     }
 }
 
+/// Media-type discriminator passed to [`VideoPeerDecoder::new`]. Distinguishes
+/// camera video streams from screen-share streams in diagnostics events so the
+/// UI can chart them separately. The values match the existing `media_type`
+/// metric carried on FPS/bitrate events.
+pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
+pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
+
 impl VideoPeerDecoder {
     /// Create a new video decoder with optional canvas element.
     /// Use `set_canvas()` to provide the canvas if not available at construction time.
-    pub fn new(canvas: Option<HtmlCanvasElement>) -> Result<Self, JsValue> {
+    ///
+    /// `media_type` tags the resolution diagnostics event so the UI can route
+    /// camera-video and screen-share resolution updates to the right place.
+    /// Use [`MEDIA_TYPE_CAMERA`] for the peer's camera decoder and
+    /// [`MEDIA_TYPE_SCREEN`] for the peer's screen-share decoder.
+    pub fn new(
+        canvas: Option<HtmlCanvasElement>,
+        media_type: &'static str,
+    ) -> Result<Self, JsValue> {
         let canvas_renderer = Rc::new(RefCell::new(None));
 
         // Initialize canvas if provided
@@ -138,7 +158,7 @@ impl VideoPeerDecoder {
 
         let canvas_ref = canvas_renderer.clone();
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
-            Self::render_to_canvas_cached(&canvas_ref, video_frame);
+            Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
@@ -152,6 +172,7 @@ impl VideoPeerDecoder {
         Ok(Self {
             decoder,
             canvas_renderer,
+            media_type,
         })
     }
 
@@ -200,6 +221,7 @@ impl VideoPeerDecoder {
                         metric!("resolution_height", renderer.last_height as u64),
                         metric!("from_peer", from_peer.clone()),
                         metric!("to_peer", to_peer.clone()),
+                        metric!("media_type", self.media_type.to_string()),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
@@ -212,6 +234,7 @@ impl VideoPeerDecoder {
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
+        media_type: &'static str,
     ) {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
@@ -238,6 +261,7 @@ impl VideoPeerDecoder {
                             metric!("resolution_height", height as u64),
                             metric!("from_peer", renderer.from_peer.clone().unwrap_or_default()),
                             metric!("to_peer", to_peer.clone()),
+                            metric!("media_type", media_type.to_string()),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);
@@ -290,6 +314,7 @@ impl VideoPeerDecoder {
         Self {
             decoder: Box::new(NoopDecoder),
             canvas_renderer: Rc::new(RefCell::new(None)),
+            media_type: MEDIA_TYPE_CAMERA,
         }
     }
 }

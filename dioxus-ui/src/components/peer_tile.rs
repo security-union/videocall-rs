@@ -70,6 +70,7 @@ pub fn PeerTile(
     let mut screen_bitrate = use_signal(|| 0.0_f64);
     let mut latency_ms = use_signal(|| 0.0_f64);
     let mut video_resolution = use_signal(String::new);
+    let mut screen_resolution = use_signal(String::new);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -150,6 +151,7 @@ pub fn PeerTile(
                     &mut screen_bitrate,
                     &mut latency_ms,
                     &mut video_resolution,
+                    &mut screen_resolution,
                     &mut peer_transport,
                 );
                 // Push a signal quality sample at most once per second,
@@ -181,6 +183,7 @@ pub fn PeerTile(
                     screen_enabled: *screen_enabled.peek(),
                     screen_fps: *screen_fps.peek(),
                     screen_bitrate_kbps: *screen_bitrate.peek(),
+                    screen_resolution: screen_resolution.peek().clone(),
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
                     video_enabled: *video_enabled.peek(),
@@ -386,6 +389,7 @@ fn handle_diagnostics_event(
     screen_bitrate: &mut Signal<f64>,
     latency_ms: &mut Signal<f64>,
     video_resolution: &mut Signal<String>,
+    screen_resolution: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
 ) {
     match evt.subsystem {
@@ -537,15 +541,19 @@ fn handle_diagnostics_event(
             }
         }
         "video_resolution" => {
-            // Track video resolution changes broadcast by the decoder.
+            // Track video resolution changes broadcast by the decoder. The
+            // `media_type` metric distinguishes the camera-video decoder
+            // ("VIDEO") from the screen-share decoder ("SCREEN").
             let mut to_peer: Option<String> = None;
             let mut res_w: Option<u64> = None;
             let mut res_h: Option<u64> = None;
+            let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
                     ("resolution_width", MetricValue::U64(w)) => res_w = Some(*w),
                     ("resolution_height", MetricValue::U64(h)) => res_h = Some(*h),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
                     _ => {}
                 }
             }
@@ -554,8 +562,14 @@ fn handle_diagnostics_event(
             }
             if let (Some(w), Some(h)) = (res_w, res_h) {
                 let res = format!("{w}x{h}");
-                if *video_resolution.peek() != res {
-                    video_resolution.set(res);
+                let is_screen = media_type_str.as_deref() == Some("SCREEN");
+                let target = if is_screen {
+                    &mut *screen_resolution
+                } else {
+                    &mut *video_resolution
+                };
+                if *target.peek() != res {
+                    target.set(res);
                 }
             }
         }

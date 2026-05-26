@@ -94,6 +94,8 @@ pub struct SignalSample {
     pub screen_enabled: bool,
     pub screen_fps: f64,
     pub screen_bitrate_kbps: f64,
+    /// Screen-share resolution as "WxH" (e.g. "1920x1080"), empty when unknown.
+    pub screen_resolution: String,
     // Latency
     pub latency_ms: f64,
 }
@@ -114,6 +116,7 @@ impl PartialEq for SignalSample {
             && self.screen_enabled == other.screen_enabled
             && self.screen_fps == other.screen_fps
             && self.screen_bitrate_kbps == other.screen_bitrate_kbps
+            && self.screen_resolution == other.screen_resolution
             && self.latency_ms == other.latency_ms
     }
 }
@@ -132,6 +135,8 @@ pub struct SampleData {
     pub screen_enabled: bool,
     pub screen_fps: f64,
     pub screen_bitrate_kbps: f64,
+    /// Screen-share resolution as "WxH", empty when unknown.
+    pub screen_resolution: String,
     pub latency_ms: f64,
     pub audio_enabled: bool,
     pub video_enabled: bool,
@@ -159,7 +164,12 @@ impl PeerSignalHistory {
     /// Append a new sample, computing quality scores internally from raw
     /// metrics. Evicts the oldest sample when at capacity.
     pub fn push_sample(&mut self, data: &SampleData) {
-        let timestamp_ms = js_sys::Date::now();
+        self.push_sample_at(data, js_sys::Date::now());
+    }
+
+    /// Append a sample with an explicit timestamp. Lets host unit tests
+    /// exercise the quality-derivation logic without depending on `js_sys`.
+    pub fn push_sample_at(&mut self, data: &SampleData, timestamp_ms: f64) {
         if self.samples.len() >= MAX_SIGNAL_SAMPLES {
             self.samples.pop_front();
         }
@@ -221,6 +231,7 @@ impl PeerSignalHistory {
             screen_enabled: data.screen_enabled,
             screen_fps: data.screen_fps,
             screen_bitrate_kbps: data.screen_bitrate_kbps,
+            screen_resolution: data.screen_resolution.clone(),
             latency_ms: data.latency_ms,
         });
     }
@@ -412,12 +423,32 @@ fn show_body_tooltip(
         String::new()
     };
     let screen_line = if show_screen && sample.screen_enabled {
-        format!(
-            "<span style='color:{}'>Screen: {:.1} fps | {:.0} kbps</span>",
-            theme_color::SIGNAL_SCREEN,
-            sample.screen_fps,
-            sample.screen_bitrate_kbps
-        )
+        let screen_tier = infer_video_tier(&sample.screen_resolution);
+        if sample.screen_resolution.is_empty() {
+            format!(
+                "<span style='color:{}'>Screen: {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_SCREEN,
+                sample.screen_fps,
+                sample.screen_bitrate_kbps
+            )
+        } else if screen_tier.is_empty() {
+            format!(
+                "<span style='color:{}'>Screen: {} | {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_SCREEN,
+                sample.screen_resolution,
+                sample.screen_fps,
+                sample.screen_bitrate_kbps
+            )
+        } else {
+            format!(
+                "<span style='color:{}'>Screen: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+                theme_color::SIGNAL_SCREEN,
+                sample.screen_resolution,
+                screen_tier,
+                sample.screen_fps,
+                sample.screen_bitrate_kbps
+            )
+        }
     } else {
         String::new()
     };
@@ -1034,12 +1065,17 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             strong { "Screen Share Quality" }
                             p { "Based on received FPS for the shared screen content." }
                             p {
+                                strong { "Resolution: " }
+                                "The dimensions of the shared screen being received (e.g., 1920x1080). "
+                                "Higher resolution means sharper text and detail."
+                            }
+                            p {
                                 strong { "FPS: " }
                                 "Frames per second of the shared screen. Screen shares typically run at 5\u{2013}15fps."
                             }
                             p {
                                 strong { "Bitrate (kbps): " }
-                                "Data rate of the screen share stream."
+                                "Data rate of the screen share stream. Combined with resolution this is the main driver of how sharp the shared content looks."
                             }
                         },
                         "latency" => rsx! {
@@ -1157,6 +1193,64 @@ mod tests {
     fn combined_quality_screen_only() {
         let q = combined_quality(0.0, 0.0, 0.7, false, false, true);
         assert!((q - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn push_sample_records_screen_resolution() {
+        let mut history = PeerSignalHistory::new();
+        let data = SampleData {
+            video_fps: 30.0,
+            video_bitrate_kbps: 800.0,
+            video_resolution: "1280x720".to_string(),
+            audio_bitrate_kbps: 64.0,
+            audio_expand_rate: 0.0,
+            audio_buffer_ms: 60.0,
+            screen_enabled: true,
+            screen_fps: 15.0,
+            screen_bitrate_kbps: 1200.0,
+            screen_resolution: "1920x1080".to_string(),
+            latency_ms: 40.0,
+            audio_enabled: true,
+            video_enabled: true,
+        };
+        history.push_sample_at(&data, 1_000.0);
+
+        let samples = history.samples_vec();
+        assert_eq!(samples.len(), 1);
+        let s = &samples[0];
+        assert_eq!(s.screen_resolution, "1920x1080");
+        assert!(s.screen_enabled);
+        assert!((s.screen_fps - 15.0).abs() < 1e-9);
+        // Screen quality is fps / 30 when enabled.
+        assert!((s.screen_quality - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn push_sample_screen_quality_zero_when_disabled() {
+        let mut history = PeerSignalHistory::new();
+        let data = SampleData {
+            screen_enabled: false,
+            screen_fps: 15.0,
+            screen_bitrate_kbps: 1200.0,
+            screen_resolution: String::new(),
+            video_enabled: true,
+            audio_enabled: true,
+            ..Default::default()
+        };
+        history.push_sample_at(&data, 2_000.0);
+        let samples = history.samples_vec();
+        assert_eq!(samples[0].screen_quality, 0.0);
+        assert_eq!(samples[0].screen_resolution, "");
+    }
+
+    #[test]
+    fn infer_video_tier_classifies_screen_resolutions() {
+        // The same tier helper is used for camera and screen lines.
+        assert_eq!(infer_video_tier("1920x1080"), "Full HD");
+        assert_eq!(infer_video_tier("1280x720"), "HD");
+        assert_eq!(infer_video_tier("640x480"), "Medium");
+        assert_eq!(infer_video_tier(""), "");
+        assert_eq!(infer_video_tier("garbage"), "");
     }
 
     #[test]

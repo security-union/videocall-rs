@@ -1759,6 +1759,22 @@ html[data-theme="light"] #invite-overlay p {
   transition: transform 0.2s ease;
 }
 
+.video-control-button.off {
+  background: rgba(255, 69, 58, 0.18);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: #FF6961;
+  box-shadow: 0 4px 12px -3px rgba(255, 69, 58, 0.25), inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.video-control-button.off:hover {
+  background: rgba(255, 69, 58, 0.28);
+  border-color: rgba(255, 69, 58, 0.45);
+  box-shadow:
+    0 8px 20px -3px rgba(255, 69, 58, 0.35),
+    0 0 0 1px rgba(255, 69, 58, 0.3),
+    inset 0 1px rgba(255, 255, 255, 0.06);
+}
+
 .video-control-button.active {
   background: #0A84FF;
   border-color: #0A84FF;

@@ -71,9 +71,8 @@ fn dash_if_empty(value: &str) -> &str {
 }
 
 #[component]
-pub fn AboutModal(open: Signal<bool>) -> Element {
+pub fn AboutModal(mut open: Signal<bool>) -> Element {
     let mut state = use_signal(|| FetchState::Loading);
-    let mut open_sig = open;
 
     use_effect(move || {
         if !open() {
@@ -162,24 +161,34 @@ pub fn AboutModal(open: Signal<bool>) -> Element {
     rsx! {
         div {
             class: "glass-backdrop",
-            role: "dialog",
-            "aria-modal": "true",
-            "aria-labelledby": "about-modal-heading",
-            tabindex: -1,
             "data-testid": "about-modal",
-            onclick: move |e| {
-                e.stop_propagation();
-                open_sig.set(false);
-            },
-            onkeydown: move |e: Event<KeyboardData>| {
-                if e.key().to_string() == "Escape" {
-                    open_sig.set(false);
-                }
-            },
+            // Click-outside dismiss.  The inner `.card-apple` stops
+            // propagation so this fires only for backdrop clicks.
+            onclick: move |_| open.set(false),
 
             div {
                 class: "card-apple about-modal-card",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "about-modal-heading",
+                tabindex: "0",
+                "data-testid": "about-modal-dialog",
                 onclick: move |e| e.stop_propagation(),
+                onkeydown: move |e: Event<KeyboardData>| {
+                    if e.key() == Key::Escape {
+                        open.set(false);
+                    }
+                },
+                // Autofocus the dialog when it first mounts so keyboard
+                // users can press Escape (or Tab) immediately without
+                // clicking inside first.  Mirrors `search_modal.rs` and
+                // `device_settings_modal.rs` accessibility patterns.
+                onmounted: move |element| {
+                    let element = element.data();
+                    spawn(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
 
                 div { class: "about-modal-header",
                     h3 {
@@ -191,7 +200,7 @@ pub fn AboutModal(open: Signal<bool>) -> Element {
                         r#type: "button",
                         class: "btn-apple btn-secondary btn-sm about-modal-close",
                         "aria-label": "Close About dialog",
-                        onclick: move |_| open_sig.set(false),
+                        onclick: move |_| open.set(false),
                         "Close"
                     }
                 }

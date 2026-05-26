@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
@@ -10,10 +12,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * the running client build (CARGO_PKG_VERSION + GIT_SHA + BUILD_TIMESTAMP)
  * and the server-side components returned by `GET /api/v1/versions`.
  *
- * The client version literal is intentionally embedded here as a string
- * mirror of `dioxus-ui/Cargo.toml#version`.  If you bump the crate version,
- * update this constant in the same commit so the assertion keeps tracking
- * the running build.
+ * The client version is read from `dioxus-ui/Cargo.toml` at spec load time
+ * so the assertion automatically tracks the running build — no hand-bumping
+ * required when the crate version changes.
  *
  * The server-versions response is mocked via `page.route` so this spec
  * doesn't depend on `meeting-api` reporting a specific set of services in
@@ -21,7 +22,24 @@ import { waitForServices } from "../helpers/wait-for-services";
  * the endpoint returns.
  */
 
-const CLIENT_VERSION = "1.1.42";
+function readClientVersionFromCargoToml(): string {
+  const cargoTomlPath = path.resolve(__dirname, "../../dioxus-ui/Cargo.toml");
+  const text = readFileSync(cargoTomlPath, "utf8");
+  // Match the first `version = "X.Y.Z"` in the [package] section.  The
+  // dioxus-ui Cargo.toml puts [package] at the top, so the first match
+  // is the crate version (a later `version = "..."` in [dependencies]
+  // would only be reached if the file is reordered, in which case the
+  // version regex below still validates the shape).
+  const match = text.match(/^version\s*=\s*"(\d+\.\d+\.\d+)"/m);
+  if (!match) {
+    throw new Error(
+      `Could not parse version from ${cargoTomlPath}; expected a 'version = "X.Y.Z"' line.`,
+    );
+  }
+  return match[1];
+}
+
+const CLIENT_VERSION = readClientVersionFromCargoToml();
 
 const MOCK_VERSIONS_BODY = {
   components: [
@@ -94,16 +112,19 @@ test.describe("Homepage About modal", () => {
     await expect(modal).toContainText("websocket");
   });
 
-  test("Escape closes the About modal", async ({ page }) => {
+  test("dialog autofocuses on open and Escape closes it", async ({ page }) => {
     await page.goto("/");
 
     await page.locator('[data-testid="about-footer-link"]').click();
     const modal = page.locator('[data-testid="about-modal"]');
+    const dialog = page.locator('[data-testid="about-modal-dialog"]');
     await expect(modal).toBeVisible({ timeout: 5_000 });
 
-    // The backdrop owns the keydown handler; focus it so the key event
-    // reaches the dialog rather than the page body.
-    await modal.focus();
+    // The inner `.card-apple` is the dialog (role="dialog", tabindex="0")
+    // and `onmounted` calls `set_focus(true)` so keyboard-only users can
+    // dismiss with Escape immediately — without any manual focus step.
+    await expect(dialog).toBeFocused({ timeout: 3_000 });
+
     await page.keyboard.press("Escape");
 
     await expect(modal).toBeHidden({ timeout: 3_000 });

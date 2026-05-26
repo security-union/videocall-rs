@@ -2441,7 +2441,7 @@ html[data-theme="light"] #invite-overlay p {
   height: 100% !important;
   min-width: 100% !important;
   object-fit: cover !important;
-  object-position: center center !important;
+  object-position: center top !important;
 }
 
 .grid-item .canvas-container canvas.uncropped,

@@ -252,4 +252,4 @@ pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
     MediaPermissionsErrorState, PermissionState, SelectableDevices,
 };
-pub use videocall_types::Callback;
+pub use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};

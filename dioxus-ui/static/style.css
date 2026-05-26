@@ -3079,6 +3079,59 @@ select {
     font-weight: 400;
 }
 
+/* ------------------------------------------------------------------
+   Screen-share visibility toast (HCL issue 893). @token-exempt
+   Three visual variants share the same outer layout as peer-toasts
+   but use distinct icon-tint tokens to communicate state. They do
+   not auto-dismiss via animation — the state machine in `attendants.rs`
+   transitions or clears them — so we override the inherited
+   `toast-exit` animation back to the enter-only animation.
+   ------------------------------------------------------------------ */
+
+.peer-toast.screen-share-toast {
+    animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.peer-toast.toast-loading .toast-icon {
+    background: var(--toast-icon-neutral-bg);
+}
+
+.peer-toast.toast-loading .toast-icon svg {
+    color: var(--toast-action-neutral);
+    animation: screen-share-spin 1s linear infinite;
+}
+
+.peer-toast.toast-success .toast-icon {
+    background: var(--success-icon-bg);
+}
+
+.peer-toast.toast-success .toast-icon svg {
+    color: var(--success);
+}
+
+.peer-toast.toast-error .toast-icon {
+    background: var(--danger-icon-bg, var(--toast-icon-neutral-bg));
+}
+
+.peer-toast.toast-error .toast-icon svg {
+    color: var(--danger, var(--toast-action-neutral));
+}
+
+@keyframes screen-share-spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .peer-toast.toast-loading .toast-icon svg {
+        animation: none;
+    }
+}
+
 @keyframes toast-enter {
     from {
         opacity: 0;

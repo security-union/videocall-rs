@@ -2420,7 +2420,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
-.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; }
+.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; object-position: center top !important; }
 
 .grid-item .canvas-container canvas.uncropped,
 .split-screen-tile .canvas-container canvas.uncropped,

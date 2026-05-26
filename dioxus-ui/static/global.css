@@ -5,7 +5,7 @@
   background: var(--overlay-backdrop);
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
-  z-index: 3000;
+  z-index: 9600;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1759,6 +1759,22 @@ html[data-theme="light"] #invite-overlay p {
   transition: transform 0.2s ease;
 }
 
+.video-control-button.off {
+  background: rgba(255, 69, 58, 0.18);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: #FF6961;
+  box-shadow: 0 4px 12px -3px rgba(255, 69, 58, 0.25), inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.video-control-button.off:hover {
+  background: rgba(255, 69, 58, 0.28);
+  border-color: rgba(255, 69, 58, 0.45);
+  box-shadow:
+    0 8px 20px -3px rgba(255, 69, 58, 0.35),
+    0 0 0 1px rgba(255, 69, 58, 0.3),
+    inset 0 1px rgba(255, 255, 255, 0.06);
+}
+
 .video-control-button.active {
   background: #0A84FF;
   border-color: #0A84FF;
@@ -2420,11 +2436,20 @@ html[data-theme="light"] #invite-overlay p {
 
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
-.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; }
+.split-peer-tile .canvas-container canvas.cropped {
+  width: auto !important;
+  height: 100% !important;
+  min-width: 100% !important;
+  object-fit: cover !important;
+  object-position: center center !important;
+}
 
 .grid-item .canvas-container canvas.uncropped,
 .split-screen-tile .canvas-container canvas.uncropped,
-.split-peer-tile .canvas-container canvas.uncropped { object-fit: contain !important; }
+.split-peer-tile .canvas-container canvas.uncropped {
+  object-fit: contain !important;
+  object-position: center center !important;
+}
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {

@@ -34,7 +34,8 @@ canvas {
   max-height: 100%;
   width: auto;
   height: auto;
-  object-fit: contain;
+  object-fit: cover;
+  object-position: center top;
 }
 
 #main-container {
@@ -581,12 +582,15 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 canvas {
-  width: 100%;
+  width: auto;
   height: 100%;
-  object-fit: contain;
+  min-width: 100%;
+  object-fit: cover;
+  object-position: center center;
 }
 
 /* ============================================================

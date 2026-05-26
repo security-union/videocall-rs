@@ -340,6 +340,39 @@ test.describe("Peer screen-share diagnostics", () => {
       await expect(helpText).toContainText("Source");
       await expect(helpText).toContainText(/Received/i);
       await expect(helpText).toContainText("pixel");
+
+      // ----- Cause line (HCL issue #903) -----
+      //
+      // The publisher's screen encoder boots at `DEFAULT_SCREEN_TIER_INDEX`
+      // ("medium" — see videocall-aq/constants.rs). That is not the top tier,
+      // so `apply_initial_tier` seeds the publisher-side encoder state with
+      //
+      //   encoder_target_bitrate_kbps = SCREEN_QUALITY_TIERS[1].ideal_bitrate_kbps (= 1200)
+      //   adaptive_tier               = "medium"
+      //   cause_hint                  = "bitrate-limited"
+      //
+      // The screen encoder stamps these onto every `VideoMetadata` it
+      // emits. The receiver's `peer_decoder.rs` translates them into a
+      // `screen_encoder_state` diag event, `peer_tile.rs` records them on
+      // the `SignalSample`, and `signal_quality.rs::build_screen_cause_line`
+      // renders the primary "(limited by adaptive-quality tier '<tier>')"
+      // phrase below the Screen row. Assert the rendered text mirrors the
+      // issue body's example verbatim — this is the end-to-end contract
+      // promised in the spec.
+      const tooltipHtml2 = await tooltip.innerHTML();
+      const causeLine = tooltipHtml2.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l));
+      if (!causeLine) {
+        throw new Error(`Tooltip did not contain a 'Cause:' line:\n${tooltipHtml2}`);
+      }
+      expect(causeLine).toMatch(/encoder target bitrate 1200 kbps/);
+      expect(causeLine).toMatch(/tier 'medium'/);
+
+      // The legend help text must describe the Cause line shape so the
+      // wording stays in sync with the renderer. The previous placeholder
+      // string ("not yet instrumented" / "#903" reference) is gone.
+      await expect(helpText).toContainText(/cause/i);
+      await expect(helpText).toContainText(/adaptive-quality|tier/i);
+      await expect(helpText).not.toContainText("not yet instrumented");
     } finally {
       for (const m of members) {
         if (m.page) {

@@ -103,6 +103,22 @@ pub struct SignalSample {
     /// yet. When this differs from `screen_resolution` the publisher's
     /// encoder downscaled in transit.
     pub screen_source_resolution: String,
+    /// Issue #903: publisher's encoder *target* bitrate for the screen-share // @token-exempt: issue ref, not a color
+    /// track (kbps). What the encoder is currently trying to produce, not
+    /// the realised on-the-wire bitrate (which is `screen_bitrate_kbps`).
+    /// `0` means the publisher hasn't stamped the field — older client or
+    /// AQ tier 0 (unconstrained). The Cause tooltip line is omitted in
+    /// either case.
+    pub screen_encoder_target_bitrate_kbps: u32,
+    /// Issue #903: name of the adaptive-quality tier currently constraining // @token-exempt: issue ref, not a color
+    /// the publisher's screen-share encoder (e.g. `"high"`, `"medium"`,
+    /// `"low"`). Empty when AQ isn't engaged or the publisher is older.
+    pub screen_adaptive_tier: String,
+    /// Issue #903: short publisher-classified cause of the downscale, // @token-exempt: issue ref, not a color
+    /// one of `"bitrate-limited"`, `"cpu-pressure"`, `"network-rtt"`,
+    /// `"network-loss"`, `"manual-cap"`, or empty. Empty means the encoder
+    /// is unconstrained or the publisher doesn't supply the field.
+    pub screen_cause_hint: String,
     // Latency
     pub latency_ms: f64,
 }
@@ -125,6 +141,9 @@ impl PartialEq for SignalSample {
             && self.screen_bitrate_kbps == other.screen_bitrate_kbps
             && self.screen_resolution == other.screen_resolution
             && self.screen_source_resolution == other.screen_source_resolution
+            && self.screen_encoder_target_bitrate_kbps == other.screen_encoder_target_bitrate_kbps
+            && self.screen_adaptive_tier == other.screen_adaptive_tier
+            && self.screen_cause_hint == other.screen_cause_hint
             && self.latency_ms == other.latency_ms
     }
 }
@@ -149,6 +168,16 @@ pub struct SampleData {
     /// capture size as reported on the wire. Empty when the publisher
     /// doesn't report it or hasn't been seen yet.
     pub screen_source_resolution: String,
+    /// Issue #903: publisher's encoder target bitrate for the screen-share // @token-exempt: issue ref, not a color
+    /// track (kbps); `0` when the publisher doesn't supply the field.
+    pub screen_encoder_target_bitrate_kbps: u32,
+    /// Issue #903: name of the AQ tier currently constraining the // @token-exempt: issue ref, not a color
+    /// publisher's screen-share encoder. Empty when AQ isn't engaged.
+    pub screen_adaptive_tier: String,
+    /// Issue #903: short publisher-classified cause of the downscale. // @token-exempt: issue ref, not a color
+    /// Empty when the encoder is unconstrained or the publisher doesn't
+    /// supply the field.
+    pub screen_cause_hint: String,
     pub latency_ms: f64,
     pub audio_enabled: bool,
     pub video_enabled: bool,
@@ -245,6 +274,9 @@ impl PeerSignalHistory {
             screen_bitrate_kbps: data.screen_bitrate_kbps,
             screen_resolution: data.screen_resolution.clone(),
             screen_source_resolution: data.screen_source_resolution.clone(),
+            screen_encoder_target_bitrate_kbps: data.screen_encoder_target_bitrate_kbps,
+            screen_adaptive_tier: data.screen_adaptive_tier.clone(),
+            screen_cause_hint: data.screen_cause_hint.clone(),
             latency_ms: data.latency_ms,
         });
     }
@@ -669,30 +701,74 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
 }
 
 /// Render the optional **Cause** sub-line that explains *why* the publisher's
-/// encoder downscaled in transit. Returns an empty string when the Screen
-/// line wouldn't carry a degradation badge (no downscale to explain) or when
-/// the screen series is disabled.
+/// encoder downscaled in transit (issue #903). The line is sourced from the // @token-exempt: issue ref, not a color
+/// publisher-stamped `VideoMetadata` fields
+/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint` and renders
+/// in one of three shapes:
 ///
-/// Today we don't have any publisher-side cause data on the wire — see issue
-/// `#903` for the plumbing plan (extending `VideoMetadata` with // @token-exempt: issue ref, not a color
-/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint`). Until then
-/// we surface a muted placeholder so users can correlate blur with downscale
-/// AND know we're aware of the gap. The line is only shown when a
-/// degradation badge is shown, to avoid noise on healthy streams.
+///   1. **Primary** — bitrate + tier present:
+///      `Cause: encoder target bitrate <N> kbps (limited by adaptive-quality
+///      tier '<tier>')`
+///   2. **Combined** — all three present:
+///      `Cause: <cause_hint> — encoder target bitrate <N> kbps, tier '<tier>'`
+///   3. **Hint-only fallback** — only `cause_hint`:
+///      `Cause: <cause_hint>`
+///
+/// Returns an empty string when:
+/// * the screen series is hidden or `screen_enabled` is false, OR
+/// * all three publisher-stamped fields are zero / empty (older publishers
+///   that don't supply cause data, or the unconstrained-tier path).
+///
+/// The empty-string return is load-bearing: the tooltip render loop omits
+/// the line entirely when this helper returns empty, so older publishers
+/// never see a placeholder shipped in their UI. See the unit tests below.
 fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
     if !show_screen || !sample.screen_enabled {
         return String::new();
     }
-    // Only render when there's an actual downscale to explain.
-    if screen_downscale_percent(&sample.screen_source_resolution, &sample.screen_resolution)
-        .is_none()
-    {
+
+    let bitrate = sample.screen_encoder_target_bitrate_kbps;
+    let tier = sample.screen_adaptive_tier.trim();
+    let hint = sample.screen_cause_hint.trim();
+    let has_bitrate = bitrate > 0;
+    let has_tier = !tier.is_empty();
+    let has_hint = !hint.is_empty();
+
+    // No data → no line. Older publishers, AQ at top tier, and zero-initialised
+    // newer publishers all land here.
+    if !has_bitrate && !has_tier && !has_hint {
         return String::new();
     }
 
+    let body = match (has_bitrate, has_tier, has_hint) {
+        // Combined: hint + bitrate + tier. Most informative — show the
+        // hint first as the human-readable summary, then the concrete
+        // numbers as parenthetical-style evidence.
+        (true, true, true) => format!(
+            "Cause: {hint} \u{2014} encoder target bitrate {bitrate} kbps, tier '{tier}'"
+        ),
+        // Primary: bitrate + tier without a hint. Mirrors the example from
+        // issue #903 verbatim so the UI copy is reviewable against the spec. // @token-exempt: issue ref, not a color
+        (true, true, false) => format!(
+            "Cause: encoder target bitrate {bitrate} kbps (limited by adaptive-quality tier '{tier}')"
+        ),
+        // Bitrate + hint (no tier) — also useful, surface both.
+        (true, false, true) => {
+            format!("Cause: {hint} \u{2014} encoder target bitrate {bitrate} kbps")
+        }
+        // Tier + hint (no bitrate).
+        (false, true, true) => format!("Cause: {hint} \u{2014} tier '{tier}'"),
+        // Single signal fallbacks.
+        (true, false, false) => format!("Cause: encoder target bitrate {bitrate} kbps"),
+        (false, true, false) => format!("Cause: adaptive-quality tier '{tier}'"),
+        (false, false, true) => format!("Cause: {hint}"),
+        (false, false, false) => return String::new(),
+    };
+
     format!(
-        "<span style='color:{}'>Cause: not yet instrumented \u{2014} see issue #903</span>", // @token-exempt: issue ref, not a color
-        theme_color::TEXT_MUTED
+        "<span style='color:{}'>{}</span>",
+        theme_color::TEXT_MUTED,
+        body
     )
 }
 
@@ -1263,11 +1339,14 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                             p {
                                 strong { "Cause: " }
-                                "Sub-line shown below the Screen row when a downscale is detected. "
-                                "Today this is a placeholder pointing at issue #903 — surfacing the " // @token-exempt: issue ref, not a color
-                                "actual cause (publisher's encoder target bitrate, adaptive-quality "
-                                "tier, CPU pressure) requires extending the wire format and is "
-                                "tracked separately."
+                                "Sub-line shown below the Screen row when the publisher's encoder "
+                                "reports it is constrained. Sourced from the publisher's adaptive-"
+                                "quality system: the encoder's current target bitrate, the tier "
+                                "actively limiting it (e.g. 'low' / 'medium'), and a short cause "
+                                "classifier (bitrate-limited, cpu-pressure, network-rtt, "
+                                "network-loss, manual-cap). The line is omitted when the "
+                                "publisher is unconstrained or is an older client that doesn't "
+                                "report this data."
                             }
                             p {
                                 strong { "FPS: " }
@@ -1410,6 +1489,9 @@ mod tests {
             screen_bitrate_kbps: 1200.0,
             screen_resolution: "1920x1080".to_string(),
             screen_source_resolution: "1920x1080".to_string(),
+            screen_encoder_target_bitrate_kbps: 0,
+            screen_adaptive_tier: String::new(),
+            screen_cause_hint: String::new(),
             latency_ms: 40.0,
             audio_enabled: true,
             video_enabled: true,
@@ -1480,6 +1562,9 @@ mod tests {
             screen_bitrate_kbps: 720.0,
             screen_resolution: received.to_string(),
             screen_source_resolution: source.to_string(),
+            screen_encoder_target_bitrate_kbps: 0,
+            screen_adaptive_tier: String::new(),
+            screen_cause_hint: String::new(),
             latency_ms: 0.0,
         }
     }
@@ -1629,35 +1714,116 @@ mod tests {
         assert!(!line.contains("pixel area"));
     }
 
+    // -----------------------------------------------------------------
+    // Issue #903: Cause line rendering. The cause line is now sourced // @token-exempt: issue ref, not a color
+    // from publisher-stamped `VideoMetadata` fields rather than a
+    // placeholder, so the tests below exercise each rendering shape:
+    //   * No data → empty (older publisher or unconstrained tier).
+    //   * Bitrate + tier → primary "(limited by ...)" phrasing.
+    //   * Cause hint only → fallback "Cause: <hint>".
+    //   * All three → combined "Cause: <hint> — encoder target ..."
+    // The Screen line wrapper drops the row entirely when the helper
+    // returns an empty string, so it is load-bearing that `""` and
+    // not a placeholder is returned for the no-data cases.
+    // -----------------------------------------------------------------
+
     #[test]
-    fn cause_line_only_present_with_downscale() {
-        // No downscale -> no cause line.
-        let s_eq = screen_sample("1920x1080", "1920x1080");
-        assert_eq!(build_screen_cause_line(&s_eq, true), "");
+    fn cause_line_empty_when_no_publisher_data() {
+        // Older publisher / unconstrained AQ tier: all three fields
+        // arrive as proto3 defaults. We MUST omit the line — shipping
+        // "not yet instrumented" or any placeholder regressed in #891. // @token-exempt: issue ref, not a color
+        let s = screen_sample("1280x720", "2560x1440");
+        assert_eq!(s.screen_encoder_target_bitrate_kbps, 0);
+        assert!(s.screen_adaptive_tier.is_empty());
+        assert!(s.screen_cause_hint.is_empty());
+        assert_eq!(build_screen_cause_line(&s, true), "");
+    }
 
-        // Source unknown -> no cause line.
-        let s_no_src = screen_sample("1280x720", "");
-        assert_eq!(build_screen_cause_line(&s_no_src, true), "");
-
-        // Downscale present -> placeholder pointing at the follow-up issue.
-        let s_down = screen_sample("1280x720", "2560x1440");
-        let line = build_screen_cause_line(&s_down, true);
+    #[test]
+    fn cause_line_primary_shape_with_bitrate_and_tier() {
+        // Bitrate + tier with no hint → the primary "(limited by adaptive-
+        // quality tier '<tier>')" shape spec'd in the issue body verbatim.
+        let mut s = screen_sample("1280x720", "1920x1080");
+        s.screen_encoder_target_bitrate_kbps = 800;
+        s.screen_adaptive_tier = "low".to_string();
+        let line = build_screen_cause_line(&s, true);
         assert!(line.contains("Cause:"));
-        assert!(line.contains("#903")); // @token-exempt: issue ref, not a color
+        assert!(line.contains("encoder target bitrate 800 kbps"));
+        assert!(line.contains("(limited by adaptive-quality tier 'low')"));
         assert!(line.contains(theme_color::TEXT_MUTED));
+    }
+
+    #[test]
+    fn cause_line_hint_only_fallback() {
+        // Older / partial publisher only stamps cause_hint. Verify the
+        // fallback shape — bare "Cause: <hint>" — and that we still
+        // render even without bitrate/tier.
+        let mut s = screen_sample("1280x720", "1920x1080");
+        s.screen_cause_hint = "cpu-pressure".to_string();
+        let line = build_screen_cause_line(&s, true);
+        assert!(line.contains("Cause: cpu-pressure"));
+        assert!(!line.contains("bitrate"));
+        assert!(!line.contains("tier"));
+        assert!(line.contains(theme_color::TEXT_MUTED));
+    }
+
+    #[test]
+    fn cause_line_combined_shape_with_all_three() {
+        // Most-informative shape: hint + bitrate + tier combined into a
+        // single line. The hint reads as the human summary, the numbers
+        // and tier name come after the em-dash as concrete evidence.
+        let mut s = screen_sample("1280x720", "2560x1440");
+        s.screen_encoder_target_bitrate_kbps = 500;
+        s.screen_adaptive_tier = "low".to_string();
+        s.screen_cause_hint = "network-rtt".to_string();
+        let line = build_screen_cause_line(&s, true);
+        assert!(line.contains("Cause: network-rtt"));
+        assert!(line.contains("encoder target bitrate 500 kbps"));
+        assert!(line.contains("tier 'low'"));
+        // em-dash separator joins hint and evidence.
+        assert!(line.contains("\u{2014}"));
     }
 
     #[test]
     fn cause_line_empty_when_screen_disabled() {
         let mut s = screen_sample("1280x720", "2560x1440");
         s.screen_enabled = false;
+        // Even with publisher data, hide when screen series is off.
+        s.screen_encoder_target_bitrate_kbps = 800;
+        s.screen_adaptive_tier = "low".to_string();
+        s.screen_cause_hint = "bitrate-limited".to_string();
         assert_eq!(build_screen_cause_line(&s, true), "");
     }
 
     #[test]
     fn cause_line_empty_when_screen_series_hidden() {
-        let s = screen_sample("1280x720", "2560x1440");
+        let mut s = screen_sample("1280x720", "2560x1440");
+        s.screen_encoder_target_bitrate_kbps = 800;
+        s.screen_adaptive_tier = "low".to_string();
+        s.screen_cause_hint = "bitrate-limited".to_string();
         assert_eq!(build_screen_cause_line(&s, false), "");
+    }
+
+    #[test]
+    fn cause_line_no_placeholder_text() {
+        // Regression test for the #891 lesson — earlier code shipped a // @token-exempt: issue ref, not a color
+        // "not yet instrumented" placeholder when no publisher data was
+        // available. The omit-line behaviour is the contract; verify the
+        // helper never emits that placeholder for any of the no-data
+        // configurations (resolution match, resolution mismatch, source
+        // unknown).
+        let cases = [
+            ("1920x1080", "1920x1080"),
+            ("1280x720", "2560x1440"),
+            ("1280x720", ""),
+            ("", ""),
+        ];
+        for (recv, src) in cases {
+            let s = screen_sample(recv, src);
+            let line = build_screen_cause_line(&s, true);
+            assert!(!line.contains("not yet instrumented"));
+            assert!(!line.contains("#903")); // @token-exempt: issue ref, not a color
+        }
     }
 
     #[test]
@@ -1677,6 +1843,33 @@ mod tests {
         let s = &history.samples_vec()[0];
         assert_eq!(s.screen_resolution, "1280x720");
         assert_eq!(s.screen_source_resolution, "2560x1440");
+    }
+
+    #[test]
+    fn push_sample_carries_encoder_state_through_to_signal_sample() {
+        // Issue #903: publisher-stamped encoder state must round-trip // @token-exempt: issue ref, not a color
+        // through `SampleData` to `SignalSample` so the Cause line in
+        // the tooltip has data to render. Regression guard against
+        // forgetting to wire one of the three fields.
+        let mut history = PeerSignalHistory::new();
+        let data = SampleData {
+            screen_enabled: true,
+            screen_fps: 10.0,
+            screen_bitrate_kbps: 800.0,
+            screen_resolution: "1280x720".to_string(),
+            screen_source_resolution: "2560x1440".to_string(),
+            screen_encoder_target_bitrate_kbps: 500,
+            screen_adaptive_tier: "low".to_string(),
+            screen_cause_hint: "bitrate-limited".to_string(),
+            video_enabled: true,
+            audio_enabled: true,
+            ..Default::default()
+        };
+        history.push_sample_at(&data, 6_000.0);
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.screen_encoder_target_bitrate_kbps, 500);
+        assert_eq!(s.screen_adaptive_tier, "low");
+        assert_eq!(s.screen_cause_hint, "bitrate-limited");
     }
 
     #[test]

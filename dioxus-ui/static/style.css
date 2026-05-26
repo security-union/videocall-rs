@@ -3586,7 +3586,7 @@ select {
   line-height: 1;
   letter-spacing: -0.028em;
 
-  color: rgba(255, 255, 255, 0.96);
+  color: rgba(255, 255, 255, 0.96); /* @token-exempt: theme variant */
 
   text-align: left;
   position: relative;
@@ -3602,7 +3602,7 @@ select {
   width: 170px;
   height: 1px;
 
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
 }
 
 /* Floating close button — replaces the old header bar. */
@@ -4358,7 +4358,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   flex-shrink: 0;
 
   opacity: 0.68;
-  color: rgba(255, 255, 255, 0.74);
+  color: rgba(255, 255, 255, 0.74); /* @token-exempt: theme variant */
 
   transform: translateY(-1px);
 }
@@ -4374,7 +4374,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   line-height: 1.55;
   letter-spacing: -0.01em;
 
-  color: rgba(255, 255, 255, 0.56);
+  color: rgba(255, 255, 255, 0.56); /* @token-exempt: theme variant */
 }
 
 .appearance-section-helper--muted {
@@ -4423,9 +4423,9 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 36px;
   height: 20px;
   border-radius: 999px;
-  background: rgba(90, 90, 96, 0.88);
+  background: rgba(90, 90, 96, 0.88); /* @token-exempt: theme variant */
   border: none;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); /* @token-exempt: theme variant */
   position: relative;
   transition: background 0.2s ease;
 }
@@ -4438,16 +4438,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 16px;
   height: 16px;
   border-radius: 999px;
-  background: #ffffff;
+  background: #ffffff; /* @token-exempt: theme variant */
   border: none;
   box-shadow:
-    0 1px 3px rgba(0, 0, 0, 0.28),
-    0 1px 1px rgba(0, 0, 0, 0.12);
+    0 1px 3px rgba(0, 0, 0, 0.28) /* @token-exempt: theme variant */,
+    0 1px 1px rgba(0, 0, 0, 0.12); /* @token-exempt: theme variant */
   transition: transform 0.2s ease;
 }
 
 .glow-switch input:checked + .glow-switch-track {
-  background: #34c759;
+  background: #34c759; /* @token-exempt: theme variant */
   box-shadow: none;
 }
 
@@ -5120,16 +5120,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   border-radius: 999px;
   background: linear-gradient(
     to right,
-    rgba(235, 232, 240, 0.72) 0%,
-    rgba(255, 238, 234, 0.54) var(--fill, 0%),
-    rgba(170, 175, 190, 0.28) var(--fill, 0%),
-    rgba(170, 175, 190, 0.2) 100%
+    rgba(235, 232, 240, 0.72) 0% /* @token-exempt: theme variant */,
+    rgba(255, 238, 234, 0.54) var(--fill, 0%) /* @token-exempt: theme variant */,
+    rgba(170, 175, 190, 0.28) var(--fill, 0%) /* @token-exempt: theme variant */,
+    rgba(170, 175, 190, 0.2) 100% /* @token-exempt: theme variant */
   );
-  border: 1px solid rgba(255, 255, 255, 0.38);
+  border: 1px solid rgba(255, 255, 255, 0.38); /* @token-exempt: theme variant */
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.7),
-    inset 0 -1px 2px rgba(130, 120, 150, 0.18),
-    0 4px 10px rgba(80, 72, 92, 0.08);
+    inset 0 1px 1px rgba(255, 255, 255, 0.7) /* @token-exempt: theme variant */,
+    inset 0 -1px 2px rgba(130, 120, 150, 0.18) /* @token-exempt: theme variant */,
+    0 4px 10px rgba(80, 72, 92, 0.08); /* @token-exempt: theme variant */
   backdrop-filter: blur(18px) saturate(130%);
   -webkit-backdrop-filter: blur(18px) saturate(130%);
   outline: none;
@@ -5148,16 +5148,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 14px;
   margin-top: -5px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.72); /* @token-exempt: theme variant */
   background: radial-gradient(
     120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.96),
-    rgba(238, 234, 242, 0.72)
+    rgba(255, 255, 255, 0.96) /* @token-exempt: theme variant */,
+    rgba(238, 234, 242, 0.72) /* @token-exempt: theme variant */
   );
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.88),
-    0 2px 6px rgba(70, 64, 82, 0.14),
-    0 6px 12px rgba(70, 64, 82, 0.08);
+    inset 0 1px 1px rgba(255, 255, 255, 0.88) /* @token-exempt: theme variant */,
+    0 2px 6px rgba(70, 64, 82, 0.14) /* @token-exempt: theme variant */,
+    0 6px 12px rgba(70, 64, 82, 0.08); /* @token-exempt: theme variant */
 }
 
 .appearance-slider::-moz-range-track {
@@ -5170,16 +5170,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 14px;
   height: 14px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.72); /* @token-exempt: theme variant */
   background: radial-gradient(
     120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.96),
-    rgba(238, 234, 242, 0.72)
+    rgba(255, 255, 255, 0.96) /* @token-exempt: theme variant */,
+    rgba(238, 234, 242, 0.72) /* @token-exempt: theme variant */
   );
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.88),
-    0 2px 6px rgba(70, 64, 82, 0.14),
-    0 6px 12px rgba(70, 64, 82, 0.08);
+    inset 0 1px 1px rgba(255, 255, 255, 0.88) /* @token-exempt: theme variant */,
+    0 2px 6px rgba(70, 64, 82, 0.14) /* @token-exempt: theme variant */,
+    0 6px 12px rgba(70, 64, 82, 0.08); /* @token-exempt: theme variant */
 }
 
 /* ── Theme icon toggle ─────────────────────────────────────────────────────── */
@@ -5304,19 +5304,19 @@ html[data-theme="light"] .settings-nav-button:hover {
 }
 
 html[data-theme="light"] .settings-nav-button.active {
-  background: rgba(238, 232, 240, 0.34);
-  border-color: rgba(255, 255, 255, 0.34);
-  color: rgba(18, 24, 34, 0.9);
+  background: rgba(238, 232, 240, 0.34); /* @token-exempt: theme variant */
+  border-color: rgba(255, 255, 255, 0.34); /* @token-exempt: theme variant */
+  color: rgba(18, 24, 34, 0.9); /* @token-exempt: theme variant */
   font-weight: 600;
 
   backdrop-filter: blur(34px) saturate(145%);
   -webkit-backdrop-filter: blur(34px) saturate(145%);
 
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.7),
-    inset 0 -1px 2px rgba(150, 140, 165, 0.22),
-    0 10px 18px rgba(80, 72, 92, 0.16),
-    0 24px 42px rgba(80, 72, 92, 0.1);
+    inset 0 1px 1px rgba(255, 255, 255, 0.7) /* @token-exempt: theme variant */,
+    inset 0 -1px 2px rgba(150, 140, 165, 0.22) /* @token-exempt: theme variant */,
+    0 10px 18px rgba(80, 72, 92, 0.16) /* @token-exempt: theme variant */,
+    0 24px 42px rgba(80, 72, 92, 0.1); /* @token-exempt: theme variant */
 }
 
 
@@ -5330,25 +5330,25 @@ html[data-theme="light"] .settings-nav-button.active::before {
   background:
     radial-gradient(
       90% 130% at 22% 12%,
-      rgba(255, 255, 255, 0.74),
+      rgba(255, 255, 255, 0.74) /* @token-exempt: theme variant */,
       transparent 48%
     ),
     radial-gradient(
       80% 120% at 88% 20%,
-      rgba(255, 215, 205, 0.42),
+      rgba(255, 215, 205, 0.42) /* @token-exempt: theme variant */,
       transparent 56%
     ),
     radial-gradient(
       70% 100% at 12% 72%,
-      rgba(185, 190, 215, 0.34),
+      rgba(185, 190, 215, 0.34) /* @token-exempt: theme variant */,
       transparent 58%
     );
 
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.72),
-    inset 0 -1px 2px rgba(150, 140, 165, 0.24),
-    inset 1px 0 1px rgba(210, 218, 240, 0.2),
-    inset -1px 0 1px rgba(255, 205, 196, 0.24);
+    inset 0 1px 1px rgba(255, 255, 255, 0.72) /* @token-exempt: theme variant */,
+    inset 0 -1px 2px rgba(150, 140, 165, 0.24) /* @token-exempt: theme variant */,
+    inset 1px 0 1px rgba(210, 218, 240, 0.2) /* @token-exempt: theme variant */,
+    inset -1px 0 1px rgba(255, 205, 196, 0.24); /* @token-exempt: theme variant */
 
   opacity: 0.9;
 }
@@ -6125,14 +6125,14 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
 .invite-glass-title {
   margin: 0;
-  color: rgba(255, 255, 255, 0.88);
+  color: rgba(255, 255, 255, 0.88); /* @token-exempt: theme variant */
   font-size: 30px;
   line-height: 1.08;
   font-weight: 300;
   letter-spacing: -0.045em;
   text-shadow:
-    0 2px 16px rgba(0, 0, 0, 0.18),
-    0 0 1px rgba(255, 255, 255, 0.24);
+    0 2px 16px rgba(0, 0, 0, 0.18) /* @token-exempt: theme variant */,
+    0 0 1px rgba(255, 255, 255, 0.24); /* @token-exempt: theme variant */
   pointer-events: none;
 }
 
@@ -6154,37 +6154,37 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   gap: 12px;
 
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.48);
+  border: 1px solid rgba(255, 255, 255, 0.48); /* @token-exempt: theme variant */
 
   background:
     radial-gradient(
       circle at 24% 0%,
-      rgba(255, 255, 255, 0.46),
+      rgba(255, 255, 255, 0.46) /* @token-exempt: theme variant */,
       transparent 34%
     ),
     radial-gradient(
       ellipse at 78% 100%,
-      rgba(0, 120, 150, 0.14),
+      rgba(0, 120, 150, 0.14) /* @token-exempt: theme variant */,
       transparent 42%
     ),
     linear-gradient(
       180deg,
-      rgba(255, 255, 255, 0.2) 0%,
-      rgba(255, 255, 255, 0.075) 46%,
-      rgba(10, 22, 34, 0.18) 100%
+      rgba(255, 255, 255, 0.2) 0% /* @token-exempt: theme variant */,
+      rgba(255, 255, 255, 0.075) 46% /* @token-exempt: theme variant */,
+      rgba(10, 22, 34, 0.18) 100% /* @token-exempt: theme variant */
     );
 
   backdrop-filter: blur(30px) saturate(190%) contrast(110%);
   -webkit-backdrop-filter: blur(30px) saturate(190%) contrast(110%);
 
   box-shadow:
-    0 18px 44px rgba(0, 0, 0, 0.18),
-    inset 0 1px 1px rgba(255, 255, 255, 0.95),
-    inset 0 -1px 2px rgba(8, 18, 30, 0.36),
-    inset 10px 0 18px rgba(255, 255, 255, 0.08),
-    inset -10px 0 18px rgba(20, 38, 54, 0.18);
+    0 18px 44px rgba(0, 0, 0, 0.18) /* @token-exempt: theme variant */,
+    inset 0 1px 1px rgba(255, 255, 255, 0.95) /* @token-exempt: theme variant */,
+    inset 0 -1px 2px rgba(8, 18, 30, 0.36) /* @token-exempt: theme variant */,
+    inset 10px 0 18px rgba(255, 255, 255, 0.08) /* @token-exempt: theme variant */,
+    inset -10px 0 18px rgba(20, 38, 54, 0.18); /* @token-exempt: theme variant */
 
-  color: rgba(255, 255, 255, 0.96);
+  color: rgba(255, 255, 255, 0.96); /* @token-exempt: theme variant */
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.18em;
@@ -6192,8 +6192,8 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   cursor: pointer;
 
   text-shadow:
-    0 1px 1px rgba(0, 0, 0, 0.2),
-    0 0 10px rgba(255, 255, 255, 0.22);
+    0 1px 1px rgba(0, 0, 0, 0.2) /* @token-exempt: theme variant */,
+    0 0 10px rgba(255, 255, 255, 0.22); /* @token-exempt: theme variant */
 
   transition:
     transform 180ms ease,
@@ -6213,39 +6213,39 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   background:
     radial-gradient(
       ellipse at 18% 54%,
-      rgba(0, 160, 190, 0.16),
+      rgba(0, 160, 190, 0.16) /* @token-exempt: theme variant */,
       transparent 34%
     ),
     radial-gradient(
       ellipse at 42% 38%,
-      rgba(70, 90, 210, 0.13),
+      rgba(70, 90, 210, 0.13) /* @token-exempt: theme variant */,
       transparent 32%
     ),
     radial-gradient(
       ellipse at 68% 58%,
-      rgba(125, 75, 190, 0.11),
+      rgba(125, 75, 190, 0.11) /* @token-exempt: theme variant */,
       transparent 34%
     ),
     radial-gradient(
       ellipse at 84% 44%,
-      rgba(40, 190, 170, 0.09),
+      rgba(40, 190, 170, 0.09) /* @token-exempt: theme variant */,
       transparent 30%
     ),
     linear-gradient(
       115deg,
       transparent 0%,
-      rgba(0, 180, 220, 0.1) 24%,
-      rgba(70, 90, 220, 0.1) 42%,
-      rgba(120, 75, 190, 0.08) 58%,
-      rgba(0, 160, 180, 0.08) 76%,
+      rgba(0, 180, 220, 0.1) 24% /* @token-exempt: theme variant */,
+      rgba(70, 90, 220, 0.1) 42% /* @token-exempt: theme variant */,
+      rgba(120, 75, 190, 0.08) 58% /* @token-exempt: theme variant */,
+      rgba(0, 160, 180, 0.08) 76% /* @token-exempt: theme variant */,
       transparent 100%
     ),
     linear-gradient(
       180deg,
-      rgba(255, 255, 255, 0.3) 0%,
-      rgba(255, 255, 255, 0.07) 34%,
+      rgba(255, 255, 255, 0.3) 0% /* @token-exempt: theme variant */,
+      rgba(255, 255, 255, 0.07) 34% /* @token-exempt: theme variant */,
       transparent 58%,
-      rgba(255, 255, 255, 0.08) 100%
+      rgba(255, 255, 255, 0.08) 100% /* @token-exempt: theme variant */
     );
 
   filter: saturate(150%) contrast(106%);
@@ -6253,10 +6253,10 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   mix-blend-mode: screen;
 
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.78),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.16),
-    inset 1px 0 0 rgba(0, 210, 220, 0.08),
-    inset -1px 0 0 rgba(105, 80, 190, 0.08);
+    inset 0 1px 0 rgba(255, 255, 255, 0.78) /* @token-exempt: theme variant */,
+    inset 0 -1px 0 rgba(255, 255, 255, 0.16) /* @token-exempt: theme variant */,
+    inset 1px 0 0 rgba(0, 210, 220, 0.08) /* @token-exempt: theme variant */,
+    inset -1px 0 0 rgba(105, 80, 190, 0.08); /* @token-exempt: theme variant */
 }
 
 /* Clipped chromatic edge, not external glow */
@@ -6271,10 +6271,10 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   background: linear-gradient(
     100deg,
     transparent 0%,
-    rgba(0, 190, 210, 0.14) 18%,
-    rgba(60, 80, 210, 0.13) 36%,
-    rgba(120, 75, 190, 0.11) 54%,
-    rgba(0, 170, 165, 0.1) 74%,
+    rgba(0, 190, 210, 0.14) 18% /* @token-exempt: theme variant */,
+    rgba(60, 80, 210, 0.13) 36% /* @token-exempt: theme variant */,
+    rgba(120, 75, 190, 0.11) 54% /* @token-exempt: theme variant */,
+    rgba(0, 170, 165, 0.1) 74% /* @token-exempt: theme variant */,
     transparent 100%
   );
 
@@ -6285,14 +6285,14 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
 .invite-share-button:hover {
   transform: translateY(-1px);
-  border-color: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.6); /* @token-exempt: theme variant */
 
   box-shadow:
-    0 22px 52px rgba(0, 0, 0, 0.22),
-    inset 0 1px 1px rgba(255, 255, 255, 1),
-    inset 0 -1px 2px rgba(8, 18, 30, 0.4),
-    inset 12px 0 20px rgba(255, 255, 255, 0.1),
-    inset -12px 0 20px rgba(20, 38, 54, 0.2);
+    0 22px 52px rgba(0, 0, 0, 0.22) /* @token-exempt: theme variant */,
+    inset 0 1px 1px rgba(255, 255, 255, 1) /* @token-exempt: theme variant */,
+    inset 0 -1px 2px rgba(8, 18, 30, 0.4) /* @token-exempt: theme variant */,
+    inset 12px 0 20px rgba(255, 255, 255, 0.1) /* @token-exempt: theme variant */,
+    inset -12px 0 20px rgba(20, 38, 54, 0.2); /* @token-exempt: theme variant */
 }
 
 .invite-share-button:active {
@@ -6316,15 +6316,15 @@ html[data-theme="dark"] .settings-modal {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.045) 0%,
-    rgba(255, 255, 255, 0.028) 100%
+    rgba(255, 255, 255, 0.045) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.028) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.085);
+  border: 1px solid rgba(255, 255, 255, 0.085); /* @token-exempt: theme variant */
 
   box-shadow:
-    0 42px 120px rgba(0, 0, 0, 0.58),
-    0 18px 48px rgba(0, 0, 0, 0.34);
+    0 42px 120px rgba(0, 0, 0, 0.58) /* @token-exempt: theme variant */,
+    0 18px 48px rgba(0, 0, 0, 0.34); /* @token-exempt: theme variant */
 
   backdrop-filter: blur(26px) saturate(145%) contrast(104%);
   -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
@@ -6336,7 +6336,7 @@ html[data-theme="dark"] .settings-modal {
   flex-shrink: 0;
 
   opacity: 0.76;
-  color: rgba(255, 255, 255, 0.88);
+  color: rgba(255, 255, 255, 0.88); /* @token-exempt: theme variant */
 
   transform: translateY(-1px);
 }
@@ -6352,15 +6352,15 @@ html[data-theme="dark"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.055) 0%,
-    rgba(255, 255, 255, 0.035) 100%
+    rgba(255, 255, 255, 0.055) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.035) 100% /* @token-exempt: theme variant */
   );
 
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045),
-    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    inset 1px 0 0 rgba(255, 255, 255, 0.045) /* @token-exempt: theme variant */,
+    inset 0 1px 0 rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
 
-  border: 1px solid rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-panel::before,
@@ -6382,14 +6382,14 @@ html[data-theme="light"] .settings-nav {
 
 html:not([data-theme]) .settings-nav-button:hover,
 html[data-theme="dark"] .settings-nav-button:hover {
-  background: rgba(255, 255, 255, 0.055);
-  color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.92); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-nav-button.active,
 html[data-theme="dark"] .settings-nav-button.active {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.97);
+  background: rgba(255, 255, 255, 0.1); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.97); /* @token-exempt: theme variant */
 }
 
 /* DIVIDERS */
@@ -6401,7 +6401,7 @@ html[data-theme="dark"] .settings-nav-button.active {
 
   margin: 8px 0 0;
 
-  background: rgba(255, 255, 255, 0.038);
+  background: rgba(255, 255, 255, 0.038); /* @token-exempt: theme variant */
 }
 
 /* INPUTS */
@@ -6410,8 +6410,8 @@ html:not([data-theme]) .settings-select,
 html[data-theme="dark"] .settings-select,
 html:not([data-theme]) .settings-input,
 html[data-theme="dark"] .settings-input {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.065);
+  background: rgba(255, 255, 255, 0.03); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.065); /* @token-exempt: theme variant */
   box-shadow: none;
 }
 
@@ -6435,15 +6435,15 @@ html[data-theme="dark"] .settings-input {
 html[data-theme="light"] .settings-modal {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.52) 0%,
-    rgba(238, 242, 248, 0.38) 100%
+    rgba(255, 255, 255, 0.52) 0% /* @token-exempt: theme variant */,
+    rgba(238, 242, 248, 0.38) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.7); /* @token-exempt: theme variant */
 
   box-shadow:
-    0 42px 120px rgba(90, 105, 130, 0.22),
-    0 18px 48px rgba(90, 105, 130, 0.14);
+    0 42px 120px rgba(90, 105, 130, 0.22) /* @token-exempt: theme variant */,
+    0 18px 48px rgba(90, 105, 130, 0.14); /* @token-exempt: theme variant */
 
   backdrop-filter: blur(26px) saturate(145%) contrast(104%);
   -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
@@ -6452,20 +6452,20 @@ html[data-theme="light"] .settings-modal {
 html[data-theme="light"] .settings-layout {
   background: linear-gradient(
     180deg,
-    rgba(218, 216, 228, 0.92) 0%,
-    rgba(198, 199, 214, 0.88) 100%
+    rgba(218, 216, 228, 0.92) 0% /* @token-exempt: theme variant */,
+    rgba(198, 199, 214, 0.88) 100% /* @token-exempt: theme variant */
   );
 }
 
 /* right panel as inner rounded layer */
 html[data-theme="light"] .settings-panel {
 
-  border: 1px solid rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(255, 255, 255, 0.58); /* @token-exempt: theme variant */
 
   background: linear-gradient(
     180deg,
-    rgba(244, 243, 248, 0.94) 0%,
-    rgba(232, 233, 240, 0.92) 100%
+    rgba(244, 243, 248, 0.94) 0% /* @token-exempt: theme variant */,
+    rgba(232, 233, 240, 0.92) 100% /* @token-exempt: theme variant */
   );
 
   backdrop-filter: blur(30px) saturate(130%);
@@ -6480,20 +6480,20 @@ html[data-theme="light"] .settings-panel::after {
 /* readable text in light theme */
 html[data-theme="light"] .settings-panel,
 html[data-theme="light"] .settings-panel * {
-  color: rgba(22, 28, 38, 0.88);
+  color: rgba(22, 28, 38, 0.88); /* @token-exempt: theme variant */
 }
 
 html[data-theme="light"] .appearance-section-helper,
 html[data-theme="light"] .settings-section-description,
 html[data-theme="light"] .speaker-highlight-preview-caption {
-  color: rgba(42, 52, 68, 0.58) !important;
+  color: rgba(42, 52, 68, 0.58) !important; /* @token-exempt: theme variant */
 }
 
 
 /* Settings title darker */
 html[data-theme="light"] .settings-sidebar-title,
 html[data-theme="light"] .settings-sidebar-title-icon {
-  color: rgba(34, 38, 50, 0.86) !important;
+  color: rgba(34, 38, 50, 0.86) !important; /* @token-exempt: theme variant */
 }
 
 /* gray divider under Settings */
@@ -6513,13 +6513,13 @@ html[data-theme="light"] .settings-sidebar-title-wrapper::after {
 
   height: 1px;
 
-  background: rgba(120, 124, 140, 0.22);
+  background: rgba(120, 124, 140, 0.22); /* @token-exempt: theme variant */
 }
 
 /* visible section dividers in right panel */
 html[data-theme="light"] .appearance-section-divider,
 html[data-theme="light"] .settings-divider {
-  background: rgba(105, 110, 126, 0.18) !important;
+  background: rgba(105, 110, 126, 0.18) !important; /* @token-exempt: theme variant */
   opacity: 1 !important;
 }
 

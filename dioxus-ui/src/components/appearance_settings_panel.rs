@@ -493,7 +493,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                         }
                                                     }
                                                     if input_error() {
-                                                        p { class: "input-error-message", "Invalid format - use #RRGGBB (e.g. #FF5500)" }
+                                                        p { class: "input-error-message", "Invalid format - use #RRGGBB (e.g. #FF5500)" } // @token-exempt: user-facing help text, not a CSS color
                                                     }
                                                 }
                                             }

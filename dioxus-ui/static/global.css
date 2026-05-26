@@ -1241,7 +1241,7 @@ html[data-theme="light"] #invite-overlay p {
      Theme-specific overrides live under html[data-theme="dark|light"] blocks. */
   --bg: #000000;
   --surface: #1c1c1e;
-  --surface-elevated: #2c2c2f;
+  --surface-elevated: #2c2c2e;
   --text-primary: #ffffff;
   --text-secondary: #aeaeb2;
   --border: #38383a;

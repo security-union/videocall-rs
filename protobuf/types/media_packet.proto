@@ -43,6 +43,26 @@ message VideoMetadata {
   // content was downscaled in transit.
   uint32 source_width = 3;
   uint32 source_height = 4;
+  // Publisher-side encoder state used by the receiving client to explain *why*
+  // the publisher's encoder downscaled in transit (issue #903). All three
+  // fields are optional; proto3 default zero / empty-string are treated as
+  // "no data" so older publishers that don't stamp them decode cleanly and
+  // the consumer simply omits the Cause line in the diagnostics tooltip.
+  //
+  // For screen-share frames specifically: the encoder ships these alongside
+  // `source_width` / `source_height` so the viewer can render
+  // `Cause: encoder target bitrate <N> kbps (limited by adaptive-quality tier
+  // '<tier>')` (or a `cause_hint`-only fallback) below the Screen row.
+  // What the encoder is currently trying to produce (kbps).
+  uint32 encoder_target_bitrate_kbps = 5;
+  // Adaptive-quality tier name actively constraining the encoder
+  // (e.g. "high", "medium", "low"). Empty when AQ is unconstrained.
+  string adaptive_tier = 6;
+  // Short publisher-classified cause string. Currently one of
+  // "bitrate-limited", "cpu-pressure", "network-rtt", "network-loss",
+  // "manual-cap", or "" when no constraint is engaged. Kept as a free-form
+  // string so new causes can be added without a wire-format break.
+  string cause_hint = 7;
 }
 
 // Video codec enum with profile/level details for scalability.

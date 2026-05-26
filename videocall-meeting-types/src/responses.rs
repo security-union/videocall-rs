@@ -230,6 +230,13 @@ pub struct MeetingFeedSummary {
     /// any ownership-based authorization decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The cached host display name captured on first participant join.
+    /// `None` until any participant (typically the host) has joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
+    /// The host's `user_id` (i.e. `creator_id`). Canonical alias of `host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_user_id: Option<String>,
     /// `true` when `creator_id == authenticated_user_id`.
     ///
     /// **Server-computed.** This is the authoritative trust signal the UI

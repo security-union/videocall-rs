@@ -266,6 +266,19 @@ async fn test_joined_only_appears_with_is_owner_false() {
         .expect("joined meeting must appear in the feed for the attendee");
     assert!(!m.is_owner, "non-owner attendee must have is_owner = false");
     assert_eq!(m.host.as_deref(), Some(host), "host must be visible");
+    // Issue #579: non-owners need a way to identify who to contact for the
+    // meeting. The feed must surface the host's identity (display_name +
+    // user_id) so the meetings-list tooltip can render it.
+    assert_eq!(
+        m.host_user_id.as_deref(),
+        Some(host),
+        "host_user_id must equal the creator's user_id"
+    );
+    assert_eq!(
+        m.host_display_name.as_deref(),
+        Some("Test User"),
+        "host_display_name must be the cached display_name captured on first join"
+    );
 
     cleanup_test_data(&pool, room_id).await;
 }

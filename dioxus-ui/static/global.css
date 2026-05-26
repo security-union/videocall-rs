@@ -5,7 +5,7 @@
   background: var(--overlay-backdrop);
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
-  z-index: 3000;
+  z-index: 9600;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1759,6 +1759,22 @@ html[data-theme="light"] #invite-overlay p {
   transition: transform 0.2s ease;
 }
 
+.video-control-button.off {
+  background: rgba(255, 69, 58, 0.18);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: #FF6961;
+  box-shadow: 0 4px 12px -3px rgba(255, 69, 58, 0.25), inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.video-control-button.off:hover {
+  background: rgba(255, 69, 58, 0.28);
+  border-color: rgba(255, 69, 58, 0.45);
+  box-shadow:
+    0 8px 20px -3px rgba(255, 69, 58, 0.35),
+    0 0 0 1px rgba(255, 69, 58, 0.3),
+    inset 0 1px rgba(255, 255, 255, 0.06);
+}
+
 .video-control-button.active {
   background: #0A84FF;
   border-color: #0A84FF;
@@ -2420,11 +2436,20 @@ html[data-theme="light"] #invite-overlay p {
 
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
-.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; object-position: center top !important; }
+.split-peer-tile .canvas-container canvas.cropped {
+  width: auto !important;
+  height: 100% !important;
+  min-width: 100% !important;
+  object-fit: cover !important;
+  object-position: center top !important;
+}
 
 .grid-item .canvas-container canvas.uncropped,
 .split-screen-tile .canvas-container canvas.uncropped,
-.split-peer-tile .canvas-container canvas.uncropped { object-fit: contain !important; }
+.split-peer-tile .canvas-container canvas.uncropped {
+  object-fit: contain !important;
+  object-position: center center !important;
+}
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {
@@ -2742,4 +2767,165 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------
+ * About modal — homepage footer + glass card surfacing client/server
+ * build info (issue 785).  All colors are tokens so the panel adapts
+ * to light/dark/system themes without further tweaks.
+ * ------------------------------------------------------------------ */
+
+.about-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.about-footer-link {
+  background: transparent;
+  border: 0;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+  letter-spacing: 0.01em;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  text-decoration: none;
+  border-radius: var(--radius-pill);
+  transition: color 0.18s ease, background 0.18s ease;
+}
+
+.about-footer-link:hover,
+.about-footer-link:focus-visible {
+  color: var(--text-primary);
+  background: var(--glass-bg-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.about-modal-card {
+  width: min(560px, 92vw);
+  max-height: min(85vh, 720px);
+  overflow-y: auto;
+  padding: 1.5rem;
+}
+
+.about-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.about-modal-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.about-modal-close {
+  flex-shrink: 0;
+}
+
+.about-modal-section {
+  margin-top: 1.25rem;
+}
+
+.about-modal-section-title {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+.about-modal-table {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--glass-border);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input);
+  overflow: hidden;
+}
+
+.about-modal-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.6fr) repeat(3, 1fr);
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--glass-bg);
+  align-items: baseline;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.about-modal-section:first-of-type .about-modal-row {
+  grid-template-columns: minmax(110px, 0.45fr) 1fr;
+}
+
+.about-modal-row--header {
+  background: var(--glass-bg-hover);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.about-modal-label {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.about-modal-value {
+  color: var(--text-primary);
+  word-break: break-word;
+  min-width: 0;
+}
+
+.about-modal-value--strong {
+  font-weight: 600;
+}
+
+.about-modal-value--mono {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.about-modal-status {
+  padding: 0.75rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input);
+  text-align: center;
+}
+
+.about-modal-status--error {
+  color: var(--text-primary);
+  border-color: var(--glass-border-hover);
+}
+
+@media (max-width: 540px) {
+  .about-modal-card {
+    padding: 1.25rem;
+  }
+  .about-modal-row {
+    grid-template-columns: 1fr;
+    gap: 0.125rem;
+  }
+  .about-modal-section:first-of-type .about-modal-row {
+    grid-template-columns: 1fr;
+  }
+  .about-modal-row--header {
+    display: none;
+  }
 }

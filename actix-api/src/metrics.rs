@@ -413,14 +413,6 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Deprecated compatibility metric for the old worst-peer name.
-    pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_worst_peer_fps",
-        "Deprecated compatibility metric; now carries the encoder p75 peer FPS",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
-    )
-    .expect("Failed to create encoder_worst_peer_fps metric");
-
     /// p75 peer FPS signal driving encoder decisions.
     pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
         "videocall_encoder_p75_peer_fps",

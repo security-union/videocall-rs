@@ -51,6 +51,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
@@ -242,6 +243,15 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host removes this client from the meeting.
     pub on_participant_kicked: Option<Callback<()>>,
 
+    /// Callback triggered when a peer publishes a `PEER_EVENT` that targets
+    /// this client. Emits `(source_user_id, event_type, stream_id)`.
+    ///
+    /// Currently used to deliver `screen_decode_started` acknowledgements
+    /// from peers that have begun rendering this client's shared screen
+    /// (HCL issue #893). The shape is intentionally generic so additional
+    /// event_types can be added without changing the callback signature.
+    pub on_peer_event: Option<Callback<(String, String, String)>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
     /// meeting event. `session_id` is the server-assigned session_id as a
@@ -334,6 +344,7 @@ struct InnerOptions {
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
     on_participant_kicked: Option<Callback<()>>,
+    on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
@@ -550,6 +561,7 @@ impl VideoCallClient {
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
                     on_participant_kicked: options.on_participant_kicked.clone(),
+                    on_peer_event: options.on_peer_event.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -2278,6 +2290,29 @@ impl Inner {
                     );
                 }
             }
+            Ok(PacketType::PEER_EVENT) => {
+                // Peer-to-peer application event. The relay has already
+                // verified `target_peer_id` matches our user_id before
+                // forwarding, but we double-check here as defense-in-depth
+                // in case a future packet path bypasses the relay filter.
+                match PeerEvent::parse_from_bytes(&response.data) {
+                    Ok(peer_event) => {
+                        if peer_event.target_peer_id.as_slice() != self.options.user_id.as_bytes() {
+                            debug!(
+                                "Dropping PEER_EVENT not addressed to us (target={})",
+                                String::from_utf8_lossy(&peer_event.target_peer_id)
+                            );
+                        } else if let Some(cb) = &self.options.on_peer_event {
+                            let source =
+                                String::from_utf8_lossy(&peer_event.source_peer_id).to_string();
+                            cb.emit((source, peer_event.event_type, peer_event.stream_id));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse PeerEvent: {e}");
+                    }
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
@@ -2433,6 +2468,7 @@ mod disconnect_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }
@@ -2597,6 +2633,7 @@ mod dedup_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

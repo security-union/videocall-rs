@@ -24,8 +24,8 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
     let class = match (enabled, available) {
         (true, false) => "video-control-button active error",
         (true, true) => "video-control-button active",
-        (false, false) => "video-control-button error",
-        (false, true) => "video-control-button",
+        (false, false) => "video-control-button off error",
+        (false, true) => "video-control-button off",
     };
 
     rsx! {
@@ -59,6 +59,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     path { d: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" }
                     path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
+                    line { x1: "3", y1: "3", x2: "21", y2: "21" }
                 }
                 span { class: "tooltip", "Unmute" }
             } else {
@@ -91,8 +92,8 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
     let class = match (enabled, available) {
         (true, false) => "video-control-button active error",
         (true, true) => "video-control-button active",
-        (false, false) => "video-control-button error",
-        (false, true) => "video-control-button",
+        (false, false) => "video-control-button off error",
+        (false, true) => "video-control-button off",
     };
 
     rsx! {
@@ -124,6 +125,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     stroke_linejoin: "round",
                     polygon { points: "23 7 16 12 23 17 23 7" }
                     rect { x: "1", y: "5", width: "15", height: "14", rx: "2", ry: "2" }
+                    line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
                 span { class: "tooltip", "Start Video" }
             } else {

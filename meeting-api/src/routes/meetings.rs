@@ -321,6 +321,8 @@ pub async fn list_feed(
                 started_at,
                 ended_at: row.ended_at.map(|t| t.timestamp_millis()),
                 host: row.creator_id.clone(),
+                host_display_name: row.host_display_name,
+                host_user_id: row.creator_id.clone(),
                 is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
                 participant_count: row.participant_count,
                 waiting_count: row.waiting_count,

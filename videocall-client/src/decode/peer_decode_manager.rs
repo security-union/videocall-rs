@@ -27,6 +27,7 @@ use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
+use js_sys::Date;
 use log::debug;
 use protobuf::Message;
 use std::cell::RefCell;
@@ -39,7 +40,8 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::Callback;
+use videocall_types::protos::peer_event::PeerEvent;
+use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
@@ -1097,9 +1099,26 @@ impl PeerDecodeManager {
                         self.on_first_frame.emit((sid_str, media_type));
                     }
 
-                    // If gap detection triggered a keyframe request, clone
-                    // the peer's user_id before releasing the mutable borrow.
+                    // Capture state we may need after dropping the mutable
+                    // borrow of `peer`:
+                    //   - `screen_first_frame_publisher` notifies the
+                    //     publisher that we just decoded their first
+                    //     screen-share frame (HCL #893). One PEER_EVENT per
+                    //     (publisher, stream) because `first_frame` flips
+                    //     true exactly once.
+                    //   - `kf_info` carries any gap-driven keyframe request.
+                    let screen_first_frame_publisher =
+                        if decode_status.first_frame && media_type == MediaType::SCREEN {
+                            Some(peer.user_id.clone())
+                        } else {
+                            None
+                        };
                     let kf_info = keyframe_request.map(|mt| (peer.user_id.clone(), mt));
+
+                    // Mutable borrow on `peer` ends here.
+                    if let Some(publisher_user_id) = screen_first_frame_publisher {
+                        self.publish_screen_decode_started(&publisher_user_id);
+                    }
 
                     // Now we can immutably borrow self for sending.
                     if let Some((peer_uid, requested_media_type)) = kf_info {
@@ -1175,6 +1194,50 @@ impl PeerDecodeManager {
             "Sending KEYFRAME_REQUEST to {} for {:?}",
             peer_user_id,
             requested_media_type
+        );
+        send_packet.emit(wrapper);
+    }
+
+    /// Send a `PEER_EVENT(screen_decode_started)` to the publisher whose
+    /// screen-share we just decoded for the first time. The relay routes
+    /// the packet by `target_peer_id`, so only the publisher receives it.
+    ///
+    /// `publisher_user_id` MUST be the publisher's user_id (the remote peer
+    /// whose screen frame we just decoded). The event's `stream_id` is set
+    /// to the same value because there is at most one screen-share per user.
+    fn publish_screen_decode_started(&self, publisher_user_id: &str) {
+        let Some(send_packet) = &self.send_packet else {
+            debug!("Cannot publish PEER_EVENT: no send_packet callback");
+            return;
+        };
+
+        let peer_event = PeerEvent {
+            source_peer_id: self.local_user_id.as_bytes().to_vec(),
+            target_peer_id: publisher_user_id.as_bytes().to_vec(),
+            event_type: PEER_EVENT_SCREEN_DECODE_STARTED.to_string(),
+            stream_id: publisher_user_id.to_string(),
+            timestamp_ms: Date::now() as i64,
+            ..Default::default()
+        };
+
+        let data = match peer_event.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("Failed to serialize PeerEvent: {}", e);
+                return;
+            }
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::PEER_EVENT.into(),
+            user_id: self.local_user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+
+        log::info!(
+            "Publishing PEER_EVENT(screen_decode_started) target={}",
+            publisher_user_id
         );
         send_packet.emit(wrapper);
     }

@@ -405,17 +405,16 @@ async fn do_delete_meeting(meeting_id: &str) -> Result<(), String> {
 ///
 /// When `meeting.is_owner` is true an "Owner" line is injected at the very
 /// top of the metadata table (gold-tinted to match the inline star icon).
-/// Non-owner rows skip that line entirely, so the tooltip starts with the
-/// usual created/started/duration metadata.
+/// Non-owner rows skip that line entirely and instead render two Host rows
+/// (display name + truncated user_id) at the top so the user knows who
+/// created the meeting and how to contact them. See HCL issue 579.
 ///
 /// SECURITY INVARIANT: The HTML body produced here MUST NOT contain any
-/// caller-controlled or server-supplied string content (user display names,
-/// meeting titles, OAuth profile names, etc). Currently the only interpolated
-/// values are static labels ("Owner", "Created on", etc.) and outputs of
-/// `format_datetime` / `format_duration`, both of which produce bounded
-/// numeric/date strings. If you add a row that includes a user-supplied value,
-/// HTML-escape it (e.g. via `web_sys::Document::create_text_node` + structured
-/// DOM construction) instead of injecting via `set_inner_html`.
+/// caller-controlled or server-supplied string content unless it is passed
+/// through `escape_html_text` / `escape_html_attr` first. The host identity
+/// strings (`host_display_name`, `host_user_id`) come from server-supplied
+/// fields populated from the OAuth provider's id_token, so they are escaped
+/// before being interpolated into the tooltip's `set_inner_html` payload.
 pub(crate) fn build_meeting_tooltip_html(
     meeting: &MeetingFeedSummary,
     is_active: bool,
@@ -429,6 +428,9 @@ pub(crate) fn build_meeting_tooltip_html(
         // star icon — same gold tint, same star glyph — and sits at the very
         // top of the metadata table so it's the first signal users see.
         rows.push(owner_tooltip_row());
+    } else {
+        rows.push(host_tooltip_row(meeting.host_display_name.as_deref()));
+        rows.push(host_id_tooltip_row(meeting.host_user_id.as_deref()));
     }
     rows.push(tooltip_row(
         "Created on",
@@ -481,6 +483,83 @@ fn owner_tooltip_row() -> String {
      </span>\
      </div>"
         .to_string()
+}
+
+/// "Host: <display name>" row for non-owner meetings. Falls back to
+/// "(unknown)" when the backend has not yet cached a display name (no
+/// participant has joined the meeting yet).
+fn host_tooltip_row(host_display_name: Option<&str>) -> String {
+    let value_escaped = match host_display_name {
+        Some(name) if !name.is_empty() => escape_html_text(name),
+        _ => "(unknown)".to_string(),
+    };
+    format!(
+        "<div class=\"meeting-info-tooltip-row\">\
+         <span class=\"meeting-info-tooltip-label\">Host</span>\
+         <span class=\"meeting-info-tooltip-value\">{value_escaped}</span>\
+         </div>"
+    )
+}
+
+/// "Host ID: <user_id>" row for non-owner meetings. The visible value is
+/// truncated to keep the tooltip compact; the full value is exposed via
+/// the row's `title` attribute so users can hover to see the complete id.
+fn host_id_tooltip_row(host_user_id: Option<&str>) -> String {
+    let raw = host_user_id.unwrap_or("");
+    if raw.is_empty() {
+        return "<div class=\"meeting-info-tooltip-row\">\
+                <span class=\"meeting-info-tooltip-label\">Host ID</span>\
+                <span class=\"meeting-info-tooltip-value\">(unknown)</span>\
+                </div>"
+            .to_string();
+    }
+    let display = truncate_for_display(raw, 12);
+    let display_escaped = escape_html_text(&display);
+    let title_escaped = escape_html_attr(raw);
+    format!(
+        "<div class=\"meeting-info-tooltip-row\" title=\"{title_escaped}\">\
+         <span class=\"meeting-info-tooltip-label\">Host ID</span>\
+         <span class=\"meeting-info-tooltip-value\">{display_escaped}</span>\
+         </div>"
+    )
+}
+
+/// Truncate `s` to `max_chars` Unicode scalar values, appending a single-char
+/// horizontal ellipsis when truncation occurred. Returns `s` unchanged when
+/// it already fits.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Escape a string for safe interpolation into HTML text content. Covers
+/// the five characters that change parser state inside element bodies and
+/// double-quoted attribute values.
+fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape a string for safe interpolation into a double-quoted HTML
+/// attribute value. The same character set as `escape_html_text` is
+/// sufficient because we only use double-quoted attribute syntax.
+fn escape_html_attr(s: &str) -> String {
+    escape_html_text(s)
 }
 
 /// Get-or-create the body-level tooltip element. Mirrors the pattern in `signal_quality.rs`.
@@ -567,6 +646,8 @@ mod tests {
             started_at: Some(1_714_323_500_000),
             ended_at: None,
             host: Some("alice@example.com".to_string()),
+            host_display_name: Some("Alice Anderson".to_string()),
+            host_user_id: Some("alice@example.com".to_string()),
             is_owner,
             participant_count: 2,
             waiting_count: 0,
@@ -616,6 +697,93 @@ mod tests {
         assert!(
             !html.contains(">Owner<"),
             "tooltip must not contain the 'Owner' label for a non-owned meeting; html: {html}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn tooltip_includes_host_rows_for_non_owner() {
+        let meeting = sample_meeting(false);
+        let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
+        assert!(
+            html.contains(">Host<"),
+            "non-owner tooltip must include a 'Host' label; html: {html}"
+        );
+        assert!(
+            html.contains(">Host ID<"),
+            "non-owner tooltip must include a 'Host ID' label; html: {html}"
+        );
+        assert!(
+            html.contains("Alice Anderson"),
+            "non-owner tooltip must show the host display name; html: {html}"
+        );
+        let host_idx = html.find(">Host<").expect("Host row must be present");
+        let created_idx = html
+            .find("Created on")
+            .expect("Created on row must be present");
+        assert!(
+            host_idx < created_idx,
+            "Host rows must precede the created-on row"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn tooltip_omits_host_rows_when_owner() {
+        let meeting = sample_meeting(true);
+        let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
+        assert!(
+            !html.contains(">Host<"),
+            "owner tooltip must not include a 'Host' label (Owner line conveys it); html: {html}"
+        );
+        assert!(
+            !html.contains(">Host ID<"),
+            "owner tooltip must not include a 'Host ID' label; html: {html}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn tooltip_truncates_long_host_id() {
+        let mut meeting = sample_meeting(false);
+        meeting.host_user_id = Some("verylonghostuserid@example.com".to_string());
+        let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
+        assert!(
+            html.contains("verylonghost\u{2026}"),
+            "long host id must be truncated to 12 chars + ellipsis; html: {html}"
+        );
+        assert!(
+            html.contains("title=\"verylonghostuserid@example.com\""),
+            "full host id must be available via the title attribute; html: {html}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn tooltip_falls_back_to_unknown_for_missing_host_identity() {
+        let mut meeting = sample_meeting(false);
+        meeting.host_display_name = None;
+        meeting.host_user_id = None;
+        let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
+        assert!(
+            html.contains("(unknown)"),
+            "missing host identity must render '(unknown)'; html: {html}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn tooltip_escapes_html_in_host_fields() {
+        let mut meeting = sample_meeting(false);
+        meeting.host_display_name = Some("<script>alert(1)</script>".to_string());
+        meeting.host_user_id = Some("a&b\"c".to_string());
+        let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw <script> from host_display_name must not appear in tooltip html; html: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "host_display_name must be HTML-escaped; html: {html}"
+        );
+        assert!(
+            html.contains("a&amp;b&quot;c") || html.contains("title=\"a&amp;b&quot;c\""),
+            "host_user_id must be HTML-escaped in both text and title attribute; html: {html}"
         );
     }
 

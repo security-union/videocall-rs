@@ -37,6 +37,15 @@ pub type Binary = Result<Vec<u8>, anyhow::Error>;
 /// This is not a real user and should be filtered out in UI/peer management.
 pub const SYSTEM_USER_ID: &str = "system-&^%$#@!";
 
+/// `PeerEvent.event_type` value emitted by a peer the first time it decodes
+/// a screen-share frame from a remote publisher. Used by the publisher's UI
+/// to confirm that its shared content is actually visible to at least one
+/// other peer (HCL issue #893).
+///
+/// Producers and consumers MUST use this constant so the string is checked
+/// at one source of truth.
+pub const PEER_EVENT_SCREEN_DECODE_STARTED: &str = "screen_decode_started";
+
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -83,6 +92,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::CONGESTION => {
                 write!(f, "CONGESTION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::PEER_EVENT => {
+                write!(f, "PEER_EVENT")
             }
         }
     }

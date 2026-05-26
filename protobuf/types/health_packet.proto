@@ -110,7 +110,8 @@ message HealthPacket {
 
   // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
   optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
-  optional double encoder_worst_peer_fps = 26;     // Deprecated compatibility field; now carries the p75 peer FPS.
+  reserved 26;                                     // Was: encoder_worst_peer_fps. Replaced by encoder_p75_peer_fps (field 67) in PR #658; legacy emitters/readers removed in #366.
+  reserved "encoder_worst_peer_fps";
   optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
   optional bool screen_sharing_active = 28;        // Whether screen share is currently active
 

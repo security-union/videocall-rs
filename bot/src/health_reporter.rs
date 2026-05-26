@@ -236,7 +236,6 @@ fn build_health_packet(
         hp.encoder_fps_ratio = Some(fps_ratio as f64);
     }
     if p75_peer_fps.is_finite() && p75_peer_fps > 0.0 {
-        hp.encoder_worst_peer_fps = Some(p75_peer_fps as f64);
         hp.encoder_p75_peer_fps = Some(p75_peer_fps as f64);
     }
     if bitrate_ratio.is_finite() && bitrate_ratio > 0.0 {

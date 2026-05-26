@@ -4,13 +4,11 @@
  */
 
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
-use crate::components::color_picker::HsvColorPicker;
 use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, save_density_mode,
     save_dock_autohide, save_dock_position, AppearanceSettings, AppearanceSettingsCtx, AutohideCtx,
     DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
-    MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;

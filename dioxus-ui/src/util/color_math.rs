@@ -7,6 +7,8 @@
 //! - `saturation` and `value` are in `[0.0, 1.0]`.
 //! - RGB channels are 8-bit `u8`.
 
+#![allow(dead_code)]
+
 /// Convert HSV to 8-bit RGB.
 ///
 /// `hue` is wrapped into `[0, 360)`. `saturation` and `value` are clamped to

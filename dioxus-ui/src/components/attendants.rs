@@ -98,7 +98,6 @@ pub enum MediaErrorState {
 }
 
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
-const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {

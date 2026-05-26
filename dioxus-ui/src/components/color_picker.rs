@@ -12,6 +12,8 @@
 //! drives the Add button), while the picker owns its internal HSV state and
 //! keeps it in sync with the hex string in both directions.
 
+#![allow(dead_code)]
+
 use crate::util::color_math::{hsv_to_rgb, parse_hex, rgb_to_hex, rgb_to_hsv};
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;

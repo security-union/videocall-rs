@@ -97,7 +97,7 @@ test.describe("Two users in a meeting", () => {
     await waitForServices();
   });
 
-  test("host starts meeting, guest joins, both see each other", async ({ baseURL }) => {
+  test("host starts meeting, guest joins, both see each other @bvt1", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_two_user_${Date.now()}`;
 

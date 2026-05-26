@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -95,25 +95,38 @@ e2e-down:
 	$(COMPOSE_E2E) down -v
 
 # Run e2e tests headless (assumes stack is already up)
-#   make e2e                        — all tests
+#   make e2e                        — all tests (full `dioxus` suite)
 #   make e2e SPEC=two-users-meeting — single spec (without .spec.ts)
+# Pinned to --project=dioxus so the bvt0/bvt1 projects (which share specs with
+# dioxus via tags) don't cause tagged tests to run multiple times.
 e2e:
-	cd e2e && npx playwright test $(if $(SPEC),tests/$(SPEC).spec.ts,)
+	cd e2e && npx playwright test --project=dioxus $(if $(SPEC),tests/$(SPEC).spec.ts,)
+
+# Run only the bvt0 smoke set (the absolute minimum "is the app alive" check).
+# Selects tests tagged `@bvt0`. Intended for the fastest possible per-PR signal.
+e2e-bvt0:
+	cd e2e && npx playwright test --project=bvt0
+
+# Run the bvt1 smoke superset (includes everything in bvt0 + auth + simple
+# meeting). Selects tests tagged `@bvt0` or `@bvt1`. Intended for per-PR CI as
+# a faster alternative to the full suite.
+e2e-bvt1:
+	cd e2e && npx playwright test --project=bvt1
 
 # Run e2e tests with visible browsers (assumes stack is already up)
 #   make e2e-headed                        — all tests
 #   make e2e-headed SPEC=two-users-meeting — single spec
 e2e-headed:
-	cd e2e && npx playwright test --headed $(if $(SPEC),tests/$(SPEC).spec.ts,)
+	cd e2e && npx playwright test --project=dioxus --headed $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
 # Run e2e tests in debug mode (step through in Playwright Inspector)
 e2e-debug:
-	cd e2e && npx playwright test --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
+	cd e2e && npx playwright test --project=dioxus --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
 # Full CI pipeline: build stack, start it, run tests, tear down
 e2e-ci: e2e-build e2e-install
 	$(COMPOSE_E2E) up -d
-	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && $(COMPOSE_E2E) down -v; exit $$E2E_EXIT
+	cd e2e && npx playwright test --project=dioxus; E2E_EXIT=$$?; cd .. && $(COMPOSE_E2E) down -v; exit $$E2E_EXIT
 
 # Lint + format check + typecheck (same as CI)
 e2e-lint:

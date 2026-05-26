@@ -86,6 +86,17 @@ pub struct VideoPeerDecoder {
     /// the `media_type` metric already carried by the FPS/bitrate events
     /// (`"VIDEO"` or `"SCREEN"`).
     media_type: &'static str,
+    /// Last `(source_width, source_height)` we saw on a `MediaPacket`'s
+    /// `VideoMetadata`. Used to dedupe `video_source_resolution` diag events
+    /// — those would otherwise fire on every decoded frame. `(0, 0)` means
+    /// either we've never seen the field or the publisher is older /
+    /// doesn't report it; in both cases we suppress the broadcast.
+    last_source_dims: RefCell<(u32, u32)>,
+    /// Peer-id pair used to tag the source-resolution diag event. We can't
+    /// borrow it from the `CanvasRenderer` because that storage may be
+    /// `None` when the canvas hasn't been wired yet, but
+    /// `set_stream_context` *does* run before any decoded frames. Set there.
+    stream_context: RefCell<Option<(String, String)>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -173,6 +184,8 @@ impl VideoPeerDecoder {
             decoder,
             canvas_renderer,
             media_type,
+            last_source_dims: RefCell::new((0, 0)),
+            stream_context: RefCell::new(None),
         })
     }
 
@@ -205,6 +218,11 @@ impl VideoPeerDecoder {
     /// Also stores the peer context in the canvas renderer so resolution changes can
     /// be broadcast with the correct peer_id.
     pub fn set_stream_context(&self, from_peer: String, to_peer: String) {
+        // Mirror the peer-id pair on `self` so `decode()` can tag the
+        // source-resolution diag event regardless of whether the canvas
+        // renderer is set yet.
+        *self.stream_context.borrow_mut() = Some((from_peer.clone(), to_peer.clone()));
+
         // Store peer context in the canvas renderer for resolution broadcasts.
         if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
             renderer.from_peer = Some(from_peer.clone());
@@ -315,6 +333,8 @@ impl VideoPeerDecoder {
             decoder: Box::new(NoopDecoder),
             canvas_renderer: Rc::new(RefCell::new(None)),
             media_type: MEDIA_TYPE_CAMERA,
+            last_source_dims: RefCell::new((0, 0)),
+            stream_context: RefCell::new(None),
         }
     }
 }
@@ -322,6 +342,38 @@ impl VideoPeerDecoder {
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
+            // Surface publisher-side source dimensions (from
+            // `MediaStreamTrack.getSettings()` on the encoder side) so the
+            // UI can show Source vs Received and detect in-transit
+            // downscaling. Dedupe by tracking the last-seen pair — without
+            // this we'd flood the diag bus with one event per decoded frame.
+            // Proto3 default-zero acts as "unknown": older publishers that
+            // don't stamp the fields are skipped here.
+            let src_w = video_metadata.source_width;
+            let src_h = video_metadata.source_height;
+            if src_w != 0 && src_h != 0 {
+                let mut last = self.last_source_dims.borrow_mut();
+                if *last != (src_w, src_h) {
+                    *last = (src_w, src_h);
+                    drop(last);
+                    if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                        let evt = DiagEvent {
+                            subsystem: "video_source_resolution",
+                            stream_id: None,
+                            ts_ms: now_ms(),
+                            metrics: vec![
+                                metric!("source_width", src_w as u64),
+                                metric!("source_height", src_h as u64),
+                                metric!("from_peer", from_peer),
+                                metric!("to_peer", to_peer),
+                                metric!("media_type", self.media_type.to_string()),
+                            ],
+                        };
+                        let _ = global_sender().try_broadcast(evt);
+                    }
+                }
+            }
+
             // Convert protobuf VideoCodec to internal FrameCodec
             let frame_codec = match video_metadata.codec.enum_value() {
                 Ok(VideoCodec::VP8) => FrameCodec::Vp8,

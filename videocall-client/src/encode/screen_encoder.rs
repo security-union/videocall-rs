@@ -764,6 +764,17 @@ impl ScreenEncoder {
         let mut width: u32 = 0;
         let mut height: u32 = 0;
 
+        // Shared atomics carrying the publisher's *source* track dimensions
+        // (from `MediaStreamTrack.getSettings()`). The output-chunk handler
+        // below is created once and outlives the `'restart:` loop, so it can
+        // not capture `width` / `height` directly — they get reassigned on
+        // restart. Atomics let the per-chunk closure read the most recent
+        // source dims at frame-stamping time without locking. `0` means
+        // "unknown" and triggers the proto3 default-skip, so older publishers
+        // / pre-capture frames stay backward-compatible.
+        let source_width_atomic = Arc::new(AtomicU32::new(0));
+        let source_height_atomic = Arc::new(AtomicU32::new(0));
+
         // The onended handler closure must live as long as we use the media track.
         // We store it here so it isn't dropped when the inner loop restarts.
         let mut _onended_handler: Option<Closure<dyn FnMut()>> = None;
@@ -784,6 +795,8 @@ impl ScreenEncoder {
             let userid = userid.clone();
             let aes = aes.clone();
             let client = client.clone();
+            let source_width_for_handler = source_width_atomic.clone();
+            let source_height_for_handler = source_height_atomic.clone();
 
             Box::new(move |chunk: JsValue| {
                 let now = window()
@@ -807,12 +820,21 @@ impl ScreenEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
+                // Read the latest source dimensions snapshot. The encoder
+                // loop updates the atomics whenever the track is (re)acquired
+                // and reports its native capture size via `get_settings()`.
+                // `Ordering::Relaxed` is sufficient — these values are
+                // descriptive metadata, not synchronization signals.
+                let source_width_now = source_width_for_handler.load(Ordering::Relaxed);
+                let source_height_now = source_height_for_handler.load(Ordering::Relaxed);
                 let packet: PacketWrapper = transform_screen_chunk(
                     chunk,
                     sequence_number,
                     buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
+                    source_width_now,
+                    source_height_now,
                 );
                 // Phase 2 of WT freeze fix: route screen-share video on its
                 // own persistent QUIC stream, isolated from the camera and
@@ -1007,6 +1029,11 @@ impl ScreenEncoder {
                 width = track_settings.get_width().expect("width is None") as u32;
                 height = track_settings.get_height().expect("height is None") as u32;
 
+                // Publish the source dims to the per-chunk stamper. Read by
+                // the screen_output_handler closure on every encoded frame.
+                source_width_atomic.store(width, Ordering::Relaxed);
+                source_height_atomic.store(height, Ordering::Relaxed);
+
                 current_stream = Some(acquired_stream);
                 current_track = Some(track);
                 media_acquired = true;
@@ -1059,6 +1086,11 @@ impl ScreenEncoder {
                 let track_settings = track.get_settings();
                 width = track_settings.get_width().expect("width is None") as u32;
                 height = track_settings.get_height().expect("height is None") as u32;
+
+                // Publish the source dims to the per-chunk stamper (see the
+                // matching `.store()` in the restart-acquire branch above).
+                source_width_atomic.store(width, Ordering::Relaxed);
+                source_height_atomic.store(height, Ordering::Relaxed);
 
                 current_track = Some(track);
             }

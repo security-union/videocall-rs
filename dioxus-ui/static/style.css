@@ -5492,7 +5492,9 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 }
 
 /* ============================================================
-   Click-outside backdrop for popups / dropdowns
+   Click-outside backdrop for the three small popovers (density, dock menu,
+   mock-peers). Full drawers like peer-list and diagnostics intentionally
+   do NOT get this — they close via their own explicit X / toggle button.
    ============================================================ */
 
 .popover-backdrop {

@@ -3002,7 +3002,8 @@ pub fn AttendantsComponent(
                                             DensityModeButton {
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
-                                                onclick: move |_| {
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
                                                     let opening = !density_open();
                                                     density_open.set(opening);
                                                     if opening {
@@ -3016,7 +3017,8 @@ pub fn AttendantsComponent(
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
-                                                onclick: move |_| {
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
                                                     let opening = !mock_peers_open();
                                                     mock_peers_open.set(opening);
                                                     if opening {

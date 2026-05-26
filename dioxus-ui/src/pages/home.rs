@@ -20,6 +20,7 @@ use crate::auth::{
     check_session, clear_access_token, clear_id_token, clear_user_profile, get_user_profile,
     UserProfile,
 };
+use crate::components::about_modal::AboutModal;
 use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meetings_list::MeetingsList;
@@ -166,6 +167,12 @@ pub fn Home() -> Element {
 
     let mut create_error = use_signal(|| None::<String>);
     let mut creating = use_signal(|| false);
+
+    // About modal — surfaces client + server build info from a thin footer
+    // link below the hero card.  Only the modal triggers the
+    // `/api/v1/versions` fetch (in its own use_effect), so the homepage
+    // itself doesn't pay for a network round-trip on every load.
+    let mut show_about = use_signal(|| false);
 
     // Tracks which (if any) info-icon tooltip the user has explicitly
     // parked open via click / Enter / Space.  CSS still handles the
@@ -748,6 +755,18 @@ pub fn Home() -> Element {
 
                 div { class: "content-separator" }
 
+                div { class: "about-footer",
+                    button {
+                        r#type: "button",
+                        class: "about-footer-link",
+                        "data-testid": "about-footer-link",
+                        "aria-label": "Show app version and About details",
+                        onclick: move |_| show_about.set(true),
+                        "About videocall-ui v"
+                        "{env!(\"CARGO_PKG_VERSION\")}"
+                    }
+                }
+
             // div { class: "grid grid-cols-1 md:grid-cols-2 gap-8", style: "margin-top:1em",
             //     div {
             //         button {
@@ -765,6 +784,8 @@ pub fn Home() -> Element {
             //     }
             // }
             }
+
+            AboutModal { open: show_about }
         }
     }
 }

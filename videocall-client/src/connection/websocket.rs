@@ -30,6 +30,16 @@ use videocall_types::Callback;
 
 impl WebMedia<WebSocketTask> for WebSocketTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebSocketTask> {
+        // Phase 3c: the netsim shim is installed once-per-tab from
+        // `?netsim=<profile>` by `Connection::connect` via
+        // `super::netsim_url::try_install_from_url`. We deliberately do
+        // **not** install or clear the hook here — doing so would
+        // overwrite the URL-driven slot with the unused, hardcoded
+        // `ConnectOptions::netsim_hook` placeholder and silently
+        // disable the simulator on every reconnect. The
+        // `Connection::connect` caller still registers the
+        // `Weak<Task>` used by the async-delay path.
+
         // Track whether the handshake (Opened event) has completed, so that
         // subsequent Close/Error events can be classified correctly.
         let handshake_complete = Rc::new(Cell::new(false));
@@ -96,7 +106,24 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
 
     /// WebSocket has a single TCP stream — there is no per-media-type
     /// routing.  The `stream_key` argument is intentionally ignored.
-    fn send_bytes(&self, bytes: Vec<u8>, _stream_key: MediaStreamKey) {
+    fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        // Phase 3b (discussion #793). When the `netsim` feature is
+        // off this entire block is compiled out and the send path is
+        // byte-for-byte identical to pre-3b. When on, the per-tab
+        // hook may instruct us to drop, delay, or duplicate the
+        // packet; the helper returns `true` in those cases and the
+        // sync `send_binary` below is skipped.
+        #[cfg(feature = "netsim")]
+        {
+            if super::netsim_hook::shape_uplink_reliable(&bytes, stream_key) {
+                return;
+            }
+        }
+        // `stream_key` is intentionally ignored on the WS path —
+        // single TCP stream serves everything. Bind to `_` only when
+        // the netsim feature would otherwise leave it unused.
+        #[cfg(not(feature = "netsim"))]
+        let _ = stream_key;
         self.send_binary(bytes);
     }
 }

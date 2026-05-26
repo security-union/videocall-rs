@@ -265,6 +265,8 @@ jobs:
             --set-string "env[7].value=4" \
             --set "env[8].name=TOKIO_BLOCKING_THREADS" \
             --set-string "env[8].value=2" \
+            --set "env[9].name=WT_OUTBOUND_CHANNEL_CAPACITY" \
+            --set-string "env[9].value=4096" \
             --set ingress.enabled=true \
             --set "ingress.hosts[0].host=webtransport.videocall.fnxlabs.com" \
             --set "ingress.hosts[0].paths[0].path=/" \

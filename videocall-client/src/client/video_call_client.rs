@@ -239,17 +239,33 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host requests this client disable its camera.
     pub on_host_disable_video: Option<Callback<()>>,
 
+    /// Callback triggered when the host removes this client from the meeting.
+    pub on_participant_kicked: Option<Callback<()>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
-    pub on_peer_left: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_left: Option<Callback<(String, String, String)>>,
 
     /// Callback triggered when a participant changes their display name.
-    /// Emits `(user_id, new_display_name)`.
-    pub on_display_name_changed: Option<Callback<(String, String)>>,
+    /// Emits `(user_id, new_display_name, session_id)` where `session_id` is
+    /// the server-assigned u64 session_id of the renaming participant — or
+    /// `0` for legacy broadcasts that did not carry a session_id (rename
+    /// applies to all sessions of `user_id`). UIs that maintain a local-self
+    /// display-name signal MUST gate their self-update on
+    /// `session_id == own_session_id` so a sibling tab of the same
+    /// authenticated user (same `user_id`, different `session_id`) does not
+    /// overwrite its own self-name when another tab renames. See HCL #828.
+    pub on_display_name_changed: Option<Callback<(String, String, u64)>>,
 
     /// Callback triggered when a remote participant joins the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
-    pub on_peer_joined: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_JOINED
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_joined: Option<Callback<(String, String, String)>>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -317,9 +333,10 @@ struct InnerOptions {
     on_meeting_settings_updated: Option<Callback<()>>,
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
-    on_peer_left: Option<Callback<(String, String)>>,
-    on_peer_joined: Option<Callback<(String, String)>>,
-    on_display_name_changed: Option<Callback<(String, String)>>,
+    on_participant_kicked: Option<Callback<()>>,
+    on_peer_left: Option<Callback<(String, String, String)>>,
+    on_peer_joined: Option<Callback<(String, String, String)>>,
+    on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
 
@@ -346,10 +363,19 @@ struct Inner {
     session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
-    /// messages, so we deduplicate by (event_type, target_user_id) within a
-    /// short time window to avoid firing duplicate toast notifications.
-    /// Key: (event_type_str, target_user_id), Value: timestamp_ms
-    recent_peer_events: HashMap<(String, String), f64>,
+    /// messages, so we deduplicate within a short time window to avoid firing
+    /// duplicate toast notifications.
+    ///
+    /// Per-session events (PARTICIPANT_JOINED, PARTICIPANT_LEFT) key on
+    /// `(event_type, target_user_id, Some(session_id))` so that two distinct
+    /// sessions of the same authenticated user (HCL issue #828) are NOT
+    /// dedup'd as one. Only the *same* session arriving over both WS and WT
+    /// gets suppressed.
+    ///
+    /// Per-user events (which do not have a meaningful session_id at this
+    /// layer) key on `(event_type, target_user_id, None)`.
+    /// Key: (event_type_str, target_user_id, session_id), Value: timestamp_ms
+    recent_peer_events: HashMap<(String, String, Option<u64>), f64>,
     /// Recently processed host action events for deduplication across
     /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
     /// shorter window than `recent_peer_events` because host actions are
@@ -523,6 +549,7 @@ impl VideoCallClient {
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
+                    on_participant_kicked: options.on_participant_kicked.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -1267,6 +1294,26 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns `true` if a peer with the given `session_id` (as a decimal
+    /// string, matching the form emitted by `on_peer_joined`) is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is the session-id-keyed counterpart to `has_peer_with_user_id`.
+    /// The UI uses it to suppress the join-toast for a PARTICIPANT_JOINED
+    /// that replays a session we already know about (e.g. on reconnect),
+    /// without collapsing sibling same-user sessions into a single toast
+    /// (HCL #828). A non-numeric or empty `session_id` returns `false` —
+    /// the legacy "unknown session" path falls back to the user-id helper.
+    pub fn has_peer_with_session_id(&self, session_id: &str) -> bool {
+        let Ok(sid) = session_id.parse::<u64>() else {
+            return false;
+        };
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get(&sid).is_some(),
+            Err(_) => false,
+        }
+    }
+
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -1550,9 +1597,24 @@ impl Inner {
     /// schedule (which can exceed 5 seconds).  A shorter window would allow
     /// stale "existing member" PARTICIPANT_JOINED events to slip through
     /// after a reconnect because the dedup entry had already expired.
-    fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
+    ///
+    /// HCL issue #828: when the same authenticated user joins from two tabs,
+    /// the backend now broadcasts two PARTICIPANT_JOINED events with the same
+    /// `target_user_id` but different `session_id`s. The dedup key therefore
+    /// includes `session_id` for per-session events so both joins are
+    /// delivered to the UI as distinct toast notifications.
+    fn is_duplicate_peer_event(
+        &mut self,
+        event_type: &str,
+        target_user_id: &str,
+        session_id: Option<u64>,
+    ) -> bool {
         let now = js_sys::Date::now();
-        let key = (event_type.to_string(), target_user_id.to_string());
+        let key = (
+            event_type.to_string(),
+            target_user_id.to_string(),
+            session_id,
+        );
 
         // Evict stale entries (older than 30 seconds).
         self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
@@ -1911,15 +1973,36 @@ impl Inner {
                             // update the local user's own name signal on reconnect.
                             // on_display_name_changed is reserved for PARTICIPANT_DISPLAY_NAME_CHANGED.
 
+                            // HCL #828: include session_id in the dedup key so
+                            // two distinct sessions of the same authenticated
+                            // user (e.g. same Google account in two tabs) are
+                            // both delivered as separate join events. A
+                            // session_id of 0 means "unknown" — fall back to
+                            // user-id-only dedup to preserve the original
+                            // WS+WT collapse semantics in that case.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("joined", &target_str);
+                                && !self.is_duplicate_peer_event("joined", &target_str, dedup_sid);
 
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_joined {
-                                    cb.emit((display_name, target_str));
+                                    // Empty string for session_id 0 keeps the
+                                    // legacy "unknown session" path observable
+                                    // without forcing every consumer to thread
+                                    // an Option<String>.
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             } else {
                                 debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str);
@@ -1945,10 +2028,19 @@ impl Inner {
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            // HCL #828: scope the dedup key to session_id so a
+                            // PARTICIPANT_LEFT for one session of a multi-
+                            // session user does not suppress the second
+                            // session's leave event later.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("left", &target_str);
+                                && !self.is_duplicate_peer_event("left", &target_str, dedup_sid);
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
@@ -1957,7 +2049,12 @@ impl Inner {
                                         &meeting_packet,
                                         &target_str,
                                     );
-                                    cb.emit((display_name, target_str));
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             }
                         }
@@ -2071,6 +2168,29 @@ impl Inner {
                                 }
                             }
                         }
+                        Ok(MeetingEventType::PARTICIPANT_KICKED) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_targeted_at_self =
+                                target.as_slice() == self.options.user_id.as_bytes();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            info!(
+                                "Received PARTICIPANT_KICKED: room={}, target=\"{}\", is_targeted_at_self={}",
+                                meeting_packet.room_id, target_str, is_targeted_at_self
+                            );
+                            if is_targeted_at_self {
+                                if !self.is_duplicate_host_action("participant_kicked", &target_str)
+                                {
+                                    if let Some(cb) = &self.options.on_participant_kicked {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate PARTICIPANT_KICKED for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -2103,10 +2223,16 @@ impl Inner {
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(
-                                    "Emitting on_display_name_changed callback for {}",
-                                    target_str
+                                    "Emitting on_display_name_changed callback for user={} session_id={}",
+                                    target_str, meeting_packet.session_id
                                 );
-                                cb.emit((target_str, new_display_name));
+                                // HCL #828: include the renaming session's
+                                // session_id so the UI can scope the
+                                // local-self update to the renaming tab only.
+                                // A value of 0 indicates a legacy broadcast
+                                // without a session_id; consumers must treat
+                                // it as "apply to all sessions of user_id".
+                                cb.emit((target_str, new_display_name, meeting_packet.session_id));
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
@@ -2306,6 +2432,7 @@ mod disconnect_tests {
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
+            on_participant_kicked: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }
@@ -2400,6 +2527,356 @@ mod disconnect_tests {
         assert!(
             !inner.peer_decode_manager.has_send_packet_callback(),
             "send_packet must be cleared after disconnect()"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dedup_tests {
+    //! Regression tests for HCL issue #828 — "same authed user multiple
+    //! times not shown as separate instance in same meeting".
+    //!
+    //! Backend fix: `actix-api` no longer evicts an existing session when a
+    //! new session of the *same* `user_id` joins a room. After that fix the
+    //! server broadcasts two PARTICIPANT_JOINED events for the same user_id
+    //! — one per session, each with a distinct `session_id`.
+    //!
+    //! Frontend contract these tests lock in:
+    //!  1. Two PARTICIPANT_JOINED events for the same `user_id` with
+    //!     *different* `session_id`s must BOTH be delivered (no dedup).
+    //!  2. Two PARTICIPANT_JOINED events for the same `(user_id, session_id)`
+    //!     pair (the WS+WT dual-transport case) must be dedup'd as one.
+    //!  3. Two HOST_MUTE events for the same `target_user_id` (different
+    //!     transports) must still be dedup'd as one — the original purpose
+    //!     of dual-transport collapse is preserved.
+    use super::*;
+    use videocall_types::Callback as VcCallback;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn build_dedup_test_options() -> VideoCallClientOptions {
+        VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            user_id: "dedup_test_user".to_string(),
+            display_name: "Dedup Tester".to_string(),
+            is_guest: false,
+            meeting_id: "dedup-test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_peer_added: VcCallback::noop(),
+            on_peer_first_frame: VcCallback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| id),
+            on_connected: VcCallback::noop(),
+            on_connection_lost: VcCallback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            decode_media: true,
+            allow_post_rebase_retry: true,
+        }
+    }
+
+    /// HCL #828: two PARTICIPANT_JOINED events for the same `user_id` with
+    /// distinct `session_id`s must NOT be collapsed. Both sessions are
+    /// legitimate, separate joiners and the UI must learn about both.
+    #[wasm_bindgen_test]
+    fn participant_joined_distinct_sessions_are_not_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let first = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1001));
+        let second = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1002));
+
+        assert!(
+            !first,
+            "first PARTICIPANT_JOINED for session 1001 must NOT be a duplicate"
+        );
+        assert!(
+            !second,
+            "second PARTICIPANT_JOINED for session 1002 (same user_id) must NOT be \
+             dedup'd against session 1001 — they are distinct sessions per HCL #828"
+        );
+    }
+
+    /// Dual-transport WS+WT delivery of the *same* PARTICIPANT_JOINED
+    /// (same `user_id` AND same `session_id`) must collapse to a single
+    /// UI event. This is the original purpose of the dedup helper.
+    #[wasm_bindgen_test]
+    fn participant_joined_same_session_over_two_transports_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+        let from_wt = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+
+        assert!(
+            !from_ws,
+            "first PARTICIPANT_JOINED (e.g. via WS) must be delivered"
+        );
+        assert!(
+            from_wt,
+            "second PARTICIPANT_JOINED for the SAME (user_id, session_id) \
+             (e.g. via WT) must be suppressed to avoid duplicate toast"
+        );
+    }
+
+    /// Dual-transport delivery of the same PARTICIPANT_LEFT (same session)
+    /// must dedup, but two different sessions of the same user leaving
+    /// must NOT — symmetric to the joined case.
+    #[wasm_bindgen_test]
+    fn participant_left_dedup_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        // Same session over two transports → second is duplicate.
+        let first_ws = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        let first_wt = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        assert!(!first_ws);
+        assert!(
+            first_wt,
+            "duplicate transport delivery for same session must dedup"
+        );
+
+        // Different session of the same user → NOT duplicate.
+        let other_session = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3002));
+        assert!(
+            !other_session,
+            "PARTICIPANT_LEFT for a different session of the same user must \
+             not be dedup'd against the first session's leave"
+        );
+    }
+
+    /// HCL #828 follow-up: `has_peer_with_session_id` is the session-id-keyed
+    /// counterpart that the join-toast suppression uses to avoid collapsing
+    /// sibling same-user sessions into a single toast. With no peers tracked
+    /// the helper must return `false` for any session_id, including the
+    /// empty-string and non-numeric inputs (the legacy "unknown session"
+    /// path). The positive case is covered end-to-end by the
+    /// `same-user-multi-session.spec.ts` E2E spec, which exercises the helper
+    /// via a real PARTICIPANT_JOINED → peer_decode_manager round trip.
+    #[wasm_bindgen_test]
+    fn has_peer_with_session_id_empty_state_returns_false() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        assert!(
+            !client.has_peer_with_session_id("4001"),
+            "untracked session_id must report absent"
+        );
+        assert!(
+            !client.has_peer_with_session_id(""),
+            "empty session_id must report absent (legacy unknown-session path)"
+        );
+        assert!(
+            !client.has_peer_with_session_id("not-a-number"),
+            "non-numeric session_id must report absent"
+        );
+    }
+
+    /// HCL #828 follow-up: when a `PARTICIPANT_DISPLAY_NAME_CHANGED` event
+    /// carries a non-zero `session_id`, the handler at
+    /// `video_call_client.rs:2173-2177` routes it through the session-scoped
+    /// `set_peer_display_name(session_id, name)` — NOT the user-id-keyed
+    /// fallback `set_peer_display_name_by_user_id`. This guarantees that two
+    /// tabs of the same authenticated user (same `user_id`, different
+    /// `session_id`s) can rename independently: only the renaming tab's
+    /// display name on that session updates.
+    ///
+    /// The test seeds two peers via the persistent `display_name_cache`
+    /// (which `set_peer_display_name` writes into unconditionally, even
+    /// without a `connected_peers` entry — see
+    /// `peer_decode_manager.rs:1325-1326`), then renames one and verifies
+    /// the other is untouched.
+    #[wasm_bindgen_test]
+    fn display_name_change_with_session_id_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        // Two sibling sessions of the same authenticated user. In production
+        // these would be two tabs of `antonio@hcl` with distinct session_ids
+        // assigned by the server's SESSION_ASSIGNED handshake.
+        let sid_a: u64 = 5001;
+        let sid_b: u64 = 5002;
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (tab A)".to_string());
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_b, "antonio (tab B)".to_string());
+        }
+
+        // Sanity: both peers report their seeded names before the rename.
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (tab A)".to_string()),
+            "session A must read back its seeded display name"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B must read back its seeded display name"
+        );
+
+        // Simulate the server broadcast for tab A's rename arriving via the
+        // `session_id != 0` branch of the
+        // `PARTICIPANT_DISPLAY_NAME_CHANGED` handler. The handler calls
+        // `set_peer_display_name(sid_a, "antonio (renamed)")`.
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (renamed)".to_string());
+        }
+
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (renamed)".to_string()),
+            "session A's display name must update to the renamed value"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B's display name must be UNTOUCHED — the rename was \
+             scoped to session_id=sid_a, and a session-scoped update must \
+             never reach sibling sessions of the same user. If this fails, \
+             the handler has reverted to the user-id-keyed fallback."
+        );
+    }
+
+    /// HOST_MUTE_PARTICIPANT dedup is user-scoped on purpose: a host muting
+    /// `antonio@hcl` legitimately mutes ALL of his sessions, and both
+    /// transports must collapse to one local effect. This guards against
+    /// any future "let's session-scope every dedup" refactor accidentally
+    /// breaking the dual-transport collapse for host actions.
+    #[wasm_bindgen_test]
+    fn host_mute_same_user_dual_transport_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+        let from_wt = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+
+        assert!(!from_ws, "first HOST_MUTE must be delivered");
+        assert!(
+            from_wt,
+            "second HOST_MUTE for the same target_user_id within the dual-\
+             transport window must be suppressed — host actions are user-scoped"
+        );
+    }
+
+    /// HCL #828 follow-up: the `on_display_name_changed` callback must
+    /// receive the `session_id` of the renaming participant so the UI can
+    /// scope its local-self update to the renaming tab only. Two tabs of
+    /// the same authenticated user (same `user_id`, different
+    /// `session_id`s) would otherwise all match the user_id-only gate at
+    /// `attendants.rs:1254` and overwrite their own self-name signal when
+    /// any sibling tab renames — the exact bug observed live for HCL #828.
+    ///
+    /// This test pushes a synthetic `PARTICIPANT_DISPLAY_NAME_CHANGED`
+    /// meeting packet through `on_inbound_media` with a non-zero
+    /// `session_id`, and asserts the callback fires with that same
+    /// `session_id` as the third tuple element. If the emit site reverts
+    /// to a 2-tuple or drops the session_id, this test fails.
+    #[wasm_bindgen_test]
+    fn display_name_change_callback_carries_session_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // Capture every (user_id, new_name, session_id) tuple the
+        // callback is invoked with.
+        let received: Rc<RefCell<Vec<(String, String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let received_for_cb = received.clone();
+
+        let mut opts = build_dedup_test_options();
+        opts.on_display_name_changed = Some(VcCallback::from(
+            move |(user_id, name, session_id): (String, String, u64)| {
+                received_for_cb
+                    .borrow_mut()
+                    .push((user_id, name, session_id));
+            },
+        ));
+        let client = VideoCallClient::new(opts);
+
+        // Build a PARTICIPANT_DISPLAY_NAME_CHANGED meeting packet for a
+        // sibling session of the local user (different session_id from
+        // anything the local client thinks is its own — the dedup_test
+        // client has no own_session_id assigned, which is fine: the
+        // contract under test is the *callback shape*, not the consumer's
+        // local-self gate. The consumer-side gate is exercised by the
+        // dioxus-ui callsite at `components/attendants.rs`.)
+        let renaming_session_id: u64 = 11_909_780_505_735_931_018;
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "TonyBots".to_string(),
+            target_user_id: b"tester1.estrada@gmail.com".to_vec(),
+            session_id: renaming_session_id,
+            display_name: b"Tester 1".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: b"tester1.estrada@gmail.com".to_vec(),
+            // PacketWrapper.session_id is 0 for MEETING packets; the
+            // renaming session is carried inside the inner MeetingPacket.
+            session_id: 0,
+            data: meeting_packet
+                .write_to_bytes()
+                .expect("MeetingPacket must serialise"),
+            ..Default::default()
+        };
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner.on_inbound_media(wrapper);
+        }
+
+        let captured = received.borrow();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one on_display_name_changed emit expected; got {:?}",
+            *captured
+        );
+        let (got_user, got_name, got_session) = &captured[0];
+        assert_eq!(got_user, "tester1.estrada@gmail.com");
+        assert_eq!(got_name, "Tester 1");
+        assert_eq!(
+            *got_session, renaming_session_id,
+            "callback must carry the renaming participant's session_id \
+             so the consumer (dioxus-ui) can scope its local-self update \
+             to the renaming tab only — sibling tabs of the same authed \
+             user must NOT overwrite their own display name signal. \
+             Regression guard for HCL #828."
         );
     }
 }

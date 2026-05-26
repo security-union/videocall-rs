@@ -34,6 +34,7 @@ pub fn PeerListItem(
     #[props(default)] on_edit_name: EventHandler<()>,
     #[props(default)] on_mute: Option<EventHandler<()>>,
     #[props(default)] on_disable_video: Option<EventHandler<()>>,
+    #[props(default)] on_kick: Option<EventHandler<()>>,
 ) -> Element {
     let effective_tooltip = if tooltip.is_empty() {
         name.clone()
@@ -110,7 +111,7 @@ pub fn PeerListItem(
                     }
                 }
             }
-            if on_mute.is_some() || on_disable_video.is_some() {
+            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                 div { class: "peer_item_menu_wrapper",
                     button {
                         class: "peer_item_menu_btn",
@@ -136,6 +137,10 @@ pub fn PeerListItem(
                         }
                     }
                     if peer_menu_open() {
+                        div {
+                            style: "position: fixed; inset: 0; z-index: 999;",
+                            onclick: move |_| peer_menu_open.set(false),
+                        }
                         div { class: "context-menu peer_item_context_menu",
                             if let Some(on_mute) = on_mute {
                                 button {
@@ -186,6 +191,31 @@ pub fn PeerListItem(
                                         line { x1: "1", y1: "1", x2: "23", y2: "23" }
                                     }
                                     "Disable video"
+                                }
+                            }
+                            if let Some(on_kick) = on_kick {
+                                button {
+                                    class: "context-menu-item",
+                                    onclick: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        peer_menu_open.set(false);
+                                        on_kick.call(());
+                                    },
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg",
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                        polyline { points: "17 8 21 12 17 16" }
+                                        line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                    }
+                                    "Remove from meeting"
                                 }
                             }
                         }

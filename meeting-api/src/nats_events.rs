@@ -172,11 +172,19 @@ pub async fn publish_waiting_room_updated(nats: Option<&async_nats::Client>, roo
 }
 
 /// Publish `PARTICIPANT_DISPLAY_NAME_CHANGED` when a participant updates their display name.
+///
+/// When `session_id` is `Some(sid)`, the broadcast packet carries that session
+/// identifier so the chat_server consumer and peer clients scope the rename to
+/// the originating tab only — not every session sharing the renaming user's
+/// `user_id` (HCL issue #828 follow-up). When `None`, the proto field is left
+/// at its default (`0`), which both peers and the chat_server handler interpret
+/// as the legacy "rename every session of this user" path.
 pub async fn publish_participant_display_name_changed(
     nats: Option<&async_nats::Client>,
     room_id: &str,
     target_user_id: &str,
     new_display_name: &str,
+    session_id: Option<u64>,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
@@ -184,12 +192,15 @@ pub async fn publish_participant_display_name_changed(
         room_id: room_id.to_string(),
         target_user_id: target_user_id.as_bytes().to_vec(),
         display_name: new_display_name.as_bytes().to_vec(),
+        session_id: session_id.unwrap_or(0),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
     tracing::debug!(
-        "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id}: {}",
+        "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id} \
+         (session_id={}): {}",
+        session_id.unwrap_or(0),
         new_display_name
     );
 }
@@ -235,6 +246,26 @@ pub async fn publish_host_disable_video(
     nats.publish(room_system_subject(room_id), bytes.into())
         .await?;
     tracing::debug!("Published HOST_DISABLE_VIDEO for room {room_id} target=\"{target_user_id}\"");
+    Ok(())
+}
+
+/// Publish `PARTICIPANT_KICKED` to tell one participant they have been removed.
+pub async fn publish_host_kick(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::PARTICIPANT_KICKED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
     Ok(())
 }
 
@@ -458,6 +489,58 @@ mod tests {
         assert!(
             inner.target_user_id.is_empty(),
             "disable-video-all uses empty target_user_id as the broadcast marker"
+        );
+    }
+
+    #[test]
+    fn test_build_participant_display_name_changed_packet_with_session_id() {
+        // When `meeting-api` is told a rename came from a specific session
+        // (HCL issue #828 follow-up), the broadcast packet MUST carry the
+        // same `session_id` so chat_server and downstream peers can scope
+        // the rename to a single tab instead of every session of the user.
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "tony@example.com".as_bytes().to_vec(),
+            display_name: "Antonio (tab A)".as_bytes().to_vec(),
+            session_id: 4242,
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into()
+        );
+        assert_eq!(inner.target_user_id, "tony@example.com".as_bytes().to_vec());
+        assert_eq!(inner.display_name, "Antonio (tab A)".as_bytes().to_vec());
+        assert_eq!(
+            inner.session_id, 4242,
+            "session_id must be preserved on the wire so peers can scope the rename to one tab"
+        );
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_participant_display_name_changed_packet_legacy_no_session_id() {
+        // Legacy callers don't supply `session_id`. The proto-3 default `0`
+        // is the agreed sentinel for the user-id-wide rename path and MUST
+        // be preserved verbatim — both chat_server and peer clients depend
+        // on this exact value to fall back to the pre-#828 behaviour.
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "legacy@example.com".as_bytes().to_vec(),
+            display_name: "Legacy".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.session_id, 0,
+            "legacy callers must produce session_id=0 so consumers fall back to user-id-wide rename"
         );
     }
 

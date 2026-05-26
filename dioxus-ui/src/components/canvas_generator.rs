@@ -287,6 +287,13 @@ pub struct AudioLevels {
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+///
+/// `my_session_id` is the LOCAL session_id (from `VideoCallClient::get_own_session_id`). It is
+/// compared against `key` (the peer's session_id) to detect the local user's own tile. Prior
+/// versions of this function used the local user_id, which caused sibling same-user sessions to
+/// be misidentified as "self" (HCL issue 828): each tab of the same authenticated user has its own
+/// distinct session_id but a shared user_id, so a user-id compare collapses sibling tabs into a
+/// single "self" tile in split layouts and screen-share paths.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_for_peer(
     client: &VideoCallClient,
@@ -295,12 +302,13 @@ pub fn generate_for_peer(
     audio_levels: AudioLevels,
     host_user_id: Option<&str>,
     mode: TileMode,
-    my_peer_id: Option<&str>,
+    my_session_id: Option<&str>,
     signal_info: SignalInfo,
     mut show_signal_popup: Signal<bool>,
     mut show_tile_menu: Signal<bool>,
     on_mute: Option<EventHandler<()>>,
     on_disable_video: Option<EventHandler<()>>,
+    on_kick: Option<EventHandler<()>>,
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
@@ -356,15 +364,18 @@ pub fn generate_for_peer(
     let mic_inline_style = mic_style(visible_mic_level, visible_audio_level, appearance);
 
     // ---- Split-layout: screen-share left panel --------------------------------
+    // Self-identification keys on session_id, not user_id: two tabs/devices of
+    // the same authenticated user share a user_id but have distinct session_ids,
+    // and a sibling session must not be treated as "self" (HCL issue 828).
     if matches!(mode, TileMode::ScreenOnly) {
         // Don't render the local user's own screen share
-        if !is_screen_share_enabled_for_peer || my_peer_id == Some(peer_user_id.as_str()) {
+        if !is_screen_share_enabled_for_peer || my_session_id == Some(key.as_str()) {
             return rsx! {};
         }
     }
 
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
-    let is_self_peer = my_peer_id == Some(peer_user_id.as_str());
+    let is_self_peer = my_session_id == Some(key.as_str());
     let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
 
     if decision == TileDecision::Empty {
@@ -511,10 +522,11 @@ pub fn generate_for_peer(
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() {
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                             {
                                 let on_mute_clone = on_mute;
                                 let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -541,6 +553,10 @@ pub fn generate_for_peer(
                                             }
                                         }
                                         if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
                                             div { class: "tile-context-menu",
                                                 if let Some(cb) = on_mute_clone {
                                                     button {
@@ -589,6 +605,30 @@ pub fn generate_for_peer(
                                                             line { x1: "1", y1: "1", x2: "23", y2: "23" }
                                                         }
                                                         "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -719,10 +759,11 @@ pub fn generate_for_peer(
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() {
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                             {
                                 let on_mute_clone = on_mute;
                                 let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -749,6 +790,10 @@ pub fn generate_for_peer(
                                             }
                                         }
                                         if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
                                             div { class: "tile-context-menu",
                                                 if let Some(cb) = on_mute_clone {
                                                     button {
@@ -797,6 +842,30 @@ pub fn generate_for_peer(
                                                             line { x1: "1", y1: "1", x2: "23", y2: "23" }
                                                         }
                                                         "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -866,12 +935,14 @@ pub fn generate_for_peer(
     };
 
     // Derive flat &str values so the rsx! condition is a simple != comparison.
-    let peer_id = peer_user_id.as_str();
-    let my_peer_id = my_peer_id.unwrap_or("");
+    // Self-identification keys on session_id (`key`), not user_id, so sibling
+    // same-user sessions get their own screen-share canvas (HCL issue 828).
+    let peer_session_id = key.as_str();
+    let my_session_id_str = my_session_id.unwrap_or("");
 
     rsx! {
         // Canvas for Screen share.
-        if peer_id != my_peer_id && is_screen_share_enabled_for_peer {
+        if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",
@@ -988,16 +1059,18 @@ pub fn generate_for_peer(
                                     }
                                 }
                             }
-                            // Three-dot host mute menu (visible on hover / when speaking, only for host)
-                            if on_mute.is_some() {
+                            // Three-dot host control menu (visible on hover, only for host)
+                            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                                 {
                                     let on_mute_clone = on_mute;
+                                    let on_disable_video_clone = on_disable_video;
+                                    let on_kick_clone = on_kick;
                                     rsx! {
                                         div { class: "tile-mute-menu-wrapper",
                                             button {
                                                 class: "tile-mute-btn",
-                                                title: "Mute participant",
-                                                "aria-label": "Mute participant",
+                                                title: "Host actions",
+                                                "aria-label": "Host actions",
                                                 onclick: move |e: MouseEvent| {
                                                     e.stop_propagation();
                                                     show_tile_menu.set(!show_tile_menu());
@@ -1018,32 +1091,83 @@ pub fn generate_for_peer(
                                                 }
                                             }
                                             if show_tile_menu() {
+                                                div {
+                                                    style: "position: fixed; inset: 0; z-index: 99;",
+                                                    onclick: move |_| show_tile_menu.set(false),
+                                                }
                                                 div { class: "tile-context-menu",
-                                                    button {
-                                                        class: "tile-context-menu-item",
-                                                        onclick: move |_| {
-                                                            show_tile_menu.set(false);
-                                                            if let Some(ref cb) = on_mute_clone {
+                                                    if let Some(cb) = on_mute_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
                                                                 cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                                path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                                path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                                line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                                line { x1: "8", y1: "23", x2: "16", y2: "23" }
                                                             }
-                                                        },
-                                                        svg {
-                                                            xmlns: "http://www.w3.org/2000/svg",
-                                                            width: "14",
-                                                            height: "14",
-                                                            view_box: "0 0 24 24",
-                                                            fill: "none",
-                                                            stroke: "currentColor",
-                                                            stroke_width: "2",
-                                                            stroke_linecap: "round",
-                                                            stroke_linejoin: "round",
-                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                                                            path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
-                                                            path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                                            line { x1: "12", y1: "19", x2: "12", y2: "23" }
-                                                            line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                            "Mute"
                                                         }
-                                                        "Mute"
+                                                    }
+                                                    if let Some(cb) = on_disable_video_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            }
+                                                            "Disable video"
+                                                        }
+                                                    }
+                                                    if let Some(cb) = on_kick_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                                polyline { points: "17 8 21 12 17 16" }
+                                                                line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                            }
+                                                            "Remove from meeting"
+                                                        }
                                                     }
                                                 }
                                             }

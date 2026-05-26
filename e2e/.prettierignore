@@ -2,3 +2,5 @@ node_modules/
 test-results/
 playwright-report/
 playwright-results.json
+bots-app/run/
+bots-app/dashboard/

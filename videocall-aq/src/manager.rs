@@ -1185,15 +1185,15 @@ mod tests {
         let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 2000.0, 5);
         assert!(!changed);
 
-        // After MIN_TIER_TRANSITION_INTERVAL_MS (3000ms) from last transition + reaction time
+        // After MIN_TIER_TRANSITION_INTERVAL_MS (1500ms) from last transition + reaction time
         let changed = mgr.update(9.0, 30.0, 1500.0, 1500.0, base + 4700.0, 5);
-        // degrade_start was reset at transition; 4700 - 1600 = 3100 > 3000 (interval ok)
+        // degrade_start was reset at transition; 4700 - 1600 = 3100 > 1500 (interval ok)
         // but degrade_start was None after transition, so it started fresh at the next
         // degraded update. Let's trace: after step-down at 11600, degrade_start=None.
         // At 12000 (base+2000): should_degrade=true, degrade_start set to 12000.
-        //   can_transition: 12000-11600=400 < 3000, so no.
+        //   can_transition: 12000-11600=400 < 1500, so no.
         // At 14700 (base+4700): should_degrade=true, degrade_start=12000, duration=2700 > 1500.
-        //   can_transition: 14700-11600=3100 > 3000, yes!
+        //   can_transition: 14700-11600=3100 > 1500, yes!
         assert!(changed);
         assert_eq!(mgr.video_tier_index(), 2);
     }
@@ -2141,7 +2141,7 @@ mod tests {
         );
 
         // === Phase 2: Second step-down (index 3 -> 4) — arms ceiling ===
-        // Wait past MIN_TIER_TRANSITION_INTERVAL_MS (3000ms) then degrade again.
+        // Wait past MIN_TIER_TRANSITION_INTERVAL_MS (1500ms) then degrade again.
         let t = t + 3100.0; // past min-interval
         mgr.update(9.0, 30.0, 1500.0, 1500.0, t, peers); // start degrade timer
         let t = t + 1600.0;

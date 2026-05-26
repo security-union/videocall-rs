@@ -3316,7 +3316,7 @@ mod tests {
         use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        let mut sent_packets: Vec<PacketWrapper> = Vec::new();
+        let sent_packets: Vec<PacketWrapper> = Vec::new();
         let collector = sent_packets.clone();
         // Use a Cell to collect packets from the closure.
         let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
@@ -3388,7 +3388,7 @@ mod tests {
         let peer_uids = ["peer0@x.com", "peer1@x.com", "peer2@x.com", "peer3@x.com"];
         for (i, &sid) in peer_ids.iter().enumerate() {
             let (mock_audio, _) = MockAudioDecoder::new();
-            let mut peer = Peer {
+            let peer = Peer {
                 audio: Box::new(mock_audio),
                 video: VideoPeerDecoder::noop(),
                 screen: VideoPeerDecoder::noop(),

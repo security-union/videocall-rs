@@ -392,6 +392,14 @@ h3 {
   background: var(--surface-hover, rgba(255, 255, 255, 0.08));
 }
 
+.tile-context-menu-item--danger {
+  color: var(--btn-danger-label);
+}
+
+.tile-context-menu-item--danger:hover {
+  background: var(--btn-danger-bg-hover);
+}
+
 #grid-container {
   position: absolute;
   inset: 0;
@@ -1568,6 +1576,14 @@ select {
 .context-menu-item:hover {
   background: var(--menu-item-hover-bg);
   color: var(--menu-item-hover-text);
+}
+
+.context-menu-item--danger {
+  color: var(--btn-danger-label);
+}
+
+.context-menu-item--danger:hover {
+  background: var(--btn-danger-bg-hover);
 }
 
 .context-menu-item:active {

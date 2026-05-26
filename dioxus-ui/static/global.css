@@ -2420,11 +2420,20 @@ html[data-theme="light"] #invite-overlay p {
 
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
-.split-peer-tile .canvas-container canvas.cropped { object-fit: cover !important; }
+.split-peer-tile .canvas-container canvas.cropped {
+  width: auto !important;
+  height: 100% !important;
+  min-width: 100% !important;
+  object-fit: cover !important;
+  object-position: center center !important;
+}
 
 .grid-item .canvas-container canvas.uncropped,
 .split-screen-tile .canvas-container canvas.uncropped,
-.split-peer-tile .canvas-container canvas.uncropped { object-fit: contain !important; }
+.split-peer-tile .canvas-container canvas.uncropped {
+  object-fit: contain !important;
+  object-position: center center !important;
+}
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {

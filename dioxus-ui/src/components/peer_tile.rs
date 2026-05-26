@@ -71,6 +71,11 @@ pub fn PeerTile(
     let mut latency_ms = use_signal(|| 0.0_f64);
     let mut video_resolution = use_signal(String::new);
     let mut screen_resolution = use_signal(String::new);
+    // Publisher's native source resolution for the screen-share track,
+    // delivered via the `video_source_resolution` diag event the decoder
+    // emits when a `MediaPacket.video_metadata.source_*` field changes.
+    // Empty when the publisher is older / doesn't stamp the fields.
+    let mut screen_source_resolution = use_signal(String::new);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -152,6 +157,7 @@ pub fn PeerTile(
                     &mut latency_ms,
                     &mut video_resolution,
                     &mut screen_resolution,
+                    &mut screen_source_resolution,
                     &mut peer_transport,
                 );
                 // Push a signal quality sample at most once per second,
@@ -184,6 +190,7 @@ pub fn PeerTile(
                     screen_fps: *screen_fps.peek(),
                     screen_bitrate_kbps: *screen_bitrate.peek(),
                     screen_resolution: screen_resolution.peek().clone(),
+                    screen_source_resolution: screen_source_resolution.peek().clone(),
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
                     video_enabled: *video_enabled.peek(),
@@ -390,6 +397,7 @@ fn handle_diagnostics_event(
     latency_ms: &mut Signal<f64>,
     video_resolution: &mut Signal<String>,
     screen_resolution: &mut Signal<String>,
+    screen_source_resolution: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
 ) {
     match evt.subsystem {
@@ -570,6 +578,38 @@ fn handle_diagnostics_event(
                 };
                 if *target.peek() != res {
                     target.set(res);
+                }
+            }
+        }
+        "video_source_resolution" => {
+            // Publisher's native capture dimensions, broadcast by the
+            // decoder when it sees a `MediaPacket.video_metadata.source_*`
+            // field change. We only track this for screen-share today; the
+            // camera-video branch carries `media_type=VIDEO` and we let the
+            // UI ignore it for now (no UI consumer requested it yet).
+            let mut to_peer: Option<String> = None;
+            let mut src_w: Option<u64> = None;
+            let mut src_h: Option<u64> = None;
+            let mut media_type_str: Option<String> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("source_width", MetricValue::U64(w)) => src_w = Some(*w),
+                    ("source_height", MetricValue::U64(h)) => src_h = Some(*h),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if media_type_str.as_deref() != Some("SCREEN") {
+                return;
+            }
+            if let (Some(w), Some(h)) = (src_w, src_h) {
+                let res = format!("{w}x{h}");
+                if *screen_source_resolution.peek() != res {
+                    screen_source_resolution.set(res);
                 }
             }
         }

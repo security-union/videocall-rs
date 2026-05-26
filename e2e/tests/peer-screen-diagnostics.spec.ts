@@ -22,6 +22,11 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      tooltip line carries the "WxH" prefix.
  *   6. The "?" help text for the Screen legend mentions Resolution / FPS /
  *      Bitrate so the wording change introduced in #883 stays in sync.
+ *   7. (#891 amendment) The tooltip Screen line carries the publisher's
+ *      *source* resolution end-to-end. When source == received the tooltip
+ *      collapses to a single WxH value with no arrow / no downscale badge;
+ *      the help text mentions Source / Received / pixel area so the
+ *      degradation framing stays in sync.
  *
  * Mirrors the structure of `signal-quality-peer-transport.spec.ts` (auth +
  * meeting setup) and the `MOCK_GET_DISPLAY_MEDIA_SCRIPT` pattern from
@@ -268,6 +273,36 @@ test.describe("Peer screen-share diagnostics", () => {
       await expect(tooltip).toContainText(/Screen:/);
       await expect(tooltip).toContainText(/fps/i);
       await expect(tooltip).toContainText(/kbps/i);
+
+      // ----- Source vs Received resolution (#891 amendment, May 2026). -----
+      //
+      // The publisher's mock track reports width 1280, height 720 from
+      // getSettings() and the encoder ships at the same dimensions, so the
+      // tooltip should *collapse* to a single value (no "Source" / arrow /
+      // degradation badge). Asserting the collapsed shape proves both ends
+      // of the source-resolution plumbing are wired end-to-end: the
+      // publisher stamped `MediaPacket.video_metadata.source_*`, the
+      // decoder emitted the `video_source_resolution` diag event, the
+      // PeerTile recorded it on the SignalSample, and the tooltip chose
+      // the equal-Source-and-Received branch.
+      //
+      // The Source > Received downscale branch + the `↓X% pixel area`
+      // badge are exhaustively covered by the unit tests in
+      // `dioxus-ui/src/components/signal_quality.rs` (pixel-area math,
+      // severity bucketing, badge presence/absence on every boundary).
+      // Reproducing the downscale path in Playwright would require
+      // pinning the publisher's adaptive-quality tier from outside the
+      // wasm boundary, which is more brittle than the unit-test coverage.
+      await expect(tooltip).toContainText("1280x720");
+      await expect(tooltip).not.toContainText("Source");
+      await expect(tooltip).not.toContainText("→"); // arrow
+      await expect(tooltip).not.toContainText("↓"); // downscale badge
+
+      // The legend help text should mention the Source vs Received story
+      // and the pixel-area badge so the wording change stays in sync.
+      await expect(helpText).toContainText("Source");
+      await expect(helpText).toContainText(/Received/i);
+      await expect(helpText).toContainText("pixel");
     } finally {
       for (const m of members) {
         if (m.page) {

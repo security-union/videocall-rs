@@ -94,8 +94,15 @@ pub struct SignalSample {
     pub screen_enabled: bool,
     pub screen_fps: f64,
     pub screen_bitrate_kbps: f64,
-    /// Screen-share resolution as "WxH" (e.g. "1920x1080"), empty when unknown.
+    /// Screen-share **received** resolution as "WxH" (e.g. "1920x1080"), i.e.
+    /// the dimensions of the decoded canvas. Empty when unknown.
     pub screen_resolution: String,
+    /// Screen-share **source** resolution as "WxH" — the publisher's native
+    /// `MediaStreamTrack.getSettings()` capture dimensions. Empty when the
+    /// publisher doesn't report it (older clients) or hasn't started sharing
+    /// yet. When this differs from `screen_resolution` the publisher's
+    /// encoder downscaled in transit.
+    pub screen_source_resolution: String,
     // Latency
     pub latency_ms: f64,
 }
@@ -117,6 +124,7 @@ impl PartialEq for SignalSample {
             && self.screen_fps == other.screen_fps
             && self.screen_bitrate_kbps == other.screen_bitrate_kbps
             && self.screen_resolution == other.screen_resolution
+            && self.screen_source_resolution == other.screen_source_resolution
             && self.latency_ms == other.latency_ms
     }
 }
@@ -135,8 +143,12 @@ pub struct SampleData {
     pub screen_enabled: bool,
     pub screen_fps: f64,
     pub screen_bitrate_kbps: f64,
-    /// Screen-share resolution as "WxH", empty when unknown.
+    /// Screen-share **received** resolution as "WxH", empty when unknown.
     pub screen_resolution: String,
+    /// Screen-share **source** resolution as "WxH" — publisher's native
+    /// capture size as reported on the wire. Empty when the publisher
+    /// doesn't report it or hasn't been seen yet.
+    pub screen_source_resolution: String,
     pub latency_ms: f64,
     pub audio_enabled: bool,
     pub video_enabled: bool,
@@ -232,6 +244,7 @@ impl PeerSignalHistory {
             screen_fps: data.screen_fps,
             screen_bitrate_kbps: data.screen_bitrate_kbps,
             screen_resolution: data.screen_resolution.clone(),
+            screen_source_resolution: data.screen_source_resolution.clone(),
             latency_ms: data.latency_ms,
         });
     }
@@ -422,36 +435,8 @@ fn show_body_tooltip(
     } else {
         String::new()
     };
-    let screen_line = if show_screen && sample.screen_enabled {
-        let screen_tier = infer_video_tier(&sample.screen_resolution);
-        if sample.screen_resolution.is_empty() {
-            format!(
-                "<span style='color:{}'>Screen: {:.1} fps | {:.0} kbps</span>",
-                theme_color::SIGNAL_SCREEN,
-                sample.screen_fps,
-                sample.screen_bitrate_kbps
-            )
-        } else if screen_tier.is_empty() {
-            format!(
-                "<span style='color:{}'>Screen: {} | {:.1} fps | {:.0} kbps</span>",
-                theme_color::SIGNAL_SCREEN,
-                sample.screen_resolution,
-                sample.screen_fps,
-                sample.screen_bitrate_kbps
-            )
-        } else {
-            format!(
-                "<span style='color:{}'>Screen: {} ({}) | {:.1} fps | {:.0} kbps</span>",
-                theme_color::SIGNAL_SCREEN,
-                sample.screen_resolution,
-                screen_tier,
-                sample.screen_fps,
-                sample.screen_bitrate_kbps
-            )
-        }
-    } else {
-        String::new()
-    };
+    let screen_line = build_screen_tooltip_line(sample, show_screen);
+    let screen_cause_line = build_screen_cause_line(sample, show_screen);
     let latency_line = if show_latency {
         format!(
             "<span style='color:{}'>Server RTT: {:.0} ms</span>",
@@ -482,6 +467,15 @@ fn show_body_tooltip(
         } else {
             Some(format!("<div>{screen_line}</div>"))
         },
+        if screen_cause_line.is_empty() {
+            None
+        } else {
+            // Slight left-indent (font-size:11px) so the cause line reads as
+            // a continuation of the Screen row above it.
+            Some(format!(
+                "<div style='font-size:11px;padding-left:8px'>{screen_cause_line}</div>"
+            ))
+        },
         if latency_line.is_empty() {
             None
         } else {
@@ -510,6 +504,196 @@ fn infer_video_tier(resolution: &str) -> &'static str {
         h if h > 0 => "Minimal",
         _ => "",
     }
+}
+
+/// Parse a `"WxH"` resolution string into `(width, height)`. Returns `None`
+/// when either side is missing, non-numeric, or zero. Used by the
+/// degradation-ratio helper below.
+fn parse_resolution(resolution: &str) -> Option<(u32, u32)> {
+    let mut parts = resolution.split('x');
+    let w = parts.next()?.parse::<u32>().ok()?;
+    let h = parts.next()?.parse::<u32>().ok()?;
+    if w == 0 || h == 0 {
+        None
+    } else {
+        Some((w, h))
+    }
+}
+
+/// Compute the screen-share downscale ratio as a rounded percentage of the
+/// publisher's source pixel area lost in transit:
+///
+/// `1 - (received_w × received_h) / (source_w × source_h)`
+///
+/// Returns `None` when either resolution is missing / unparseable OR when the
+/// received area is not strictly smaller than the source (no downscale to
+/// report). The percentage is rounded to the nearest integer in the
+/// `1..=100` range — values that round to zero return `None` rather than
+/// surfacing a misleading `↓0%` badge.
+///
+/// Using pixel area (not linear dimensions) is intentional: a 2× linear
+/// downscale loses 75% of pixels, which is the user-visible quantity.
+fn screen_downscale_percent(source: &str, received: &str) -> Option<u32> {
+    let (sw, sh) = parse_resolution(source)?;
+    let (rw, rh) = parse_resolution(received)?;
+    let src_area = sw as u64 * sh as u64;
+    let rcv_area = rw as u64 * rh as u64;
+    if rcv_area >= src_area {
+        return None;
+    }
+    // 0.0 < ratio < 1.0; multiply, round-half-away-from-zero.
+    let pct = 100.0 * (1.0 - (rcv_area as f64 / src_area as f64));
+    let pct_rounded = pct.round() as u32;
+    if pct_rounded == 0 {
+        None
+    } else {
+        Some(pct_rounded.min(100))
+    }
+}
+
+/// Pick the tooltip color for a given downscale percentage.
+/// Severity buckets follow the user-facing copy in the legend help text:
+///   - ≥50% pixel-area loss is severe (danger).
+///   - 25-49% is moderate (warning).
+///   - <25% is mild (muted).
+fn screen_downscale_color(pct: u32) -> &'static str {
+    if pct >= 50 {
+        theme_color::ERROR_TEXT
+    } else if pct >= 25 {
+        theme_color::WARNING_TEXT
+    } else {
+        theme_color::TEXT_MUTED
+    }
+}
+
+/// Render the Screen-share tooltip line. Pulled out so the per-arm formatting
+/// stays readable and so unit tests can exercise it without going through the
+/// DOM. Returns an empty string when the screen share isn't active or the
+/// caller has disabled the screen series.
+///
+/// Shape rules:
+///   - Received unknown -> `Screen: N fps | M kbps` (legacy fallback).
+///   - Source unknown or Source == Received -> `Screen: WxH (tier) | N fps | M kbps`.
+///   - Source != Received -> `Screen: Source AxB (tier) → Received CxD (tier)` plus
+///     a colored `↓X% pixel area` badge when the publisher's encoder downscaled
+///     in transit, plus the trailing `| N fps | M kbps`.
+fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String {
+    if !show_screen || !sample.screen_enabled {
+        return String::new();
+    }
+
+    let metrics_suffix = format!(
+        " | {:.1} fps | {:.0} kbps",
+        sample.screen_fps, sample.screen_bitrate_kbps
+    );
+
+    let received_known = !sample.screen_resolution.is_empty();
+    let source_known = !sample.screen_source_resolution.is_empty();
+    let source_equals_received = sample.screen_source_resolution == sample.screen_resolution;
+
+    if !received_known {
+        // Nothing to attribute. Same single-line shape used by older clients
+        // before #883 introduced received-resolution tracking. // @token-exempt: issue ref, not a color
+        return format!(
+            "<span style='color:{}'>Screen:{}</span>",
+            theme_color::SIGNAL_SCREEN,
+            metrics_suffix
+        );
+    }
+
+    if !source_known || source_equals_received {
+        // Either the publisher is older / doesn't report a source dimension,
+        // or the encoder hit no tier constraint and shipped the native size.
+        // In both cases collapse to a single value — there is nothing to
+        // compare against.
+        let tier = infer_video_tier(&sample.screen_resolution);
+        return if tier.is_empty() {
+            format!(
+                "<span style='color:{}'>Screen: {}{}</span>",
+                theme_color::SIGNAL_SCREEN,
+                sample.screen_resolution,
+                metrics_suffix
+            )
+        } else {
+            format!(
+                "<span style='color:{}'>Screen: {} ({}){}</span>",
+                theme_color::SIGNAL_SCREEN,
+                sample.screen_resolution,
+                tier,
+                metrics_suffix
+            )
+        };
+    }
+
+    // Source != Received. Show both with the arrow separator so it's
+    // immediately legible that downscaling happened.
+    let source_tier = infer_video_tier(&sample.screen_source_resolution);
+    let received_tier = infer_video_tier(&sample.screen_resolution);
+    let source_label = if source_tier.is_empty() {
+        sample.screen_source_resolution.clone()
+    } else {
+        format!("{} ({})", sample.screen_source_resolution, source_tier)
+    };
+    let received_label = if received_tier.is_empty() {
+        sample.screen_resolution.clone()
+    } else {
+        format!("{} ({})", sample.screen_resolution, received_tier)
+    };
+
+    // Optional degradation badge when the encoder downscaled in transit.
+    // U+2193 DOWNWARDS ARROW is the icon, the pct is bucketed for severity.
+    let badge = if let Some(pct) =
+        screen_downscale_percent(&sample.screen_source_resolution, &sample.screen_resolution)
+    {
+        format!(
+            " <span style='color:{}'>\u{2193}{}% pixel area</span>",
+            screen_downscale_color(pct),
+            pct
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "<span style='color:{}'>Screen: Source {} \u{2192} Received {}</span>{}{}",
+        theme_color::SIGNAL_SCREEN,
+        source_label,
+        received_label,
+        badge,
+        format_args!(
+            "<span style='color:{}'>{}</span>",
+            theme_color::SIGNAL_SCREEN,
+            metrics_suffix
+        )
+    )
+}
+
+/// Render the optional **Cause** sub-line that explains *why* the publisher's
+/// encoder downscaled in transit. Returns an empty string when the Screen
+/// line wouldn't carry a degradation badge (no downscale to explain) or when
+/// the screen series is disabled.
+///
+/// Today we don't have any publisher-side cause data on the wire — see issue
+/// `#903` for the plumbing plan (extending `VideoMetadata` with // @token-exempt: issue ref, not a color
+/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint`). Until then
+/// we surface a muted placeholder so users can correlate blur with downscale
+/// AND know we're aware of the gap. The line is only shown when a
+/// degradation badge is shown, to avoid noise on healthy streams.
+fn build_screen_cause_line(sample: &SignalSample, show_screen: bool) -> String {
+    if !show_screen || !sample.screen_enabled {
+        return String::new();
+    }
+    // Only render when there's an actual downscale to explain.
+    if screen_downscale_percent(&sample.screen_source_resolution, &sample.screen_resolution)
+        .is_none()
+    {
+        return String::new();
+    }
+
+    format!(
+        "<span style='color:{}'>Cause: not yet instrumented \u{2014} see issue #903</span>", // @token-exempt: issue ref, not a color
+        theme_color::TEXT_MUTED
+    )
 }
 
 /// Hide the global tooltip.
@@ -1065,9 +1249,25 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             strong { "Screen Share Quality" }
                             p { "Based on received FPS for the shared screen content." }
                             p {
-                                strong { "Resolution: " }
-                                "The dimensions of the shared screen being received (e.g., 1920x1080). "
-                                "Higher resolution means sharper text and detail."
+                                strong { "Source vs Received resolution: " }
+                                "Source is the publisher's native capture resolution (their monitor / window). "
+                                "Received is what your client decoded. A gap between the two means the publisher's "
+                                "encoder downscaled the content in transit — usually because the network or CPU "
+                                "couldn't sustain a full-resolution stream."
+                            }
+                            p {
+                                strong { "↓ Pixel-area badge: " }
+                                "Quantifies how much detail was lost in transit. A 2× linear downscale (e.g., 1080p \u{2192} 540p) "
+                                "drops 75% of the pixels, which is what the badge reports. \u{2265}50% is shown in red, 25\u{2013}49% in amber, "
+                                "<25% in muted text."
+                            }
+                            p {
+                                strong { "Cause: " }
+                                "Sub-line shown below the Screen row when a downscale is detected. "
+                                "Today this is a placeholder pointing at issue #903 — surfacing the " // @token-exempt: issue ref, not a color
+                                "actual cause (publisher's encoder target bitrate, adaptive-quality "
+                                "tier, CPU pressure) requires extending the wire format and is "
+                                "tracked separately."
                             }
                             p {
                                 strong { "FPS: " }
@@ -1209,6 +1409,7 @@ mod tests {
             screen_fps: 15.0,
             screen_bitrate_kbps: 1200.0,
             screen_resolution: "1920x1080".to_string(),
+            screen_source_resolution: "1920x1080".to_string(),
             latency_ms: 40.0,
             audio_enabled: true,
             video_enabled: true,
@@ -1219,6 +1420,7 @@ mod tests {
         assert_eq!(samples.len(), 1);
         let s = &samples[0];
         assert_eq!(s.screen_resolution, "1920x1080");
+        assert_eq!(s.screen_source_resolution, "1920x1080");
         assert!(s.screen_enabled);
         assert!((s.screen_fps - 15.0).abs() < 1e-9);
         // Screen quality is fps / 30 when enabled.
@@ -1233,6 +1435,7 @@ mod tests {
             screen_fps: 15.0,
             screen_bitrate_kbps: 1200.0,
             screen_resolution: String::new(),
+            screen_source_resolution: String::new(),
             video_enabled: true,
             audio_enabled: true,
             ..Default::default()
@@ -1241,6 +1444,7 @@ mod tests {
         let samples = history.samples_vec();
         assert_eq!(samples[0].screen_quality, 0.0);
         assert_eq!(samples[0].screen_resolution, "");
+        assert_eq!(samples[0].screen_source_resolution, "");
     }
 
     #[test]
@@ -1251,6 +1455,228 @@ mod tests {
         assert_eq!(infer_video_tier("640x480"), "Medium");
         assert_eq!(infer_video_tier(""), "");
         assert_eq!(infer_video_tier("garbage"), "");
+    }
+
+    // -----------------------------------------------------------------
+    // Source vs received tooltip behavior. These tests exercise the pure
+    // formatter, so we can drive them through host `cargo test` without
+    // any browser / DOM dependency.
+    // -----------------------------------------------------------------
+
+    fn screen_sample(received: &str, source: &str) -> SignalSample {
+        SignalSample {
+            timestamp_ms: 0.0,
+            audio_quality: 0.0,
+            video_quality: 0.0,
+            screen_quality: 0.5,
+            video_fps: 0.0,
+            video_bitrate_kbps: 0.0,
+            video_resolution: String::new(),
+            audio_bitrate_kbps: 0.0,
+            audio_expand_rate: 0.0,
+            audio_buffer_ms: 0.0,
+            screen_enabled: true,
+            screen_fps: 8.0,
+            screen_bitrate_kbps: 720.0,
+            screen_resolution: received.to_string(),
+            screen_source_resolution: source.to_string(),
+            latency_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn screen_downscale_percent_pixel_area_math() {
+        // 2× linear downscale -> 75% pixel-area loss.
+        assert_eq!(screen_downscale_percent("2560x1440", "1280x720"), Some(75));
+        // 1.5× linear-ish (1920x1080 -> 1280x720) -> ~55.6% rounded to 56.
+        assert_eq!(screen_downscale_percent("1920x1080", "1280x720"), Some(56));
+        // Source == Received -> no badge.
+        assert_eq!(screen_downscale_percent("1920x1080", "1920x1080"), None);
+        // Received >= Source area (no downscale) -> no badge.
+        assert_eq!(screen_downscale_percent("1280x720", "1920x1080"), None);
+        // Source unknown -> no badge.
+        assert_eq!(screen_downscale_percent("", "1920x1080"), None);
+        // Received unknown -> no badge.
+        assert_eq!(screen_downscale_percent("1920x1080", ""), None);
+        // Sub-1% loss rounds to 0 and returns None to avoid "↓0%" noise.
+        // 1920x1080 -> 1920x1079 = 0.09% area loss -> None.
+        assert_eq!(screen_downscale_percent("1920x1080", "1920x1079"), None);
+        // Unparseable input -> no badge.
+        assert_eq!(screen_downscale_percent("garbage", "1920x1080"), None);
+    }
+
+    #[test]
+    fn screen_downscale_color_severity_buckets() {
+        // <25% -> muted text.
+        assert_eq!(screen_downscale_color(0), theme_color::TEXT_MUTED);
+        assert_eq!(screen_downscale_color(24), theme_color::TEXT_MUTED);
+        // 25-49% -> amber warning.
+        assert_eq!(screen_downscale_color(25), theme_color::WARNING_TEXT);
+        assert_eq!(screen_downscale_color(49), theme_color::WARNING_TEXT);
+        // >=50% -> danger.
+        assert_eq!(screen_downscale_color(50), theme_color::ERROR_TEXT);
+        assert_eq!(screen_downscale_color(75), theme_color::ERROR_TEXT);
+        assert_eq!(screen_downscale_color(100), theme_color::ERROR_TEXT);
+    }
+
+    #[test]
+    fn tooltip_collapses_when_source_equals_received() {
+        let s = screen_sample("1920x1080", "1920x1080");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.contains("Screen: 1920x1080"));
+        assert!(line.contains("(Full HD)"));
+        // Single value — no arrow, no badge.
+        assert!(!line.contains("Source"));
+        assert!(!line.contains("\u{2192}"));
+        assert!(!line.contains("\u{2193}"));
+    }
+
+    #[test]
+    fn tooltip_shows_source_arrow_received_when_different() {
+        let s = screen_sample("1280x720", "2560x1440");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.contains("Source 2560x1440"));
+        assert!(line.contains("Received 1280x720"));
+        assert!(line.contains("\u{2192}")); // arrow
+                                            // 2560x1440 -> 1280x720 = 75% pixel-area loss, danger color.
+        assert!(line.contains("\u{2193}75% pixel area"));
+        assert!(line.contains(theme_color::ERROR_TEXT));
+    }
+
+    #[test]
+    fn tooltip_uses_warning_color_for_moderate_downscale() {
+        // 1920x1080 -> 1280x720 = 56% loss -> danger (since >= 50%).
+        // Use a smaller delta to land in 25-49%.
+        // 1920x1080 -> 1600x900 = 30.6% loss -> warning.
+        let s = screen_sample("1600x900", "1920x1080");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.contains(theme_color::WARNING_TEXT));
+        assert!(line.contains("\u{2193}31% pixel area"));
+    }
+
+    #[test]
+    fn tooltip_uses_muted_color_for_minor_downscale() {
+        // 1920x1080 -> 1820x1024 = ~10.1% loss -> muted.
+        let s = screen_sample("1820x1024", "1920x1080");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.contains(theme_color::TEXT_MUTED));
+        assert!(line.contains("\u{2193}"));
+    }
+
+    #[test]
+    fn tooltip_received_only_when_source_unknown() {
+        let s = screen_sample("1280x720", "");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.contains("Screen: 1280x720"));
+        assert!(line.contains("(HD)"));
+        // Older publisher -> no arrow, no badge.
+        assert!(!line.contains("Source"));
+        assert!(!line.contains("\u{2192}"));
+        assert!(!line.contains("\u{2193}"));
+    }
+
+    #[test]
+    fn tooltip_legacy_shape_when_received_unknown() {
+        // Both unknown -> fall back to no-resolution shape (pre-#891 baseline). // @token-exempt: issue ref, not a color
+        let s = screen_sample("", "");
+        let line = build_screen_tooltip_line(&s, true);
+        assert!(line.starts_with("<span"));
+        assert!(line.contains("Screen:"));
+        assert!(line.contains("8.0 fps"));
+        assert!(line.contains("720 kbps"));
+        assert!(!line.contains("Source"));
+        assert!(!line.contains("Received "));
+    }
+
+    #[test]
+    fn tooltip_empty_when_screen_disabled() {
+        let mut s = screen_sample("1280x720", "1920x1080");
+        s.screen_enabled = false;
+        assert_eq!(build_screen_tooltip_line(&s, true), "");
+    }
+
+    #[test]
+    fn tooltip_metrics_suffix_always_present() {
+        // Source == Received branch
+        let s_eq = screen_sample("1280x720", "1280x720");
+        let line_eq = build_screen_tooltip_line(&s_eq, true);
+        assert!(line_eq.contains("8.0 fps"));
+        assert!(line_eq.contains("720 kbps"));
+
+        // Source != Received branch
+        let s_diff = screen_sample("1280x720", "1920x1080");
+        let line_diff = build_screen_tooltip_line(&s_diff, true);
+        assert!(line_diff.contains("8.0 fps"));
+        assert!(line_diff.contains("720 kbps"));
+
+        // Received-only branch
+        let s_no_src = screen_sample("1280x720", "");
+        let line_no_src = build_screen_tooltip_line(&s_no_src, true);
+        assert!(line_no_src.contains("8.0 fps"));
+        assert!(line_no_src.contains("720 kbps"));
+    }
+
+    #[test]
+    fn tooltip_drops_badge_at_or_below_zero_rounded() {
+        // <0.5% downscale rounds to 0 — we must NOT render "↓0%".
+        let s = screen_sample("1919x1080", "1920x1080");
+        let line = build_screen_tooltip_line(&s, true);
+        // Source and Received differ as strings, so we still see both rows…
+        assert!(line.contains("Source"));
+        assert!(line.contains("Received"));
+        // …but no badge because the area delta rounds to 0.
+        assert!(!line.contains("\u{2193}"));
+        assert!(!line.contains("pixel area"));
+    }
+
+    #[test]
+    fn cause_line_only_present_with_downscale() {
+        // No downscale -> no cause line.
+        let s_eq = screen_sample("1920x1080", "1920x1080");
+        assert_eq!(build_screen_cause_line(&s_eq, true), "");
+
+        // Source unknown -> no cause line.
+        let s_no_src = screen_sample("1280x720", "");
+        assert_eq!(build_screen_cause_line(&s_no_src, true), "");
+
+        // Downscale present -> placeholder pointing at the follow-up issue.
+        let s_down = screen_sample("1280x720", "2560x1440");
+        let line = build_screen_cause_line(&s_down, true);
+        assert!(line.contains("Cause:"));
+        assert!(line.contains("#903")); // @token-exempt: issue ref, not a color
+        assert!(line.contains(theme_color::TEXT_MUTED));
+    }
+
+    #[test]
+    fn cause_line_empty_when_screen_disabled() {
+        let mut s = screen_sample("1280x720", "2560x1440");
+        s.screen_enabled = false;
+        assert_eq!(build_screen_cause_line(&s, true), "");
+    }
+
+    #[test]
+    fn cause_line_empty_when_screen_series_hidden() {
+        let s = screen_sample("1280x720", "2560x1440");
+        assert_eq!(build_screen_cause_line(&s, false), "");
+    }
+
+    #[test]
+    fn push_sample_carries_source_resolution_through_to_signal_sample() {
+        let mut history = PeerSignalHistory::new();
+        let data = SampleData {
+            screen_enabled: true,
+            screen_fps: 10.0,
+            screen_bitrate_kbps: 800.0,
+            screen_resolution: "1280x720".to_string(),
+            screen_source_resolution: "2560x1440".to_string(),
+            video_enabled: true,
+            audio_enabled: true,
+            ..Default::default()
+        };
+        history.push_sample_at(&data, 5_000.0);
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.screen_resolution, "1280x720");
+        assert_eq!(s.screen_source_resolution, "2560x1440");
     }
 
     #[test]

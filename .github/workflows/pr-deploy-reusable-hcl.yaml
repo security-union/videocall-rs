@@ -53,7 +53,7 @@ jobs:
           echo "${CLUSTER_INFO}" | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Kubernetes control plane is running at https://10.190.252.83:8443"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.0
         with:
           ref: ${{ inputs.pr_sha }}
 

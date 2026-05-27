@@ -76,6 +76,16 @@ pub fn PeerTile(
     // emits when a `MediaPacket.video_metadata.source_*` field changes.
     // Empty when the publisher is older / doesn't stamp the fields.
     let mut screen_source_resolution = use_signal(String::new);
+    // Issue #903: publisher-side encoder state for the screen-share track, // @token-exempt: issue ref, not a color
+    // delivered via the `screen_encoder_state` diag event the decoder
+    // emits when any of the three values changes. Used by the
+    // SignalQualityPopup tooltip to render a `Cause:` sub-line below the
+    // Screen row explaining *why* the encoder downscaled in transit.
+    // All three default to 0 / empty so older publishers (and the
+    // unconstrained-tier path on newer publishers) skip the Cause line.
+    let mut screen_encoder_target_bitrate = use_signal(|| 0_u32);
+    let mut screen_adaptive_tier = use_signal(String::new);
+    let mut screen_cause_hint = use_signal(String::new);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -158,6 +168,9 @@ pub fn PeerTile(
                     &mut video_resolution,
                     &mut screen_resolution,
                     &mut screen_source_resolution,
+                    &mut screen_encoder_target_bitrate,
+                    &mut screen_adaptive_tier,
+                    &mut screen_cause_hint,
                     &mut peer_transport,
                 );
                 // Push a signal quality sample at most once per second,
@@ -191,6 +204,9 @@ pub fn PeerTile(
                     screen_bitrate_kbps: *screen_bitrate.peek(),
                     screen_resolution: screen_resolution.peek().clone(),
                     screen_source_resolution: screen_source_resolution.peek().clone(),
+                    screen_encoder_target_bitrate_kbps: *screen_encoder_target_bitrate.peek(),
+                    screen_adaptive_tier: screen_adaptive_tier.peek().clone(),
+                    screen_cause_hint: screen_cause_hint.peek().clone(),
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
                     video_enabled: *video_enabled.peek(),
@@ -398,6 +414,9 @@ fn handle_diagnostics_event(
     video_resolution: &mut Signal<String>,
     screen_resolution: &mut Signal<String>,
     screen_source_resolution: &mut Signal<String>,
+    screen_encoder_target_bitrate: &mut Signal<u32>,
+    screen_adaptive_tier: &mut Signal<String>,
+    screen_cause_hint: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
 ) {
     match evt.subsystem {
@@ -610,6 +629,58 @@ fn handle_diagnostics_event(
                 let res = format!("{w}x{h}");
                 if *screen_source_resolution.peek() != res {
                     screen_source_resolution.set(res);
+                }
+            }
+        }
+        "screen_encoder_state" => {
+            // Issue #903: publisher's encoder state for the screen-share // @token-exempt: issue ref, not a color
+            // track, dispatched by the decoder when any of the three
+            // fields changes. We filter strictly on `media_type=SCREEN`
+            // mirroring the `video_source_resolution` arm — the camera
+            // decoder doesn't emit this subsystem today, but the guard
+            // documents the contract and prevents a future spillover
+            // from corrupting the screen signal.
+            //
+            // .set() is gated on change to avoid waking PeerTile
+            // subscribers when the values are unchanged. The decoder
+            // already dedupes at the source so this is belt-and-braces
+            // but cheap.
+            let mut to_peer: Option<String> = None;
+            let mut bitrate: Option<u32> = None;
+            let mut tier: Option<String> = None;
+            let mut hint: Option<String> = None;
+            let mut media_type_str: Option<String> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("encoder_target_bitrate_kbps", MetricValue::F64(v)) => {
+                        bitrate = Some(v.round().max(0.0) as u32);
+                    }
+                    ("adaptive_tier", MetricValue::Text(t)) => tier = Some(t.clone()),
+                    ("cause_hint", MetricValue::Text(t)) => hint = Some(t.clone()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if media_type_str.as_deref() != Some("SCREEN") {
+                return;
+            }
+            if let Some(b) = bitrate {
+                if *screen_encoder_target_bitrate.peek() != b {
+                    screen_encoder_target_bitrate.set(b);
+                }
+            }
+            if let Some(t) = tier {
+                if *screen_adaptive_tier.peek() != t {
+                    screen_adaptive_tier.set(t);
+                }
+            }
+            if let Some(h) = hint {
+                if *screen_cause_hint.peek() != h {
+                    screen_cause_hint.set(h);
                 }
             }
         }

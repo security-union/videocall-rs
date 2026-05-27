@@ -2209,6 +2209,11 @@ pub fn AttendantsComponent(
         }
     }
 
+    // Tile count drives the `participants-N` class modifier on the grid
+    // container, which lets CSS branch layout behavior (see
+    // `.participants-2` rule in global.css that disables the 3:2 cap).
+    let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
+
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
@@ -2221,9 +2226,26 @@ pub fn AttendantsComponent(
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
         // screen-share (flex) back to normal (grid) is clean.
-        let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
         let th = tw / (16.0 / 9.0);
+        // 2-peer case: let tiles stretch to fill their half (CSS rule in
+        // global.css disables the 3:2 cap on `.participants-2 .grid-item`).
+        // 3+ peers: size tracks to the natural tile dimensions and pack
+        // left/top so surplus viewport width sits on the right edge as
+        // empty space instead of being distributed between tiles.
+        let (track_cols, track_rows, pack) = if tile_count <= 2 {
+            (
+                format!("repeat({cols}, 1fr)"),
+                format!("repeat({rows}, 1fr)"),
+                "justify-content: stretch; align-content: stretch;",
+            )
+        } else {
+            (
+                format!("repeat({cols}, var(--tile-w))"),
+                format!("repeat({rows}, var(--tile-h))"),
+                "justify-content: start; align-content: start;",
+            )
+        };
         format!(
             "display: grid; \
              position: absolute; inset: 0; \
@@ -2232,10 +2254,15 @@ pub fn AttendantsComponent(
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
              width: 100%; height: 100%; \
-             grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
+             grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
+             {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
     };
+
+    // `participants-N` modifier; CSS uses `.participants-2` to disable the
+    // 3:2 aspect-ratio cap so tiles fill their half of the viewport.
+    let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -2725,7 +2752,7 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div { id: "grid-container", style: "{container_style}",
+                div { id: "grid-container", class: "{container_class}", style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();

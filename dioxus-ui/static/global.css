@@ -57,6 +57,25 @@
   width: 100%;
   height: 100%;
 }
+/* 2-peer layout: each tile fills its half of the viewport.
+   Overrides the `aspect-ratio: 3 / 2` cap from `.grid-item` (style.css) and
+   the centering from `place-self: center`. Single-peer is handled by
+   `.grid-item.full-bleed` above; 3+ peers keep the 3:2 cap. Pure CSS
+   selector — the `participants-N` class is set by attendants.rs on
+   `#grid-container` based on the visible tile count. */
+#grid-container.participants-2 .grid-item {
+  aspect-ratio: auto;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  place-self: stretch;
+}
+#grid-container.participants-2 .grid-item .canvas-container,
+#grid-container.participants-2 .grid-item canvas {
+  width: 100%;
+  height: 100%;
+}
 /* Video placeholder styling to ensure consistent rounded corners */
 .video-placeholder {
   background: var(--surface);

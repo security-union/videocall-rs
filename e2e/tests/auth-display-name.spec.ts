@@ -58,7 +58,7 @@ test.describe("Auth-based display name handling", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  test("display name input is empty when localStorage is clear", async ({ page }) => {
+  test("display name input is empty when localStorage is clear @bvt1", async ({ page }) => {
     // In the non-OAuth stack, the display name input should start empty when
     // there is no saved value in localStorage. OAuth pre-fill does not run.
     await page.goto("/");
@@ -66,7 +66,7 @@ test.describe("Auth-based display name handling", () => {
     await expect(page.locator("#username")).toHaveValue("");
   });
 
-  test("display name is restored from localStorage on page load", async ({ page }) => {
+  test("display name is restored from localStorage on page load @bvt1", async ({ page }) => {
     // When a display name is saved in localStorage in non-OAuth mode, it should
     // be restored into the #username input on page load.
     // Use addInitScript so the value is present before the app's own scripts run.
@@ -80,7 +80,7 @@ test.describe("Auth-based display name handling", () => {
     await expect(page.locator("#username")).toHaveValue("StoredUser");
   });
 
-  test("navigating directly to /meeting/<id> picks up display name from localStorage", async ({
+  test("navigating directly to /meeting/<id> picks up display name from localStorage @bvt1", async ({
     page,
   }) => {
     // When a user navigates directly to a /meeting/<id> URL without going through

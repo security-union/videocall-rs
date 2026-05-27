@@ -1989,6 +1989,8 @@ fn handle_msg(
         // with the sender's session_id embedded, and they MUST still
         // reach the sender so the client can step down its quality tier.
         let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
+        // N.B. `session_id` inside the packet is partially attacker-controlled;
+        // this field is only safe for self-echo suppression, not for identity verification.
         let inner_session_self = parsed
             .as_ref()
             .map(|pw| pw.session_id != 0 && pw.session_id == session)

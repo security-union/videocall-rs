@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: e2e
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.0
         with:
           clean: false
 

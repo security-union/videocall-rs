@@ -149,7 +149,7 @@ jobs:
           sudo find . -mindepth 1 -delete 2>/dev/null || true
           sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.0
         with:
           ref: ${{ steps.setup.outputs.ref }}
           clean: false

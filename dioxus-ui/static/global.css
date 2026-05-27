@@ -2451,6 +2451,38 @@ html[data-theme="light"] #invite-overlay p {
   object-position: center center !important;
 }
 
+/* ============================================================
+   Screen-share consumer-side aspect ratio (HCL issue: screen-
+   share distortion).
+
+   Screen-share content (the publisher's window or full screen)
+   is a rectangular source whose proportions carry information
+   — UI panels, text columns, slide aspect ratios. Stretching
+   the frame to fill a tile of a different shape produces wrong
+   proportions on the consumer side, so the canvas MUST always
+   letterbox / pillarbox inside its container regardless of the
+   shared `.cropped` / `.uncropped` crop toggle (which is meant
+   for camera tiles, where some edge cropping is acceptable to
+   keep faces centered).
+
+   Targets the screen-share canvas by id-prefix (`screen-share-
+   {peer_id}`) so this override applies to both the regular grid
+   tile (`.grid-item .canvas-container`) and the split-layout
+   left panel (`.split-screen-tile .canvas-container`), and wins
+   over the class-based `object-fit: cover` rule above on
+   specificity grounds (attribute selector + class beats class
+   alone, and the !important here matches the surrounding
+   rules so the cascade stays deterministic).
+   ============================================================ */
+.grid-item .canvas-container canvas[id^="screen-share-"],
+.split-screen-tile .canvas-container canvas[id^="screen-share-"] {
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  object-fit: contain !important;
+  object-position: center center !important;
+}
+
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {
   position: relative;

@@ -179,6 +179,16 @@ async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boo
 }
 
 async function openSignalPopup(page: Page) {
+  // In split-layout mode the signal button lives inside .split-peer-tile.
+  // Hover the tile first to ensure any lazy-rendered overlay elements are
+  // materialised (mirrors the crop/pin hover-gate pattern).
+  const splitPeerTile = page.locator(".split-peer-tile").first();
+  const hasSplitTile = await splitPeerTile.isVisible().catch(() => false);
+  if (hasSplitTile) {
+    await splitPeerTile.hover();
+    await page.waitForTimeout(300);
+  }
+
   const signalButton = page.locator('button[aria-label="Show signal quality"]').first();
   await expect(signalButton).toBeVisible({ timeout: 15_000 });
   await signalButton.click();
@@ -328,7 +338,7 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
       // mean the held lookup misfired and we're holding the zero we
       // were trying to mask. The held value should be the prior live
       // FPS, which in our mock is ~10fps.
-      expect(screenLine).not.toMatch(/0\.0fps \(static\)/);
+      expect(screenLine).not.toMatch(/(?<!\d)0\.0fps \(static\)/);
       // And the no-frames annotation must NOT appear — heartbeat is
       // fresh (peer_status is still firing every ~1s on the live
       // session) so we should land squarely in the `Static` branch.

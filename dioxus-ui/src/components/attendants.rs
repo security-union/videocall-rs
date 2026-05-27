@@ -1614,12 +1614,14 @@ pub fn AttendantsComponent(
     });
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
+    // Only fires for users already in-meeting who had a prior denial — on the
+    // pre-join screen (meeting_joined=false) this is a no-op.
     {
         let mda = mda.clone();
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-                if session_loaded() || connecting() {
+                if !meeting_joined() || session_loaded() || connecting() {
                     return;
                 }
 

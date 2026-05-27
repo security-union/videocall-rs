@@ -1428,11 +1428,12 @@ pub fn AttendantsComponent(
             decode_media: true,
             // Honour user transport preference: only allow the connection
             // manager's post-rebase re-election retry when the user is on
-            // the default `Auto` mode. Manual `WebTransportOnly` /
-            // `WebSocketOnly` selections must not be overridden by an
-            // automatic retry — the single-candidate state in those modes is
+            // the default `WebTransport` mode (which advertises BOTH URL
+            // lists to the manager). A manual `WebSocket` selection is a
+            // deliberate single-transport choice and the retry must not
+            // override it — the single-candidate state in that mode is
             // intentional, not a recoverable system condition.
-            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
+            allow_post_rebase_retry: transport_pref == TransportPreference::WebTransport,
             // Phase 3 / AUTH-2 — discussion 562: let the connection
             // manager preempt token expiry from inside its internal
             // re-election. Without this, the manager re-uses the cached
@@ -2209,6 +2210,11 @@ pub fn AttendantsComponent(
         }
     }
 
+    // Tile count drives the `participants-N` class modifier on the grid
+    // container, which lets CSS branch layout behavior (see
+    // `.participants-2` rule in global.css that disables the 3:2 cap).
+    let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
+
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
@@ -2221,9 +2227,26 @@ pub fn AttendantsComponent(
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
         // screen-share (flex) back to normal (grid) is clean.
-        let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
         let th = tw / (16.0 / 9.0);
+        // 2-peer case: let tiles stretch to fill their half (CSS rule in
+        // global.css disables the 3:2 cap on `.participants-2 .grid-item`).
+        // 3+ peers: size tracks to the natural tile dimensions and pack
+        // left/top so surplus viewport width sits on the right edge as
+        // empty space instead of being distributed between tiles.
+        let (track_cols, track_rows, pack) = if tile_count <= 2 {
+            (
+                format!("repeat({cols}, 1fr)"),
+                format!("repeat({rows}, 1fr)"),
+                "justify-content: stretch; align-content: stretch;",
+            )
+        } else {
+            (
+                format!("repeat({cols}, var(--tile-w))"),
+                format!("repeat({rows}, var(--tile-h))"),
+                "justify-content: start; align-content: start;",
+            )
+        };
         format!(
             "display: grid; \
              position: absolute; inset: 0; \
@@ -2232,10 +2255,15 @@ pub fn AttendantsComponent(
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
              width: 100%; height: 100%; \
-             grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
+             grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
+             {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
     };
+
+    // `participants-N` modifier; CSS uses `.participants-2` to disable the
+    // 3:2 aspect-ratio cap so tiles fill their half of the viewport.
+    let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -2725,7 +2753,7 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div { id: "grid-container", style: "{container_style}",
+                div { id: "grid-container", class: "{container_class}", style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();
@@ -3181,6 +3209,122 @@ pub fn AttendantsComponent(
                                                 },
                                             }
                                         }
+                                        // (а) Dock position dropdown — grouped with the tile-layout (density)
+                                        // button because both control how the meeting view is arranged.
+                                        // Keeping them adjacent so users see "view / layout" preferences
+                                        // together. The popup menu escapes the controls-secondary overflow
+                                        // clip via CSS (`overflow: visible` on the expanded state).
+                                        div { class: "dock-position-wrapper",
+                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                                button {
+                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                    title: "Dock position",
+                                                    r#type: "button",
+                                                    "aria-haspopup": "listbox",
+                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let opening = !dock_menu_open();
+                                                        dock_menu_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            mock_peers_open.set(false);
+
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        // Horizontal bar outline
+                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                        // Three dots inside the bar
+                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    }
+                                                }
+                                                if dock_menu_open() {
+                                                    div {
+                                                        class: "glass-select-menu",
+                                                        role: "listbox",
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Bottom"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Left"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Right"
+                                                        }
+                                                        // Separator
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            if autohide_enabled() {
+                                                                "Turn Hiding Off"
+                                                            } else {
+                                                                "Turn Hiding On"
+                                                            }
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                device_settings_initial_section
+                                                                    .set(Some("appearance".to_string()));
+                                                                device_settings_generation
+                                                                    .set(device_settings_generation() + 1);
+                                                                device_settings_open.set(true);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Dock Settings\u{2026}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
@@ -3227,118 +3371,6 @@ pub fn AttendantsComponent(
 
                                                 }
                                             },
-                                        }
-                                    }
-                                    // (а) Dock position dropdown — glass-select style
-                                    div { class: "dock-position-wrapper",
-                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
-                                            button {
-                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
-                                                title: "Dock position",
-                                                r#type: "button",
-                                                "aria-haspopup": "listbox",
-                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
-                                                onclick: move |e| {
-                                                    e.stop_propagation();
-                                                    let opening = !dock_menu_open();
-                                                    dock_menu_open.set(opening);
-                                                    if opening {
-                                                        density_open.set(false);
-                                                        mock_peers_open.set(false);
-
-                                                    }
-                                                },
-                                                svg {
-                                                    xmlns: "http://www.w3.org/2000/svg",
-                                                    width: "20",
-                                                    height: "20",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    // Horizontal bar outline
-                                                    rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
-                                                    // Three dots inside the bar
-                                                    circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                }
-                                            }
-                                            if dock_menu_open() {
-                                                div {
-                                                    class: "glass-select-menu",
-                                                    role: "listbox",
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Bottom);
-                                                            save_dock_position(DockPosition::Bottom);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Bottom"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Left);
-                                                            save_dock_position(DockPosition::Left);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Left"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Right);
-                                                            save_dock_position(DockPosition::Right);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Right"
-                                                    }
-                                                    // Separator
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            let new_val = !autohide_enabled();
-                                                            autohide_enabled.set(new_val);
-                                                            save_dock_autohide(new_val);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        if autohide_enabled() {
-                                                            "Turn Hiding Off"
-                                                        } else {
-                                                            "Turn Hiding On"
-                                                        }
-                                                    }
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            device_settings_initial_section
-                                                                .set(Some("appearance".to_string()));
-                                                            device_settings_generation
-                                                                .set(device_settings_generation() + 1);
-                                                            device_settings_open.set(true);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Dock Settings\u{2026}"
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     {
@@ -3879,77 +3911,68 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_enabled_returns_both_lists() {
-        // Auto pref + server says WT enabled: both lists must come through.
-        // This is the scenario the dioxus-ui hits on a normal reconnect once
-        // runtime config has loaded.
+    fn current_transport_urls_webtransport_with_wt_enabled_returns_both_lists() {
+        // WebTransport pref + server says WT enabled: both lists must come
+        // through. This is the WT-with-WS-fallback shape — the connection
+        // manager creates candidates for every URL and the election prefers
+        // WT, but if every WT candidate fails the WS candidates remain
+        // available for the manager to elect. This is the scenario the
+        // dioxus-ui hits on a normal reconnect once runtime config has
+        // loaded.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             true,
             ws.clone(),
             wt.clone(),
         );
-        assert!(enable_wt, "Auto+server-WT-enabled must enable WT");
-        assert_eq!(ws_out, ws, "WS list passed through unchanged");
+        assert!(enable_wt, "WebTransport+server-WT-enabled must enable WT");
+        assert_eq!(
+            ws_out, ws,
+            "WebTransport must keep the WS list — it's the fallback if every \
+             WT candidate fails its handshake"
+        );
         assert_eq!(wt_out, wt, "WT list passed through unchanged");
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_disabled_returns_only_ws() {
-        // Auto pref + runtime config hasn't loaded (or WT disabled): the WT
-        // list is dropped from the effective config, mirroring how `Auto`
-        // collapses to WS-only in this state. This is the *initial* shape
-        // that strands the user before the reconnect path re-evaluates.
+    fn current_transport_urls_webtransport_with_wt_disabled_returns_only_ws() {
+        // WebTransport pref + runtime config hasn't loaded (or WT disabled
+        // at the server): the WT list is dropped from the effective config,
+        // collapsing to WS-only. This is the *initial* shape that strands
+        // the user before the reconnect path re-evaluates.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
-        assert!(!enable_wt, "Auto+server-WT-disabled must disable WT");
+        assert!(
+            !enable_wt,
+            "WebTransport+server-WT-disabled must disable WT"
+        );
         assert_eq!(ws_out, ws, "WS list still populated");
         assert_eq!(
             wt_out, wt,
-            "Auto preserves the WT list shape (resolve_transport_config returns it as-is); \
+            "WebTransport preserves the WT list shape (resolve_transport_config returns it as-is); \
              the manager's enable_webtransport=false is what gates use of WT"
         );
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_websocket_only_drops_wt_list() {
-        // Explicit WebSocketOnly preference: WT list must always be empty,
+    fn current_transport_urls_websocket_drops_wt_list() {
+        // Explicit WebSocket preference: WT list must always be empty,
         // regardless of what the server-side flag says.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebSocketOnly,
-            true,
-            ws.clone(),
-            wt,
-        );
-        assert!(!enable_wt, "WebSocketOnly must report WT disabled");
+        let (enable_wt, ws_out, wt_out) =
+            current_transport_urls_from_lists(TransportPreference::WebSocket, true, ws.clone(), wt);
+        assert!(!enable_wt, "WebSocket must report WT disabled");
         assert_eq!(ws_out, ws);
-        assert!(wt_out.is_empty(), "WebSocketOnly must drop the WT list");
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_webtransport_only_drops_ws_list() {
-        // Explicit WebTransportOnly preference: WS list must always be empty.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebTransportOnly,
-            false, // server says WT disabled, but user override wins
-            ws,
-            wt.clone(),
-        );
-        assert!(enable_wt, "WebTransportOnly must report WT enabled");
-        assert!(ws_out.is_empty(), "WebTransportOnly must drop the WS list");
-        assert_eq!(wt_out, wt);
+        assert!(wt_out.is_empty(), "WebSocket must drop the WT list");
     }
 
     #[wasm_bindgen_test]
@@ -3965,22 +3988,26 @@ mod tests {
 
         // Initial call (runtime config still loading)
         let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
         assert!(!init_enable_wt);
         assert_eq!(init_ws, ws);
-        // Note: `Auto` keeps the wt list value; it's the bool that gates use.
+        // Note: `WebTransport` keeps the wt list value; it's the bool that gates use.
         // The recovery story is that `init_enable_wt == false` makes the manager
         // treat the WT list as unusable even though it's present in the vec —
         // see `resolve_transport_config`. The bool is the real signal, not the
         // list contents.
 
         // Reconnect call (runtime config now loaded — WT enabled)
-        let (reconn_enable_wt, reconn_ws, reconn_wt) =
-            current_transport_urls_from_lists(TransportPreference::Auto, true, ws.clone(), wt);
+        let (reconn_enable_wt, reconn_ws, reconn_wt) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt,
+        );
         assert!(reconn_enable_wt, "reconnect path now has WT enabled");
         assert_eq!(reconn_ws, ws, "WS list still populated");
         assert!(

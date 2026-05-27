@@ -296,13 +296,14 @@ pub struct VideoCallClientOptions {
     /// post-rebase re-election retry when the RTT-degradation watchdog hits a
     /// "only 1 server configured" rebase.
     ///
-    /// Set to `true` for users on the default `Auto` transport preference —
-    /// the single-candidate state is system-side (e.g. relay-availability
-    /// blip) and recovery via re-evaluation is desirable.
+    /// Set to `true` for users on the default `WebTransport` transport
+    /// preference (the WT-with-WS-fallback mode) — the single-candidate
+    /// state is system-side (e.g. relay-availability blip) and recovery via
+    /// re-evaluation is desirable.
     ///
-    /// Set to `false` for users who explicitly chose `WebTransportOnly` or
-    /// `WebSocketOnly` — the single-candidate state is the user's deliberate
-    /// choice and the retry must not override it.
+    /// Set to `false` for users who explicitly chose `WebSocket` — the
+    /// single-candidate state is the user's deliberate choice and the
+    /// retry must not override it.
     ///
     /// Defaults to `true`. The dioxus-ui derives the value from the user's
     /// `TransportPreference` context signal.

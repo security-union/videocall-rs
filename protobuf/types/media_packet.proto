@@ -32,6 +32,17 @@ message AudioMetadata {
 message VideoMetadata {
   uint64 sequence = 1;
   VideoCodec codec = 2;
+  // Native source dimensions of the captured track at the publisher (e.g. the
+  // monitor / window pixel size from `MediaStreamTrack.getSettings()`). Optional
+  // so older publishers that don't emit the fields decode cleanly (proto3
+  // default zero is interpreted as "unknown" by consumers).
+  //
+  // For screen-share frames these can exceed the encoded `data` resolution
+  // when the encoder is constrained by a downscale tier — the diagnostics UI
+  // surfaces the source-vs-received delta so users can tell whether shared
+  // content was downscaled in transit.
+  uint32 source_width = 3;
+  uint32 source_height = 4;
 }
 
 // Video codec enum with profile/level details for scalability.

@@ -81,6 +81,22 @@ struct CanvasRenderer {
 pub struct VideoPeerDecoder {
     decoder: Box<dyn VideoFrameDecoder>,
     canvas_renderer: Rc<RefCell<Option<CanvasRenderer>>>,
+    /// Discriminator tag emitted on diagnostics events so consumers can tell
+    /// camera-video resolution events apart from screen-share ones. Mirrors
+    /// the `media_type` metric already carried by the FPS/bitrate events
+    /// (`"VIDEO"` or `"SCREEN"`).
+    media_type: &'static str,
+    /// Last `(source_width, source_height)` we saw on a `MediaPacket`'s
+    /// `VideoMetadata`. Used to dedupe `video_source_resolution` diag events
+    /// — those would otherwise fire on every decoded frame. `(0, 0)` means
+    /// either we've never seen the field or the publisher is older /
+    /// doesn't report it; in both cases we suppress the broadcast.
+    last_source_dims: RefCell<(u32, u32)>,
+    /// Peer-id pair used to tag the source-resolution diag event. We can't
+    /// borrow it from the `CanvasRenderer` because that storage may be
+    /// `None` when the canvas hasn't been wired yet, but
+    /// `set_stream_context` *does* run before any decoded frames. Set there.
+    stream_context: RefCell<Option<(String, String)>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -113,10 +129,60 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     }
 }
 
+/// Media-type discriminator passed to [`VideoPeerDecoder::new`]. Distinguishes
+/// camera video streams from screen-share streams in diagnostics events so the
+/// UI can chart them separately. The values match the existing `media_type`
+/// metric carried on FPS/bitrate events.
+pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
+pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
+
+/// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
+/// [`CanvasRenderer`] inside [`VideoPeerDecoder::set_canvas`].
+///
+/// Two real-world orderings have to converge here:
+///
+/// 1. Canvas attached *before* `set_stream_context` (camera path: the
+///    `<canvas>` element exists at peer-tile mount, before the first packet
+///    arrives). The renderer was created with `(None, None)`, then
+///    `set_stream_context` populated it directly. Subsequent re-attachments
+///    must preserve that pair.
+/// 2. Canvas attached *after* `set_stream_context` (screen-share path: the
+///    `ScreenCanvas` tile only mounts once the peer's screen-share is
+///    advertised, which is after the first media packet — and the first
+///    packet is what triggers `set_stream_context`). The prior renderer is
+///    either absent or carries `(None, None)` and we must seed the new
+///    renderer from the decoder-level `stream_context` instead, otherwise
+///    `render_to_canvas_cached` cannot emit `video_resolution` diag events
+///    (it gates on `renderer.to_peer.is_some()`) and the screen-share
+///    resolution stays hidden in the Signal Quality tooltip for the whole
+///    session. This was the #883 regression.
+fn resolve_renderer_context(
+    prior_renderer_ctx: Option<(Option<String>, Option<String>)>,
+    decoder_stream_ctx: Option<&(String, String)>,
+) -> (Option<String>, Option<String>) {
+    if let Some((fp, tp)) = prior_renderer_ctx {
+        if fp.is_some() || tp.is_some() {
+            return (fp, tp);
+        }
+    }
+    match decoder_stream_ctx {
+        Some((fp, tp)) => (Some(fp.clone()), Some(tp.clone())),
+        None => (None, None),
+    }
+}
+
 impl VideoPeerDecoder {
     /// Create a new video decoder with optional canvas element.
     /// Use `set_canvas()` to provide the canvas if not available at construction time.
-    pub fn new(canvas: Option<HtmlCanvasElement>) -> Result<Self, JsValue> {
+    ///
+    /// `media_type` tags the resolution diagnostics event so the UI can route
+    /// camera-video and screen-share resolution updates to the right place.
+    /// Use [`MEDIA_TYPE_CAMERA`] for the peer's camera decoder and
+    /// [`MEDIA_TYPE_SCREEN`] for the peer's screen-share decoder.
+    pub fn new(
+        canvas: Option<HtmlCanvasElement>,
+        media_type: &'static str,
+    ) -> Result<Self, JsValue> {
         let canvas_renderer = Rc::new(RefCell::new(None));
 
         // Initialize canvas if provided
@@ -138,7 +204,7 @@ impl VideoPeerDecoder {
 
         let canvas_ref = canvas_renderer.clone();
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
-            Self::render_to_canvas_cached(&canvas_ref, video_frame);
+            Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
@@ -152,6 +218,9 @@ impl VideoPeerDecoder {
         Ok(Self {
             decoder,
             canvas_renderer,
+            media_type,
+            last_source_dims: RefCell::new((0, 0)),
+            stream_context: RefCell::new(None),
         })
     }
 
@@ -164,11 +233,11 @@ impl VideoPeerDecoder {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let mut guard = self.canvas_renderer.borrow_mut();
-        // Preserve existing peer context when the canvas is swapped.
-        let (from_peer, to_peer) = guard
+        let prior_ctx = guard
             .as_ref()
-            .map(|r| (r.from_peer.clone(), r.to_peer.clone()))
-            .unwrap_or_default();
+            .map(|r| (r.from_peer.clone(), r.to_peer.clone()));
+        let (from_peer, to_peer) =
+            resolve_renderer_context(prior_ctx, self.stream_context.borrow().as_ref());
         *guard = Some(CanvasRenderer {
             canvas,
             context,
@@ -184,6 +253,11 @@ impl VideoPeerDecoder {
     /// Also stores the peer context in the canvas renderer so resolution changes can
     /// be broadcast with the correct peer_id.
     pub fn set_stream_context(&self, from_peer: String, to_peer: String) {
+        // Mirror the peer-id pair on `self` so `decode()` can tag the
+        // source-resolution diag event regardless of whether the canvas
+        // renderer is set yet.
+        *self.stream_context.borrow_mut() = Some((from_peer.clone(), to_peer.clone()));
+
         // Store peer context in the canvas renderer for resolution broadcasts.
         if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
             renderer.from_peer = Some(from_peer.clone());
@@ -200,6 +274,7 @@ impl VideoPeerDecoder {
                         metric!("resolution_height", renderer.last_height as u64),
                         metric!("from_peer", from_peer.clone()),
                         metric!("to_peer", to_peer.clone()),
+                        metric!("media_type", self.media_type.to_string()),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
@@ -212,6 +287,7 @@ impl VideoPeerDecoder {
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
+        media_type: &'static str,
     ) {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
@@ -238,6 +314,7 @@ impl VideoPeerDecoder {
                             metric!("resolution_height", height as u64),
                             metric!("from_peer", renderer.from_peer.clone().unwrap_or_default()),
                             metric!("to_peer", to_peer.clone()),
+                            metric!("media_type", media_type.to_string()),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);
@@ -290,6 +367,9 @@ impl VideoPeerDecoder {
         Self {
             decoder: Box::new(NoopDecoder),
             canvas_renderer: Rc::new(RefCell::new(None)),
+            media_type: MEDIA_TYPE_CAMERA,
+            last_source_dims: RefCell::new((0, 0)),
+            stream_context: RefCell::new(None),
         }
     }
 }
@@ -297,6 +377,38 @@ impl VideoPeerDecoder {
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
+            // Surface publisher-side source dimensions (from
+            // `MediaStreamTrack.getSettings()` on the encoder side) so the
+            // UI can show Source vs Received and detect in-transit
+            // downscaling. Dedupe by tracking the last-seen pair — without
+            // this we'd flood the diag bus with one event per decoded frame.
+            // Proto3 default-zero acts as "unknown": older publishers that
+            // don't stamp the fields are skipped here.
+            let src_w = video_metadata.source_width;
+            let src_h = video_metadata.source_height;
+            if src_w != 0 && src_h != 0 {
+                let mut last = self.last_source_dims.borrow_mut();
+                if *last != (src_w, src_h) {
+                    *last = (src_w, src_h);
+                    drop(last);
+                    if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                        let evt = DiagEvent {
+                            subsystem: "video_source_resolution",
+                            stream_id: None,
+                            ts_ms: now_ms(),
+                            metrics: vec![
+                                metric!("source_width", src_w as u64),
+                                metric!("source_height", src_h as u64),
+                                metric!("from_peer", from_peer),
+                                metric!("to_peer", to_peer),
+                                metric!("media_type", self.media_type.to_string()),
+                            ],
+                        };
+                        let _ = global_sender().try_broadcast(evt);
+                    }
+                }
+            }
+
             // Convert protobuf VideoCodec to internal FrameCodec
             let frame_codec = match video_metadata.codec.enum_value() {
                 Ok(VideoCodec::VP8) => FrameCodec::Vp8,
@@ -458,5 +570,73 @@ impl PeerDecode for StandardAudioPeerDecoder {
             _rendered: true,
             first_frame,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Camera path: canvas was attached first, so the renderer already carries
+    /// a valid `(from_peer, to_peer)`. Even if `stream_context` is populated,
+    /// we must keep the prior pair — overwriting it would erase a peer-id swap
+    /// that landed via `set_stream_context` after the renderer was constructed.
+    #[test]
+    fn resolve_renderer_context_keeps_prior_pair_when_present() {
+        let prior = Some((Some("alice".to_string()), Some("session-1".to_string())));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Screen-share path: the first packet arrives before the dioxus
+    /// `ScreenCanvas` tile mounts, so `set_stream_context` populates the
+    /// decoder-level `stream_context` while the renderer is still absent. When
+    /// the tile finally calls `set_canvas`, we have to seed the new renderer
+    /// from `stream_context` — otherwise `render_to_canvas_cached`'s
+    /// `video_resolution` broadcast stays gated on `to_peer.is_some()` and
+    /// never fires. This is the #883 regression.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_renderer_absent() {
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(None, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Renderer existed but was created before `set_stream_context` ran (canvas
+    /// passed at construction time, peer-id pair plumbed in later). Both
+    /// fields are `None`, so we must fall back to `stream_context`.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_prior_pair_empty() {
+        let prior = Some((None, None));
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Neither source has data — return `(None, None)` so the renderer
+    /// remains in an un-tagged state until `set_stream_context` runs.
+    #[test]
+    fn resolve_renderer_context_returns_none_when_both_empty() {
+        let (fp, tp) = resolve_renderer_context(None, None);
+        assert!(fp.is_none());
+        assert!(tp.is_none());
+    }
+
+    /// Partial prior context (only `from_peer` or only `to_peer` known) is
+    /// still preserved — never overwritten by `stream_context`. This avoids
+    /// accidentally clobbering a half-set state during a canvas swap, which
+    /// can happen if `set_canvas` is called twice in a row by Dioxus
+    /// `use_effect` re-runs.
+    #[test]
+    fn resolve_renderer_context_preserves_partial_prior() {
+        let prior = Some((Some("alice".to_string()), None));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert!(tp.is_none());
     }
 }

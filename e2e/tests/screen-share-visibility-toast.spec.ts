@@ -185,6 +185,9 @@ test.describe("Screen-share visibility toast", () => {
         timeout: 10_000,
       });
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for host to see guest's tile (signals the peer connection
       // is established in both directions, so the screen-share decode
       // path on the guest is ready to fire its ack back).

@@ -200,6 +200,10 @@ test.describe("Peer screen-share diagnostics", () => {
       const hostPage = members[0].page;
       const guestPage = members[1].page;
 
+      // Allow peer discovery to propagate through signaling before
+      // asserting on remote tiles.
+      await hostPage.waitForTimeout(5000);
+
       // Wait for mesh to settle so the host has the guest tile + diagnostics flow.
       await hostPage.waitForTimeout(8000);
 

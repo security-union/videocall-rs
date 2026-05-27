@@ -138,6 +138,9 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
         "admitted",
       );
 
+      // Allow the DB writes to settle before querying the feed
+      await new Promise((r) => setTimeout(r, 2000));
+
       // ── User A: should see the row with owner-only affordances ────────
       const ctxA = await createAuthenticatedContext(browserA, userAEmail, userAName, uiURL);
       const pageA = await ctxA.newPage();

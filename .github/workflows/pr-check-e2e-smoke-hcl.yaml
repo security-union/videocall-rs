@@ -1,0 +1,126 @@
+# Per-PR E2E smoke check — runs the bvt1 Playwright project (10 tests,
+# ~40s test time) on every PR that touches code compiled into the E2E
+# Docker stack. Catches regressions before merge to PR-staging.
+#
+# This is NOT the full 226-test suite — that runs on push to PR-staging
+# and hcl-main via e2e-hcl.yaml. This workflow provides fast per-PR
+# signal: "is the app alive and can two users join a meeting?"
+#
+# The bvt1 project is defined in e2e/playwright.config.ts and covers:
+#   - Home page loads
+#   - Auth + display name handling
+#   - Single user can join a meeting
+#   - Two users can join and see each other
+#
+# See issue #745 for the gap this closes.
+name: E2E Smoke (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'dioxus-ui/**'
+      - 'actix-api/**'
+      - 'meeting-api/**'
+      - 'videocall-client/**'
+      - 'videocall-transport/**'
+      - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
+      - 'videocall-meeting-client/**'
+      - 'videocall-diagnostics/**'
+      - 'videocall-aq/**'
+      - 'videocall-codecs/**'
+      - 'neteq/**'
+      - 'protobuf/**'
+      - 'e2e/**'
+      - 'scripts/**'
+      - 'dbmate/**'
+      - 'docker/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pr-check-e2e-smoke-hcl.yaml'
+
+concurrency:
+  group: pr-check-e2e-smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  smoke:
+    name: Playwright bvt1
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 30
+    concurrency:
+      group: hcl-ci-heavy-workload
+      cancel-in-progress: false
+
+    steps:
+      - name: Clean workspace (root-owned files from Docker)
+        run: |
+          sudo find . -mindepth 1 -delete 2>/dev/null || true
+
+      - uses: actions/checkout@v4.2.0
+        with:
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies and Playwright browser
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install chromium
+
+      - name: Generate short-lived WebTransport dev cert
+        run: bash scripts/regen-dev-cert.sh --force
+
+      - name: Build E2E stack images
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
+
+      - name: Start E2E stack
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          wait_for_service() {
+            local name="$1" url="$2" timeout="$3"
+            echo "Waiting for ${name}..."
+            for i in $(seq 1 "${timeout}"); do
+              if curl -sf "${url}" > /dev/null 2>&1 || \
+                 curl -so /dev/null -w '%{http_code}' "${url}" 2>/dev/null | grep -qE '2[0-9][0-9]|4[0-9][0-9]'; then
+                echo "${name} ready after ${i}s"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "ERROR: ${name} failed to become ready within ${timeout}s"
+            return 1
+          }
+
+          wait_for_service "dioxus-ui" "http://localhost:3001" 120
+          wait_for_service "meeting-api" "http://localhost:8081/session" 60
+          wait_for_service "websocket-api" "http://localhost:8080" 60
+
+      - name: Run bvt1 smoke tests
+        working-directory: e2e
+        run: npx playwright test --project=bvt1 --reporter=list
+
+      - name: Dump docker logs on failure
+        if: failure()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs --tail=200
+
+      - name: Teardown
+        if: always()
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down

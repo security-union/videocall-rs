@@ -10,10 +10,19 @@ on:
       - 'videocall-client/**'
       - 'videocall-transport/**'
       - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
+      - 'videocall-meeting-client/**'
+      - 'videocall-diagnostics/**'
+      - 'videocall-aq/**'
+      - 'videocall-codecs/**'
+      - 'neteq/**'
       - 'protobuf/**'
       - 'e2e/**'
-      - 'docker/docker-compose.e2e.yaml'
-      - 'docker/Dockerfile.*'
+      - 'scripts/**'
+      - 'dbmate/**'
+      - 'docker/**'
+      - 'flake.nix'
+      - 'flake.lock'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/pr-check-e2e-smoke-hcl.yaml'
@@ -35,7 +44,7 @@ jobs:
   smoke:
     name: Playwright bvt1
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    timeout-minutes: 20
+    timeout-minutes: 30
     concurrency:
       group: hcl-ci-heavy-workload
       cancel-in-progress: false

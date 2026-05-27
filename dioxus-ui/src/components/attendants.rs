@@ -804,6 +804,9 @@ pub fn AttendantsComponent(
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let transport_pref = (transport_pref_ctx.0)();
 
+    // Create the appearance settings signal on_peer_joined / on_peer_left callbacks
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
+
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
     // callback can access the client for reconnection. The cell is populated
@@ -1193,41 +1196,52 @@ pub fn AttendantsComponent(
                     move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
-                        let mut toast_counter = toast_counter;
-                        let mut peer_toasts = peer_toasts;
-                        let mut toast_version = toast_version;
-                        let id = *toast_counter.peek();
-                        toast_counter.set(id + 1);
-                        let mut current = peer_toasts.peek().clone();
-                        current.push((id, display_name, user_id, false));
-                        peer_toasts.set(current);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
-                        }
-                        // Defer the leave sound: only play if the toast still exists
-                        // after 500ms (i.e. no join event cancelled it).
-                        Timeout::new(500, move || {
-                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                                play_user_left();
-                            }
-                        })
-                        .forget();
-                        // Schedule toast removal after 8 seconds.
-                        Timeout::new(8_000, move || {
-                            let updated: Vec<_> = peer_toasts
-                                .peek()
-                                .iter()
-                                .filter(|(tid, _, _, _)| *tid != id)
-                                .cloned()
-                                .collect();
-                            peer_toasts.set(updated);
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
+
+                        if show_toast {
+                            let mut toast_counter = toast_counter;
+                            let mut peer_toasts = peer_toasts;
+                            let mut toast_version = toast_version;
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            let mut current = peer_toasts.peek().clone();
+                            current.push((id, display_name, user_id, false));
+                            peer_toasts.set(current);
                             {
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                        })
-                        .forget();
+                            // Defer the leave sound: only play if the toast still exists
+                            // after 500ms (i.e. no join event cancelled it).
+                            Timeout::new(500, move || {
+                                if play_sound
+                                    && peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id)
+                                {
+                                    play_user_left();
+                                }
+                            })
+                            .forget();
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else if play_sound {
+                            play_user_left();
+                        }
                     },
                 ))
             },
@@ -1241,6 +1255,11 @@ pub fn AttendantsComponent(
                             user_id,
                             session_id
                         );
+
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -1289,8 +1308,10 @@ pub fn AttendantsComponent(
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
-                        if !suppress_toast {
-                            play_user_joined();
+                        if !suppress_toast && show_toast {
+                            if play_sound {
+                                play_user_joined();
+                            }
                             let id = *toast_counter.peek();
                             toast_counter.set(id + 1);
                             current.push((id, display_name, user_id, true));
@@ -1314,6 +1335,9 @@ pub fn AttendantsComponent(
                             })
                             .forget();
                         } else {
+                            if !suppress_toast && play_sound {
+                                play_user_joined();
+                            }
                             peer_toasts.set(current);
                         }
 
@@ -1627,7 +1651,6 @@ pub fn AttendantsComponent(
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
-    let appearance_settings = use_signal(load_appearance_settings_from_storage);
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));

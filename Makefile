@@ -114,23 +114,30 @@ e2e-up: e2e-cert
 e2e-down:
 	$(COMPOSE_E2E) down -v
 
-# Run e2e tests headless (assumes stack is already up).
+# Run e2e tests headless. Assumes the stack is already up — bring it up
+# with `make e2e-up`, which is also the only target that rotates the cert.
+# These run-only targets deliberately do NOT depend on `e2e-cert` because
+# regenerating the cert here would leave the running webtransport-api
+# container holding the OLD cert (it reads CERT_PATH/KEY_PATH only at
+# process startup) while Playwright injects the NEW hash — recreating the
+# QUIC handshake mismatch this PR is trying to eliminate. If you need a
+# fresh cert, run `make e2e-up` (or `make e2e-cert ARGS=--force` followed
+# by `docker restart videocall-e2e-webtransport-api-1`).
 #   make e2e                        — all tests
 #   make e2e SPEC=two-users-meeting — single spec (without .spec.ts)
-# Re-runs the cert script first: Playwright reads the cert-hash file at
-# module load and a stale cert + matching hash still fails Chromium QUIC
-# verification with the same error this fix eliminated. Idempotent guard.
-e2e: e2e-cert
+e2e:
 	cd e2e && npx playwright test $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
-# Run e2e tests with visible browsers (assumes stack is already up)
+# Run e2e tests with visible browsers (assumes stack is already up; same
+# cert-rotation rule as `make e2e`)
 #   make e2e-headed                        — all tests
 #   make e2e-headed SPEC=two-users-meeting — single spec
-e2e-headed: e2e-cert
+e2e-headed:
 	cd e2e && npx playwright test --headed $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
-# Run e2e tests in debug mode (step through in Playwright Inspector)
-e2e-debug: e2e-cert
+# Run e2e tests in debug mode (step through in Playwright Inspector;
+# same cert-rotation rule as `make e2e`)
+e2e-debug:
 	cd e2e && npx playwright test --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
 # Full CI pipeline: regen cert, build stack, start it, run tests, tear down

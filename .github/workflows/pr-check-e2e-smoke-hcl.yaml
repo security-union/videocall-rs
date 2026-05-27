@@ -87,13 +87,15 @@ jobs:
         run: bash scripts/regen-dev-cert.sh --force
 
       - name: Tear down any prior E2E stack state
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down --remove-orphans || true
+        run: |
+          docker compose -p videocall-e2e-smoke -f docker/docker-compose.e2e.yaml down --remove-orphans || true
+          docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down --remove-orphans || true
 
       - name: Build E2E stack images
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
+        run: docker compose -p videocall-e2e-smoke -f docker/docker-compose.e2e.yaml build
 
       - name: Start E2E stack
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+        run: docker compose -p videocall-e2e-smoke -f docker/docker-compose.e2e.yaml up -d
         env:
           DIOXUS_SERVE_MODE: static
 
@@ -124,8 +126,8 @@ jobs:
 
       - name: Dump docker logs on failure
         if: failure()
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml logs --tail=200
+        run: docker compose -p videocall-e2e-smoke -f docker/docker-compose.e2e.yaml logs --tail=200
 
       - name: Teardown
         if: always()
-        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down
+        run: docker compose -p videocall-e2e-smoke -f docker/docker-compose.e2e.yaml down

@@ -6,6 +6,7 @@ purposes and are intentionally designed with different tradeoffs.
 ## 1. Playwright E2E tests
 
 Location:
+
 - `e2e/tests/`
 - `e2e/helpers/`
 - `e2e/playwright.config.ts`
@@ -14,6 +15,7 @@ Location:
 These are the true end-to-end browser tests.
 
 They run:
+
 - a real Chromium browser through Playwright
 - the real `dioxus-ui`
 - the real `meeting-api`
@@ -87,13 +89,40 @@ Two layers of validation prevent silent breakage:
 
 ### Common QUIC errors and fixes
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `QUIC_TLS_CERTIFICATE_UNKNOWN` in browser console; WT spec times out at the canvas-container assertion | Stale, RSA, or >14d-validity cert | `make e2e-cert ARGS=--force` then `docker restart videocall-e2e-webtransport-api-1` |
-| WT server fails to start with `WT_DEV_CERT_PREFLIGHT detected a problem...` | Cert violates one of the four rules above | Same as above; the error message names the specific violation |
-| Specs pass locally but fail with the cert error in CI | Ephemeral CI runner has no cert (file is gitignored) | Confirm the workflow runs `scripts/regen-dev-cert.sh --force` before `docker compose up` |
-| `make e2e-up` fails with "openssl not found" | Tool missing | `apt-get install -y openssl` (Debian/WSL) or `brew install openssl` (macOS) |
-| Browser console shows `Failed to fetch http://localhost:8082/...` mid-test | dioxus-ui container's runtime-generated `scripts/config.js` was reverted by `git checkout` while the container was up | `docker restart videocall-e2e-dioxus-ui-1` to re-run the config-injection entrypoint |
+| Symptom                                                                                                | Likely cause                                                                                                                    | Fix                                                                                                                                                                                                  |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `QUIC_TLS_CERTIFICATE_UNKNOWN` in browser console; WT spec times out at the canvas-container assertion | Stale, RSA, or >14d-validity cert                                                                                               | `make e2e-cert ARGS=--force` then `docker restart videocall-e2e-webtransport-api-1`                                                                                                                  |
+| WT server fails to start with `WT_DEV_CERT_PREFLIGHT detected a problem...`                            | Cert violates one of the four rules above                                                                                       | Same as above; the error message names the specific violation                                                                                                                                        |
+| Specs pass locally but fail with the cert error in CI                                                  | Ephemeral CI runner has no cert (file is gitignored)                                                                            | Confirm the workflow runs `scripts/regen-dev-cert.sh --force` before `docker compose up`                                                                                                             |
+| `make e2e-up` fails with "openssl not found"                                                           | Tool missing                                                                                                                    | `apt-get install -y openssl` (Debian/WSL) or `brew install openssl` (macOS)                                                                                                                          |
+| Browser console shows `Failed to fetch http://localhost:8082/...` mid-test                             | Stale `dioxus-ui/scripts/config.js` from a pre-PR-#909 checkout — that revision had a phantom `meetingApiBaseUrl: 8082` default | Update the branch (or apply the fix manually). The current committed `config.js` has no `meetingApiBaseUrl` so the wasm falls back to `apiBaseUrl` (`8081`) — see `dioxus-ui/src/constants.rs:14-16` |
+
+### Gotcha: the dioxus-ui container mutates `scripts/config.js`
+
+The `dioxus-ui` service in `docker/docker-compose.e2e.yaml` bind-mounts the
+host repo at `/app`. At container start, `docker/start-dioxus.sh` regenerates
+`/app/dioxus-ui/scripts/config.js` from environment variables — which means
+**the container is writing to a tracked source file in your working tree**.
+
+You'll see this as `dioxus-ui/scripts/config.js` showing as modified in
+`git status` whenever the e2e stack is up. That is normal. But it means:
+
+- Don't `git add` that file casually; you'll commit env-var noise.
+- A `git checkout dioxus-ui/scripts/config.js` while the stack is running
+  will silently revert to the committed default. Trunk hot-reload picks up
+  the change and serves it to the browser without restarting the wasm. If
+  the committed default is broken or stale, the browser starts hitting wrong
+  URLs mid-test.
+- A clean wasm rebuild (e.g. after a Rust change) is the only way to make
+  trunk re-run its dist-copy step. Touching the file alone is not enough.
+
+The committed `dioxus-ui/scripts/config.js` is intentionally a "minimal
+correct fallback" — every key it carries must work against a vanilla
+`make e2e-up` stack, because that's the file the wasm sees if anything
+reverts the container's runtime-generated version. If you add a new field
+to the wasm `RuntimeConfig`, give it a value that is correct for the local
+e2e stack OR wrap the deserializer in `Option<T>` + `#[serde(default)]` so
+absence is tolerated.
 
 ### Common coding patterns
 
@@ -123,6 +152,7 @@ Two layers of validation prevent silent breakage:
 ### When to add a Playwright test
 
 Use Playwright when the behavior depends on:
+
 - real routing
 - multiple users
 - WebSocket or WebTransport behavior
@@ -132,6 +162,7 @@ Use Playwright when the behavior depends on:
 ## 2. Dioxus browser integration tests
 
 Location:
+
 - `dioxus-ui/tests/`
 - `dioxus-ui/tests/support/mod.rs`
 - `.github/workflows/pr-check-dioxus-ui-hcl.yaml`
@@ -178,6 +209,7 @@ This is the main source of flake in the Dioxus browser test layer.
 ### Running Dioxus browser tests locally
 
 Prerequisites:
+
 - Rust toolchain with the `wasm32-unknown-unknown` target installed
 - Chrome or Chromium
 - `chromedriver` on your `PATH`
@@ -243,6 +275,7 @@ cross-test browser state issues locally.
 ### When to add a Dioxus browser integration test
 
 Use this layer when the behavior depends on:
+
 - a browser DOM
 - a specific Dioxus page or component
 - local browser APIs
@@ -254,12 +287,14 @@ belong in Playwright.
 ## 3. Backend integration tests
 
 Location:
+
 - `meeting-api/tests/`
 - `actix-api/tests/`
 
 These are Rust integration tests for API, persistence, and protocol behavior.
 
 They validate:
+
 - meeting lifecycle rules
 - waiting room semantics
 - auth and JWT behavior
@@ -272,13 +307,16 @@ does not require a browser.
 ## Choosing the right layer
 
 Use backend integration tests when:
+
 - the behavior is mostly API or database semantics
 
 Use Dioxus browser integration tests when:
+
 - the behavior is frontend-only or page-local
 - you want fast feedback in PR CI
 
 Use Playwright E2E when:
+
 - the behavior crosses UI, backend, and realtime boundaries
 - the scenario involves multiple participants or true browser flows
 

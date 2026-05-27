@@ -406,14 +406,17 @@ async fn do_delete_meeting(meeting_id: &str) -> Result<(), String> {
 /// When `meeting.is_owner` is true an "Owner" line is injected at the very
 /// top of the metadata table (gold-tinted to match the inline star icon).
 /// Non-owner rows skip that line entirely and instead render two Host rows
-/// (display name + truncated user_id) at the top so the user knows who
-/// created the meeting and how to contact them. See HCL issue 579.
+/// (display name + full user_id) at the top so the user knows who
+/// created the meeting and how to contact them. See HCL issue 579. The
+/// Host ID value is rendered in full — long IDs wrap inside the tooltip
+/// (see `.meeting-info-tooltip-row__value--breakable` in `global.css`)
+/// rather than being truncated with an ellipsis.
 ///
 /// SECURITY INVARIANT: The HTML body produced here MUST NOT contain any
 /// caller-controlled or server-supplied string content unless it is passed
-/// through `escape_html_text` / `escape_html_attr` first. The host identity
-/// strings (`host_display_name`, `host_user_id`) come from server-supplied
-/// fields populated from the OAuth provider's id_token, so they are escaped
+/// through `escape_html_text` first. The host identity strings
+/// (`host_display_name`, `host_user_id`) come from server-supplied fields
+/// populated from the OAuth provider's id_token, so they are escaped
 /// before being interpolated into the tooltip's `set_inner_html` payload.
 pub(crate) fn build_meeting_tooltip_html(
     meeting: &MeetingFeedSummary,
@@ -501,9 +504,11 @@ fn host_tooltip_row(host_display_name: Option<&str>) -> String {
     )
 }
 
-/// "Host ID: <user_id>" row for non-owner meetings. The visible value is
-/// truncated to keep the tooltip compact; the full value is exposed via
-/// the row's `title` attribute so users can hover to see the complete id.
+/// "Host ID: <user_id>" row for non-owner meetings. The full user_id is
+/// rendered inline (no truncation) so the value is copyable from the
+/// tooltip's text content. CSS in `global.css` allows long IDs to wrap
+/// inside a bounded tooltip width — see
+/// `.meeting-info-tooltip-row__value--breakable`.
 fn host_id_tooltip_row(host_user_id: Option<&str>) -> String {
     let raw = host_user_id.unwrap_or("");
     if raw.is_empty() {
@@ -513,28 +518,13 @@ fn host_id_tooltip_row(host_user_id: Option<&str>) -> String {
                 </div>"
             .to_string();
     }
-    let display = truncate_for_display(raw, 12);
-    let display_escaped = escape_html_text(&display);
-    let title_escaped = escape_html_attr(raw);
+    let value_escaped = escape_html_text(raw);
     format!(
-        "<div class=\"meeting-info-tooltip-row\" title=\"{title_escaped}\">\
+        "<div class=\"meeting-info-tooltip-row\">\
          <span class=\"meeting-info-tooltip-label\">Host ID</span>\
-         <span class=\"meeting-info-tooltip-value\">{display_escaped}</span>\
+         <span class=\"meeting-info-tooltip-value meeting-info-tooltip-value--breakable\">{value_escaped}</span>\
          </div>"
     )
-}
-
-/// Truncate `s` to `max_chars` Unicode scalar values, appending a single-char
-/// horizontal ellipsis when truncation occurred. Returns `s` unchanged when
-/// it already fits.
-fn truncate_for_display(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push('\u{2026}');
-    out
 }
 
 /// Escape a string for safe interpolation into HTML text content. Covers
@@ -553,13 +543,6 @@ fn escape_html_text(s: &str) -> String {
         }
     }
     out
-}
-
-/// Escape a string for safe interpolation into a double-quoted HTML
-/// attribute value. The same character set as `escape_html_text` is
-/// sufficient because we only use double-quoted attribute syntax.
-fn escape_html_attr(s: &str) -> String {
-    escape_html_text(s)
 }
 
 /// Get-or-create the body-level tooltip element. Mirrors the pattern in `signal_quality.rs`.
@@ -741,17 +724,29 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn tooltip_truncates_long_host_id() {
+    fn tooltip_renders_full_host_user_id_without_truncation() {
+        // Regression guard for the UX tweak that dropped the 12-char +
+        // ellipsis truncation from the Host ID row. The full value must
+        // appear inline (no `\u{2026}` ellipsis, no `title="…"` fallback)
+        // so it is selectable / copyable from the tooltip text.
         let mut meeting = sample_meeting(false);
-        meeting.host_user_id = Some("verylonghostuserid@example.com".to_string());
+        let full_id = "verylonghostuserid@example.com";
+        meeting.host_user_id = Some(full_id.to_string());
         let html = build_meeting_tooltip_html(&meeting, true, false, 60_000);
         assert!(
-            html.contains("verylonghost\u{2026}"),
-            "long host id must be truncated to 12 chars + ellipsis; html: {html}"
+            html.contains(full_id),
+            "full host_user_id must render inline in the tooltip; html: {html}"
         );
         assert!(
-            html.contains("title=\"verylonghostuserid@example.com\""),
-            "full host id must be available via the title attribute; html: {html}"
+            !html.contains('\u{2026}'),
+            "tooltip must not contain a horizontal-ellipsis truncation marker; html: {html}"
+        );
+        // The breakable-value class lets CSS wrap long IDs inside the
+        // bounded tooltip width — guard it so we don't lose layout if the
+        // CSS rule is renamed in the future.
+        assert!(
+            html.contains("meeting-info-tooltip-value--breakable"),
+            "Host ID row must carry the breakable-value class so long IDs wrap; html: {html}"
         );
     }
 
@@ -782,8 +777,12 @@ mod tests {
             "host_display_name must be HTML-escaped; html: {html}"
         );
         assert!(
-            html.contains("a&amp;b&quot;c") || html.contains("title=\"a&amp;b&quot;c\""),
-            "host_user_id must be HTML-escaped in both text and title attribute; html: {html}"
+            html.contains("a&amp;b&quot;c"),
+            "host_user_id must be HTML-escaped in the tooltip's text content; html: {html}"
+        );
+        assert!(
+            !html.contains("a&b\"c"),
+            "raw host_user_id characters must not appear unescaped in tooltip html; html: {html}"
         );
     }
 

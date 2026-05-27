@@ -1654,6 +1654,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use super::cause_hint_from_trigger;
     use super::is_fatal_encoder_error_message;
     use super::should_reacquire_screen_capture;
     use super::ScreenEncoder;
@@ -1724,6 +1725,23 @@ mod tests {
         assert!(!is_fatal_encoder_error_message(
             "EncodingError: transient frame drop"
         ));
+    }
+
+    /// Issue #903: the trigger -> cause_hint mapping is the publisher-side
+    /// wire format consumed by `build_screen_cause_line` in the dioxus UI.
+    /// If a `videocall-aq` trigger string is ever renamed without updating
+    /// this match arm, the function silently falls back to `""`, the Cause
+    /// line vanishes from the Signal Quality tooltip, and no other test
+    /// fails. This guards each known mapping and the unknown-trigger
+    /// fallback so a stale arm is caught at compile time.
+    #[test]
+    fn cause_hint_from_trigger_maps_each_known_trigger_and_falls_back_for_unknown() {
+        assert_eq!(cause_hint_from_trigger("bitrate"), "bitrate-limited");
+        assert_eq!(cause_hint_from_trigger("fps"), "cpu-pressure");
+        assert_eq!(cause_hint_from_trigger("congestion"), "network-rtt");
+        assert_eq!(cause_hint_from_trigger("coordination"), "manual-cap");
+        assert_eq!(cause_hint_from_trigger("nonsense_unknown_trigger"), "");
+        assert_eq!(cause_hint_from_trigger(""), "");
     }
 
     #[test]

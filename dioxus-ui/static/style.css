@@ -2803,10 +2803,23 @@ select {
   background: var(--resize-handle-bg-active);
 }
 
-/* Screen share split-layout — right-panel peer video tile */
+/* Screen share split-layout — right-panel peer video tile.
+   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
+   height set by the parent right-panel, derives its width from
+   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
+   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
+   full width. `place-self: center` centers the tile within its grid cell
+   when the 3:2 cap is binding (i.e. the cell is wider than 1.5x its height).
+   The dominant shared-content tile (`.split-screen-tile`) intentionally
+   does NOT get this cap — it stays as a large, dominant display. */
 .split-peer-tile {
-  width: 100%;
+  width: auto;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
+  min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;

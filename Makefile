@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-cert e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -82,36 +82,51 @@ rebuild-up:
 e2e-install:
 	cd e2e && npm ci && npx playwright install chromium
 
-# Build E2E stack images (same dev Dockerfiles as CI)
-e2e-build:
+# Regenerate the WebTransport dev cert + companion DER-SHA-256 hash file.
+# The cert is short-lived (ECDSA P-256, 13 days) so the
+# WebTransport `serverCertificateHashes` constructor option will accept it
+# (Chromium rejects entries for any cert with > 14 days of validity).
+# The script is idempotent: if the existing cert has > 1 day of life left
+# it does nothing. Pass `--force` to force regen.
+e2e-cert:
+	bash scripts/regen-dev-cert.sh
+
+# Build E2E stack images (same dev Dockerfiles as CI). Cert must exist
+# before the webtransport-api container mounts and reads it at startup.
+e2e-build: e2e-cert
 	$(COMPOSE_E2E) build
 
-# Start the E2E stack (postgres, nats, meeting-api, websocket-api, dioxus-ui)
-e2e-up:
+# Start the E2E stack (postgres, nats, meeting-api, websocket-api,
+# webtransport-api, dioxus-ui). Re-runs the cert script first so a stale /
+# expired cert is regenerated automatically before bringing up the stack.
+e2e-up: e2e-cert
 	$(COMPOSE_E2E) up -d
 
 # Tear down the E2E stack and remove volumes
 e2e-down:
 	$(COMPOSE_E2E) down -v
 
-# Run e2e tests headless (assumes stack is already up)
+# Run e2e tests headless (assumes stack is already up).
 #   make e2e                        — all tests
 #   make e2e SPEC=two-users-meeting — single spec (without .spec.ts)
-e2e:
+# Re-runs the cert script first: Playwright reads the cert-hash file at
+# module load and a stale cert + matching hash still fails Chromium QUIC
+# verification with the same error this fix eliminated. Idempotent guard.
+e2e: e2e-cert
 	cd e2e && npx playwright test $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
 # Run e2e tests with visible browsers (assumes stack is already up)
 #   make e2e-headed                        — all tests
 #   make e2e-headed SPEC=two-users-meeting — single spec
-e2e-headed:
+e2e-headed: e2e-cert
 	cd e2e && npx playwright test --headed $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
 # Run e2e tests in debug mode (step through in Playwright Inspector)
-e2e-debug:
+e2e-debug: e2e-cert
 	cd e2e && npx playwright test --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
 
-# Full CI pipeline: build stack, start it, run tests, tear down
-e2e-ci: e2e-build e2e-install
+# Full CI pipeline: regen cert, build stack, start it, run tests, tear down
+e2e-ci: e2e-cert e2e-build e2e-install
 	$(COMPOSE_E2E) up -d
 	cd e2e && npx playwright test; E2E_EXIT=$$?; cd .. && $(COMPOSE_E2E) down -v; exit $$E2E_EXIT
 

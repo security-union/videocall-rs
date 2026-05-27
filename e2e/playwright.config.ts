@@ -1,28 +1,40 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// SPKI sha256 (base64) of `actix-api/certs/localhost.pem` — the cert the
-// `webtransport-api` service serves on UDP 4433. Compute with:
-//   openssl x509 -in actix-api/certs/localhost.pem -pubkey -noout \
-//     | openssl pkey -pubin -outform DER \
-//     | openssl dgst -sha256 -binary \
-//     | base64
+// ---------------------------------------------------------------------------
+// WebTransport dev cert hash
+// ---------------------------------------------------------------------------
 //
-// `--ignore-certificate-errors` alone does NOT bypass cert validation for
-// HTTP/3 / QUIC connections in modern Chromium — the WebTransport handshake
-// to `https://127.0.0.1:4433` (forced by `--origin-to-force-quic-on`) rejects
-// the self-signed dev cert unless its SPKI hash is explicitly pinned via
-// this flag. We keep `--ignore-certificate-errors` for non-QUIC TLS traffic
-// the suite may incidentally touch.
+// Chromium 145 IGNORES `--ignore-certificate-errors-spki-list` for
+// QUIC/HTTP-3 connections (verified empirically — the freeze regression
+// spec failed every CI run from 2026-05-13 onward with
+// `net::ERR_QUIC_PROTOCOL_ERROR.QUIC_TLS_CERTIFICATE_UNKNOWN` until this
+// flag was replaced). The supported path for self-signed dev certs over
+// WebTransport is the constructor option:
 //
-// If the cert is regenerated, recompute this value with the command above
-// and update the constant in the same change — CI will start timing out the
-// WebTransport-only specs otherwise (see
-// `e2e/tests/wt-persistent-streams-freeze-regression.spec.ts`).
-const WT_CERT_SPKI_SHA256 = "Oahy1QQGBftLedXEonkr6apvCmD3JnqVaCItsq8w/Zk=";
+//   new WebTransport(url, {
+//     serverCertificateHashes: [{ algorithm: "sha-256", value: <bytes> }],
+//   })
+//
+// Constraints from the W3C WebTransport spec + Chromium impl:
+//   - Cert MUST be ECDSA (P-256 recommended).
+//   - Cert validity period MUST be <= 14 days.
+//   - Hash is SHA-256 of the **DER-encoded cert** (NOT the SPKI).
+//
+// The cert + hash are produced together by `scripts/regen-dev-cert.sh` and
+// the hash is checked into `actix-api/certs/localhost.cert-sha256.txt`. Each
+// authenticated context injects the hash into `window.__VC_WT_CERT_HASHES__`
+// before the wasm boots — see `e2e/helpers/auth-context.ts::CERT_HASH_INIT_SCRIPT`
+// and the wasm side at
+// `videocall-transport/src/webtransport.rs::read_wt_cert_hash_options`.
+//
+// To regenerate manually: `make e2e-cert` (or `scripts/regen-dev-cert.sh`).
+//
+// `--ignore-certificate-errors` is kept because it still bypasses TCP/TLS
+// validation for incidental HTTPS traffic (e.g. health probes); the new
+// hash-injection plumbing is only used for the QUIC handshake.
 
 const CHROME_ARGS = [
   "--ignore-certificate-errors",
-  `--ignore-certificate-errors-spki-list=${WT_CERT_SPKI_SHA256}`,
   "--origin-to-force-quic-on=127.0.0.1:4433",
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",

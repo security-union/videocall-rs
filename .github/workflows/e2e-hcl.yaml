@@ -164,6 +164,15 @@ jobs:
           npm ci
           npx playwright install chromium
 
+      # Regenerate the WT dev cert + DER-SHA-256 hash file.
+      # Required for any WT-only spec: Chromium 145 ignores
+      # `--ignore-certificate-errors-spki-list` for QUIC, so the wasm client
+      # passes the hash via `serverCertificateHashes` (constraints: ECDSA
+      # P-256, validity <= 14 days, hash of DER cert). Cannot be checked
+      # into git because of the 14-day cap.
+      - name: Generate short-lived WebTransport dev cert
+        run: bash scripts/regen-dev-cert.sh --force
+
       - name: Build E2E stack images
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
 

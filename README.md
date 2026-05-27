@@ -566,11 +566,14 @@ make e2e SPEC=two-users-meeting           # run a single spec
 make e2e-down                             # tear down
 ```
 
-A short-lived ECDSA P-256 dev cert is regenerated automatically by `make e2e-cert`
-(invoked as a dependency of every E2E target) so the WebTransport
-`serverCertificateHashes` flow works against modern Chromium. See
-**[docs/TESTING.md](docs/TESTING.md)** for the full setup, troubleshooting table,
-and the rationale behind the cert lifecycle.
+A 13-day ECDSA P-256 dev cert is regenerated automatically by `make e2e-cert`
+(invoked as a dependency of every E2E target). The short lifetime is required
+by Chromium's WebTransport `serverCertificateHashes` API — the only practical
+way to use a self-signed cert against modern Chromium for QUIC since
+`--ignore-certificate-errors-spki-list` stopped applying to HTTP/3.
+
+See **[docs/TESTING.md](docs/TESTING.md)** for the full setup, troubleshooting
+table, and the rationale behind the cert lifecycle.
 
 ## Roadmap
 

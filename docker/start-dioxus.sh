@@ -66,10 +66,13 @@ if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
     fi
 
     # Serve statically. No file watcher, no recompilation, ~3MB RSS.
+    # --spa enables SPA fallback: unknown routes serve index.html so the
+    # Dioxus client-side router handles /meeting/:id etc.
     exec miniserve \
         --port "${TRUNK_SERVE_PORT:-3001}" \
         --interfaces 0.0.0.0 \
         --index index.html \
+        --spa \
         /app/dioxus-ui/dist
 else
     # Development mode: hot-reload with trunk serve.

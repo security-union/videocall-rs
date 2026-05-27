@@ -80,6 +80,14 @@ pub fn transform_video_chunk(
 /// (e.g. a 2560×1440 desktop encoded down to 1280×720 under a tier
 /// constraint). Pass `0` for either dimension when the value is unknown —
 /// proto3 default-zero semantics make the consumer treat it as missing.
+///
+/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint` carry the
+/// publisher's encoder state so the consumer can render a `Cause:` line
+/// below the Screen row explaining *why* the encoder downscaled (issue
+/// #903). Pass `0` / empty strings when no constraint is engaged or the
+/// data isn't available — proto3 defaults make the consumer omit the line
+/// entirely in that case.
+#[allow(clippy::too_many_arguments)]
 pub fn transform_screen_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
@@ -88,6 +96,9 @@ pub fn transform_screen_chunk(
     aes: Rc<Aes128State>,
     source_width: u32,
     source_height: u32,
+    encoder_target_bitrate_kbps: u32,
+    adaptive_tier: String,
+    cause_hint: String,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
@@ -104,6 +115,9 @@ pub fn transform_screen_chunk(
             codec: get_video_codec().into(),
             source_width,
             source_height,
+            encoder_target_bitrate_kbps,
+            adaptive_tier,
+            cause_hint,
             ..Default::default()
         })
         .into(),

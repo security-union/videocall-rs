@@ -17,7 +17,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *      boundary so the system picker is never shown).
  *   3. Host opens the signal-quality popup for the guest tile.
  *   4. The chart's Screen legend entry appears (gated on `has_screen_data`).
- *   5. Hovering the chart pops the body tooltip with a "Screen: ... fps ...
+ *   5. Hovering the chart pops the body tooltip with a "Screen ... fps ...
  *      kbps" line — and when the decoder has reported a resolution, the
  *      tooltip line carries the "WxH" prefix.
  *   6. The "?" help text for the Screen legend mentions Resolution / FPS /
@@ -291,7 +291,10 @@ test.describe("Peer screen-share diagnostics", () => {
 
       const tooltip = hostPage.locator("#signal-chart-tooltip-global");
       await expect(tooltip).toBeVisible({ timeout: 10_000 });
-      await expect(tooltip).toContainText(/Screen:/);
+      // Post-#903 tightening: `Screen` (no colon), joined units (`fps`,
+      // `kbps`), middle-dot separators. Match the bare `Screen ` prefix
+      // followed by either a resolution number or a metric value.
+      await expect(tooltip).toContainText(/Screen /);
       await expect(tooltip).toContainText(/fps/i);
       await expect(tooltip).toContainText(/kbps/i);
 
@@ -326,11 +329,14 @@ test.describe("Peer screen-share diagnostics", () => {
       // Pull just the line that starts with "Screen:" and assert resolution
       // lives there.
       const tooltipHtml = await tooltip.innerHTML();
-      const screenLine = tooltipHtml.split(/<br\s*\/?>|\n/i).find((l) => /Screen:/.test(l));
+      const screenLine = tooltipHtml.split(/<br\s*\/?>|\n/i).find((l) => /Screen /.test(l));
       if (!screenLine) {
-        throw new Error(`Tooltip did not contain a 'Screen:' line:\n${tooltipHtml}`);
+        throw new Error(`Tooltip did not contain a 'Screen ' line:\n${tooltipHtml}`);
       }
       expect(screenLine).toMatch(/1280x720/);
+      // Post-tightening: no "Source"/"Received" labels in the expanded
+      // form; the collapsed form (used here, source == received) also
+      // skips them and never carries the arrow or badge.
       await expect(tooltip).not.toContainText("Source");
       await expect(tooltip).not.toContainText("→"); // arrow
       await expect(tooltip).not.toContainText("↓"); // downscale badge
@@ -340,6 +346,47 @@ test.describe("Peer screen-share diagnostics", () => {
       await expect(helpText).toContainText("Source");
       await expect(helpText).toContainText(/Received/i);
       await expect(helpText).toContainText("pixel");
+
+      // ----- Cause line (HCL issue #903) -----
+      //
+      // The publisher's screen encoder boots at `DEFAULT_SCREEN_TIER_INDEX`
+      // ("medium" — see videocall-aq/constants.rs). That is not the top tier,
+      // so `apply_initial_tier` seeds the publisher-side encoder state with
+      //
+      //   encoder_target_bitrate_kbps = SCREEN_QUALITY_TIERS[1].ideal_bitrate_kbps (= 1200)
+      //   adaptive_tier               = "medium"
+      //   cause_hint                  = "bitrate-limited"
+      //
+      // The screen encoder stamps these onto every `VideoMetadata` it
+      // emits. The receiver's `peer_decoder.rs` translates them into a
+      // `screen_encoder_state` diag event, `peer_tile.rs` records them on
+      // the `SignalSample`, and `signal_quality.rs::build_screen_cause_line`
+      // renders the compact `Cause: <hint> · <N>kbps · tier '<tier>'`
+      // line below the Screen row.
+      const tooltipHtml2 = await tooltip.innerHTML();
+      const causeLine = tooltipHtml2.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l));
+      if (!causeLine) {
+        throw new Error(`Tooltip did not contain a 'Cause:' line:\n${tooltipHtml2}`);
+      }
+      // Compact (post-tightening) format pieces:
+      //   * `1200kbps` — bitrate joined to its unit, no space.
+      //   * `tier 'medium'` — bare tier cue, kept so users can read
+      //     'medium' as a tier name and not a generic adjective.
+      //   * `bitrate-limited` — the cause_hint the publisher seeds when
+      //     AQ boots below the top tier.
+      expect(causeLine).toMatch(/1200kbps/);
+      expect(causeLine).toMatch(/tier 'medium'/);
+      expect(causeLine).toMatch(/bitrate-limited/);
+      // Wordy phrasing from the pre-tightening prototype must be gone.
+      expect(causeLine).not.toMatch(/encoder target/);
+      expect(causeLine).not.toMatch(/limited by/);
+
+      // The legend help text must describe the Cause line shape so the
+      // wording stays in sync with the renderer. The previous placeholder
+      // string ("not yet instrumented" / "#903" reference) is gone.
+      await expect(helpText).toContainText(/cause/i);
+      await expect(helpText).toContainText(/adaptive-quality|tier/i);
+      await expect(helpText).not.toContainText("not yet instrumented");
     } finally {
       for (const m of members) {
         if (m.page) {

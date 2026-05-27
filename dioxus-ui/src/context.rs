@@ -261,6 +261,8 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+    pub show_join_leave_notifications: bool,
+    pub play_join_leave_sounds: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -270,6 +272,8 @@ impl Default for AppearanceSettings {
             glow_color: GlowColor::MintGreen,
             glow_brightness: 1.0,
             inner_glow_strength: 1.0,
+            show_join_leave_notifications: true,
+            play_join_leave_sounds: true,
         }
     }
 }
@@ -282,6 +286,8 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY: &str = "vc_appearance_join_leave_notifications";
+const APPEARANCE_JOIN_LEAVE_SOUNDS_KEY: &str = "vc_appearance_join_leave_sounds";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -312,6 +318,17 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
+    if let Some(value) =
+        LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string())
+    {
+        settings.show_join_leave_notifications = value != "false";
+    }
+
+    if let Some(value) = LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string())
+    {
+        settings.play_join_leave_sounds = value != "false";
+    }
+
     settings
 }
 
@@ -332,6 +349,14 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     LocalStorage::set(
         APPEARANCE_INNER_STORAGE_KEY.to_string(),
         &settings.inner_glow_strength.clamp(0.0, 1.0),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string(),
+        &settings.show_join_leave_notifications.to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string(),
+        &settings.play_join_leave_sounds.to_string(),
     );
 }
 

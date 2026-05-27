@@ -92,6 +92,15 @@ pub struct VideoPeerDecoder {
     /// either we've never seen the field or the publisher is older /
     /// doesn't report it; in both cases we suppress the broadcast.
     last_source_dims: RefCell<(u32, u32)>,
+    /// Issue #903: last `(encoder_target_bitrate_kbps, adaptive_tier,
+    /// cause_hint)` we saw on a `VideoMetadata`. Used to dedupe
+    /// `screen_encoder_state` diag events the same way `last_source_dims`
+    /// dedupes resolution events. Empty / zero tuple means either the
+    /// publisher hasn't stamped the fields yet or the field has never
+    /// changed since the last broadcast. The tuple is owned strings (not
+    /// `&'static str`) because the values flow from a protobuf message
+    /// the consumer can't reason about lifetime-wise.
+    last_encoder_state: RefCell<(u32, String, String)>,
     /// Peer-id pair used to tag the source-resolution diag event. We can't
     /// borrow it from the `CanvasRenderer` because that storage may be
     /// `None` when the canvas hasn't been wired yet, but
@@ -220,6 +229,7 @@ impl VideoPeerDecoder {
             canvas_renderer,
             media_type,
             last_source_dims: RefCell::new((0, 0)),
+            last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
         })
     }
@@ -369,6 +379,7 @@ impl VideoPeerDecoder {
             canvas_renderer: Rc::new(RefCell::new(None)),
             media_type: MEDIA_TYPE_CAMERA,
             last_source_dims: RefCell::new((0, 0)),
+            last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
         }
     }
@@ -405,6 +416,55 @@ impl PeerDecode for VideoPeerDecoder {
                             ],
                         };
                         let _ = global_sender().try_broadcast(evt);
+                    }
+                }
+            }
+
+            // Issue #903: surface publisher-side encoder state so the UI
+            // can render a `Cause:` line below the Screen row explaining
+            // *why* the encoder downscaled. Only emitted for the screen
+            // decoder (`media_type=SCREEN`); the camera path ignores these
+            // fields today. We dedupe on the full `(bitrate, tier, hint)`
+            // tuple so the diag bus only fires on actual change.
+            //
+            // Suppression rules:
+            //   * `media_type != SCREEN` — only the screen decoder forwards.
+            //   * All three values zero / empty — older publishers that
+            //     don't stamp the fields; emitting would mislead the UI
+            //     into rendering a Cause line with no data.
+            if self.media_type == MEDIA_TYPE_SCREEN {
+                let target_bitrate = video_metadata.encoder_target_bitrate_kbps;
+                let adaptive_tier = video_metadata.adaptive_tier.as_str();
+                let cause_hint = video_metadata.cause_hint.as_str();
+                let any_present =
+                    target_bitrate != 0 || !adaptive_tier.is_empty() || !cause_hint.is_empty();
+                if any_present {
+                    let mut last = self.last_encoder_state.borrow_mut();
+                    let changed =
+                        last.0 != target_bitrate || last.1 != adaptive_tier || last.2 != cause_hint;
+                    if changed {
+                        *last = (
+                            target_bitrate,
+                            adaptive_tier.to_string(),
+                            cause_hint.to_string(),
+                        );
+                        drop(last);
+                        if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                            let evt = DiagEvent {
+                                subsystem: "screen_encoder_state",
+                                stream_id: None,
+                                ts_ms: now_ms(),
+                                metrics: vec![
+                                    metric!("encoder_target_bitrate_kbps", target_bitrate as f64),
+                                    metric!("adaptive_tier", adaptive_tier.to_string()),
+                                    metric!("cause_hint", cause_hint.to_string()),
+                                    metric!("from_peer", from_peer),
+                                    metric!("to_peer", to_peer),
+                                    metric!("media_type", self.media_type.to_string()),
+                                ],
+                            };
+                            let _ = global_sender().try_broadcast(evt);
+                        }
                     }
                 }
             }

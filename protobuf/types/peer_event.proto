@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+// Peer-to-peer application-level event delivered through the relay.
+//
+// Used for cases where a peer needs to confirm to another peer that
+// a specific application-level milestone has been reached (for example,
+// confirming that a remote peer's screen-share frames are now being
+// decoded and rendered locally).
+//
+// The relay routes a PEER_EVENT to the single session whose user_id
+// matches `target_peer_id`. The event_type string identifies which
+// milestone is being reported; new event_types can be added without
+// changing the wire format.
+message PeerEvent {
+  // Sender of the event (the peer that observed the milestone).
+  bytes source_peer_id = 1;
+  // Intended recipient of the event (the peer that should be notified).
+  bytes target_peer_id = 2;
+  // Identifier for the event_type. See PEER_EVENT_* constants on the
+  // videocall-types crate.
+  string event_type = 3;
+  // Optional stream-scoped identifier. For screen-share events this is
+  // the publisher's user_id, since there is one screen-share per user.
+  string stream_id = 4;
+  // Wall-clock timestamp (ms) when the source observed the milestone.
+  int64 timestamp_ms = 5;
+}

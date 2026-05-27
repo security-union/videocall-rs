@@ -162,6 +162,13 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       await rowA.locator(".meeting-item-content").first().hover();
       await expect(pageA.locator(TOOLTIP_VISIBLE)).toBeVisible({ timeout: 2_000 });
       await expect(pageA.locator(TOOLTIP)).toContainText("Owner");
+      // Issue 579: an owner row already conveys identity via the Owner pill
+      // and the user's own session — the explicit "Host" / "Host ID" rows
+      // must be suppressed so the tooltip doesn't repeat what the row
+      // already says.
+      const tooltipAText = (await pageA.locator(TOOLTIP).textContent()) ?? "";
+      expect(tooltipAText).not.toMatch(/^Host$|\bHost\b(?!\s*ID)/);
+      expect(tooltipAText).not.toMatch(/Host ID/);
       // Move the pointer off the row so the tooltip is hidden again before
       // we navigate away — keeps the page state predictable for cleanup.
       await pageA.mouse.move(0, 0);
@@ -198,6 +205,12 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       // ownership lines are absent, not the whole tooltip.
       expect(tooltipBText).toMatch(/Started on|Last active on/);
       expect(tooltipBText).toMatch(/Duration/);
+      // Issue 579: non-owner tooltip must surface the host's identity so
+      // the user knows who created the meeting. Both the display name and
+      // the host's user_id must be present.
+      expect(tooltipBText).toMatch(/Host/);
+      expect(tooltipBText).toMatch(/Host ID/);
+      expect(tooltipBText).toContain(userAName);
     } finally {
       // Best-effort cleanup so seeded state doesn't bleed into future
       // runs. Failures here are tolerated by the helper.

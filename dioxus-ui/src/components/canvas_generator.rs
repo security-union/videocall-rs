@@ -460,6 +460,11 @@ pub fn generate_for_peer(
         } else {
             "split-peer-tile"
         };
+        // Anchor id for the signal-quality popup's portal positioning.
+        // Same id we attach to the outer tile div below; the popup uses it
+        // to read the tile's bounding rect through ResizeObserver / window
+        // listeners and follow the tile across grid reflows.
+        let split_anchor_id = (*peer_video_div_id).clone();
         return rsx! {
             div {
                 class: "{split_peer_class}{vo_speaking}",
@@ -647,21 +652,29 @@ pub fn generate_for_peer(
                             PushPinIcon {}
                         }
                     }
-                    if show_signal_popup() {
-                        {
-                            let h = signal_history.clone();
-                            let popup_peer_id = key.clone();
-                            let popup_peer_name = peer_display_name.clone();
-                            let popup_transport = signal_transport.clone();
-                            rsx! {
-                                SignalQualityPopup {
-                                    peer_id: popup_peer_id,
-                                    peer_name: popup_peer_name,
-                                    history: h,
-                                    meeting_start_ms,
-                                    transport: popup_transport,
-                                    on_close: move |_| show_signal_popup.set(false),
-                                }
+                }
+                // Signal-quality popup rendered as a sibling of
+                // `.canvas-container` (rather than a child) so the
+                // tile's `overflow: hidden` border-radius clip from
+                // PR #923 cannot cut it off. The popup itself is // @token-exempt: PR ref, not a color
+                // `position: fixed` (see `.signal-quality-popup-portal`
+                // in style.css) and anchors to this tile by id.
+                if show_signal_popup() {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = split_anchor_id.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                on_close: move |_| show_signal_popup.set(false),
                             }
                         }
                     }
@@ -694,6 +707,9 @@ pub fn generate_for_peer(
         } else {
             "grid-item full-bleed"
         };
+        // Anchor id for the signal-quality popup's portal positioning;
+        // shared with the outer tile div's id below.
+        let fb_anchor_id = (*peer_video_div_id).clone();
         return rsx! {
             div {
                 class: "{full_bleed_grid_class}{speaking_class}",
@@ -884,21 +900,25 @@ pub fn generate_for_peer(
                             PushPinIcon {}
                         }
                     }
-                    if show_signal_popup() {
-                        {
-                            let h = signal_history.clone();
-                            let popup_peer_id = key.clone();
-                            let popup_peer_name = peer_display_name.clone();
-                            let popup_transport = signal_transport.clone();
-                            rsx! {
-                                SignalQualityPopup {
-                                    peer_id: popup_peer_id,
-                                    peer_name: popup_peer_name,
-                                    history: h,
-                                    meeting_start_ms,
-                                    transport: popup_transport,
-                                    on_close: move |_| show_signal_popup.set(false),
-                                }
+                }
+                // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
+                // border-radius `overflow: hidden` clip cannot crop it.
+                if show_signal_popup() {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = fb_anchor_id.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                on_close: move |_| show_signal_popup.set(false),
                             }
                         }
                     }
@@ -998,6 +1018,9 @@ pub fn generate_for_peer(
             } else {
                 "grid-item"
             };
+            // Anchor id for the signal-quality popup's portal positioning;
+            // shared with the outer grid-item div's id below.
+            let grid_anchor_id = (*peer_video_div_id).clone();
             rsx! {
                 div {
                     class: "{grid_item_class}{grid_speaking}",
@@ -1185,21 +1208,25 @@ pub fn generate_for_peer(
                                 PushPinIcon {}
                             }
                         }
-                        if show_signal_popup() {
-                            {
-                                let h = signal_history.clone();
-                                let popup_peer_id = key.clone();
-                                let popup_peer_name = peer_display_name.clone();
-                                let popup_transport = signal_transport.clone();
-                                rsx! {
-                                    SignalQualityPopup {
-                                        peer_id: popup_peer_id,
-                                        peer_name: popup_peer_name,
-                                        history: h,
-                                        meeting_start_ms,
-                                        transport: popup_transport,
-                                        on_close: move |_| show_signal_popup.set(false),
-                                    }
+                    }
+                    // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
+                    // border-radius `overflow: hidden` clip cannot crop it.
+                    if show_signal_popup() {
+                        {
+                            let h = signal_history.clone();
+                            let popup_peer_id = key.clone();
+                            let popup_peer_name = peer_display_name.clone();
+                            let popup_transport = signal_transport.clone();
+                            let popup_anchor = grid_anchor_id.clone();
+                            rsx! {
+                                SignalQualityPopup {
+                                    peer_id: popup_peer_id,
+                                    peer_name: popup_peer_name,
+                                    history: h,
+                                    meeting_start_ms,
+                                    transport: popup_transport,
+                                    anchor_id: popup_anchor,
+                                    on_close: move |_| show_signal_popup.set(false),
                                 }
                             }
                         }

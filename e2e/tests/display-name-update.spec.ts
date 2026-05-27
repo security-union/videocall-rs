@@ -448,6 +448,9 @@ test.describe("Display name live update", () => {
       const guestResult = await joinMeetingFromPage(guestPage);
       await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for peer discovery
       await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,

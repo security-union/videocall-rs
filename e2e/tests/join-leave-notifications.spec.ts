@@ -208,6 +208,9 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the toast to appear and verify the container is visible.
       await toastPromise;
       await expect(hostPage.locator(".peer-toasts")).toBeVisible();
@@ -273,6 +276,9 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.
       const hostPeerTile = hostPage.locator("#grid-container .canvas-container");
@@ -321,6 +327,9 @@ test.describe("Entry/exit notifications preference", () => {
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Hover the action bar to reveal controls (autohide may be active)
+      await hostPage.locator(".video-controls-container").hover();
 
       // Open the device settings modal from the bottom toolbar.
       await hostPage.locator('[data-testid="open-settings"]').click();
@@ -383,6 +392,9 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the host to see the guest tile so we know the join was
       // processed.
       const hostPeerTile = hostPage.locator("#grid-container .canvas-container");
@@ -422,6 +434,9 @@ test.describe("Entry/exit notifications preference", () => {
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Hover the action bar to reveal controls (autohide may be active)
+      await hostPage.locator(".video-controls-container").hover();
 
       // Open the device settings modal from the bottom toolbar.
       await hostPage.locator('[data-testid="open-settings"]').click();
@@ -517,6 +532,9 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.
       const hostPeerTile = hostPage.locator("#grid-container .canvas-container");
@@ -556,6 +574,9 @@ test.describe("Entry/exit notifications preference", () => {
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Hover the action bar to reveal controls (autohide may be active)
+      await hostPage.locator(".video-controls-container").hover();
 
       // Open the device settings modal from the bottom toolbar.
       await hostPage.locator('[data-testid="open-settings"]').click();

@@ -416,8 +416,18 @@ h3 {
 }
 
 .grid-item {
-  width: 100%;
+  /* Height-driven sizing so wide grid cells letterbox horizontally instead
+     of stretching the tile into a very wide rectangle. The tile fills the
+     grid cell height, derives its width from `aspect-ratio: 3/2` (the max
+     ratio we accept), and is clamped by `max-width: 100%` so narrow cells
+     (3+ peers per row) still fill their full width. `place-self: center`
+     centers the tile in its grid cell when the cap is binding. */
+  width: auto;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
   min-width: 0;
   min-height: 0;
 

@@ -30,13 +30,22 @@
 .change-name-fab svg { width: 18px; height: 18px; }
 .top-bar a img { filter: grayscale(20%); opacity: 0.9; }
 .top-bar .w-8 svg { opacity: 0.9; }
-/* Full-bleed single peer tile */
+/* Full-bleed single peer tile.
+   Height-driven with `aspect-ratio: 3/2` cap (matches `.grid-item` in
+   style.css): on very wide viewports the tile letterboxes horizontally
+   against the page background instead of stretching edge-to-edge. The
+   `inset: 0; margin: auto` pair centers the fixed-position element when
+   `max-width: 100vw` is not binding (i.e., viewport wider than 1.5x its
+   height). */
 .grid-item.full-bleed {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
+  inset: 0;
+  margin: auto;
+  width: auto;
   height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  aspect-ratio: 3 / 2;
   z-index: 0;
 
   /* No borders for full bleed */

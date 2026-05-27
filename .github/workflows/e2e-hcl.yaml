@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 60
     concurrency:
       group: hcl-ci-e2e
-      cancel-in-progress: true
+      cancel-in-progress: false
     needs: [check-permissions]
     if: |
       always() && (

@@ -2961,3 +2961,41 @@ html[data-theme="light"] #invite-overlay p {
     display: none;
   }
 }
+
+/* ------------------------------------------------------------
+   Meetings-list tooltip — long-value wrapping
+
+   The body-portaled tooltip in `style.css` defaults to
+   `white-space: nowrap` so short label/value pairs render on a
+   single line. The non-owner "Host ID" row can carry a full
+   user_id (often a 36-char UUID or a long email), which would
+   stretch the tooltip past the viewport. These overrides:
+     1. bound the tooltip width so it can't run off-screen on
+        narrow viewports;
+     2. let rows that opt in via `--breakable` wrap their value
+        onto additional lines using `overflow-wrap: anywhere` so
+        even unbroken strings (UUIDs, emails) wrap cleanly.
+   ------------------------------------------------------------ */
+.meeting-info-tooltip-portal {
+  max-width: min(420px, calc(100vw - 32px));
+}
+
+.meeting-info-tooltip-row:has(.meeting-info-tooltip-value--breakable) {
+  /* Stack label above value so the breakable column has full row
+     width to wrap into instead of competing with the label. */
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.0625rem;
+}
+
+.meeting-info-tooltip-value--breakable {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  /* Mild monospace nudge so wrapped IDs read as a single token. */
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.65rem;
+}

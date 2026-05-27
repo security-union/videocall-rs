@@ -207,10 +207,16 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       expect(tooltipBText).toMatch(/Duration/);
       // Issue 579: non-owner tooltip must surface the host's identity so
       // the user knows who created the meeting. Both the display name and
-      // the host's user_id must be present.
+      // the host's user_id must be present. The user_id is rendered in
+      // full (no 12-char ellipsis truncation) so it is selectable and
+      // identifiable end-to-end.
       expect(tooltipBText).toMatch(/Host/);
       expect(tooltipBText).toMatch(/Host ID/);
       expect(tooltipBText).toContain(userAName);
+      expect(tooltipBText).toContain(userAEmail);
+      // Regression guard for the truncation drop — there must be no
+      // horizontal-ellipsis character anywhere in the tooltip text.
+      expect(tooltipBText).not.toContain("…");
     } finally {
       // Best-effort cleanup so seeded state doesn't bleed into future
       // runs. Failures here are tolerated by the helper.

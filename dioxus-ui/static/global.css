@@ -173,7 +173,10 @@ html[data-theme="dark"] {
   --overlay-opaque: rgba(0, 0, 0, 0.8);
   --field-bg: rgba(255, 255, 255, 0.05);
   --field-bg-hover: rgba(255, 255, 255, 0.07);
-  --grid-item-border: rgba(100, 100, 100, 0.3);
+  /* Tile border: softened from rgba(100,100,100,0.3) to a lighter,
+     lower-opacity gray for a more subtle separation against dark
+     surfaces (see PR refining peer-tile layout). */
+  --grid-item-border: rgba(140, 140, 140, 0.18);
   --signal-popup-bg: rgba(26, 26, 46, 0.97);
   --signal-popup-border: rgba(255, 255, 255, 0.12);
   --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
@@ -224,7 +227,10 @@ html[data-theme="light"] {
   --overlay-opaque: rgba(0, 0, 0, 0.60);
   --field-bg: rgba(0, 0, 0, 0.04);
   --field-bg-hover: rgba(0, 0, 0, 0.06);
-  --grid-item-border: rgba(100, 100, 100, 0.15);
+  /* Tile border: softened from rgba(100,100,100,0.15) to a lighter,
+     lower-opacity gray for a more subtle separation against light
+     surfaces (see PR refining peer-tile layout). */
+  --grid-item-border: rgba(150, 150, 150, 0.10);
   --signal-popup-bg: rgba(250, 250, 252, 0.98);
   --signal-popup-border: rgba(200, 200, 220, 0.25);
   --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);

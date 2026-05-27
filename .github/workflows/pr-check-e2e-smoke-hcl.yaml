@@ -86,6 +86,9 @@ jobs:
       - name: Generate short-lived WebTransport dev cert
         run: bash scripts/regen-dev-cert.sh --force
 
+      - name: Tear down any prior E2E stack state
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down -v --remove-orphans || true
+
       - name: Build E2E stack images
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
 

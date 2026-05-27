@@ -1428,11 +1428,12 @@ pub fn AttendantsComponent(
             decode_media: true,
             // Honour user transport preference: only allow the connection
             // manager's post-rebase re-election retry when the user is on
-            // the default `Auto` mode. Manual `WebTransportOnly` /
-            // `WebSocketOnly` selections must not be overridden by an
-            // automatic retry — the single-candidate state in those modes is
+            // the default `WebTransport` mode (which advertises BOTH URL
+            // lists to the manager). A manual `WebSocket` selection is a
+            // deliberate single-transport choice and the retry must not
+            // override it — the single-candidate state in that mode is
             // intentional, not a recoverable system condition.
-            allow_post_rebase_retry: transport_pref == TransportPreference::Auto,
+            allow_post_rebase_retry: transport_pref == TransportPreference::WebTransport,
             // Phase 3 / AUTH-2 — discussion 562: let the connection
             // manager preempt token expiry from inside its internal
             // re-election. Without this, the manager re-uses the cached
@@ -3879,77 +3880,68 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_enabled_returns_both_lists() {
-        // Auto pref + server says WT enabled: both lists must come through.
-        // This is the scenario the dioxus-ui hits on a normal reconnect once
-        // runtime config has loaded.
+    fn current_transport_urls_webtransport_with_wt_enabled_returns_both_lists() {
+        // WebTransport pref + server says WT enabled: both lists must come
+        // through. This is the WT-with-WS-fallback shape — the connection
+        // manager creates candidates for every URL and the election prefers
+        // WT, but if every WT candidate fails the WS candidates remain
+        // available for the manager to elect. This is the scenario the
+        // dioxus-ui hits on a normal reconnect once runtime config has
+        // loaded.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             true,
             ws.clone(),
             wt.clone(),
         );
-        assert!(enable_wt, "Auto+server-WT-enabled must enable WT");
-        assert_eq!(ws_out, ws, "WS list passed through unchanged");
+        assert!(enable_wt, "WebTransport+server-WT-enabled must enable WT");
+        assert_eq!(
+            ws_out, ws,
+            "WebTransport must keep the WS list — it's the fallback if every \
+             WT candidate fails its handshake"
+        );
         assert_eq!(wt_out, wt, "WT list passed through unchanged");
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_auto_with_wt_disabled_returns_only_ws() {
-        // Auto pref + runtime config hasn't loaded (or WT disabled): the WT
-        // list is dropped from the effective config, mirroring how `Auto`
-        // collapses to WS-only in this state. This is the *initial* shape
-        // that strands the user before the reconnect path re-evaluates.
+    fn current_transport_urls_webtransport_with_wt_disabled_returns_only_ws() {
+        // WebTransport pref + runtime config hasn't loaded (or WT disabled
+        // at the server): the WT list is dropped from the effective config,
+        // collapsing to WS-only. This is the *initial* shape that strands
+        // the user before the reconnect path re-evaluates.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
         let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
-        assert!(!enable_wt, "Auto+server-WT-disabled must disable WT");
+        assert!(
+            !enable_wt,
+            "WebTransport+server-WT-disabled must disable WT"
+        );
         assert_eq!(ws_out, ws, "WS list still populated");
         assert_eq!(
             wt_out, wt,
-            "Auto preserves the WT list shape (resolve_transport_config returns it as-is); \
+            "WebTransport preserves the WT list shape (resolve_transport_config returns it as-is); \
              the manager's enable_webtransport=false is what gates use of WT"
         );
     }
 
     #[wasm_bindgen_test]
-    fn current_transport_urls_websocket_only_drops_wt_list() {
-        // Explicit WebSocketOnly preference: WT list must always be empty,
+    fn current_transport_urls_websocket_drops_wt_list() {
+        // Explicit WebSocket preference: WT list must always be empty,
         // regardless of what the server-side flag says.
         let ws = vec!["wss://ws-1".to_string()];
         let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebSocketOnly,
-            true,
-            ws.clone(),
-            wt,
-        );
-        assert!(!enable_wt, "WebSocketOnly must report WT disabled");
+        let (enable_wt, ws_out, wt_out) =
+            current_transport_urls_from_lists(TransportPreference::WebSocket, true, ws.clone(), wt);
+        assert!(!enable_wt, "WebSocket must report WT disabled");
         assert_eq!(ws_out, ws);
-        assert!(wt_out.is_empty(), "WebSocketOnly must drop the WT list");
-    }
-
-    #[wasm_bindgen_test]
-    fn current_transport_urls_webtransport_only_drops_ws_list() {
-        // Explicit WebTransportOnly preference: WS list must always be empty.
-        let ws = vec!["wss://ws-1".to_string()];
-        let wt = vec!["https://wt-1".to_string()];
-        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
-            TransportPreference::WebTransportOnly,
-            false, // server says WT disabled, but user override wins
-            ws,
-            wt.clone(),
-        );
-        assert!(enable_wt, "WebTransportOnly must report WT enabled");
-        assert!(ws_out.is_empty(), "WebTransportOnly must drop the WS list");
-        assert_eq!(wt_out, wt);
+        assert!(wt_out.is_empty(), "WebSocket must drop the WT list");
     }
 
     #[wasm_bindgen_test]
@@ -3965,22 +3957,26 @@ mod tests {
 
         // Initial call (runtime config still loading)
         let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
-            TransportPreference::Auto,
+            TransportPreference::WebTransport,
             false,
             ws.clone(),
             wt.clone(),
         );
         assert!(!init_enable_wt);
         assert_eq!(init_ws, ws);
-        // Note: `Auto` keeps the wt list value; it's the bool that gates use.
+        // Note: `WebTransport` keeps the wt list value; it's the bool that gates use.
         // The recovery story is that `init_enable_wt == false` makes the manager
         // treat the WT list as unusable even though it's present in the vec —
         // see `resolve_transport_config`. The bool is the real signal, not the
         // list contents.
 
         // Reconnect call (runtime config now loaded — WT enabled)
-        let (reconn_enable_wt, reconn_ws, reconn_wt) =
-            current_transport_urls_from_lists(TransportPreference::Auto, true, ws.clone(), wt);
+        let (reconn_enable_wt, reconn_ws, reconn_wt) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt,
+        );
         assert!(reconn_enable_wt, "reconnect path now has WT enabled");
         assert_eq!(reconn_ws, ws, "WS list still populated");
         assert!(

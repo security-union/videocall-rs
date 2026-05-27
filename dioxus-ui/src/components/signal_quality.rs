@@ -749,10 +749,19 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
 
 /// Install everything the `SignalQualityPopup` needs to behave like a
 /// portal-rendered overlay anchored to a source tile: a `ResizeObserver`
-/// on the source tile + `resize`/`scroll` window listeners + an `Escape`
-/// keydown listener.  All closures are stored in `use_hook` so they live
-/// for the popup's lifetime, and `use_drop` tears them down on unmount.
-fn install_popup_anchor(anchor_id: String, popup_id: String, on_close: EventHandler<()>) {
+/// on the source tile + `resize`/`scroll` window listeners.  All closures
+/// are stored in `use_hook` so they live for the popup's lifetime, and
+/// `use_drop` tears them down on unmount.
+///
+/// Dismissal is intentionally limited to the explicit close button (the
+/// "X" in the popup header) so the user can keep multiple per-peer popups
+/// open simultaneously and inspect them at leisure.  Earlier revisions
+/// also installed an `Escape` keydown listener and a click-outside
+/// transparent backdrop; both were removed because, with one backdrop
+/// per popup at the same z-index, the topmost backdrop swallowed clicks
+/// on every other tile's signal-meter button and made it impossible to
+/// open a second popup without first closing the first.
+fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHandler<()>) {
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::closure::Closure;
@@ -765,7 +774,6 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, on_close: EventHand
         win: web_sys::Window,
         resize_cb: Option<Closure<dyn FnMut()>>,
         scroll_cb: Option<Closure<dyn FnMut()>>,
-        key_cb: Option<Closure<dyn FnMut(web_sys::KeyboardEvent)>>,
         observer: Option<web_sys::ResizeObserver>,
         _observer_cb: Option<Closure<dyn FnMut(js_sys::Array)>>,
     }
@@ -830,20 +838,6 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, on_close: EventHand
                 true,
             );
 
-            // Esc to dismiss.  Mirrors the diagnostics-popup behavior;
-            // also serves as a keyboard-accessibility win for users who
-            // can't reach the close button via tab focus.
-            let key_cb: Closure<dyn FnMut(web_sys::KeyboardEvent)> = Closure::new({
-                let on_close = on_close;
-                move |ev: web_sys::KeyboardEvent| {
-                    if ev.key() == "Escape" {
-                        on_close.call(());
-                    }
-                }
-            });
-            let _ =
-                win.add_event_listener_with_callback("keydown", key_cb.as_ref().unchecked_ref());
-
             // ResizeObserver on the anchor tile catches grid reflows on
             // peer join/leave (the tile's own size changes when CSS Grid
             // re-distributes available space).  `window` resize covers
@@ -865,7 +859,6 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, on_close: EventHand
                 win: win.clone(),
                 resize_cb: Some(resize_cb),
                 scroll_cb: Some(scroll_cb),
-                key_cb: Some(key_cb),
                 observer,
                 _observer_cb: Some(observer_cb),
             });
@@ -891,12 +884,6 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, on_close: EventHand
                         "scroll",
                         cb.as_ref().unchecked_ref(),
                         true,
-                    );
-                }
-                if let Some(cb) = s.key_cb.as_ref() {
-                    let _ = s.win.remove_event_listener_with_callback(
-                        "keydown",
-                        cb.as_ref().unchecked_ref(),
                     );
                 }
                 if let Some(obs) = s.observer.as_ref() {
@@ -1371,8 +1358,11 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     //   - clamps / flips the popup position so it stays in the viewport,
     //   - re-runs the math on window `resize`, `scroll` (capture phase), and
     //     a `ResizeObserver` on the anchor tile (grid reflows when peers
-    //     join / leave bubble up via ResizeObserver),
-    //   - dismisses on `Escape`.
+    //     join / leave bubble up via ResizeObserver).
+    //
+    // Dismissal is restricted to the explicit "X" close button so multiple
+    // popups can be open at once without an Esc keystroke or a stray click
+    // tearing them all down.
     //
     // All closures + the ResizeObserver are torn down via `use_drop` when
     // the popup unmounts, so reopening it on a different tile attaches
@@ -1407,14 +1397,6 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
 
     if history.is_empty() {
         return rsx! {
-            // Click-outside backdrop. Invisible, but catches mouse events
-            // anywhere outside the popup so the popup dismisses naturally
-            // when the user clicks elsewhere. Sits just below the popup
-            // in the z-stack so the popup body remains clickable.
-            div {
-                class: "signal-quality-popup-backdrop",
-                onclick: move |_| on_close.call(()),
-            }
             div {
                 id: "{popup_id}",
                 class: "signal-quality-popup signal-quality-popup-portal",
@@ -1539,15 +1521,6 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     });
 
     rsx! {
-        // Click-outside backdrop — invisible scrim that catches clicks
-        // anywhere outside the popup. Sits below the popup in z-order so
-        // the popup body still receives its own clicks. The Esc key path
-        // is wired up inside `install_popup_anchor` so keyboard dismissal
-        // works equivalently.
-        div {
-            class: "signal-quality-popup-backdrop",
-            onclick: move |_| on_close.call(()),
-        }
         div {
             id: "{popup_id}",
             class: "signal-quality-popup signal-quality-popup-portal",

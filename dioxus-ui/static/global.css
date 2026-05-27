@@ -2483,6 +2483,27 @@ html[data-theme="light"] #invite-overlay p {
   object-position: center center !important;
 }
 
+/* ============================================================
+   Clip peer-tile video feed to the tile's rounded corners.
+
+   `.grid-item` carries the tile's `border-radius` (var(--radius-lg)
+   in style.css) but intentionally keeps `overflow: visible` so the
+   outer speaking-glow box-shadow from `speak_style()` can extend
+   beyond the tile. The inner `.canvas-container` already has
+   `overflow: hidden` to clip video content, but lacks a matching
+   `border-radius`, so the underlying <canvas> renders past the
+   tile's rounded corners.
+
+   Mirror the established `.split-peer-tile .canvas-container`
+   pattern (style.css ~L2811): match the parent radius minus the
+   2px tile border so the inner clip aligns visually with the
+   outer rounded edge. Applies to both camera and screen-share
+   canvases inside grid tiles (both render inside `.canvas-container`).
+   ============================================================ */
+.grid-item .canvas-container {
+  border-radius: calc(var(--radius-lg) - 2px);
+}
+
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {
   position: relative;

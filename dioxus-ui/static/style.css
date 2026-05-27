@@ -5128,19 +5128,6 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   z-index: 9400;
 }
 
-/* Click-outside scrim.  Sits one z-stack level below the popup so a
-   click anywhere outside the popup hits this transparent element and
-   dismisses the popup.  Pointer events stay enabled (default) so the
-   click handler fires; visually it is fully transparent so the
-   user-perceived layout does not change. */
-.signal-quality-popup-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9399;
-  background: transparent;
-  /* Ensure the scrim sits above all video tiles but below the popup. */
-}
-
 /* Legacy `.signal-popup-open` overflow-visible escape was needed when
    the popup was an absolutely-positioned child of `.canvas-container`.
    In portal mode it is no longer required, but we keep the rule (with

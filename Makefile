@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-cert e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -87,9 +87,17 @@ e2e-install:
 # WebTransport `serverCertificateHashes` constructor option will accept it
 # (Chromium rejects entries for any cert with > 14 days of validity).
 # The script is idempotent: if the existing cert has > 1 day of life left
-# it does nothing. Pass `--force` to force regen.
+# AND passes every preflight check (key type, validity, SAN, hash match)
+# it does nothing. Pass `ARGS=--force` to force regen, or `ARGS=--verify`
+# to run the preflight without writing anything.
 e2e-cert:
-	bash scripts/regen-dev-cert.sh
+	bash scripts/regen-dev-cert.sh $(ARGS)
+
+# Diagnostic target: check every prerequisite for `make e2e` and report
+# pass/fail. Non-mutating (does NOT regen the cert; use `make e2e-cert
+# ARGS=--force` for that). Useful when an E2E run fails confusingly.
+e2e-doctor:
+	bash scripts/e2e-doctor.sh
 
 # Build E2E stack images (same dev Dockerfiles as CI). Cert must exist
 # before the webtransport-api container mounts and reads it at startup.

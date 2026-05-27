@@ -557,8 +557,20 @@ The E2E stack is defined in `docker/docker-compose.e2e.yaml` and uses the same
 Nix-based dev Dockerfiles as CI. Tests run automatically on pushes to `main` and
 can be triggered manually from the GitHub Actions page.
 
-See the `e2e-*` targets in the `Makefile` for available commands.
-For a broader testing-layer overview, see **[docs/TESTING.md](docs/TESTING.md)**.
+Quick start:
+
+```bash
+make e2e-doctor                           # diagnose your local setup
+make e2e-install && make e2e-up           # one-time setup + bring up the stack
+make e2e SPEC=two-users-meeting           # run a single spec
+make e2e-down                             # tear down
+```
+
+A short-lived ECDSA P-256 dev cert is regenerated automatically by `make e2e-cert`
+(invoked as a dependency of every E2E target) so the WebTransport
+`serverCertificateHashes` flow works against modern Chromium. See
+**[docs/TESTING.md](docs/TESTING.md)** for the full setup, troubleshooting table,
+and the rationale behind the cert lifecycle.
 
 ## Roadmap
 

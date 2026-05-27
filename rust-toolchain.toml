@@ -1,0 +1,16 @@
+# Pin the workspace toolchain so local cargo, CI clippy, and
+# `cargo +stable` all agree. CI's HCL self-hosted runner already runs
+# 1.95.0; new clippy lints (e.g. `collapsible_match`) introduced in that
+# release would otherwise fire for CI but not for developers running an
+# older local toolchain — which is exactly the divergence that masked
+# a clippy failure on PR #909 (commit f534754b).
+#
+# Bumping this file is a deliberate action: rustup auto-installs the
+# named version on the next `cargo` invocation, but new clippy releases
+# may fire new lints across the workspace and require fixes. Land
+# toolchain bumps in their own PR.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

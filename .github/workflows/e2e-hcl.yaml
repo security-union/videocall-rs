@@ -105,8 +105,8 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 60
     concurrency:
-      group: hcl-ci-heavy-workload
-      cancel-in-progress: false
+      group: hcl-ci-e2e
+      cancel-in-progress: true
     needs: [check-permissions]
     if: |
       always() && (

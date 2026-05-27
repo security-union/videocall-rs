@@ -61,7 +61,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 30
     concurrency:
-      group: hcl-ci-heavy-workload
+      group: hcl-ci-e2e
       cancel-in-progress: false
 
     steps:

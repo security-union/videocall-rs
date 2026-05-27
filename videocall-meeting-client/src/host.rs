@@ -12,9 +12,11 @@
  */
 
 //! Host-only meeting controls: mute a single participant or mute all,
-//! and disable video for a single participant or all.
+//! disable video for a single participant or all, and kick a participant.
 
-use videocall_meeting_types::requests::{DisableVideoParticipantRequest, MuteParticipantRequest};
+use videocall_meeting_types::requests::{
+    DisableVideoParticipantRequest, KickParticipantRequest, MuteParticipantRequest,
+};
 
 use crate::error::ApiError;
 use crate::{parse_status_only, MeetingApiClient};
@@ -76,6 +78,22 @@ impl MeetingApiClient {
     pub async fn disable_video_all(&self, meeting_id: &str) -> Result<(), ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/disable-video-all");
         let response = self.post(&path).send().await?;
+        parse_status_only(response).await
+    }
+
+    /// Remove a single participant from the meeting.
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/kick`.
+    ///
+    /// Only the meeting host may call this endpoint. The kicked participant
+    /// receives a `PARTICIPANT_KICKED` event and disconnects; they may rejoin
+    /// by navigating to the meeting URL again.
+    pub async fn kick_participant(&self, meeting_id: &str, user_id: &str) -> Result<(), ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/kick");
+        let body = KickParticipantRequest {
+            user_id: user_id.to_string(),
+        };
+        let response = self.post(&path).json(&body).send().await?;
         parse_status_only(response).await
     }
 }

@@ -21,7 +21,10 @@ They run:
 - supporting services such as Postgres and NATS
 
 CI brings this stack up with Docker Compose, waits for the services to become
-reachable, and then runs `npx playwright test`.
+reachable, and then runs `npx playwright test --project=dioxus` (the full
+207-test suite). The Playwright config also defines `bvt0` and `bvt1` smoke
+projects for fast per-PR signal — see `e2e/playwright.config.ts` for the
+project taxonomy.
 
 ### Design goals
 
@@ -250,7 +253,14 @@ Install browser-test dependencies and run the suite:
 cd e2e
 npm ci
 npx playwright install --with-deps chromium
-npx playwright test
+npx playwright test --project=dioxus
+```
+
+Or use a smoke subset for faster iteration:
+
+```bash
+npx playwright test --project=bvt0   # 1 test (home page liveness)
+npx playwright test --project=bvt1   # 10 tests (smoke superset)
 ```
 
 Tear the stack down when done:

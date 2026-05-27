@@ -28,6 +28,8 @@ message MeetingPacket {
     HOST_MUTE_PARTICIPANT = 11;
     // Host requests participants disable their video
     HOST_DISABLE_VIDEO = 12;
+    // Host removes a participant from the meeting
+    PARTICIPANT_KICKED = 13;
   }
 
   MeetingEventType event_type = 1;

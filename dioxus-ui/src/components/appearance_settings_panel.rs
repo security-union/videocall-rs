@@ -600,6 +600,77 @@ pub fn AppearanceSettingsPanel() -> Element {
                     }
                 }
             }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 5: Preferences ───────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Preferences" }
+                }
+
+                // Entry/exit notifications toggle
+                div { class: "appearance-section-header dock-autohide-row",
+                    div { class: "appearance-section-heading-stack",
+                        label {
+                            class: "appearance-section-title appearance-section-title--sm",
+                            r#for: "join-leave-notifications-toggle",
+                            "Entry/exit notifications"
+                        }
+                        p { class: "appearance-section-helper",
+                            "Show a message when participants join or leave."
+                        }
+                    }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle entry and exit notifications",
+                        input {
+                            id: "join-leave-notifications-toggle",
+                            r#type: "checkbox",
+                            checked: appearance.show_join_leave_notifications,
+                            onchange: move |evt: Event<FormData>| {
+                                let enabled = evt.checked();
+                                appearance_ctx.0.set(AppearanceSettings {
+                                    show_join_leave_notifications: enabled,
+                                    ..appearance_ctx.0()
+                                });
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
+
+                // Entry/exit sounds toggle
+                div { class: "appearance-section-header dock-autohide-row",
+                    div { class: "appearance-section-heading-stack",
+                        label {
+                            class: "appearance-section-title appearance-section-title--sm",
+                            r#for: "join-leave-sounds-toggle",
+                            "Entry/exit sounds"
+                        }
+                        p { class: "appearance-section-helper",
+                            "Play a sound when participants join or leave."
+                        }
+                    }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle entry and exit sounds",
+                        input {
+                            id: "join-leave-sounds-toggle",
+                            r#type: "checkbox",
+                            checked: appearance.play_join_leave_sounds,
+                            onchange: move |evt: Event<FormData>| {
+                                let enabled = evt.checked();
+                                appearance_ctx.0.set(AppearanceSettings {
+                                    play_join_leave_sounds: enabled,
+                                    ..appearance_ctx.0()
+                                });
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
+            }
             }
         }
     }

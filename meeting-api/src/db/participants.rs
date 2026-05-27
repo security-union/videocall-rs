@@ -278,6 +278,28 @@ pub async fn reject(
         .await
 }
 
+/// Kick a participant (set status to 'kicked', record left_at).
+/// Only transitions from 'admitted' — ignores waiting/left/etc.
+pub async fn kick(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    let query = format!(
+        r#"
+        UPDATE meeting_participants
+        SET status = 'kicked', left_at = NOW()
+        WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted'
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Leave a meeting (set status to 'left').
 pub async fn leave(
     pool: &PgPool,

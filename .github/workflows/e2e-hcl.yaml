@@ -149,7 +149,7 @@ jobs:
           sudo find . -mindepth 1 -delete 2>/dev/null || true
           sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.0
         with:
           ref: ${{ steps.setup.outputs.ref }}
           clean: false
@@ -204,7 +204,13 @@ jobs:
           PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
           E2E_GREP: ${{ inputs.grep }}
         run: |
-          ARGS=(--reporter=list,json)
+          # Pin to the `dioxus` project (the full 207-test suite). Without
+          # this flag, Playwright runs every project defined in the config —
+          # which now includes `bvt0` and `bvt1` — and each tagged test would
+          # run once per matching project. See playwright.config.ts for the
+          # project taxonomy. The bvt projects are invoked explicitly by
+          # `make e2e-bvt0`/`make e2e-bvt1` and (per #745) by per-PR CI.
+          ARGS=(--project=dioxus --reporter=list,json)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${E2E_GREP}" ]; then
             ARGS+=(--grep "${E2E_GREP}")
           fi

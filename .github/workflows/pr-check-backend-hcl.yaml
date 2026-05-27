@@ -40,7 +40,7 @@ jobs:
       group: hcl-ci-heavy-workload
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.0
         with:
           clean: false
           path: backend-repo

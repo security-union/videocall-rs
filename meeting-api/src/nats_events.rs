@@ -249,6 +249,26 @@ pub async fn publish_host_disable_video(
     Ok(())
 }
 
+/// Publish `PARTICIPANT_KICKED` to tell one participant they have been removed.
+pub async fn publish_host_kick(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::PARTICIPANT_KICKED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
+    Ok(())
+}
+
 /// Publish `MEETING_SETTINGS_UPDATED` when meeting settings change.
 pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>, room_id: &str) {
     let Some(nats) = nats else { return };

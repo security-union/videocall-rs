@@ -308,6 +308,7 @@ pub fn generate_for_peer(
     mut show_tile_menu: Signal<bool>,
     on_mute: Option<EventHandler<()>>,
     on_disable_video: Option<EventHandler<()>>,
+    on_kick: Option<EventHandler<()>>,
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
@@ -420,7 +421,7 @@ pub fn generate_for_peer(
                             rsx! {
                                 button {
                                     onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                     CropIcon {}
                                 }
                             }
@@ -514,17 +515,18 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() {
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                             {
                                 let on_mute_clone = on_mute;
                                 let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -551,6 +553,10 @@ pub fn generate_for_peer(
                                             }
                                         }
                                         if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
                                             div { class: "tile-context-menu",
                                                 if let Some(cb) = on_mute_clone {
                                                     button {
@@ -599,6 +605,30 @@ pub fn generate_for_peer(
                                                             line { x1: "1", y1: "1", x2: "23", y2: "23" }
                                                         }
                                                         "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -722,17 +752,18 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() {
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                             {
                                 let on_mute_clone = on_mute;
                                 let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
                                         button {
@@ -759,6 +790,10 @@ pub fn generate_for_peer(
                                             }
                                         }
                                         if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
                                             div { class: "tile-context-menu",
                                                 if let Some(cb) = on_mute_clone {
                                                     button {
@@ -807,6 +842,30 @@ pub fn generate_for_peer(
                                                             line { x1: "1", y1: "1", x2: "23", y2: "23" }
                                                         }
                                                         "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
                                                     }
                                                 }
                                             }
@@ -909,7 +968,7 @@ pub fn generate_for_peer(
                         rsx! {
                             button {
                                 onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                 CropIcon {}
                             }
                         }
@@ -994,22 +1053,24 @@ pub fn generate_for_peer(
                                     rsx! {
                                         button {
                                             onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon active" } else { "crop-icon" },
+                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                             CropIcon {}
                                         }
                                     }
                                 }
                             }
-                            // Three-dot host mute menu (visible on hover / when speaking, only for host)
-                            if on_mute.is_some() {
+                            // Three-dot host control menu (visible on hover, only for host)
+                            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
                                 {
                                     let on_mute_clone = on_mute;
+                                    let on_disable_video_clone = on_disable_video;
+                                    let on_kick_clone = on_kick;
                                     rsx! {
                                         div { class: "tile-mute-menu-wrapper",
                                             button {
                                                 class: "tile-mute-btn",
-                                                title: "Mute participant",
-                                                "aria-label": "Mute participant",
+                                                title: "Host actions",
+                                                "aria-label": "Host actions",
                                                 onclick: move |e: MouseEvent| {
                                                     e.stop_propagation();
                                                     show_tile_menu.set(!show_tile_menu());
@@ -1030,32 +1091,83 @@ pub fn generate_for_peer(
                                                 }
                                             }
                                             if show_tile_menu() {
+                                                div {
+                                                    style: "position: fixed; inset: 0; z-index: 99;",
+                                                    onclick: move |_| show_tile_menu.set(false),
+                                                }
                                                 div { class: "tile-context-menu",
-                                                    button {
-                                                        class: "tile-context-menu-item",
-                                                        onclick: move |_| {
-                                                            show_tile_menu.set(false);
-                                                            if let Some(ref cb) = on_mute_clone {
+                                                    if let Some(cb) = on_mute_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
                                                                 cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                                path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                                path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                                line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                                line { x1: "8", y1: "23", x2: "16", y2: "23" }
                                                             }
-                                                        },
-                                                        svg {
-                                                            xmlns: "http://www.w3.org/2000/svg",
-                                                            width: "14",
-                                                            height: "14",
-                                                            view_box: "0 0 24 24",
-                                                            fill: "none",
-                                                            stroke: "currentColor",
-                                                            stroke_width: "2",
-                                                            stroke_linecap: "round",
-                                                            stroke_linejoin: "round",
-                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
-                                                            path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
-                                                            path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                                            line { x1: "12", y1: "19", x2: "12", y2: "23" }
-                                                            line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                            "Mute"
                                                         }
-                                                        "Mute"
+                                                    }
+                                                    if let Some(cb) = on_disable_video_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            }
+                                                            "Disable video"
+                                                        }
+                                                    }
+                                                    if let Some(cb) = on_kick_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                                polyline { points: "17 8 21 12 17 16" }
+                                                                line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                            }
+                                                            "Remove from meeting"
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1118,9 +1230,9 @@ fn UserVideo(id: String, hidden: bool) -> Element {
     });
 
     let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
-        "cropped"
-    } else {
         "uncropped"
+    } else {
+        "cropped"
     };
 
     rsx! {
@@ -1154,9 +1266,9 @@ fn ScreenCanvas(peer_id: String) -> Element {
     });
 
     let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
-        "cropped"
-    } else {
         "uncropped"
+    } else {
+        "cropped"
     };
 
     rsx! {

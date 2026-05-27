@@ -81,6 +81,8 @@
 //!     on_display_name_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
+//!     on_participant_kicked: None,
+//!     on_peer_event: None,
 //!     decode_media: true,
 //!     is_guest: false,
 //!     allow_post_rebase_retry: true,
@@ -122,6 +124,8 @@
 //! #     on_display_name_changed: None,
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
+//! #     on_participant_kicked: None,
+//! #     on_peer_event: None,
 //! #     decode_media: true,
 //! #     is_guest: false,
 //! #     allow_post_rebase_retry: true,
@@ -248,4 +252,4 @@ pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
     MediaPermissionsErrorState, PermissionState, SelectableDevices,
 };
-pub use videocall_types::Callback;
+pub use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};

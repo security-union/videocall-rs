@@ -207,3 +207,10 @@ pub struct DisableVideoParticipantRequest {
     /// User ID of the participant to ask to disable video.
     pub user_id: String,
 }
+
+/// Request body for `POST /api/v1/meetings/{meeting_id}/kick`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KickParticipantRequest {
+    /// User ID of the participant to remove from the meeting.
+    pub user_id: String,
+}

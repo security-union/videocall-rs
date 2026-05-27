@@ -1,14 +1,11 @@
--- This file is regenerated automatically via `dbmate dump` against the deployed database.
--- Schema changes live in dbmate/db/migrations/*.sql; do not hand-edit this file.
 \restrict dbmate
 
--- Dumped from database version 18.3 (Homebrew)
--- Dumped by pg_dump version 18.3 (Homebrew)
+-- Dumped from database version 12.22 (Debian 12.22-1.pgdg120+1)
+-- Dumped by pg_dump version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
-SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -16,6 +13,13 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+-- *not* creating schema, since initdb creates it
+
 
 --
 -- Name: update_updated_at_column(); Type: FUNCTION; Schema: public; Owner: -
@@ -42,7 +46,7 @@ SET default_table_access_method = heap;
 CREATE TABLE public.meeting_participants (
     id integer NOT NULL,
     meeting_id integer NOT NULL,
-    user_id character varying(255) CONSTRAINT meeting_participants_email_not_null NOT NULL,
+    user_id character varying(255) NOT NULL,
     status character varying(50) DEFAULT 'waiting'::character varying NOT NULL,
     is_host boolean DEFAULT false NOT NULL,
     is_required boolean DEFAULT false NOT NULL,
@@ -52,7 +56,8 @@ CREATE TABLE public.meeting_participants (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     display_name character varying(255),
-    CONSTRAINT chk_participant_status CHECK (((status)::text = ANY ((ARRAY['waiting'::character varying, 'admitted'::character varying, 'rejected'::character varying, 'left'::character varying])::text[])))
+    is_guest boolean DEFAULT false NOT NULL,
+    CONSTRAINT chk_participant_status CHECK (((status)::text = ANY ((ARRAY['waiting'::character varying, 'admitted'::character varying, 'rejected'::character varying, 'left'::character varying, 'kicked'::character varying])::text[])))
 );
 
 
@@ -95,6 +100,8 @@ CREATE TABLE public.meetings (
     host_display_name character varying(255),
     waiting_room_enabled boolean DEFAULT true NOT NULL,
     admitted_can_admit boolean DEFAULT false NOT NULL,
+    allow_guests boolean DEFAULT false NOT NULL,
+    end_on_host_leave boolean DEFAULT true NOT NULL,
     CONSTRAINT chk_attendees_max_100 CHECK ((jsonb_array_length(attendees) <= 100)),
     CONSTRAINT chk_meeting_state CHECK (((state)::text = ANY ((ARRAY['idle'::character varying, 'active'::character varying, 'ended'::character varying])::text[])))
 );
@@ -391,4 +398,7 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260302000000'),
     ('20260307000001'),
     ('20260317000000'),
-    ('20260429000000');
+    ('20260402143618'),
+    ('20260416000000'),
+    ('20260429000000'),
+    ('20260505130637');

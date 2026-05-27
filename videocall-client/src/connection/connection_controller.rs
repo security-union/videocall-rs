@@ -454,10 +454,12 @@ mod tests {
             })
         }
 
+        #[allow(dead_code)]
         fn get_states(&self) -> Vec<ConnectionState> {
             self.states.lock().unwrap().clone()
         }
 
+        #[allow(dead_code)]
         fn last_state(&self) -> Option<ConnectionState> {
             self.states.lock().unwrap().last().cloned()
         }

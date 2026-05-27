@@ -112,6 +112,14 @@ pub fn PeerTile(
     let mut sample_counter = use_signal(|| 0u32);
     // Track last sample timestamp to throttle to ~1 sample/second
     let last_sample_ts: Rc<RefCell<f64>> = use_hook(|| Rc::new(RefCell::new(0.0)));
+    // Issue #906: timestamp (ms since epoch) of the most recent `peer_status` // @token-exempt: issue ref, not a color
+    // event seen for this peer. Used to compute the heartbeat-freshness
+    // window the screen-state classifier consults when deciding between
+    // `Static` and `NoFrames`. Initialised to 0.0; the first event sets
+    // it, and the sampling code translates `0.0` into `None` so we don't
+    // false-classify an idle session as having a stale heartbeat before any
+    // event has arrived.
+    let last_peer_status_ts: Rc<RefCell<f64>> = use_hook(|| Rc::new(RefCell::new(0.0)));
 
     // Initialize from client snapshot and subscribe to diagnostics
     let peer_id_owned = peer_id.clone();
@@ -119,6 +127,7 @@ pub fn PeerTile(
     let prev_abort_handle = use_hook(|| Rc::new(RefCell::new(None::<AbortHandle>)));
     let mic_hold_for_effect = mic_hold_timeout.clone();
     let last_sample_for_effect = last_sample_ts.clone();
+    let last_peer_status_for_effect = last_peer_status_ts.clone();
     let signal_history_for_effect = signal_history.clone();
     use_effect(move || {
         // Abort previous subscription
@@ -137,6 +146,7 @@ pub fn PeerTile(
         let peer_id_inner = peer_id_owned.clone();
         let mic_hold = mic_hold_for_effect.clone();
         let last_sample = last_sample_for_effect.clone();
+        let last_peer_status = last_peer_status_for_effect.clone();
         // Clone the Rc for the async block so the outer FnMut closure can be
         // called again without consuming the captured value.
         let signal_hist = signal_history_for_effect.clone();
@@ -172,6 +182,7 @@ pub fn PeerTile(
                     &mut screen_adaptive_tier,
                     &mut screen_cause_hint,
                     &mut peer_transport,
+                    &last_peer_status,
                 );
                 // Push a signal quality sample at most once per second,
                 // piggybacking on the diagnostics event stream.
@@ -192,6 +203,19 @@ pub fn PeerTile(
                         }
                     }
                 }
+                // Issue #906: snapshot the heartbeat age at sample-record  // @token-exempt: issue ref, not a color
+                // time so the screen-state classifier can later distinguish
+                // a static publisher (fresh heartbeat) from a broken one
+                // (stale heartbeat). `0.0` means we have not yet observed
+                // a `peer_status` event for this peer — translate to `None`
+                // so the classifier doesn't conclude the heartbeat is
+                // ancient at start-of-meeting.
+                let last_status_ms = *last_peer_status.borrow();
+                let peer_status_age_ms = if last_status_ms > 0.0 {
+                    Some((js_sys::Date::now() - last_status_ms).max(0.0))
+                } else {
+                    None
+                };
                 let data = SampleData {
                     video_fps: *fps_received.peek(),
                     video_bitrate_kbps: *video_bitrate.peek(),
@@ -207,6 +231,7 @@ pub fn PeerTile(
                     screen_encoder_target_bitrate_kbps: *screen_encoder_target_bitrate.peek(),
                     screen_adaptive_tier: screen_adaptive_tier.peek().clone(),
                     screen_cause_hint: screen_cause_hint.peek().clone(),
+                    peer_status_age_ms,
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
                     video_enabled: *video_enabled.peek(),
@@ -418,6 +443,7 @@ fn handle_diagnostics_event(
     screen_adaptive_tier: &mut Signal<String>,
     screen_cause_hint: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
+    last_peer_status_ts: &Rc<RefCell<f64>>,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -443,6 +469,12 @@ fn handle_diagnostics_event(
             if to_peer.as_deref() != Some(peer_id) {
                 return;
             }
+            // Issue #906: stamp the heartbeat timestamp the first time we   // @token-exempt: issue ref, not a color
+            // confirm this `peer_status` event is for our peer. The screen-
+            // state classifier consults this to decide between `Static` and
+            // `NoFrames` — fresh heartbeat means the publisher is alive,
+            // stale heartbeat means the connection is the problem.
+            *last_peer_status_ts.borrow_mut() = js_sys::Date::now();
             if let Some(a) = audio {
                 if a != *audio_enabled.peek() {
                     audio_enabled.set(a);

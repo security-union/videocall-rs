@@ -119,6 +119,28 @@ pub struct SignalSample {
     /// `"network-loss"`, `"manual-cap"`, or empty. Empty means the encoder
     /// is unconstrained or the publisher doesn't supply the field.
     pub screen_cause_hint: String,
+    /// Issue #906: held-last value to render when the current screen FPS // @token-exempt: issue ref, not a color
+    /// sample reads zero but a recent non-zero value exists. `None` means
+    /// either the current sample is itself live (use `screen_fps`) or the
+    /// held window has expired / no prior live value exists (render the
+    /// raw zero with a `(no frames)` annotation).
+    ///
+    /// Populated by [`PeerSignalHistory::push_sample_at`] at sample-record
+    /// time so the tooltip and chart renderers don't have to rescan the
+    /// VecDeque on every paint.
+    pub screen_fps_held: Option<f64>,
+    /// Issue #906: held-last value for screen bitrate, paired with // @token-exempt: issue ref, not a color
+    /// `screen_fps_held`. Tracked independently because the two metrics
+    /// could in principle drop to zero on different cadences, though in
+    /// practice they correlate (encoder emits or doesn't).
+    pub screen_bitrate_kbps_held: Option<f64>,
+    /// Issue #906: milliseconds since the last `peer_status` heartbeat // @token-exempt: issue ref, not a color
+    /// from the peer at the time this sample was recorded. `None` means
+    /// no heartbeat has been observed yet (very early in the connection).
+    /// Used by the screen-state classifier to distinguish a `(static)`
+    /// publisher (fresh heartbeat, zero metrics) from a `(no frames)`
+    /// publisher (stale heartbeat, the connection is the problem).
+    pub peer_status_age_ms: Option<f64>,
     // Latency
     pub latency_ms: f64,
 }
@@ -144,6 +166,9 @@ impl PartialEq for SignalSample {
             && self.screen_encoder_target_bitrate_kbps == other.screen_encoder_target_bitrate_kbps
             && self.screen_adaptive_tier == other.screen_adaptive_tier
             && self.screen_cause_hint == other.screen_cause_hint
+            && self.screen_fps_held == other.screen_fps_held
+            && self.screen_bitrate_kbps_held == other.screen_bitrate_kbps_held
+            && self.peer_status_age_ms == other.peer_status_age_ms
             && self.latency_ms == other.latency_ms
     }
 }
@@ -178,6 +203,12 @@ pub struct SampleData {
     /// Empty when the encoder is unconstrained or the publisher doesn't
     /// supply the field.
     pub screen_cause_hint: String,
+    /// Issue #906: milliseconds since the most recent `peer_status` // @token-exempt: issue ref, not a color
+    /// heartbeat from the peer at sample-record time. `None` when no
+    /// heartbeat has been observed yet. Passed straight through onto
+    /// `SignalSample.peer_status_age_ms` so the screen-state classifier
+    /// can distinguish static publishers from broken connections.
+    pub peer_status_age_ms: Option<f64>,
     pub latency_ms: f64,
     pub audio_enabled: bool,
     pub video_enabled: bool,
@@ -186,6 +217,105 @@ pub struct SampleData {
 /// Maximum number of signal samples retained per peer.
 /// At 1 sample/second this covers 30 minutes of history.
 const MAX_SIGNAL_SAMPLES: usize = 1800;
+
+// ---------------------------------------------------------------------------
+// Issue #906: screen-share static-vs-no-frames classification.            // @token-exempt: issue ref, not a color
+//
+// During genuine static screen-share (no mouse motion, no UI changes) modern
+// video codecs emit zero encoded frames — the publisher is healthy but the
+// metrics read `0.0fps | 0kbps`, which is visually indistinguishable from a
+// broken connection. The state machine below classifies each (peer, sample)
+// into one of three states the tooltip and chart use to render correctly.
+// ---------------------------------------------------------------------------
+
+/// Maximum age (in milliseconds) of a prior non-zero screen FPS / bitrate
+/// reading before we stop holding it. After this window elapses the sample
+/// falls back to `NoFrames` regardless of heartbeat freshness — at that point
+/// the encoder has been silent long enough that the held value is no longer
+/// representative of what the publisher is doing now.
+///
+/// 30 seconds is the issue-spec value: long enough to bridge realistic
+/// static periods (reading code, looking at a document) without latching the
+/// held value indefinitely on stalled publishers.
+pub(crate) const SCREEN_STATIC_HOLD_WINDOW_MS: f64 = 30_000.0;
+
+/// Maximum `peer_status` age (in milliseconds) for the heartbeat to be
+/// considered fresh enough to justify holding the screen metrics. The
+/// `peer_status` event fires roughly every 1 second per peer, so 5s gives
+/// 5 missed beats of tolerance for network jitter / packet reordering before
+/// we conclude the publisher is unreachable.
+///
+/// Kept local to `signal_quality.rs` because the threshold is UI-policy, not
+/// shared with the AQ controller's reaction windows in `videocall-aq`.
+pub(crate) const SCREEN_STATIC_HEARTBEAT_FRESH_MS: f64 = 5_000.0;
+
+/// Per-sample screen-state classification used by the tooltip and chart
+/// renderers. Computed at render time from the sample's own held / heartbeat
+/// fields so we don't have to re-scan history.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScreenSampleState {
+    /// The encoder is actively emitting frames. Render `screen_fps` /
+    /// `screen_bitrate_kbps` directly with no annotation.
+    Live,
+    /// The current sample reads zero, but a prior non-zero reading exists
+    /// within the hold window AND the peer's heartbeat is fresh. Render
+    /// the held values with a `(static)` annotation.
+    Static {
+        held_fps: f64,
+        held_bitrate_kbps: f64,
+    },
+    /// Either the publisher has been silent for longer than the hold
+    /// window, OR the peer's heartbeat is stale. Render `0fps` / `0kbps`
+    /// with a `(no frames)` annotation — the connection or encoder is the
+    /// problem, not a quiet desktop.
+    NoFrames,
+}
+
+impl SignalSample {
+    /// Classify the screen-share metric state for this sample.
+    ///
+    /// `Live` when either `screen_fps` or `screen_bitrate_kbps` reports a
+    /// non-zero reading (we treat the two metrics as a single screen-level
+    /// state — in practice they correlate, the encoder emits or doesn't).
+    /// Otherwise we consult the held values + heartbeat staleness to
+    /// distinguish static publishers from broken connections.
+    pub(crate) fn screen_state(&self) -> ScreenSampleState {
+        // Live: either metric reports a real reading.
+        let live_fps = self.screen_fps > 0.0;
+        let live_bitrate = self.screen_bitrate_kbps > 0.0;
+        if live_fps || live_bitrate {
+            return ScreenSampleState::Live;
+        }
+
+        // Both zero. Was the heartbeat fresh when we recorded the sample?
+        // `None` means we haven't seen any peer_status yet — treat the same
+        // as a stale heartbeat (we cannot prove the publisher is alive, so
+        // we will not paper over the zero with held values).
+        let heartbeat_fresh = match self.peer_status_age_ms {
+            Some(age) => age <= SCREEN_STATIC_HEARTBEAT_FRESH_MS,
+            None => false,
+        };
+
+        match (self.screen_fps_held, self.screen_bitrate_kbps_held) {
+            // Recent non-zero values within the hold window AND heartbeat
+            // fresh -> Static. We hold both metrics together; if only one
+            // is set the other defaults to zero so the tooltip still
+            // renders the available number.
+            (Some(fps), bitrate) if heartbeat_fresh => ScreenSampleState::Static {
+                held_fps: fps,
+                held_bitrate_kbps: bitrate.unwrap_or(0.0),
+            },
+            (None, Some(bitrate)) if heartbeat_fresh => ScreenSampleState::Static {
+                held_fps: 0.0,
+                held_bitrate_kbps: bitrate,
+            },
+            // Anything else: no recent non-zero, heartbeat stale, or
+            // neither held value is available. Render the raw zero with
+            // the `(no frames)` annotation.
+            _ => ScreenSampleState::NoFrames,
+        }
+    }
+}
 
 /// Accumulates [`SignalSample`]s for a single peer.  Uses a bounded
 /// [`VecDeque`] so memory stays capped even for very long meetings or
@@ -211,6 +341,25 @@ impl PeerSignalHistory {
     /// Append a sample with an explicit timestamp. Lets host unit tests
     /// exercise the quality-derivation logic without depending on `js_sys`.
     pub fn push_sample_at(&mut self, data: &SampleData, timestamp_ms: f64) {
+        // Issue #906: before evicting / appending, scan recent history     // @token-exempt: issue ref, not a color
+        // for the most recent non-zero screen FPS / bitrate values. We
+        // only consult held values when the *current* reading is zero; for
+        // live readings the held fields are `None`. Walking backwards is
+        // O(window) but bounded by the 30s hold window divided by the
+        // ~1s sample cadence, so in practice ~30 iterations max.
+        let (screen_fps_held, screen_bitrate_kbps_held) =
+            if data.screen_enabled && (data.screen_fps == 0.0 || data.screen_bitrate_kbps == 0.0) {
+                find_recent_non_zero_screen_metrics(
+                    &self.samples,
+                    timestamp_ms,
+                    SCREEN_STATIC_HOLD_WINDOW_MS,
+                    data.screen_fps == 0.0,
+                    data.screen_bitrate_kbps == 0.0,
+                )
+            } else {
+                (None, None)
+            };
+
         if self.samples.len() >= MAX_SIGNAL_SAMPLES {
             self.samples.pop_front();
         }
@@ -277,6 +426,9 @@ impl PeerSignalHistory {
             screen_encoder_target_bitrate_kbps: data.screen_encoder_target_bitrate_kbps,
             screen_adaptive_tier: data.screen_adaptive_tier.clone(),
             screen_cause_hint: data.screen_cause_hint.clone(),
+            screen_fps_held,
+            screen_bitrate_kbps_held,
+            peer_status_age_ms: data.peer_status_age_ms,
             latency_ms: data.latency_ms,
         });
     }
@@ -313,6 +465,60 @@ impl PeerSignalHistory {
             None => SignalLevel::Excellent, // no data yet -- assume good
         }
     }
+}
+
+/// Issue #906: walk the recorded samples backwards looking for the most // @token-exempt: issue ref, not a color
+/// recent non-zero screen FPS and / or bitrate readings. Returns held values
+/// only when the prior reading is within the supplied `hold_window_ms`. The
+/// `want_fps` / `want_bitrate` flags let the caller skip the scan for whichever
+/// metric is currently live — typically only one of the two drops to zero on
+/// any given sample, though we handle both independently.
+///
+/// Iterating right-to-left is O(window) but bounded by the 30s hold window
+/// divided by the ~1s sample cadence, so worst case ~30 iterations. We also
+/// bail out early once both metrics have been resolved.
+fn find_recent_non_zero_screen_metrics(
+    samples: &VecDeque<SignalSample>,
+    now_ms: f64,
+    hold_window_ms: f64,
+    want_fps: bool,
+    want_bitrate: bool,
+) -> (Option<f64>, Option<f64>) {
+    let mut held_fps: Option<f64> = None;
+    let mut held_bitrate: Option<f64> = None;
+    let deadline = now_ms - hold_window_ms;
+    for sample in samples.iter().rev() {
+        // The sample's own timestamp must be inside the hold window. The
+        // VecDeque is ordered oldest-first, so once we cross the deadline
+        // all earlier samples are also too old.
+        if sample.timestamp_ms < deadline {
+            break;
+        }
+        // Recover the live value if the sample was itself live, OR walk
+        // through samples that recorded a *held* value from earlier in the
+        // chain — this keeps the held value latched across consecutive
+        // zero samples without rescanning back to the original live one.
+        if want_fps && held_fps.is_none() {
+            if sample.screen_fps > 0.0 {
+                held_fps = Some(sample.screen_fps);
+            } else if let Some(h) = sample.screen_fps_held {
+                held_fps = Some(h);
+            }
+        }
+        if want_bitrate && held_bitrate.is_none() {
+            if sample.screen_bitrate_kbps > 0.0 {
+                held_bitrate = Some(sample.screen_bitrate_kbps);
+            } else if let Some(h) = sample.screen_bitrate_kbps_held {
+                held_bitrate = Some(h);
+            }
+        }
+        let fps_done = !want_fps || held_fps.is_some();
+        let bitrate_done = !want_bitrate || held_bitrate.is_some();
+        if fps_done && bitrate_done {
+            break;
+        }
+    }
+    (held_fps, held_bitrate)
 }
 
 /// Compute a single combined quality score.
@@ -637,13 +843,34 @@ fn build_screen_tooltip_line(sample: &SignalSample, show_screen: bool) -> String
         return String::new();
     }
 
+    // Issue #906: classify the screen-state and pick which fps / kbps      // @token-exempt: issue ref, not a color
+    // values the metrics tail should render. `Live` uses the sample's own
+    // numbers; `Static` substitutes the held values + appends a `(static)`
+    // marker; `NoFrames` keeps the literal zeros + appends `(no frames)`
+    // so the user can tell apart "publisher's screen is quiet" from
+    // "publisher's connection is broken / encoder crashed".
+    let (display_fps, display_bitrate, fps_annotation, bitrate_annotation) =
+        match sample.screen_state() {
+            ScreenSampleState::Live => (sample.screen_fps, sample.screen_bitrate_kbps, "", ""),
+            ScreenSampleState::Static {
+                held_fps,
+                held_bitrate_kbps,
+            } => (held_fps, held_bitrate_kbps, " (static)", " (static)"),
+            ScreenSampleState::NoFrames => (
+                sample.screen_fps,
+                sample.screen_bitrate_kbps,
+                " (no frames)",
+                " (no frames)",
+            ),
+        };
+
     // Compact metrics tail used by every branch. `·` (U+00B7 MIDDLE DOT)
     // replaces the previous `|` pipe so the row reads less like a CSV.
     // No space between number and unit (`850kbps`, `12.5fps`) — the user's
-    // tightening spec called this out explicitly.
+    // tightening spec called this out explicitly. Issue #906 appends an   // @token-exempt: issue ref, not a color
+    // optional `(static)` / `(no frames)` annotation per metric.
     let metrics_suffix = format!(
-        " \u{00B7} {:.1}fps \u{00B7} {:.0}kbps",
-        sample.screen_fps, sample.screen_bitrate_kbps
+        " \u{00B7} {display_fps:.1}fps{fps_annotation} \u{00B7} {display_bitrate:.0}kbps{bitrate_annotation}",
     );
 
     let received_known = !sample.screen_resolution.is_empty();
@@ -909,14 +1136,11 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         |s| s.video_quality,
     );
     let screen_points: String = if has_screen_data {
-        build_quality_polyline(
-            history,
-            first_ts,
-            px_per_sec,
-            padding_top,
-            draw_height,
-            |s| s.screen_quality,
-        )
+        // Issue #906: the screen polyline is state-aware so static periods // @token-exempt: issue ref, not a color
+        // render at the held Y instead of dropping to zero. `NoFrames` and
+        // `Live` use the raw `screen_quality`; `Static` plots at the held
+        // value's normalized quality (held_fps / 30).
+        build_screen_quality_polyline(history, first_ts, px_per_sec, padding_top, draw_height)
     } else {
         String::new()
     };
@@ -1418,6 +1642,53 @@ fn build_quality_polyline(
         .join(" ")
 }
 
+/// Build the screen-share polyline. Unlike the camera-video / audio lines
+/// the screen series classifies each sample (issue #906) so static periods // @token-exempt: issue ref, not a color
+/// flatline at the held value's Y position instead of dropping to zero,
+/// which would otherwise be visually indistinguishable from a broken
+/// encoder. `NoFrames` and `Live` use the raw `screen_quality`; `Static`
+/// substitutes the held FPS's normalized quality (held_fps clamped to the
+/// same 30fps target the live path uses).
+fn build_screen_quality_polyline(
+    history: &[SignalSample],
+    first_ts: f64,
+    px_per_sec: f64,
+    padding_top: f64,
+    draw_height: f64,
+) -> String {
+    history
+        .iter()
+        .map(|s| {
+            let x = ((s.timestamp_ms - first_ts) / 1000.0) * px_per_sec;
+            let quality = screen_chart_quality(s);
+            let y = padding_top + draw_height * (1.0 - quality);
+            format!("{x:.1},{y:.1}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Issue #906: pick the quality value the screen chart should plot for a   // @token-exempt: issue ref, not a color
+/// given sample, honoring the screen-state classification:
+///
+///   * `Live` -> raw `screen_quality` (fps/30 clamped).
+///   * `Static { held_fps, .. }` -> held value normalized the same way the
+///     live path does (held_fps / 30, clamped).
+///   * `NoFrames` -> raw zero (or whatever `screen_quality` resolved to,
+///     which is also zero in practice).
+///
+/// Pulled out so unit tests can drive the Y-coordinate decision without
+/// constructing a full polyline string.
+pub(crate) fn screen_chart_quality(sample: &SignalSample) -> f64 {
+    match sample.screen_state() {
+        ScreenSampleState::Static { held_fps, .. } => (held_fps / 30.0).clamp(0.0, 1.0),
+        // NoFrames and Live both use the recorded quality. NoFrames drops
+        // to zero (visually distinct from the flat held line above), and
+        // Live preserves the existing rendering behavior.
+        ScreenSampleState::Live | ScreenSampleState::NoFrames => sample.screen_quality,
+    }
+}
+
 /// Round a value up to a "nice" number for axis labels.
 fn nice_ceil(val: f64) -> f64 {
     if val <= 0.0 {
@@ -1514,6 +1785,7 @@ mod tests {
             screen_encoder_target_bitrate_kbps: 0,
             screen_adaptive_tier: String::new(),
             screen_cause_hint: String::new(),
+            peer_status_age_ms: None,
             latency_ms: 40.0,
             audio_enabled: true,
             video_enabled: true,
@@ -1602,6 +1874,9 @@ mod tests {
             screen_encoder_target_bitrate_kbps: 0,
             screen_adaptive_tier: String::new(),
             screen_cause_hint: String::new(),
+            screen_fps_held: None,
+            screen_bitrate_kbps_held: None,
+            peer_status_age_ms: None,
             latency_ms: 0.0,
         }
     }
@@ -1932,5 +2207,367 @@ mod tests {
         assert!((nice_ceil(150.0) - 200.0).abs() < 1e-9);
         assert!((nice_ceil(8.0) - 10.0).abs() < 1e-9);
         assert!((nice_ceil(0.0) - 10.0).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #906: static-vs-no-frames classification.                  // @token-exempt: issue ref, not a color
+    //
+    // Modern video codecs emit zero encoded frames during truly static
+    // screen-share content. The metrics then read `0fps | 0kbps`, which
+    // is visually indistinguishable from a broken encoder. The state
+    // machine holds the last-known value for up to 30s and renders
+    // a `(static)` annotation while the publisher's heartbeat is fresh
+    // (<5s old). Stale heartbeat or expired hold window falls back to
+    // `(no frames)` so the user can distinguish quiet desktop from
+    // broken connection.
+    // -----------------------------------------------------------------
+
+    /// Build a sample data builder pre-set with screen-enabled defaults so
+    /// each test only spells out the fields it cares about.
+    fn screen_sample_data() -> SampleData {
+        SampleData {
+            screen_enabled: true,
+            screen_fps: 12.5,
+            screen_bitrate_kbps: 850.0,
+            screen_resolution: "1280x720".to_string(),
+            screen_source_resolution: "1280x720".to_string(),
+            video_enabled: false,
+            audio_enabled: false,
+            peer_status_age_ms: Some(1_000.0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn screen_state_live_when_metrics_non_zero() {
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 1_000.0);
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.screen_state(), ScreenSampleState::Live);
+        // Held fields are None on a live sample so the tooltip / chart
+        // render the raw values directly.
+        assert!(s.screen_fps_held.is_none());
+        assert!(s.screen_bitrate_kbps_held.is_none());
+    }
+
+    #[test]
+    fn test_zero_with_recent_non_zero_renders_as_static() {
+        // Record a live sample, then a zero sample 2s later with the
+        // heartbeat fresh. The second sample should classify as Static
+        // and the tooltip should hold the prior FPS / kbps values.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(1_000.0); // 1s old -> fresh
+        history.push_sample_at(&zero, 2_000.0);
+
+        let s = &history.samples_vec()[1];
+        match s.screen_state() {
+            ScreenSampleState::Static {
+                held_fps,
+                held_bitrate_kbps,
+            } => {
+                assert!(
+                    (held_fps - 12.5).abs() < 1e-9,
+                    "expected held_fps 12.5, got {held_fps}"
+                );
+                assert!(
+                    (held_bitrate_kbps - 850.0).abs() < 1e-9,
+                    "expected held_bitrate 850, got {held_bitrate_kbps}"
+                );
+            }
+            other => panic!("expected Static, got {other:?}"),
+        }
+        // Tooltip wording: held values with `(static)` annotation.
+        let line = build_screen_tooltip_line(s, true);
+        assert!(
+            line.contains("12.5fps (static)"),
+            "missing 12.5fps (static) in {line}"
+        );
+        assert!(
+            line.contains("850kbps (static)"),
+            "missing 850kbps (static) in {line}"
+        );
+        // No no-frames marker.
+        assert!(!line.contains("(no frames)"));
+    }
+
+    #[test]
+    fn test_zero_with_stale_heartbeat_renders_as_no_frames() {
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        // Heartbeat is 7s stale -> NoFrames even though prior live value
+        // is in the hold window.
+        zero.peer_status_age_ms = Some(7_000.0);
+        history.push_sample_at(&zero, 2_000.0);
+
+        let s = &history.samples_vec()[1];
+        assert_eq!(s.screen_state(), ScreenSampleState::NoFrames);
+        let line = build_screen_tooltip_line(s, true);
+        assert!(
+            line.contains("0.0fps (no frames)"),
+            "missing 0.0fps (no frames) in {line}"
+        );
+        assert!(
+            line.contains("0kbps (no frames)"),
+            "missing 0kbps (no frames) in {line}"
+        );
+        assert!(!line.contains("(static)"));
+    }
+
+    #[test]
+    fn test_static_lasts_until_30s_then_falls_to_no_frames() {
+        // Record a live sample at t=0, then a zero sample at t=31s with
+        // the heartbeat still fresh. The hold window is 30s so the new
+        // sample should NOT hold the value any longer — `NoFrames` wins.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(1_000.0); // heartbeat fresh
+        history.push_sample_at(&zero, 31_000.0);
+
+        let s = &history.samples_vec()[1];
+        assert_eq!(s.screen_state(), ScreenSampleState::NoFrames);
+        let line = build_screen_tooltip_line(s, true);
+        assert!(
+            line.contains("(no frames)"),
+            "expected (no frames) in {line}"
+        );
+        assert!(!line.contains("(static)"));
+    }
+
+    #[test]
+    fn test_static_latches_across_consecutive_zero_samples() {
+        // Sequence: live @ 0s, zero @ 1s (Static, held=12.5), zero @ 2s.
+        // The third sample's own `screen_fps_held` should still be 12.5
+        // — the held value latches across consecutive zeros so the line
+        // stays flat without rescanning all the way back to the live one
+        // every sample.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&zero, 1_000.0);
+        history.push_sample_at(&zero, 2_000.0);
+
+        let samples = history.samples_vec();
+        for (idx, expected_state) in [1, 2].iter().map(|&i| {
+            (
+                i,
+                ScreenSampleState::Static {
+                    held_fps: 12.5,
+                    held_bitrate_kbps: 850.0,
+                },
+            )
+        }) {
+            assert_eq!(
+                samples[idx].screen_state(),
+                expected_state,
+                "sample idx {idx} state mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transition_back_to_non_zero_drops_annotation() {
+        // Sequence: live @ 0, zero @ 1 (Static), live @ 2. The third
+        // sample must classify as Live and the tooltip must not carry
+        // the `(static)` annotation.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&zero, 1_000.0);
+
+        // New live sample picks up at full fps.
+        let mut live2 = screen_sample_data();
+        live2.screen_fps = 14.0;
+        live2.screen_bitrate_kbps = 900.0;
+        live2.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&live2, 2_000.0);
+
+        let s = &history.samples_vec()[2];
+        assert_eq!(s.screen_state(), ScreenSampleState::Live);
+        assert!(s.screen_fps_held.is_none());
+        assert!(s.screen_bitrate_kbps_held.is_none());
+
+        let line = build_screen_tooltip_line(s, true);
+        assert!(line.contains("14.0fps"));
+        assert!(line.contains("900kbps"));
+        assert!(!line.contains("(static)"));
+        assert!(!line.contains("(no frames)"));
+    }
+
+    #[test]
+    fn test_no_held_value_when_no_prior_live() {
+        // First sample is itself zero — there is no prior live value to
+        // hold. The state must be NoFrames regardless of heartbeat
+        // freshness.
+        let mut history = PeerSignalHistory::new();
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(500.0); // fresh
+        history.push_sample_at(&zero, 1_000.0);
+
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.screen_state(), ScreenSampleState::NoFrames);
+        let line = build_screen_tooltip_line(s, true);
+        assert!(line.contains("0.0fps (no frames)"));
+        assert!(line.contains("0kbps (no frames)"));
+    }
+
+    #[test]
+    fn test_no_held_value_when_no_heartbeat_yet() {
+        // `peer_status_age_ms = None` means we haven't observed any
+        // heartbeat — be conservative and treat the zero as NoFrames.
+        // Otherwise we would paper over an unproven publisher with held
+        // values that may not be accurate.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = None;
+        history.push_sample_at(&zero, 1_000.0);
+
+        let s = &history.samples_vec()[1];
+        assert_eq!(s.screen_state(), ScreenSampleState::NoFrames);
+    }
+
+    #[test]
+    fn test_static_holds_bitrate_when_fps_is_live() {
+        // Edge: one metric is zero while the other is live. We classify
+        // by treating any non-zero metric as Live (so this is Live, not
+        // Static-half). Held fields are populated for the zero metric so
+        // a *future* sample where both go to zero can still pick up the
+        // bitrate from this sample's held field.
+        let mut history = PeerSignalHistory::new();
+        history.push_sample_at(&screen_sample_data(), 0.0);
+
+        let mut mixed = screen_sample_data();
+        mixed.screen_fps = 10.0;
+        mixed.screen_bitrate_kbps = 0.0;
+        mixed.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&mixed, 1_000.0);
+
+        let s = &history.samples_vec()[1];
+        // Live wins because screen_fps is non-zero.
+        assert_eq!(s.screen_state(), ScreenSampleState::Live);
+        // But the bitrate held value is populated so it's available for
+        // a future fully-zero sample.
+        assert_eq!(s.screen_fps_held, None);
+        assert_eq!(s.screen_bitrate_kbps_held, Some(850.0));
+    }
+
+    #[test]
+    fn test_chart_y_during_static_uses_held_value() {
+        // The screen chart polyline must plot Static samples at the held
+        // value's Y position instead of dropping to zero. We compare
+        // `screen_chart_quality` against the live sample's quality.
+        let mut history = PeerSignalHistory::new();
+        let live = screen_sample_data(); // screen_fps 12.5 -> quality 12.5/30
+        history.push_sample_at(&live, 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&zero, 1_000.0);
+
+        let samples = history.samples_vec();
+        let live_q = screen_chart_quality(&samples[0]);
+        let static_q = screen_chart_quality(&samples[1]);
+        assert!(
+            (live_q - 12.5 / 30.0).abs() < 1e-9,
+            "live sample quality unexpected: {live_q}"
+        );
+        // Static must equal the live value's quality (flat line) and
+        // must NOT be zero (which would be the bad pre-#906 behavior).  // @token-exempt: issue ref, not a color
+        assert!(
+            (static_q - 12.5 / 30.0).abs() < 1e-9,
+            "static sample chart Y should match held value, got {static_q}"
+        );
+        assert!(static_q > 0.0, "static chart Y must not flatline at zero");
+    }
+
+    #[test]
+    fn test_chart_y_during_no_frames_drops_to_zero() {
+        // NoFrames samples should plot at zero so the chart visually
+        // distinguishes them from static (held) periods.
+        let mut history = PeerSignalHistory::new();
+        let mut zero = screen_sample_data();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        // Stale heartbeat -> NoFrames.
+        zero.peer_status_age_ms = Some(10_000.0);
+        history.push_sample_at(&zero, 1_000.0);
+
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.screen_state(), ScreenSampleState::NoFrames);
+        let q = screen_chart_quality(s);
+        assert!(q.abs() < 1e-9, "NoFrames chart Y should be 0, got {q}");
+    }
+
+    #[test]
+    fn test_static_tooltip_preserves_resolution_prefix() {
+        // The `(static)` annotation only modifies the FPS / kbps tail.
+        // The resolution prefix (with tier label or arrow / badge) must
+        // still appear — we are not collapsing the line.
+        let mut history = PeerSignalHistory::new();
+        let mut live = screen_sample_data();
+        live.screen_resolution = "1920x1080".to_string();
+        live.screen_source_resolution = "1920x1080".to_string();
+        history.push_sample_at(&live, 0.0);
+
+        let mut zero = screen_sample_data();
+        zero.screen_resolution = "1920x1080".to_string();
+        zero.screen_source_resolution = "1920x1080".to_string();
+        zero.screen_fps = 0.0;
+        zero.screen_bitrate_kbps = 0.0;
+        zero.peer_status_age_ms = Some(500.0);
+        history.push_sample_at(&zero, 1_000.0);
+
+        let s = &history.samples_vec()[1];
+        let line = build_screen_tooltip_line(s, true);
+        assert!(
+            line.contains("Screen 1920x1080"),
+            "missing prefix in {line}"
+        );
+        assert!(line.contains("(FHD)"), "missing tier in {line}");
+        assert!(
+            line.contains("12.5fps (static)"),
+            "missing held fps in {line}"
+        );
+    }
+
+    #[test]
+    fn test_peer_status_age_ms_round_trips_through_sample_data() {
+        // Regression guard: forgetting to wire `peer_status_age_ms`
+        // through SampleData -> SignalSample would silently revert the
+        // classifier to NoFrames in every case.
+        let mut history = PeerSignalHistory::new();
+        let mut data = screen_sample_data();
+        data.peer_status_age_ms = Some(2_500.0);
+        history.push_sample_at(&data, 1_000.0);
+        let s = &history.samples_vec()[0];
+        assert_eq!(s.peer_status_age_ms, Some(2_500.0));
     }
 }

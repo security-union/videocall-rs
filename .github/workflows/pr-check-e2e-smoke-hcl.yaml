@@ -1,3 +1,18 @@
+# Per-PR E2E smoke check — runs the bvt1 Playwright project (10 tests,
+# ~40s test time) on every PR that touches code compiled into the E2E
+# Docker stack. Catches regressions before merge to PR-staging.
+#
+# This is NOT the full 226-test suite — that runs on push to PR-staging
+# and hcl-main via e2e-hcl.yaml. This workflow provides fast per-PR
+# signal: "is the app alive and can two users join a meeting?"
+#
+# The bvt1 project is defined in e2e/playwright.config.ts and covers:
+#   - Home page loads
+#   - Auth + display name handling
+#   - Single user can join a meeting
+#   - Two users can join and see each other
+#
+# See issue #745 for the gap this closes.
 name: E2E Smoke (HCL)
 
 on:

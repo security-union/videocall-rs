@@ -76,7 +76,7 @@ jobs:
           echo "Deploying images with tag: $TAG"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.0
 
       - name: Add NATS Helm repo
         run: |

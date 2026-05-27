@@ -187,19 +187,16 @@ fn check_subject_alt_names(cert: &X509Certificate<'_>) -> Result<(), String> {
     for ext in cert.extensions() {
         if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
             for name in &san.general_names {
+                // IPv4 127.0.0.1 is the 4 bytes [127, 0, 0, 1]; IPv6 ::1 is
+                // 16 bytes ending in 1. The dev cert is expected to carry the
+                // IPv4 form (the QUIC dial target is `https://127.0.0.1:4433`),
+                // so only that exact byte sequence counts.
                 match name {
                     GeneralName::DNSName(dns) if *dns == "localhost" => {
                         has_localhost_dns = true;
                     }
-                    GeneralName::IPAddress(bytes) => {
-                        // IPv4 127.0.0.1 is the 4 bytes [127, 0, 0, 1]; IPv6
-                        // ::1 is 16 bytes ending in 1. The dev cert is
-                        // expected to carry the IPv4 form (the QUIC dial
-                        // target is `https://127.0.0.1:4433`), so we only
-                        // accept that.
-                        if *bytes == [127, 0, 0, 1] {
-                            has_loopback_ip = true;
-                        }
+                    GeneralName::IPAddress(bytes) if *bytes == [127, 0, 0, 1] => {
+                        has_loopback_ip = true;
                     }
                     _ => {}
                 }

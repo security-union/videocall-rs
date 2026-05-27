@@ -3181,6 +3181,122 @@ pub fn AttendantsComponent(
                                                 },
                                             }
                                         }
+                                        // (а) Dock position dropdown — grouped with the tile-layout (density)
+                                        // button because both control how the meeting view is arranged.
+                                        // Keeping them adjacent so users see "view / layout" preferences
+                                        // together. The popup menu escapes the controls-secondary overflow
+                                        // clip via CSS (`overflow: visible` on the expanded state).
+                                        div { class: "dock-position-wrapper",
+                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                                button {
+                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                    title: "Dock position",
+                                                    r#type: "button",
+                                                    "aria-haspopup": "listbox",
+                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let opening = !dock_menu_open();
+                                                        dock_menu_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            mock_peers_open.set(false);
+
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        // Horizontal bar outline
+                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                        // Three dots inside the bar
+                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    }
+                                                }
+                                                if dock_menu_open() {
+                                                    div {
+                                                        class: "glass-select-menu",
+                                                        role: "listbox",
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Bottom"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Left"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Right"
+                                                        }
+                                                        // Separator
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            if autohide_enabled() {
+                                                                "Turn Hiding Off"
+                                                            } else {
+                                                                "Turn Hiding On"
+                                                            }
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                device_settings_initial_section
+                                                                    .set(Some("appearance".to_string()));
+                                                                device_settings_generation
+                                                                    .set(device_settings_generation() + 1);
+                                                                device_settings_open.set(true);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Dock Settings\u{2026}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
@@ -3227,118 +3343,6 @@ pub fn AttendantsComponent(
 
                                                 }
                                             },
-                                        }
-                                    }
-                                    // (а) Dock position dropdown — glass-select style
-                                    div { class: "dock-position-wrapper",
-                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
-                                            button {
-                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
-                                                title: "Dock position",
-                                                r#type: "button",
-                                                "aria-haspopup": "listbox",
-                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
-                                                onclick: move |e| {
-                                                    e.stop_propagation();
-                                                    let opening = !dock_menu_open();
-                                                    dock_menu_open.set(opening);
-                                                    if opening {
-                                                        density_open.set(false);
-                                                        mock_peers_open.set(false);
-
-                                                    }
-                                                },
-                                                svg {
-                                                    xmlns: "http://www.w3.org/2000/svg",
-                                                    width: "20",
-                                                    height: "20",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    // Horizontal bar outline
-                                                    rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
-                                                    // Three dots inside the bar
-                                                    circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                }
-                                            }
-                                            if dock_menu_open() {
-                                                div {
-                                                    class: "glass-select-menu",
-                                                    role: "listbox",
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Bottom);
-                                                            save_dock_position(DockPosition::Bottom);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Bottom"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Left);
-                                                            save_dock_position(DockPosition::Left);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Left"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Right);
-                                                            save_dock_position(DockPosition::Right);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Right"
-                                                    }
-                                                    // Separator
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            let new_val = !autohide_enabled();
-                                                            autohide_enabled.set(new_val);
-                                                            save_dock_autohide(new_val);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        if autohide_enabled() {
-                                                            "Turn Hiding Off"
-                                                        } else {
-                                                            "Turn Hiding On"
-                                                        }
-                                                    }
-                                                    div { class: "glass-select-separator" }
-                                                    div {
-                                                        class: "glass-select-option",
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            device_settings_initial_section
-                                                                .set(Some("appearance".to_string()));
-                                                            device_settings_generation
-                                                                .set(device_settings_generation() + 1);
-                                                            device_settings_open.set(true);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Dock Settings\u{2026}"
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     {

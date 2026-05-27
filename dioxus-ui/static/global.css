@@ -1637,6 +1637,11 @@ html[data-theme="light"] #invite-overlay p {
 .dock-bottom:hover .controls-secondary {
   max-width: 600px;
   opacity: 1;
+  /* Allow the dock-position dropdown menu (an absolutely-positioned child
+     of .dock-position-wrapper, which now lives inside .controls-secondary
+     so it sits next to the tile-layout / density button) to pop ABOVE the
+     action bar without being clipped by the collapse-time overflow:hidden. */
+  overflow: visible;
 }
 
 /* Vertical (left/right dock): collapse height */
@@ -1652,6 +1657,9 @@ html[data-theme="light"] #invite-overlay p {
 .dock-right:hover .controls-secondary {
   max-height: 500px;
   opacity: 1;
+  /* See note above — allow the dock dropdown to overflow sideways without
+     being clipped when the controls are fully expanded. */
+  overflow: visible;
 }
 
 /* Dock position dropdown — reuses glass-select design */

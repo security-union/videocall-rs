@@ -78,6 +78,10 @@ jobs:
         working-directory: backend-repo
         run: mkdir -p actix-api/target
 
+      - name: Generate WT dev cert for integration tests
+        working-directory: backend-repo
+        run: scripts/regen-dev-cert.sh --force
+
       - name: Run backend tests
         working-directory: backend-repo
         env:

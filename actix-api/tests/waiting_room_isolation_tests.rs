@@ -457,3 +457,162 @@ async fn test_observer_receives_session_assigned() {
 
     drop(ws_observer);
 }
+
+/// An observer sends a MEDIA PacketWrapper where `user_id` is spoofed to match
+/// an admitted peer (Alice). The server MUST drop this packet based on the
+/// sender's session role (observer), not the packet-asserted identity. Alice
+/// must NOT receive the spoofed packet.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_spoofed_user_id_still_dropped() {
+    let port = WR_PORT_BASE + 4;
+    setup(port).await;
+    let room = "wr-spoofed-user-id";
+
+    // Connect admitted Alice
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    // Connect observer
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Observer sends MEDIA with alice's user_id (spoofed)
+    let spoofed = make_media_packet("alice@test.com");
+    ws_obs
+        .send(Message::Binary(spoofed))
+        .await
+        .expect("send should succeed");
+
+    // Alice must NOT receive it
+    let packets = collect_packets_for(&mut ws_a, Duration::from_secs(2)).await;
+    let media: Vec<_> = packets
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+    assert!(
+        media.is_empty(),
+        "Spoofed user_id from observer MUST be dropped by inbound filter. Got {} MEDIA packets.",
+        media.len()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
+}
+
+/// An observer sends a MEDIA packet with `session_id` spoofed to match admitted
+/// Alice's session. This probes the `inner_session_self` self-echo suppression
+/// path: if the packet reached Alice, it would be dropped as a self-echo —
+/// giving the observer a per-recipient censorship primitive. The server's inbound
+/// filter blocks this packet before it ever reaches NATS, so neither Alice nor
+/// Bob should receive it.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_spoofed_session_id_still_dropped() {
+    let port = WR_PORT_BASE + 5;
+    setup(port).await;
+    let room = "wr-spoofed-session-id";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_b = make_admitted_token("bob@test.com", room, "Bob");
+    let mut ws_b = connect_with_token(port, &token_b).await;
+    let _sid_b = wait_for_session_assigned(&mut ws_b).await;
+    wait_for_meeting_started(&mut ws_b).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Build packet with spoofed session_id = Alice's session
+    let mut media = MediaPacket::new();
+    media.media_type = MediaType::AUDIO.into();
+    media.user_id = b"observer@test.com".to_vec();
+    media.data = vec![0xDE, 0xAD];
+
+    let mut wrapper = PacketWrapper::new();
+    wrapper.packet_type = PacketType::MEDIA.into();
+    wrapper.user_id = b"observer@test.com".to_vec();
+    wrapper.session_id = sid_a; // spoof Alice's session_id
+    wrapper.data = media
+        .write_to_bytes()
+        .expect("MediaPacket serialization should succeed");
+    let bytes = wrapper
+        .write_to_bytes()
+        .expect("PacketWrapper serialization should succeed");
+
+    ws_obs
+        .send(Message::Binary(bytes))
+        .await
+        .expect("send should succeed");
+
+    // Neither Alice nor Bob should receive it
+    let packets_b = collect_packets_for(&mut ws_b, Duration::from_secs(2)).await;
+    let media_b: Vec<_> = packets_b
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+    assert!(
+        media_b.is_empty(),
+        "Spoofed session_id from observer MUST be dropped. Bob got {} MEDIA packets.",
+        media_b.len()
+    );
+
+    drop(ws_a);
+    drop(ws_b);
+    drop(ws_obs);
+}
+
+/// An observer sends raw garbage bytes that cannot be parsed as a valid
+/// PacketWrapper. This verifies the fail-closed default (`.unwrap_or(false)`)
+/// drops malformed inputs even if they somehow bypass the inbound filter.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_unparseable_packet_dropped() {
+    let port = WR_PORT_BASE + 6;
+    setup(port).await;
+    let room = "wr-unparseable";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send garbage bytes
+    let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x00, 0x01];
+    ws_obs
+        .send(Message::Binary(garbage))
+        .await
+        .expect("send should succeed");
+
+    // Alice should not receive anything from this
+    let packets = collect_packets_for(&mut ws_a, Duration::from_secs(2)).await;
+    let non_meeting: Vec<_> = packets
+        .iter()
+        .filter(|p| {
+            p.packet_type != PacketType::MEETING.into()
+                && p.packet_type != PacketType::SESSION_ASSIGNED.into()
+        })
+        .collect();
+    assert!(
+        non_meeting.is_empty(),
+        "Unparseable packet from observer MUST be dropped. Got {} unexpected packets.",
+        non_meeting.len()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
+}

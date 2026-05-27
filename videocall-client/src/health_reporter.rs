@@ -1096,9 +1096,6 @@ impl HealthReporter {
             pb.encoder_fps_ratio = Some(encoder_fps_ratio);
         }
         if encoder_p75_peer_fps.is_finite() {
-            // Keep the old field populated for one release so existing
-            // dashboards/consumers do not break during the rename window.
-            pb.encoder_worst_peer_fps = Some(encoder_p75_peer_fps);
             pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);

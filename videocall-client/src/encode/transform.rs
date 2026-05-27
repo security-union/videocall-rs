@@ -71,12 +71,34 @@ pub fn transform_video_chunk(
     }
 }
 
+/// Build a `PacketWrapper` for an encoded screen-share frame.
+///
+/// `source_width` / `source_height` carry the publisher's native capture
+/// dimensions as reported by `MediaStreamTrack.getSettings()` (the monitor /
+/// window / tab pixel size). They are stamped into `VideoMetadata` so
+/// consumers can detect when the encoder downscaled the content in transit
+/// (e.g. a 2560×1440 desktop encoded down to 1280×720 under a tier
+/// constraint). Pass `0` for either dimension when the value is unknown —
+/// proto3 default-zero semantics make the consumer treat it as missing.
+///
+/// `encoder_target_bitrate_kbps` / `adaptive_tier` / `cause_hint` carry the
+/// publisher's encoder state so the consumer can render a `Cause:` line
+/// below the Screen row explaining *why* the encoder downscaled (issue
+/// #903). Pass `0` / empty strings when no constraint is engaged or the
+/// data isn't available — proto3 defaults make the consumer omit the line
+/// entirely in that case.
+#[allow(clippy::too_many_arguments)]
 pub fn transform_screen_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
     buffer: &mut [u8],
     user_id: &str,
     aes: Rc<Aes128State>,
+    source_width: u32,
+    source_height: u32,
+    encoder_target_bitrate_kbps: u32,
+    adaptive_tier: String,
+    cause_hint: String,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
@@ -91,6 +113,11 @@ pub fn transform_screen_chunk(
         video_metadata: Some(VideoMetadata {
             sequence,
             codec: get_video_codec().into(),
+            source_width,
+            source_height,
+            encoder_target_bitrate_kbps,
+            adaptive_tier,
+            cause_hint,
             ..Default::default()
         })
         .into(),

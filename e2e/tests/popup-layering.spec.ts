@@ -166,4 +166,45 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 5_000 });
     await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
   });
+
+  test("clicking outside the density popover closes it", async ({ page }) => {
+    await joinMeeting(page, "click_outside_density");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await page.locator("#grid-container").click({ position: { x: 10, y: 10 } });
+    await expect(page.locator(".density-popover")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  test("clicking outside the dock menu closes it", async ({ page }) => {
+    await joinMeeting(page, "click_outside_dock");
+
+    await openDockMenu(page);
+    await expect(page.locator(".glass-select-menu")).toBeVisible();
+
+    await page.locator("#grid-container").click({ position: { x: 10, y: 10 } });
+    await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  test("clicking outside the mock-peers popover closes it", async ({ page }) => {
+    await joinMeeting(page, "click_outside_mock_peers");
+
+    await page.locator(".video-controls-container").hover();
+    const mockBtn = page
+      .locator(".video-controls-container button")
+      .filter({ has: page.locator('.tooltip:has-text("Mock Peers")') });
+
+    // Skip if mock peers button doesn't exist
+    if ((await mockBtn.count()) === 0) {
+      test.skip();
+      return;
+    }
+
+    await mockBtn.first().click();
+    await expect(page.locator(".mock-peers-popover")).toBeVisible({ timeout: 5_000 });
+
+    await page.locator("#grid-container").click({ position: { x: 10, y: 10 } });
+    await expect(page.locator(".mock-peers-popover")).not.toBeVisible({ timeout: 3_000 });
+  });
 });

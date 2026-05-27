@@ -23,8 +23,9 @@ use std::sync::Arc;
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
     screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
-    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
-    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    MAX_BITRATE_SLEW_KBPS_PER_SEC, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
+    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -586,10 +587,26 @@ impl EncoderBitrateController {
         let tier_max = tier.max_bitrate_kbps as f64;
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
 
+        let outside_previous_tier =
+            self.last_target_bitrate_kbps > tier_max || self.last_target_bitrate_kbps < tier_min;
+        let bypass_slew = tier_changed
+            || outside_previous_tier
+            || self.last_target_bitrate_kbps <= 0.0
+            || dt <= 0.0;
+        let slewed = if bypass_slew {
+            tier_clamped
+        } else {
+            let max_delta = MAX_BITRATE_SLEW_KBPS_PER_SEC as f64 * dt;
+            tier_clamped.clamp(
+                self.last_target_bitrate_kbps - max_delta,
+                self.last_target_bitrate_kbps + max_delta,
+            )
+        };
+
         // Store encoder decision inputs for external observation (health reporting).
         self.last_fps_ratio = fps_received / target_fps;
-        self.last_bitrate_ratio = tier_clamped / ideal_for_tier;
-        self.last_target_bitrate_kbps = tier_clamped;
+        self.last_bitrate_ratio = slewed / ideal_for_tier;
+        self.last_target_bitrate_kbps = slewed;
 
         let should_log_summary =
             tier_changed || (now - self.last_aq_summary_ms >= AQ_SUMMARY_INTERVAL_MS);
@@ -602,14 +619,14 @@ impl EncoderBitrateController {
                  fps_ratio={:.2} bitrate_ratio={:.2} peers={}",
                 video_tier.label, self.quality_manager.video_tier_index(),
                 audio_tier.label, self.quality_manager.audio_tier_index(),
-                self.ideal_bitrate_kbps, tier_clamped,
+                self.ideal_bitrate_kbps, slewed,
                 self.last_fps_ratio, self.last_bitrate_ratio,
                 self.diagnostic_packets.peer_count(),
             );
         }
 
         self.last_correction_time = now;
-        Some(tier_clamped)
+        Some(slewed)
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -1850,6 +1867,148 @@ mod tests {
             (450.0..=550.0).contains(&final_bitrate),
             "PID should converge near ideal_bitrate ({ideal_bitrate_kbps}) with p75=28, \
              got {final_bitrate}"
+        );
+    }
+
+    // =====================================================================
+    // Slew-rate limiter and reconfigure-threshold tests
+    // =====================================================================
+
+    /// Warm a freshly-built controller through initialization without leaving
+    /// behind a `last_target_bitrate_kbps` baseline that would interfere with
+    /// slew-limit assertions. Returns the time of the last call so the caller
+    /// can keep advancing the clock monotonically.
+    fn warm_up_for_slew_test(
+        controller: &mut EncoderBitrateController,
+        base_time: f64,
+        fps: f32,
+        bitrate_kbps: u32,
+    ) -> f64 {
+        for i in 0..3 {
+            let t = base_time + (i as f64 * 1100.0);
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", fps, bitrate_kbps),
+                t,
+            );
+        }
+        base_time + 2.0 * 1100.0
+    }
+
+    #[test]
+    fn test_slew_limit_caps_per_tick_swing() {
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let target_fps = Arc::new(AtomicU32::new(15));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+
+        let base_time = 100_000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 15.0, 2500);
+
+        controller.last_target_bitrate_kbps = 1500.0;
+        controller.last_update = last_warm;
+
+        let max_delta = MAX_BITRATE_SLEW_KBPS_PER_SEC as f64;
+        let mut prev = 1500.0;
+        let mut now = last_warm;
+        for tick in 1..=7 {
+            now += 1100.0;
+            let result = controller
+                .process_diagnostics_packet_with_time(
+                    create_test_packet("s", "peer1", 15.0, 2500),
+                    now,
+                )
+                .expect("slew tick should emit a bitrate");
+            let dt_seconds = 1.1;
+            let allowed = max_delta * dt_seconds;
+            assert!(
+                (result - prev).abs() <= allowed + 0.5,
+                "tick {tick}: bitrate {result:.1} jumped more than {allowed:.1} kbps \
+                 from previous {prev:.1}"
+            );
+            prev = result;
+        }
+    }
+
+    #[test]
+    fn test_slew_limit_handles_dt_zero() {
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let target_fps = Arc::new(AtomicU32::new(15));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+
+        let base_time = 100_000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 15.0, 2500);
+
+        let now = last_warm + 1100.0;
+        let first = controller
+            .process_diagnostics_packet_with_time(create_test_packet("s", "peer1", 15.0, 2500), now)
+            .expect("first tick should emit a bitrate");
+
+        controller.last_correction_time = 0.0;
+        controller.last_target_bitrate_kbps = 200.0;
+
+        let second = controller
+            .process_diagnostics_packet_with_time(create_test_packet("s", "peer1", 15.0, 2500), now)
+            .expect("duplicate-timestamp tick should still emit a bitrate");
+
+        let max_step = MAX_BITRATE_SLEW_KBPS_PER_SEC as f64;
+        assert!(
+            (second - 200.0).abs() > max_step,
+            "with dt=0 the slew limit must be bypassed: prev=200, got {second} \
+             (first={first})"
+        );
+    }
+
+    #[test]
+    fn test_slew_limit_bypassed_on_tier_downshift() {
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let target_fps = Arc::new(AtomicU32::new(15));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+
+        let base_time = 100_000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 15.0, 2500);
+
+        let high_max = SCREEN_QUALITY_TIERS[0].max_bitrate_kbps as f64;
+        controller.last_target_bitrate_kbps = high_max;
+        controller.last_update = last_warm;
+        controller.last_correction_time = 0.0;
+
+        let low_index = SCREEN_QUALITY_TIERS.len() - 1;
+        controller
+            .quality_manager
+            .force_video_step_to(low_index, last_warm);
+        controller.ideal_bitrate_kbps = SCREEN_QUALITY_TIERS[low_index].ideal_bitrate_kbps;
+
+        let low_tier_max = SCREEN_QUALITY_TIERS[low_index].max_bitrate_kbps as f64;
+        let now = last_warm + 1100.0;
+        let result = controller
+            .process_diagnostics_packet_with_time(create_test_packet("s", "peer1", 15.0, 200), now)
+            .expect("downshift tick should emit a bitrate");
+
+        assert!(
+            result <= low_tier_max,
+            "after downshift, output {result} must respect new tier max {low_tier_max}"
+        );
+        let max_step = MAX_BITRATE_SLEW_KBPS_PER_SEC as f64 * 1.1;
+        assert!(
+            high_max - result > max_step,
+            "downshift drop ({} -> {}) must exceed slew step ({}); slew was not bypassed",
+            high_max,
+            result,
+            max_step,
+        );
+    }
+
+    #[test]
+    fn test_bitrate_change_threshold_is_010() {
+        assert!(
+            (crate::constants::BITRATE_CHANGE_THRESHOLD - 0.10).abs() < f64::EPSILON,
+            "BITRATE_CHANGE_THRESHOLD must be 0.10 to keep encoder reconfigures rare; \
+             changing it forces a review of keyframe-cost trade-offs"
         );
     }
 }

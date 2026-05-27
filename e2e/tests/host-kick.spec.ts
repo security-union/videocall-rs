@@ -71,7 +71,7 @@ async function admitGuestIfNeeded(
     const admitButton = hostPage.getByTitle("Admit").first();
     await expect(admitButton).toBeVisible({ timeout: 20_000 });
     await hostPage.waitForTimeout(1000);
-    await admitButton.dispatchEvent("click");
+    await admitButton.click();
     await hostPage.waitForTimeout(3000);
 
     const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
@@ -194,6 +194,10 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling before
+      // asserting on remote tiles (mirrors two-users-meeting.spec.ts).
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the peer connection to establish (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -285,6 +289,9 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
+      // Allow peer discovery to propagate through signaling.
+      await hostPage.waitForTimeout(5000);
+
       // Wait for the peer connection (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -361,21 +368,13 @@ test.describe("Host kick controls", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Wait for the host's own canvas tile to render.
-      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-        timeout: 30_000,
-      });
+      // The host's own session is excluded from display_peers, so when
+      // alone in the meeting no tiles render — the invite overlay appears.
+      await expect(hostPage.locator("#invite-overlay")).toBeVisible({ timeout: 30_000 });
+      await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(0);
+      await expect(hostPage.locator(".grid-item")).toHaveCount(0);
 
-      // Hover the host's tile to ensure that if any host-actions button
-      // existed, its hover-gated visibility would not hide it from the
-      // assertion. There should still be zero such buttons.
-      const hostTile = hostPage.locator(".grid-item").first();
-      await hostTile.hover();
-      await hostPage.waitForTimeout(500);
-
-      // ---- The host's own tile must NOT render the three-dot host-actions
-      // button. With only the host present, there must be zero buttons
-      // anywhere. ----
+      // With zero tiles rendered, there must be zero host-actions buttons.
       await expect(hostPage.locator(".tile-mute-btn")).toHaveCount(0);
       await expect(hostPage.getByTitle("Host actions")).toHaveCount(0);
     } finally {

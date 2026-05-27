@@ -12,6 +12,7 @@ message PacketWrapper {
     MEETING = 7;
     SESSION_ASSIGNED = 8;
     CONGESTION = 9;
+    PEER_EVENT = 10;
   }
   
   PacketType packet_type = 1;

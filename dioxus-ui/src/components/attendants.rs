@@ -83,6 +83,21 @@ pub enum ScreenShareState {
     Active,
 }
 
+/// UI state of the screen-share visibility toast (HCL issue 893). @token-exempt
+///
+/// Walks through `Starting` -> `SuccessfullyShared` (on the first
+/// `PEER_EVENT(screen_decode_started)` ack from any peer) or
+/// `Failed(message)` (on a 10s timeout with no ack).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareToastState {
+    /// Local screen-share has started but no peer has confirmed visibility yet.
+    Starting,
+    /// At least one peer has acknowledged decoding our screen-share.
+    SuccessfullyShared,
+    /// The visibility window elapsed without any peer ack.
+    Failed(String),
+}
+
 /// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
 ///
 /// Safari requires `getDisplayMedia()` to be called synchronously within a
@@ -523,6 +538,8 @@ pub fn AttendantsComponent(
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+    let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
+    let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
 
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
@@ -786,6 +803,9 @@ pub fn AttendantsComponent(
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let transport_pref = (transport_pref_ctx.0)();
+
+    // Create the appearance settings signal on_peer_joined / on_peer_left callbacks
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -1144,46 +1164,84 @@ pub fn AttendantsComponent(
                     }
                 }))
             },
+            on_peer_event: Some(VcCallback::from(
+                move |(source_user_id, event_type, _stream_id): (String, String, String)| {
+                    if event_type != videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
+                        log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
+                        return;
+                    }
+                    log::info!("PEER_EVENT screen_decode_started received from {source_user_id}");
+                    let mut screen_share_toast_state = screen_share_toast_state;
+                    let mut screen_share_toast_timer = screen_share_toast_timer;
+                    if !matches!(
+                        screen_share_toast_state.peek().as_ref(),
+                        Some(ScreenShareToastState::Starting)
+                    ) {
+                        return;
+                    }
+                    screen_share_toast_state.set(Some(ScreenShareToastState::SuccessfullyShared));
+                    screen_share_toast_timer.set(Some(Timeout::new(4_000, move || {
+                        let mut s = screen_share_toast_state;
+                        if matches!(
+                            s.peek().as_ref(),
+                            Some(ScreenShareToastState::SuccessfullyShared)
+                        ) {
+                            s.set(None);
+                        }
+                    })));
+                },
+            )),
             on_peer_left: {
                 Some(VcCallback::from(
                     move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
-                        let mut toast_counter = toast_counter;
-                        let mut peer_toasts = peer_toasts;
-                        let mut toast_version = toast_version;
-                        let id = *toast_counter.peek();
-                        toast_counter.set(id + 1);
-                        let mut current = peer_toasts.peek().clone();
-                        current.push((id, display_name, user_id, false));
-                        peer_toasts.set(current);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
-                        }
-                        // Defer the leave sound: only play if the toast still exists
-                        // after 500ms (i.e. no join event cancelled it).
-                        Timeout::new(500, move || {
-                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                                play_user_left();
-                            }
-                        })
-                        .forget();
-                        // Schedule toast removal after 8 seconds.
-                        Timeout::new(8_000, move || {
-                            let updated: Vec<_> = peer_toasts
-                                .peek()
-                                .iter()
-                                .filter(|(tid, _, _, _)| *tid != id)
-                                .cloned()
-                                .collect();
-                            peer_toasts.set(updated);
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
+
+                        if show_toast {
+                            let mut toast_counter = toast_counter;
+                            let mut peer_toasts = peer_toasts;
+                            let mut toast_version = toast_version;
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            let mut current = peer_toasts.peek().clone();
+                            current.push((id, display_name, user_id, false));
+                            peer_toasts.set(current);
                             {
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                        })
-                        .forget();
+                            // Defer the leave sound: only play if the toast still exists
+                            // after 500ms (i.e. no join event cancelled it).
+                            Timeout::new(500, move || {
+                                if play_sound
+                                    && peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id)
+                                {
+                                    play_user_left();
+                                }
+                            })
+                            .forget();
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else if play_sound {
+                            play_user_left();
+                        }
                     },
                 ))
             },
@@ -1197,6 +1255,11 @@ pub fn AttendantsComponent(
                             user_id,
                             session_id
                         );
+
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -1245,8 +1308,10 @@ pub fn AttendantsComponent(
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
-                        if !suppress_toast {
-                            play_user_joined();
+                        if !suppress_toast && show_toast {
+                            if play_sound {
+                                play_user_joined();
+                            }
                             let id = *toast_counter.peek();
                             toast_counter.set(id + 1);
                             current.push((id, display_name, user_id, true));
@@ -1270,6 +1335,9 @@ pub fn AttendantsComponent(
                             })
                             .forget();
                         } else {
+                            if !suppress_toast && play_sound {
+                                play_user_joined();
+                            }
                             peer_toasts.set(current);
                         }
 
@@ -1583,7 +1651,6 @@ pub fn AttendantsComponent(
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
-    let appearance_settings = use_signal(load_appearance_settings_from_storage);
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
@@ -2434,8 +2501,108 @@ pub fn AttendantsComponent(
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() || show_muted_toast() || show_video_off_toast() {
+                if !peer_toasts().is_empty()
+                    || show_muted_toast()
+                    || show_video_off_toast()
+                    || screen_share_toast_state().is_some()
+                {
                     div { class: "peer-toasts",
+                        // Screen-share visibility toast (HCL issue 893). @token-exempt
+                        // Rendered first so it sits above other transient toasts.
+                        {
+                            let toast = screen_share_toast_state.read().clone();
+                            match toast {
+                                Some(ScreenShareToastState::Starting) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-loading screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Starting to share content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                path { d: "M21 12a9 9 0 1 1-6.219-8.56" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Starting to share content..."
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::SuccessfullyShared) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-success screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Others can now see your shared content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                polyline { points: "20 6 9 17 4 12" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Others can now see your shared content"
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::Failed(msg)) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-error screen-share-toast",
+                                        role: "alert",
+                                        aria_live: "assertive",
+                                        aria_label: "Screen share visibility error",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "10" }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "8",
+                                                    x2: "12",
+                                                    y2: "12",
+                                                }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "16",
+                                                    x2: "12.01",
+                                                    y2: "16",
+                                                }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{msg}" }
+                                        }
+                                    }
+                                },
+                                None => rsx! {},
+                            }
+                        }
                         if show_muted_toast() {
                             div { class: "peer-toast toast-left",
                                 span { class: "toast-icon",
@@ -3002,7 +3169,8 @@ pub fn AttendantsComponent(
                                             DensityModeButton {
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
-                                                onclick: move |_| {
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
                                                     let opening = !density_open();
                                                     density_open.set(opening);
                                                     if opening {
@@ -3016,7 +3184,8 @@ pub fn AttendantsComponent(
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
-                                                onclick: move |_| {
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
                                                     let opening = !mock_peers_open();
                                                     mock_peers_open.set(opening);
                                                     if opening {
@@ -3265,16 +3434,48 @@ pub fn AttendantsComponent(
                                     },
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
+                                        let mut screen_share_toast_state = screen_share_toast_state;
+                                        let mut screen_share_toast_timer = screen_share_toast_timer;
                                         match event {
                                             ScreenShareEvent::Started(_stream) => {
                                                 screen_share_state.set(ScreenShareState::Active);
+                                                screen_share_toast_state
+                                                    .set(Some(ScreenShareToastState::Starting));
+                                                screen_share_toast_timer.set(Some(Timeout::new(
+                                                    10_000,
+                                                    move || {
+                                                        let mut s = screen_share_toast_state;
+                                                        if matches!(
+                                                            s.peek().as_ref(),
+                                                            Some(ScreenShareToastState::Starting)
+                                                        ) {
+                                                            s.set(Some(ScreenShareToastState::Failed(
+                                                                "No peers received the shared content within 10 seconds."
+                                                                    .to_string(),
+                                                            )));
+                                                            let mut t = screen_share_toast_timer;
+                                                            t.set(Some(Timeout::new(
+                                                                6_000,
+                                                                move || {
+                                                                    let mut s2 =
+                                                                        screen_share_toast_state;
+                                                                    s2.set(None);
+                                                                },
+                                                            )));
+                                                        }
+                                                    },
+                                                )));
                                             }
                                             ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                             }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                                 user_error.set(Some(format!("Screen share failed: {msg}")));
                                             }
                                         }
@@ -3391,6 +3592,10 @@ pub fn AttendantsComponent(
 
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| mock_peers_open.set(false),
+                    }
                     div { class: "mock-peers-popover",
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
@@ -3435,8 +3640,20 @@ pub fn AttendantsComponent(
                     }
                 }
 
+                // Dock menu backdrop (rendered outside action bar so click-outside works)
+                if dock_menu_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| dock_menu_open.set(false),
+                    }
+                }
+
                 // Density mode popover
                 if !has_screen_share && density_open() {
+                    div {
+                        class: "popover-backdrop",
+                        onclick: move |_| density_open.set(false),
+                    }
                     div { class: "density-popover",
                         for mode in DENSITY_MODES {
                             div {

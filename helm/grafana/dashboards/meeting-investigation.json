@@ -2466,7 +2466,7 @@
           },
           "targets": [
             {
-              "expr": "videocall_encoder_p75_peer_fps{meeting_id=~\"$meeting\"} or videocall_encoder_worst_peer_fps{meeting_id=~\"$meeting\"}",
+              "expr": "videocall_encoder_p75_peer_fps{meeting_id=~\"$meeting\"}",
               "legendFormat": "{{display_name}} p75_peer",
               "refId": "A"
             },

@@ -61,7 +61,7 @@ test.describe("Meetings", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  test("home page loads with meeting form", async ({ page }) => {
+  test("home page loads with meeting form @bvt0 @bvt1", async ({ page }) => {
     await page.goto("/");
     await page.waitForTimeout(1500);
     await expect(page.locator("h1")).toContainText("Concept Car");
@@ -74,14 +74,14 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(1500);
   });
 
-  test("browser tab title is exactly 'videocall.rs'", async ({ page }) => {
+  test("browser tab title is exactly 'videocall.rs' @bvt1", async ({ page }) => {
     // Regression guard: the title was briefly 'videocall.rs (Dioxus)' during
     // earlier UX work. The final state must be the bare brand name.
     await page.goto("/");
     await expect(page).toHaveTitle(/videocall\.rs|Concept Car/);
   });
 
-  test("display name input starts empty in a fresh session", async ({ page }) => {
+  test("display name input starts empty in a fresh session @bvt1", async ({ page }) => {
     // In a fresh browser context (no localStorage), the controlled display
     // name input should start with an empty value.
     await page.goto("/");
@@ -89,7 +89,7 @@ test.describe("Meetings", () => {
     await expect(page.locator("#username")).toHaveValue("");
   });
 
-  test("can join a meeting by filling the form", async ({ page }) => {
+  test("can join a meeting by filling the form @bvt1", async ({ page }) => {
     await page.goto("/");
     await page.waitForTimeout(1500);
     // Fill meeting-id first (has oninput handler that triggers re-render),
@@ -146,7 +146,7 @@ test.describe("Meetings", () => {
     await page.waitForTimeout(2000);
   });
 
-  test("display name is saved to localStorage on form submit", async ({ page }) => {
+  test("display name is saved to localStorage on form submit @bvt1", async ({ page }) => {
     // The display name should be saved to localStorage when "Start or Join
     // Meeting" is clicked (not on keystroke). Verify by joining, then
     // navigating back to the home page and checking the input is pre-filled.
@@ -640,7 +640,11 @@ test.describe("Meetings list (merged feed)", () => {
     await waitForServices();
   });
 
-  test("section header reads 'Meetings' with a count badge", async ({ context, baseURL, page }) => {
+  test("section header reads 'Meetings' with a count badge @bvt1", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
     // Use a dedicated user to keep the assertion stable regardless of any
     // residual seed data left over from earlier tests.
     const email = `meetings-header-${Date.now()}@videocall.rs`;

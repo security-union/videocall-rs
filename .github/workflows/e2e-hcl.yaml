@@ -105,7 +105,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 60
     concurrency:
-      group: hcl-ci-heavy-workload
+      group: hcl-ci-e2e
       cancel-in-progress: false
     needs: [check-permissions]
     if: |
@@ -164,11 +164,25 @@ jobs:
           npm ci
           npx playwright install chromium
 
+      # Regenerate the WT dev cert + DER-SHA-256 hash file.
+      # Required for any WT-only spec: Chromium 145 ignores
+      # `--ignore-certificate-errors-spki-list` for QUIC, so the wasm client
+      # passes the hash via `serverCertificateHashes` (constraints: ECDSA
+      # P-256, validity <= 14 days, hash of DER cert). Cannot be checked
+      # into git because of the 14-day cap.
+      - name: Generate short-lived WebTransport dev cert
+        run: bash scripts/regen-dev-cert.sh --force
+
+      - name: Tear down any prior E2E stack state
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down --remove-orphans || true
+
       - name: Build E2E stack images
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
 
       - name: Start E2E stack
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+        env:
+          DIOXUS_SERVE_MODE: static
 
       - name: Wait for services to be healthy
         run: |

@@ -37,7 +37,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 20
     concurrency:
-      group: hcl-ci-heavy-workload
+      group: hcl-ci-backend
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4.2.0
@@ -77,6 +77,10 @@ jobs:
       - name: Pre-create target dirs to prevent Docker from initializing them as root
         working-directory: backend-repo
         run: mkdir -p actix-api/target
+
+      - name: Generate WT dev cert for integration tests
+        working-directory: backend-repo
+        run: scripts/regen-dev-cert.sh --force
 
       - name: Run backend tests
         working-directory: backend-repo

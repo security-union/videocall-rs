@@ -528,9 +528,8 @@ pub fn DeviceSettingsModal(
                                             role: "radiogroup",
                                             "aria-labelledby": "transport-segmented-label",
                                             for option in [
-                                                (TransportPreference::Auto, "Auto", "transport-radio-auto"),
-                                                (TransportPreference::WebTransportOnly, "WebTransport", "transport-radio-webtransport"),
-                                                (TransportPreference::WebSocketOnly, "WebSocket", "transport-radio-websocket"),
+                                                (TransportPreference::WebTransport, "WebTransport (default)", "transport-radio-webtransport"),
+                                                (TransportPreference::WebSocket, "WebSocket", "transport-radio-websocket"),
                                             ] {
                                                 {
                                                     let (value, label, test_id) = option;
@@ -554,8 +553,9 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Hidden for Auto since pinning Auto is a no-op.
-                                    if pending_protocol() != TransportPreference::Auto {
+                                    // Hidden for the default (WebTransport) since pinning the
+                                    // implicit default is a no-op.
+                                    if pending_protocol() != TransportPreference::default() {
                                         div { class: "device-setting-group sticky-protocol-row",
                                             div { class: "sticky-protocol-row-inner",
                                                 div { class: "sticky-protocol-text",
@@ -593,8 +593,8 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Auto+sticky is a silent no-op, so suppress the advisory there.
-                                    if sticky_transport() && pending_protocol() != TransportPreference::Auto {
+                                    // Default+sticky is a silent no-op, so suppress the advisory there.
+                                    if sticky_transport() && pending_protocol() != TransportPreference::default() {
                                         div {
                                             class: "settings-info-panel",
                                             role: "note",
@@ -631,7 +631,7 @@ pub fn DeviceSettingsModal(
                                                     "Protocol pinned"
                                                 }
                                                 p { class: "settings-info-panel-text",
-                                                    "This protocol will be used on every future page load. To clear it, switch to Auto. Picking a different explicit protocol replaces the saved choice."
+                                                    "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
                                                 }
                                             }
                                         }
@@ -649,15 +649,18 @@ pub fn DeviceSettingsModal(
                                                 "data-testid": "transport-apply-button",
                                                 onclick: move |_| {
                                                     let pref = pending_protocol();
-                                                    match (pref, sticky_transport()) {
-                                                        (TransportPreference::Auto, _) => {
+                                                    let is_default = pref == TransportPreference::default();
+                                                    match (is_default, sticky_transport()) {
+                                                        // Default + not sticky: clear all storage so the
+                                                        // implicit default takes over on reload.
+                                                        (true, false) => {
                                                             clear_transport_sticky_and_pref();
                                                         }
                                                         (_, true) => {
                                                             save_transport_preference(pref);
                                                             save_transport_sticky(true);
                                                         }
-                                                        (_, false) => {
+                                                        (false, false) => {
                                                             // Session-scoped: survives the reload only.
                                                             save_transport_preference_session(pref);
                                                         }

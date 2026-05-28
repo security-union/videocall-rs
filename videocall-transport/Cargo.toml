@@ -45,9 +45,12 @@ features = [
     "WebTransport",
     "WebTransportBidirectionalStream",
     "WebTransportDatagramDuplexStream",
+    "WebTransportHash",
+    "WebTransportOptions",
     "WebTransportReceiveStream",
     "WritableStream",
     "WritableStreamDefaultWriter",
     "ReadableStreamReadResult",
     "WebTransportSendStream",
+    "Window",
 ]

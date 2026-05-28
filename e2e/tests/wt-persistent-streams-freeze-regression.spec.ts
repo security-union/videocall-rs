@@ -73,13 +73,15 @@
  * `WEBTRANSPORT_ENABLED=false` as well.
  *
  * With sticky `vc_transport_preference=webtransport`, the client picks
- * `TransportPreference::WebTransportOnly`, which forces the connection
- * to `https://127.0.0.1:4433` and explicitly empties the WebSocket URL
- * list (see `resolve_transport_config` in `dioxus-ui/src/context.rs`).
- * Against the current e2e stack that connection has nowhere to land,
- * the peer tile never appears, and every assertion below fails for
- * infrastructure reasons unrelated to the architectural property under
- * test.
+ * `TransportPreference::WebTransport`, which (since the
+ * protocol-settings-simplification rollout) advertises BOTH URL lists to
+ * the connection manager — the WT-with-WS-fallback shape that used to
+ * live under the now-removed `Auto` variant. This spec was originally
+ * written against the older `WebTransportOnly` variant (which emptied
+ * the WS list and provided no fallback); the current model can therefore
+ * still elect a WebSocket candidate against the e2e stack and would not
+ * exercise the "WT-only writer topology" architectural property the
+ * spec was meant to catch.
  *
  * The test is therefore marked `test.fixme()` to land the regression
  * scaffolding without breaking the green push-e2e-hcl pipeline. The

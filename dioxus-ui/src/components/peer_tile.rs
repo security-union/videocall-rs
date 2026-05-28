@@ -301,6 +301,7 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut audio_enabled = audio_enabled;
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -308,6 +309,8 @@ pub fn PeerTile(
                                     api_client.mute_participant(&meeting_id, &peer_uid).await
                                 {
                                     log::warn!("mute_participant failed: {e}");
+                                } else {
+                                    audio_enabled.set(false);
                                 }
                             }
                             Err(e) => log::warn!("meeting_api_client error: {e}"),
@@ -329,6 +332,7 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut video_enabled = video_enabled;
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -337,6 +341,8 @@ pub fn PeerTile(
                                     .await
                                 {
                                     log::warn!("disable_video_participant failed: {e}");
+                                } else {
+                                    video_enabled.set(false);
                                 }
                             }
                             Err(e) => log::warn!("meeting_api_client error: {e}"),

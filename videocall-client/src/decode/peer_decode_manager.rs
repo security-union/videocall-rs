@@ -330,13 +330,26 @@ pub struct Peer {
     last_audio_frame_ms: u64,
 }
 
-/// HCL bug #1: how long after a media frame we still trust the live media
-/// signal over a `metadata.X_enabled = false` heartbeat. The publisher emits
-/// heartbeats at ~1Hz (see `microphone_encoder.rs::605`), so a 2000ms window
-/// absorbs one full heartbeat period plus jitter. Heartbeats older than this
-/// window are presumed to reflect the publisher's CURRENT state and are
-/// applied normally.
-const MEDIA_FRESH_WINDOW_MS: u64 = 2000;
+/// HCL bug #1: window during which a recent media frame suppresses a stale
+/// negative heartbeat. Set to match the publisher's heartbeat cadence
+/// (`HEARTBEAT_KEEPALIVE_INTERVAL_MS = 5000ms`, see
+/// `videocall-aq/src/constants.rs`).
+///
+/// Heartbeats are sent over lossy datagrams (see
+/// `videocall-client/src/connection/connection.rs`) and can arrive up to
+/// one full cadence late on bad links (mobile, 3G, congested WT). A
+/// heartbeat carrying `screen_enabled = false` sent at t=0 might land at
+/// t=4.5s — well after the first SCREEN frame of a freshly-started share
+/// has already set the local flag to true. If the freshness window were
+/// shorter than the cadence, the stale heartbeat would clobber the live
+/// flag back to false, collapse the split layout, and re-introduce the
+/// "shared content shown in a small tile only" symptom this fix exists
+/// to prevent.
+///
+/// 5000ms is the minimum value that covers the worst case while still
+/// honouring genuine "publisher stopped sharing" transitions on the
+/// NEXT heartbeat after the window expires.
+const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 
 /// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
 /// arrives, given:
@@ -1880,15 +1893,20 @@ mod tests {
     /// The user-visible symptom of regressing this is the split-screen
     /// layout collapsing for one heartbeat period after every SCREEN
     /// keyframe on WebTransport.
+    ///
+    /// Uses `MEDIA_FRESH_WINDOW_MS - 100` so the test tracks the constant
+    /// rather than baking in a literal — if the window is widened or
+    /// narrowed in future, the test stays load-bearing.
     #[test]
     fn apply_hb_flag_keeps_current_when_media_is_fresh() {
-        // current=true, hb=false, frame at 4500ms, now at 5000ms (delta 500ms).
-        // Must KEEP true (frame is well within the 2000ms window).
+        let delta = MEDIA_FRESH_WINDOW_MS - 100;
+        let now = 10_000_u64;
+        let last_frame = now - delta;
         assert!(apply_heartbeat_enabled_flag(
-            true,  /* current */
-            false, /* heartbeat */
-            4_500, /* last_frame_ms */
-            5_000  /* now_ms */
+            true,       /* current */
+            false,      /* heartbeat */
+            last_frame, /* last_frame_ms */
+            now,        /* now_ms */
         ));
     }
 
@@ -1896,15 +1914,65 @@ mod tests {
     /// window must let the heartbeat win — the publisher has genuinely
     /// stopped sharing, and a single very-old frame should not pin the
     /// flag on forever.
+    ///
+    /// Uses `MEDIA_FRESH_WINDOW_MS + 100` so the test tracks the constant.
     #[test]
     fn apply_hb_flag_heartbeat_wins_when_media_is_stale() {
-        // Frame at 1000ms, now at 5000ms (delta 4000ms > 2000ms window).
+        let delta = MEDIA_FRESH_WINDOW_MS + 100;
+        let now = 10_000_u64;
+        let last_frame = now - delta;
         assert!(!apply_heartbeat_enabled_flag(
-            true,  /* current */
-            false, /* heartbeat */
-            1_000, /* last_frame_ms */
-            5_000  /* now_ms */
+            true,       /* current */
+            false,      /* heartbeat */
+            last_frame, /* last_frame_ms */
+            now,        /* now_ms */
         ));
+    }
+
+    /// Boundary test: pin the 5000ms cadence value explicitly so a
+    /// future "let's shrink the window back to 2000ms" change fails
+    /// loudly. The PR-review fix raised the window to match
+    /// `HEARTBEAT_KEEPALIVE_INTERVAL_MS = 5000ms` because heartbeats
+    /// ride lossy datagrams and can arrive up to one full cadence late
+    /// on bad links — a sub-cadence window lets a stale heartbeat
+    /// clobber a live SCREEN stream on WT/3G/mobile and re-introduces
+    /// the "shared content in a small tile only" bug.
+    #[test]
+    fn apply_hb_flag_5000ms_window_covers_heartbeat_cadence() {
+        // The constant itself must be ≥ 5000ms.
+        assert!(
+            MEDIA_FRESH_WINDOW_MS >= 5_000,
+            "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
+             a shorter window lets a stale heartbeat clobber live media on lossy WT"
+        );
+
+        let now = 10_000_u64;
+
+        // A 4900ms-old frame is still inside the 5000ms window → KEEP.
+        let fresh = apply_heartbeat_enabled_flag(
+            true,        /* current */
+            false,       /* heartbeat */
+            now - 4_900, /* last_frame_ms — 4900ms ago */
+            now,
+        );
+        assert!(
+            fresh,
+            "frame 4900ms old must still suppress a stale heartbeat (worst-case \
+             cadence-late heartbeat is up to 5000ms behind)"
+        );
+
+        // A 5100ms-old frame is outside the window → heartbeat wins.
+        let stale = apply_heartbeat_enabled_flag(
+            true,        /* current */
+            false,       /* heartbeat */
+            now - 5_100, /* last_frame_ms — 5100ms ago */
+            now,
+        );
+        assert!(
+            !stale,
+            "frame 5100ms old is past the cadence-aligned window — the heartbeat \
+             is presumed current and must be honoured"
+        );
     }
 
     /// `heartbeat=false` with NO media ever (last_frame_ms = 0) must let

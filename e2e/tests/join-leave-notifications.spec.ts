@@ -189,8 +189,16 @@ test.describe("Entry/exit notifications preference", () => {
 
       // Sanity check: with no override, the preference should be unset
       // (default true) or "true". Either way, notifications are enabled.
-      const storedBefore = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(storedBefore === null || storedBefore === "true").toBe(true);
+      // Use polling to account for the 300ms debounced save in attendants.rs.
+      await expect
+        .poll(
+          async () => {
+            const v = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+            return v === null || v === "true";
+          },
+          { timeout: 3_000 },
+        )
+        .toBe(true);
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.
@@ -514,8 +522,15 @@ test.describe("Entry/exit notifications preference", () => {
       );
       expect(storedSounds).toBe("false");
 
-      const storedNotifs = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(storedNotifs === null || storedNotifs === "true").toBe(true);
+      await expect
+        .poll(
+          async () => {
+            const v = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
+            return v === null || v === "true";
+          },
+          { timeout: 3_000 },
+        )
+        .toBe(true);
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.

@@ -200,15 +200,10 @@ test.describe("Peer screen-share diagnostics", () => {
       const hostPage = members[0].page;
       const guestPage = members[1].page;
 
-      // Allow peer discovery to propagate through signaling before
-      // asserting on remote tiles.
-      await hostPage.waitForTimeout(5000);
-
-      // Wait for mesh to settle so the host has the guest tile + diagnostics flow.
-      await hostPage.waitForTimeout(8000);
-
+      // Wait for peer discovery + mesh settlement — the assertion timeout
+      // covers the full propagation window without redundant hardcoded waits.
       await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {
-        timeout: 30_000,
+        timeout: 45_000,
       });
 
       // Guest starts screen-share. If the wasm-level mock could not produce a

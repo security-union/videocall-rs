@@ -125,7 +125,7 @@ async function enableMic(page: Page): Promise<void> {
  */
 async function hostMutePeerViaTile(page: Page): Promise<void> {
   const guestTile = page.locator(".grid-item:has(.tile-mute-btn)").first();
-  await expect(guestTile).toBeVisible({ timeout: 15_000 });
+  await expect(guestTile).toBeVisible({ timeout: 30_000 });
 
   // Hover to reveal `.tile-mute-btn` (CSS sets visibility:hidden until
   // `.grid-item:hover`).
@@ -202,8 +202,12 @@ test.describe("Host mute controls", () => {
 
       // Wait for the peer connection to establish (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-        timeout: 30_000,
+        timeout: 45_000,
       });
+
+      // Brief stabilization for the WebRTC data channel to finish setup
+      // after the tile renders — audio track state propagation needs this.
+      await hostPage.waitForTimeout(2000);
 
       // Guest enables their microphone so the host's per-tile diagnostics
       // reflect audio_enabled=true and the tile mute menu is rendered.

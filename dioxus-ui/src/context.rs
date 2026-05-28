@@ -439,6 +439,25 @@ pub type PeerSignalHistoryMap = Signal<
     >,
 >;
 
+/// HCL bug #8 / #9: per-(peer, mode) signal-quality popup state, lifted out
+/// of `PeerTile`'s per-component lifecycle so a peer leaving the meeting (or
+/// a layout switch between grid / split / full-bleed) does not unmount every
+/// open popup. Only the popup whose anchored peer left is dropped; all other
+/// open popups survive untouched.
+///
+/// Bug #9 also stores the user's drag-and-drop position here so that
+/// switching layouts (grid → split when a peer starts screen sharing, etc.)
+/// keeps the popup pinned to wherever the user dragged it.
+pub type SignalPopupStateMap = Signal<
+    std::collections::HashMap<
+        (
+            String,
+            crate::components::signal_quality::SignalMeterMode,
+        ),
+        crate::components::signal_quality::SignalPopupState,
+    >,
+>;
+
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]

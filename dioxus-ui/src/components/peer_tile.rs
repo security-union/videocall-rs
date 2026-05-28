@@ -301,6 +301,8 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut audio_enabled = audio_enabled;
+                    audio_enabled.set(false);
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -308,9 +310,13 @@ pub fn PeerTile(
                                     api_client.mute_participant(&meeting_id, &peer_uid).await
                                 {
                                     log::warn!("mute_participant failed: {e}");
+                                    audio_enabled.set(true);
                                 }
                             }
-                            Err(e) => log::warn!("meeting_api_client error: {e}"),
+                            Err(e) => {
+                                log::warn!("meeting_api_client error: {e}");
+                                audio_enabled.set(true);
+                            }
                         }
                     });
                 }))
@@ -329,6 +335,8 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut video_enabled = video_enabled;
+                    video_enabled.set(false);
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -337,9 +345,13 @@ pub fn PeerTile(
                                     .await
                                 {
                                     log::warn!("disable_video_participant failed: {e}");
+                                    video_enabled.set(true);
                                 }
                             }
-                            Err(e) => log::warn!("meeting_api_client error: {e}"),
+                            Err(e) => {
+                                log::warn!("meeting_api_client error: {e}");
+                                video_enabled.set(true);
+                            }
                         }
                     });
                 }))

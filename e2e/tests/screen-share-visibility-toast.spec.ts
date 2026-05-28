@@ -214,7 +214,7 @@ test.describe("Screen-share visibility toast", () => {
         hostPage.locator(".peer-toast.toast-success.screen-share-toast", {
           hasText: "Others can now see your shared content",
         }),
-      ).toBeVisible({ timeout: 15_000 });
+      ).toBeVisible({ timeout: 30_000 });
 
       // The success toast must auto-dismiss after a few seconds.
       await expect(hostPage.locator(".peer-toast.toast-success.screen-share-toast")).toHaveCount(

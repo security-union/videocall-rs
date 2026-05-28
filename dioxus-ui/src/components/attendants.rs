@@ -2541,6 +2541,11 @@ pub fn AttendantsComponent(
             // Provide MeetingTime context
             // Provide VideoCallClient context
             div { id: "main-container", class: "meeting-page",
+                onclick: move |_| {
+                    dock_menu_open.set(false);
+                    density_open.set(false);
+                    mock_peers_open.set(false);
+                },
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
@@ -3639,11 +3644,8 @@ pub fn AttendantsComponent(
 
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| mock_peers_open.set(false),
-                    }
                     div { class: "mock-peers-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {
@@ -3687,21 +3689,10 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                // Dock menu backdrop (rendered outside action bar so click-outside works)
-                if dock_menu_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| dock_menu_open.set(false),
-                    }
-                }
-
                 // Density mode popover
                 if !has_screen_share && density_open() {
-                    div {
-                        class: "popover-backdrop",
-                        onclick: move |_| density_open.set(false),
-                    }
                     div { class: "density-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         for mode in DENSITY_MODES {
                             div {
                                 key: "{mode.label()}",

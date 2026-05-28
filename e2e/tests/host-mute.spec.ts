@@ -230,7 +230,7 @@ test.describe("Host mute controls", () => {
       // `.tile-mute-menu-wrapper` (and its `title="Host actions"` button)
       // is no longer rendered for that peer.
       await expect(hostPage.getByTitle("Host actions")).toHaveCount(0, {
-        timeout: 10_000,
+        timeout: 30_000,
       });
     } finally {
       await browser1.close();

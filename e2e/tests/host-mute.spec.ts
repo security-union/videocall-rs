@@ -225,13 +225,17 @@ test.describe("Host mute controls", () => {
       });
       await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
-      // ---- Mute menu-toggle disappears from host's view (peer is now muted) ----
-      // Once the guest is muted, on_mute becomes None and the entire
-      // `.tile-mute-menu-wrapper` (and its `title="Host actions"` button)
-      // is no longer rendered for that peer.
-      await expect(hostPage.getByTitle("Host actions")).toHaveCount(0, {
-        timeout: 30_000,
-      });
+      // ---- "Mute" item gone from the tile context menu (peer is now muted) ----
+      // The three-dot "Host actions" button stays visible (kick/disable-video
+      // are still available) but the "Mute" menu item inside is no longer
+      // rendered because on_mute becomes None when audio_enabled is false.
+      const hostActionsBtn = hostPage.getByTitle("Host actions");
+      await hostActionsBtn.hover();
+      await hostActionsBtn.click();
+      await expect(hostPage.locator(".tile-context-menu-item", { hasText: "Mute" })).toHaveCount(
+        0,
+        { timeout: 10_000 },
+      );
     } finally {
       await browser1.close();
       await browser2.close();

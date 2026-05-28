@@ -5609,7 +5609,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 .popover-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 9050;
+  z-index: 8999;
   background: transparent;
   cursor: default;
 }

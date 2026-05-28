@@ -61,7 +61,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, hcl-ci]
     timeout-minutes: 30
     concurrency:
-      group: hcl-ci-heavy-workload
+      group: hcl-ci-e2e
       cancel-in-progress: false
 
     steps:
@@ -86,11 +86,16 @@ jobs:
       - name: Generate short-lived WebTransport dev cert
         run: bash scripts/regen-dev-cert.sh --force
 
+      - name: Tear down any prior E2E stack state
+        run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml down --remove-orphans || true
+
       - name: Build E2E stack images
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml build
 
       - name: Start E2E stack
         run: docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml up -d
+        env:
+          DIOXUS_SERVE_MODE: static
 
       - name: Wait for services to be healthy
         run: |

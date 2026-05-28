@@ -96,11 +96,18 @@ test.describe("Auth-based display name handling", () => {
     await page.goto(`/meeting/${meetingId}`);
 
     // The name was picked up from localStorage — the user should NOT see
-    // the name entry form. Instead, auto-join fires and the user lands on
-    // the pre-join settings card with a "Start Meeting" button.
-    await expect(page.getByRole("button", { name: /Start Meeting|Join Meeting/ })).toBeVisible({
-      timeout: 30_000,
-    });
+    // the name entry form. Auto-join fires; depending on timing the user
+    // lands either on the pre-join card (Start/Join button visible) or
+    // directly in-meeting (grid-container visible). Both are valid — the
+    // key assertion is that the display-name input is never shown.
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+    const grid = page.locator("#grid-container");
+
+    await Promise.race([
+      joinButton.waitFor({ timeout: 30_000 }),
+      grid.waitFor({ timeout: 30_000 }),
+    ]);
+
     // The form input should NOT be visible because the name was already set.
     await expect(page.locator('input[placeholder="Enter your display name"]')).not.toBeVisible();
   });

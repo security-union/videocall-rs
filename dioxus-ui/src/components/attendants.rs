@@ -416,8 +416,17 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
+/// Aspect ratio of a rendered tile in the participant grid.
+///
+/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
+/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
+/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
+/// than the tile and `place-self: center` will surface as visible internal
+/// padding around every tile.
+const TILE_AR: f64 = 3.0 / 2.0;
+
 /// Google Meet–style layout: try every column count, compute the maximum
-/// 16:9 tile size for each, and pick the variant with the largest tile area.
+/// 3:2 tile size for each, and pick the variant with the largest tile area.
 /// Returns `(cols, rows, tile_width)`.
 fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     if n == 0 {
@@ -427,7 +436,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let mut best_rows = 1_usize;
     let mut best_area = 0.0_f64;
     let mut best_tw = 0.0_f64;
-    let ar: f64 = 16.0 / 9.0;
+    let ar: f64 = TILE_AR;
 
     for cols in 1..=n {
         let rows = n.div_ceil(cols);
@@ -1614,12 +1623,14 @@ pub fn AttendantsComponent(
     });
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
+    // Only fires for users already in-meeting who had a prior denial — on the
+    // pre-join screen (meeting_joined=false) this is a no-op.
     {
         let mda = mda.clone();
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-                if session_loaded() || connecting() {
+                if !meeting_joined() || session_loaded() || connecting() {
                     return;
                 }
 
@@ -2228,7 +2239,11 @@ pub fn AttendantsComponent(
         // Explicitly reset all flex properties so the transition from
         // screen-share (flex) back to normal (grid) is clean.
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        let th = tw / (16.0 / 9.0);
+        // Cell height tracks the same 3:2 ratio `.grid-item` is capped at, so
+        // the cell exactly fits the tile and `place-self: center` has no
+        // surplus to distribute. Using a wider ratio here would leave
+        // `tw - th * TILE_AR` of internal padding on every cell.
+        let th = tw / TILE_AR;
         // 2-peer case: let tiles stretch to fill their half (CSS rule in
         // global.css disables the 3:2 cap on `.participants-2 .grid-item`).
         // 3+ peers: size tracks to the natural tile dimensions and pack

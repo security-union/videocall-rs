@@ -37,25 +37,51 @@ window.__APP_CONFIG = ({
 });
 EOF
 
-# Mirror the live config into dist/ in case trunk has already done its initial
-# build (the `<link data-trunk rel="copy-file" href="./scripts/config.js" />`
-# directive only runs at build time, so a regeneration of scripts/config.js
-# AFTER the first build wouldn't propagate without a touch-rebuild).
-if [ -d /app/dioxus-ui/dist ]; then
-    cp -f /app/dioxus-ui/scripts/config.js /app/dioxus-ui/dist/config.js
-fi
-
-# Stage the developer's optional config.local.js into dist/ so the dev server
-# can serve it. The Trunk.toml post_build hook also copies it on every build,
-# but trunk doesn't watch files that didn't exist when `trunk serve` started,
-# so a config.local.js created after the first build wouldn't auto-stage. This
-# copy at container startup makes the docker workflow predictable: if the file
-# exists on the host bind-mount at container-up time, it's available.
+# Stage the developer's optional config.local.js so it's available at serve
+# time regardless of whether trunk built before or after it appeared.
 if [ -f /app/dioxus-ui/scripts/config.local.js ]; then
     mkdir -p /app/dioxus-ui/dist
     cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
 fi
 
-tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
+# ---------------------------------------------------------------------------
+# DIOXUS_SERVE_MODE controls runtime behavior:
+#   "static" — build once, serve dist/ with miniserve (CI / E2E)
+#   "dev"    — trunk serve with hot-reload (local development, default)
+# ---------------------------------------------------------------------------
+DIOXUS_SERVE_MODE="${DIOXUS_SERVE_MODE:-dev}"
 
-exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-3001}" --poll
+if [ "$DIOXUS_SERVE_MODE" = "static" ]; then
+    # One-shot tailwind build (no --watch)
+    tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --minify
+
+    # Build wasm once. Uses cached artifacts from the Docker volume on warm runs.
+    trunk build
+
+    # Copy runtime config into the built dist/ (trunk's copy-file directive only
+    # runs at build time, config.js was generated above after any prior build).
+    cp -f /app/dioxus-ui/scripts/config.js /app/dioxus-ui/dist/config.js
+    if [ -f /app/dioxus-ui/scripts/config.local.js ]; then
+        cp -f /app/dioxus-ui/scripts/config.local.js /app/dioxus-ui/dist/config.local.js
+    fi
+
+    # Serve statically. No file watcher, no recompilation, ~3MB RSS.
+    # --spa enables SPA fallback: unknown routes serve index.html so the
+    # Dioxus client-side router handles /meeting/:id etc.
+    exec miniserve \
+        --port "${TRUNK_SERVE_PORT:-3001}" \
+        --interfaces 0.0.0.0 \
+        --index index.html \
+        --spa \
+        /app/dioxus-ui/dist
+else
+    # Development mode: hot-reload with trunk serve.
+    # Mirror config into dist/ in case trunk has already done its initial build.
+    if [ -d /app/dioxus-ui/dist ]; then
+        cp -f /app/dioxus-ui/scripts/config.js /app/dioxus-ui/dist/config.js
+    fi
+
+    tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
+
+    exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-3001}" --poll
+fi

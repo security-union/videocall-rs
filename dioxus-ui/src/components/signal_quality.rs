@@ -670,6 +670,19 @@ pub struct SignalInfo {
     /// observed yet. Renders as a header badge in [`SignalQualityPopup`];
     /// not part of the time-series chart.
     pub transport: Option<String>,
+    /// HCL bug #2: scope filter for the popup. `Full` (legacy) shows every
+    /// series; `ScreenOnly` restricts the chart / legend / tooltip to the
+    /// screen-share series (used by the shared-content tile in the split
+    /// layout); `NoScreen` hides the screen-share series (used by peer
+    /// tiles so the screen metric only renders in the dedicated
+    /// shared-content popup).
+    pub meter_mode: SignalMeterMode,
+    /// HCL bug #2: human-readable name of the peer currently sharing their
+    /// screen, surfaced as a "Sharing: <name>" header line in the popup
+    /// header when this popup is hiding the screen series (`NoScreen` mode
+    /// + a publisher is active). `None` when no one is sharing or when
+    /// the popup itself is the screen-only one.
+    pub sharing_peer_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +715,34 @@ pub struct SignalQualityPopupProps {
     /// join/leave keeps the popup glued to the right tile instead of
     /// stranding it where the tile used to be.
     anchor_id: String,
+    /// HCL bug #2: scope filter for which metric series the popup shows.
+    /// Defaults to `Full` so legacy call sites unaffected by bug #2 keep
+    /// rendering every series.
+    #[props(default)]
+    meter_mode: SignalMeterMode,
+    /// HCL bug #2: human-readable name of the peer currently sharing their
+    /// screen, surfaced as a small "Sharing: <name>" header line when
+    /// `meter_mode == NoScreen` and somebody is publishing — lets users
+    /// see at a glance who's sharing without expanding the screen-share
+    /// tile's separate popup.
+    #[props(default)]
+    sharing_peer_name: Option<String>,
+    /// HCL bug #9: when `Some`, position the popup at fixed viewport
+    /// coordinates instead of anchoring to the tile. `None` re-engages
+    /// the anchored-follow behaviour. Owned by the popup-state context
+    /// map (`SignalPopupStateMap`).
+    #[props(default)]
+    free_position: Option<(f64, f64)>,
+    /// HCL bug #9: invoked when the user drags the popup to a new viewport
+    /// position. The host installs this callback to commit the new free
+    /// position into the popup-state map.
+    #[props(default)]
+    on_drag_commit: EventHandler<(f64, f64)>,
+    /// HCL bug #9: invoked when the user clicks the reanchor button in the
+    /// popup header. The host installs this callback to reset
+    /// `free_position` to `None` so the popup snaps back to the tile.
+    #[props(default)]
+    on_reanchor: EventHandler<()>,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
 }

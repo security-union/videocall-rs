@@ -20,7 +20,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
-use crate::components::signal_quality::{PeerSignalHistory, SampleData, SignalInfo};
+use crate::components::signal_quality::{
+    PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode,
+};
 use crate::context::{
     AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, VideoCallClientCtx,
 };
@@ -408,6 +410,11 @@ pub fn PeerTile(
                 mt().meeting_start_time.unwrap_or_else(js_sys::Date::now)
             },
             transport: sig_transport,
+            // HCL bug #2: defaults seeded here; real values will be wired
+            // from caller props in the upcoming PeerTile/canvas_generator
+            // refactor.
+            meter_mode: SignalMeterMode::Full,
+            sharing_peer_name: None,
         },
         show_signal_popup,
         show_tile_menu,

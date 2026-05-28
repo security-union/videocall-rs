@@ -3556,4 +3556,157 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------
+    // HCL bug #2: SignalMeterMode scope filter.
+    //
+    // The mode-driven helpers gate which series the popup renders. These
+    // are pure-data predicates so they're trivially unit-testable; the
+    // contract is contractual for the popup body that reads them and the
+    // call sites in `attendants.rs` that pick the mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn meter_mode_full_shows_every_series() {
+        let m = super::SignalMeterMode::Full;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_screen_only_shows_only_screen() {
+        let m = super::SignalMeterMode::ScreenOnly;
+        assert!(!m.shows_audio());
+        assert!(!m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_no_screen_hides_screen() {
+        let m = super::SignalMeterMode::NoScreen;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(!m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_id_suffix_is_stable() {
+        // The suffix is load-bearing for the popup-state map key and the
+        // DOM id, so a refactor that renames a variant would break
+        // every open popup's DOM identity. Lock it down.
+        assert_eq!(super::SignalMeterMode::Full.id_suffix(), "full");
+        assert_eq!(super::SignalMeterMode::ScreenOnly.id_suffix(), "screen");
+        assert_eq!(super::SignalMeterMode::NoScreen.id_suffix(), "peer");
+    }
+
+    #[test]
+    fn meter_mode_default_is_full() {
+        // Default is `Full` so legacy callers (e.g. the diagnostics
+        // popup) that don't supply a mode keep showing every series.
+        assert_eq!(super::SignalMeterMode::default(), super::SignalMeterMode::Full);
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: clamp_free_position keeps a dragged popup inside the
+    // viewport. Sweep every clamp branch (no clamp, both axes clamped,
+    // tiny viewport that flips min/max math).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn clamp_free_inside_viewport_is_noop() {
+        // Popup that already fits inside the viewport with breathing room
+        // should pass through unchanged.
+        let (l, t) = super::clamp_free_position(100.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - 100.0).abs() < 0.01);
+        assert!((t - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clamp_free_left_overflow_clamps_to_margin() {
+        // Negative target left -> clamp to VIEWPORT_MARGIN_PX.
+        let (l, _) = super::clamp_free_position(-50.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    #[test]
+    fn clamp_free_right_overflow_clamps_to_max_left() {
+        // Target left that would push the popup off the right edge -> clamp
+        // to (viewport_w - popup_w - margin).
+        let viewport_w = 1920.0;
+        let popup_w = 420.0;
+        let (l, _) = super::clamp_free_position(2000.0, 100.0, popup_w, 400.0, viewport_w, 1080.0);
+        let expected = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        assert!((l - expected).abs() < 0.01, "got {l}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_top_overflow_clamps_to_margin() {
+        // Negative target top -> clamp to VIEWPORT_MARGIN_PX.
+        let (_, t) = super::clamp_free_position(100.0, -50.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((t - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {t}");
+    }
+
+    #[test]
+    fn clamp_free_bottom_overflow_clamps_to_max_top() {
+        // Target top that would push the popup off the bottom edge ->
+        // clamp to (viewport_h - popup_h - margin).
+        let viewport_h = 1080.0;
+        let popup_h = 400.0;
+        let (_, t) =
+            super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
+        let expected = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        assert!((t - expected).abs() < 0.01, "got {t}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_handles_oversized_popup() {
+        // Popup wider than the viewport: max_left math goes negative and
+        // the `.max()` keeps the result at VIEWPORT_MARGIN_PX. The popup
+        // should sit at the left margin, not at a negative coordinate.
+        let (l, _) = super::clamp_free_position(500.0, 100.0, 1000.0, 400.0, 600.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: SignalPopupState defaults to Anchored. The popup body
+    // reads this to decide whether to render the 📌 reanchor button —
+    // legacy callers that don't bother to insert a state value get the
+    // expected anchored behaviour.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn signal_popup_state_default_is_anchored() {
+        let s = super::SignalPopupState::default();
+        assert_eq!(s.position, super::SignalPopupPosition::Anchored);
+        assert!(!s.position.is_free());
+    }
+
+    #[test]
+    fn signal_popup_position_free_is_free() {
+        let p = super::SignalPopupPosition::Free {
+            left: 100.0,
+            top: 200.0,
+        };
+        assert!(p.is_free());
+    }
+
+    #[test]
+    fn html_escape_handles_xss_chars() {
+        // Display names are user-supplied; the sharing indicator is emitted
+        // via `dangerous_inner_html`, so we MUST escape every char the
+        // HTML spec considers special. Lock down the contract here.
+        assert_eq!(super::html_escape("plain"), "plain");
+        assert_eq!(super::html_escape("a & b"), "a &amp; b");
+        assert_eq!(super::html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(super::html_escape("\"hi\""), "&quot;hi&quot;");
+        assert_eq!(super::html_escape("'name'"), "&#39;name&#39;");
+        // Round-trip safety: an attacker-controlled name combining each char.
+        let attacker = "<img src=x onerror=\"alert('xss')\">";
+        let escaped = super::html_escape(attacker);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
+        assert!(!escaped.contains('\''));
+    }
 }

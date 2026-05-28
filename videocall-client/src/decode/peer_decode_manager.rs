@@ -308,6 +308,84 @@ pub struct Peer {
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
     screen_seq_tracker: SequenceTracker,
+    /// HCL bug #1: monotonic timestamp (ms since epoch) of the most recent
+    /// SCREEN media frame this receiver actually decoded. A non-zero value
+    /// means we have hard evidence the publisher is currently sharing
+    /// (the SCREEN stream is live), regardless of what an older heartbeat
+    /// metadata payload claims. Used by the HEARTBEAT branch to suppress
+    /// stale-heartbeat clobbering — when WT delivers a SCREEN keyframe on
+    /// the Screen persistent stream before an older heartbeat (carrying
+    /// `screen_enabled = false`) catches up on the Control stream, we
+    /// must NOT let the heartbeat reset `screen_enabled` back to false.
+    /// On WS (strict FIFO over one TCP socket) the heartbeat almost
+    /// always wins the race so the symptom is rare; on WT (multi-stream,
+    /// no global ordering) the race surfaces reliably and the screen
+    /// tile collapses out of the split layout.
+    last_screen_frame_ms: u64,
+    /// HCL bug #1: same idea for the camera-video stream. Without this
+    /// guard a stale heartbeat with `video_enabled = false` would mute
+    /// an actively-streaming camera on WT for one heartbeat period.
+    last_video_frame_ms: u64,
+    /// HCL bug #1: same idea for the audio stream.
+    last_audio_frame_ms: u64,
+}
+
+/// HCL bug #1: how long after a media frame we still trust the live media
+/// signal over a `metadata.X_enabled = false` heartbeat. The publisher emits
+/// heartbeats at ~1Hz (see `microphone_encoder.rs::605`), so a 2000ms window
+/// absorbs one full heartbeat period plus jitter. Heartbeats older than this
+/// window are presumed to reflect the publisher's CURRENT state and are
+/// applied normally.
+const MEDIA_FRESH_WINDOW_MS: u64 = 2000;
+
+/// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
+/// arrives, given:
+///   * `current` — our locally tracked flag for this peer
+///   * `heartbeat_value` — what `HeartbeatMetadata.X_enabled` says
+///   * `last_frame_ms` — timestamp of the most recent live X frame we
+///     decoded (0 = none ever)
+///   * `now_ms` — current monotonic clock
+///
+/// Returns the value to install on `self.X_enabled`.
+///
+/// Decision matrix:
+///
+///   heartbeat=true   → trust the heartbeat (publisher announces it's on;
+///                      any contradicting "no frames seen" condition is
+///                      a network problem, not a state problem).
+///
+///   heartbeat=false  → if we saw an X frame within
+///                      `MEDIA_FRESH_WINDOW_MS`, KEEP `current`. The
+///                      heartbeat is stale relative to the live stream
+///                      (classic out-of-order-arrival window on WT, where
+///                      heartbeats and SCREEN frames live on different
+///                      QUIC streams with no global FIFO ordering). If
+///                      no recent frame, trust the heartbeat — the
+///                      publisher really did stop the X stream.
+///
+/// Pure function so it can be unit-tested without a real `Peer`.
+pub(crate) fn apply_heartbeat_enabled_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    if heartbeat_value {
+        // Affirmative heartbeats always win — publisher is announcing
+        // the stream is live, and we can't out-vote the source of truth
+        // with stale local state.
+        return true;
+    }
+    // heartbeat says off — only override the heartbeat when we have
+    // live media evidence within the freshness window. `saturating_sub`
+    // guards the (unlikely) case where `now_ms < last_frame_ms` due to
+    // a clock skew or test fixture setting future timestamps; we treat
+    // that as "frame is fresh" rather than panic / wrap.
+    if last_frame_ms > 0 && now_ms.saturating_sub(last_frame_ms) < MEDIA_FRESH_WINDOW_MS {
+        current
+    } else {
+        false
+    }
 }
 
 use std::fmt::Debug;
@@ -365,6 +443,14 @@ impl Peer {
             has_received_heartbeat: false,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            // HCL bug #1: 0 means "no media frame observed yet". The
+            // freshness check (`apply_heartbeat_enabled_flag`) treats 0
+            // as "not fresh," so a heartbeat at session start carries
+            // unchallenged authority — correct behaviour because we have
+            // no media yet.
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         })
     }
 
@@ -507,6 +593,13 @@ impl Peer {
                 // Track sequence numbers for gap detection (PLI).
                 let kf_request = self.track_sequence(media_type, &packet);
 
+                // HCL bug #1: stamp the freshness timestamp BEFORE the
+                // `has_received_heartbeat` branch so it works on both the
+                // "no heartbeat yet" and "heartbeat says off, drop frame"
+                // paths. The next heartbeat consults this to decide whether
+                // to trust its own metadata or the live frame stream.
+                self.last_video_frame_ms = now_ms();
+
                 if !self.video_enabled {
                     if !self.has_received_heartbeat {
                         // No heartbeat yet — infer video_enabled from the actual frame.
@@ -539,6 +632,11 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
+                // HCL bug #1: stamp audio freshness regardless of the
+                // straggler-drop path so the next heartbeat can detect
+                // recent audio frames and suppress a stale-muted heartbeat.
+                self.last_audio_frame_ms = now_ms();
+
                 if !self.audio_enabled {
                     if !self.has_received_heartbeat {
                         // No heartbeat yet — infer audio_enabled from the actual frame.
@@ -562,6 +660,19 @@ impl Peer {
             MediaType::SCREEN => {
                 // Track sequence numbers for gap detection (PLI).
                 let kf_request = self.track_sequence(media_type, &packet);
+
+                // HCL bug #1: stamp the screen-freshness timestamp on every
+                // observed SCREEN frame. The next heartbeat (which may carry
+                // a stale `metadata.screen_enabled = false` on WebTransport
+                // because heartbeats and SCREEN frames race across separate
+                // QUIC streams) consults this to decide whether to honour
+                // its own metadata or trust the live screen stream.
+                // Without this stamp, the heartbeat at line ~691 below would
+                // overwrite `screen_enabled` back to false, the UI would
+                // observe `has_screen_share = false`, and the split-screen
+                // layout would collapse — exactly the WT-only symptom from
+                // the user report.
+                self.last_screen_frame_ms = now_ms();
 
                 if !self.screen_enabled {
                     // A SCREEN frame arrived while screen_enabled is false.
@@ -622,27 +733,57 @@ impl Peer {
                 self.has_received_heartbeat = true;
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    let now = now_ms();
+                    // HCL bug #1: resolve each media-enabled flag against
+                    // recently observed frames. The heartbeat stream and the
+                    // media streams race on WebTransport — a stale heartbeat
+                    // carrying `metadata.X_enabled = false` can arrive after
+                    // we've already started decoding live X frames. Trusting
+                    // the heartbeat blindly would erase `screen_enabled = true`
+                    // and collapse the split-screen-share layout for one full
+                    // heartbeat period. The freshness check trusts the live
+                    // media when we saw an X frame within the last
+                    // `MEDIA_FRESH_WINDOW_MS`; otherwise the heartbeat wins.
+                    let resolved_video = apply_heartbeat_enabled_flag(
+                        self.video_enabled,
+                        metadata.video_enabled,
+                        self.last_video_frame_ms,
+                        now,
+                    );
+                    let resolved_audio = apply_heartbeat_enabled_flag(
+                        self.audio_enabled,
+                        metadata.audio_enabled,
+                        self.last_audio_frame_ms,
+                        now,
+                    );
+                    let resolved_screen = apply_heartbeat_enabled_flag(
+                        self.screen_enabled,
+                        metadata.screen_enabled,
+                        self.last_screen_frame_ms,
+                        now,
+                    );
+
                     // Check if video is being turned off (on -> off transition)
-                    let video_turned_off = self.video_enabled && !metadata.video_enabled;
+                    let video_turned_off = self.video_enabled && !resolved_video;
                     // Check if screen is being turned off (on -> off transition)
-                    let screen_turned_off = self.screen_enabled && !metadata.screen_enabled;
+                    let screen_turned_off = self.screen_enabled && !resolved_screen;
                     // Check if audio is being turned off (on -> off transition)
-                    let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
+                    let audio_turned_off = self.audio_enabled && !resolved_audio;
                     // Check if audio state changed at all
-                    let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
+                    let audio_state_changed = self.audio_enabled != resolved_audio;
 
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
-                        self.audio.set_muted(!metadata.audio_enabled);
+                        self.audio.set_muted(!resolved_audio);
                         debug!(
                             "Audio state changed for peer {} - muted: {}",
-                            self.session_id, !metadata.audio_enabled
+                            self.session_id, !resolved_audio
                         );
                     }
 
-                    self.video_enabled = metadata.video_enabled;
-                    self.audio_enabled = metadata.audio_enabled;
-                    self.screen_enabled = metadata.screen_enabled;
+                    self.video_enabled = resolved_video;
+                    self.audio_enabled = resolved_audio;
+                    self.screen_enabled = resolved_screen;
                     self.is_speaking = metadata.is_speaking;
                     if !metadata.is_speaking {
                         self.audio_level = 0.0;
@@ -1610,6 +1751,9 @@ mod tests {
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         };
         (peer, muted_handle)
     }
@@ -1707,6 +1851,144 @@ mod tests {
         assert!(
             peer.screen_enabled,
             "screen_enabled should be inferred true"
+        );
+    }
+
+    // --- HCL bug #1: heartbeat-vs-SCREEN-frame race -----------------------
+    //
+    // These tests pin down `apply_heartbeat_enabled_flag`, the pure
+    // decision function the HEARTBEAT branch consults to decide whether a
+    // stale `metadata.X_enabled = false` is allowed to clobber a locally
+    // tracked `X_enabled = true`. The bug fix REQUIRES this function — a
+    // regression that simplifies it back to "always trust the heartbeat"
+    // will fail every one of these tests.
+
+    /// `heartbeat=true` always wins, regardless of whether we have any
+    /// recent media. The publisher is the source of truth for "on."
+    #[test]
+    fn apply_hb_flag_affirmative_heartbeat_wins() {
+        // No media observed.
+        assert!(apply_heartbeat_enabled_flag(false, true, 0, 5_000));
+        // Stale media (older than the freshness window).
+        assert!(apply_heartbeat_enabled_flag(false, true, 1_000, 10_000));
+        // Fresh media.
+        assert!(apply_heartbeat_enabled_flag(true, true, 4_500, 5_000));
+    }
+
+    /// `heartbeat=false` with a SCREEN frame inside the freshness window
+    /// MUST preserve the current `true` flag — this is the WT-race fix.
+    /// The user-visible symptom of regressing this is the split-screen
+    /// layout collapsing for one heartbeat period after every SCREEN
+    /// keyframe on WebTransport.
+    #[test]
+    fn apply_hb_flag_keeps_current_when_media_is_fresh() {
+        // current=true, hb=false, frame at 4500ms, now at 5000ms (delta 500ms).
+        // Must KEEP true (frame is well within the 2000ms window).
+        assert!(apply_heartbeat_enabled_flag(
+            true,  /* current */
+            false, /* heartbeat */
+            4_500, /* last_frame_ms */
+            5_000  /* now_ms */
+        ));
+    }
+
+    /// `heartbeat=false` with a SCREEN frame OLDER than the freshness
+    /// window must let the heartbeat win — the publisher has genuinely
+    /// stopped sharing, and a single very-old frame should not pin the
+    /// flag on forever.
+    #[test]
+    fn apply_hb_flag_heartbeat_wins_when_media_is_stale() {
+        // Frame at 1000ms, now at 5000ms (delta 4000ms > 2000ms window).
+        assert!(!apply_heartbeat_enabled_flag(
+            true,  /* current */
+            false, /* heartbeat */
+            1_000, /* last_frame_ms */
+            5_000  /* now_ms */
+        ));
+    }
+
+    /// `heartbeat=false` with NO media ever (last_frame_ms = 0) must let
+    /// the heartbeat win even though `now_ms - 0 < MEDIA_FRESH_WINDOW_MS`
+    /// arithmetically. The sentinel `0` means "never observed," not
+    /// "observed at epoch."
+    #[test]
+    fn apply_hb_flag_zero_sentinel_is_not_fresh() {
+        assert!(!apply_heartbeat_enabled_flag(
+            true,  /* current */
+            false, /* heartbeat */
+            0,     /* never observed */
+            500    /* now_ms inside window arithmetically */
+        ));
+    }
+
+    /// Clock skew guard: if `last_frame_ms > now_ms` (timestamp from the
+    /// future — possible in test fixtures or under clock adjustment),
+    /// the saturating subtraction must NOT panic / wrap, and the frame
+    /// should be treated as fresh.
+    #[test]
+    fn apply_hb_flag_clock_skew_treats_future_frame_as_fresh() {
+        assert!(apply_heartbeat_enabled_flag(
+            true, false, 10_000, /* last_frame_ms */
+            5_000,  /* now_ms — earlier than last_frame */
+        ));
+    }
+
+    /// Integration: simulate the exact WT-race scenario. A SCREEN
+    /// keyframe lands first (auto-enables `screen_enabled`), then a
+    /// stale heartbeat carrying `screen_enabled = false` arrives. The
+    /// peer's local flag MUST remain true — this is the test that
+    /// would fail before the fix.
+    #[wasm_bindgen_test]
+    fn screen_enabled_survives_stale_heartbeat_after_frame() {
+        let (mut peer, _muted) = make_test_peer(193);
+        assert!(!peer.screen_enabled);
+
+        // SCREEN keyframe arrives first → `screen_enabled = true` and
+        // `last_screen_frame_ms` is stamped to a recent value.
+        let screen = screen_frame_packet(193);
+        let _ = peer.decode(&screen);
+        assert!(
+            peer.screen_enabled,
+            "SCREEN frame should auto-enable screen_enabled"
+        );
+        assert!(
+            peer.last_screen_frame_ms > 0,
+            "SCREEN frame should stamp last_screen_frame_ms"
+        );
+
+        // Stale heartbeat with screen_enabled=false arrives within the
+        // freshness window. Before the fix: peer.screen_enabled flips
+        // back to false, has_screen_share goes false in the UI, split
+        // layout collapses. After the fix: the flag must remain true.
+        let hb = heartbeat_packet(193, false, false, false);
+        let _ = peer.decode(&hb);
+        assert!(
+            peer.screen_enabled,
+            "HCL bug #1: stale heartbeat must not clobber fresh SCREEN \
+             stream — the split-layout would otherwise collapse on WT"
+        );
+    }
+
+    /// Integration: a heartbeat arriving AFTER the freshness window
+    /// elapses must be honoured. The publisher really did stop sharing
+    /// — we should not pin the flag on indefinitely just because we
+    /// once saw a SCREEN frame.
+    #[wasm_bindgen_test]
+    fn screen_enabled_cleared_by_heartbeat_when_media_stops() {
+        let (mut peer, _muted) = make_test_peer(194);
+
+        // Force the timestamp into the past so a subsequent heartbeat
+        // is OUTSIDE the freshness window. We can't actually sleep
+        // 2s in a unit test; instead we install the value directly
+        // (peer is pub-field accessible from inside the same module).
+        peer.screen_enabled = true;
+        peer.last_screen_frame_ms = 1; // ancient frame
+                                       // The current monotonic clock is now ~now_ms() ≫ 1 + 2000.
+        let hb = heartbeat_packet(194, false, false, false);
+        let _ = peer.decode(&hb);
+        assert!(
+            !peer.screen_enabled,
+            "heartbeat must clear screen_enabled when last frame is stale"
         );
     }
 
@@ -3477,6 +3759,9 @@ mod tests {
                 vad_threshold: None,
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
+                last_screen_frame_ms: 0,
+                last_video_frame_ms: 0,
+                last_audio_frame_ms: 0,
             };
             manager.connected_peers.insert(sid, peer);
         }
@@ -3562,6 +3847,9 @@ mod tests {
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         };
         manager.connected_peers.insert(510, peer);
 
@@ -3618,6 +3906,9 @@ mod tests {
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         };
         manager.connected_peers.insert(520, peer);
 

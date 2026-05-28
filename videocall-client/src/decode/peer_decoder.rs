@@ -106,6 +106,20 @@ pub struct VideoPeerDecoder {
     /// `None` when the canvas hasn't been wired yet, but
     /// `set_stream_context` *does* run before any decoded frames. Set there.
     stream_context: RefCell<Option<(String, String)>>,
+    /// HCL issue 893: pending acknowledgement that the underlying
+    /// `WasmDecoder` has produced its first decoded frame and rendered it
+    /// to the canvas. The decoder pipeline is asynchronous — `decode()`
+    /// pushes a `FrameBuffer` into a worker and returns immediately, so
+    /// the synchronous return value cannot carry a "first frame decoded"
+    /// signal. Instead the `on_video_frame` callback (which runs on the
+    /// render thread when the decoder hands a real `VideoFrame` back) sets
+    /// this flag to `true` on its first invocation. The next `decode()`
+    /// call observes the flag, swaps it back to `false`, and returns
+    /// `first_frame: true` so `peer_decode_manager` can fire the
+    /// `PEER_EVENT(screen_decode_started)` ack to the publisher. Without
+    /// this signal the screen-share visibility toast on the publisher
+    /// would time out at 10s on every share, even on the happy path.
+    first_render_pending_ack: Rc<RefCell<bool>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -211,8 +225,23 @@ impl VideoPeerDecoder {
             });
         }
 
+        // HCL #893: shared flag the async render callback uses to tell the
+        // next synchronous `decode()` call that a frame has actually
+        // landed on the canvas. See doc comment on `first_render_pending_ack`.
+        let first_render_pending_ack = Rc::new(RefCell::new(false));
+
         let canvas_ref = canvas_renderer.clone();
+        let first_render_flag = first_render_pending_ack.clone();
+        // Track within the closure (cheap `Cell` would suffice but we already
+        // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
+        // closure). `*flag = true` only flips once per `VideoPeerDecoder` —
+        // every later render is a no-op.
+        let first_render_fired = Rc::new(RefCell::new(false));
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
+            if !*first_render_fired.borrow() {
+                *first_render_fired.borrow_mut() = true;
+                *first_render_flag.borrow_mut() = true;
+            }
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
@@ -231,6 +260,7 @@ impl VideoPeerDecoder {
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
+            first_render_pending_ack,
         })
     }
 
@@ -381,6 +411,7 @@ impl VideoPeerDecoder {
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
+            first_render_pending_ack: Rc::new(RefCell::new(false)),
         }
     }
 }
@@ -504,9 +535,28 @@ impl PeerDecode for VideoPeerDecoder {
             self.decoder.push_frame(frame_buffer);
         }
 
+        // HCL #893: consume the async "first frame rendered" flag set by the
+        // `on_video_frame` callback. The decode pipeline is async, so the
+        // very first `push_frame` call returns here BEFORE the worker has
+        // produced a `VideoFrame`. The flag will fire on a later `decode()`
+        // call (typically the second or third packet for SCREEN, where the
+        // worker has had time to decode the keyframe). When we observe the
+        // flag we return `first_frame: true` exactly once, which lets
+        // `peer_decode_manager` fire the `PEER_EVENT(screen_decode_started)`
+        // ack to the publisher.
+        let first_frame = {
+            let mut flag = self.first_render_pending_ack.borrow_mut();
+            if *flag {
+                *flag = false;
+                true
+            } else {
+                false
+            }
+        };
+
         Ok(DecodeStatus {
             _rendered: true,
-            first_frame: false,
+            first_frame,
         })
     }
 }

@@ -2223,7 +2223,8 @@ pub fn AttendantsComponent(
 
     // Tile count drives the `participants-N` class modifier on the grid
     // container, which lets CSS branch layout behavior (see
-    // `.participants-2` rule in global.css that disables the 3:2 cap).
+    // `.participants-1 .grid-item.full-bleed` rule in style.css that drops
+    // the 3:2 cap on the lone tile for the 2-peer meeting case — HCL #7).
     let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
 
     let container_style = if has_screen_share {
@@ -2244,12 +2245,19 @@ pub fn AttendantsComponent(
         // surplus to distribute. Using a wider ratio here would leave
         // `tw - th * TILE_AR` of internal padding on every cell.
         let th = tw / TILE_AR;
-        // 2-peer case: let tiles stretch to fill their half (CSS rule in
-        // global.css disables the 3:2 cap on `.participants-2 .grid-item`).
-        // 3+ peers: size tracks to the natural tile dimensions and pack
-        // left/top so surplus viewport width sits on the right edge as
-        // empty space instead of being distributed between tiles.
-        let (track_cols, track_rows, pack) = if tile_count <= 2 {
+        // 1-tile case (HCL #7, 2-peer meeting): let the lone remote tile
+        // stretch to fill the entire grid area. The `.participants-1
+        // .grid-item.full-bleed` CSS rule drops the 3:2 cap on this lone
+        // tile so the remote peer fills the viewport — combined with `1fr`
+        // tracks and `stretch` packing, the tile reaches edge-to-edge.
+        // 2+ tiles (HCL #6): size tracks to the natural 3:2 tile dimensions
+        // and pack left/top so surplus viewport width sits on the right
+        // edge as empty space instead of being distributed between tiles.
+        // This is the only way to guarantee the 3:2 aspect holds in narrow
+        // viewports where `1fr` cells would be taller than `cell_w * 2/3`
+        // and `.grid-item { height: 100% }` would otherwise stretch the
+        // tile vertically. See HCL bug report for the 3-peer-aspect issue.
+        let (track_cols, track_rows, pack) = if tile_count == 1 {
             (
                 format!("repeat({cols}, 1fr)"),
                 format!("repeat({rows}, 1fr)"),
@@ -2276,8 +2284,11 @@ pub fn AttendantsComponent(
         )
     };
 
-    // `participants-N` modifier; CSS uses `.participants-2` to disable the
-    // 3:2 aspect-ratio cap so tiles fill their half of the viewport.
+    // `participants-N` modifier; CSS uses `.participants-1 .grid-item.full-bleed`
+    // (HCL #7) to drop the 3:2 cap on the lone remote tile in a 2-peer
+    // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
+    // size is driven by `--tile-w` / `--tile-h` (set above) — see the
+    // `tile_count == 1` branch in `container_style`.
     let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
@@ -2839,15 +2850,34 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                // Right panel — 1 or 2-column grid of compact peer tiles.
+                                //
+                                // HCL issues #3 + #4: columns are sized to the tile's natural
+                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
+                                // the grid stretch each cell to fill `right_pct%`, leaving the
+                                // 3:2-capped `.split-peer-tile` centered with surplus on both
+                                // sides — visually "centered with too-large column gaps" on a
+                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
+                                // with `justify-content: start` packs the tiles to the left
+                                // edge and keeps the inter-tile gap exactly `8px`, matching
+                                // the non-share grid feel. Tiles still hold their 3:2 cap
+                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
+                                // so wide-screen viewports leave empty space on the right
+                                // edge of the panel instead of stretching the tiles.
                                 div {
                                     style: {
-                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
+                                        let grid_cols = if ss_cols > 1.0 {
+                                            format!("repeat(2, {ss_tile_w:.0}px)")
+                                        } else {
+                                            format!("{ss_tile_w:.0}px")
+                                        };
                                         format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
                                                 display: grid; grid-template-columns: {grid_cols}; \
                                                 grid-auto-rows: {ss_tile_h:.0}px; \
                                                 gap: 8px; padding: 6px; \
-                                                align-content: start; overflow: visible;")
+                                                justify-content: start; align-content: start; \
+                                                overflow: visible;")
                                     },
                                     for tile_id in ss_tiles.iter() {
                                         {

@@ -19,6 +19,107 @@ use crate::theme::color as theme_color;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Scope filter for [`SignalQualityPopup`].
+///
+/// Drives which metric series (audio, video, screen) the popup renders in the
+/// chart, legend, and tooltip. Introduced for HCL bug #2 so the LEFT panel of
+/// the screen-share split layout can show ONLY the screen-share series, and
+/// peer tiles can suppress the screen-share series (the shared-content tile
+/// has its own popup for that).
+///
+/// Two distinct popups can therefore be open simultaneously for the same
+/// publisher: one anchored to the screen-share tile (`ScreenOnly`) and one
+/// anchored to that peer's video tile (`NoScreen`). The popup-state map keys
+/// on `(peer_id, mode)` so they coexist without colliding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum SignalMeterMode {
+    /// Show every metric series the sample has data for. Used by legacy
+    /// callers (e.g. the diagnostics overview) where the popup isn't paired
+    /// with a specific tile mode.
+    #[default]
+    Full,
+    /// Show ONLY the screen-share series. Used by the shared-content tile in
+    /// the split layout — clicking its signal-meter icon must surface only the
+    /// screen-share metric, not camera or audio.
+    ScreenOnly,
+    /// Show audio + video, hide the screen-share series. Used by every peer
+    /// tile so the screen-share metric doesn't double-render (it has its own
+    /// popup on the shared-content tile).
+    NoScreen,
+}
+
+impl SignalMeterMode {
+    /// Whether this mode renders the audio series.
+    pub fn shows_audio(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the camera-video series.
+    pub fn shows_video(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the screen-share series.
+    pub fn shows_screen(self) -> bool {
+        matches!(self, Self::Full | Self::ScreenOnly)
+    }
+
+    /// Short stable string for DOM ids. The popup-state map keys on
+    /// `(peer_id, mode)` and we serialise both halves into the DOM id so
+    /// CSS / Playwright selectors can target each popup independently.
+    pub fn id_suffix(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ScreenOnly => "screen",
+            Self::NoScreen => "peer",
+        }
+    }
+}
+
+/// Per-popup persistent state, lifted out of the per-tile `PeerTile` so
+/// mid-meeting peer leaves / layout switches don't unmount the popup
+/// containers and close every other popup (HCL bug #8). Stored in a
+/// context-provided `Signal<HashMap<(peer_id, mode), SignalPopupState>>`
+/// so multiple popups can coexist independently.
+///
+/// `position` honours the drag-and-drop rule from HCL bug #9: when the user
+/// drags a popup, we transition from `Anchored` (auto-follow the tile) to
+/// `Free` (fixed viewport coordinates). The popup's header carries a 📌
+/// reanchor button that resets the state back to `Anchored`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SignalPopupState {
+    pub position: SignalPopupPosition,
+}
+
+impl Default for SignalPopupState {
+    fn default() -> Self {
+        Self {
+            position: SignalPopupPosition::Anchored,
+        }
+    }
+}
+
+/// Viewport-space position for a signal-quality popup. `Anchored` reads the
+/// tile's `getBoundingClientRect()` and tracks the tile through layout
+/// reflows; `Free { left, top }` pins the popup to fixed viewport
+/// coordinates regardless of where the tile moves (drag-and-drop result).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SignalPopupPosition {
+    Anchored,
+    Free { left: f64, top: f64 },
+}
+
+impl SignalPopupPosition {
+    /// Convenience predicate. Currently unused by the popup itself (the
+    /// `data-anchor-mode` attribute on the popup DOM element is the source of
+    /// truth for `reposition_popup`), but exposed for tests and downstream
+    /// callers that want to inspect the state.
+    #[allow(dead_code)]
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free { .. })
+    }
+}
+
 /// Discrete signal quality level shown as 0-5 filled bars.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SignalLevel {

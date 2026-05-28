@@ -450,10 +450,7 @@ pub type PeerSignalHistoryMap = Signal<
 /// keeps the popup pinned to wherever the user dragged it.
 pub type SignalPopupStateMap = Signal<
     std::collections::HashMap<
-        (
-            String,
-            crate::components::signal_quality::SignalMeterMode,
-        ),
+        (String, crate::components::signal_quality::SignalMeterMode),
         crate::components::signal_quality::SignalPopupState,
     >,
 >;

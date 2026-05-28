@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
@@ -40,7 +41,6 @@ use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
     CANVAS_LIMIT,
 };
-use crate::components::signal_quality::SignalMeterMode;
 use crate::context::{
     load_appearance_settings_from_storage, load_density_mode, load_dock_autohide,
     load_dock_position, resolve_transport_config, save_appearance_settings_to_storage,
@@ -998,9 +998,7 @@ pub fn AttendantsComponent(
                 // entries; every other peer's popup state stays intact so
                 // their popups remain visible across the parent re-render.
                 let mut popup_map = signal_popup_state_map;
-                popup_map
-                    .write()
-                    .retain(|(pid, _mode), _| pid != &peer_id);
+                popup_map.write().retain(|(pid, _mode), _| pid != &peer_id);
                 let mut speech_map = peer_speech_priority;
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
@@ -2141,9 +2139,11 @@ pub fn AttendantsComponent(
     // every peer-mode signal-meter popup can surface a small
     // "Sharing: <name>" header line. Computed once per render so the
     // PeerTile for-loop avoids repeating the lookup.
-    let active_screen_sharer_name: Option<String> = active_screen_sharer
-        .as_ref()
-        .map(|sid| client.get_peer_display_name(sid).unwrap_or_else(|| sid.clone()));
+    let active_screen_sharer_name: Option<String> = active_screen_sharer.as_ref().map(|sid| {
+        client
+            .get_peer_display_name(sid)
+            .unwrap_or_else(|| sid.clone())
+    });
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     // The right panel uses a 2-column grid of compact tiles. We compute how

@@ -678,9 +678,9 @@ pub struct SignalInfo {
     /// shared-content popup).
     pub meter_mode: SignalMeterMode,
     /// HCL bug #2: human-readable name of the peer currently sharing their
-    /// screen, surfaced as a "Sharing: <name>" header line in the popup
-    /// header when this popup is hiding the screen series (`NoScreen` mode
-    /// + a publisher is active). `None` when no one is sharing or when
+    /// screen. Surfaced as a "Sharing: <name>" header line in the popup
+    /// when this popup is hiding the screen series (i.e. `NoScreen` mode
+    /// and a publisher is active). `None` when no one is sharing or when
     /// the popup itself is the screen-only one.
     pub sharing_peer_name: Option<String>,
 }
@@ -1188,8 +1188,7 @@ fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>
                         return;
                     }
                     // Only fire when the click landed in the drag handle.
-                    let in_handle =
-                        matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
+                    let in_handle = matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
                     if !in_handle {
                         return;
                     }
@@ -1271,10 +1270,8 @@ fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>
                     on_drag_commit_for_init.call((rect.left(), rect.top()));
                 }
             });
-            let _ = win.add_event_listener_with_callback(
-                "mouseup",
-                mouseup_cb.as_ref().unchecked_ref(),
-            );
+            let _ = win
+                .add_event_listener_with_callback("mouseup", mouseup_cb.as_ref().unchecked_ref());
 
             *state.borrow_mut() = Some(DragState {
                 win: win.clone(),
@@ -1822,7 +1819,11 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // unchanged.
     let popup_id = match meter_mode {
         SignalMeterMode::Full => format!("signal-quality-popup-{}", props.peer_id),
-        other => format!("signal-quality-popup-{}-{}", props.peer_id, other.id_suffix()),
+        other => format!(
+            "signal-quality-popup-{}-{}",
+            props.peer_id,
+            other.id_suffix()
+        ),
     };
     {
         let anchor_id = props.anchor_id.clone();
@@ -3604,7 +3605,10 @@ mod tests {
     fn meter_mode_default_is_full() {
         // Default is `Full` so legacy callers (e.g. the diagnostics
         // popup) that don't supply a mode keep showing every series.
-        assert_eq!(super::SignalMeterMode::default(), super::SignalMeterMode::Full);
+        assert_eq!(
+            super::SignalMeterMode::default(),
+            super::SignalMeterMode::Full
+        );
     }
 
     // -----------------------------------------------------------------
@@ -3653,8 +3657,7 @@ mod tests {
         // clamp to (viewport_h - popup_h - margin).
         let viewport_h = 1080.0;
         let popup_h = 400.0;
-        let (_, t) =
-            super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
+        let (_, t) = super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
         let expected = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
         assert!((t - expected).abs() < 0.01, "got {t}, expected {expected}");
     }

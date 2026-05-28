@@ -209,21 +209,12 @@ test.describe("Screen-share visibility toast", () => {
       ).toBeVisible({ timeout: 5_000 });
 
       // The "SuccessfullyShared" toast must replace it once the guest
-      // decodes the first frame and acks via PEER_EVENT. This requires
-      // actual WebRTC frame propagation which is unreliable in Docker
-      // environments with mock canvas streams.
-      const successToast = hostPage.locator(".peer-toast.toast-success.screen-share-toast", {
-        hasText: "Others can now see your shared content",
-      });
-      try {
-        await expect(successToast).toBeVisible({ timeout: 30_000 });
-      } catch {
-        test.skip(
-          true,
-          "PEER_EVENT screen_decode_started never arrived — mock canvas frames did not propagate through WebRTC in this environment.",
-        );
-        return;
-      }
+      // decodes the first frame and acks via PEER_EVENT.
+      await expect(
+        hostPage.locator(".peer-toast.toast-success.screen-share-toast", {
+          hasText: "Others can now see your shared content",
+        }),
+      ).toBeVisible({ timeout: 30_000 });
 
       // The success toast must auto-dismiss after a few seconds.
       await expect(hostPage.locator(".peer-toast.toast-success.screen-share-toast")).toHaveCount(

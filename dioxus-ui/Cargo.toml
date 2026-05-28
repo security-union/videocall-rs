@@ -90,6 +90,8 @@ features = [
     "OscillatorType",
     "Performance",
     "PointerEvent",
+    "ResizeObserver",
+    "ResizeObserverEntry",
     "Storage",
     "MediaQueryList",
     "Window",

@@ -416,8 +416,18 @@ h3 {
 }
 
 .grid-item {
-  width: 100%;
+  /* Height-driven sizing so wide grid cells letterbox horizontally instead
+     of stretching the tile into a very wide rectangle. The tile fills the
+     grid cell height, derives its width from `aspect-ratio: 3/2` (the max
+     ratio we accept), and is clamped by `max-width: 100%` so narrow cells
+     (3+ peers per row) still fill their full width. `place-self: center`
+     centers the tile in its grid cell when the cap is binding. */
+  width: auto;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
   min-width: 0;
   min-height: 0;
 
@@ -2793,10 +2803,23 @@ select {
   background: var(--resize-handle-bg-active);
 }
 
-/* Screen share split-layout — right-panel peer video tile */
+/* Screen share split-layout — right-panel peer video tile.
+   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
+   height set by the parent right-panel, derives its width from
+   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
+   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
+   full width. `place-self: center` centers the tile within its grid cell
+   when the 3:2 cap is binding (i.e. the cell is wider than 1.5x its height).
+   The dominant shared-content tile (`.split-screen-tile`) intentionally
+   does NOT get this cap — it stays as a large, dominant display. */
 .split-peer-tile {
-  width: 100%;
+  width: auto;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
+  min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
@@ -5064,23 +5087,52 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 /* Signal quality popup -- inline overlay positioned within each tile */
 .signal-quality-popup {
-  position: absolute;
-  top: 44px;           /* 8px top padding + 32px icon row + 4px gap */
-  right: 0;
-  width: min(420px, calc(100% - 8px));
+  /* Base visual style.  Positioning is supplied by
+     `.signal-quality-popup-portal` (the portal mode that anchors via
+     `getBoundingClientRect`) so the popup escapes the tile's
+     `overflow: hidden` border-radius clip from PR #923 and dense grids /* @token-exempt: PR ref, not a color */
+     can no longer crop it. */
+  width: min(420px, calc(100vw - 16px));
   max-height: calc(100vh - 100px);
   overflow-y: auto;
   background: var(--signal-popup-bg);
   border: 1px solid var(--signal-popup-border);
   border-radius: var(--radius-lg);
   padding: 16px;
-  z-index: 10;
   box-shadow: var(--signal-popup-shadow);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-/* Allow the popup to overflow tile boundaries on small tiles */
+/* Portal mode — popup rendered as a sibling of `.canvas-container`,
+   positioned by JS from the source tile's getBoundingClientRect().
+   `position: fixed` so the popup escapes the tile's `overflow: hidden`
+   clip on every browser, regardless of any later refactor that adds
+   intermediate scroll containers.
+
+   z-index ladder (see global.css custom-color modal comment for the
+   full hierarchy):
+     - peer list backdrop          : 9300
+     - signal-quality popup        : 9400  ← here
+     - device-settings modal       : 9500
+     - custom-color picker modal   : 9700
+     - meeting-ended overlay       : 9999
+   We sit above the peer list but below all real modal dialogs so
+   opening any modal naturally renders above this popup. */
+.signal-quality-popup-portal {
+  position: fixed;
+  /* JS supplies `top` and `left` inline; these fallbacks position the
+     popup somewhere sane before the first reposition tick lands. */
+  top: 16px;
+  left: 16px;
+  z-index: 9400;
+}
+
+/* Legacy `.signal-popup-open` overflow-visible escape was needed when
+   the popup was an absolutely-positioned child of `.canvas-container`.
+   In portal mode it is no longer required, but we keep the rule (with
+   the same effect) so any third-party theme that still relies on it
+   keeps working. */
 .grid-item.signal-popup-open,
 .split-peer-tile.signal-popup-open {
   overflow: visible;

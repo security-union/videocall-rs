@@ -60,6 +60,8 @@ test.describe("Dock settings", () => {
   }
 
   async function openDockMenu(page: Page): Promise<void> {
+    // Hover to reveal the action bar in case autohide is active
+    await page.locator(".video-controls-container").hover();
     const toggleBtn = page.locator('.dock-position-wrapper button[aria-haspopup="listbox"]');
     await toggleBtn.click();
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });

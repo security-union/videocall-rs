@@ -39,7 +39,14 @@ async function openAppearanceTab(
   await page.locator("#username").fill("");
   await page.locator("#username").pressSequentially(username, { delay: 80 });
   await page.waitForTimeout(500);
-  await page.locator("#username").press("Enter");
+
+  // Click the submit button explicitly — pressing Enter is unreliable across
+  // repeated navigations (e.g. after page.reload or emulateMedia calls) due
+  // to Dioxus reactive state timing. The button renders once meeting_id_value
+  // is non-empty, so wait for it first.
+  const submitButton = page.getByRole("button", { name: "Start or Join Meeting" });
+  await expect(submitButton).toBeVisible({ timeout: 5_000 });
+  await submitButton.click();
 
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
     timeout: 10_000,

@@ -72,10 +72,8 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
 
   async function openSettings(page: Page): Promise<void> {
     await page.locator(".video-controls-container").hover();
-    const settingsBtn = page.locator(
-      '.video-controls-container button[aria-label="Settings"], .video-controls-container .device-settings-button, .video-controls-container button:has-text("Settings")',
-    );
-    await settingsBtn.first().click();
+    const settingsBtn = page.locator('[data-testid="open-settings"]');
+    await settingsBtn.click();
     await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
   }
 

@@ -217,6 +217,7 @@ services:
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
       - USERS_ALLOWED_TO_STREAM=
+      - DIOXUS_SERVE_MODE=${DIOXUS_SERVE_MODE:-dev}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false

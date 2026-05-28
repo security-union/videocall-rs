@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
+use wasm_bindgen::JsCast;
 
 use crate::theme::color as theme_color;
 
@@ -593,8 +594,304 @@ pub struct SignalQualityPopupProps {
     /// `None` is treated like `"unknown"` (em-dash).
     #[props(default)]
     transport: Option<String>,
+    /// DOM id of the source tile element the popup should anchor to.  The
+    /// popup is rendered with `position: fixed` and follows this element
+    /// through grid reflows / window resizes / scrolls via a
+    /// `ResizeObserver` + window listeners, so a grid reflow on peer
+    /// join/leave keeps the popup glued to the right tile instead of
+    /// stranding it where the tile used to be.
+    anchor_id: String,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
+}
+
+// ---------------------------------------------------------------------------
+// Popup positioning math (portal-mode)
+// ---------------------------------------------------------------------------
+
+/// Margin in CSS pixels between the popup and the tile edge / viewport edge.
+const POPUP_GAP_PX: f64 = 8.0;
+/// Minimum spacing between the popup and the viewport edges.  The popup is
+/// clamped inside `[VIEWPORT_MARGIN_PX .. viewport - VIEWPORT_MARGIN_PX]`
+/// on both axes so it never sits flush against a screen edge.
+const VIEWPORT_MARGIN_PX: f64 = 8.0;
+
+/// Axis-aligned bounding box in viewport (CSS pixel) coordinates.  Mirrors
+/// the fields of `DOMRect` we care about so the position-math helpers can
+/// be unit-tested without a browser.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Rect {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+impl Rect {
+    pub(crate) fn width(&self) -> f64 {
+        (self.right - self.left).max(0.0)
+    }
+    pub(crate) fn height(&self) -> f64 {
+        (self.bottom - self.top).max(0.0)
+    }
+}
+
+/// Compute the viewport-coordinate `(left, top)` for the signal-quality
+/// popup given the source tile rect, the popup's own size, and the
+/// viewport size.
+///
+/// Anchoring rules (in order of preference):
+///   1. Place the popup adjacent to the tile's right edge, top-aligned
+///      with the tile.  This mirrors the historical visual relationship
+///      where the popup hung off the top-right corner of the tile.
+///   2. If that would overflow the right viewport edge, flip to the
+///      tile's left side.
+///   3. If still overflowing (popup wider than the available space on
+///      either side), clamp to the viewport edge with `VIEWPORT_MARGIN_PX`
+///      breathing room.
+///   4. Vertically, clamp to the viewport so the popup never extends
+///      above or below the visible area.
+///
+/// The function operates on pure data, so unit tests can drive every
+/// edge-case path without a browser.
+pub(crate) fn compute_popup_position(
+    anchor: Rect,
+    popup_w: f64,
+    popup_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> (f64, f64) {
+    // Horizontal: prefer right-of-tile, then left-of-tile, then clamp.
+    let right_of_left = anchor.right + POPUP_GAP_PX;
+    let left_of_left = anchor.left - POPUP_GAP_PX - popup_w;
+
+    let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_left = VIEWPORT_MARGIN_PX;
+
+    let left = if right_of_left + popup_w <= viewport_w - VIEWPORT_MARGIN_PX {
+        // Fits to the right of the tile.
+        right_of_left
+    } else if left_of_left >= VIEWPORT_MARGIN_PX {
+        // Fits to the left of the tile.
+        left_of_left
+    } else {
+        // Neither side fits — overlay the tile, anchored to the right
+        // edge of the viewport.  This is the dense-grid worst case.
+        max_left
+    };
+    let left = left.clamp(min_left, max_left.max(min_left));
+
+    // Vertical: prefer top-aligned with the tile, then clamp into viewport.
+    let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_top = VIEWPORT_MARGIN_PX;
+    let top = anchor.top.clamp(min_top, max_top.max(min_top));
+
+    (left, top)
+}
+
+/// Read an `Element`'s viewport-coordinate rect into our pure-data [`Rect`].
+fn element_rect(el: &web_sys::Element) -> Rect {
+    let r = el.get_bounding_client_rect();
+    Rect {
+        left: r.left(),
+        top: r.top(),
+        right: r.right(),
+        bottom: r.bottom(),
+    }
+}
+
+/// Reposition the popup element to anchor to its source tile.
+///
+/// No-ops silently if either element is missing from the DOM — that's the
+/// normal state when the source tile has just unmounted from a peer leave
+/// but the popup has not yet finished its own unmount cycle.
+fn reposition_popup(anchor_id: &str, popup_id: &str) {
+    let doc = gloo_utils::document();
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let anchor = match doc.get_element_by_id(anchor_id) {
+        Some(el) => el,
+        None => return,
+    };
+    let popup = match doc.get_element_by_id(popup_id) {
+        Some(el) => el,
+        None => return,
+    };
+
+    let anchor_rect = element_rect(&anchor);
+    let popup_rect = element_rect(&popup);
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let (left, top) = compute_popup_position(
+        anchor_rect,
+        popup_rect.width(),
+        popup_rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+
+    let html_popup: web_sys::HtmlElement = popup.unchecked_into();
+    let style = html_popup.style();
+    let _ = style.set_property("left", &format!("{left:.0}px"));
+    let _ = style.set_property("top", &format!("{top:.0}px"));
+}
+
+/// Install everything the `SignalQualityPopup` needs to behave like a
+/// portal-rendered overlay anchored to a source tile: a `ResizeObserver`
+/// on the source tile + `resize`/`scroll` window listeners.  All closures
+/// are stored in `use_hook` so they live for the popup's lifetime, and
+/// `use_drop` tears them down on unmount.
+///
+/// Dismissal is intentionally limited to the explicit close button (the
+/// "X" in the popup header) so the user can keep multiple per-peer popups
+/// open simultaneously and inspect them at leisure.  Earlier revisions
+/// also installed an `Escape` keydown listener and a click-outside
+/// transparent backdrop; both were removed because, with one backdrop
+/// per popup at the same z-index, the topmost backdrop swallowed clicks
+/// on every other tile's signal-meter button and made it impossible to
+/// open a second popup without first closing the first.
+fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHandler<()>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::closure::Closure;
+
+    // Holder kept alive for the popup's lifetime.  Listed fields are
+    // dropped explicitly in `use_drop` so closures stop firing the moment
+    // the popup unmounts (otherwise `forget()`-style closures would leak
+    // across remounts).
+    struct AnchorState {
+        win: web_sys::Window,
+        resize_cb: Option<Closure<dyn FnMut()>>,
+        scroll_cb: Option<Closure<dyn FnMut()>>,
+        observer: Option<web_sys::ResizeObserver>,
+        _observer_cb: Option<Closure<dyn FnMut(js_sys::Array)>>,
+    }
+
+    let state: Rc<RefCell<Option<AnchorState>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    {
+        let state = state.clone();
+        let anchor_id_for_init = anchor_id.clone();
+        let popup_id_for_init = popup_id.clone();
+        // One-shot installation: use_hook runs once per popup mount.
+        use_hook(move || {
+            let win = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+
+            // ── reposition trampoline ────────────────────────────────
+            let reposition = {
+                let aid = anchor_id_for_init.clone();
+                let pid = popup_id_for_init.clone();
+                move || {
+                    reposition_popup(&aid, &pid);
+                }
+            };
+
+            // Initial paint can race the popup actually being attached to
+            // the DOM (Dioxus has not flushed yet), so schedule a single
+            // microtask after the current render to lay it out correctly
+            // on first appearance.  rAF gives the layout engine a chance
+            // to measure the popup's natural size before we read it back.
+            {
+                let rep = reposition.clone();
+                // rAF callback signature is `FnOnce(f64)` (the timestamp);
+                // discard it and call `rep()` which expects no args.
+                let cb = Closure::once_into_js(move |_ts: f64| rep());
+                let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+
+            // Window resize.
+            let resize_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ =
+                win.add_event_listener_with_callback("resize", resize_cb.as_ref().unchecked_ref());
+
+            // Window scroll (capture phase so we observe scroll on any
+            // ancestor scroll container, not just window).  Scroll fires
+            // a lot; `getBoundingClientRect` is cheap and the DOM writes
+            // we issue are minimal, so we don't throttle here.  We use
+            // the `_with_bool` overload which sets `useCapture=true`
+            // without requiring the `AddEventListenerOptions` web-sys
+            // feature.
+            let scroll_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ = win.add_event_listener_with_callback_and_bool(
+                "scroll",
+                scroll_cb.as_ref().unchecked_ref(),
+                true,
+            );
+
+            // ResizeObserver on the anchor tile catches grid reflows on
+            // peer join/leave (the tile's own size changes when CSS Grid
+            // re-distributes available space).  `window` resize covers
+            // viewport changes, but the grid can reflow without any
+            // viewport change — that's the case this observer handles.
+            let observer_cb: Closure<dyn FnMut(js_sys::Array)> = Closure::new({
+                let rep = reposition.clone();
+                move |_entries: js_sys::Array| rep()
+            });
+            let observer = web_sys::ResizeObserver::new(observer_cb.as_ref().unchecked_ref()).ok();
+            if let Some(obs) = observer.as_ref() {
+                let doc = gloo_utils::document();
+                if let Some(anchor_el) = doc.get_element_by_id(&anchor_id_for_init) {
+                    obs.observe(&anchor_el);
+                }
+            }
+
+            *state.borrow_mut() = Some(AnchorState {
+                win: win.clone(),
+                resize_cb: Some(resize_cb),
+                scroll_cb: Some(scroll_cb),
+                observer,
+                _observer_cb: Some(observer_cb),
+            });
+        });
+    }
+
+    // Tear down listeners + observer on unmount so popup remounts on a
+    // different tile install a fresh anchor (and so old anchors do not
+    // keep repositioning a popup that no longer exists).
+    use_drop({
+        let state = state.clone();
+        move || {
+            if let Some(s) = state.borrow_mut().take() {
+                if let Some(cb) = s.resize_cb.as_ref() {
+                    let _ = s
+                        .win
+                        .remove_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+                }
+                if let Some(cb) = s.scroll_cb.as_ref() {
+                    // Removal capture-flag must mirror the addition's
+                    // `useCapture=true` so the matching listener is found.
+                    let _ = s.win.remove_event_listener_with_callback_and_bool(
+                        "scroll",
+                        cb.as_ref().unchecked_ref(),
+                        true,
+                    );
+                }
+                if let Some(obs) = s.observer.as_ref() {
+                    obs.disconnect();
+                }
+            }
+        }
+    });
 }
 
 /// Get or create the global tooltip element on `<body>`.
@@ -1029,8 +1326,6 @@ fn hide_body_tooltip() {
     }
 }
 
-use wasm_bindgen::JsCast;
-
 /// Popup overlay showing a scrollable SVG line chart of audio, video,
 /// screen share quality, and latency.
 #[component]
@@ -1052,6 +1347,32 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // directly to escape all stacking contexts from grid-items.
     // Hide tooltip when this popup component unmounts.
     use_drop(hide_body_tooltip);
+
+    // ── Portal positioning ─────────────────────────────────────────────────
+    // The popup is rendered with `position: fixed` so it escapes the source
+    // tile's `overflow: hidden` clip (added in PR #923 for rounded-corner // @token-exempt: PR ref, not a color
+    // canvases).  To keep it visually anchored to the tile we install a
+    // [`PopupAnchor`] hook that:
+    //
+    //   - reads `getBoundingClientRect()` on the anchor tile,
+    //   - clamps / flips the popup position so it stays in the viewport,
+    //   - re-runs the math on window `resize`, `scroll` (capture phase), and
+    //     a `ResizeObserver` on the anchor tile (grid reflows when peers
+    //     join / leave bubble up via ResizeObserver).
+    //
+    // Dismissal is restricted to the explicit "X" close button so multiple
+    // popups can be open at once without an Esc keystroke or a stray click
+    // tearing them all down.
+    //
+    // All closures + the ResizeObserver are torn down via `use_drop` when
+    // the popup unmounts, so reopening it on a different tile attaches
+    // a fresh anchor cleanly.
+    let popup_id = format!("signal-quality-popup-{}", props.peer_id);
+    {
+        let anchor_id = props.anchor_id.clone();
+        let popup_id_for_hook = popup_id.clone();
+        install_popup_anchor(anchor_id, popup_id_for_hook, on_close);
+    }
 
     // Which legend help text is currently expanded (if any).
     let mut help_visible = use_signal(|| None::<&'static str>);
@@ -1077,7 +1398,9 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     if history.is_empty() {
         return rsx! {
             div {
-                class: "signal-quality-popup",
+                id: "{popup_id}",
+                class: "signal-quality-popup signal-quality-popup-portal",
+                onclick: move |e| e.stop_propagation(),
                 div { class: "popup-header",
                     span { class: "popup-title", "{popup_title}" }
                     div { class: "popup-header-actions",
@@ -1199,8 +1522,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
 
     rsx! {
         div {
-            class: "signal-quality-popup",
-            // Stop clicks inside the popup from bubbling to tile handlers.
+            id: "{popup_id}",
+            class: "signal-quality-popup signal-quality-popup-portal",
+            // Stop clicks inside the popup from bubbling to tile handlers
+            // (e.g. the mobile-pin onclick on `.canvas-container`).
             onclick: move |e| e.stop_propagation(),
             div { class: "popup-header",
                 span { class: "popup-title", "{popup_title}" }
@@ -2569,5 +2894,129 @@ mod tests {
         history.push_sample_at(&data, 1_000.0);
         let s = &history.samples_vec()[0];
         assert_eq!(s.peer_status_age_ms, Some(2_500.0));
+    }
+
+    // ── Portal positioning math ──────────────────────────────────────────
+    // `compute_popup_position` is the pure-data heart of the portal anchor;
+    // every browser-side branch (initial render, resize, scroll,
+    // ResizeObserver fire) ultimately funnels into this function.  Cover
+    // each branch — right-of-tile fit, flip-left, dense-grid clamp,
+    // vertical clamp — so a future refactor cannot silently strand the
+    // popup off-screen.
+
+    /// Build a `Rect` from `(left, top, w, h)`.
+    fn rect_from(left: f64, top: f64, w: f64, h: f64) -> super::Rect {
+        super::Rect {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        }
+    }
+
+    #[test]
+    fn popup_anchors_to_right_of_tile_when_space_available() {
+        // 1920x1080 viewport, 400x300 tile at top-left, 420x300 popup.
+        // Plenty of room to the right of the tile — the popup should
+        // be placed at `tile.right + 8` and top-aligned with the tile.
+        let anchor = rect_from(100.0, 100.0, 400.0, 300.0);
+        let (left, top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
+        assert!(
+            (left - (500.0 + super::POPUP_GAP_PX)).abs() < 0.01,
+            "expected left == tile.right+gap, got {left}"
+        );
+        assert!(
+            (top - 100.0).abs() < 0.01,
+            "expected top == tile.top, got {top}"
+        );
+    }
+
+    #[test]
+    fn popup_flips_to_left_when_right_overflows() {
+        // 1920x1080 viewport, tile near the right edge.  Right-of-tile
+        // doesn't fit, but there's room on the left — popup flips.
+        // tile.right = 1850, popup_w = 420, right-of-tile placement
+        // would land at 1858 (overflows).  Left-of-tile = 1450-8-420 =
+        // 1022 — fits.
+        let anchor = rect_from(1450.0, 200.0, 400.0, 300.0);
+        let (left, _top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
+        assert!(
+            (left - (1450.0 - super::POPUP_GAP_PX - 420.0)).abs() < 0.01,
+            "expected left of tile, got {left}"
+        );
+    }
+
+    #[test]
+    fn popup_clamps_when_neither_side_fits() {
+        // Very narrow viewport: tile + popup widths exceed viewport
+        // width.  Should clamp to the right margin (popup overlays tile
+        // in this dense-grid worst case rather than disappearing).
+        let anchor = rect_from(50.0, 50.0, 300.0, 200.0);
+        let viewport_w = 500.0;
+        let popup_w = 420.0;
+        let (left, _top) = super::compute_popup_position(anchor, popup_w, 200.0, viewport_w, 800.0);
+        let expected_max_left = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        assert!(
+            (left - expected_max_left).abs() < 0.01,
+            "expected clamp to right margin {expected_max_left}, got {left}"
+        );
+        // Popup is fully on-screen on the right side.
+        assert!(left + popup_w <= viewport_w);
+    }
+
+    #[test]
+    fn popup_clamps_vertically_when_tile_is_near_bottom() {
+        // Tile is at the bottom of the viewport — popup top would force
+        // it off-screen.  Should clamp to viewport - popup_h - margin.
+        let anchor = rect_from(100.0, 900.0, 400.0, 300.0);
+        let popup_h = 500.0;
+        let viewport_h = 1000.0;
+        let (_left, top) =
+            super::compute_popup_position(anchor, 420.0, popup_h, 1920.0, viewport_h);
+        let expected_max_top = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        assert!(
+            (top - expected_max_top).abs() < 0.01,
+            "expected clamp to {expected_max_top}, got {top}"
+        );
+        assert!(top + popup_h <= viewport_h);
+    }
+
+    #[test]
+    fn popup_clamps_vertically_when_tile_is_above_viewport() {
+        // Negative tile.top (scrolled above viewport).  Popup must still
+        // sit inside the visible region with at least VIEWPORT_MARGIN_PX
+        // breathing room from the top edge.
+        let anchor = rect_from(100.0, -200.0, 400.0, 300.0);
+        let (_left, top) = super::compute_popup_position(anchor, 420.0, 400.0, 1920.0, 1080.0);
+        assert!(
+            top >= super::VIEWPORT_MARGIN_PX,
+            "expected clamp >= {}, got {top}",
+            super::VIEWPORT_MARGIN_PX
+        );
+    }
+
+    #[test]
+    fn popup_never_overflows_viewport_in_dense_grid() {
+        // Sweep a few dense-grid scenarios to catch any clamp/flip
+        // regression that would land the popup off-screen.
+        let popup_w = 420.0;
+        let popup_h = 400.0;
+        let viewport_w = 1280.0;
+        let viewport_h = 720.0;
+        for (left, top) in [
+            (10.0, 10.0),
+            (1000.0, 10.0),
+            (10.0, 600.0),
+            (1000.0, 600.0),
+            (640.0, 350.0),
+        ] {
+            let anchor = rect_from(left, top, 200.0, 150.0);
+            let (l, t) =
+                super::compute_popup_position(anchor, popup_w, popup_h, viewport_w, viewport_h);
+            assert!(
+                l >= 0.0 && (l + popup_w) <= viewport_w && t >= 0.0 && (t + popup_h) <= viewport_h,
+                "popup off-screen at anchor=({left},{top}): pos=({l},{t})"
+            );
+        }
     }
 }

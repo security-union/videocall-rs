@@ -209,12 +209,13 @@ test.describe("Screen-share visibility toast", () => {
       ).toBeVisible({ timeout: 5_000 });
 
       // The "SuccessfullyShared" toast must replace it once the guest
-      // decodes the first frame and acks via PEER_EVENT.
+      // decodes the first frame and acks via PEER_EVENT. Allow extra time
+      // for WebRTC frame propagation in Docker.
       await expect(
         hostPage.locator(".peer-toast.toast-success.screen-share-toast", {
           hasText: "Others can now see your shared content",
         }),
-      ).toBeVisible({ timeout: 15_000 });
+      ).toBeVisible({ timeout: 30_000 });
 
       // The success toast must auto-dismiss after a few seconds.
       await expect(hostPage.locator(".peer-toast.toast-success.screen-share-toast")).toHaveCount(

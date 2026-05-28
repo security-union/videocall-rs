@@ -1202,6 +1202,11 @@ impl PeerDecodeManager {
     /// screen-share we just decoded for the first time. The relay routes
     /// the packet by `target_peer_id`, so only the publisher receives it.
     ///
+    /// Sends immediately then retries twice (at 2s and 4s) to handle a
+    /// race condition where the publisher's NATS subscription may not be
+    /// active yet when the first packet arrives (the relay's JoinRoom
+    /// handler spawns the subscription asynchronously).
+    ///
     /// `publisher_user_id` MUST be the publisher's user_id (the remote peer
     /// whose screen frame we just decoded). The event's `stream_id` is set
     /// to the same value because there is at most one screen-share per user.
@@ -1211,11 +1216,40 @@ impl PeerDecodeManager {
             return;
         };
 
+        let local_user_id = self.local_user_id.clone();
+        let target_user_id = publisher_user_id.to_string();
+        let send_packet = send_packet.clone();
+
+        log::info!(
+            "Publishing PEER_EVENT(screen_decode_started) target={} (with retries)",
+            publisher_user_id
+        );
+
+        Self::emit_screen_decode_event(&send_packet, &local_user_id, &target_user_id);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            for delay_ms in [2000, 4000] {
+                gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                log::debug!(
+                    "Retry PEER_EVENT(screen_decode_started) target={} delay={}ms",
+                    target_user_id,
+                    delay_ms
+                );
+                Self::emit_screen_decode_event(&send_packet, &local_user_id, &target_user_id);
+            }
+        });
+    }
+
+    fn emit_screen_decode_event(
+        send_packet: &Callback<PacketWrapper>,
+        local_user_id: &str,
+        target_user_id: &str,
+    ) {
         let peer_event = PeerEvent {
-            source_peer_id: self.local_user_id.as_bytes().to_vec(),
-            target_peer_id: publisher_user_id.as_bytes().to_vec(),
+            source_peer_id: local_user_id.as_bytes().to_vec(),
+            target_peer_id: target_user_id.as_bytes().to_vec(),
             event_type: PEER_EVENT_SCREEN_DECODE_STARTED.to_string(),
-            stream_id: publisher_user_id.to_string(),
+            stream_id: target_user_id.to_string(),
             timestamp_ms: Date::now() as i64,
             ..Default::default()
         };
@@ -1230,15 +1264,11 @@ impl PeerDecodeManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::PEER_EVENT.into(),
-            user_id: self.local_user_id.as_bytes().to_vec(),
+            user_id: local_user_id.as_bytes().to_vec(),
             data,
             ..Default::default()
         };
 
-        log::info!(
-            "Publishing PEER_EVENT(screen_decode_started) target={}",
-            publisher_user_id
-        );
         send_packet.emit(wrapper);
     }
 

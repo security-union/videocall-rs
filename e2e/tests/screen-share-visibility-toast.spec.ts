@@ -185,14 +185,14 @@ test.describe("Screen-share visibility toast", () => {
         timeout: 10_000,
       });
 
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
-
-      // Wait for host to see guest's tile (signals the peer connection
-      // is established in both directions, so the screen-share decode
-      // path on the guest is ready to fire its ack back).
+      // Wait for bidirectional peer connection: host sees guest AND guest
+      // sees host. The ack path requires the guest to send packets back
+      // through the relay, so both directions must be established.
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
-        timeout: 30_000,
+        timeout: 45_000,
+      });
+      await expect(guestPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 45_000,
       });
 
       // Reveal dock controls.

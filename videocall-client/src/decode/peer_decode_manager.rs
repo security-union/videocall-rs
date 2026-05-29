@@ -1079,6 +1079,7 @@ impl PeerDecodeManager {
         let peer_session_id = packet.session_id;
 
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
+            let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
                 peer.video
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
@@ -1089,6 +1090,11 @@ impl PeerDecodeManager {
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
+                    let stopped_screen_share = was_screen_enabled && !peer.screen_enabled;
+                    let publisher_user_id = stopped_screen_share.then(|| peer.user_id.clone());
+                    if let Some(publisher_user_id) = publisher_user_id {
+                        self.cancel_screen_decode_retries(&publisher_user_id);
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status, keyframe_request)) => {
@@ -1148,6 +1154,12 @@ impl PeerDecodeManager {
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(peer_session_id))
+        }
+    }
+
+    fn cancel_screen_decode_retries(&mut self, publisher_user_id: &str) {
+        if let Some(token) = self.screen_decode_retry_tokens.remove(publisher_user_id) {
+            token.set(false);
         }
     }
 
@@ -1230,8 +1242,12 @@ impl PeerDecodeManager {
         let send_packet = send_packet.clone();
 
         let active = Rc::new(std::cell::Cell::new(true));
-        self.screen_decode_retry_tokens
-            .insert(target_user_id.clone(), Rc::clone(&active));
+        if let Some(previous) = self
+            .screen_decode_retry_tokens
+            .insert(target_user_id.clone(), Rc::clone(&active))
+        {
+            previous.set(false);
+        }
 
         log::info!(
             "Publishing PEER_EVENT(screen_decode_started) target={} (with retries)",
@@ -1572,16 +1588,20 @@ mod tests {
 
     // -- helpers ----------------------------------------------------------
 
-    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
-    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+    fn packet_wrapper(media: &MediaPacket, session_id: u64) -> PacketWrapper {
         let data = media.write_to_bytes().expect("serialize MediaPacket");
-        Arc::new(PacketWrapper {
+        PacketWrapper {
             data,
             user_id: "test@test.com".into(),
             packet_type: PacketType::MEDIA.into(),
             session_id,
             ..Default::default()
-        })
+        }
+    }
+
+    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
+    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+        Arc::new(packet_wrapper(media, session_id))
     }
 
     fn heartbeat_packet(
@@ -1669,6 +1689,97 @@ mod tests {
             screen_seq_tracker: SequenceTracker::new(),
         };
         (peer, muted_handle)
+    }
+
+    #[wasm_bindgen_test]
+    fn heartbeat_screen_off_cancels_pending_screen_decode_retries() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(42);
+        peer.screen_enabled = true;
+        peer.has_received_heartbeat = true;
+        manager.connected_peers.insert(42, peer);
+
+        let token = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("test@test.com".to_string(), token.clone());
+
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: false,
+                audio_enabled: false,
+                screen_enabled: false,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+
+        manager
+            .decode(packet_wrapper(&media, 42), "test@test.com")
+            .expect("screen-off heartbeat should decode");
+
+        assert!(
+            !token.get(),
+            "screen-off heartbeat must cancel pending screen_decode_started retries"
+        );
+        assert!(
+            !manager
+                .screen_decode_retry_tokens
+                .contains_key("test@test.com"),
+            "cancelled retry token should be removed from the manager"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn new_screen_decode_publish_cancels_previous_retry_token() {
+        let collected = Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = Callback::from(move |packet: PacketWrapper| {
+            collected_clone.borrow_mut().push(packet);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "viewer@test.com".to_string());
+
+        let previous = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("publisher@test.com".to_string(), previous.clone());
+
+        manager.publish_screen_decode_started("publisher@test.com");
+
+        assert!(
+            !previous.get(),
+            "re-publishing for the same publisher must cancel the old retry loop"
+        );
+        assert!(
+            manager
+                .screen_decode_retry_tokens
+                .get("publisher@test.com")
+                .is_some_and(|token| token.get()),
+            "new publish should install an active retry token"
+        );
+
+        let packets = collected.borrow();
+        assert_eq!(
+            packets.len(),
+            1,
+            "publish sends the first event immediately"
+        );
+        assert_eq!(
+            packets[0].packet_type.enum_value(),
+            Ok(PacketType::PEER_EVENT)
+        );
+        let peer_event =
+            PeerEvent::parse_from_bytes(&packets[0].data).expect("peer event should parse");
+        assert_eq!(
+            peer_event.event_type,
+            PEER_EVENT_SCREEN_DECODE_STARTED.to_string()
+        );
+        assert_eq!(peer_event.target_peer_id, b"publisher@test.com".to_vec());
     }
 
     // -- straggler guard tests --------------------------------------------

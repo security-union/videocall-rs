@@ -62,7 +62,7 @@ jobs:
     timeout-minutes: 30
     concurrency:
       group: hcl-ci-bvt
-      cancel-in-progress: true
+      cancel-in-progress: false
 
     steps:
       - name: Clean workspace (root-owned files from Docker)

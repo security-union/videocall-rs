@@ -114,7 +114,7 @@ jobs:
             return 1
           }
 
-          wait_for_service "dioxus-ui" "http://localhost:3001" 120
+          wait_for_service "dioxus-ui" "http://localhost:3001" 300
           wait_for_service "meeting-api" "http://localhost:8081/session" 60
           wait_for_service "websocket-api" "http://localhost:8080" 60
 

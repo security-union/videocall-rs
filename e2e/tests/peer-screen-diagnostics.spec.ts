@@ -375,6 +375,30 @@ test.describe("Peer screen-share diagnostics", () => {
       expect(causeLine).not.toMatch(/encoder target/);
       expect(causeLine).not.toMatch(/limited by/);
 
+      // HCL follow-up #939: a separate, longer-running assertion verifies that
+      // the publisher actually emits BOTH `tier '<name>'` and a recognized
+      // cause-hint value within a generous (~30s) window. Keeps the fast
+      // `\d+kbps` assertion above as the liveness check while still catching
+      // a regression where the publisher silently stops emitting tier or
+      // cause_hint (the loosening in PR #938 swallowed that signal).
+      //
+      // Cause-hint vocabulary (from
+      // `videocall-client/src/encode/screen_encoder.rs::cause_hint_from_trigger`):
+      //   - bitrate-limited (trigger=bitrate)
+      //   - cpu-pressure   (trigger=fps)
+      //   - network-rtt    (trigger=congestion)
+      //   - manual-cap     (trigger=coordination)
+      // Empty hint ("") is the proto3 default — the renderer skips the
+      // line in that case, so the poll body would not find a Cause line
+      // and `.toPass()` would keep retrying until a non-default hint
+      // lands.
+      await expect(async () => {
+        const html = await tooltip.innerHTML();
+        const line = html.split(/<br\s*\/?>|\n/i).find((l) => /Cause:/.test(l)) ?? "";
+        expect(line).toMatch(/tier '[^']+'/);
+        expect(line).toMatch(/(bitrate-limited|cpu-pressure|network-rtt|manual-cap)/);
+      }).toPass({ timeout: 30_000 });
+
       // The legend help text must describe the Cause line shape so the
       // wording stays in sync with the renderer. The previous placeholder
       // string ("not yet instrumented" / "#903" reference) is gone.

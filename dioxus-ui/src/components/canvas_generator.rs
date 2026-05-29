@@ -450,6 +450,7 @@ pub fn generate_for_peer(
             div {
                 id: "{ss_div_id}",
                 class: "{ss_split_class}",
+                "data-tile-root": "true",
                 div {
                     class: "canvas-container video-on",
                     ScreenCanvas { peer_id: key.clone() }
@@ -566,6 +567,7 @@ pub fn generate_for_peer(
             div {
                 class: "{split_peer_class}{vo_speaking}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{vo_tile_style}",
                 div {
                     class: "{grid_class}",
@@ -820,6 +822,7 @@ pub fn generate_for_peer(
             div {
                 class: "{full_bleed_grid_class}{speaking_class}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{tile_style}",
                 div {
                     class: "{full_bleed_class}",
@@ -1141,6 +1144,7 @@ pub fn generate_for_peer(
                 div {
                     class: "{grid_item_class}{grid_speaking}",
                     id: "{peer_video_div_id}",
+                    "data-tile-root": "true",
                     style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {

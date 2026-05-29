@@ -942,21 +942,95 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
 /// pass. The Dioxus re-render that follows the state-map write
 /// confirms the same attribute / style declaratively, so the two paths
 /// agree.
-fn snap_popup_back_to_anchor(anchor_id: &str, popup_id: &str) {
+///
+/// HCL follow-up 957: split-layout regression — clicking pin while a
+/// peer was sharing left the popup parked at its dragged coordinates.
+/// To make this robust across layout transitions (grid ↔ split panels):
+///
+///   1. The anchor id is read from the popup's live
+///      `data-popup-anchor-id` attribute every call — not from a Rust
+///      string captured at popup-open time, which could go stale if
+///      the layout switched mid-session.
+///   2. If the captured id no longer matches a live DOM element, we
+///      fall back to the closest `[data-tile-root]` ancestor of the
+///      popup and search inside it for a `.floating-name` element.
+///      This gives the snap-back a "land somewhere sane" path even
+///      when an anchor id mismatch would otherwise leave the popup
+///      stranded.
+///   3. The popup element itself is re-queried every call, so a stale
+///      handle from a prior render can never cause a no-op.
+fn snap_popup_back_to_anchor(popup_id: &str) {
     let doc = gloo_utils::document();
     let popup = match doc.get_element_by_id(popup_id) {
         Some(el) => el,
         None => return,
     };
+    // Flip the mode FIRST so any subsequent reposition pass does not
+    // early-return into the free-clamp branch.
     let _ = popup.set_attribute("data-anchor-mode", "anchored");
-    let html_popup: web_sys::HtmlElement = popup.unchecked_into();
+
+    // Clear drag-written inline coordinates so the reposition writes
+    // below are the source of truth for the post-snap position.
+    let html_popup: web_sys::HtmlElement = popup.clone().unchecked_into();
     let style = html_popup.style();
-    // Clear any drag-written inline coordinates so the imminent
-    // `reposition_popup` call is the source of truth for the post-snap
-    // position.
     let _ = style.remove_property("left");
     let _ = style.remove_property("top");
-    reposition_popup(anchor_id, popup_id);
+
+    // Resolve the anchor element. We prefer the popup's own live
+    // `data-popup-anchor-id` attribute (set declaratively by Dioxus on
+    // every render so it is always current for the active tile-mode);
+    // when that lookup fails we fall back to a tile-relative
+    // `.floating-name` search before giving up.
+    let anchor_id = popup
+        .get_attribute("data-popup-anchor-id")
+        .unwrap_or_default();
+    let anchor_el = if anchor_id.is_empty() {
+        None
+    } else {
+        doc.get_element_by_id(&anchor_id)
+    };
+    let anchor_el = anchor_el.or_else(|| find_fallback_anchor(&popup));
+    let Some(anchor_el) = anchor_el else {
+        return;
+    };
+
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let anchor_rect = element_rect(&anchor_el);
+    let popup_rect = element_rect(&popup);
+    let (left, top) = compute_popup_position(
+        anchor_rect,
+        popup_rect.width(),
+        popup_rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+    let _ = style.set_property("left", &format!("{left:.0}px"));
+    let _ = style.set_property("top", &format!("{top:.0}px"));
+}
+
+/// HCL follow-up 957: tile-relative fallback used when the popup's
+/// stored anchor id does not match a live DOM element. Walks up from
+/// the popup to its owning tile root (`[data-tile-root]`) and returns
+/// the first `.floating-name` element it finds inside. Returns `None`
+/// when no tile root is found or the tile has no floating-name
+/// element — in that case `snap_popup_back_to_anchor` gives up rather
+/// than guessing.
+fn find_fallback_anchor(popup: &web_sys::Element) -> Option<web_sys::Element> {
+    let tile_root = popup.closest("[data-tile-root]").ok().flatten()?;
+    tile_root.query_selector(".floating-name").ok().flatten()
 }
 
 /// HCL bug #9: clamp a `Free` popup so it stays within the viewport when
@@ -1971,15 +2045,20 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         // HCL follow-up 952 (@token-exempt): capture the popup + anchor ids
         // so the reanchor button onclick can snap the popup back to its
         // tile-name anchor immediately rather than waiting for the next
-        // resize/scroll/ResizeObserver tick.
-        let anchor_id_for_reanchor_empty = props.anchor_id.clone();
+        // resize/scroll/ResizeObserver tick. HCL follow-up 957: the
+        // anchor id is published on the popup itself via
+        // `data-popup-anchor-id` so `snap_popup_back_to_anchor` reads
+        // it back live (rather than from a captured closure that could
+        // go stale across a grid ↔ split layout transition).
         let popup_id_for_reanchor_empty = popup_id.clone();
+        let popup_anchor_id_attr_empty = props.anchor_id.clone();
         return rsx! {
             div {
                 id: "{popup_id}",
                 class: "signal-quality-popup signal-quality-popup-portal",
                 "data-anchor-mode": "{anchor_mode_attr}",
                 "data-meter-mode": "{meter_mode.id_suffix()}",
+                "data-popup-anchor-id": "{popup_anchor_id_attr_empty}",
                 style: "{position_style}",
                 onclick: move |e| e.stop_propagation(),
                 div {
@@ -2029,10 +2108,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                                 "aria-label": "Reanchor to tile",
                                 "data-no-drag": "true",
                                 onclick: move |_| {
-                                    snap_popup_back_to_anchor(
-                                        &anchor_id_for_reanchor_empty,
-                                        &popup_id_for_reanchor_empty,
-                                    );
+                                    snap_popup_back_to_anchor(&popup_id_for_reanchor_empty);
                                     on_reanchor.call(());
                                 },
                                 "\u{1F4CC}"
@@ -2151,18 +2227,20 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     });
 
     let sharing_indicator_render = sharing_indicator.clone();
-    // HCL follow-up 952 (@token-exempt): see comment on the empty-history
-    // branch above — the reanchor button needs the anchor + popup ids in
-    // scope so it can call `snap_popup_back_to_anchor` synchronously on
-    // click instead of waiting on the next reposition tick.
-    let anchor_id_for_reanchor = props.anchor_id.clone();
+    // HCL follow-up 952 (@token-exempt) / 957: see the empty-history branch
+    // above. The anchor id is also published as `data-popup-anchor-id` on
+    // the popup div so `snap_popup_back_to_anchor` reads it live (defending
+    // against any stale captured closure across a grid ↔ split layout
+    // switch).
     let popup_id_for_reanchor = popup_id.clone();
+    let popup_anchor_id_attr = props.anchor_id.clone();
     rsx! {
         div {
             id: "{popup_id}",
             class: "signal-quality-popup signal-quality-popup-portal",
             "data-anchor-mode": "{anchor_mode_attr}",
             "data-meter-mode": "{meter_mode.id_suffix()}",
+            "data-popup-anchor-id": "{popup_anchor_id_attr}",
             style: "{position_style}",
             // Stop clicks inside the popup from bubbling to tile handlers
             // (e.g. the mobile-pin onclick on `.canvas-container`).
@@ -2213,10 +2291,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             "aria-label": "Reanchor to tile",
                             "data-no-drag": "true",
                             onclick: move |_| {
-                                snap_popup_back_to_anchor(
-                                    &anchor_id_for_reanchor,
-                                    &popup_id_for_reanchor,
-                                );
+                                snap_popup_back_to_anchor(&popup_id_for_reanchor);
                                 on_reanchor.call(());
                             },
                             "\u{1F4CC}"

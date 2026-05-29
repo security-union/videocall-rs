@@ -655,6 +655,150 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
     }
   });
 
+  // ── HCL follow-up 957: reanchor snap-back also works in split layout ────
+  // Regression for the user-reported case: clicking pin while a peer is
+  // sharing left the popup parked at its dragged coordinates. We exercise
+  // BOTH popups available during a share — the LEFT-panel sharer popup
+  // and a right-strip peer popup — to lock the fix across all share-mode
+  // popup placements.
+  test("reanchor snaps popup back while a peer is sharing", async ({ baseURL }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_sigm_snap_split_${Date.now()}`;
+
+    const browsers = await Promise.all([
+      chromium.launch({ args: BROWSER_ARGS }),
+      chromium.launch({ args: BROWSER_ARGS }),
+    ]);
+    const members: MeetingMember[] = [];
+
+    try {
+      const profiles = [
+        { email: "host-sigsnsp@videocall.rs", name: "SigSNSpHost" },
+        { email: "guest-sigsnsp@videocall.rs", name: "SigSNSpGuest" },
+      ];
+
+      for (let i = 0; i < 2; i++) {
+        const ctx = await createAuthenticatedContext(
+          browsers[i],
+          profiles[i].email,
+          profiles[i].name,
+          uiURL,
+        );
+        if (i === 1) {
+          // Guest will start the share, so they need the mocked picker.
+          await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+        }
+        members.push({
+          page: null as unknown as Page,
+          context: ctx,
+          email: profiles[i].email,
+          name: profiles[i].name,
+        });
+      }
+
+      members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name);
+      await clickJoinAndEnterGrid(members[0].page);
+      members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name);
+      await admitGuestIfNeeded(members[0].page, members[1].page);
+
+      const hostPage = members[0].page;
+      const guestPage = members[1].page;
+      await hostPage.waitForTimeout(8_000);
+
+      // Guest starts the share — host enters split layout.
+      await guestPage.mouse.move(400, 400);
+      await guestPage.waitForTimeout(300);
+      const shareBtn = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareBtn).toBeVisible({ timeout: 15_000 });
+      await shareBtn.click();
+      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({
+        timeout: 20_000,
+      });
+      await hostPage.waitForTimeout(2_000);
+
+      // Helper: from any popup-bearing tile locator, run open → drag →
+      // pin → assert-snap-back, all within a single test step. Returns
+      // the captured boxes so the caller can dump them on failure.
+      const assertSnapBack = async (tile: Locator, label: string): Promise<void> => {
+        await expect(tile).toBeVisible({ timeout: 30_000 });
+        const sigBtn = tile.locator('button[aria-label$="signal quality"]');
+        await expect(sigBtn).toBeVisible({ timeout: 15_000 });
+        await sigBtn.click();
+        const popup = hostPage.locator(".signal-quality-popup").last();
+        await expect(popup, `${label}: popup visible`).toBeVisible({ timeout: 10_000 });
+        await hostPage.waitForTimeout(300);
+
+        const initial = await popup.boundingBox();
+        if (!initial) throw new Error(`${label}: no initial bounding box`);
+
+        const header = popup.locator(".popup-header[data-drag-handle='true']");
+        const hb = await header.boundingBox();
+        if (!hb) throw new Error(`${label}: no header bounding box`);
+        const grabX = hb.x + 80;
+        const grabY = hb.y + hb.height / 2;
+        await hostPage.mouse.move(grabX, grabY);
+        await hostPage.mouse.down();
+        await hostPage.mouse.move(grabX + 120, grabY + 100);
+        await hostPage.mouse.move(grabX + 200, grabY + 180);
+        await hostPage.mouse.up();
+        await hostPage.waitForTimeout(200);
+
+        const dragged = await popup.boundingBox();
+        if (dragged) {
+          const dx = Math.abs(dragged.x - initial.x);
+          const dy = Math.abs(dragged.y - initial.y);
+          expect(dx + dy, `${label}: drag moved popup`).toBeGreaterThan(50);
+        }
+
+        const pin = popup.locator("button.popup-reanchor");
+        await expect(pin, `${label}: pin visible after drag`).toBeVisible();
+        await pin.click();
+        // 200ms window pins the snap-on-click contract; pre-fix
+        // behavior in the split layout was that the popup stayed
+        // at the dragged coordinates.
+        await hostPage.waitForTimeout(200);
+
+        const snapped = await popup.boundingBox();
+        if (!snapped) throw new Error(`${label}: no snapped bounding box`);
+        const sdx = Math.abs(snapped.x - initial.x);
+        const sdy = Math.abs(snapped.y - initial.y);
+        const SNAP_TOLERANCE_PX = 8;
+        expect(sdx, `${label}: snapped x within tolerance`).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
+        expect(sdy, `${label}: snapped y within tolerance`).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
+        await expect(popup, `${label}: anchored attr`).toHaveAttribute(
+          "data-anchor-mode",
+          "anchored",
+        );
+
+        // Close popup before the next iteration so `.last()` picks the
+        // new one.
+        await popup.locator("button.popup-close").click();
+        await hostPage.waitForTimeout(300);
+      };
+
+      // Case 1: LEFT-panel sharer popup (sharer's own signal meter).
+      await assertSnapBack(
+        hostPage.locator(".split-screen-tile").first(),
+        "split-screen-tile (LEFT panel)",
+      );
+
+      // Case 2: right-strip peer popup (any non-self peer's NoScreen popup).
+      await assertSnapBack(
+        hostPage.locator(".split-peer-tile").first(),
+        "split-peer-tile (right strip)",
+      );
+    } finally {
+      for (const m of members) {
+        if (m.page) await m.page.close().catch(() => undefined);
+        await m.context.close().catch(() => undefined);
+      }
+      await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
+    }
+  });
+
   // ── HCL follow-up 952: visible drag-handle affordance ───────────────────
   // The popup header now renders a small SVG grip icon at its leading
   // edge so users see at a glance that the header is draggable. The

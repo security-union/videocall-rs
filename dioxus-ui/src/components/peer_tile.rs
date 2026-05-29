@@ -62,14 +62,6 @@ pub fn PeerTile(
     /// hiding it is a no-op for them.
     #[props(default = SignalMeterMode::NoScreen)]
     meter_mode: SignalMeterMode,
-    /// HCL bug #2: human-readable display name of the peer who is
-    /// currently sharing their screen. Forwarded to the popup so peer
-    /// signal-meter popups can show a "Sharing: <name>" header line —
-    /// users see at a glance who's sharing without expanding the
-    /// shared-content tile's separate popup. `None` when no one is
-    /// sharing or when this tile is itself the shared-content tile.
-    #[props(default)]
-    sharing_peer_name: Option<String>,
     on_toggle_pin: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
@@ -499,7 +491,6 @@ pub fn PeerTile(
             },
             transport: sig_transport,
             meter_mode,
-            sharing_peer_name,
         },
         SignalPopupHandlers {
             show: show_signal_popup,

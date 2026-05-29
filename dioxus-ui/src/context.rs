@@ -72,13 +72,25 @@ pub fn load_dock_position() -> DockPosition {
         .unwrap_or(DockPosition::Bottom)
 }
 
-/// Load dock autohide from localStorage. Defaults to true.
+/// Resolve a raw localStorage value (e.g. `Some("true")`, `Some("false")`, or
+/// `None` when no preference has been persisted) into the initial autohide
+/// signal value. When no preference is stored, default to `false` (always
+/// visible) so first-time users see the action bar without learning the
+/// dock menu first.
+pub fn resolve_dock_autohide(stored: Option<&str>) -> bool {
+    match stored {
+        Some(v) => v != "false",
+        None => false,
+    }
+}
+
+/// Load dock autohide from localStorage. Defaults to `false` (no hiding)
+/// when no preference has been persisted yet.
 pub fn load_dock_autohide() -> bool {
-    web_sys::window()
+    let stored = web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten())
-        .map(|v| v != "false")
-        .unwrap_or(true)
+        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten());
+    resolve_dock_autohide(stored.as_deref())
 }
 
 /// Persist dock position to localStorage.
@@ -1099,5 +1111,25 @@ mod tests {
         // Compile-time check that DensityModeCtx implements Clone.
         fn _assert_clone<T: Clone>() {}
         _assert_clone::<DensityModeCtx>();
+    }
+
+    #[test]
+    fn resolve_dock_autohide_defaults_to_false_when_unset() {
+        // First-time users with no persisted preference should see the
+        // action bar always visible — autohide must default to false.
+        assert!(!resolve_dock_autohide(None));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_true() {
+        // Regression guard: a user who has explicitly enabled autohide must
+        // keep that preference after the default-off fix.
+        assert!(resolve_dock_autohide(Some("true")));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_false() {
+        // Explicitly disabled autohide stays disabled.
+        assert!(!resolve_dock_autohide(Some("false")));
     }
 }

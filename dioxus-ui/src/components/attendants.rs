@@ -2927,6 +2927,20 @@ pub fn AttendantsComponent(
                                                     }
                                                 }
                                             } else {
+                                                // HCL follow-up 952 (@token-exempt): suppress
+                                                // the "Sharing: <name>" indicator on the
+                                                // sharer's own popup — the sharer obviously
+                                                // already knows they're sharing, so the line
+                                                // is pure noise on their tile. Pass `None` in
+                                                // that case; every other peer's popup still
+                                                // gets `Some(name)` so they can see at a
+                                                // glance who's sharing.
+                                                let tile_sharing_name =
+                                                    if active_screen_sharer.as_deref() == Some(tile_id.as_str()) {
+                                                        None
+                                                    } else {
+                                                        active_screen_sharer_name.clone()
+                                                    };
                                                 rsx! {
                                                     PeerTile {
                                                         key: "tile-{tile_id}",
@@ -2942,7 +2956,7 @@ pub fn AttendantsComponent(
                                                         // HCL bug #2: peer popups suppress the
                                                         // screen metric and surface a header note
                                                         // pointing at whoever is sharing right now.
-                                                        sharing_peer_name: active_screen_sharer_name.clone(),
+                                                        sharing_peer_name: tile_sharing_name,
                                                     }
                                                 }
                                             }
@@ -2979,6 +2993,16 @@ pub fn AttendantsComponent(
                                         }
                                     }
                                 } else {
+                                    // HCL follow-up 952 (@token-exempt): same self-suppress
+                                    // gate as the split path above — the sharer's own popup
+                                    // doesn't need a "Sharing: <name>" line pointing at
+                                    // itself.
+                                    let tile_sharing_name =
+                                        if active_screen_sharer.as_deref() == Some(tile_id.as_str()) {
+                                            None
+                                        } else {
+                                            active_screen_sharer_name.clone()
+                                        };
                                     rsx! {
                                         PeerTile {
                                             key: "tile-{tile_id}",
@@ -2995,7 +3019,7 @@ pub fn AttendantsComponent(
                                             // the publisher's own grid tile — forward the
                                             // active sharer name so each peer popup can show
                                             // the "Sharing: <name>" indicator.
-                                            sharing_peer_name: active_screen_sharer_name.clone(),
+                                            sharing_peer_name: tile_sharing_name,
                                         }
                                     }
                                 }

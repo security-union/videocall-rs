@@ -5260,6 +5260,28 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 .signal-quality-popup .popup-header [data-no-drag] {
   cursor: pointer;
 }
+/* HCL follow-up 952: visual grip affordance at the leading edge of the
+   popup header so users discover the popup is draggable. The grip
+   inherits `cursor: grab` from the header rule above (it sits inside
+   `.popup-header[data-drag-handle="true"]`); the explicit `grab` /
+   `grabbing` declarations here are belt-and-braces in case a future
+   refactor splits the handle out of the header. The SVG uses
+   `currentColor` and the muted text token so the grip reads as
+   secondary chrome rather than competing with the popup title. */
+.signal-quality-popup .signal-popup-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-right: 6px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  cursor: grab;
+}
+.signal-quality-popup[data-anchor-mode="dragging"] .signal-popup-drag-handle {
+  cursor: grabbing;
+}
 /* HCL bug #2: 'Sharing: <name>' indicator inside the header actions
    cluster. Sits between the (optional) reanchor button and the close
    button so the user sees both the active sharer and the controls in

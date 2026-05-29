@@ -1154,7 +1154,7 @@ fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>
                 None => return,
             };
 
-            // HCL follow-up #946: defer the `popup_el` lookup until after
+            // HCL follow-up 946 (@token-exempt): defer the `popup_el` lookup until after
             // Dioxus has committed the DOM. Without this rAF guard,
             // `doc.get_element_by_id(popup_id)` can race the same render
             // cycle that mounted the popup, returning `None` — the

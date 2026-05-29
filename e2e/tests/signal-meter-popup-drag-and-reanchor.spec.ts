@@ -331,12 +331,13 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
     }
   });
 
-  // ── HCL follow-up 952: anchor position locked to display name ───────────
-  // The popup anchor changed from the outer tile div to the floating
-  // display-name `<h4>`. The new placement is "just below and slightly
-  // to the right of" the name overlay — i.e. `popup.left >= name.right`
-  // and `popup.top >= name.bottom`. This test pins that contract.
-  test("popup opens just below and slightly right of the display name", async ({ baseURL }) => {
+  // ── HCL follow-up 957: anchor position locked to signal-quality button ──
+  // The popup anchor moved from the floating display-name `<h4>` (PR 952)
+  // to the signal-quality button itself. On first open the popup's
+  // top-left should land slightly past the button's top-left corner, so
+  // the eye reads "the popup grew out of the button". This test pins
+  // that overlay contract.
+  test("popup opens overlaying the signal-quality button on first open", async ({ baseURL }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
     const meetingId = `e2e_sigm_anchor_${Date.now()}`;
@@ -376,20 +377,14 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       await members[0].page.waitForTimeout(10_000);
       const hostPage = members[0].page;
 
-      const signalButton = hostPage.locator(
-        '#grid-container button[aria-label="Show signal quality"]',
-      );
+      const tile = hostPage.locator("#grid-container > div[id^='peer-video-']").first();
+      const signalButton = tile.locator('button[aria-label="Show signal quality"]');
       await expect(signalButton).toBeVisible({ timeout: 30_000 });
 
-      // Locate the matching display-name on the same tile so we can read
-      // its rect. The signal button and the `<h4 class="floating-name">`
-      // both live inside the same `[id^="peer-video-"]` tile.
-      const tile = hostPage.locator("#grid-container > div[id^='peer-video-']").first();
-      const displayName = tile.locator("h4.floating-name");
-      await expect(displayName).toBeVisible();
-      const nameBox = await displayName.boundingBox();
-      expect(nameBox).not.toBeNull();
-      if (!nameBox) throw new Error("display name has no bounding box");
+      // Capture the button's rect BEFORE clicking — popup will overlay it.
+      const buttonBox = await signalButton.boundingBox();
+      expect(buttonBox).not.toBeNull();
+      if (!buttonBox) throw new Error("signal button has no bounding box");
 
       await signalButton.click();
       const popup = hostPage.locator(".signal-quality-popup");
@@ -401,138 +396,16 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       expect(popupBox).not.toBeNull();
       if (!popupBox) throw new Error("popup has no bounding box");
 
-      // Anchor contract: popup sits below-right of the name overlay. We
-      // allow a couple of pixels of tolerance to absorb sub-pixel rounding
-      // and the small viewport-clamp slack (`VIEWPORT_MARGIN_PX = 8`).
-      const ANCHOR_TOLERANCE_PX = 4;
-      const nameRight = nameBox.x + nameBox.width;
-      const nameBottom = nameBox.y + nameBox.height;
-      expect(popupBox.x + ANCHOR_TOLERANCE_PX).toBeGreaterThanOrEqual(nameRight);
-      expect(popupBox.y + ANCHOR_TOLERANCE_PX).toBeGreaterThanOrEqual(nameBottom);
-    } finally {
-      for (const m of members) {
-        if (m.page) await m.page.close().catch(() => undefined);
-        await m.context.close().catch(() => undefined);
-      }
-      await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
-    }
-  });
-
-  // ── HCL follow-up 952: sharing-indicator render gate ────────────────────
-  // 3-context meeting; peer A starts a share. Host's signal popup for
-  // peer A must NOT contain the indicator (the sharer doesn't need it);
-  // host's signal popup for peer B SHOULD contain it (B benefits from
-  // knowing who is sharing).
-  test("sharing-indicator renders only for non-sharer peers", async ({ baseURL }) => {
-    test.setTimeout(240_000);
-    const uiURL = baseURL || DEFAULT_UI_URL;
-    const meetingId = `e2e_sigm_share_ind_${Date.now()}`;
-
-    const browsers = await Promise.all([
-      chromium.launch({ args: BROWSER_ARGS }),
-      chromium.launch({ args: BROWSER_ARGS }),
-      chromium.launch({ args: BROWSER_ARGS }),
-    ]);
-    const members: MeetingMember[] = [];
-
-    try {
-      const profiles = [
-        { email: "host-sigmsi@videocall.rs", name: "SigMSIHost" },
-        { email: "peera-sigmsi@videocall.rs", name: "SigMSIPeerA" },
-        { email: "peerb-sigmsi@videocall.rs", name: "SigMSIPeerB" },
-      ];
-
-      for (let i = 0; i < 3; i++) {
-        const ctx = await createAuthenticatedContext(
-          browsers[i],
-          profiles[i].email,
-          profiles[i].name,
-          uiURL,
-        );
-        // Peer A needs the mocked getDisplayMedia so it can start a share
-        // without a real picker.
-        if (i === 1) {
-          await ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
-        }
-        members.push({
-          page: null as unknown as Page,
-          context: ctx,
-          email: profiles[i].email,
-          name: profiles[i].name,
-        });
-      }
-
-      members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name);
-      await clickJoinAndEnterGrid(members[0].page);
-      members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name);
-      await admitGuestIfNeeded(members[0].page, members[1].page);
-      members[2].page = await joinMeetingAs(members[2].context, meetingId, profiles[2].name);
-      await admitGuestIfNeeded(members[0].page, members[2].page);
-
-      const hostPage = members[0].page;
-      await hostPage.waitForTimeout(8_000);
-
-      // Helper: open the popup on the tile whose floating-name matches
-      // `peerName`, assert sharing-indicator presence/absence + text, then
-      // close it. The popup uses a `data-meter-mode="peer"` selector when
-      // not in `Full` mode (split layout) and the generic
-      // `.signal-quality-popup` selector otherwise; we match the popup
-      // belonging to the just-opened tile by recently-mounted DOM order.
-      const openPopupForPeer = async (peerName: string): Promise<Locator> => {
-        const tile = hostPage
-          .locator("#grid-container div[id^='peer-video-']", {
-            has: hostPage.locator("h4.floating-name", { hasText: peerName }),
-          })
-          .first();
-        await expect(tile).toBeVisible({ timeout: 30_000 });
-        const sigBtn = tile.locator('button[aria-label="Show signal quality"]');
-        await expect(sigBtn).toBeVisible({ timeout: 15_000 });
-        await sigBtn.click();
-        const popup = hostPage.locator(".signal-quality-popup").last();
-        await expect(popup).toBeVisible({ timeout: 10_000 });
-        return popup;
-      };
-
-      // Step 1: no one sharing. Neither popup has the indicator.
-      let popupA = await openPopupForPeer(profiles[1].name);
-      await expect(popupA.locator(".popup-sharing-indicator")).toHaveCount(0);
-      await popupA.locator(".popup-close").click();
-      await hostPage.waitForTimeout(400);
-
-      let popupB = await openPopupForPeer(profiles[2].name);
-      await expect(popupB.locator(".popup-sharing-indicator")).toHaveCount(0);
-      await popupB.locator(".popup-close").click();
-      await hostPage.waitForTimeout(400);
-
-      // Step 2: peer A starts a screen share.
-      const peerA = members[1].page;
-      await peerA.mouse.move(400, 400);
-      await peerA.waitForTimeout(300);
-      const shareBtn = peerA.locator("button.video-control-button", {
-        has: peerA.locator(".tooltip", { hasText: "Share Screen" }),
-      });
-      await expect(shareBtn).toBeVisible({ timeout: 15_000 });
-      await shareBtn.click();
-
-      // The split layout activates on the host side when a peer shares.
-      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({
-        timeout: 20_000,
-      });
-      await hostPage.waitForTimeout(2_000);
-
-      // Step 3: peer A's popup (the sharer) must NOT contain the
-      // indicator — it would be useless self-noise.
-      popupA = await openPopupForPeer(profiles[1].name);
-      await expect(popupA.locator(".popup-sharing-indicator")).toHaveCount(0);
-      await popupA.locator(".popup-close").click();
-      await hostPage.waitForTimeout(400);
-
-      // Step 4: peer B's popup (a non-sharer) MUST contain the indicator
-      // and the text must mention peer A's display name.
-      popupB = await openPopupForPeer(profiles[2].name);
-      const ind = popupB.locator(".popup-sharing-indicator");
-      await expect(ind).toHaveCount(1);
-      await expect(ind).toContainText(profiles[1].name, { timeout: 10_000 });
+      // Overlay contract: the popup's top-left lands at or slightly past
+      // the button's top-left — the popup covers the button's top-left
+      // by a few pixels. Tolerances absorb sub-pixel rounding +
+      // VIEWPORT_MARGIN_PX clamp slack.
+      const OVERLAY_TOLERANCE_PX = 4;
+      expect(popupBox.x).toBeLessThanOrEqual(buttonBox.x + OVERLAY_TOLERANCE_PX);
+      expect(popupBox.y).toBeLessThanOrEqual(buttonBox.y + OVERLAY_TOLERANCE_PX);
+      // And the popup actually extends past the button's left edge —
+      // zero-overlap (popup flush right of the button) would fail this.
+      expect(popupBox.x + popupBox.width).toBeGreaterThanOrEqual(buttonBox.x + 8);
     } finally {
       for (const m of members) {
         if (m.page) await m.page.close().catch(() => undefined);

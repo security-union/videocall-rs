@@ -5282,18 +5282,6 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 .signal-quality-popup[data-anchor-mode="dragging"] .signal-popup-drag-handle {
   cursor: grabbing;
 }
-/* HCL bug #2: 'Sharing: <name>' indicator inside the header actions
-   cluster. Sits between the (optional) reanchor button and the close
-   button so the user sees both the active sharer and the controls in
-   the same horizontal row. */
-.signal-quality-popup .popup-sharing-indicator {
-  font-size: 11px;
-  line-height: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 160px;
-}
 .signal-chart-wrapper {
   display: flex;
   align-items: flex-start;

@@ -58,11 +58,11 @@ env:
 jobs:
   smoke:
     name: Playwright bvt1
-    runs-on: [self-hosted, linux, x64, hcl-ci]
+    runs-on: [self-hosted, linux, x64, hcl-ci-bvt]
     timeout-minutes: 30
     concurrency:
-      group: hcl-ci-e2e
-      cancel-in-progress: false
+      group: hcl-ci-bvt
+      cancel-in-progress: true
 
     steps:
       - name: Clean workspace (root-owned files from Docker)

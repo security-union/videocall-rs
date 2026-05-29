@@ -123,6 +123,13 @@ This pins it to this dedicated runner. The full E2E suite remains on
 
 ## Concurrency
 
-Job-level concurrency group is `hcl-ci-bvt` with `cancel-in-progress: true`.
-If a developer pushes twice quickly, the first bvt1 run is cancelled and
-the second takes over immediately — no queueing delay.
+Two levels of concurrency control:
+
+- **Workflow-level**: `pr-check-e2e-smoke-${{ PR_number }}` with `cancel-in-progress: true`.
+  Handles same-PR supersession — a developer pushes a new commit, the old run for
+  that PR is cancelled immediately.
+
+- **Job-level**: `hcl-ci-bvt` with `cancel-in-progress: false`.
+  Serializes access to the dedicated runner across different PRs. If PR A's bvt1
+  is running and PR B's bvt1 starts, B queues until A finishes (~2 min) rather
+  than cancelling A's unrelated run.

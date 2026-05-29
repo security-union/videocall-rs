@@ -880,6 +880,42 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       });
       // Release so other tests don't inherit a dangling mouse-down state.
       await hostPage.mouse.up();
+      // The mouseup handler flips `data-anchor-mode` from `dragging` to
+      // `free` and commits the drag. Wait one tick before the negative
+      // assertion below so we start from a settled state.
+      await hostPage.waitForTimeout(200);
+
+      // HCL follow-up 957: negative assertion — mousedown on the close
+      // button (which carries `data-no-drag="true"`) must NOT start a
+      // drag. The mousedown handler bails at the `closest('[data-no-drag]')`
+      // check before it ever reaches the drag-handle filter. Without this
+      // guard the close button would silently turn into a drag handle
+      // and clicking 'X' would never reach `on_close`.
+      const closeBtn = popup.locator("button.popup-close");
+      await expect(closeBtn).toBeVisible();
+      const closeBox = await closeBtn.boundingBox();
+      if (!closeBox) throw new Error("close button has no bounding box");
+      // Capture the current anchor-mode (post-drag commit: should be
+      // `free`) so we can assert it does NOT flip to `dragging` on the
+      // close-button mousedown sequence.
+      const preCloseMode = await popup.getAttribute("data-anchor-mode");
+      const cx = closeBox.x + closeBox.width / 2;
+      const cy = closeBox.y + closeBox.height / 2;
+      await hostPage.mouse.move(cx, cy);
+      await hostPage.mouse.down();
+      // Same intermediate move as the positive grip case. If the close
+      // button were not gated, this would set `data-anchor-mode` to
+      // `dragging`.
+      await hostPage.mouse.move(cx + 30, cy + 20);
+      // Tiny settle window for any (incorrect) drag-start side-effect.
+      await hostPage.waitForTimeout(100);
+      await expect(popup).not.toHaveAttribute("data-anchor-mode", "dragging");
+      // Mode must be unchanged from before the close-button mousedown.
+      if (preCloseMode !== null) {
+        await expect(popup).toHaveAttribute("data-anchor-mode", preCloseMode);
+      }
+      // Release so other tests don't inherit a dangling mouse-down state.
+      await hostPage.mouse.up();
     } finally {
       for (const m of members) {
         if (m.page) await m.page.close().catch(() => undefined);

@@ -850,6 +850,10 @@ pub struct PeerDecodeManager {
     /// render frame. Invalidated to `None` whenever the peer set changes
     /// (insert / remove / drain) — see `invalidate_sorted_string_keys()`.
     cached_sorted_string_keys: RefCell<Option<Rc<Vec<String>>>>,
+    /// Cancellation tokens for in-flight PEER_EVENT(screen_decode_started)
+    /// retries, keyed by publisher user_id. Set to `false` when the peer
+    /// stops screen-sharing or is removed, causing pending retries to no-op.
+    screen_decode_retry_tokens: HashMap<String, Rc<std::cell::Cell<bool>>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -874,6 +878,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -892,6 +897,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -1047,6 +1053,9 @@ impl PeerDecodeManager {
             .remove_if_and_return(|peer| peer.check_heartbeat());
         let mut removed_ids = Vec::new();
         for (_session_id, peer) in removed {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
@@ -1210,7 +1219,7 @@ impl PeerDecodeManager {
     /// `publisher_user_id` MUST be the publisher's user_id (the remote peer
     /// whose screen frame we just decoded). The event's `stream_id` is set
     /// to the same value because there is at most one screen-share per user.
-    fn publish_screen_decode_started(&self, publisher_user_id: &str) {
+    fn publish_screen_decode_started(&mut self, publisher_user_id: &str) {
         let Some(send_packet) = &self.send_packet else {
             debug!("Cannot publish PEER_EVENT: no send_packet callback");
             return;
@@ -1219,6 +1228,10 @@ impl PeerDecodeManager {
         let local_user_id = self.local_user_id.clone();
         let target_user_id = publisher_user_id.to_string();
         let send_packet = send_packet.clone();
+
+        let active = Rc::new(std::cell::Cell::new(true));
+        self.screen_decode_retry_tokens
+            .insert(target_user_id.clone(), Rc::clone(&active));
 
         log::info!(
             "Publishing PEER_EVENT(screen_decode_started) target={} (with retries)",
@@ -1230,6 +1243,13 @@ impl PeerDecodeManager {
         wasm_bindgen_futures::spawn_local(async move {
             for delay_ms in [2000, 4000] {
                 gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                if !active.get() {
+                    log::debug!(
+                        "PEER_EVENT(screen_decode_started) retry cancelled for target={}",
+                        target_user_id
+                    );
+                    return;
+                }
                 log::debug!(
                     "Retry PEER_EVENT(screen_decode_started) target={} delay={}ms",
                     target_user_id,
@@ -1312,6 +1332,9 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
@@ -1334,6 +1357,10 @@ impl PeerDecodeManager {
     /// Called when the connection drops so stale workers don't linger and
     /// consume WASM memory while the client reconnects.
     pub fn clear_all_peers(&mut self) {
+        for token in self.screen_decode_retry_tokens.values() {
+            token.set(false);
+        }
+        self.screen_decode_retry_tokens.clear();
         let removed = self.connected_peers.drain_all();
         let mut removed_ids: Vec<String> = Vec::with_capacity(removed.len());
         for (_session_id, peer) in removed {

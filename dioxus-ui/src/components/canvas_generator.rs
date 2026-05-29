@@ -435,7 +435,12 @@ pub fn generate_for_peer(
         // so this popup and the matching peer-tile popup coexist without
         // collision. Anchor on the screen-share div so the portal positioner
         // tracks it through layout reflows.
-        let ss_anchor_id = (*ss_div_id).clone();
+        // HCL follow-up 952 (@token-exempt): anchor the signal-meter
+        // popup on the tile's display-name `<h4>` so the popup reads as
+        // attached to the name instead of floating off the tile edge.
+        // The popup-state map key (peer_id, meter_mode) is unchanged.
+        let ss_name_id = format!("{}-name", &*ss_div_id);
+        let ss_anchor_id = ss_name_id.clone();
         let ss_split_class = if show_signal_popup {
             "split-screen-tile signal-popup-open"
         } else {
@@ -449,6 +454,7 @@ pub fn generate_for_peer(
                     class: "canvas-container video-on",
                     ScreenCanvas { peer_id: key.clone() }
                     h4 {
+                        id: "{ss_name_id}",
                         class: "floating-name",
                         title: "{ss_name_title}",
                         dir: "auto",
@@ -548,11 +554,14 @@ pub fn generate_for_peer(
         } else {
             "split-peer-tile"
         };
-        // Anchor id for the signal-quality popup's portal positioning.
-        // Same id we attach to the outer tile div below; the popup uses it
-        // to read the tile's bounding rect through ResizeObserver / window
-        // listeners and follow the tile across grid reflows.
-        let split_anchor_id = (*peer_video_div_id).clone();
+        // HCL follow-up 952 (@token-exempt): the signal-meter popup
+        // anchors on the tile's display-name `<h4>` (id below) rather
+        // than the outer tile div. The portal positioner reads this
+        // element's bounding rect through ResizeObserver / window
+        // listeners so the popup sits "just below and slightly to the
+        // right of" the name overlay through grid reflows.
+        let split_name_id = format!("{}-name", &*peer_video_div_id);
+        let split_anchor_id = split_name_id.clone();
         return rsx! {
             div {
                 class: "{split_peer_class}{vo_speaking}",
@@ -575,6 +584,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{split_name_id}",
                         class: "floating-name",
                         title: "{title_vo}",
                         dir: "auto",
@@ -801,9 +811,11 @@ pub fn generate_for_peer(
         } else {
             "grid-item full-bleed"
         };
-        // Anchor id for the signal-quality popup's portal positioning;
-        // shared with the outer tile div's id below.
-        let fb_anchor_id = (*peer_video_div_id).clone();
+        // HCL follow-up 952 (@token-exempt): anchor the popup on the
+        // tile's display-name `<h4>` (id below) so the popup sits "just
+        // below and slightly to the right of" the name overlay.
+        let fb_name_id = format!("{}-name", &*peer_video_div_id);
+        let fb_anchor_id = fb_name_id.clone();
         return rsx! {
             div {
                 class: "{full_bleed_grid_class}{speaking_class}",
@@ -829,6 +841,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{fb_name_id}",
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
@@ -1118,9 +1131,12 @@ pub fn generate_for_peer(
             } else {
                 "grid-item"
             };
-            // Anchor id for the signal-quality popup's portal positioning;
-            // shared with the outer grid-item div's id below.
-            let grid_anchor_id = (*peer_video_div_id).clone();
+            // HCL follow-up 952 (@token-exempt): anchor the popup on
+            // the tile's display-name `<h4>` (id below) so the popup
+            // hangs "just below and slightly to the right of" the name
+            // overlay.
+            let grid_name_id = format!("{}-name", &*peer_video_div_id);
+            let grid_anchor_id = grid_name_id.clone();
             rsx! {
                 div {
                     class: "{grid_item_class}{grid_speaking}",
@@ -1143,6 +1159,7 @@ pub fn generate_for_peer(
                             }
                         }
                         h4 {
+                            id: "{grid_name_id}",
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",

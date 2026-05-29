@@ -1153,133 +1153,161 @@ fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>
                 Some(w) => w,
                 None => return,
             };
-            let doc = gloo_utils::document();
-            let popup_el = match doc.get_element_by_id(&popup_id_for_init) {
-                Some(el) => el,
-                None => return, // mount race; tear down in use_drop
-            };
 
-            // Per-drag-session offset of the cursor inside the popup so the
-            // drag preserves the click point. Reset on every mousedown.
-            let offset: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
-            // Whether a drag is currently active. Drives `mousemove` early-out
-            // when the user isn't dragging.
-            let active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            // HCL follow-up 946 (@token-exempt): defer the `popup_el` lookup until after
+            // Dioxus has committed the DOM. Without this rAF guard,
+            // `doc.get_element_by_id(popup_id)` can race the same render
+            // cycle that mounted the popup, returning `None` — the
+            // listeners then never bind and drag silently fails. Mirrors
+            // the rAF pattern `install_popup_anchor` uses for the same
+            // mount-race reason ("Initial paint can race the popup
+            // actually being attached to the DOM").
+            //
+            // If the popup unmounts before this rAF fires, the lookup
+            // returns `None` and we silently bail. `state` stays at
+            // `None`, so `use_drop` (below) is a no-op. No listener leak.
+            let win_for_raf = win.clone();
+            let popup_id_for_raf = popup_id_for_init;
+            let state_for_raf = state;
+            let on_drag_commit_for_raf = on_drag_commit_for_init;
+            let raf_cb = Closure::once_into_js(move |_ts: f64| {
+                let win = win_for_raf;
+                let state = state_for_raf;
+                let popup_id_for_init = popup_id_for_raf;
+                let on_drag_commit_for_init = on_drag_commit_for_raf;
 
-            // mousedown handler attached to the popup root. We bubble-listen
-            // and filter by `closest('[data-drag-handle]')` so only clicks
-            // inside the header start a drag. Buttons inside the header
-            // (close, reanchor) carry `data-no-drag` so they're excluded.
-            let mousedown_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
-                let popup_el = popup_el.clone();
-                let offset = offset.clone();
-                let active = active.clone();
-                move |evt: web_sys::MouseEvent| {
-                    let target = match evt.target() {
-                        Some(t) => t,
-                        None => return,
-                    };
-                    let target_el: web_sys::Element = match target.dyn_into() {
-                        Ok(el) => el,
-                        Err(_) => return,
-                    };
-                    // Bail on no-drag controls (close button, reanchor button).
-                    if let Ok(Some(_)) = target_el.closest("[data-no-drag]") {
-                        return;
+                let doc = gloo_utils::document();
+                let popup_el = match doc.get_element_by_id(&popup_id_for_init) {
+                    Some(el) => el,
+                    None => return, // popup unmounted before rAF fired
+                };
+
+                // Per-drag-session offset of the cursor inside the popup so the
+                // drag preserves the click point. Reset on every mousedown.
+                let offset: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
+                // Whether a drag is currently active. Drives `mousemove` early-out
+                // when the user isn't dragging.
+                let active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+                // mousedown handler attached to the popup root. We bubble-listen
+                // and filter by `closest('[data-drag-handle]')` so only clicks
+                // inside the header start a drag. Buttons inside the header
+                // (close, reanchor) carry `data-no-drag` so they're excluded.
+                let mousedown_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let offset = offset.clone();
+                    let active = active.clone();
+                    move |evt: web_sys::MouseEvent| {
+                        let target = match evt.target() {
+                            Some(t) => t,
+                            None => return,
+                        };
+                        let target_el: web_sys::Element = match target.dyn_into() {
+                            Ok(el) => el,
+                            Err(_) => return,
+                        };
+                        // Bail on no-drag controls (close button, reanchor button).
+                        if let Ok(Some(_)) = target_el.closest("[data-no-drag]") {
+                            return;
+                        }
+                        // Only fire when the click landed in the drag handle.
+                        let in_handle =
+                            matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
+                        if !in_handle {
+                            return;
+                        }
+                        if evt.button() != 0 {
+                            return;
+                        }
+                        evt.prevent_default();
+                        let rect = popup_el.get_bounding_client_rect();
+                        let dx = evt.client_x() as f64 - rect.left();
+                        let dy = evt.client_y() as f64 - rect.top();
+                        *offset.borrow_mut() = (dx, dy);
+                        *active.borrow_mut() = true;
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let _ = html_popup.set_attribute("data-anchor-mode", "dragging");
                     }
-                    // Only fire when the click landed in the drag handle.
-                    let in_handle = matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
-                    if !in_handle {
-                        return;
+                });
+                let _ = popup_el.add_event_listener_with_callback(
+                    "mousedown",
+                    mousedown_cb.as_ref().unchecked_ref(),
+                );
+
+                // mousemove handler on window — runs only while a drag is
+                // active, so the early-out keeps the cost negligible when
+                // the user is just moving the cursor.
+                let mousemove_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let offset = offset.clone();
+                    let active = active.clone();
+                    let win_inner = win.clone();
+                    move |evt: web_sys::MouseEvent| {
+                        if !*active.borrow() {
+                            return;
+                        }
+                        let (dx, dy) = *offset.borrow();
+                        let target_left = evt.client_x() as f64 - dx;
+                        let target_top = evt.client_y() as f64 - dy;
+                        let rect = popup_el.get_bounding_client_rect();
+                        let viewport_w = win_inner
+                            .inner_width()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let viewport_h = win_inner
+                            .inner_height()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let (l, t) = clamp_free_position(
+                            target_left,
+                            target_top,
+                            rect.width(),
+                            rect.height(),
+                            viewport_w,
+                            viewport_h,
+                        );
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let style = html_popup.style();
+                        let _ = style.set_property("left", &format!("{l:.0}px"));
+                        let _ = style.set_property("top", &format!("{t:.0}px"));
                     }
-                    if evt.button() != 0 {
-                        return;
+                });
+                let _ = win.add_event_listener_with_callback(
+                    "mousemove",
+                    mousemove_cb.as_ref().unchecked_ref(),
+                );
+
+                // mouseup commits the final position.
+                let mouseup_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let active = active.clone();
+                    move |_evt: web_sys::MouseEvent| {
+                        if !*active.borrow() {
+                            return;
+                        }
+                        *active.borrow_mut() = false;
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let rect = html_popup.get_bounding_client_rect();
+                        let _ = html_popup.set_attribute("data-anchor-mode", "free");
+                        on_drag_commit_for_init.call((rect.left(), rect.top()));
                     }
-                    evt.prevent_default();
-                    let rect = popup_el.get_bounding_client_rect();
-                    let dx = evt.client_x() as f64 - rect.left();
-                    let dy = evt.client_y() as f64 - rect.top();
-                    *offset.borrow_mut() = (dx, dy);
-                    *active.borrow_mut() = true;
-                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
-                    let _ = html_popup.set_attribute("data-anchor-mode", "dragging");
-                }
+                });
+                let _ = win.add_event_listener_with_callback(
+                    "mouseup",
+                    mouseup_cb.as_ref().unchecked_ref(),
+                );
+
+                *state.borrow_mut() = Some(DragState {
+                    win: win.clone(),
+                    mousedown_cb: Some(mousedown_cb),
+                    mousemove_cb: Some(mousemove_cb),
+                    mouseup_cb: Some(mouseup_cb),
+                    popup_el: Some(popup_el),
+                });
             });
-            let _ = popup_el.add_event_listener_with_callback(
-                "mousedown",
-                mousedown_cb.as_ref().unchecked_ref(),
-            );
-
-            // mousemove handler on window — runs only while a drag is
-            // active, so the early-out keeps the cost negligible when
-            // the user is just moving the cursor.
-            let mousemove_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
-                let popup_el = popup_el.clone();
-                let offset = offset.clone();
-                let active = active.clone();
-                let win_inner = win.clone();
-                move |evt: web_sys::MouseEvent| {
-                    if !*active.borrow() {
-                        return;
-                    }
-                    let (dx, dy) = *offset.borrow();
-                    let target_left = evt.client_x() as f64 - dx;
-                    let target_top = evt.client_y() as f64 - dy;
-                    let rect = popup_el.get_bounding_client_rect();
-                    let viewport_w = win_inner
-                        .inner_width()
-                        .ok()
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let viewport_h = win_inner
-                        .inner_height()
-                        .ok()
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let (l, t) = clamp_free_position(
-                        target_left,
-                        target_top,
-                        rect.width(),
-                        rect.height(),
-                        viewport_w,
-                        viewport_h,
-                    );
-                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
-                    let style = html_popup.style();
-                    let _ = style.set_property("left", &format!("{l:.0}px"));
-                    let _ = style.set_property("top", &format!("{t:.0}px"));
-                }
-            });
-            let _ = win.add_event_listener_with_callback(
-                "mousemove",
-                mousemove_cb.as_ref().unchecked_ref(),
-            );
-
-            // mouseup commits the final position.
-            let mouseup_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
-                let popup_el = popup_el.clone();
-                let active = active.clone();
-                move |_evt: web_sys::MouseEvent| {
-                    if !*active.borrow() {
-                        return;
-                    }
-                    *active.borrow_mut() = false;
-                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
-                    let rect = html_popup.get_bounding_client_rect();
-                    let _ = html_popup.set_attribute("data-anchor-mode", "free");
-                    on_drag_commit_for_init.call((rect.left(), rect.top()));
-                }
-            });
-            let _ = win
-                .add_event_listener_with_callback("mouseup", mouseup_cb.as_ref().unchecked_ref());
-
-            *state.borrow_mut() = Some(DragState {
-                win: win.clone(),
-                mousedown_cb: Some(mousedown_cb),
-                mousemove_cb: Some(mousemove_cb),
-                mouseup_cb: Some(mouseup_cb),
-                popup_el: Some(popup_el),
-            });
+            let _ = win.request_animation_frame(raf_cb.as_ref().unchecked_ref());
         });
     }
 

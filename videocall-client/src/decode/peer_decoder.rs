@@ -106,6 +106,20 @@ pub struct VideoPeerDecoder {
     /// `None` when the canvas hasn't been wired yet, but
     /// `set_stream_context` *does* run before any decoded frames. Set there.
     stream_context: RefCell<Option<(String, String)>>,
+    /// HCL issue 893: pending acknowledgement that the underlying
+    /// `WasmDecoder` has produced its first decoded frame and rendered it
+    /// to the canvas. The decoder pipeline is asynchronous — `decode()`
+    /// pushes a `FrameBuffer` into a worker and returns immediately, so
+    /// the synchronous return value cannot carry a "first frame decoded"
+    /// signal. Instead the `on_video_frame` callback (which runs on the
+    /// render thread when the decoder hands a real `VideoFrame` back) sets
+    /// this flag to `true` on its first invocation. The next `decode()`
+    /// call observes the flag, swaps it back to `false`, and returns
+    /// `first_frame: true` so `peer_decode_manager` can fire the
+    /// `PEER_EVENT(screen_decode_started)` ack to the publisher. Without
+    /// this signal the screen-share visibility toast on the publisher
+    /// would time out at 10s on every share, even on the happy path.
+    first_render_pending_ack: Rc<RefCell<bool>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -211,8 +225,21 @@ impl VideoPeerDecoder {
             });
         }
 
+        // HCL #893: shared flag the async render callback uses to tell the
+        // next synchronous `decode()` call that a frame has actually
+        // landed on the canvas. See doc comment on `first_render_pending_ack`.
+        let first_render_pending_ack = Rc::new(RefCell::new(false));
+
         let canvas_ref = canvas_renderer.clone();
+        let first_render_flag = first_render_pending_ack.clone();
+        // Track within the closure (cheap `Cell` would suffice but we already
+        // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
+        // closure). `mark_first_render` only flips once per
+        // `VideoPeerDecoder` — every later render is a no-op (see the
+        // `mark_first_render_*` tests for the pinned semantics).
+        let first_render_fired = Rc::new(RefCell::new(false));
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
+            mark_first_render(&first_render_fired, &first_render_flag);
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
@@ -231,6 +258,7 @@ impl VideoPeerDecoder {
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
+            first_render_pending_ack,
         })
     }
 
@@ -381,6 +409,7 @@ impl VideoPeerDecoder {
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
+            first_render_pending_ack: Rc::new(RefCell::new(false)),
         }
     }
 }
@@ -504,10 +533,61 @@ impl PeerDecode for VideoPeerDecoder {
             self.decoder.push_frame(frame_buffer);
         }
 
+        // HCL #893: consume the async "first frame rendered" flag set by the
+        // `on_video_frame` callback. The decode pipeline is async, so the
+        // very first `push_frame` call returns here BEFORE the worker has
+        // produced a `VideoFrame`. The flag will fire on a later `decode()`
+        // call (typically the second or third packet for SCREEN, where the
+        // worker has had time to decode the keyframe). When we observe the
+        // flag we return `first_frame: true` exactly once, which lets
+        // `peer_decode_manager` fire the `PEER_EVENT(screen_decode_started)`
+        // ack to the publisher.
+        let first_frame = consume_first_render_flag(&self.first_render_pending_ack);
+
         Ok(DecodeStatus {
             _rendered: true,
-            first_frame: false,
+            first_frame,
         })
+    }
+}
+
+/// HCL #893: consume the `first_render_pending_ack` flag, returning `true`
+/// exactly once after the async render callback flips it.
+///
+/// Extracted from `VideoPeerDecoder::decode()` so the consume semantics
+/// can be unit-tested without a real `WasmDecoder` (which would require
+/// WebCodecs / a browser worker).
+///
+/// Invariants:
+///   - First call after the flag is set: returns `true` and clears the flag.
+///   - Subsequent calls (until the flag is set again): return `false`.
+///   - Calls before the flag is ever set: return `false`.
+///
+/// A regression that "fixes" this to keep returning `true` on every call
+/// would make `peer_decode_manager` fire `PEER_EVENT(screen_decode_started)`
+/// on every SCREEN packet — a per-frame storm to the publisher. The
+/// unit tests pin the exactly-once semantics.
+fn consume_first_render_flag(flag: &Rc<RefCell<bool>>) -> bool {
+    let mut guard = flag.borrow_mut();
+    if *guard {
+        *guard = false;
+        true
+    } else {
+        false
+    }
+}
+
+/// HCL #893: helper used by the `on_video_frame` callback the first time
+/// the WasmDecoder hands a `VideoFrame` back to the render path. Flips
+/// the shared `first_render_pending_ack` flag exactly once per decoder
+/// lifetime; subsequent calls are no-ops.
+///
+/// Extracted so the "first call sets, later calls don't" behaviour is
+/// covered by a unit test independent of the real WasmDecoder.
+fn mark_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
+    if !*fired.borrow() {
+        *fired.borrow_mut() = true;
+        *ack.borrow_mut() = true;
     }
 }
 
@@ -698,5 +778,135 @@ mod tests {
         let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert!(tp.is_none());
+    }
+
+    // --- HCL #893: `first_render_pending_ack` flag semantics --------------
+    //
+    // These tests pin down the exactly-once behaviour of the async
+    // "first SCREEN frame rendered" signal. A regression that loosens
+    // the helpers — e.g., "set the flag on every render" or "return
+    // true on every decode" — would produce a per-frame PEER_EVENT
+    // storm to the publisher and fail these tests.
+
+    /// `consume_first_render_flag` returns `false` when the flag was
+    /// never set — the no-op case the decoder hits on every packet
+    /// before the worker has produced its first frame.
+    #[test]
+    fn consume_first_render_flag_returns_false_when_unset() {
+        let flag = Rc::new(RefCell::new(false));
+        assert!(!consume_first_render_flag(&flag));
+        // Unchanged on the return — no side effect when there was
+        // nothing to consume.
+        assert!(!*flag.borrow());
+    }
+
+    /// `consume_first_render_flag` returns `true` exactly once after the
+    /// flag is set, and clears the flag so subsequent calls return `false`.
+    /// This is the LOAD-BEARING behaviour: it guarantees
+    /// `peer_decode_manager` fires `PEER_EVENT(screen_decode_started)`
+    /// exactly once per share, not on every SCREEN packet.
+    #[test]
+    fn consume_first_render_flag_returns_true_once_and_clears() {
+        let flag = Rc::new(RefCell::new(true));
+        assert!(
+            consume_first_render_flag(&flag),
+            "first call must observe the set flag and return true"
+        );
+        assert!(
+            !*flag.borrow(),
+            "flag must be cleared after consume so the next call \
+             does NOT re-fire the publisher ack"
+        );
+        assert!(
+            !consume_first_render_flag(&flag),
+            "subsequent calls must return false until the render \
+             callback sets the flag again"
+        );
+    }
+
+    /// Multiple consume calls after a single flag-set must return
+    /// `true` exactly once — defends against accidentally inverting
+    /// the clear semantics inside `decode()`.
+    #[test]
+    fn consume_first_render_flag_is_exactly_once() {
+        let flag = Rc::new(RefCell::new(true));
+        let mut true_count = 0;
+        for _ in 0..10 {
+            if consume_first_render_flag(&flag) {
+                true_count += 1;
+            }
+        }
+        assert_eq!(
+            true_count, 1,
+            "exactly one consume call must observe the flag — got {true_count}"
+        );
+    }
+
+    /// `mark_first_render` flips both flags on the first invocation but
+    /// is a no-op on every subsequent call, even if the consumer side
+    /// already cleared `ack`. This guarantees a SINGLE PEER_EVENT per
+    /// VideoPeerDecoder lifetime.
+    #[test]
+    fn mark_first_render_fires_once_per_decoder() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        mark_first_render(&fired, &ack);
+        assert!(*fired.borrow(), "first call must set `fired`");
+        assert!(*ack.borrow(), "first call must set `ack`");
+
+        // Consumer side clears the ack (simulates `decode()` reading
+        // the flag).
+        *ack.borrow_mut() = false;
+
+        // A subsequent render must NOT re-arm the ack — that would
+        // cause `decode()` to return `first_frame: true` again and
+        // fire a duplicate PEER_EVENT to the publisher.
+        mark_first_render(&fired, &ack);
+        assert!(
+            !*ack.borrow(),
+            "subsequent renders must not re-arm `ack` — would cause \
+             a duplicate PEER_EVENT(screen_decode_started) per share"
+        );
+    }
+
+    /// End-to-end: simulate the decoder loop. Decode N packets,
+    /// have the async callback fire once between packet 2 and 3,
+    /// confirm exactly one `decode()` returns `first_frame: true`.
+    #[test]
+    fn first_render_ack_round_trip() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        // Packet 1: no render yet → false.
+        assert!(!consume_first_render_flag(&ack));
+
+        // Packet 2: still no render → false.
+        assert!(!consume_first_render_flag(&ack));
+
+        // Worker produces its first VideoFrame.
+        mark_first_render(&fired, &ack);
+
+        // Packet 3: consume the ack.
+        assert!(
+            consume_first_render_flag(&ack),
+            "the first decode() call after the render callback fires \
+             must return first_frame: true"
+        );
+
+        // Packets 4..N: never again.
+        for _ in 0..5 {
+            assert!(!consume_first_render_flag(&ack));
+        }
+
+        // Worker produces more frames — does NOT re-arm the ack.
+        for _ in 0..3 {
+            mark_first_render(&fired, &ack);
+        }
+        assert!(
+            !consume_first_render_flag(&ack),
+            "additional render callbacks must not produce a second \
+             first_frame: true"
+        );
     }
 }

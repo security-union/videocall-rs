@@ -334,11 +334,12 @@ test.describe("Screen-share split-layout", () => {
   //
   // WHAT THIS TEST WOULD VERIFY (once screen-share automation is available):
   //   - Default split (screen_share_ratio = 0.667 → right_ratio = 0.333):
-  //     right panel `grid-template-columns` is "1fr 1fr" (two columns).
+  //     right panel `grid-template-columns` is "repeat(2, <ss_tile_w>px)"
+  //     (two fixed-width tile-sized columns, HCL #3/#4 fix).
   //   - After dragging the resize handle so screen share occupies ≥ 75%
   //     (right_ratio ≤ 0.25):
-  //     right panel `grid-template-columns` is "1fr" (single column).
-  //   - Dragging back below the threshold restores "1fr 1fr".
+  //     right panel `grid-template-columns` is "<ss_tile_w>px" (single column).
+  //   - Dragging back below the threshold restores the 2-column form.
   //
   // IMPLEMENTATION NOTE (from attendants.rs):
   //   let right_ratio = 1.0 - screen_share_ratio();
@@ -347,21 +348,26 @@ test.describe("Screen-share split-layout", () => {
   //   } else {
   //       2.0   // two columns
   //   };
-  //   // Right panel: grid-template-columns: {if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" }}
+  //   let ss_tile_w = (ss_tile_h * TILE_AR).round(); // 3:2 footprint
+  //   // Right panel: grid-template-columns:
+  //   //   ss_cols > 1.0 → format!("repeat(2, {ss_tile_w:.0}px)")
+  //   //   else          → format!("{ss_tile_w:.0}px")
+  //   // Plus `justify-content: start` so tiles pack to the left edge.
   //
   // The resize handle is constrained to [0.3, 0.85] (screen_share_ratio),
   // so right_ratio spans [0.15, 0.70]. The single-column threshold at 0.25
   // is reachable by dragging screen share to cover ≥ 75% of the container.
   //
   // To assert in a future automated test:
-  //   // Default: two columns
+  //   // Default: two fixed-width columns
   //   const rightPanel = page.locator("#grid-container > div").nth(2);
   //   let style = await rightPanel.getAttribute("style");
-  //   expect(style).toContain("grid-template-columns: 1fr 1fr");
+  //   expect(style).toMatch(/grid-template-columns:\s*repeat\(2,\s*\d+px\)/);
+  //   expect(style).toContain("justify-content: start");
   //   // Drag handle far left (screen share ratio → 0.85, right_ratio → 0.15)
   //   await dragResizeHandle(page, -largeOffset);
   //   style = await rightPanel.getAttribute("style");
-  //   expect(style).toContain("grid-template-columns: 1fr");
+  //   expect(style).toMatch(/grid-template-columns:\s*\d+px\b/);
   // ──────────────────────────────────────────────────────────────────────
   test.skip("right panel switches to single column when screen share occupies ≥ 75% of screen (requires screen-share automation)", () => {
     // Skipped: getDisplayMedia() cannot be automated in headless Chromium.

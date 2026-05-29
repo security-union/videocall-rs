@@ -177,11 +177,35 @@ async function admitGuestIfNeeded(
   }
 }
 
+// HCL follow-up #944: synthetic getDisplayMedia mock — injected via
+// `addInitScript` so screen-share tests can run reliably in headless
+// Chromium without a system-level picker. Mirrors the pattern used in
+// `screen-share-panel.spec.ts`.
+const MOCK_GET_DISPLAY_MEDIA_SCRIPT = `
+  (() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices) return;
+    const createStream = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 640; canvas.height = 480;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 640, 480);
+      ctx.fillStyle = '#fff'; ctx.font = '24px sans-serif';
+      ctx.fillText('Mock Screen Share', 160, 240);
+      return canvas.captureStream(5);
+    };
+    Object.defineProperty(mediaDevices, 'getDisplayMedia', {
+      configurable: true, value: async () => createStream(),
+    });
+  })();
+`;
+
 async function setupTwoUserMeeting(
   uiURL: string,
   meetingId: string,
   hostName: string,
   guestName: string,
+  opts: { mockDisplayMedia?: boolean } = {},
 ) {
   const browser1 = await chromium.launch({ args: BROWSER_ARGS });
   const browser2 = await chromium.launch({ args: BROWSER_ARGS });
@@ -198,6 +222,11 @@ async function setupTwoUserMeeting(
     guestName,
     uiURL,
   );
+
+  if (opts.mockDisplayMedia) {
+    await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+    await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+  }
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -322,9 +351,75 @@ test.describe("Screen-share split-layout", () => {
   //   const rightStyleAfter = await rightPanel.getAttribute("style");
   //   expect(extractGridAutoRows(rightStyleAfter)).toBe(rowsBefore);
   // ──────────────────────────────────────────────────────────────────────
-  test.skip("right panel tiles have fixed height independent of resize handle position (requires screen-share automation)", () => {
-    // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
-    // See the block comment above for the full assertion plan.
+  // HCL follow-up #944: this test is no longer skipped — the synthetic
+  // `MOCK_GET_DISPLAY_MEDIA_SCRIPT` defined above (and the
+  // `setupTwoUserMeeting({ mockDisplayMedia: true })` opt-in) lets us
+  // trigger a screen share programmatically without the OS-level picker.
+  test("right panel tiles have fixed height independent of resize handle position", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_layout_fixed_height_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSFixHeightHost",
+      "SSFixHeightGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await expect(hostPage.locator("#grid-container .grid-item")).toHaveCount(1, {
+        timeout: 30_000,
+      });
+
+      // Guest starts the mocked screen share.
+      await guestPage.mouse.move(400, 400);
+      await guestPage.waitForTimeout(300);
+      const shareButton = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareButton).toBeVisible({ timeout: 10_000 });
+      await shareButton.click();
+
+      // Host sees the split-screen tile appear.
+      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
+
+      // The right panel is the 3rd direct child of #grid-container
+      // (left split-screen + handle + right grid). It carries the
+      // `grid-auto-rows: <N>px` inline style we want to lock in.
+      const rightPanel = hostPage.locator("#grid-container > div").nth(2);
+      const styleBefore = await rightPanel.getAttribute("style");
+      expect(styleBefore).toMatch(/grid-auto-rows:\s*\d+px/);
+      const rowsBefore = (styleBefore?.match(/grid-auto-rows:\s*(\d+)px/) ?? [])[1];
+
+      // Drag the resize handle ~100px to the right so screen_share_ratio
+      // changes. The split layout reflows but grid-auto-rows must NOT
+      // change — tile height is sized to fit 4-per-column on the
+      // available viewport, independent of the resize position.
+      const handle = hostPage.locator(".screen-share-resize-handle");
+      await expect(handle).toBeVisible({ timeout: 5_000 });
+      const handleBox = await handle.boundingBox();
+      if (!handleBox) {
+        throw new Error("resize handle has no bounding box");
+      }
+      const startX = handleBox.x + handleBox.width / 2;
+      const startY = handleBox.y + handleBox.height / 2;
+      await hostPage.mouse.move(startX, startY);
+      await hostPage.mouse.down();
+      await hostPage.mouse.move(startX + 100, startY, { steps: 10 });
+      await hostPage.mouse.up();
+      await hostPage.waitForTimeout(300);
+
+      const styleAfter = await rightPanel.getAttribute("style");
+      const rowsAfter = (styleAfter?.match(/grid-auto-rows:\s*(\d+)px/) ?? [])[1];
+      expect(rowsAfter).toBe(rowsBefore);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
   });
 
   // ──────────────────────────────────────────────────────────────────────
@@ -369,8 +464,74 @@ test.describe("Screen-share split-layout", () => {
   //   style = await rightPanel.getAttribute("style");
   //   expect(style).toMatch(/grid-template-columns:\s*\d+px\b/);
   // ──────────────────────────────────────────────────────────────────────
-  test.skip("right panel switches to single column when screen share occupies ≥ 75% of screen (requires screen-share automation)", () => {
-    // Skipped: getDisplayMedia() cannot be automated in headless Chromium.
-    // See the block comment above for the full assertion plan.
+  // HCL follow-up #944: no longer skipped, same rationale as the
+  // fixed-height test above.
+  test("right panel switches to single column when screen share occupies >= 75%", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_layout_single_col_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSSingleColHost",
+      "SSSingleColGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await expect(hostPage.locator("#grid-container .grid-item")).toHaveCount(1, {
+        timeout: 30_000,
+      });
+
+      // Guest triggers screen share.
+      await guestPage.mouse.move(400, 400);
+      await guestPage.waitForTimeout(300);
+      const shareButton = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareButton).toBeVisible({ timeout: 10_000 });
+      await shareButton.click();
+
+      // Split-layout activates on host.
+      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
+
+      const rightPanel = hostPage.locator("#grid-container > div").nth(2);
+
+      // Default split (screen_share_ratio = 0.667 → right_ratio = 0.333):
+      // grid-template-columns is `repeat(2, <px>px)` (two fixed-width
+      // tile-sized columns from the PR #940 HCL #3/#4 fix).
+      const styleDefault = await rightPanel.getAttribute("style");
+      expect(styleDefault).toMatch(/grid-template-columns:\s*repeat\(2,\s*\d+px\)/);
+
+      // Drag the resize handle toward the right edge so screen_share_ratio
+      // approaches 0.85 (right_ratio → 0.15). At right_ratio <= 0.25 the
+      // layout collapses to a single column.
+      const handle = hostPage.locator(".screen-share-resize-handle");
+      const handleBox = await handle.boundingBox();
+      const viewport = hostPage.viewportSize();
+      if (!handleBox || !viewport) {
+        throw new Error("resize handle or viewport unavailable");
+      }
+      const startX = handleBox.x + handleBox.width / 2;
+      const startY = handleBox.y + handleBox.height / 2;
+      const targetX = Math.floor(viewport.width * 0.85);
+      await hostPage.mouse.move(startX, startY);
+      await hostPage.mouse.down();
+      await hostPage.mouse.move(targetX, startY, { steps: 20 });
+      await hostPage.mouse.up();
+      await hostPage.waitForTimeout(500);
+
+      // Single-column form: grid-template-columns is a single `<px>px`
+      // entry, NOT `repeat(2, ...)`.
+      const styleNarrow = await rightPanel.getAttribute("style");
+      expect(styleNarrow).toMatch(/grid-template-columns:\s*\d+px/);
+      expect(styleNarrow).not.toMatch(/grid-template-columns:\s*repeat\(2,/);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
   });
 });

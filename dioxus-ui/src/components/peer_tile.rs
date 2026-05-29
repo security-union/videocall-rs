@@ -19,10 +19,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
-use crate::components::signal_quality::{PeerSignalHistory, SampleData, SignalInfo};
+use crate::components::canvas_generator::{
+    generate_for_peer, AudioLevels, SignalPopupHandlers, TileMode,
+};
+use crate::components::signal_quality::{
+    PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
+    SignalPopupState,
+};
 use crate::context::{
-    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, VideoCallClientCtx,
+    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, SignalPopupStateMap,
+    VideoCallClientCtx,
 };
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -46,6 +52,24 @@ pub fn PeerTile(
     #[props(default)] pinned_peer_id: Option<String>,
     #[props(default)] room_id: Option<String>,
     #[props(default = false)] is_current_user_host: bool,
+    /// HCL bug #2: scope of the signal-meter popup this tile owns. The
+    /// LEFT-panel shared-content tile passes `ScreenOnly` (the popup
+    /// surfaces ONLY the screen-share metric). Peer tiles pass
+    /// `NoScreen` (the popup hides the screen-share metric so the
+    /// dedicated shared-content tile's popup remains the single source
+    /// for screen-share signal). Legacy callers leave this defaulted to
+    /// `NoScreen` — full-bleed solo tiles never have screen data, so
+    /// hiding it is a no-op for them.
+    #[props(default = SignalMeterMode::NoScreen)]
+    meter_mode: SignalMeterMode,
+    /// HCL bug #2: human-readable display name of the peer who is
+    /// currently sharing their screen. Forwarded to the popup so peer
+    /// signal-meter popups can show a "Sharing: <name>" header line —
+    /// users see at a glance who's sharing without expanding the
+    /// shared-content tile's separate popup. `None` when no one is
+    /// sharing or when this tile is itself the shared-content tile.
+    #[props(default)]
+    sharing_peer_name: Option<String>,
     on_toggle_pin: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
@@ -103,8 +127,74 @@ pub fn PeerTile(
             .or_insert_with(|| Rc::new(RefCell::new(PeerSignalHistory::new())))
             .clone()
     };
-    let show_signal_popup = use_signal(|| false);
+    // HCL bug #8 + #9: popup open state and drag position are owned by a
+    // context-wide map rather than a per-PeerTile signal. When a peer
+    // leaves the meeting, that peer's tile remounts under a different
+    // sub-tree (the parent re-runs its for-loop / switches between
+    // grid and split layouts). With per-tile state every popup on every
+    // OTHER peer would also unmount because Dioxus tears down the
+    // entire prior tree. The shared map survives the rebuild, so each
+    // popup is only torn down when its OWN anchored peer leaves.
+    //
+    // The map keys on `(peer_id, meter_mode)` so this tile's popup
+    // doesn't collide with the same peer's screen-share-only popup
+    // (rendered on the shared-content tile in split layout).
+    let mut popup_state_map = use_context::<SignalPopupStateMap>();
+    let popup_key = (peer_id.clone(), meter_mode);
+    let signal_popup_state: Option<SignalPopupState> =
+        popup_state_map.read().get(&popup_key).copied();
+    let show_signal_popup = signal_popup_state.is_some();
+    let signal_popup_free_position = match signal_popup_state {
+        Some(SignalPopupState {
+            position: SignalPopupPosition::Free { left, top },
+        }) => Some((left, top)),
+        _ => None,
+    };
     let show_tile_menu = use_signal(|| false);
+
+    // Closures for the popup-state map. Each one writes through the
+    // shared map so layout switches / peer leaves don't invalidate them.
+    let on_toggle_signal_popup: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            let mut map = popup_state_map.write();
+            if map.contains_key(&popup_key) {
+                map.remove(&popup_key);
+            } else {
+                map.insert(popup_key.clone(), SignalPopupState::default());
+            }
+        })
+    };
+    let on_close_signal_popup: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            popup_state_map.write().remove(&popup_key);
+        })
+    };
+    let on_signal_popup_drag_commit: EventHandler<(f64, f64)> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |(left, top): (f64, f64)| {
+            let mut map = popup_state_map.write();
+            map.insert(
+                popup_key.clone(),
+                SignalPopupState {
+                    position: SignalPopupPosition::Free { left, top },
+                },
+            );
+        })
+    };
+    let on_signal_popup_reanchor: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            let mut map = popup_state_map.write();
+            map.insert(
+                popup_key.clone(),
+                SignalPopupState {
+                    position: SignalPopupPosition::Anchored,
+                },
+            );
+        })
+    };
 
     // Counter that increments each time a sample is pushed. Reading this
     // Dioxus Signal triggers re-renders, compensating for the fact that
@@ -259,7 +349,7 @@ pub fn PeerTile(
     // copying ~3.4 MB/s of data when 20 peers update at ~2 Hz.
     let sig_history = signal_history.borrow();
     let sig_level = sig_history.current_level(audio_en, video_en, screen_en);
-    let sig_samples = if show_signal_popup() {
+    let sig_samples = if show_signal_popup {
         // Reading sample_counter subscribes this component to updates from the
         // diagnostics task, ensuring the chart re-renders when new samples arrive.
         let _ = sample_counter();
@@ -274,7 +364,7 @@ pub fn PeerTile(
     // popup is even open. The .set() call is already gated on actual
     // change in handle_diagnostics_event, so this is purely a
     // re-render-scope optimization.
-    let sig_transport = if show_signal_popup() {
+    let sig_transport = if show_signal_popup {
         peer_transport()
     } else {
         None
@@ -408,8 +498,17 @@ pub fn PeerTile(
                 mt().meeting_start_time.unwrap_or_else(js_sys::Date::now)
             },
             transport: sig_transport,
+            meter_mode,
+            sharing_peer_name,
         },
-        show_signal_popup,
+        SignalPopupHandlers {
+            show: show_signal_popup,
+            free_position: signal_popup_free_position,
+            on_toggle: on_toggle_signal_popup,
+            on_close: on_close_signal_popup,
+            on_drag_commit: on_signal_popup_drag_commit,
+            on_reanchor: on_signal_popup_reanchor,
+        },
         show_tile_menu,
         on_mute,
         on_disable_video,

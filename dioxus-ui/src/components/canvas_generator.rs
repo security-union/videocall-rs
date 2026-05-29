@@ -23,6 +23,8 @@ use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
+// SignalMeterMode is referenced via SignalInfo internally — no direct import
+// needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
 use crate::context::{AppearanceSettings, CroppedTilesCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
@@ -283,6 +285,33 @@ pub struct AudioLevels {
     pub mic: f32,
 }
 
+/// HCL bugs #8 + #9: bundled per-tile signal-popup state + callbacks
+/// passed into [`generate_for_peer`]. Replaces the previous
+/// `Signal<bool>` so the popup state can be owned by a context-wide map
+/// (surviving peer-leave-induced remounts and layout switches) and so
+/// drag/reanchor wiring lives alongside the toggle/close events.
+pub struct SignalPopupHandlers {
+    /// Whether the popup is currently open for this tile.
+    pub show: bool,
+    /// HCL bug #9: `Some(left, top)` when the user has dragged the popup
+    /// to a fixed viewport position; `None` re-engages the anchored
+    /// follow-the-tile behaviour.
+    pub free_position: Option<(f64, f64)>,
+    /// Fired when the user clicks the signal-meter icon to toggle the
+    /// popup open/closed.
+    pub on_toggle: EventHandler<()>,
+    /// Fired when the user explicitly dismisses the popup via the "X".
+    pub on_close: EventHandler<()>,
+    /// HCL bug #9: fired when the user drops the popup at a new
+    /// viewport position. The host commits the position to the
+    /// popup-state map so the popup re-mounts at the same place on
+    /// later renders.
+    pub on_drag_commit: EventHandler<(f64, f64)>,
+    /// HCL bug #9: fired when the user clicks the 📌 reanchor button so
+    /// the popup snaps back to the tile.
+    pub on_reanchor: EventHandler<()>,
+}
+
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
@@ -304,7 +333,7 @@ pub fn generate_for_peer(
     mode: TileMode,
     my_session_id: Option<&str>,
     signal_info: SignalInfo,
-    mut show_signal_popup: Signal<bool>,
+    signal_popup: SignalPopupHandlers,
     mut show_tile_menu: Signal<bool>,
     on_mute: Option<EventHandler<()>>,
     on_disable_video: Option<EventHandler<()>>,
@@ -320,10 +349,21 @@ pub fn generate_for_peer(
     let signal_level = signal_info.level;
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
-    // Pulled out once before rsx so the three SignalQualityPopup call
-    // sites below can each pass an `Option<String>` clone without
-    // hunting through the bundle.
+    // Pulled out once before rsx so the SignalQualityPopup call sites
+    // below can each pass an `Option<String>` clone without hunting
+    // through the bundle.
     let signal_transport = signal_info.transport;
+    let signal_meter_mode = signal_info.meter_mode;
+    let signal_sharing_peer_name = signal_info.sharing_peer_name;
+    // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
+    let SignalPopupHandlers {
+        show: show_signal_popup,
+        free_position: signal_free_position,
+        on_toggle: on_toggle_signal_popup,
+        on_close: on_close_signal_popup,
+        on_drag_commit: on_drag_commit_signal_popup,
+        on_reanchor: on_reanchor_signal_popup,
+    } = signal_popup;
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
         .get_peer_display_name(key)
@@ -390,10 +430,21 @@ pub fn generate_for_peer(
         let peer_user_id_for_pin_ss = peer_user_id.clone();
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
+        // HCL bug #2: the shared-content tile gets its own signal-meter
+        // icon + popup. The popup-state map keys on `(peer_id, meter_mode)`,
+        // so this popup and the matching peer-tile popup coexist without
+        // collision. Anchor on the screen-share div so the portal positioner
+        // tracks it through layout reflows.
+        let ss_anchor_id = (*ss_div_id).clone();
+        let ss_split_class = if show_signal_popup {
+            "split-screen-tile signal-popup-open"
+        } else {
+            "split-screen-tile"
+        };
         return rsx! {
             div {
                 id: "{ss_div_id}",
-                class: "split-screen-tile",
+                class: "{ss_split_class}",
                 div {
                     class: "canvas-container video-on",
                     ScreenCanvas { peer_id: key.clone() }
@@ -408,6 +459,17 @@ pub fn generate_for_peer(
                     }
                     div {
                         class: "tile-top-icons",
+                        // HCL bug #2: signal-meter icon button on the
+                        // shared-content tile. Visually identical to peer
+                        // tiles (same `.signal-indicator` class + bars
+                        // icon). Toggles the SCREEN-ONLY popup for this
+                        // publisher.
+                        button {
+                            class: "signal-indicator",
+                            "aria-label": "Show screen-share signal quality",
+                            onclick: move |_| on_toggle_signal_popup.call(()),
+                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                        }
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&ss_div_pin);
@@ -424,6 +486,32 @@ pub fn generate_for_peer(
                                     class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                     CropIcon {}
                                 }
+                            }
+                        }
+                    }
+                }
+                if show_signal_popup {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = ss_anchor_id.clone();
+                        let popup_sharing = signal_sharing_peer_name.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                meter_mode: signal_meter_mode,
+                                sharing_peer_name: popup_sharing,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
                             }
                         }
                     }
@@ -455,7 +543,7 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let split_peer_class = if show_signal_popup() {
+        let split_peer_class = if show_signal_popup {
             "split-peer-tile signal-popup-open"
         } else {
             "split-peer-tile"
@@ -510,7 +598,7 @@ pub fn generate_for_peer(
                         button {
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
-                            onclick: move |_| show_signal_popup.toggle(),
+                            onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
                         // Crop (visible on hover only, hidden when video disabled)
@@ -659,13 +747,14 @@ pub fn generate_for_peer(
                 // PR #923 cannot cut it off. The popup itself is // @token-exempt: PR ref, not a color
                 // `position: fixed` (see `.signal-quality-popup-portal`
                 // in style.css) and anchors to this tile by id.
-                if show_signal_popup() {
+                if show_signal_popup {
                     {
                         let h = signal_history.clone();
                         let popup_peer_id = key.clone();
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_anchor = split_anchor_id.clone();
+                        let popup_sharing = signal_sharing_peer_name.clone();
                         rsx! {
                             SignalQualityPopup {
                                 peer_id: popup_peer_id,
@@ -674,7 +763,12 @@ pub fn generate_for_peer(
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
-                                on_close: move |_| show_signal_popup.set(false),
+                                meter_mode: signal_meter_mode,
+                                sharing_peer_name: popup_sharing,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
                             }
                         }
                     }
@@ -702,7 +796,7 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let full_bleed_grid_class = if show_signal_popup() {
+        let full_bleed_grid_class = if show_signal_popup {
             "grid-item full-bleed signal-popup-open"
         } else {
             "grid-item full-bleed"
@@ -758,7 +852,7 @@ pub fn generate_for_peer(
                         button {
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
-                            onclick: move |_| show_signal_popup.toggle(),
+                            onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
                         // Crop (visible on hover only)
@@ -903,13 +997,14 @@ pub fn generate_for_peer(
                 }
                 // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
                 // border-radius `overflow: hidden` clip cannot crop it.
-                if show_signal_popup() {
+                if show_signal_popup {
                     {
                         let h = signal_history.clone();
                         let popup_peer_id = key.clone();
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_anchor = fb_anchor_id.clone();
+                        let popup_sharing = signal_sharing_peer_name.clone();
                         rsx! {
                             SignalQualityPopup {
                                 peer_id: popup_peer_id,
@@ -918,7 +1013,12 @@ pub fn generate_for_peer(
                                 meeting_start_ms,
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
-                                on_close: move |_| show_signal_popup.set(false),
+                                meter_mode: signal_meter_mode,
+                                sharing_peer_name: popup_sharing,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
                             }
                         }
                     }
@@ -1013,7 +1113,7 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
-            let grid_item_class = if show_signal_popup() {
+            let grid_item_class = if show_signal_popup {
                 "grid-item signal-popup-open"
             } else {
                 "grid-item"
@@ -1066,7 +1166,7 @@ pub fn generate_for_peer(
                             button {
                                 class: "signal-indicator",
                                 "aria-label": "Show signal quality",
-                                onclick: move |_| show_signal_popup.toggle(),
+                                onclick: move |_| on_toggle_signal_popup.call(()),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
                             // Crop (visible on hover only)
@@ -1211,13 +1311,14 @@ pub fn generate_for_peer(
                     }
                     // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
                     // border-radius `overflow: hidden` clip cannot crop it.
-                    if show_signal_popup() {
+                    if show_signal_popup {
                         {
                             let h = signal_history.clone();
                             let popup_peer_id = key.clone();
                             let popup_peer_name = peer_display_name.clone();
                             let popup_transport = signal_transport.clone();
                             let popup_anchor = grid_anchor_id.clone();
+                            let popup_sharing = signal_sharing_peer_name.clone();
                             rsx! {
                                 SignalQualityPopup {
                                     peer_id: popup_peer_id,
@@ -1226,7 +1327,12 @@ pub fn generate_for_peer(
                                     meeting_start_ms,
                                     transport: popup_transport,
                                     anchor_id: popup_anchor,
-                                    on_close: move |_| show_signal_popup.set(false),
+                                    meter_mode: signal_meter_mode,
+                                    sharing_peer_name: popup_sharing,
+                                    free_position: signal_free_position,
+                                    on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                    on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                    on_close: move |_| on_close_signal_popup.call(()),
                                 }
                             }
                         }

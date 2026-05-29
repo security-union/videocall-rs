@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
@@ -46,7 +47,8 @@ use crate::context::{
     save_density_mode, save_display_name_to_storage, save_dock_autohide, save_dock_position,
     validate_display_name, AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DensityModeCtx,
     DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -805,6 +807,14 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // HCL bug #8 + #9: per-(peer, mode) signal-popup state map, owned by
+    // the parent so PeerTile remounts (peer leaves, layout switches) do
+    // not unmount the popup containers and accidentally close every
+    // other peer's open popup. Cleaned up alongside
+    // `peer_signal_history_map` when peers leave so we don't leak
+    // entries for departed peers.
+    let signal_popup_state_map: SignalPopupStateMap = use_signal(HashMap::new);
+
     // Per-tile crop state — created early so on_peer_removed can clean up.
     let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
@@ -984,6 +994,11 @@ pub fn AttendantsComponent(
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                // HCL bug #8: drop only this peer's open signal-meter popup
+                // entries; every other peer's popup state stays intact so
+                // their popups remain visible across the parent re-render.
+                let mut popup_map = signal_popup_state_map;
+                popup_map.write().retain(|(pid, _mode), _| pid != &peer_id);
                 let mut speech_map = peer_speech_priority;
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
@@ -1707,6 +1722,11 @@ pub fn AttendantsComponent(
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
 
+    // HCL bug #8 + #9: provide the popup-state map so PeerTile can look up
+    // each popup's open/free-position state. Surviving the parent re-render
+    // is what makes peer leaves stop tearing down every other open popup.
+    use_context_provider(|| signal_popup_state_map);
+
     // Per-tile crop state — signal created early (near peer_status_map) so
     // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
@@ -2115,6 +2135,15 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
+    // HCL bug #2: display name of the active screen sharer (if any), so
+    // every peer-mode signal-meter popup can surface a small
+    // "Sharing: <name>" header line. Computed once per render so the
+    // PeerTile for-loop avoids repeating the lookup.
+    let active_screen_sharer_name: Option<String> = active_screen_sharer.as_ref().map(|sid| {
+        client
+            .get_peer_display_name(sid)
+            .unwrap_or_else(|| sid.clone())
+    });
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     // The right panel uses a 2-column grid of compact tiles. We compute how
@@ -2838,6 +2867,9 @@ pub fn AttendantsComponent(
                                             render_mode: TileMode::ScreenOnly,
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
+                                            // HCL bug #2: the shared-content tile shows
+                                            // ONLY the screen-share metric in its popup.
+                                            meter_mode: SignalMeterMode::ScreenOnly,
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
                                     }
@@ -2907,6 +2939,10 @@ pub fn AttendantsComponent(
                                                         on_toggle_pin: toggle_pin.clone(),
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
+                                                        // HCL bug #2: peer popups suppress the
+                                                        // screen metric and surface a header note
+                                                        // pointing at whoever is sharing right now.
+                                                        sharing_peer_name: active_screen_sharer_name.clone(),
                                                     }
                                                 }
                                             }
@@ -2954,6 +2990,12 @@ pub fn AttendantsComponent(
                                             on_toggle_pin: toggle_pin.clone(),
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
+                                            // HCL bug #2: grid layout never reaches the split
+                                            // path, but a screen share may still be live in
+                                            // the publisher's own grid tile — forward the
+                                            // active sharer name so each peer popup can show
+                                            // the "Sharing: <name>" indicator.
+                                            sharing_peer_name: active_screen_sharer_name.clone(),
                                         }
                                     }
                                 }

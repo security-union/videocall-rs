@@ -19,6 +19,107 @@ use crate::theme::color as theme_color;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Scope filter for [`SignalQualityPopup`].
+///
+/// Drives which metric series (audio, video, screen) the popup renders in the
+/// chart, legend, and tooltip. Introduced for HCL bug #2 so the LEFT panel of
+/// the screen-share split layout can show ONLY the screen-share series, and
+/// peer tiles can suppress the screen-share series (the shared-content tile
+/// has its own popup for that).
+///
+/// Two distinct popups can therefore be open simultaneously for the same
+/// publisher: one anchored to the screen-share tile (`ScreenOnly`) and one
+/// anchored to that peer's video tile (`NoScreen`). The popup-state map keys
+/// on `(peer_id, mode)` so they coexist without colliding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum SignalMeterMode {
+    /// Show every metric series the sample has data for. Used by legacy
+    /// callers (e.g. the diagnostics overview) where the popup isn't paired
+    /// with a specific tile mode.
+    #[default]
+    Full,
+    /// Show ONLY the screen-share series. Used by the shared-content tile in
+    /// the split layout — clicking its signal-meter icon must surface only the
+    /// screen-share metric, not camera or audio.
+    ScreenOnly,
+    /// Show audio + video, hide the screen-share series. Used by every peer
+    /// tile so the screen-share metric doesn't double-render (it has its own
+    /// popup on the shared-content tile).
+    NoScreen,
+}
+
+impl SignalMeterMode {
+    /// Whether this mode renders the audio series.
+    pub fn shows_audio(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the camera-video series.
+    pub fn shows_video(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the screen-share series.
+    pub fn shows_screen(self) -> bool {
+        matches!(self, Self::Full | Self::ScreenOnly)
+    }
+
+    /// Short stable string for DOM ids. The popup-state map keys on
+    /// `(peer_id, mode)` and we serialise both halves into the DOM id so
+    /// CSS / Playwright selectors can target each popup independently.
+    pub fn id_suffix(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ScreenOnly => "screen",
+            Self::NoScreen => "peer",
+        }
+    }
+}
+
+/// Per-popup persistent state, lifted out of the per-tile `PeerTile` so
+/// mid-meeting peer leaves / layout switches don't unmount the popup
+/// containers and close every other popup (HCL bug #8). Stored in a
+/// context-provided `Signal<HashMap<(peer_id, mode), SignalPopupState>>`
+/// so multiple popups can coexist independently.
+///
+/// `position` honours the drag-and-drop rule from HCL bug #9: when the user
+/// drags a popup, we transition from `Anchored` (auto-follow the tile) to
+/// `Free` (fixed viewport coordinates). The popup's header carries a 📌
+/// reanchor button that resets the state back to `Anchored`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SignalPopupState {
+    pub position: SignalPopupPosition,
+}
+
+impl Default for SignalPopupState {
+    fn default() -> Self {
+        Self {
+            position: SignalPopupPosition::Anchored,
+        }
+    }
+}
+
+/// Viewport-space position for a signal-quality popup. `Anchored` reads the
+/// tile's `getBoundingClientRect()` and tracks the tile through layout
+/// reflows; `Free { left, top }` pins the popup to fixed viewport
+/// coordinates regardless of where the tile moves (drag-and-drop result).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SignalPopupPosition {
+    Anchored,
+    Free { left: f64, top: f64 },
+}
+
+impl SignalPopupPosition {
+    /// Convenience predicate. Currently unused by the popup itself (the
+    /// `data-anchor-mode` attribute on the popup DOM element is the source of
+    /// truth for `reposition_popup`), but exposed for tests and downstream
+    /// callers that want to inspect the state.
+    #[allow(dead_code)]
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free { .. })
+    }
+}
+
 /// Discrete signal quality level shown as 0-5 filled bars.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SignalLevel {
@@ -569,6 +670,19 @@ pub struct SignalInfo {
     /// observed yet. Renders as a header badge in [`SignalQualityPopup`];
     /// not part of the time-series chart.
     pub transport: Option<String>,
+    /// HCL bug #2: scope filter for the popup. `Full` (legacy) shows every
+    /// series; `ScreenOnly` restricts the chart / legend / tooltip to the
+    /// screen-share series (used by the shared-content tile in the split
+    /// layout); `NoScreen` hides the screen-share series (used by peer
+    /// tiles so the screen metric only renders in the dedicated
+    /// shared-content popup).
+    pub meter_mode: SignalMeterMode,
+    /// HCL bug #2: human-readable name of the peer currently sharing their
+    /// screen. Surfaced as a "Sharing: <name>" header line in the popup
+    /// when this popup is hiding the screen series (i.e. `NoScreen` mode
+    /// and a publisher is active). `None` when no one is sharing or when
+    /// the popup itself is the screen-only one.
+    pub sharing_peer_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +715,34 @@ pub struct SignalQualityPopupProps {
     /// join/leave keeps the popup glued to the right tile instead of
     /// stranding it where the tile used to be.
     anchor_id: String,
+    /// HCL bug #2: scope filter for which metric series the popup shows.
+    /// Defaults to `Full` so legacy call sites unaffected by bug #2 keep
+    /// rendering every series.
+    #[props(default)]
+    meter_mode: SignalMeterMode,
+    /// HCL bug #2: human-readable name of the peer currently sharing their
+    /// screen, surfaced as a small "Sharing: <name>" header line when
+    /// `meter_mode == NoScreen` and somebody is publishing — lets users
+    /// see at a glance who's sharing without expanding the screen-share
+    /// tile's separate popup.
+    #[props(default)]
+    sharing_peer_name: Option<String>,
+    /// HCL bug #9: when `Some`, position the popup at fixed viewport
+    /// coordinates instead of anchoring to the tile. `None` re-engages
+    /// the anchored-follow behaviour. Owned by the popup-state context
+    /// map (`SignalPopupStateMap`).
+    #[props(default)]
+    free_position: Option<(f64, f64)>,
+    /// HCL bug #9: invoked when the user drags the popup to a new viewport
+    /// position. The host installs this callback to commit the new free
+    /// position into the popup-state map.
+    #[props(default)]
+    on_drag_commit: EventHandler<(f64, f64)>,
+    /// HCL bug #9: invoked when the user clicks the reanchor button in the
+    /// popup header. The host installs this callback to reset
+    /// `free_position` to `None` so the popup snaps back to the tile.
+    #[props(default)]
+    on_reanchor: EventHandler<()>,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
 }
@@ -705,17 +847,40 @@ fn element_rect(el: &web_sys::Element) -> Rect {
 /// No-ops silently if either element is missing from the DOM — that's the
 /// normal state when the source tile has just unmounted from a peer leave
 /// but the popup has not yet finished its own unmount cycle.
+///
+/// HCL bug #9: the popup carries a `data-anchor-mode` attribute reflecting
+/// its current anchor state. `"free"` / `"dragging"` means the user has
+/// dragged it; the JS-driven reposition must NOT overwrite the user's
+/// coordinates in that case, so we early-return when the attribute is
+/// `"free"`/`"dragging"`. This is the lever that lets the resize / scroll
+/// / ResizeObserver callbacks coexist with drag-and-drop without re-
+/// snapping the popup back to the tile mid-drag.
 fn reposition_popup(anchor_id: &str, popup_id: &str) {
     let doc = gloo_utils::document();
     let win = match web_sys::window() {
         Some(w) => w,
         None => return,
     };
-    let anchor = match doc.get_element_by_id(anchor_id) {
+    let popup = match doc.get_element_by_id(popup_id) {
         Some(el) => el,
         None => return,
     };
-    let popup = match doc.get_element_by_id(popup_id) {
+
+    // Bug #9: respect the user's manual drag position.
+    if popup
+        .get_attribute("data-anchor-mode")
+        .as_deref()
+        .map(|m| m == "free" || m == "dragging")
+        .unwrap_or(false)
+    {
+        // Free popups are positioned by the user; only clamp them so they
+        // remain within the current viewport. This handles window-resize
+        // edge cases where a free popup would otherwise spill off-screen.
+        clamp_free_popup_to_viewport(&popup, &win);
+        return;
+    }
+
+    let anchor = match doc.get_element_by_id(anchor_id) {
         Some(el) => el,
         None => return,
     };
@@ -745,6 +910,58 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
     let style = html_popup.style();
     let _ = style.set_property("left", &format!("{left:.0}px"));
     let _ = style.set_property("top", &format!("{top:.0}px"));
+}
+
+/// HCL bug #9: clamp a `Free` popup so it stays within the viewport when
+/// the window resizes. We don't touch the popup if it already fits — the
+/// user dragged it there deliberately and we should not drift it.
+fn clamp_free_popup_to_viewport(popup: &web_sys::Element, win: &web_sys::Window) {
+    let html_popup: web_sys::HtmlElement = popup.clone().unchecked_into();
+    let rect = element_rect(&html_popup);
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let (left, top) = clamp_free_position(
+        rect.left,
+        rect.top,
+        rect.width(),
+        rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+    if (left - rect.left).abs() > 0.5 || (top - rect.top).abs() > 0.5 {
+        let style = html_popup.style();
+        let _ = style.set_property("left", &format!("{left:.0}px"));
+        let _ = style.set_property("top", &format!("{top:.0}px"));
+    }
+}
+
+/// Clamp a free-mode popup position to keep it inside the viewport with
+/// the same `VIEWPORT_MARGIN_PX` breathing room used by
+/// [`compute_popup_position`]. Extracted so unit tests can drive every
+/// clamp branch without a browser.
+pub(crate) fn clamp_free_position(
+    left: f64,
+    top: f64,
+    popup_w: f64,
+    popup_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> (f64, f64) {
+    let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_left = VIEWPORT_MARGIN_PX;
+    let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_top = VIEWPORT_MARGIN_PX;
+    let l = left.clamp(min_left, max_left.max(min_left));
+    let t = top.clamp(min_top, max_top.max(min_top));
+    (l, t)
 }
 
 /// Install everything the `SignalQualityPopup` needs to behave like a
@@ -892,6 +1109,224 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
             }
         }
     });
+}
+
+/// HCL bug #9: install drag-and-drop on the popup header so users can
+/// pull the popup off its tile anchor and place it wherever they like.
+///
+/// The header carries a `data-drag-handle` attribute. We attach
+/// `mousedown` to the popup root (and filter to events that originated
+/// inside the header). On mousedown we capture the pointer's offset from
+/// the popup's current top-left, set `data-anchor-mode="dragging"` (which
+/// `reposition_popup` honours by skipping its auto-layout math), and
+/// install temporary `mousemove` / `mouseup` listeners on the window.
+///
+/// `mousemove` writes the new `left`/`top` directly to the popup's inline
+/// style — using inline styles instead of a Dioxus signal keeps the drag
+/// 60fps even when the popup tree is otherwise expensive to re-render.
+/// On `mouseup` we commit the final position to the popup-state map via
+/// the `on_drag_commit` callback, which clears the `dragging` data-attr
+/// and flips it to `"free"` (the durable state). Touch support is
+/// intentionally out of scope for the first cut — desktop drag is the
+/// primary UX.
+fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::closure::Closure;
+
+    struct DragState {
+        win: web_sys::Window,
+        mousedown_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        mousemove_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        mouseup_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        popup_el: Option<web_sys::Element>,
+    }
+
+    let state: Rc<RefCell<Option<DragState>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    {
+        let state = state.clone();
+        let popup_id_for_init = popup_id.clone();
+        let on_drag_commit_for_init = on_drag_commit;
+        use_hook(move || {
+            let win = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+            let doc = gloo_utils::document();
+            let popup_el = match doc.get_element_by_id(&popup_id_for_init) {
+                Some(el) => el,
+                None => return, // mount race; tear down in use_drop
+            };
+
+            // Per-drag-session offset of the cursor inside the popup so the
+            // drag preserves the click point. Reset on every mousedown.
+            let offset: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
+            // Whether a drag is currently active. Drives `mousemove` early-out
+            // when the user isn't dragging.
+            let active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+            // mousedown handler attached to the popup root. We bubble-listen
+            // and filter by `closest('[data-drag-handle]')` so only clicks
+            // inside the header start a drag. Buttons inside the header
+            // (close, reanchor) carry `data-no-drag` so they're excluded.
+            let mousedown_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                let popup_el = popup_el.clone();
+                let offset = offset.clone();
+                let active = active.clone();
+                move |evt: web_sys::MouseEvent| {
+                    let target = match evt.target() {
+                        Some(t) => t,
+                        None => return,
+                    };
+                    let target_el: web_sys::Element = match target.dyn_into() {
+                        Ok(el) => el,
+                        Err(_) => return,
+                    };
+                    // Bail on no-drag controls (close button, reanchor button).
+                    if let Ok(Some(_)) = target_el.closest("[data-no-drag]") {
+                        return;
+                    }
+                    // Only fire when the click landed in the drag handle.
+                    let in_handle = matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
+                    if !in_handle {
+                        return;
+                    }
+                    if evt.button() != 0 {
+                        return;
+                    }
+                    evt.prevent_default();
+                    let rect = popup_el.get_bounding_client_rect();
+                    let dx = evt.client_x() as f64 - rect.left();
+                    let dy = evt.client_y() as f64 - rect.top();
+                    *offset.borrow_mut() = (dx, dy);
+                    *active.borrow_mut() = true;
+                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                    let _ = html_popup.set_attribute("data-anchor-mode", "dragging");
+                }
+            });
+            let _ = popup_el.add_event_listener_with_callback(
+                "mousedown",
+                mousedown_cb.as_ref().unchecked_ref(),
+            );
+
+            // mousemove handler on window — runs only while a drag is
+            // active, so the early-out keeps the cost negligible when
+            // the user is just moving the cursor.
+            let mousemove_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                let popup_el = popup_el.clone();
+                let offset = offset.clone();
+                let active = active.clone();
+                let win_inner = win.clone();
+                move |evt: web_sys::MouseEvent| {
+                    if !*active.borrow() {
+                        return;
+                    }
+                    let (dx, dy) = *offset.borrow();
+                    let target_left = evt.client_x() as f64 - dx;
+                    let target_top = evt.client_y() as f64 - dy;
+                    let rect = popup_el.get_bounding_client_rect();
+                    let viewport_w = win_inner
+                        .inner_width()
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let viewport_h = win_inner
+                        .inner_height()
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let (l, t) = clamp_free_position(
+                        target_left,
+                        target_top,
+                        rect.width(),
+                        rect.height(),
+                        viewport_w,
+                        viewport_h,
+                    );
+                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                    let style = html_popup.style();
+                    let _ = style.set_property("left", &format!("{l:.0}px"));
+                    let _ = style.set_property("top", &format!("{t:.0}px"));
+                }
+            });
+            let _ = win.add_event_listener_with_callback(
+                "mousemove",
+                mousemove_cb.as_ref().unchecked_ref(),
+            );
+
+            // mouseup commits the final position.
+            let mouseup_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                let popup_el = popup_el.clone();
+                let active = active.clone();
+                move |_evt: web_sys::MouseEvent| {
+                    if !*active.borrow() {
+                        return;
+                    }
+                    *active.borrow_mut() = false;
+                    let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                    let rect = html_popup.get_bounding_client_rect();
+                    let _ = html_popup.set_attribute("data-anchor-mode", "free");
+                    on_drag_commit_for_init.call((rect.left(), rect.top()));
+                }
+            });
+            let _ = win
+                .add_event_listener_with_callback("mouseup", mouseup_cb.as_ref().unchecked_ref());
+
+            *state.borrow_mut() = Some(DragState {
+                win: win.clone(),
+                mousedown_cb: Some(mousedown_cb),
+                mousemove_cb: Some(mousemove_cb),
+                mouseup_cb: Some(mouseup_cb),
+                popup_el: Some(popup_el),
+            });
+        });
+    }
+
+    use_drop({
+        let state = state.clone();
+        move || {
+            if let Some(s) = state.borrow_mut().take() {
+                if let (Some(el), Some(cb)) = (s.popup_el.as_ref(), s.mousedown_cb.as_ref()) {
+                    let _ = el.remove_event_listener_with_callback(
+                        "mousedown",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+                if let Some(cb) = s.mousemove_cb.as_ref() {
+                    let _ = s.win.remove_event_listener_with_callback(
+                        "mousemove",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+                if let Some(cb) = s.mouseup_cb.as_ref() {
+                    let _ = s.win.remove_event_listener_with_callback(
+                        "mouseup",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Minimal HTML-escape for the small inline header label we emit via
+/// `dangerous_inner_html`. Only handles the five characters the spec
+/// requires for a text node embedded in an attribute-free context; peer
+/// display names are user-supplied so this guards against XSS.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Get or create the global tooltip element on `<body>`.
@@ -1332,7 +1767,15 @@ fn hide_body_tooltip() {
 pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let history = &props.history;
     let on_close = props.on_close;
-    let popup_title = format!("Signal Quality - {}", props.peer_name);
+    let on_drag_commit = props.on_drag_commit;
+    let on_reanchor = props.on_reanchor;
+    let meter_mode = props.meter_mode;
+    let free_position = props.free_position;
+    let sharing_peer_name = props.sharing_peer_name.clone();
+    let popup_title = match meter_mode {
+        SignalMeterMode::ScreenOnly => format!("Screen Share Quality - {}", props.peer_name),
+        _ => format!("Signal Quality - {}", props.peer_name),
+    };
 
     // Derive the transport badge tuple once, before rsx, so we don't pay
     // for repeated `String::as_str` / match work inside the rsx! macro
@@ -1367,21 +1810,63 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // All closures + the ResizeObserver are torn down via `use_drop` when
     // the popup unmounts, so reopening it on a different tile attaches
     // a fresh anchor cleanly.
-    let popup_id = format!("signal-quality-popup-{}", props.peer_id);
+    //
+    // HCL bug #2: DOM id includes the meter-mode suffix so a peer's
+    // screen-only popup and their no-screen peer popup can both exist
+    // simultaneously without colliding on the same id. Legacy callers
+    // (`meter_mode == Full`) get the original `signal-quality-popup-<peer_id>`
+    // shape, which keeps the existing portal Playwright spec passing
+    // unchanged.
+    let popup_id = match meter_mode {
+        SignalMeterMode::Full => format!("signal-quality-popup-{}", props.peer_id),
+        other => format!(
+            "signal-quality-popup-{}-{}",
+            props.peer_id,
+            other.id_suffix()
+        ),
+    };
     {
         let anchor_id = props.anchor_id.clone();
         let popup_id_for_hook = popup_id.clone();
         install_popup_anchor(anchor_id, popup_id_for_hook, on_close);
     }
+    {
+        // HCL bug #9: install drag-and-drop handlers on the header. The
+        // drag installer is a no-op until the user mousedowns on
+        // `.popup-header` (which carries `data-drag-handle`).
+        let popup_id_for_drag = popup_id.clone();
+        install_popup_drag(popup_id_for_drag, on_drag_commit);
+    }
 
     // Which legend help text is currently expanded (if any).
     let mut help_visible = use_signal(|| None::<&'static str>);
 
-    // Per-metric visibility toggles (all on by default).
-    let mut show_audio = use_signal(|| true);
-    let mut show_video = use_signal(|| true);
-    let mut show_screen = use_signal(|| true);
+    // Per-metric visibility toggles. Defaults follow the meter mode so the
+    // popup opens with the right scope already applied (HCL bug #2). The
+    // user can still toggle these checkboxes inside the popup if they
+    // want to override the default for a single session.
+    let mut show_audio = use_signal(|| meter_mode.shows_audio());
+    let mut show_video = use_signal(|| meter_mode.shows_video());
+    let mut show_screen = use_signal(|| meter_mode.shows_screen());
     let mut show_latency = use_signal(|| true);
+
+    // HCL bug #9: compute the initial `data-anchor-mode` and inline
+    // position style from the `free_position` prop. `data-anchor-mode`
+    // is the lever `reposition_popup` reads to decide whether to skip
+    // the auto-layout math; the inline `left`/`top` style covers the
+    // first paint before any reposition tick runs.
+    let (anchor_mode_attr, position_style) = match free_position {
+        Some((l, t)) => ("free", format!("left: {l:.0}px; top: {t:.0}px;")),
+        None => ("anchored", String::new()),
+    };
+    let show_reanchor = free_position.is_some();
+    let sharing_indicator = sharing_peer_name.as_ref().map(|name| {
+        format!(
+            "<span style='color:{};font-size:11px;'>\u{1F5A5} Sharing: {}</span>",
+            theme_color::TEXT_SUBTLE,
+            html_escape(name)
+        )
+    });
 
     // Unique scroll container ID so multiple popups don't collide.
     let scroll_id = format!("signal-chart-scroll-{}", props.peer_id);
@@ -1396,21 +1881,44 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let draw_height = chart_height - padding_top - padding_bottom;
 
     if history.is_empty() {
+        let sharing_indicator_empty = sharing_indicator.clone();
         return rsx! {
             div {
                 id: "{popup_id}",
                 class: "signal-quality-popup signal-quality-popup-portal",
+                "data-anchor-mode": "{anchor_mode_attr}",
+                "data-meter-mode": "{meter_mode.id_suffix()}",
+                style: "{position_style}",
                 onclick: move |e| e.stop_propagation(),
-                div { class: "popup-header",
+                div {
+                    class: "popup-header",
+                    "data-drag-handle": "true",
                     span { class: "popup-title", "{popup_title}" }
                     div { class: "popup-header-actions",
+                        if let Some(html) = sharing_indicator_empty.as_ref() {
+                            span {
+                                class: "popup-sharing-indicator",
+                                dangerous_inner_html: "{html}",
+                            }
+                        }
                         span {
                             class: "{transport_class}",
                             title: "{transport_title}",
                             "{transport_label}"
                         }
+                        if show_reanchor {
+                            button {
+                                class: "popup-reanchor",
+                                title: "Reanchor to tile",
+                                "aria-label": "Reanchor to tile",
+                                "data-no-drag": "true",
+                                onclick: move |_| on_reanchor.call(()),
+                                "\u{1F4CC}"
+                            }
+                        }
                         button {
                             class: "popup-close",
+                            "data-no-drag": "true",
                             onclick: move |_| on_close.call(()),
                             "X"
                         }
@@ -1520,23 +2028,46 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         }
     });
 
+    let sharing_indicator_render = sharing_indicator.clone();
     rsx! {
         div {
             id: "{popup_id}",
             class: "signal-quality-popup signal-quality-popup-portal",
+            "data-anchor-mode": "{anchor_mode_attr}",
+            "data-meter-mode": "{meter_mode.id_suffix()}",
+            style: "{position_style}",
             // Stop clicks inside the popup from bubbling to tile handlers
             // (e.g. the mobile-pin onclick on `.canvas-container`).
             onclick: move |e| e.stop_propagation(),
-            div { class: "popup-header",
+            div {
+                class: "popup-header",
+                "data-drag-handle": "true",
                 span { class: "popup-title", "{popup_title}" }
                 div { class: "popup-header-actions",
+                    if let Some(html) = sharing_indicator_render.as_ref() {
+                        span {
+                            class: "popup-sharing-indicator",
+                            dangerous_inner_html: "{html}",
+                        }
+                    }
                     span {
                         class: "{transport_class}",
                         title: "{transport_title}",
                         "{transport_label}"
                     }
+                    if show_reanchor {
+                        button {
+                            class: "popup-reanchor",
+                            title: "Reanchor to tile",
+                            "aria-label": "Reanchor to tile",
+                            "data-no-drag": "true",
+                            onclick: move |_| on_reanchor.call(()),
+                            "\u{1F4CC}"
+                        }
+                    }
                     button {
                         class: "popup-close",
+                        "data-no-drag": "true",
                         onclick: move |_| on_close.call(()),
                         "X"
                     }
@@ -1768,51 +2299,58 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             }
             // Tooltip is rendered directly on <body> via show_body_tooltip/hide_body_tooltip
             // to escape all grid-item stacking contexts.
-            // Legend with visibility checkboxes
+            // Legend with visibility checkboxes. HCL bug #2: each row is
+            // gated on `meter_mode` so a `ScreenOnly` popup only exposes the
+            // Screen + RTT toggles, and a `NoScreen` popup hides the Screen
+            // toggle (the dedicated shared-content tile owns it).
             div { class: "signal-chart-legend",
-                label { class: "legend-item",
-                    input {
-                        r#type: "checkbox",
-                        checked: show_audio(),
-                        onchange: move |_| show_audio.set(!show_audio()),
-                    }
-                    span { class: "dot", style: "background: {theme_color::SIGNAL_AUDIO};" }
-                    "Audio"
-                    button {
-                        class: "legend-help-btn",
-                        onclick: move |_| {
-                            let current = help_visible();
-                            if current == Some("audio") {
-                                help_visible.set(None);
-                            } else {
-                                help_visible.set(Some("audio"));
-                            }
-                        },
-                        "?"
-                    }
-                }
-                label { class: "legend-item",
-                    input {
-                        r#type: "checkbox",
-                        checked: show_video(),
-                        onchange: move |_| show_video.set(!show_video()),
-                    }
-                    span { class: "dot", style: "background: {theme_color::SIGNAL_VIDEO};" }
-                    "Video"
-                    button {
-                        class: "legend-help-btn",
-                        onclick: move |_| {
-                            let current = help_visible();
-                            if current == Some("video") {
-                                help_visible.set(None);
-                            } else {
-                                help_visible.set(Some("video"));
-                            }
-                        },
-                        "?"
+                if meter_mode.shows_audio() {
+                    label { class: "legend-item",
+                        input {
+                            r#type: "checkbox",
+                            checked: show_audio(),
+                            onchange: move |_| show_audio.set(!show_audio()),
+                        }
+                        span { class: "dot", style: "background: {theme_color::SIGNAL_AUDIO};" }
+                        "Audio"
+                        button {
+                            class: "legend-help-btn",
+                            onclick: move |_| {
+                                let current = help_visible();
+                                if current == Some("audio") {
+                                    help_visible.set(None);
+                                } else {
+                                    help_visible.set(Some("audio"));
+                                }
+                            },
+                            "?"
+                        }
                     }
                 }
-                if has_screen_data {
+                if meter_mode.shows_video() {
+                    label { class: "legend-item",
+                        input {
+                            r#type: "checkbox",
+                            checked: show_video(),
+                            onchange: move |_| show_video.set(!show_video()),
+                        }
+                        span { class: "dot", style: "background: {theme_color::SIGNAL_VIDEO};" }
+                        "Video"
+                        button {
+                            class: "legend-help-btn",
+                            onclick: move |_| {
+                                let current = help_visible();
+                                if current == Some("video") {
+                                    help_visible.set(None);
+                                } else {
+                                    help_visible.set(Some("video"));
+                                }
+                            },
+                            "?"
+                        }
+                    }
+                }
+                if has_screen_data && meter_mode.shows_screen() {
                     label { class: "legend-item",
                         input {
                             r#type: "checkbox",
@@ -3018,5 +3556,160 @@ mod tests {
                 "popup off-screen at anchor=({left},{top}): pos=({l},{t})"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #2: SignalMeterMode scope filter.
+    //
+    // The mode-driven helpers gate which series the popup renders. These
+    // are pure-data predicates so they're trivially unit-testable; the
+    // contract is contractual for the popup body that reads them and the
+    // call sites in `attendants.rs` that pick the mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn meter_mode_full_shows_every_series() {
+        let m = super::SignalMeterMode::Full;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_screen_only_shows_only_screen() {
+        let m = super::SignalMeterMode::ScreenOnly;
+        assert!(!m.shows_audio());
+        assert!(!m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_no_screen_hides_screen() {
+        let m = super::SignalMeterMode::NoScreen;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(!m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_id_suffix_is_stable() {
+        // The suffix is load-bearing for the popup-state map key and the
+        // DOM id, so a refactor that renames a variant would break
+        // every open popup's DOM identity. Lock it down.
+        assert_eq!(super::SignalMeterMode::Full.id_suffix(), "full");
+        assert_eq!(super::SignalMeterMode::ScreenOnly.id_suffix(), "screen");
+        assert_eq!(super::SignalMeterMode::NoScreen.id_suffix(), "peer");
+    }
+
+    #[test]
+    fn meter_mode_default_is_full() {
+        // Default is `Full` so legacy callers (e.g. the diagnostics
+        // popup) that don't supply a mode keep showing every series.
+        assert_eq!(
+            super::SignalMeterMode::default(),
+            super::SignalMeterMode::Full
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: clamp_free_position keeps a dragged popup inside the
+    // viewport. Sweep every clamp branch (no clamp, both axes clamped,
+    // tiny viewport that flips min/max math).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn clamp_free_inside_viewport_is_noop() {
+        // Popup that already fits inside the viewport with breathing room
+        // should pass through unchanged.
+        let (l, t) = super::clamp_free_position(100.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - 100.0).abs() < 0.01);
+        assert!((t - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clamp_free_left_overflow_clamps_to_margin() {
+        // Negative target left -> clamp to VIEWPORT_MARGIN_PX.
+        let (l, _) = super::clamp_free_position(-50.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    #[test]
+    fn clamp_free_right_overflow_clamps_to_max_left() {
+        // Target left that would push the popup off the right edge -> clamp
+        // to (viewport_w - popup_w - margin).
+        let viewport_w = 1920.0;
+        let popup_w = 420.0;
+        let (l, _) = super::clamp_free_position(2000.0, 100.0, popup_w, 400.0, viewport_w, 1080.0);
+        let expected = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        assert!((l - expected).abs() < 0.01, "got {l}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_top_overflow_clamps_to_margin() {
+        // Negative target top -> clamp to VIEWPORT_MARGIN_PX.
+        let (_, t) = super::clamp_free_position(100.0, -50.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((t - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {t}");
+    }
+
+    #[test]
+    fn clamp_free_bottom_overflow_clamps_to_max_top() {
+        // Target top that would push the popup off the bottom edge ->
+        // clamp to (viewport_h - popup_h - margin).
+        let viewport_h = 1080.0;
+        let popup_h = 400.0;
+        let (_, t) = super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
+        let expected = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        assert!((t - expected).abs() < 0.01, "got {t}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_handles_oversized_popup() {
+        // Popup wider than the viewport: max_left math goes negative and
+        // the `.max()` keeps the result at VIEWPORT_MARGIN_PX. The popup
+        // should sit at the left margin, not at a negative coordinate.
+        let (l, _) = super::clamp_free_position(500.0, 100.0, 1000.0, 400.0, 600.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: SignalPopupState defaults to Anchored. The popup body
+    // reads this to decide whether to render the 📌 reanchor button —
+    // legacy callers that don't bother to insert a state value get the
+    // expected anchored behaviour.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn signal_popup_state_default_is_anchored() {
+        let s = super::SignalPopupState::default();
+        assert_eq!(s.position, super::SignalPopupPosition::Anchored);
+        assert!(!s.position.is_free());
+    }
+
+    #[test]
+    fn signal_popup_position_free_is_free() {
+        let p = super::SignalPopupPosition::Free {
+            left: 100.0,
+            top: 200.0,
+        };
+        assert!(p.is_free());
+    }
+
+    #[test]
+    fn html_escape_handles_xss_chars() {
+        // Display names are user-supplied; the sharing indicator is emitted
+        // via `dangerous_inner_html`, so we MUST escape every char the
+        // HTML spec considers special. Lock down the contract here.
+        assert_eq!(super::html_escape("plain"), "plain");
+        assert_eq!(super::html_escape("a & b"), "a &amp; b");
+        assert_eq!(super::html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(super::html_escape("\"hi\""), "&quot;hi&quot;");
+        assert_eq!(super::html_escape("'name'"), "&#39;name&#39;");
+        // Round-trip safety: an attacker-controlled name combining each char.
+        let attacker = "<img src=x onerror=\"alert('xss')\">";
+        let escaped = super::html_escape(attacker);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
+        assert!(!escaped.contains('\''));
     }
 }

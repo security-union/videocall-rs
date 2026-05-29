@@ -5224,6 +5224,54 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   background-color: var(--field-bg-hover);
   color: var(--text-primary);
 }
+/* HCL bug #9: reanchor button visually mirrors the close button so the
+   header's right cluster reads as a uniform row of icon controls. The
+   button only renders when the popup is in `Free` mode (the user dragged
+   it). Clicking snaps the popup back to its tile anchor. */
+.signal-quality-popup .popup-reanchor {
+  background: none;
+  border: none;
+  color: var(--signal-popup-close-text);
+  cursor: pointer;
+  font-size: 14px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  padding: 0;
+}
+.signal-quality-popup .popup-reanchor:hover {
+  background-color: var(--field-bg-hover);
+  color: var(--text-primary);
+}
+/* HCL bug #9: header doubles as the drag handle, so the cursor signals
+   the affordance to the user. Inputs / buttons inside the header carry
+   `data-no-drag` and their default cursors win via CSS specificity. */
+.signal-quality-popup .popup-header[data-drag-handle="true"] {
+  cursor: grab;
+  user-select: none;
+}
+.signal-quality-popup[data-anchor-mode="dragging"] .popup-header[data-drag-handle="true"] {
+  cursor: grabbing;
+}
+.signal-quality-popup .popup-header [data-no-drag] {
+  cursor: pointer;
+}
+/* HCL bug #2: 'Sharing: <name>' indicator inside the header actions
+   cluster. Sits between the (optional) reanchor button and the close
+   button so the user sees both the active sharer and the controls in
+   the same horizontal row. */
+.signal-quality-popup .popup-sharing-indicator {
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
 .signal-chart-wrapper {
   display: flex;
   align-items: flex-start;

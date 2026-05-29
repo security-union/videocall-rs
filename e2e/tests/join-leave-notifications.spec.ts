@@ -211,9 +211,6 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
-
       // Wait for the toast to appear and verify the container is visible.
       await toastPromise;
       await expect(hostPage.locator(".peer-toasts")).toBeVisible();
@@ -279,9 +276,6 @@ test.describe("Entry/exit notifications preference", () => {
       // PARTICIPANT_JOINED event was processed on the host side.
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.
@@ -395,9 +389,6 @@ test.describe("Entry/exit notifications preference", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile so we know the join was
       // processed.
@@ -530,9 +521,6 @@ test.describe("Entry/exit notifications preference", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.

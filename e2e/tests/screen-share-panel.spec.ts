@@ -296,7 +296,7 @@ test.describe("Screen share right panel layout", () => {
   // to a split layout where the right panel uses a 2-column CSS grid
   // with `.split-peer-tile` elements for peer video tiles.
   // ──────────────────────────────────────────────────────────────────────
-  test("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
+  test("right panel renders 2-column grid during screen share @bvt1", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_panel_grid_${Date.now()}`;
@@ -536,7 +536,7 @@ test.describe("Screen share right panel layout", () => {
   // pre-fix code path would distribute surplus into both cells —
   // exactly the regression scenario the user reported.
   // ──────────────────────────────────────────────────────────────────────
-  test("right panel left-justifies tiles with 3:2 footprint on wide viewport (HCL #3+#4)", async ({
+  test("right panel left-justifies tiles with 3:2 footprint on wide viewport (HCL #3+#4) @bvt1", async ({
     baseURL,
   }) => {
     test.setTimeout(120_000);

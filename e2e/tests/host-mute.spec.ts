@@ -226,15 +226,30 @@ test.describe("Host mute controls", () => {
       await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
       // ---- "Mute" item gone from the tile context menu (peer is now muted) ----
+      //
       // The three-dot "Host actions" button stays visible (kick/disable-video
       // are still available) but the "Mute" menu item inside is no longer
       // rendered because on_mute becomes None when audio_enabled is false.
+      //
+      // The removal is gated on the guest's diagnostics re-broadcast carrying
+      // `audio_enabled=false` — a multi-hop async chain:
+      //
+      //   host.mute -> NATS -> guest mutes locally -> guest's next
+      //   diagnostics tick (1-5s) -> host receives -> on_mute becomes None
+      //   -> Dioxus re-render removes the "Mute" menu item.
+      //
+      // The previous 10s timeout (PR #938 stabilization) was too tight under
+      // hcl-main push-runner load (issue #985 — 9+ consecutive failures with
+      // the same `Received: 1, Timeout: 10000ms` shape). 30s gives headroom
+      // for a ~5s diagnostics tick + propagation + rAF slack. Playwright's
+      // `toHaveCount(0)` returns as soon as the condition is met, so the
+      // wider bound does not slow the common fast-runner case.
       const hostActionsBtn = hostPage.getByTitle("Host actions");
       await hostActionsBtn.hover();
       await hostActionsBtn.click();
       await expect(hostPage.locator(".tile-context-menu-item", { hasText: "Mute" })).toHaveCount(
         0,
-        { timeout: 10_000 },
+        { timeout: 30_000 },
       );
     } finally {
       await browser1.close();

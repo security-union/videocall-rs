@@ -331,12 +331,16 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
     }
   });
 
-  // ── HCL follow-up 957: anchor position locked to signal-quality button ──
+  // ── HCL follow-up 957 + PR #973: anchor position locked to signal-quality
+  // button, upper-right-corner overlay ───────────────────────────────────
   // The popup anchor moved from the floating display-name `<h4>` (PR 952)
-  // to the signal-quality button itself. On first open the popup's
-  // top-left should land slightly past the button's top-left corner, so
-  // the eye reads "the popup grew out of the button". This test pins
-  // that overlay contract.
+  // to the signal-quality button itself (PR 957), and the corner that
+  // overlays the button changed from top-left to upper-RIGHT (PR #973).
+  // Post-PR-973 spec (matches `compute_popup_position` unit tests in
+  // `dioxus-ui/src/components/signal_quality.rs`): the popup's UPPER-RIGHT
+  // corner lands at (button.left + button.width * 0.25, button.top +
+  // button.height * 0.5). The popup body extends LEFT of and BELOW that
+  // corner. This test pins that overlay contract.
   test("popup opens overlaying the signal-quality button on first open", async ({ baseURL }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
@@ -396,16 +400,36 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       expect(popupBox).not.toBeNull();
       if (!popupBox) throw new Error("popup has no bounding box");
 
-      // Overlay contract: the popup's top-left lands at or slightly past
-      // the button's top-left — the popup covers the button's top-left
-      // by a few pixels. Tolerances absorb sub-pixel rounding +
-      // VIEWPORT_MARGIN_PX clamp slack.
-      const OVERLAY_TOLERANCE_PX = 4;
-      expect(popupBox.x).toBeLessThanOrEqual(buttonBox.x + OVERLAY_TOLERANCE_PX);
-      expect(popupBox.y).toBeLessThanOrEqual(buttonBox.y + OVERLAY_TOLERANCE_PX);
-      // And the popup actually extends past the button's left edge —
-      // zero-overlap (popup flush right of the button) would fail this.
-      expect(popupBox.x + popupBox.width).toBeGreaterThanOrEqual(buttonBox.x + 8);
+      // Overlay contract (post PR #973): the popup's upper-right corner
+      // lands at (button.left + button.width * 0.25, button.top +
+      // button.height * 0.5). The popup body extends to the LEFT of and
+      // BELOW that corner — it covers the button's LEFT QUARTER
+      // horizontally, and overlaps the button's BOTTOM HALF vertically.
+      //
+      // Tolerance absorbs sub-pixel rounding + the viewport-margin clamp
+      // (VIEWPORT_MARGIN_PX = 8 in compute_popup_position).
+      const TOLERANCE_PX = 6;
+      const expectedPopupRight = buttonBox.x + buttonBox.width * 0.25;
+      const expectedPopupTop = buttonBox.y + buttonBox.height * 0.5;
+      const popupRight = popupBox.x + popupBox.width;
+
+      // Guard: if the button is so close to the viewport's left edge that
+      // the popup body would be clamped against VIEWPORT_MARGIN_PX, the
+      // right-edge assertion would false-fail. In that clamped case the
+      // popup's left edge is pinned at the viewport margin (8px) instead
+      // of being driven by the upper-right-corner anchor. The 2-peer grid
+      // layout normally keeps the tile well clear of the edge, but skip
+      // the right-edge assertion defensively when the button is within
+      // one popup-width of the viewport's left edge.
+      const nearLeftEdge = buttonBox.x < popupBox.width;
+      if (!nearLeftEdge) {
+        expect(Math.abs(popupRight - expectedPopupRight)).toBeLessThanOrEqual(TOLERANCE_PX);
+      }
+      expect(Math.abs(popupBox.y - expectedPopupTop)).toBeLessThanOrEqual(TOLERANCE_PX);
+      // The popup body extends LEFT of its right edge — popup.left is
+      // well to the left of the button. This holds whether or not the
+      // right-edge anchor was clamped.
+      expect(popupBox.x).toBeLessThan(buttonBox.x);
     } finally {
       for (const m of members) {
         if (m.page) await m.page.close().catch(() => undefined);

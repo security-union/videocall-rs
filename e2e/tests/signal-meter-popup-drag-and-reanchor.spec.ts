@@ -623,6 +623,43 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
         await expect(tile).toBeVisible({ timeout: 30_000 });
         const sigBtn = tile.locator('button[aria-label$="signal quality"]');
         await expect(sigBtn).toBeVisible({ timeout: 15_000 });
+
+        // Iter6: wait for the signal-quality button's bounding box to
+        // STABILIZE before opening the popup. On the LEFT-panel
+        // `.split-screen-tile` the button keeps widening throughout the
+        // test as the shared content reaches full resolution and the tile
+        // chrome reflows. `compute_popup_position` on the Dioxus side
+        // locks the popup's snap-back X to the button's width AT THAT
+        // INSTANT; if the button widens further between snap-time and the
+        // test's `snappedButtonBox` capture, the formula-target assertion
+        // sees a `~0.25 × ΔbuttonWidth` delta. Polling for two
+        // consecutive identical width samples (within 1px) before any
+        // popup mechanic eliminates the moving anchor and makes both the
+        // snap-time width and the snapshot-time width identical.
+        //
+        // The right-strip `.split-peer-tile` anchor is already stable, so
+        // the loop exits after the second sample (~400ms) with no impact.
+        // Budget is capped at 40 × 200ms = 8s; if the button never
+        // stabilizes within that window the loop falls through and the
+        // test proceeds (and may legitimately fail) rather than blocking.
+        let prevButtonWidth = -1;
+        let stableHits = 0;
+        const STABILITY_REQUIRED_HITS = 2;
+        for (let i = 0; i < 40; i++) {
+          const box = await sigBtn.boundingBox();
+          const current = box?.width ?? 0;
+          if (current > 0 && Math.abs(current - prevButtonWidth) < 1) {
+            stableHits += 1;
+            if (stableHits >= STABILITY_REQUIRED_HITS) {
+              break;
+            }
+          } else {
+            stableHits = 0;
+          }
+          prevButtonWidth = current;
+          await hostPage.waitForTimeout(200);
+        }
+
         await sigBtn.click();
         const popup = hostPage.locator(".signal-quality-popup").last();
         await expect(popup, `${label}: popup visible`).toBeVisible({ timeout: 10_000 });

@@ -1004,6 +1004,10 @@ pub struct PeerDecodeManager {
     /// render frame. Invalidated to `None` whenever the peer set changes
     /// (insert / remove / drain) — see `invalidate_sorted_string_keys()`.
     cached_sorted_string_keys: RefCell<Option<Rc<Vec<String>>>>,
+    /// Cancellation tokens for in-flight PEER_EVENT(screen_decode_started)
+    /// retries, keyed by publisher user_id. Set to `false` when the peer
+    /// stops screen-sharing or is removed, causing pending retries to no-op.
+    screen_decode_retry_tokens: HashMap<String, Rc<std::cell::Cell<bool>>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -1028,6 +1032,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -1046,6 +1051,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -1201,6 +1207,9 @@ impl PeerDecodeManager {
             .remove_if_and_return(|peer| peer.check_heartbeat());
         let mut removed_ids = Vec::new();
         for (_session_id, peer) in removed {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
@@ -1224,6 +1233,7 @@ impl PeerDecodeManager {
         let peer_session_id = packet.session_id;
 
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
+            let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
                 peer.video
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
@@ -1234,6 +1244,11 @@ impl PeerDecodeManager {
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
+                    let stopped_screen_share = was_screen_enabled && !peer.screen_enabled;
+                    let publisher_user_id = stopped_screen_share.then(|| peer.user_id.clone());
+                    if let Some(publisher_user_id) = publisher_user_id {
+                        self.cancel_screen_decode_retries(&publisher_user_id);
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status, keyframe_request)) => {
@@ -1293,6 +1308,12 @@ impl PeerDecodeManager {
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(peer_session_id))
+        }
+    }
+
+    fn cancel_screen_decode_retries(&mut self, publisher_user_id: &str) {
+        if let Some(token) = self.screen_decode_retry_tokens.remove(publisher_user_id) {
+            token.set(false);
         }
     }
 
@@ -1364,7 +1385,7 @@ impl PeerDecodeManager {
     /// `publisher_user_id` MUST be the publisher's user_id (the remote peer
     /// whose screen frame we just decoded). The event's `stream_id` is set
     /// to the same value because there is at most one screen-share per user.
-    fn publish_screen_decode_started(&self, publisher_user_id: &str) {
+    fn publish_screen_decode_started(&mut self, publisher_user_id: &str) {
         let Some(send_packet) = &self.send_packet else {
             debug!("Cannot publish PEER_EVENT: no send_packet callback");
             return;
@@ -1373,6 +1394,14 @@ impl PeerDecodeManager {
         let local_user_id = self.local_user_id.clone();
         let target_user_id = publisher_user_id.to_string();
         let send_packet = send_packet.clone();
+
+        let active = Rc::new(std::cell::Cell::new(true));
+        if let Some(previous) = self
+            .screen_decode_retry_tokens
+            .insert(target_user_id.clone(), Rc::clone(&active))
+        {
+            previous.set(false);
+        }
 
         log::info!(
             "Publishing PEER_EVENT(screen_decode_started) target={} (with retries)",
@@ -1384,6 +1413,13 @@ impl PeerDecodeManager {
         wasm_bindgen_futures::spawn_local(async move {
             for delay_ms in [2000, 4000] {
                 gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                if !active.get() {
+                    log::debug!(
+                        "PEER_EVENT(screen_decode_started) retry cancelled for target={}",
+                        target_user_id
+                    );
+                    return;
+                }
                 log::debug!(
                     "Retry PEER_EVENT(screen_decode_started) target={} delay={}ms",
                     target_user_id,
@@ -1466,6 +1502,9 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
@@ -1488,6 +1527,10 @@ impl PeerDecodeManager {
     /// Called when the connection drops so stale workers don't linger and
     /// consume WASM memory while the client reconnects.
     pub fn clear_all_peers(&mut self) {
+        for token in self.screen_decode_retry_tokens.values() {
+            token.set(false);
+        }
+        self.screen_decode_retry_tokens.clear();
         let removed = self.connected_peers.drain_all();
         let mut removed_ids: Vec<String> = Vec::with_capacity(removed.len());
         for (_session_id, peer) in removed {
@@ -1699,16 +1742,20 @@ mod tests {
 
     // -- helpers ----------------------------------------------------------
 
-    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
-    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+    fn packet_wrapper(media: &MediaPacket, session_id: u64) -> PacketWrapper {
         let data = media.write_to_bytes().expect("serialize MediaPacket");
-        Arc::new(PacketWrapper {
+        PacketWrapper {
             data,
             user_id: "test@test.com".into(),
             packet_type: PacketType::MEDIA.into(),
             session_id,
             ..Default::default()
-        })
+        }
+    }
+
+    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
+    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+        Arc::new(packet_wrapper(media, session_id))
     }
 
     fn heartbeat_packet(
@@ -1799,6 +1846,97 @@ mod tests {
             last_audio_frame_ms: 0,
         };
         (peer, muted_handle)
+    }
+
+    #[wasm_bindgen_test]
+    fn heartbeat_screen_off_cancels_pending_screen_decode_retries() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(42);
+        peer.screen_enabled = true;
+        peer.has_received_heartbeat = true;
+        manager.connected_peers.insert(42, peer);
+
+        let token = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("test@test.com".to_string(), token.clone());
+
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: false,
+                audio_enabled: false,
+                screen_enabled: false,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+
+        manager
+            .decode(packet_wrapper(&media, 42), "test@test.com")
+            .expect("screen-off heartbeat should decode");
+
+        assert!(
+            !token.get(),
+            "screen-off heartbeat must cancel pending screen_decode_started retries"
+        );
+        assert!(
+            !manager
+                .screen_decode_retry_tokens
+                .contains_key("test@test.com"),
+            "cancelled retry token should be removed from the manager"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn new_screen_decode_publish_cancels_previous_retry_token() {
+        let collected = Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = Callback::from(move |packet: PacketWrapper| {
+            collected_clone.borrow_mut().push(packet);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "viewer@test.com".to_string());
+
+        let previous = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("publisher@test.com".to_string(), previous.clone());
+
+        manager.publish_screen_decode_started("publisher@test.com");
+
+        assert!(
+            !previous.get(),
+            "re-publishing for the same publisher must cancel the old retry loop"
+        );
+        assert!(
+            manager
+                .screen_decode_retry_tokens
+                .get("publisher@test.com")
+                .is_some_and(|token| token.get()),
+            "new publish should install an active retry token"
+        );
+
+        let packets = collected.borrow();
+        assert_eq!(
+            packets.len(),
+            1,
+            "publish sends the first event immediately"
+        );
+        assert_eq!(
+            packets[0].packet_type.enum_value(),
+            Ok(PacketType::PEER_EVENT)
+        );
+        let peer_event =
+            PeerEvent::parse_from_bytes(&packets[0].data).expect("peer event should parse");
+        assert_eq!(
+            peer_event.event_type,
+            PEER_EVENT_SCREEN_DECODE_STARTED.to_string()
+        );
+        assert_eq!(peer_event.target_peer_id, b"publisher@test.com".to_vec());
     }
 
     // -- straggler guard tests --------------------------------------------

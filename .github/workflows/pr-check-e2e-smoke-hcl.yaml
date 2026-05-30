@@ -58,11 +58,11 @@ env:
 jobs:
   smoke:
     name: Playwright bvt1
-    runs-on: [self-hosted, linux, x64, hcl-ci]
+    runs-on: [self-hosted, linux, x64, hcl-ci-bvt]
     timeout-minutes: 30
     concurrency:
-      group: hcl-ci-e2e
-      cancel-in-progress: false
+      group: hcl-ci-bvt
+      cancel-in-progress: true
 
     steps:
       - name: Clean workspace (root-owned files from Docker)
@@ -114,7 +114,7 @@ jobs:
             return 1
           }
 
-          wait_for_service "dioxus-ui" "http://localhost:3001" 120
+          wait_for_service "dioxus-ui" "http://localhost:3001" 300
           wait_for_service "meeting-api" "http://localhost:8081/session" 60
           wait_for_service "websocket-api" "http://localhost:8080" 60
 

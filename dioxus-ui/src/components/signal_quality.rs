@@ -767,53 +767,6 @@ const POPUP_BUTTON_OVERLAY_X_FRACTION: f64 = 0.25;
 /// left, vertical midpoint).
 const POPUP_BUTTON_OVERLAY_Y_FRACTION: f64 = 0.5;
 
-/// HCL iter7: CSS-defined content-box width of `.signal-quality-popup`,
-/// matching the `width: min(420px, calc(100vw - 16px))` rule in
-/// `dioxus-ui/static/style.css`. The popup is rendered with the default
-/// `box-sizing: content-box`, so the rendered border-box width is this
-/// value PLUS the popup's symmetric padding and border.
-const POPUP_CSS_CONTENT_WIDTH_PX: f64 = 420.0;
-/// HCL iter7: popup's `calc(100vw - 16px)` upper bound — `16px` is the
-/// shrink margin applied when the viewport is narrower than the natural
-/// content width.
-const POPUP_VIEWPORT_SHRINK_MARGIN_PX: f64 = 16.0;
-/// HCL iter7: total horizontal padding the popup adds around its content
-/// (`.signal-quality-popup { padding: 16px; }` → `2 * 16`).
-const POPUP_HORIZONTAL_PADDING_PX: f64 = 32.0;
-/// HCL iter7: total horizontal border the popup adds around its content
-/// (`.signal-quality-popup { border: 1px solid ...; }` → `2 * 1`).
-const POPUP_HORIZONTAL_BORDER_PX: f64 = 2.0;
-
-/// HCL iter7: CSS-known border-box width of `.signal-quality-popup`.
-///
-/// `compute_popup_position` and the test assertions both compare the
-/// popup's border-box right edge against the anchor's formula target
-/// — `getBoundingClientRect()` returns border-box dimensions, so the
-/// `popup_w` term passed to `compute_popup_position` must be the
-/// border-box width too if we want `popup.right == anchor.left +
-/// anchor.width * X_FRAC` to hold.
-///
-/// Live-measuring the popup via `get_bounding_client_rect()` is a
-/// proxy for this CSS-known value. That measurement races with the
-/// empty→populated rsx-branch transition on the LEFT-panel `ScreenOnly`
-/// popup: snap-back's measurement can briefly capture an intermediate
-/// width (HCL e2e iter7's deterministic 36.17px X delta), then the
-/// popup re-renders to its full size and the test sees the math being
-/// off by exactly the empty/populated width gap. The CSS rule fixes the
-/// width at `min(420px, vw - 16px)` regardless of body state, so we
-/// short-circuit the measurement and use the CSS-defined value directly
-/// — the math then agrees with the steady-state DOM in every render
-/// state.
-///
-/// Returns the border-box width clamped to non-negative values so callers
-/// can pass it straight to `compute_popup_position` (which expects
-/// non-negative `popup_w`).
-fn css_popup_border_box_width(viewport_w: f64) -> f64 {
-    let content_w = POPUP_CSS_CONTENT_WIDTH_PX.min(viewport_w - POPUP_VIEWPORT_SHRINK_MARGIN_PX);
-    let content_w = content_w.max(0.0);
-    content_w + POPUP_HORIZONTAL_PADDING_PX + POPUP_HORIZONTAL_BORDER_PX
-}
-
 /// Axis-aligned bounding box in viewport (CSS pixel) coordinates.  Mirrors
 /// the fields of `DOMRect` we care about so the position-math helpers can
 /// be unit-tested without a browser.
@@ -944,16 +897,6 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
     };
 
     let anchor_rect = element_rect(&anchor);
-    // HCL iter7: use the CSS-known border-box width instead of a live
-    // `getBoundingClientRect()` read. `.signal-quality-popup` is set to
-    // `width: min(420px, calc(100vw - 16px))` so the natural border-box
-    // width is constant for a given viewport — measuring it live races
-    // with the empty→populated rsx-body swap (see
-    // `css_popup_border_box_width` for the full rationale). Height is
-    // still measured live because the popup's height is content-driven
-    // (the chart + legend grow when more samples arrive); height drift
-    // only affects vertical viewport-edge clamping, not the X anchor
-    // math at the heart of the snap-back assertion.
     let popup_rect = element_rect(&popup);
     let viewport_w = win
         .inner_width()
@@ -968,7 +911,7 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
 
     let (left, top) = compute_popup_position(
         anchor_rect,
-        css_popup_border_box_width(viewport_w),
+        popup_rect.width(),
         popup_rect.height(),
         viewport_w,
         viewport_h,
@@ -1062,20 +1005,10 @@ fn snap_popup_back_to_anchor(popup_id: &str) {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     let anchor_rect = element_rect(&anchor_el);
-    // HCL iter7: use the CSS-known border-box width here too — this is
-    // the snap-back path that the LEFT-panel `ScreenOnly` snap test
-    // exercises. The live `popup_rect.width()` measurement that used
-    // to feed this call could race with the empty→populated rsx-body
-    // transition, producing a deterministic ~36px X delta between the
-    // computed `target_left` (based on a transient narrow measurement)
-    // and the post-snap popup that the test reads (settled at the wider
-    // populated width). Pinning `popup_w` to the CSS-defined constant
-    // sidesteps the race entirely. Height stays live because vertical
-    // anchoring is content-driven and not asserted by the snap test.
     let popup_rect = element_rect(&popup);
     let (left, top) = compute_popup_position(
         anchor_rect,
-        css_popup_border_box_width(viewport_w),
+        popup_rect.width(),
         popup_rect.height(),
         viewport_w,
         viewport_h,
@@ -4001,61 +3934,5 @@ mod tests {
             top: 200.0,
         };
         assert!(p.is_free());
-    }
-
-    // -----------------------------------------------------------------
-    // HCL iter7: `css_popup_border_box_width` mirrors the popup's
-    // `.signal-quality-popup` CSS rules. The math callers in
-    // `reposition_popup` and `snap_popup_back_to_anchor` pass its return
-    // value as `popup_w` to `compute_popup_position`. These tests pin
-    // the CSS-equivalent so any future style.css refactor that changes
-    // the popup's natural width, padding, or border without updating
-    // these constants gets caught at unit-test time rather than as a
-    // flaky e2e snap-back delta.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn css_popup_border_box_width_at_typical_viewport() {
-        // Standard Playwright Desktop Chrome viewport is 1280x720. The
-        // popup's natural content width is 420px; padding adds 32px and
-        // border adds 2px, so the border-box width is 454px.
-        let w = super::css_popup_border_box_width(1280.0);
-        assert!((w - 454.0).abs() < 0.01, "got {w}, expected 454.0");
-    }
-
-    #[test]
-    fn css_popup_border_box_width_shrinks_below_min_viewport() {
-        // Viewport narrower than `420 + 16 = 436px` hits the `100vw - 16`
-        // arm of the `min()` and shrinks the popup. At vw=300, content =
-        // 300 - 16 = 284; border-box = 284 + 32 + 2 = 318.
-        let w = super::css_popup_border_box_width(300.0);
-        assert!((w - 318.0).abs() < 0.01, "got {w}, expected 318.0");
-    }
-
-    #[test]
-    fn css_popup_border_box_width_clamps_negative_content_to_zero() {
-        // Pathologically narrow viewport (< 16px) would produce a
-        // negative content width via `vw - 16`. The helper clamps the
-        // content width to zero before adding padding + border so the
-        // result is at least `padding + border = 34` and never negative.
-        let w = super::css_popup_border_box_width(8.0);
-        assert!((w - 34.0).abs() < 0.01, "got {w}, expected 34.0");
-        let w_zero = super::css_popup_border_box_width(0.0);
-        assert!((w_zero - 34.0).abs() < 0.01, "got {w_zero}, expected 34.0");
-    }
-
-    #[test]
-    fn css_popup_border_box_width_uses_min_arm_above_threshold() {
-        // At viewport exactly 436px, both arms of the `min()` evaluate
-        // to 420 (since `436 - 16 = 420`). Above 436px we stay locked
-        // at 420 content -> 454 border-box regardless of how wide the
-        // viewport gets, matching `.signal-quality-popup { width: min(
-        // 420px, calc(100vw - 16px)); }`.
-        let w_436 = super::css_popup_border_box_width(436.0);
-        assert!((w_436 - 454.0).abs() < 0.01, "got {w_436}");
-        let w_2000 = super::css_popup_border_box_width(2000.0);
-        assert!((w_2000 - 454.0).abs() < 0.01, "got {w_2000}");
-        let w_4000 = super::css_popup_border_box_width(4000.0);
-        assert!((w_4000 - 454.0).abs() < 0.01, "got {w_4000}");
     }
 }

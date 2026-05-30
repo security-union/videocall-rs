@@ -1798,4 +1798,89 @@ mod tests {
             "screen encoder should read the externally owned re-election signal"
         );
     }
+
+    /// Issue #982 (follow-up to PR #973 iter2): tier 0 is "unconstrained" and
+    /// ALL three Cause-line fields — target bitrate, tier label, cause hint —
+    /// MUST read their proto3 defaults (`0` / empty) so the receiver omits
+    /// the Cause line entirely.
+    ///
+    /// This contract is documented in three places that must stay in sync:
+    ///   * `ScreenEncoder::apply_initial_tier` (the cold-start branch this
+    ///     test exercises),
+    ///   * the per-tick / tier-change branches in `set_encoder_control`,
+    ///   * `SignalSample::screen_encoder_target_bitrate_kbps`'s doc-comment
+    ///     and `build_screen_cause_line` in the dioxus UI (the consumer).
+    ///
+    /// The regression caught by HCL e2e iter2 of PR #973 was that the
+    /// receiver saw `Cause: 2500kbps` at tier 0 — the publisher had leaked
+    /// the high tier's `ideal_bitrate_kbps` into the shared atomic. The
+    /// renderer keys off ANY non-default Cause field, so a partial line
+    /// (just bitrate, with no tier label or hint) is enough to violate the
+    /// omit-on-unconstrained contract. This unit test pins the publisher
+    /// side directly so a future revert of the tier-0 guards is caught at
+    /// `cargo test`, not at e2e time.
+    #[test]
+    fn tier_zero_zeroes_all_three_cause_line_fields() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+        );
+
+        encoder.apply_initial_tier(0);
+
+        assert_eq!(
+            encoder
+                .shared_screen_encoder_target_bitrate_kbps
+                .load(Ordering::Relaxed),
+            0,
+            "tier 0 must zero shared target bitrate so the receiver omits the Cause line"
+        );
+        assert!(
+            encoder.shared_screen_adaptive_tier.borrow().is_empty(),
+            "tier 0 must clear adaptive-tier label so the receiver omits the Cause line"
+        );
+        assert!(
+            encoder.shared_screen_cause_hint.borrow().is_empty(),
+            "tier 0 must clear cause hint so the receiver omits the Cause line"
+        );
+    }
+
+    /// Pairs with `tier_zero_zeroes_all_three_cause_line_fields`: at any
+    /// constrained tier the three Cause-line fields must carry non-default
+    /// values, otherwise the receiver would also (incorrectly) omit the
+    /// Cause line. This guards against an over-eager future refactor that
+    /// zeroes the fields at every tier instead of only tier 0.
+    #[test]
+    fn tier_one_emits_non_default_cause_line_fields() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+        );
+
+        encoder.apply_initial_tier(1);
+
+        assert!(
+            encoder
+                .shared_screen_encoder_target_bitrate_kbps
+                .load(Ordering::Relaxed)
+                > 0,
+            "constrained tier must seed shared target bitrate"
+        );
+        assert!(
+            !encoder.shared_screen_adaptive_tier.borrow().is_empty(),
+            "constrained tier must seed adaptive-tier label"
+        );
+        assert!(
+            !encoder.shared_screen_cause_hint.borrow().is_empty(),
+            "constrained tier must seed cause hint"
+        );
+    }
 }

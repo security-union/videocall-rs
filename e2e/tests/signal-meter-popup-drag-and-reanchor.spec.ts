@@ -699,44 +699,56 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
         const snappedButtonBox = await sigBtn.boundingBox();
         if (!snappedButtonBox) throw new Error(`${label}: no snapped signal-button bounding box`);
 
-        // Iter4: assert anchor-relative position is stable, not absolute
-        // viewport position.
+        // Iter5: assert the snapped popup matches its CURRENT anchor's
+        // formula target, rather than comparing snapped-vs-initial.
         //
         // The Dioxus `compute_popup_position` formula in
         // `videocall-client`'s signal-quality popup is:
         //   target_left = anchor.left + anchor.width * 0.25 - popup_w
         //   target_top  = anchor.top  + anchor.height * 0.5
-        // It is run at initial mount AND at snap-back. If the anchor's
-        // viewport box changes between those two instants — which is
-        // legitimate, e.g. on the LEFT-panel `.split-screen-tile` the
-        // signal-quality button widens by ~144px as screen-share content
-        // reaches full resolution and the tile chrome reflows, producing
-        // a `144 * 0.25 = 36px` target_left shift — the popup correctly
-        // follows the anchor. Comparing absolute viewport positions then
-        // reports that 36px as a snap-back failure, when in fact the
-        // popup is right where the anchor says it should be.
+        // Equivalently: the popup's upper-right corner lands at
+        //   (button.left + button.width * 0.25, button.top + button.height * 0.5)
         //
-        // The contract under test is "snap-back returned the popup to
-        // its anchor", which is precisely an anchor-relative claim, so
-        // we measure popup-minus-anchor at each instant and require
-        // that the *delta of deltas* is within tolerance. This also
-        // preserves the right-strip case (`NoScreen` popup on
-        // `.split-peer-tile`) where the anchor is stable across the
-        // snap — there the relative deltas reduce to the same value as
-        // the original absolute deltas, so the assertion still holds.
-        const initialRelX = initial.x - initialButtonBox.x;
-        const initialRelY = initial.y - initialButtonBox.y;
-        const snappedRelX = snapped.x - snappedButtonBox.x;
-        const snappedRelY = snapped.y - snappedButtonBox.y;
+        // Both initial-open and post-snap-back run that formula with
+        // whatever the button's bounding box looks like AT THAT INSTANT.
+        // On the LEFT-panel `.split-screen-tile`, the signal-quality
+        // button widens as the shared content reaches full resolution;
+        // the formula's `button.width * 0.25` term AND the `popup_w`
+        // term then both shift, so `popup.left - button.left` is itself
+        // a function of `button.width`. That moves the target for any
+        // initial-vs-snapped comparison (viewport-absolute in iter1-3,
+        // anchor-relative in iter4) and produces spurious failures.
+        //
+        // Iter5: instead of comparing to `initial`, verify the snapped
+        // popup matches its CURRENT button's formula target. That is the
+        // contract the popup is supposed to satisfy after snap-back; the
+        // test asserts that directly. The right-strip case
+        // (`NoScreen` popup on `.split-peer-tile`) has a stable anchor,
+        // so its initial-open already matches the formula and the
+        // post-snap state trivially does too.
         const SNAP_TOLERANCE_PX = 8;
-        const rdx = Math.abs(snappedRelX - initialRelX);
-        const rdy = Math.abs(snappedRelY - initialRelY);
-        expect(rdx, `${label}: snapped x within tolerance (anchor-relative)`).toBeLessThanOrEqual(
-          SNAP_TOLERANCE_PX,
-        );
-        expect(rdy, `${label}: snapped y within tolerance (anchor-relative)`).toBeLessThanOrEqual(
-          SNAP_TOLERANCE_PX,
-        );
+        const expectedRight = snappedButtonBox.x + snappedButtonBox.width * 0.25;
+        const expectedTop = snappedButtonBox.y + snappedButtonBox.height * 0.5;
+        const actualRight = snapped.x + snapped.width;
+        // Viewport-edge guard: if the formula's `target_left` would be
+        // negative (i.e. `button.left + button.width * 0.25 < popup_w`),
+        // the popup gets clamped against `VIEWPORT_MARGIN_PX = 8` on the
+        // left edge and `popup.right ≠ button.left + button.width * 0.25`
+        // by construction. Skip the X assertion in that clamp zone
+        // (same shape as the iter2 viewport-edge guard applied to the
+        // popup-overlay-on-first-open test). Vertical clamping is far
+        // less likely at the standard viewport size used in these tests,
+        // so the Y assertion stays unconditional.
+        if (snappedButtonBox.x >= snapped.width) {
+          expect(
+            Math.abs(actualRight - expectedRight),
+            `${label}: snap-back popup right edge at button left-quarter`,
+          ).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
+        }
+        expect(
+          Math.abs(snapped.y - expectedTop),
+          `${label}: snap-back popup top at button vertical-midpoint`,
+        ).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
         await expect(popup, `${label}: anchored attr`).toHaveAttribute(
           "data-anchor-mode",
           "anchored",

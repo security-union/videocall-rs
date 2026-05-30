@@ -626,7 +626,31 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
         await sigBtn.click();
         const popup = hostPage.locator(".signal-quality-popup").last();
         await expect(popup, `${label}: popup visible`).toBeVisible({ timeout: 10_000 });
-        await hostPage.waitForTimeout(300);
+
+        // Iter3 stabilization: the popup opens in an empty-history rsx
+        // branch ("No data yet") that has a narrower intrinsic width than
+        // the populated chart branch. The popup's first rAF reposition
+        // anchors against the empty-body width; once samples arrive the
+        // body swaps to the populated SVG chart and the intrinsic width
+        // grows by ~36px. Snapshotting `initial` mid-transition produces a
+        // position that disagrees with the snap-back position by that
+        // width delta, which makes the snap-back assertion flaky.
+        //
+        // Wait for the populated body to mount before capturing `initial`.
+        // The populated branch always renders the latency polyline
+        // (`show_latency` defaults to true in `signal_quality.rs`), so
+        // "at least one `svg polyline` exists" is a deterministic signal
+        // that the body has switched out of the empty branch — true for
+        // both the LEFT-panel `ScreenOnly` popup and the right-strip
+        // `NoScreen` popup.
+        await expect
+          .poll(async () => await popup.locator("svg polyline").count(), {
+            timeout: 15_000,
+            intervals: [200],
+          })
+          .toBeGreaterThanOrEqual(1);
+        // One more layout tick so the post-mount reposition has settled.
+        await hostPage.waitForTimeout(150);
 
         const initial = await popup.boundingBox();
         if (!initial) throw new Error(`${label}: no initial bounding box`);

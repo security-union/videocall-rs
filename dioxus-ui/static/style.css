@@ -5273,7 +5273,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   align-items: center;
   justify-content: center;
   width: 14px;
-  height: 14px;
+  height: 22px;
   margin-right: 6px;
   color: var(--text-tertiary);
   flex-shrink: 0;

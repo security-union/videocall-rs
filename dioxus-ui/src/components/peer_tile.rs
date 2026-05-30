@@ -54,13 +54,21 @@ pub fn PeerTile(
     #[props(default = false)] is_current_user_host: bool,
     /// HCL bug #2: scope of the signal-meter popup this tile owns. The
     /// LEFT-panel shared-content tile passes `ScreenOnly` (the popup
-    /// surfaces ONLY the screen-share metric). Peer tiles pass
-    /// `NoScreen` (the popup hides the screen-share metric so the
-    /// dedicated shared-content tile's popup remains the single source
-    /// for screen-share signal). Legacy callers leave this defaulted to
-    /// `NoScreen` — full-bleed solo tiles never have screen data, so
-    /// hiding it is a no-op for them.
-    #[props(default = SignalMeterMode::NoScreen)]
+    /// surfaces ONLY the screen-share metric). Every other tile leaves
+    /// this defaulted to `Full`, which renders whichever series the
+    /// sample history actually contains — the legend / tooltip are
+    /// already gated on `has_screen_data` (any sample with
+    /// `screen_enabled == true`) and per-sample `screen_enabled`, so a
+    /// peer who is NOT screen-sharing naturally hides the Screen row
+    /// without any mode-level suppression. Keeping the default at
+    /// `Full` ensures the peer-tile popup surfaces screen-share metrics
+    /// the moment the peer starts sharing, which is the contract the
+    /// `peer-screen-diagnostics` E2E spec asserts (a host opens the
+    /// guest's peer-tile signal popup and expects the Screen series to
+    /// appear once samples arrive). The dedicated LEFT-panel
+    /// `ScreenOnly` popup still coexists independently because the
+    /// popup-state map keys on `(peer_id, meter_mode)`.
+    #[props(default = SignalMeterMode::Full)]
     meter_mode: SignalMeterMode,
     on_toggle_pin: EventHandler<String>,
 ) -> Element {

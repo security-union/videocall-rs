@@ -42,9 +42,20 @@ pub enum SignalMeterMode {
     /// the split layout — clicking its signal-meter icon must surface only the
     /// screen-share metric, not camera or audio.
     ScreenOnly,
-    /// Show audio + video, hide the screen-share series. Used by every peer
-    /// tile so the screen-share metric doesn't double-render (it has its own
-    /// popup on the shared-content tile).
+    /// Show audio + video, hide the screen-share series. Originally used
+    /// by peer tiles to suppress double-rendering of the screen-share
+    /// metric (the LEFT-panel `ScreenOnly` popup was the dedicated
+    /// source). The peer-tile default has since been moved back to
+    /// `Full` so the peer-tile popup surfaces screen-share metrics when
+    /// the peer starts sharing — `has_screen_data` already gates the
+    /// Screen legend / tooltip line on samples actually carrying
+    /// `screen_enabled == true`, so the suppression is a no-op for
+    /// non-sharing peers and was hiding live data for sharing peers
+    /// (caught by `peer-screen-diagnostics` / `peer-screen-static-fps`
+    /// E2Es). The variant is retained so external callers / future
+    /// surface areas (e.g. a settings preference) can opt back in
+    /// without breaking the popup-state-map key shape.
+    #[allow(dead_code)]
     NoScreen,
 }
 
@@ -742,13 +753,19 @@ pub struct SignalQualityPopupProps {
 /// clamped inside `[VIEWPORT_MARGIN_PX .. viewport - VIEWPORT_MARGIN_PX]`
 /// on both axes so it never sits flush against a screen edge.
 const VIEWPORT_MARGIN_PX: f64 = 8.0;
-/// HCL follow-up 957 (@token-exempt): horizontal overlap applied to the
-/// signal-quality button's top-left corner so the popup's top-left lands
-/// `POPUP_ANCHOR_OVERLAP_PX` to the left of (and above) the button's
-/// top-left. A small overlap reads as "the popup grew out of the button"
-/// on first open. Picked at 12px so the eye reads "slightly overlaying"
-/// without the popup covering more than a few px of the button.
-const POPUP_ANCHOR_OVERLAP_PX: f64 = 12.0;
+/// HCL follow-up (@token-exempt): fraction of the signal-quality button's
+/// width at which the popup's RIGHT edge lands. `0.25` means the popup's
+/// right edge sits 25% across the button from its left, so the popup
+/// horizontally overlays only the LEFT QUARTER of the button — the body
+/// of the popup extends to the LEFT of the button.
+const POPUP_BUTTON_OVERLAY_X_FRACTION: f64 = 0.25;
+/// HCL follow-up (@token-exempt): fraction of the signal-quality button's
+/// height at which the popup's TOP edge lands. `0.5` puts the popup's
+/// top edge at the button's vertical midpoint, so the popup hangs BELOW
+/// the upper half of the button. Combined with the X fraction above, the
+/// popup's upper-right corner touches the button at (25% from button
+/// left, vertical midpoint).
+const POPUP_BUTTON_OVERLAY_Y_FRACTION: f64 = 0.5;
 
 /// Axis-aligned bounding box in viewport (CSS pixel) coordinates.  Mirrors
 /// the fields of `DOMRect` we care about so the position-math helpers can
@@ -774,17 +791,24 @@ impl Rect {
 /// popup given the source anchor (the tile's signal-quality button) rect,
 /// the popup's own size, and the viewport size.
 ///
-/// HCL follow-up 957 (@token-exempt): the anchor is the signal-quality
-/// button itself, NOT the display-name `<h4>` (the PR 952 anchor). The
-/// popup's top-left lands `POPUP_ANCHOR_OVERLAP_PX` to the left of and
-/// above the button's top-left, so the popup partially overlays the
-/// button on first open — the eye reads "the popup grew out of the
-/// button".
+/// HCL follow-up (@token-exempt): the popup's UPPER-RIGHT corner lands at
+/// `(button.left + button.width * POPUP_BUTTON_OVERLAY_X_FRACTION,
+///   button.top  + button.height * POPUP_BUTTON_OVERLAY_Y_FRACTION)`.
+/// With the defaults (`0.25`, `0.5`) that means the popup's right edge
+/// sits 25% across the button from its left, and the popup's top edge
+/// sits at the button's vertical midpoint. The popup body therefore
+/// hangs mostly to the LEFT of, and BELOW the upper half of, the button
+/// — overlaying only the button's upper-left quadrant slightly.
 ///
 /// Anchoring rules (in order of preference):
-///   1. Place the popup's top-left at `(btn.left - OVERLAP, btn.top - OVERLAP)`.
+///   1. Place the popup's upper-right corner at the (X, Y) point above —
+///      i.e. `target_left = btn.left + btn.width * X_FRAC - popup_w`
+///      and  `target_top  = btn.top  + btn.height * Y_FRAC`.
 ///   2. Clamp the result into `[VIEWPORT_MARGIN_PX, viewport - popup - margin]`
 ///      on both axes so the popup never extends past a screen edge.
+///      Buttons near the viewport left can otherwise push `target_left`
+///      negative; buttons near the bottom can otherwise push the popup
+///      off the bottom edge.
 ///
 /// The function operates on pure data, so unit tests can drive every
 /// edge-case path without a browser.
@@ -795,20 +819,24 @@ pub(crate) fn compute_popup_position(
     viewport_w: f64,
     viewport_h: f64,
 ) -> (f64, f64) {
-    // Horizontal: the popup's left lands `OVERLAP` pixels to the left of
-    // the button's left, so the popup covers ~`OVERLAP`px of the button's
-    // top-left corner. Clamp into the viewport so a button near the
-    // right edge can't push the popup off-screen.
+    // Horizontal: the popup's RIGHT edge lands at
+    // `btn.left + btn.width * X_FRAC`, so `target_left = right - popup_w`.
+    // Clamp into the viewport so a button near the left edge can't push
+    // the popup off-screen on the left, and a narrow viewport can't let
+    // it spill off on the right.
     let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
     let min_left = VIEWPORT_MARGIN_PX;
-    let target_left = anchor.left - POPUP_ANCHOR_OVERLAP_PX;
+    let target_right = anchor.left + anchor.width() * POPUP_BUTTON_OVERLAY_X_FRACTION;
+    let target_left = target_right - popup_w;
     let left = target_left.clamp(min_left, max_left.max(min_left));
 
-    // Vertical: same `OVERLAP` shift upward. Clamp into the viewport so
-    // a button near the bottom edge can't push the popup off-screen.
+    // Vertical: the popup's TOP edge lands at the button's vertical
+    // midpoint (`btn.top + btn.height * Y_FRAC`). Clamp into the viewport
+    // so a button near the bottom edge can't push the popup off-screen,
+    // and a button scrolled above the viewport can't yield a negative top.
     let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
     let min_top = VIEWPORT_MARGIN_PX;
-    let target_top = anchor.top - POPUP_ANCHOR_OVERLAP_PX;
+    let target_top = anchor.top + anchor.height() * POPUP_BUTTON_OVERLAY_Y_FRACTION;
     let top = target_top.clamp(min_top, max_top.max(min_top));
 
     (left, top)
@@ -2008,15 +2036,19 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         svg {
                             xmlns: "http://www.w3.org/2000/svg",
                             width: "12",
-                            height: "12",
-                            view_box: "0 0 12 12",
+                            height: "22",
+                            view_box: "0 0 12 22",
                             fill: "currentColor",
                             circle { cx: "3", cy: "3", r: "1.2" }
-                            circle { cx: "3", cy: "6", r: "1.2" }
-                            circle { cx: "3", cy: "9", r: "1.2" }
+                            circle { cx: "3", cy: "7", r: "1.2" }
+                            circle { cx: "3", cy: "11", r: "1.2" }
+                            circle { cx: "3", cy: "15", r: "1.2" }
+                            circle { cx: "3", cy: "19", r: "1.2" }
                             circle { cx: "8", cy: "3", r: "1.2" }
-                            circle { cx: "8", cy: "6", r: "1.2" }
-                            circle { cx: "8", cy: "9", r: "1.2" }
+                            circle { cx: "8", cy: "7", r: "1.2" }
+                            circle { cx: "8", cy: "11", r: "1.2" }
+                            circle { cx: "8", cy: "15", r: "1.2" }
+                            circle { cx: "8", cy: "19", r: "1.2" }
                         }
                     }
                     span { class: "popup-title", "{popup_title}" }
@@ -2184,15 +2216,19 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                     svg {
                         xmlns: "http://www.w3.org/2000/svg",
                         width: "12",
-                        height: "12",
-                        view_box: "0 0 12 12",
+                        height: "22",
+                        view_box: "0 0 12 22",
                         fill: "currentColor",
                         circle { cx: "3", cy: "3", r: "1.2" }
-                        circle { cx: "3", cy: "6", r: "1.2" }
-                        circle { cx: "3", cy: "9", r: "1.2" }
+                        circle { cx: "3", cy: "7", r: "1.2" }
+                        circle { cx: "3", cy: "11", r: "1.2" }
+                        circle { cx: "3", cy: "15", r: "1.2" }
+                        circle { cx: "3", cy: "19", r: "1.2" }
                         circle { cx: "8", cy: "3", r: "1.2" }
-                        circle { cx: "8", cy: "6", r: "1.2" }
-                        circle { cx: "8", cy: "9", r: "1.2" }
+                        circle { cx: "8", cy: "7", r: "1.2" }
+                        circle { cx: "8", cy: "11", r: "1.2" }
+                        circle { cx: "8", cy: "15", r: "1.2" }
+                        circle { cx: "8", cy: "19", r: "1.2" }
                     }
                 }
                 span { class: "popup-title", "{popup_title}" }
@@ -3588,8 +3624,10 @@ mod tests {
     // `compute_popup_position` is the pure-data heart of the portal anchor;
     // every browser-side branch (initial render, resize, scroll,
     // ResizeObserver fire) ultimately funnels into this function.  Cover
-    // each branch — right-of-tile fit, flip-left, dense-grid clamp,
-    // vertical clamp — so a future refactor cannot silently strand the
+    // each branch — basic placement (popup upper-right corner at the
+    // button's (25% across, vertical midpoint) point), left-edge clamp,
+    // right-edge clamp, top-edge clamp, bottom-edge clamp, and the
+    // dense-grid sweep — so a future refactor cannot silently strand the
     // popup off-screen.
 
     /// Build a `Rect` from `(left, top, w, h)`.
@@ -3603,36 +3641,53 @@ mod tests {
     }
 
     #[test]
-    fn popup_overlays_button_when_space_available() {
-        // 1920x1080 viewport, 32x32 anchor (signal-quality button) at
-        // (300,200), 420x300 popup. Plenty of room — the popup's
-        // top-left should be at `(btn.left - OVERLAP, btn.top - OVERLAP)`
-        // so it overlays the button's top-left corner by `OVERLAP` px.
-        let anchor = rect_from(300.0, 200.0, 32.0, 32.0);
-        let (left, top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
-        let expected_left = 300.0 - super::POPUP_ANCHOR_OVERLAP_PX;
-        let expected_top = 200.0 - super::POPUP_ANCHOR_OVERLAP_PX;
+    fn popup_overlays_button_upper_left_quadrant_when_space_available() {
+        // 1920x1080 viewport, 40x20 anchor (signal-quality button) at
+        // (300,200), 200x100 popup. Plenty of room — the popup's
+        // upper-right corner should land at
+        //   (btn.left + btn.width  * X_FRAC, btn.top + btn.height * Y_FRAC)
+        // = (300 + 40*0.25, 200 + 20*0.5) = (310, 210).
+        // So popup_left = 310 - 200 = 110, popup_top = 210.
+        let anchor = rect_from(300.0, 200.0, 40.0, 20.0);
+        let popup_w = 200.0;
+        let popup_h = 100.0;
+        let (left, top) = super::compute_popup_position(anchor, popup_w, popup_h, 1920.0, 1080.0);
+        let expected_right = 300.0 + 40.0 * super::POPUP_BUTTON_OVERLAY_X_FRACTION;
+        let expected_left = expected_right - popup_w;
+        let expected_top = 200.0 + 20.0 * super::POPUP_BUTTON_OVERLAY_Y_FRACTION;
         assert!(
             (left - expected_left).abs() < 0.01,
-            "expected left == btn.left-overlap ({expected_left}), got {left}"
+            "expected left == {expected_left}, got {left}"
         );
         assert!(
             (top - expected_top).abs() < 0.01,
-            "expected top == btn.top-overlap ({expected_top}), got {top}"
+            "expected top == {expected_top}, got {top}"
         );
-        // Sanity: the popup actually does overlap the button by a few
-        // pixels (the qualitative "grew out of the button" cue).
-        let popup_right = left + 420.0;
+        // Sanity: the popup's body sits mostly to the LEFT of the button
+        // (its right edge is at 25% across the button, so its bulk is
+        // to the left).
+        let popup_right = left + popup_w;
         assert!(
-            popup_right > anchor.left + 4.0,
-            "popup should extend past the button's left edge, got popup_right={popup_right}"
+            (popup_right - expected_right).abs() < 0.01,
+            "popup right edge should sit at {expected_right} (25% across button), got {popup_right}"
+        );
+        assert!(
+            popup_right < anchor.right,
+            "popup right edge should sit inside the button, not past its right edge"
+        );
+        // And the popup's top edge sits at the button's vertical midpoint.
+        let btn_vmid = anchor.top + anchor.height() * 0.5;
+        assert!(
+            (top - btn_vmid).abs() < 0.01,
+            "popup top should sit at button vertical midpoint ({btn_vmid}), got {top}"
         );
     }
 
     #[test]
     fn popup_clamps_left_when_button_near_left_edge() {
-        // Anchor near the left edge: `btn.left - OVERLAP` goes negative,
-        // so the clamp pulls the popup back to `VIEWPORT_MARGIN_PX`.
+        // Anchor near the left edge: `target_left = btn.left + btn.width*X_FRAC
+        // - popup_w` goes deeply negative, so the clamp pulls the popup
+        // back to `VIEWPORT_MARGIN_PX`.
         let anchor = rect_from(4.0, 200.0, 32.0, 32.0);
         let (left, _top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
         assert!(
@@ -3644,14 +3699,22 @@ mod tests {
 
     #[test]
     fn popup_clamps_when_button_near_right_edge() {
-        // Narrow viewport so the popup overflows the right margin no
-        // matter how we shift it. The clamp should pull it back to
+        // Narrow viewport with the button hugging the right edge. The
+        // unclamped target_left would push the popup's right edge past
+        // the viewport margin, so the clamp should pull it back to
         // `viewport_w - popup_w - margin`.
-        let anchor = rect_from(450.0, 50.0, 32.0, 32.0);
+        let anchor = rect_from(495.0, 50.0, 40.0, 32.0);
         let viewport_w = 500.0;
         let popup_w = 420.0;
         let (left, _top) = super::compute_popup_position(anchor, popup_w, 200.0, viewport_w, 800.0);
         let expected_max_left = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        // Sanity: the unclamped target really did overflow the right margin.
+        let target_right = anchor.left + anchor.width() * super::POPUP_BUTTON_OVERLAY_X_FRACTION;
+        let target_left_unclamped = target_right - popup_w;
+        assert!(
+            target_left_unclamped > expected_max_left,
+            "test sanity: unclamped target_left ({target_left_unclamped}) should exceed max_left ({expected_max_left})"
+        );
         assert!(
             (left - expected_max_left).abs() < 0.01,
             "expected clamp to right margin {expected_max_left}, got {left}"
@@ -3662,8 +3725,8 @@ mod tests {
 
     #[test]
     fn popup_clamps_vertically_when_button_is_near_bottom() {
-        // Anchor at the bottom of the viewport — the upward overlap
-        // shift still pushes the popup off-screen, so the clamp pulls
+        // Anchor at the bottom of the viewport — the downward Y_FRAC
+        // shift would push the popup off-screen, so the clamp pulls
         // it back to `viewport_h - popup_h - margin`.
         let anchor = rect_from(100.0, 950.0, 32.0, 32.0);
         let popup_h = 500.0;
@@ -3680,9 +3743,10 @@ mod tests {
 
     #[test]
     fn popup_clamps_vertically_when_button_is_above_viewport() {
-        // Negative `btn.top` (scrolled above viewport). Popup must still
-        // sit inside the visible region with at least VIEWPORT_MARGIN_PX
-        // breathing room from the top edge.
+        // Negative `btn.top` (scrolled above viewport) deep enough that
+        // even after the downward Y_FRAC shift the target is still
+        // negative. Popup must still sit inside the visible region with
+        // at least VIEWPORT_MARGIN_PX breathing room from the top edge.
         let anchor = rect_from(100.0, -200.0, 32.0, 32.0);
         let (_left, top) = super::compute_popup_position(anchor, 420.0, 400.0, 1920.0, 1080.0);
         assert!(

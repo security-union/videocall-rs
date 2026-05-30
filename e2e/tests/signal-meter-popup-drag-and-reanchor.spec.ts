@@ -654,6 +654,15 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
 
         const initial = await popup.boundingBox();
         if (!initial) throw new Error(`${label}: no initial bounding box`);
+        // Iter4: snapshot the anchor (signal-quality button) bounding box
+        // at the same instant as `initial`. The snap-back assertion below
+        // compares popup position *relative to the anchor*, not absolute
+        // viewport position, so reflow of the anchor between `initial`
+        // and `snapped` (e.g. the LEFT-panel `.split-screen-tile` signal
+        // button growing in width as screen-share content reaches full
+        // resolution) does not produce a spurious viewport-delta failure.
+        const initialButtonBox = await sigBtn.boundingBox();
+        if (!initialButtonBox) throw new Error(`${label}: no initial signal-button bounding box`);
 
         const header = popup.locator(".popup-header[data-drag-handle='true']");
         const hb = await header.boundingBox();
@@ -684,11 +693,50 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
 
         const snapped = await popup.boundingBox();
         if (!snapped) throw new Error(`${label}: no snapped bounding box`);
-        const sdx = Math.abs(snapped.x - initial.x);
-        const sdy = Math.abs(snapped.y - initial.y);
+        // Iter4: capture the anchor's *current* box (after snap) so we
+        // can compute the popup's anchor-relative position at the same
+        // instant as `snapped`.
+        const snappedButtonBox = await sigBtn.boundingBox();
+        if (!snappedButtonBox) throw new Error(`${label}: no snapped signal-button bounding box`);
+
+        // Iter4: assert anchor-relative position is stable, not absolute
+        // viewport position.
+        //
+        // The Dioxus `compute_popup_position` formula in
+        // `videocall-client`'s signal-quality popup is:
+        //   target_left = anchor.left + anchor.width * 0.25 - popup_w
+        //   target_top  = anchor.top  + anchor.height * 0.5
+        // It is run at initial mount AND at snap-back. If the anchor's
+        // viewport box changes between those two instants — which is
+        // legitimate, e.g. on the LEFT-panel `.split-screen-tile` the
+        // signal-quality button widens by ~144px as screen-share content
+        // reaches full resolution and the tile chrome reflows, producing
+        // a `144 * 0.25 = 36px` target_left shift — the popup correctly
+        // follows the anchor. Comparing absolute viewport positions then
+        // reports that 36px as a snap-back failure, when in fact the
+        // popup is right where the anchor says it should be.
+        //
+        // The contract under test is "snap-back returned the popup to
+        // its anchor", which is precisely an anchor-relative claim, so
+        // we measure popup-minus-anchor at each instant and require
+        // that the *delta of deltas* is within tolerance. This also
+        // preserves the right-strip case (`NoScreen` popup on
+        // `.split-peer-tile`) where the anchor is stable across the
+        // snap — there the relative deltas reduce to the same value as
+        // the original absolute deltas, so the assertion still holds.
+        const initialRelX = initial.x - initialButtonBox.x;
+        const initialRelY = initial.y - initialButtonBox.y;
+        const snappedRelX = snapped.x - snappedButtonBox.x;
+        const snappedRelY = snapped.y - snappedButtonBox.y;
         const SNAP_TOLERANCE_PX = 8;
-        expect(sdx, `${label}: snapped x within tolerance`).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
-        expect(sdy, `${label}: snapped y within tolerance`).toBeLessThanOrEqual(SNAP_TOLERANCE_PX);
+        const rdx = Math.abs(snappedRelX - initialRelX);
+        const rdy = Math.abs(snappedRelY - initialRelY);
+        expect(rdx, `${label}: snapped x within tolerance (anchor-relative)`).toBeLessThanOrEqual(
+          SNAP_TOLERANCE_PX,
+        );
+        expect(rdy, `${label}: snapped y within tolerance (anchor-relative)`).toBeLessThanOrEqual(
+          SNAP_TOLERANCE_PX,
+        );
         await expect(popup, `${label}: anchored attr`).toHaveAttribute(
           "data-anchor-mode",
           "anchored",

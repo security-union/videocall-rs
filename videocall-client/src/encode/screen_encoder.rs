@@ -333,10 +333,21 @@ impl ScreenEncoder {
                 // negotiated step). This runs whether or not a tier change
                 // fired — PID-driven adjustments within a tier still change
                 // the target.
-                let last_target =
-                    encoder_control.last_target_bitrate_kbps().round().max(0.0) as u32;
-                if last_target > 0 {
-                    shared_target_bitrate.store(last_target, Ordering::Relaxed);
+                //
+                // Contract: at tier 0 the encoder is "unconstrained" and the
+                // entire Cause line must be omitted by the receiver. The
+                // tier-change branch below clears tier + hint at index 0;
+                // for symmetry the target bitrate must read `0` too,
+                // otherwise the receiver renders a partial `Cause: <N>kbps`
+                // line (the renderer keys off ANY non-default Cause field).
+                if encoder_control.video_tier_index() == 0 {
+                    shared_target_bitrate.store(0, Ordering::Relaxed);
+                } else {
+                    let last_target =
+                        encoder_control.last_target_bitrate_kbps().round().max(0.0) as u32;
+                    if last_target > 0 {
+                        shared_target_bitrate.store(last_target, Ordering::Relaxed);
+                    }
                 }
 
                 // Check for tier changes and update shared atomics.
@@ -358,7 +369,14 @@ impl ScreenEncoder {
                     // Issue #903: refresh the tier label exposed on the wire.
                     // Tier 0 (highest) is treated as "unconstrained" and
                     // clears the label so the receiver omits the Cause line.
+                    // Target bitrate must also be cleared here for the
+                    // same omit-on-unconstrained contract — the per-tick
+                    // refresh above already guards on `tier_index == 0`,
+                    // but a tier-change tick that arrives without a
+                    // subsequent diagnostics packet would otherwise leave
+                    // the previous tier's target bitrate stale.
                     if tier_index == 0 {
+                        shared_target_bitrate.store(0, Ordering::Relaxed);
                         shared_adaptive_tier.borrow_mut().clear();
                         shared_cause_hint.borrow_mut().clear();
                     } else {
@@ -533,12 +551,26 @@ impl ScreenEncoder {
         // bandwidth-conservative choice and the receiver should be able to
         // explain the resulting downscale immediately rather than waiting
         // for the first PID-driven tier transition.
-        self.shared_screen_encoder_target_bitrate_kbps
-            .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
+        //
+        // Contract (mirrored in the consumer at
+        // `dioxus-ui/components/signal_quality.rs::build_screen_cause_line`
+        // and on `SignalSample::screen_encoder_target_bitrate_kbps`'s
+        // doc-comment): tier 0 is "unconstrained" and ALL three Cause-line
+        // fields — target bitrate, tier label, and cause hint — must read
+        // their proto3 defaults (`0` / empty). If we leak the high-tier
+        // ideal bitrate here, the receiver renders a partial
+        // `Cause: <N>kbps` line that violates the omit-on-unconstrained
+        // contract (regression caught by HCL e2e iter2: cause-hint test
+        // observed `Cause: 2500kbps` at tier 0 from cold-start RTT/camera
+        // signals).
         if clamped_tier == 0 {
+            self.shared_screen_encoder_target_bitrate_kbps
+                .store(0, Ordering::Relaxed);
             self.shared_screen_adaptive_tier.borrow_mut().clear();
             self.shared_screen_cause_hint.borrow_mut().clear();
         } else {
+            self.shared_screen_encoder_target_bitrate_kbps
+                .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
             *self.shared_screen_adaptive_tier.borrow_mut() = tier.label.to_string();
             // Default cause for the initial constrained tier: the encoder
             // started below the top of the ladder because the screen

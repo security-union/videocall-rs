@@ -1179,6 +1179,22 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
             // re-distributes available space).  `window` resize covers
             // viewport changes, but the grid can reflow without any
             // viewport change — that's the case this observer handles.
+            //
+            // HCL iter2 follow-up: we also observe the POPUP element itself.
+            // The popup body switches between two rsx branches as the peer's
+            // signal history populates ("No data yet" vs. the chart UI). The
+            // popup's height (and on first paint, briefly its measured
+            // width) changes across that transition. Without observing the
+            // popup, the initial rAF reposition runs against the empty-body
+            // dimensions and the position is never re-evaluated against the
+            // populated-body dimensions — observed in HCL e2e iter2 as a
+            // ~36px X delta on the LEFT-panel split-screen-tile popup snap-
+            // back assertion (the snap-back recomputed against the wider
+            // populated popup; the test's `initial` snapshot still reflected
+            // the narrower empty-body measurement). Observing the popup
+            // makes reposition fire when the body grows, so the
+            // `compute_popup_position` math is always evaluated against the
+            // popup's final dimensions and snap-back stays within tolerance.
             let observer_cb: Closure<dyn FnMut(js_sys::Array)> = Closure::new({
                 let rep = reposition.clone();
                 move |_entries: js_sys::Array| rep()
@@ -1188,6 +1204,9 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
                 let doc = gloo_utils::document();
                 if let Some(anchor_el) = doc.get_element_by_id(&anchor_id_for_init) {
                     obs.observe(&anchor_el);
+                }
+                if let Some(popup_el) = doc.get_element_by_id(&popup_id_for_init) {
+                    obs.observe(&popup_el);
                 }
             }
 

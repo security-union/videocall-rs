@@ -322,6 +322,11 @@ pub struct ChatServer {
     /// Absent or empty = fail-open (forward all video). This is a
     /// **subtract-only** filter layered AFTER JWT/observer authorization; it
     /// never grants access. See [`DesiredStreams`].
+    ///
+    /// The actor never *reads* this map; all reads/writes of the viewport go
+    /// through the `Arc<RwLock>` clone held by the spawned NATS task. The map
+    /// exists purely to own the shared handle and bound its lifetime (entries
+    /// are removed on `leave_rooms`/`forget_session`), not as a read source.
     session_desired_streams: HashMap<SessionId, DesiredStreams>,
 }
 

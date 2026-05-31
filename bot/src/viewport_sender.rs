@@ -75,7 +75,7 @@ pub struct ViewportSender {
     has_sent: bool,
     /// Channel to send outbound packets.
     packet_tx: Sender<OutboundFrame>,
-    /// Counter for total VIEWPORT packets sent (shared with health reporter).
+    /// Counter for total VIEWPORT packets sent.
     pub viewports_sent: Arc<AtomicU64>,
 }
 

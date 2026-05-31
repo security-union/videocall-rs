@@ -36,10 +36,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::metrics::{
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
+    RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
@@ -640,6 +641,12 @@ impl ChatServer {
             if members.is_empty() {
                 self.room_members.remove(room);
                 self.room_policy.remove(room);
+                // Drop the per-room viewport set-size gauge series (HCL #988).
+                // GaugeVec series persist until explicitly removed; without
+                // this a drained room would read its last set size forever.
+                // `remove_label_values` errors only when no series exists, so
+                // the unused-result is intentionally discarded.
+                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
             }
         }
     }
@@ -673,6 +680,10 @@ impl ChatServer {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
                 self.room_members.remove(room);
+                // Mirror forget_room_if_empty: release the per-room viewport
+                // set-size gauge series so the eviction teardown path also
+                // cannot leak a stale series for a drained room (HCL #988).
+                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
             }
         }
 
@@ -1853,6 +1864,7 @@ impl Handler<JoinRoom> for ChatServer {
                             &self_subject,
                             session_clone,
                             &desired_streams_for_loop,
+                            &room_clone,
                         ) {
                             continue;
                         }
@@ -1935,6 +1947,7 @@ fn try_intercept_viewport(
     self_subject: &str,
     receiver_session: SessionId,
     desired_streams: &DesiredStreams,
+    room: &str,
 ) -> bool {
     // Unparseable payloads are not our concern; let `handle_msg` apply its own
     // fail-closed handling.
@@ -1956,6 +1969,11 @@ fn try_intercept_viewport(
     // connection. If this VIEWPORT did not arrive on our own subject it is not
     // ours: drop it without touching our set.
     if msg.subject.as_str() != self_subject {
+        // Forged / cross-session VIEWPORT — dropped without mutating state.
+        // Surfaced so the ownership defence is not invisible (HCL #988 G3).
+        RELAY_VIEWPORT_UPDATES_TOTAL
+            .with_label_values(&[room, "not_owner"])
+            .inc();
         return true;
     }
 
@@ -1965,6 +1983,7 @@ fn try_intercept_viewport(
         // DoS bound: cap the number of session_ids we will process. Truncate
         // rather than reject so an over-long list still applies its first N
         // entries (fail-open on the excess).
+        let raw_len = viewport.session_ids.len();
         let next: std::collections::HashSet<u64> = viewport
             .session_ids
             .into_iter()
@@ -1973,6 +1992,14 @@ fn try_intercept_viewport(
             // `[self]` viewport from collapsing into "drop everything".
             .filter(|sid| *sid != receiver_session)
             .collect();
+        // The cap fired silently before #988 (G3): record truncation so the
+        // DoS guard is observable. Counted in addition to `accepted` below
+        // when the (capped) update is also applied.
+        if raw_len > VIEWPORT_MAX_SESSION_IDS {
+            RELAY_VIEWPORT_UPDATES_TOTAL
+                .with_label_values(&[room, "truncated"])
+                .inc();
+        }
 
         // Overwrite (not merge): the latest VIEWPORT is the full current
         // visible set. `write()` only fails on a poisoned lock, which would
@@ -1986,9 +2013,28 @@ fn try_intercept_viewport(
                 let too_soon = guard
                     .last_update
                     .is_some_and(|last| now.duration_since(last) < VIEWPORT_MIN_UPDATE_INTERVAL);
-                if !too_soon {
+                if too_soon {
+                    // Rate limit fired silently before #988 (G3).
+                    RELAY_VIEWPORT_UPDATES_TOTAL
+                        .with_label_values(&[room, "rate_limited"])
+                        .inc();
+                } else {
                     guard.ids = next;
                     guard.last_update = Some(now);
+                    let set_size = guard.ids.len();
+                    // Drop the lock before touching metrics.
+                    drop(guard);
+                    RELAY_VIEWPORT_UPDATES_TOTAL
+                        .with_label_values(&[room, "accepted"])
+                        .inc();
+                    // Per-room set-size gauge (G2): a collapse toward 0/1 while
+                    // peers still publish is the wrongly-dropping signature.
+                    // Last-writer-wins across receivers in the room (no
+                    // per-session label — cardinality). Cleaned up when the
+                    // room drains (forget_room_if_empty / forget_session).
+                    RELAY_VIEWPORT_SET_SIZE
+                        .with_label_values(&[room])
+                        .set(set_size as f64);
                 }
             }
             Err(_) => {
@@ -2340,14 +2386,19 @@ fn handle_msg(
                     .next()
                     .and_then(|tok| tok.parse::<u64>().ok());
 
-                // Read the viewport set; a poisoned lock fails OPEN (forward).
-                // An unparseable source (`None`) also fails OPEN.
-                let drop_video = match source {
+                // Read the viewport set ONCE: derive both the drop decision and
+                // the current set size from a single guard so the debug log on
+                // the drop path costs no extra RwLock read (the drop path runs
+                // at near-full inbound VIDEO rate per receiver during a viewport
+                // collapse — exactly when this log matters most). A poisoned
+                // lock fails OPEN (forward); an unparseable source (`None`) also
+                // fails OPEN.
+                let (drop_video, viewport_len) = match source {
                     Some(src) => desired_streams
                         .read()
-                        .map(|st| !st.ids.is_empty() && !st.ids.contains(&src))
-                        .unwrap_or(false),
-                    None => false,
+                        .map(|st| (!st.ids.is_empty() && !st.ids.contains(&src), st.ids.len()))
+                        .unwrap_or((false, 0)),
+                    None => (false, 0),
                 };
                 if drop_video {
                     // Intentional, viewport-driven drop — accounted on a
@@ -2356,14 +2407,27 @@ fn handle_msg(
                     RELAY_VIEWPORT_FILTERED_TOTAL
                         .with_label_values(&[&room])
                         .inc();
-                    trace!(
-                        "Dropping off-screen VIDEO from subject-derived source {:?} for session {} in room {}",
-                        source,
-                        session,
-                        room
+                    // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
+                    // — not global trace — can reconstruct who-dropped-what-from-whom
+                    // for one room: receiver session, the SUBJECT-derived source
+                    // (#994: derived from the NATS subject, not the forgeable payload
+                    // session_id), and the current viewport set size (a collapse
+                    // toward 0/1 is the wrongly-dropping signature). Per-source
+                    // forensics live HERE, never in metric labels (cardinality).
+                    // `viewport_len` was captured from the single decision read
+                    // above — no second lock on the hot drop path.
+                    debug!(
+                        "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
+                        source, session, room, viewport_len
                     );
                     return Ok(());
                 }
+                // Forwarded VIDEO — the denominator complement of the filtered
+                // counter (HCL #988). Mutually exclusive with the drop branch
+                // above; together they cover every VIDEO packet at the filter.
+                RELAY_VIEWPORT_FORWARDED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
             }
         }
 
@@ -4898,7 +4962,7 @@ mod tests {
         let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[200, 300]));
         let parsed = parse_pw(&msg);
         let intercepted =
-            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired, "r");
         assert!(intercepted, "VIEWPORT packet must be intercepted (dropped)");
         let st = desired.read().unwrap();
         assert_eq!(st.ids.len(), 2);
@@ -4918,7 +4982,8 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             100,
-            &desired
+            &desired,
+            "r"
         ));
         assert!(
             desired.read().unwrap().ids.is_empty(),
@@ -4936,7 +5001,7 @@ mod tests {
         let msg = make_nats_message("room.r.555", make_viewport_packet_bytes(555, &[999]));
         let parsed = parse_pw(&msg);
         let intercepted =
-            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired, "r");
         assert!(
             intercepted,
             "another session's VIEWPORT must still be intercepted (never re-broadcast)"
@@ -4963,7 +5028,7 @@ mod tests {
         let msg = make_nats_message("room.r.555", make_viewport_packet_bytes(100, &[999]));
         let parsed = parse_pw(&msg);
         let intercepted =
-            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired, "r");
         assert!(
             intercepted,
             "forged cross-session VIEWPORT must still be intercepted (never re-broadcast)"
@@ -4989,7 +5054,7 @@ mod tests {
         let msg = make_nats_message(&self_subject, make_packet_bytes(PacketType::MEDIA));
         let parsed = parse_pw(&msg);
         assert!(
-            !try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired),
+            !try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired, "r"),
             "non-VIEWPORT packets must fall through to handle_msg"
         );
     }
@@ -5002,7 +5067,7 @@ mod tests {
         let self_subject = self_subject_for("r", 100);
         let msg = make_nats_message(&self_subject, vec![0xff, 0xfe, 0xfd]);
         assert!(
-            !try_intercept_viewport(&msg, None, &self_subject, 100, &desired),
+            !try_intercept_viewport(&msg, None, &self_subject, 100, &desired, "r"),
             "unparseable payloads must fall through to handle_msg"
         );
     }
@@ -5019,7 +5084,8 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             100,
-            &desired
+            &desired,
+            "r"
         ));
         let st = desired.read().unwrap();
         assert_eq!(st.ids.len(), 1);
@@ -5041,7 +5107,8 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             100,
-            &desired
+            &desired,
+            "r"
         ));
         let st = desired.read().unwrap();
         assert_eq!(
@@ -5065,7 +5132,8 @@ mod tests {
             parsed1.as_ref(),
             &self_subject,
             100,
-            &desired
+            &desired,
+            "r"
         ));
         assert_eq!(desired.read().unwrap().ids.len(), 2);
 
@@ -5073,7 +5141,7 @@ mod tests {
         let msg2 = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[999]));
         let parsed2 = parse_pw(&msg2);
         assert!(
-            try_intercept_viewport(&msg2, parsed2.as_ref(), &self_subject, 100, &desired),
+            try_intercept_viewport(&msg2, parsed2.as_ref(), &self_subject, 100, &desired, "r"),
             "rate-limited VIEWPORT must still be intercepted (never re-broadcast)"
         );
         let st = desired.read().unwrap();
@@ -5105,7 +5173,8 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             100,
-            &desired
+            &desired,
+            "r"
         ));
         let st = desired.read().unwrap();
         assert_eq!(st.ids.len(), 1);

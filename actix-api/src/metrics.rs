@@ -461,6 +461,48 @@ lazy_static! {
     )
     .expect("Failed to create encoder_bitrate_ratio metric");
 
+    // ===== DECODE-BUDGET STATE (#987 / PR #999) =====
+
+    /// Current effective tile cap enforced by the decode-budget controller.
+    pub static ref DECODE_BUDGET_EFFECTIVE_CAP: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_effective_cap",
+        "Current effective decode-budget tile cap",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_effective_cap metric");
+
+    /// Natural/unconstrained tile count before any decode-budget cap is applied.
+    pub static ref DECODE_BUDGET_NATURAL: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_natural",
+        "Natural (unconstrained) decode-budget tile count before capping",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_natural metric");
+
+    /// Decode-budget pressured latch (1=pressured, 0=not pressured).
+    pub static ref DECODE_BUDGET_PRESSURED: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_pressured",
+        "Decode-budget pressured latch (1=pressured, 0=not pressured)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_pressured metric");
+
+    /// Decode-budget override mode (0=unspecified, 1=auto, 2=fixed).
+    pub static ref DECODE_BUDGET_OVERRIDE_MODE: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_override_mode",
+        "Decode-budget override mode (0=unspecified, 1=auto, 2=fixed)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_override_mode metric");
+
+    /// User-configured fixed tile cap, set only when override_mode == fixed.
+    pub static ref DECODE_BUDGET_OVERRIDE_FIXED_N: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_override_fixed_n",
+        "Decode-budget user-configured fixed tile cap (override_mode=fixed)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_override_fixed_n metric");
+
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
     /// Audio concealment percentage from NetEQ expand events (0.0-100.0)

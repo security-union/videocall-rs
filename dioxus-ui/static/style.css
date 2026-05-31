@@ -487,6 +487,19 @@ h3 {
   opacity: 0.7;
 }
 
+/* Issue #987, task 1a.4: off-budget avatar tiles. These peers are present and
+   audible but their video is not being decoded (the adaptive decode-budget
+   controller capped how many tiles decode to protect CPU). A dashed border and
+   slightly muted surface distinguishes "I'm not decoding your video" from a
+   normal camera-off tile, without hiding who is in the meeting. The tile reuses
+   the standard `.grid-item` + `.placeholder-content` markup; only the framing
+   differs. E2E queries `.grid-item.off-budget-tile` / `[data-off-budget=true]`. */
+.grid-item.off-budget-tile {
+  border-style: dashed;
+  border-color: var(--color-border-emphasis);
+  background-color: var(--surface);
+}
+
 /* ============================================================
    Mobile: narrower gap/padding
    Keep breakpoint + values in sync with attendants.rs (vw < 568.0)

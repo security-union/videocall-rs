@@ -19,4 +19,5 @@ message PacketWrapper {
   bytes user_id = 2;
   bytes data = 3;
   uint64 session_id = 4;
+  uint32 simulcast_layer_id = 5;
 }

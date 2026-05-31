@@ -73,6 +73,16 @@ if ! collect_added_lines | awk '
       next
     }
     if (line ~ /@token-exempt/) { next }
+    # Skip comment-only lines. Color literals in comments never render, so the
+    # guardrail does not care about them — and this avoids false positives on
+    # GitHub issue/PR references like "#987" (three valid hex chars) that live
+    # in code comments. Real colors in CSS rules / string literals are still
+    # caught because those lines do not start with a comment marker. Covers
+    # Rust line comments (// /// //!) and CSS/block-comment lines (/* and the
+    # leading "*" of continuation lines).
+    trimmed = line
+    sub(/^[[:space:]]+/, "", trimmed)
+    if (trimmed ~ /^(\/\/|\/\*|\*)/) { next }
     if (line ~ /(^|[^A-Za-z_0-9#])#[0-9A-Fa-f]{3,8}([[:space:][:punct:]]|$)|(^|[^A-Za-z_0-9])rgba?[[:space:]]*\([^)]*\)|(^|[^A-Za-z_0-9])hsla?[[:space:]]*\([^)]*\)/) {
       key = file ":" line
       if (!(key in seen)) {

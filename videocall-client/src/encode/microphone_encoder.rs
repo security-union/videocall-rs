@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
-    packet_wrapper::packet_wrapper::PacketType,
+    packet_wrapper::packet_wrapper::{MediaKind, PacketType},
 };
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -127,6 +127,9 @@ pub fn transform_audio_chunk(
         data,
         user_id: user_id.as_bytes().to_vec(),
         packet_type: PacketType::MEDIA.into(),
+        // Cleartext discriminator so the relay can apply viewport-aware VIDEO
+        // filtering while ALWAYS forwarding AUDIO (HCL issue #988).
+        media_kind: MediaKind::AUDIO.into(),
         ..Default::default()
     }
 }

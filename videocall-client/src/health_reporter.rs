@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
+    decode_budget::OverrideMode as PbOverrideMode, DecodeBudget as PbDecodeBudget,
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
     PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
@@ -131,6 +132,28 @@ pub struct ClimbLimiterSnapshot {
     pub step_up_blocked_screen_share: u64,
 }
 
+/// Snapshot of the adaptive decode-budget controller's current decision (#987).
+///
+/// Captured from the `decode_budget` diagnostics subsystem (published by the
+/// Dioxus control loop) and folded into each HEALTH packet so population-scale
+/// dashboards can observe the receiver-side tile-cap decision that today only
+/// exists in client console logs. Mirrors how the AdaptiveQuality tier atomics
+/// ride the health packet.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeBudgetSnapshot {
+    /// Current effective cap on simultaneously decoded video tiles.
+    pub effective_cap: u32,
+    /// Natural/unconstrained tile count the layout would show (∩ CANVAS_LIMIT).
+    pub natural: u32,
+    /// Whether the pressured latch is engaged (the loop owns the cap).
+    pub pressured: bool,
+    /// Override mode, as the proto `OverrideMode` enum integer value
+    /// (1 = Auto, 2 = Fixed; 0 = unset/Auto).
+    pub override_mode: u32,
+    /// User's hard tile cap; meaningful only when `override_mode` is Fixed.
+    pub override_fixed_n: u32,
+}
+
 /// Shared buffer of tier transition records from camera and screen encoders.
 type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
 
@@ -201,6 +224,10 @@ pub struct HealthReporter {
     longtask_buffer: Rc<RefCell<Vec<f64>>>,
     /// TELEM-9: Latest render FPS reading from the rAF cadence observer.
     render_fps: Rc<RefCell<Option<f64>>>,
+    /// #987: Latest adaptive decode-budget snapshot from the `decode_budget`
+    /// diagnostics subsystem. `None` until the controller publishes its first
+    /// decision (no peers / pre-warmup), in which case the field is omitted.
+    decode_budget: Rc<RefCell<Option<DecodeBudgetSnapshot>>>,
 }
 
 /// Static client metadata read from JS globals (TELEM-7).
@@ -377,6 +404,7 @@ impl HealthReporter {
             shutdown: Rc::new(AtomicBool::new(false)),
             longtask_buffer: Rc::new(RefCell::new(Vec::new())),
             render_fps: Rc::new(RefCell::new(None)),
+            decode_budget: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -503,6 +531,7 @@ impl HealthReporter {
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
         let longtask_buffer = Rc::downgrade(&self.longtask_buffer);
         let render_fps_state = Rc::downgrade(&self.render_fps);
+        let decode_budget_state = Rc::downgrade(&self.decode_budget);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -584,6 +613,36 @@ impl HealthReporter {
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+                    }
+                    // #987: capture the adaptive decode-budget snapshot. The
+                    // Dioxus control loop publishes one event per decision change
+                    // (state-change driven, not per render), so we simply overwrite
+                    // the latest snapshot here and read it at packet-assembly time.
+                    if event.subsystem == "decode_budget" {
+                        if let Some(db_rc) = Weak::upgrade(&decode_budget_state) {
+                            let mut snap = DecodeBudgetSnapshot::default();
+                            for m in &event.metrics {
+                                if let MetricValue::U64(v) = &m.value {
+                                    match m.name {
+                                        "decode_budget_effective_cap" => {
+                                            snap.effective_cap = *v as u32
+                                        }
+                                        "decode_budget_natural" => snap.natural = *v as u32,
+                                        "decode_budget_pressured" => snap.pressured = *v != 0,
+                                        "decode_budget_override_mode" => {
+                                            snap.override_mode = *v as u32
+                                        }
+                                        "decode_budget_override_fixed_n" => {
+                                            snap.override_fixed_n = *v as u32
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Ok(mut cell) = db_rc.try_borrow_mut() {
+                                *cell = Some(snap);
                             }
                         }
                     }
@@ -824,6 +883,7 @@ impl HealthReporter {
         let dwell_samples = self.dwell_samples.clone();
         let longtask_buffer = self.longtask_buffer.clone();
         let render_fps_cell = self.render_fps.clone();
+        let decode_budget_cell = self.decode_budget.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -950,6 +1010,11 @@ impl HealthReporter {
                         // TELEM-9: read latest render FPS
                         let current_render_fps = render_fps_cell.try_borrow().ok().and_then(|v| *v);
 
+                        // #987: read latest decode-budget snapshot (None until the
+                        // controller has published its first decision).
+                        let decode_budget_snapshot =
+                            decode_budget_cell.try_borrow().ok().and_then(|v| *v);
+
                         // TELEM-7: read client metadata from JS globals
                         let client_meta = read_client_metadata();
 
@@ -987,6 +1052,7 @@ impl HealthReporter {
                             drained_longtasks,
                             current_render_fps,
                             client_meta,
+                            decode_budget_snapshot,
                         );
 
                         if let Some(packet) = health_packet {
@@ -1038,6 +1104,7 @@ impl HealthReporter {
         longtask_durations: Vec<f64>,
         render_fps: Option<f64>,
         client_metadata: ClientMetadata,
+        decode_budget: Option<DecodeBudgetSnapshot>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -1231,6 +1298,26 @@ impl HealthReporter {
 
         // TELEM-9: Render FPS
         pb.render_fps = render_fps;
+
+        // #987: Adaptive decode-budget controller snapshot. Only present once the
+        // controller has published a decision (so a no-peer / pre-warmup packet
+        // omits it). Mirrors how the AdaptiveQuality tier fields ride the packet.
+        if let Some(db) = decode_budget {
+            let mut pb_db = PbDecodeBudget::new();
+            pb_db.effective_cap = db.effective_cap;
+            pb_db.natural = db.natural;
+            pb_db.pressured = db.pressured;
+            // Map the integer override mode (1 = Auto, 2 = Fixed; 0/other = Auto)
+            // to the proto enum. `override_fixed_n` is only meaningful for Fixed.
+            pb_db.override_mode = ::protobuf::EnumOrUnknown::new(match db.override_mode {
+                2 => PbOverrideMode::OVERRIDE_MODE_FIXED,
+                _ => PbOverrideMode::OVERRIDE_MODE_AUTO,
+            });
+            if db.override_mode == 2 {
+                pb_db.override_fixed_n = db.override_fixed_n;
+            }
+            pb.decode_budget = ::protobuf::MessageField::some(pb_db);
+        }
 
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
@@ -1612,6 +1699,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None,
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -1639,6 +1727,115 @@ mod tests {
         // transport identity and RTT.
         assert_eq!(pb.active_server_type, "webtransport");
         assert_eq!(pb.active_server_rtt_ms, 42.0);
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// with the given decode-budget snapshot, then round-trip it through the
+    /// protobuf so the assertions are on exactly what goes on the wire (#987).
+    fn health_packet_with_decode_budget(
+        decode_budget: Option<DecodeBudgetSnapshot>,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            decode_budget,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_pressured_auto() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 5,
+            natural: 12,
+            pressured: true,
+            override_mode: 1, // Auto
+            override_fixed_n: 0,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 5);
+        assert_eq!(db.natural, 12);
+        assert!(db.pressured);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_AUTO
+        );
+        // override_fixed_n is meaningless in Auto and left at its default.
+        assert_eq!(db.override_fixed_n, 0);
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_fixed_override() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 3,
+            natural: 12,
+            pressured: false,
+            override_mode: 2, // Fixed
+            override_fixed_n: 3,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 3);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_FIXED
+        );
+        assert_eq!(db.override_fixed_n, 3);
+    }
+
+    #[test]
+    fn decode_budget_absent_when_no_snapshot() {
+        // No snapshot (controller pre-warmup / no peers) → field omitted so a
+        // healthy no-peer packet stays minimal and backward-compatible.
+        let pb = health_packet_with_decode_budget(None);
+        assert!(pb.decode_budget.is_none());
     }
 
     #[test]

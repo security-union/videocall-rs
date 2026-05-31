@@ -636,6 +636,13 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Last decode-budget snapshot published to the diagnostics bus (for the
+    // HEALTH packet, #987 P3): (effective_cap, natural_capped, pressured,
+    // is_fixed, fixed_n). Tracked so the publisher effect only emits a bus
+    // event when the decision actually moves, never per unrelated render. Read
+    // via `.peek()` inside that effect (never reactively) so writing it back
+    // cannot self-retrigger the effect.
+    let mut prev_db_snapshot = use_signal(|| (MIN_CAP, MIN_CAP, false, false, 0usize));
     // Viewport size signal — updated on window resize so layout recomputes.
     let mut viewport_version = use_signal(|| 0u32);
     {
@@ -2465,6 +2472,85 @@ pub fn AttendantsComponent(
         if previous != current {
             prev_override.set(current);
         }
+    });
+
+    // Publish the adaptive decode-budget decision onto the diagnostics bus so
+    // the HealthReporter (videocall-client) can fold it into the periodic
+    // HEALTH packet (#987 P3). This mirrors how the AdaptiveQuality tier state
+    // already rides the health packet: the controller's decision lives only in
+    // client console logs today, so population-scale dashboards are blind to it
+    // server-side. We publish the SNAPSHOT (current state), not a drained
+    // transition buffer — the snapshot is the must-have for dashboards.
+    //
+    // Reactive reads (`.read()`/calling the signal) of all four authoritative
+    // signals mean this effect re-runs the instant any of them changes, and the
+    // change-guard `prev_db_snapshot` ensures we only emit a bus event when the
+    // decision actually moved — not on every unrelated render. The effective
+    // cap is recomputed with the SAME three-mode logic as the render-side
+    // `effective_cap` actuator below (Fixed clamp / un-pressured == natural /
+    // pressured == loop-owned cap) so the reported value matches what is on
+    // screen. `decode_budget_natural` already equals the live `total_tiles`
+    // (written just above), so `natural_capped` here matches the render-side
+    // `canvas_capped_natural`.
+    use_effect(move || {
+        let override_mode = decode_budget_override();
+        let pressured = decode_budget_pressured();
+        let natural = decode_budget_natural();
+        let cap = decode_budget_cap();
+
+        let natural_capped = natural.min(CANVAS_LIMIT);
+        let effective = match override_mode {
+            DecodeBudgetOverride::Fixed(n) => {
+                n.clamp(MIN_CAP, natural.clamp(MIN_CAP, CANVAS_LIMIT))
+            }
+            DecodeBudgetOverride::Auto if !pressured => natural_capped,
+            DecodeBudgetOverride::Auto => cap,
+        };
+
+        // Compact, comparable snapshot. Only emit on a real change so the
+        // diagnostics bus (and the health packet) is not spammed per render.
+        // `override_fixed_n` is 0 in Auto and meaningless to readers there
+        // (the proto enum carries the Auto/Fixed discriminator).
+        // Clamp the reported fixed cap to CANVAS_LIMIT so telemetry matches the
+        // displayed semantics: `parse_decode_budget_override` accepts any
+        // `usize > 0` from localStorage, but a tampered value above u32::MAX
+        // would otherwise silently truncate on the `as u64 -> as u32` path in
+        // the consumer. `effective_cap` is already clamped, so this only aligns
+        // the telemetry `override_fixed_n` with what is actually rendered.
+        let fixed_n = match override_mode {
+            DecodeBudgetOverride::Fixed(n) => n.min(CANVAS_LIMIT),
+            DecodeBudgetOverride::Auto => 0,
+        };
+        let is_fixed = matches!(override_mode, DecodeBudgetOverride::Fixed(_));
+        let snapshot = (effective, natural_capped, pressured, is_fixed, fixed_n);
+        if *prev_db_snapshot.peek() == snapshot {
+            return;
+        }
+        prev_db_snapshot.set(snapshot);
+
+        // Override mode encoded as the proto OverrideMode enum's integer value
+        // (1 = Auto, 2 = Fixed) so the HealthReporter can map it directly.
+        let override_mode_i = if is_fixed { 2u64 } else { 1u64 };
+        videocall_diagnostics::global_sender()
+            .try_broadcast(videocall_diagnostics::DiagEvent {
+                subsystem: "decode_budget",
+                stream_id: None,
+                ts_ms: videocall_diagnostics::now_ms(),
+                metrics: vec![
+                    videocall_diagnostics::metric!("decode_budget_effective_cap", effective as u64),
+                    videocall_diagnostics::metric!("decode_budget_natural", natural_capped as u64),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_pressured",
+                        if pressured { 1u64 } else { 0u64 }
+                    ),
+                    videocall_diagnostics::metric!("decode_budget_override_mode", override_mode_i),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_override_fixed_n",
+                        fixed_n as u64
+                    ),
+                ],
+            })
+            .ok();
     });
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---

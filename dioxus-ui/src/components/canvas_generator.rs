@@ -341,6 +341,14 @@ pub fn generate_for_peer(
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
+    // Issue #987, task 1a.4: when `true`, this tile is "off-budget" — the
+    // adaptive decode-budget controller has excluded the peer from video decode
+    // to save CPU. The tile renders the avatar/initials placeholder instead of a
+    // live `<canvas>` (so no decode pipeline is bound) and tags the grid item
+    // with `off-budget-tile` for styling / E2E. Audio is unaffected: the peer is
+    // simply not in `active_decode_set`. Always `false` on the screen-share /
+    // full-bleed paths (the avatar tier only appears in the multi-tile grid).
+    force_avatar: bool,
 ) -> Element {
     let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
         try_use_context::<CroppedTilesCtx>().map(|c| c.0);
@@ -380,6 +388,15 @@ pub fn generate_for_peer(
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+
+    // Issue #987, task 1a.4: an off-budget tile renders the avatar placeholder
+    // even when the peer's camera is on, because the decode-budget controller
+    // has excluded it from `active_decode_set` (no frames are being decoded for
+    // it). `show_canvas` therefore requires BOTH the peer's camera to be on AND
+    // the tile not to be forced into avatar mode. When `force_avatar` is false
+    // (the no-cap default and every screen-share / full-bleed call) this is
+    // exactly `is_video_enabled_for_peer`, so behaviour is unchanged.
+    let show_canvas = is_video_enabled_for_peer && !force_avatar;
 
     let is_pinned = pinned_peer_id
         .map(|p| p == peer_user_id.as_str())
@@ -1126,7 +1143,7 @@ pub fn generate_for_peer(
             }
         }
         {
-            let grid_class = if is_video_enabled_for_peer {
+            let grid_class = if show_canvas {
                 "canvas-container video-on"
             } else {
                 "canvas-container"
@@ -1134,6 +1151,11 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
+            // Issue #987, task 1a.4: tag off-budget tiles with `off-budget-tile`
+            // so CSS can style them and E2E can query them
+            // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
+            // so the rendered class list is unchanged when no budget is active.
+            let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
             let grid_item_class = if show_signal_popup {
                 "grid-item signal-popup-open"
             } else {
@@ -1147,11 +1169,22 @@ pub fn generate_for_peer(
             let grid_name_id = format!("{}-name", &*peer_video_div_id);
             let grid_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
             let grid_anchor_id = grid_signal_btn_id.clone();
+            // Placeholder wording reflects WHY there is no video:
+            //   - camera genuinely off               → "Video Disabled" (unchanged)
+            //   - camera on but decode budget-paused  → "Video paused" (task 1a.4)
+            // An off-budget tile whose camera is also off keeps the camera-off
+            // wording, since that is the more fundamental reason.
+            let placeholder_label = if force_avatar && is_video_enabled_for_peer {
+                "Video paused"
+            } else {
+                "Video Disabled"
+            };
             rsx! {
                 div {
-                    class: "{grid_item_class}{grid_speaking}",
+                    class: "{grid_item_class}{grid_speaking}{off_budget_class}",
                     id: "{peer_video_div_id}",
                     "data-tile-root": "true",
+                    "data-off-budget": if force_avatar { "true" } else { "false" },
                     style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {
@@ -1161,12 +1194,12 @@ pub fn generate_for_peer(
                                 toggle_pinned_div(&pv_div_mobile);
                             }
                         },
-                        if is_video_enabled_for_peer {
+                        if show_canvas {
                             UserVideo { id: key_clone.clone(), hidden: false }
                         } else {
                             div { class: "placeholder-content",
                                 PeerIcon {}
-                                span { class: "placeholder-text", "Video Disabled" }
+                                span { class: "placeholder-text", "{placeholder_label}" }
                             }
                         }
                         h4 {
@@ -1198,8 +1231,10 @@ pub fn generate_for_peer(
                                 onclick: move |_| on_toggle_signal_popup.call(()),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
-                            // Crop (visible on hover only)
-                            if is_video_enabled_for_peer {
+                            // Crop (visible on hover only). Gated on `show_canvas`
+                            // so off-budget avatar tiles — which have no canvas —
+                            // don't show a no-op crop button (task 1a.4).
+                            if show_canvas {
                                 {
                                     let pv_crop_class = pv_canvas_crop.clone();
                                     rsx! {

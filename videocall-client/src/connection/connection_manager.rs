@@ -526,6 +526,22 @@ pub struct ConnectionManager {
     suppression_started_at_ms: Option<f64>,
 }
 
+fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
+    let Some(own_id) = own_session_id else {
+        return false;
+    };
+
+    if packet.session_id == 0 || packet.session_id != own_id {
+        return false;
+    }
+
+    // CONGESTION packets are deliberately self-addressed: the server stamps
+    // the throttled sender's session_id so that sender can step down quality.
+    // They must pass this transport-level self-filter and be handled by
+    // VideoCallClient, which still ignores cross-session CONGESTION.
+    packet.packet_type != PacketType::CONGESTION.into()
+}
+
 impl ConnectionManager {
     /// Create a new ConnectionManager and immediately start testing all connections
     pub fn new(options: ConnectionManagerOptions, aes: Rc<Aes128State>) -> Result<Self> {
@@ -951,15 +967,15 @@ impl ConnectionManager {
                 }
             }
 
-            // Filter self-packets using session_id
-            if let Some(own_id) = *own_session_id.borrow() {
-                if packet.session_id != 0 && packet.session_id == own_id {
-                    debug!(
-                        "Rejecting packet from same session_id: {}",
-                        packet.session_id
-                    );
-                    return;
-                }
+            // Filter self-packets using session_id. Self-targeted CONGESTION is
+            // exempt because it is the server's feedback path telling this
+            // sender to step down quality under relay backpressure.
+            if should_filter_self_packet(&packet, *own_session_id.borrow()) {
+                debug!(
+                    "Rejecting packet from same session_id: {}",
+                    packet.session_id
+                );
+                return;
             }
 
             // Only forward packets from the elected connection.
@@ -3781,6 +3797,92 @@ mod tests {
                 consecutive_implausible_discards: 0,
             },
         );
+    }
+
+    fn packet(packet_type: PacketType, session_id: u64) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: packet_type.into(),
+            session_id,
+            ..Default::default()
+        }
+    }
+
+    fn forwarded_packets_for(
+        packet: PacketWrapper,
+        own_session_id: Option<u64>,
+    ) -> Vec<PacketWrapper> {
+        let forwarded = Rc::new(RefCell::new(Vec::<PacketWrapper>::new()));
+        let sink = forwarded.clone();
+        let mut mgr = make_test_manager();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            sink.borrow_mut().push(packet);
+        });
+        *mgr.own_session_id.borrow_mut() = own_session_id;
+        *mgr.active_connection_id.borrow_mut() = Some("conn".to_string());
+
+        let callback = mgr.create_inbound_media_callback("conn".to_string());
+        callback.emit(packet);
+
+        let packets = forwarded.borrow().clone();
+        packets
+    }
+
+    #[test]
+    fn self_packet_filter_exempts_self_targeted_congestion() {
+        let pkt = packet(PacketType::CONGESTION, 42);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(42)),
+            "self-targeted CONGESTION must reach VideoCallClient so AQ can step down"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_still_drops_non_congestion_self_packets() {
+        let pkt = packet(PacketType::MEDIA, 42);
+        assert!(
+            should_filter_self_packet(&pkt, Some(42)),
+            "non-CONGESTION self packets must still be filtered"
+        );
+    }
+
+    #[test]
+    fn inbound_callback_forwards_self_targeted_congestion() {
+        let forwarded = forwarded_packets_for(packet(PacketType::CONGESTION, 42), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].packet_type, PacketType::CONGESTION.into());
+        assert_eq!(forwarded[0].session_id, 42);
+    }
+
+    #[test]
+    fn inbound_callback_filters_non_congestion_self_packets() {
+        let forwarded = forwarded_packets_for(packet(PacketType::MEDIA, 42), Some(42));
+
+        assert!(
+            forwarded.is_empty(),
+            "self MEDIA echo should remain filtered"
+        );
+    }
+
+    #[test]
+    fn inbound_callback_leaves_cross_session_congestion_to_client_handler() {
+        let forwarded = forwarded_packets_for(packet(PacketType::CONGESTION, 77), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].packet_type, PacketType::CONGESTION.into());
+        assert_eq!(forwarded[0].session_id, 77);
+    }
+
+    #[test]
+    fn inbound_callback_handles_session_assigned_before_self_filter() {
+        let forwarded = forwarded_packets_for(packet(PacketType::SESSION_ASSIGNED, 42), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded[0].packet_type,
+            PacketType::SESSION_ASSIGNED.into()
+        );
+        assert_eq!(forwarded[0].session_id, 42);
     }
 
     // ===================================================================

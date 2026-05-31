@@ -16,6 +16,9 @@
  * conditions.
  */
 
+use crate::components::decode_budget::{
+    decide_step, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+};
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
@@ -42,10 +45,11 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    load_appearance_settings_from_storage, load_density_mode, load_dock_autohide,
-    load_dock_position, resolve_transport_config, save_appearance_settings_to_storage,
-    save_density_mode, save_display_name_to_storage, save_dock_autohide, save_dock_position,
-    validate_display_name, AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DensityModeCtx,
+    load_appearance_settings_from_storage, load_decode_budget_override, load_density_mode,
+    load_dock_autohide, load_dock_position, resolve_transport_config,
+    save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
+    save_dock_autohide, save_dock_position, validate_display_name, AppearanceSettingsCtx,
+    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
     DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
     PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx,
@@ -572,6 +576,66 @@ pub fn AttendantsComponent(
     let mut peer_join_time: Signal<HashMap<String, f64>> = use_signal(HashMap::new);
     let mut density_mode: Signal<DensityMode> = use_signal(load_density_mode);
     let mut density_open = use_signal(|| false);
+    // --- Adaptive decode budget (issue #987, task 1a.3) ---
+    // Manual override for the adaptive controller. `Auto` runs the loop;
+    // `Fixed(n)` is a hard override that bypasses the loop entirely. Task 1a.5
+    // (settings UI) mutates this through the `DecodeBudgetCtx` provided below.
+    // Loaded first so the initial `decode_budget_cap` can honour a persisted
+    // `Fixed(n)` immediately (no first-render flash; HCL #987 review FIX 2).
+    let decode_budget_override = use_signal(load_decode_budget_override);
+    // `decode_budget_cap` is the control-loop-owned cap: the maximum number of
+    // video tiles the layout may decode AFTER the loop has measured real
+    // pressure. It is NOT the actuator on its own — see the render-side
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2).
+    //
+    // Cap-ownership model (replaces the old one-shot seed latches):
+    //   - `Fixed(n)`: the render-side `effective_cap` clamps `n` directly, so a
+    //     manual "show N tiles" choice takes effect on the NEXT render with NO
+    //     dependency on a `client_render_fps` diagnostics event. The loop also
+    //     clamps `decode_budget_cap` as a backstop / state bookkeeping.
+    //   - `Auto`, never pressured: `effective_cap` tracks the live natural tile
+    //     count EXACTLY (== `total_tiles`, ∩ CANVAS_LIMIT). A healthy machine
+    //     therefore shows ALL natural tiles from the first render and keeps
+    //     showing every peer that joins later (staggered joins) with ZERO
+    //     avatars — independent of any FPS-event timing. `decode_budget_cap` is
+    //     NOT consulted on this path; the loop keeps `state.cap` synced to
+    //     `natural` so the first down-step starts from the displayed value.
+    //   - `Auto`, pressured: once the loop has measured sustained pressure and
+    //     taken a down-step, `decode_budget_pressured` latches true and the loop
+    //     becomes the sole owner of `decode_budget_cap`, applying its
+    //     conservative anti-oscillation growth. `effective_cap` then reads
+    //     `decode_budget_cap`.
+    let initial_cap = match *decode_budget_override.peek() {
+        DecodeBudgetOverride::Fixed(n) => n.clamp(MIN_CAP, CANVAS_LIMIT),
+        DecodeBudgetOverride::Auto => MIN_CAP,
+    };
+    let mut decode_budget_cap = use_signal(|| initial_cap);
+    // "Has a pressure-driven down-step occurred this Auto session?" (HCL #987
+    // review FIX 1 + FIX 2). While `false`, an Auto cap tracks the natural tile
+    // count exactly (render-side `effective_cap`), so a capable machine shows
+    // every peer — including staggered joins — with no avatars and no dependence
+    // on the ~1 Hz control-loop cadence. The control loop latches this `true`
+    // the first time `decide_step` returns `Down`, after which the loop owns the
+    // cap with its conservative growth. The latch stays set for the rest of the
+    // Auto session (a machine that has demonstrated it can struggle stays in
+    // conservative adaptive mode — safe, and only affects machines that genuinely
+    // hit pressure). It is reset to `false` on a Fixed -> Auto transition so
+    // resuming Auto re-reveals all natural tiles immediately.
+    let mut decode_budget_pressured = use_signal(|| false);
+    // Previous value of `decode_budget_override`, tracked in render scope so a
+    // render-driven `use_effect` can detect a Fixed -> Auto transition and reset
+    // the pressured latch IMMEDIATELY, with no dependence on the ~1 Hz control
+    // loop (HCL #987 review). Seeded to the current override so the very first
+    // render observes no transition. Read via `.peek()` inside the effect (never
+    // reactively) so writing it back cannot self-retrigger the effect.
+    let mut prev_override = use_signal(|| *decode_budget_override.peek());
+    // The uncapped layout tile count (`total_tiles`), republished from render
+    // so the async control loop can pass it to `decide_step` as `natural_count`
+    // and never raise the cap above what the layout would actually show.
+    // Seeded at MIN_CAP (matching the Auto cap seed pre-join); render overwrites
+    // it with the live `total_tiles` on the first frame, after which the loop
+    // seeds/tracks the cap up to it.
+    let mut decode_budget_natural = use_signal(|| MIN_CAP);
     // Viewport size signal — updated on window resize so layout recomputes.
     let mut viewport_version = use_signal(|| 0u32);
     {
@@ -1736,6 +1800,9 @@ pub fn AttendantsComponent(
     use_context_provider(|| DockPositionCtx(dock_position));
     use_context_provider(|| AutohideCtx(autohide_enabled));
     use_context_provider(|| DensityModeCtx(density_mode));
+    // Provide the decode-budget override so the settings UI (task 1a.5) can read
+    // and mutate it. Exposed exactly like density: a single shared signal.
+    use_context_provider(|| DecodeBudgetCtx(decode_budget_override));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -1829,6 +1896,309 @@ pub fn AttendantsComponent(
         }
     });
 
+    // --- Adaptive decode-budget control loop (issue #987, task 1a.3) ---
+    //
+    // A single lifecycle-scoped async task subscribes to the videocall
+    // diagnostics bus and drives the decode-budget actuator. It is modelled on
+    // the shared `peer_status` subscriber above: `subscribe()` inside a
+    // `spawn`, then `while let Ok(evt) = rx.recv().await`.
+    //
+    // It consumes exactly two `client_perf` metrics (see
+    // `videocall-client/src/{render_fps,long_tasks}.rs`):
+    //   - `client_render_fps`           (f64, emitted at ~1 Hz)  → sample cadence
+    //   - `client_longtask_duration_ms` (f64, event-driven)      → summed per bucket
+    //
+    // Every render-fps tick we close the current 1-second bucket: build a
+    // `BudgetSample` from the latest FPS plus the *sum* of long-task durations
+    // observed in that bucket (= longtask_ms_per_sec), push it into a rolling
+    // ~5-sample window, then call `decide_step`. The control loop — not
+    // `decide_step` — owns `BudgetState`: it increments `direction_hold` on each
+    // consecutive recovery-qualifying sample, resets it to 0 the moment recovery
+    // breaks, and on an applied Down/Up step updates `cap` and sets
+    // `last_step_ms = now_ms`. Cadence is driven off the 1 Hz render-fps event,
+    // never the 5 s health-reporter tick.
+    //
+    // Pressured-latch cap-ownership model (HCL #987 review FIX 1 + FIX 2,
+    // replaces the old one-shot seed latches):
+    //   - While NOT pressured (Auto): the render-side `effective_cap` tracks the
+    //     live `natural` tile count exactly, so a capable machine shows ALL
+    //     tiles (including staggered joins) with no avatars and NO dependence on
+    //     this loop's cadence. This loop does NOT write `decode_budget_cap` on
+    //     that path; it only keeps `state.cap` synced to `natural` so that, when
+    //     pressure first hits, `decide_step`'s down-step starts from the value
+    //     actually on screen rather than a stale seed. The FIRST time
+    //     `decide_step` returns `Down`, the loop latches `decode_budget_pressured`
+    //     true, applies the down-step, and writes `decode_budget_cap`.
+    //   - While pressured (Auto): this loop is the SOLE owner of
+    //     `decode_budget_cap`, running the existing Down/Up/Hold-growth logic
+    //     (including the non-distress growth gate, which now correctly governs
+    //     only RE-growth after real pressure). The latch stays set for the
+    //     session (a machine that demonstrated it can struggle stays in
+    //     conservative adaptive mode). It is reset on a Fixed -> Auto transition.
+    let mut decode_budget_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    use_effect(move || {
+        let task = spawn(async move {
+            use crate::components::decode_budget::{
+                non_distress_growth_qualifying, recovery_qualifying, STEP_UP_COOLDOWN_MS,
+                SUSTAIN_SAMPLES,
+            };
+            use videocall_diagnostics::{now_ms, MetricValue};
+
+            /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
+            /// `decide_step` always has a full sustain window once warmed up.
+            const WINDOW: usize = 5;
+
+            let mut rx = videocall_diagnostics::subscribe();
+            // Rolling window of finished 1-second samples (most-recent-last).
+            let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
+            // Sum of long-task durations observed in the *current* (open) bucket.
+            let mut longtask_bucket_ms: f64 = 0.0;
+            // Controller-owned budget state. `cap` is seeded from the current
+            // actuator value; switching the override Auto -> Fixed -> Auto
+            // re-seeds it from whatever the cap is at that moment.
+            let mut state = BudgetState {
+                cap: *decode_budget_cap.peek(),
+                last_step_ms: 0.0,
+                direction_hold: 0,
+            };
+            // Tracks the last override we acted on so we can detect a transition
+            // back to Auto and cleanly re-seed `state` from the live cap.
+            let mut last_override = *decode_budget_override.peek();
+
+            while let Ok(evt) = rx.recv().await {
+                if evt.subsystem != "client_perf" {
+                    continue;
+                }
+
+                // Accumulate long-task durations into the open bucket. These
+                // arrive asynchronously between render-fps ticks.
+                for m in &evt.metrics {
+                    if m.name == "client_longtask_duration_ms" {
+                        if let MetricValue::F64(dur) = &m.value {
+                            longtask_bucket_ms += *dur;
+                        }
+                    }
+                }
+
+                // Only a render-fps event closes a bucket and advances the loop.
+                let render_fps = evt.metrics.iter().find_map(|m| {
+                    if m.name == "client_render_fps" {
+                        if let MetricValue::F64(v) = &m.value {
+                            return Some(*v);
+                        }
+                    }
+                    None
+                });
+                let Some(fps) = render_fps else {
+                    continue;
+                };
+
+                // Close the 1-second bucket into a sample and reset the bucket.
+                let sample = BudgetSample {
+                    render_fps: Some(fps),
+                    longtask_ms_per_sec: longtask_bucket_ms,
+                };
+                longtask_bucket_ms = 0.0;
+                samples.push(sample);
+                if samples.len() > WINDOW {
+                    let overflow = samples.len() - WINDOW;
+                    samples.drain(0..overflow);
+                }
+
+                // ---- Override handling (DECISION: hard override) ----
+                let current_override = *decode_budget_override.peek();
+                let natural = *decode_budget_natural.peek();
+
+                // Detect a return to Auto and re-seed BudgetState from the live
+                // cap so the loop resumes cleanly without a phantom step.
+                if current_override != last_override {
+                    if current_override == DecodeBudgetOverride::Auto {
+                        state = BudgetState {
+                            cap: *decode_budget_cap.peek(),
+                            last_step_ms: now_ms() as f64,
+                            direction_hold: 0,
+                        };
+                        // Loop-local hygiene: re-seed BudgetState so the loop
+                        // resumes cleanly without a phantom step. The pressured
+                        // latch reset now happens RENDER-SIDE (a `use_effect`
+                        // watching `decode_budget_override`), so resuming Auto
+                        // re-reveals all natural tiles immediately without waiting
+                        // for this FPS-gated loop to advance (HCL #987 review).
+                        // The loop re-latches pressured=true below only if it
+                        // measures fresh pressure after the Auto resume.
+                    }
+                    last_override = current_override;
+                }
+
+                if let DecodeBudgetOverride::Fixed(n) = current_override {
+                    // Hard override: bypass decide_step entirely and clamp the
+                    // actuator to n, the natural count, and CANVAS_LIMIT. The
+                    // upper bound (natural ∩ CANVAS_LIMIT) is floored at MIN_CAP
+                    // so `clamp` can never see `max < min` (natural may be 0
+                    // before any peers join).
+                    // MIN_CAP (1) < CANVAS_LIMIT, so this clamp never sees
+                    // `max < min`; it also floors a 0 natural count at MIN_CAP.
+                    let upper = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                    let forced = n.clamp(MIN_CAP, upper);
+                    if *decode_budget_cap.peek() != forced {
+                        decode_budget_cap.set(forced);
+                    }
+                    // Keep state.cap in sync so an Auto resume starts here.
+                    state.cap = forced;
+                    continue;
+                }
+
+                // ---- Auto path ----
+                let now = now_ms() as f64;
+                let pressured = *decode_budget_pressured.peek();
+
+                if !pressured {
+                    // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
+                    // render-side `effective_cap` already shows ALL natural tiles
+                    // here (including staggered joins), so this loop does NOT
+                    // write `decode_budget_cap`. It only keeps `state.cap` synced
+                    // to the live `natural` so that, when pressure FIRST hits,
+                    // `decide_step` computes the down-step from the value actually
+                    // on screen rather than a stale MIN_CAP seed. Likewise keep
+                    // `direction_hold` book-keeping live so the strict-recovery
+                    // gate is warm if we ever do step down then recover.
+                    state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+
+                    let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
+                    if qualifies {
+                        state.direction_hold = state.direction_hold.saturating_add(1);
+                    } else {
+                        state.direction_hold = 0;
+                    }
+
+                    // Only a DOWN decision matters before pressure: it latches
+                    // the controller into ownership of the cap. Up/Hold are
+                    // irrelevant here because the un-pressured cap already equals
+                    // natural (the maximum the loop would ever grow to).
+                    if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
+                    {
+                        decode_budget_pressured.set(true);
+                        state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                        state.last_step_ms = now;
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                    }
+                    continue;
+                }
+
+                // ---- Pressured Auto path: the loop is the sole cap owner ----
+                let step = decide_step(&samples, &state, natural, now);
+
+                // Controller owns direction_hold: increment per consecutive
+                // recovery-qualifying sample, reset to 0 when recovery breaks.
+                // We call the SAME `recovery_qualifying` helper that
+                // `decide_step` uses for its step-up gate (HCL #987 review
+                // FIX 6) so the two can never silently drift apart.
+                let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
+                if qualifies {
+                    state.direction_hold = state.direction_hold.saturating_add(1);
+                } else {
+                    state.direction_hold = 0;
+                }
+
+                // Apply the step: the controller owns cap + last_step_ms.
+                match step {
+                    BudgetStep::Down(magnitude) => {
+                        // Proportional/multi-tile down-step (HCL #987 review
+                        // FIX 4): `magnitude` is 1 under mild pressure, larger
+                        // under catastrophic pressure. Floor at MIN_CAP.
+                        state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
+                        state.last_step_ms = now;
+                        // A down-step ends the recovery streak. Because the
+                        // last_step_ms is updated here, the non-distress growth
+                        // gate below is held off by the up-cooldown, so a machine
+                        // that just dropped a tile under pressure cannot
+                        // instantly re-add it (anti-oscillation).
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                    }
+                    BudgetStep::Up => {
+                        state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
+                        state.last_step_ms = now;
+                        // A consumed up-step resets the recovery streak so the
+                        // next up-step must re-earn RECOVERY_HOLD samples.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                    }
+                    BudgetStep::Hold => {
+                        // Non-distress growth gate (HCL #987 review FIX 1).
+                        //
+                        // `decide_step` returned Hold, which means it did not see
+                        // a *strict-recovery* up-step (that path needs median FPS
+                        // >= FPS_STEP_UP=30 + RECOVERY_HOLD + up-cooldown). But a
+                        // perfectly healthy machine on a 30 Hz panel reports ~29
+                        // fps — it sits in the 24-30 hysteresis band forever and
+                        // would NEVER reach natural through the strict gate. That
+                        // is the dead-band trap the previous warm-up climb was
+                        // trying (and failing) to paper over.
+                        //
+                        // The rule we use to grow the cap toward `natural` here is
+                        // the COMPLEMENT of the step-DOWN condition — "not under
+                        // measured pressure" — rather than the strict recovery
+                        // gate:
+                        //
+                        //     median_fps >= FPS_STEP_DOWN  (>= 24, the distress
+                        //                                   floor; INCLUDES the
+                        //                                   24-30 band)
+                        //   AND every sample's longtask < LONGTASK_BUSY_MS_PER_SEC
+                        //
+                        // Why this avoids the dead band: a steady 29 fps idle
+                        // machine satisfies `>= FPS_STEP_DOWN`, so the cap can
+                        // RE-grow back toward == natural and HOLD there after a
+                        // pressure-driven down-step. (This arm only runs once
+                        // pressured; the un-pressured cap already equals natural.)
+                        //
+                        // Why this still preserves anti-oscillation: growth is
+                        // rate-limited to one tile per STEP_UP_COOLDOWN_MS using
+                        // the SAME `last_step_ms` that the Down arm refreshes. So
+                        // a machine that just dropped a tile under real pressure
+                        // cannot re-add it until a full up-cooldown has elapsed
+                        // with no further down-step — exactly the behaviour the
+                        // strict recovery gate gives, without excluding the 24-30
+                        // band. A genuinely flapping machine keeps tripping the
+                        // down condition (which refreshes last_step_ms and resets
+                        // direction_hold), so the up-cooldown never elapses and
+                        // the cap does not yo-yo. The strict recovery gate in
+                        // `decide_step` is simply the stricter subset of this
+                        // rule and remains the path that fires when FPS is in the
+                        // healthy >= 30 band.
+                        // `non_distress_growth_qualifying` is the single source
+                        // of truth for the non-distress condition (and returns
+                        // false on a short/incomplete window, so no underflow).
+                        let target = natural.max(MIN_CAP);
+                        let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
+                        let not_distressed =
+                            non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
+                        if state.cap < target && up_cooldown_elapsed && not_distressed {
+                            state.cap += 1;
+                            state.last_step_ms = now;
+                            decode_budget_cap.set(state.cap);
+                        }
+                    }
+                }
+            }
+        });
+        decode_budget_task.write().replace(task);
+    });
+    use_drop(move || {
+        if let Some(task) = decode_budget_task.peek().as_ref() {
+            task.cancel();
+        }
+    });
+
+    // --- Test-only decode-budget injection hooks (issue #987, task 1a.6) ---
+    // Register `window.__videocall_inject_render_fps` /
+    // `window.__videocall_inject_longtask` so E2E specs can drive the adaptive
+    // control loop synthetically. The registration is itself gated on
+    // `MOCK_PEERS_ENABLED`, so it is a no-op (and attaches nothing to `window`)
+    // in production where that runtime-config flag is false.
+    use_hook(crate::components::decode_budget_inject::register_decode_budget_inject_hooks);
+
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
     // the entire meeting view on every audio-level tick.
     // Note: host glow is intentionally not suppressed by pin state so the local
@@ -1919,6 +2289,37 @@ pub fn AttendantsComponent(
     // Mock peers are layout-only placeholders and don't carry that cost.
     let capped_real = num_display_peers.min(CANVAS_LIMIT);
     let total_tiles = capped_real + mock_count;
+    // Republish the uncapped layout tile count so the adaptive decode-budget
+    // control loop (task 1a.3) can pass it to `decide_step` as `natural_count`
+    // and never raise the cap above what the layout would actually render.
+    // Writing only on change keeps this off the per-render hot path.
+    if *decode_budget_natural.peek() != total_tiles {
+        decode_budget_natural.set(total_tiles);
+    }
+
+    // Render-driven Fixed -> Auto pressured-reset (HCL #987 review). Reads
+    // `decode_budget_override` REACTIVELY so this effect re-runs the instant the
+    // override changes — independent of the ~1 Hz control loop. On a transition
+    // INTO Auto from a non-Auto value, clear the pressured latch so the
+    // render-side `effective_cap` re-reveals ALL natural tiles on the very next
+    // render (a previously-pressured machine no longer waits for an FPS tick to
+    // drop its reduced `decode_budget_cap`).
+    //
+    // It fires ONLY on the transition: `prev_override` is peeked (not read
+    // reactively), so writing it back does not self-retrigger, and while the
+    // override stays Auto `prev == current == Auto` makes the body a no-op — it
+    // therefore never fights the loop's mid-Auto pressure latch (the loop sets
+    // pressured=true on a real down-step; this effect leaves that alone).
+    use_effect(move || {
+        let current = decode_budget_override();
+        let previous = *prev_override.peek();
+        if previous != DecodeBudgetOverride::Auto && current == DecodeBudgetOverride::Auto {
+            decode_budget_pressured.set(false);
+        }
+        if previous != current {
+            prev_override.set(current);
+        }
+    });
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
     let vw = window()
@@ -2044,12 +2445,103 @@ pub fn AttendantsComponent(
         t
     };
 
-    let (visible_tile_count, overflow_count) = if total_tiles > effective_visible {
-        let visible = effective_visible.saturating_sub(1).max(1);
-        (visible, total_tiles - visible)
+    // --- Adaptive decode-budget actuator (issue #987, task 1a.3) ---
+    // `effective_cap` is the real actuator: the ceiling on the number of RENDERED
+    // video tiles, folded into the same overflow path that density /
+    // min-tile-width already use (one more upper bound on how many tiles fit).
+    //
+    // It is derived HERE, in render scope, from REACTIVE reads of the override
+    // and pressured signals (`.read()`, not `.peek()`), so the render re-runs the
+    // instant either changes — this is what makes a manual "show N tiles" choice
+    // (HCL #987 review FIX 1) and an un-pressured Auto machine's staggered-join
+    // tracking (HCL #987 review FIX 2) take effect on the NEXT render with NO
+    // dependency on the ~1 Hz control-loop / `client_render_fps` event:
+    //
+    //   - `Fixed(n)`           → clamp `n` to [MIN_CAP, total_tiles ∩ CANVAS_LIMIT]
+    //   - `Auto`, NOT pressured → `total_tiles ∩ CANVAS_LIMIT` (== natural; tracks
+    //                             joins immediately, ZERO avatars)
+    //   - `Auto`, pressured     → `decode_budget_cap()` (the loop owns the cap
+    //                             with its conservative anti-oscillation growth)
+    //
+    // On a healthy, unpressured machine (or one showing exactly `n` <= natural
+    // tiles) `effective_cap >= layout_limit`, so the `min()` below is a no-op and
+    // all displayed peers decode, including the mock-peer / `debug_peer_count`
+    // path. Avatars only materialise once Auto has measured real pressure and the
+    // loop steps `decode_budget_cap` below the layout capacity.
+    //
+    // Capping `visible_tile_count` here naturally shrinks `visible_tiles` (the
+    // slice below) and therefore the `active_decode_set` derived from it, so we
+    // do NOT cap the decode set independently of layout.
+    //
+    // --- Three buckets (issue #987, task 1a.4) ---
+    // The decode-budget cap and the natural layout capacity are SEPARATE
+    // ceilings, and they partition the sorted tile list into three buckets:
+    //
+    //   1. Decoded video tiles  `[0 .. visible_tile_count)`
+    //        Bounded by the decode-budget cap. These feed `active_decode_set`
+    //        and render live `<canvas>` video via `PeerTile`.
+    //   2. Off-budget avatar tiles `[visible_tile_count .. displayed_tile_count)`
+    //        Peers that the LAYOUT could show but the budget cap excludes from
+    //        decode. They render as initials/avatar placeholders (no video
+    //        decode → the CPU saving) but stay on screen so the user still sees
+    //        who is present. Audio is untouched (see note below).
+    //   3. True overflow `[displayed_tile_count .. total_tiles)`
+    //        Peers beyond the natural layout capacity. Folded into the `+N`
+    //        badge exactly as before.
+    //
+    // CRITICAL no-cap invariant: whether the `+N` badge appears depends ONLY on
+    // the layout capacity (`effective_visible`), never on the budget cap. When
+    // the controller is idle (healthy, unpressured Auto), `effective_cap` equals
+    // `total_tiles ∩ CANVAS_LIMIT`, so `budget_cap >= effective_visible` always
+    // holds: `decoded_limit == layout_limit`, `avatar_count == 0`, and
+    // `visible_tile_count` / `overflow_count` are byte-for-byte identical to the
+    // pre-1a.4 values. The avatar tier only materialises when `effective_cap <
+    // effective_visible` — i.e. after the loop steps the cap down under measured
+    // pressure (Auto, pressured), or under an explicit `Fixed(n)` below natural.
+    //
+    // Audio note: `active_decode_set` (built below from `visible_tiles`) gates
+    // ONLY video decode via `client.set_active_decode_set`. Audio playback runs
+    // through the independent NetEQ path and the per-peer diagnostics stream
+    // every `PeerTile` subscribes to globally, neither of which consults this
+    // set. Avatar-tier (and even +N-overflow) peers therefore remain audible.
+    //
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2). Reactive reads
+    // (`.read()`) so a change to either signal re-runs render immediately, with
+    // no dependence on the 1 Hz control loop.
+    let canvas_capped_natural = total_tiles.min(CANVAS_LIMIT);
+    let effective_cap = match *decode_budget_override.read() {
+        // Manual hard override takes effect on the NEXT render, no FPS event
+        // required. `total_tiles.clamp(MIN_CAP, CANVAS_LIMIT)` floors a 0-peer
+        // upper bound at MIN_CAP so `clamp` never sees `max < min`.
+        DecodeBudgetOverride::Fixed(n) => {
+            n.clamp(MIN_CAP, total_tiles.clamp(MIN_CAP, CANVAS_LIMIT))
+        }
+        // Un-pressured Auto: cap == natural, so staggered joins are decoded
+        // immediately and no avatars appear.
+        DecodeBudgetOverride::Auto if !decode_budget_pressured() => canvas_capped_natural,
+        // Pressured Auto: the control loop owns the cap.
+        DecodeBudgetOverride::Auto => decode_budget_cap(),
+    };
+    let budget_cap = effective_cap;
+    // Natural layout capacity (already bounded by CANVAS_LIMIT through
+    // `total_tiles`/`capped_real`). This decides the +N badge boundary.
+    let layout_limit = effective_visible;
+    // Decode-budget ceiling: how many of the displayed tiles may decode video.
+    let decoded_limit = layout_limit.min(budget_cap.max(MIN_CAP));
+    // Tiles actually placed in the grid (video + avatar), and the +N count.
+    // Reserve one grid slot for the badge only when there is true overflow
+    // beyond the layout capacity — identical to the prior badge logic.
+    let (displayed_tile_count, overflow_count) = if total_tiles > layout_limit {
+        let displayed = layout_limit.saturating_sub(1).max(1);
+        (displayed, total_tiles - displayed)
     } else {
         (total_tiles, 0)
     };
+    // Bucket 1 / bucket 2 split within the displayed tiles. `visible_tile_count`
+    // keeps its meaning: the count of DECODED video tiles. The remainder are
+    // off-budget avatar tiles.
+    let visible_tile_count = displayed_tile_count.min(decoded_limit);
+    let avatar_tile_count = displayed_tile_count - visible_tile_count;
     // --- Build unified tile list (real + mock peers) sorted by join time ---
     // Tiles are ordered by join time (earliest first) rather than by speech
     // activity. This provides a stable, predictable grid that doesn't shuffle
@@ -2093,8 +2585,46 @@ pub fn AttendantsComponent(
         );
     }
 
-    // The visible portion of the unified tile list (used by the normal grid layout).
+    // --- Pinned-peer promotion (HCL #987 review FIX 7) ---
+    // A pinned peer is force-added to `active_decode_set` (phase 3, below), so
+    // it is ALWAYS decoded regardless of the budget cap. If that peer is ranked
+    // beyond `visible_tile_count` (e.g. it joined late and is silent), it would
+    // otherwise land in `avatar_tiles` and render with `force_avatar = true`
+    // ("Video paused") while it is in fact being decoded — wasted decode AND a
+    // misleading UI. Promote it into the decoded bucket so decode and render
+    // agree. We swap it into the LAST decoded slot to disturb ordering least.
+    if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
+        if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
+            // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
+            // the pinned peer's tile index by mapping each session_id back to
+            // its user_id. Mock tiles ("mock-N") never match a real user_id.
+            let pinned_idx = all_tiles.iter().position(|tile_id| {
+                client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+            });
+            if let Some(idx) = pinned_idx {
+                if idx >= visible_tile_count {
+                    // Swap the pinned peer into the last decoded slot.
+                    all_tiles.swap(visible_tile_count - 1, idx);
+                }
+            }
+        }
+    }
+
+    // Bucket 1: the DECODED portion of the unified tile list. These render live
+    // video and seed `active_decode_set` below. (Used by the normal grid layout.)
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
+    // Bucket 2 (issue #987, task 1a.4): off-budget avatar tiles. These are the
+    // tiles the layout could show but the decode-budget cap excludes from video
+    // decode. They render as initials/avatar placeholders so the user still sees
+    // who is present (and keeps hearing them — audio is independent of the decode
+    // set). Empty unless the budget cap is below the natural layout capacity, so
+    // the no-cap path produces an empty slice and is unchanged.
+    let avatar_tiles: Vec<String> = all_tiles
+        .iter()
+        .skip(visible_tile_count)
+        .take(avatar_tile_count)
+        .cloned()
+        .collect();
 
     // Build the peer-list sidebar entries keyed by `session_id` so each open
     // browser tab is its own row. `user_id` is carried alongside only for
@@ -2242,10 +2772,16 @@ pub fn AttendantsComponent(
     }
 
     // Tile count drives the `participants-N` class modifier on the grid
-    // container, which lets CSS branch layout behavior (see
-    // `.participants-1 .grid-item.full-bleed` rule in style.css that drops
-    // the 3:2 cap on the lone tile for the 2-peer meeting case — HCL #7).
-    let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
+    // container AND the `compute_layout` cell sizing, which lets CSS branch
+    // layout behavior (see `.participants-1 .grid-item.full-bleed` rule in
+    // style.css that drops the 3:2 cap on the lone tile for the 2-peer meeting
+    // case — HCL #7).
+    //
+    // Must count BOTH decoded video tiles AND off-budget avatar tiles (task
+    // 1a.4), because both occupy real grid cells. `avatar_tile_count` is 0 when
+    // no budget cap is active, so `displayed_tile_count == visible_tile_count`
+    // and this is identical to the pre-1a.4 value.
+    let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 };
 
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
@@ -2971,6 +3507,50 @@ pub fn AttendantsComponent(
                                             key: "tile-{tile_id}",
                                             peer_id: tile_id.clone(),
                                             full_bleed,
+                                            host_user_id: host_user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Off-budget avatar tiles (issue #987, task 1a.4) ----
+                        // Peers the layout could show but the decode-budget cap
+                        // excluded from video decode. They render via the SAME
+                        // `PeerTile` component with `force_avatar: true`, so they
+                        // show the avatar/initials placeholder (no canvas, no
+                        // decode) while keeping name, mic state and host controls.
+                        // They are NOT in `active_decode_set` (it is built from
+                        // `visible_tiles` only), but their audio is untouched.
+                        // `avatar_tiles` is empty unless a budget cap is active,
+                        // so this loop is a no-op on the default path.
+                        for tile_id in avatar_tiles.iter() {
+                            {
+                                let is_mock = tile_id.starts_with("mock-");
+                                if is_mock {
+                                    rsx! {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            force_avatar: true,
+                                            host_user_id: host_user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
+                                            on_toggle_pin: move |_: String| {},
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            force_avatar: true,
                                             host_user_id: host_user_id.clone(),
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),

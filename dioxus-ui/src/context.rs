@@ -151,6 +151,73 @@ pub fn save_density_mode(mode: DensityMode) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Decode-budget override persistence
+// ---------------------------------------------------------------------------
+
+/// Manual override for the adaptive decode-budget controller.
+///
+/// `Auto` (the default) lets the adaptive control loop in `attendants.rs`
+/// decide how many tiles to decode. `Fixed(n)` is a **hard override**: it
+/// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
+/// type is purely the persisted/shared state — the bypass behavior lives in
+/// the control loop (task 1a.3), not here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DecodeBudgetOverride {
+    #[default]
+    Auto,
+    Fixed(usize),
+}
+
+/// Context for the decode-budget override.
+#[derive(Clone, Copy)]
+pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
+
+/// Parse a persisted decode-budget override string. Mirrors the density-mode
+/// manual-match style: `"auto"` (or any unparseable value) yields the default
+/// `Auto`; a positive integer string yields `Fixed(n)`. A stored `Fixed(0)`
+/// (or any value that fails to parse as a non-zero `usize`) collapses to
+/// `Auto`, since a zero-tile hard override is meaningless.
+fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
+    match raw {
+        "auto" => DecodeBudgetOverride::Auto,
+        other => match other.parse::<usize>() {
+            Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
+            _ => DecodeBudgetOverride::Auto,
+        },
+    }
+}
+
+/// Serialize a decode-budget override to its compact storage string: `"auto"`
+/// for `Auto`, or the bare integer for `Fixed(n)`.
+fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
+    match value {
+        DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Load the decode-budget override from localStorage. Defaults to `Auto`.
+pub fn load_decode_budget_override() -> DecodeBudgetOverride {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DECODE_BUDGET_OVERRIDE_KEY).ok().flatten())
+        .map(|v| parse_decode_budget_override(&v))
+        .unwrap_or_default()
+}
+
+/// Persist the decode-budget override to localStorage.
+pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(
+            DECODE_BUDGET_OVERRIDE_KEY,
+            &serialize_decode_budget_override(value),
+        );
+    }
+}
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
@@ -1111,6 +1178,76 @@ mod tests {
         // Compile-time check that DensityModeCtx implements Clone.
         fn _assert_clone<T: Clone>() {}
         _assert_clone::<DensityModeCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_default_is_auto() {
+        assert_eq!(DecodeBudgetOverride::default(), DecodeBudgetOverride::Auto);
+    }
+
+    #[test]
+    fn decode_budget_override_debug_impl() {
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Auto), "Auto");
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Fixed(4)), "Fixed(4)");
+    }
+
+    #[test]
+    fn decode_budget_override_clone_and_eq() {
+        let original = DecodeBudgetOverride::Fixed(8);
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(1));
+        assert_ne!(
+            DecodeBudgetOverride::Fixed(2),
+            DecodeBudgetOverride::Fixed(3)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_ctx_clone() {
+        // Compile-time check that DecodeBudgetCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DecodeBudgetCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_auto() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Auto);
+        assert_eq!(serialized, "auto");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Auto
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_fixed() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Fixed(12));
+        assert_eq!(serialized, "12");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Fixed(12)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_parse_invalid_falls_back_to_auto() {
+        // Garbage, empty, negative, and zero all collapse to the default Auto,
+        // mirroring the density-mode "_ => Auto" fallback semantics.
+        assert_eq!(
+            parse_decode_budget_override("garbage"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(parse_decode_budget_override(""), DecodeBudgetOverride::Auto);
+        assert_eq!(
+            parse_decode_budget_override("-5"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(
+            parse_decode_budget_override("0"),
+            DecodeBudgetOverride::Auto
+        );
     }
 
     #[test]

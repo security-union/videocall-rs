@@ -43,7 +43,8 @@ message PacketWrapper {
   bytes user_id = 2;
   bytes data = 3;
   uint64 session_id = 4;
-  // field 5 reserved for simulcast_layer_id (#989/PR #993); see discussion #890
+  // Simulcast layer id (#989/PR #993); see discussion #890.
+  uint32 simulcast_layer_id = 5;
   // Cleartext discriminator; see MediaKind. Default 0 = unspecified = fail-open.
   MediaKind media_kind = 6;
 }

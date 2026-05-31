@@ -65,6 +65,7 @@ collect_added_lines() {
 if ! collect_added_lines | awk '
   /^\+\+\+ b\// {
     file = substr($0, 7)
+    in_block_comment = 0
     next
   }
   /^\+/ && $0 !~ /^\+\+\+/ {
@@ -77,12 +78,28 @@ if ! collect_added_lines | awk '
     # guardrail does not care about them — and this avoids false positives on
     # GitHub issue/PR references like "#987" (three valid hex chars) that live
     # in code comments. Real colors in CSS rules / string literals are still
-    # caught because those lines do not start with a comment marker. Covers
-    # Rust line comments (// /// //!) and CSS/block-comment lines (/* and the
-    # leading "*" of continuation lines).
+    # caught because those lines do not start with a comment marker.
     trimmed = line
     sub(/^[[:space:]]+/, "", trimmed)
-    if (trimmed ~ /^(\/\/|\/\*|\*)/) { next }
+    if (in_block_comment) {
+      if (trimmed ~ /\*\//) {
+        sub(/^.*\*\//, "", line)
+        in_block_comment = 0
+        if (line ~ /^[[:space:]]*$/) { next }
+      } else {
+        next
+      }
+    } else if (trimmed ~ /^\/\//) {
+      next
+    } else if (trimmed ~ /^\/\*/) {
+      if (trimmed ~ /\*\//) {
+        sub(/^[[:space:]]*\/\*.*\*\//, "", line)
+        if (line ~ /^[[:space:]]*$/) { next }
+      } else {
+        in_block_comment = 1
+        next
+      }
+    }
     if (line ~ /(^|[^A-Za-z_0-9#])#[0-9A-Fa-f]{3,8}([[:space:][:punct:]]|$)|(^|[^A-Za-z_0-9])rgba?[[:space:]]*\([^)]*\)|(^|[^A-Za-z_0-9])hsla?[[:space:]]*\([^)]*\)/) {
       key = file ":" line
       if (!(key in seen)) {

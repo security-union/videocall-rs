@@ -613,19 +613,20 @@ lazy_static! {
     /// "VIEWPORT received" visibility via the `accepted` outcome.
     ///
     /// `outcome` is bounded — exactly 4 values:
-    /// - `accepted`:     update was applied to the receiver's set.
-    /// - `rate_limited`: arrived within `VIEWPORT_MIN_UPDATE_INTERVAL` of the
-    ///   last accepted update; consumed but ignored.
-    /// - `truncated`:    the session_id list exceeded `VIEWPORT_MAX_SESSION_IDS`
-    ///   and was capped (fail-open on the excess). Counted in ADDITION to
-    ///   `accepted` for the same packet (it was both truncated AND applied).
-    /// - `not_owner`:    arrived on a subject other than the receiver's own;
-    ///   dropped without mutating state (the forged-ownership defence).
+    /// - `accepted`:              update was applied to the receiver's set.
+    /// - `rate_limited`:          arrived within `VIEWPORT_MIN_UPDATE_INTERVAL`
+    ///   of the last accepted update; consumed but ignored.
+    /// - `truncated`:             the session_id list exceeded
+    ///   `VIEWPORT_MAX_SESSION_IDS` and was capped (fail-open on the excess).
+    ///   Counted in ADDITION to `accepted` for the same packet (it was both
+    ///   truncated AND applied).
+    /// - `ignored_other_subject`: arrived on a subject other than the receiver's
+    ///   own; expected for normal NATS fan-out and dropped without mutating state.
     ///
     /// CARDINALITY: bounded — `room` × 4 outcomes. No per-session label.
     pub static ref RELAY_VIEWPORT_UPDATES_TOTAL: CounterVec = register_counter_vec!(
         "relay_viewport_updates_total",
-        "VIEWPORT control-packet update outcomes per room (accepted|rate_limited|truncated|not_owner) (HCL #988)",
+        "VIEWPORT control-packet update outcomes per room (accepted|rate_limited|truncated|ignored_other_subject) (HCL #988)",
         &["room", "outcome"]
     )
     .expect("Failed to create relay_viewport_updates_total metric");
@@ -930,7 +931,12 @@ mod tests {
         // against label typos drifting between try_intercept_viewport and the
         // dashboard's `outcome=~` breakdown.
         let room = "wiretest_room_upd";
-        let outcomes = ["accepted", "rate_limited", "truncated", "not_owner"];
+        let outcomes = [
+            "accepted",
+            "rate_limited",
+            "truncated",
+            "ignored_other_subject",
+        ];
         let before: Vec<f64> = outcomes
             .iter()
             .map(|o| snapshot(&RELAY_VIEWPORT_UPDATES_TOTAL, &[room, o]))

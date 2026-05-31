@@ -72,6 +72,10 @@ pub struct ViewportSender {
     /// The visible subset most recently sent to the relay. Used to suppress
     /// duplicate VIEWPORT packets when the visible set is unchanged.
     last_sent: Vec<u64>,
+    /// Visible subset that should be sent once the outbound channel accepts it.
+    /// Set before an emit attempt and cleared only after the packet is queued,
+    /// so a transient full channel cannot permanently lose the first viewport.
+    pending: Option<Vec<u64>>,
     /// Whether we have emitted at least one VIEWPORT this connection.
     has_sent: bool,
     /// Channel to send outbound packets.
@@ -104,6 +108,7 @@ impl ViewportSender {
             visible_count,
             known_sources: BTreeSet::new(),
             last_sent: Vec::new(),
+            pending: None,
             has_sent: false,
             packet_tx,
             viewports_sent: Arc::new(AtomicU64::new(0)),
@@ -147,7 +152,8 @@ impl ViewportSender {
             return;
         }
 
-        self.emit_viewport(visible, "change");
+        self.pending = Some(visible);
+        self.flush_pending("change");
     }
 
     /// Re-assert the CURRENT viewport after a reconnect / re-election.
@@ -161,20 +167,23 @@ impl ViewportSender {
     ///
     /// This is a no-op when:
     ///   - legacy mode (`visible_count == None`) — the bot never filters,
-    ///   - nothing has ever been sent (`!has_sent`) — there is no prior viewport
-    ///     to restore, so a first-connect caller never double-sends, and
+    ///   - nothing has ever been sent and no failed send is pending — there is no
+    ///     prior viewport to restore, so a first-connect caller never double-sends,
+    ///     and
     ///   - the current visible subset is empty — an empty VIEWPORT is a relay
     ///     no-op (fail-open).
     ///
     /// Unlike the change-driven [`Self::on_source_seen`], this re-sends the
     /// current set *unconditionally* (the relay's copy is stale even though the
-    /// local set is unchanged), but it is rate-limited by [`MIN_RESEND_INTERVAL`]
-    /// so a periodic reconnect hook cannot spam identical packets. The
-    /// `known_sources` set is deliberately preserved across the reconnect, so
-    /// the re-send reflects exactly what the bot was rendering before the drop.
+    /// local set is unchanged), and it also retries a pending send that previously
+    /// failed because the outbound channel was full. Both paths are rate-limited
+    /// by [`MIN_RESEND_INTERVAL`] so a periodic reconnect hook cannot spam
+    /// identical packets. The `known_sources` set is deliberately preserved
+    /// across the reconnect, so the re-send reflects exactly what the bot was
+    /// rendering before the drop.
     pub fn resend_on_reconnect(&mut self) {
-        // Legacy mode, or no viewport ever established → nothing to restore.
-        if self.visible_count.is_none() || !self.has_sent {
+        // Legacy mode → nothing to restore.
+        if self.visible_count.is_none() {
             return;
         }
 
@@ -185,13 +194,45 @@ impl ViewportSender {
             }
         }
 
+        // A previous change-driven send may have failed because the outbound
+        // channel was full. Retry that exact pending set here even if no
+        // viewport has ever made it onto the wire yet.
+        if self.pending.is_some() {
+            if self.flush_pending("retry") {
+                self.last_resend = Some(Instant::now());
+            }
+            return;
+        }
+
+        // No viewport ever established and no failed pending send → nothing to
+        // restore, so a first-connect caller never double-sends.
+        if !self.has_sent {
+            return;
+        }
+
         let visible = self.compute_visible();
         if visible.is_empty() {
             return;
         }
 
-        if self.emit_viewport(visible, "reconnect") {
+        self.pending = Some(visible);
+        if self.flush_pending("reconnect") {
             self.last_resend = Some(Instant::now());
+        }
+    }
+
+    /// Try to queue the current pending viewport. The pending value is cleared
+    /// only after a successful send, so transient channel backpressure is
+    /// retried by the periodic reset/reconnect hook.
+    fn flush_pending(&mut self, reason: &str) -> bool {
+        let Some(visible) = self.pending.clone() else {
+            return false;
+        };
+        if self.emit_viewport(visible, reason) {
+            self.pending = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -204,7 +245,7 @@ impl ViewportSender {
                 let frame = OutboundFrame::new(MediaTypeLabel::Other, bytes);
                 if self.packet_tx.try_send(frame).is_err() {
                     warn!(
-                        "[{}] Failed to send VIEWPORT ({} sessions, channel full, will retry)",
+                        "[{}] Failed to send VIEWPORT ({} sessions, channel full, will retry on reset/source change)",
                         self.self_user_id,
                         visible.len()
                     );
@@ -382,6 +423,30 @@ mod tests {
             "no viewport established yet → reconnect must be a no-op"
         );
         assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_initial_send_is_retried_on_reconnect_hook() {
+        // If the first VIEWPORT enqueue fails, the source is already known. The
+        // retry must not depend on seeing a new source or on has_sent=true.
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(1);
+        tx.try_send(OutboundFrame::new(MediaTypeLabel::Other, vec![0]))
+            .expect("prefill channel");
+        let mut vs = ViewportSender::new("bot-1".to_string(), Some(1), tx);
+
+        vs.on_source_seen(7);
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 0);
+        assert!(!vs.has_sent);
+        assert_eq!(vs.pending, Some(vec![7]));
+
+        let _ = rx.try_recv().expect("remove prefilled frame");
+        vs.resend_on_reconnect();
+
+        let (uid, ids) = parse_sent(&rx.try_recv().expect("retried viewport").bytes);
+        assert_eq!(uid, b"bot-1");
+        assert_eq!(ids, vec![7]);
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 1);
+        assert!(vs.pending.is_none());
     }
 
     #[tokio::test]

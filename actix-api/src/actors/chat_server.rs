@@ -1967,12 +1967,14 @@ fn try_intercept_viewport(
     // forge `wrapper.session_id`, but it cannot publish onto another session's
     // subject — the relay derives the subject from the authenticated
     // connection. If this VIEWPORT did not arrive on our own subject it is not
-    // ours: drop it without touching our set.
+    // ours: drop it without touching our set. This is expected for normal NATS
+    // fan-out: every other receiver sees the owner's VIEWPORT and ignores it.
     if msg.subject.as_str() != self_subject {
-        // Forged / cross-session VIEWPORT — dropped without mutating state.
-        // Surfaced so the ownership defence is not invisible (HCL #988 G3).
+        // Normal fan-out / other-subject VIEWPORT — dropped without mutating
+        // state. A forged payload is handled by the same subject-authoritative
+        // path, but this label intentionally does not imply an attack.
         RELAY_VIEWPORT_UPDATES_TOTAL
-            .with_label_values(&[room, "not_owner"])
+            .with_label_values(&[room, "ignored_other_subject"])
             .inc();
         return true;
     }

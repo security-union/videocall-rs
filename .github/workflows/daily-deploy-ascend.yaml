@@ -48,7 +48,7 @@ jobs:
           echo "Deploying images with tag: $TAG"
 
       - name: Checkout repository
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Add NATS Helm repo
         run: |
@@ -133,7 +133,6 @@ jobs:
 
           REQUIRED_SECRETS=(
             "postgres-credentials"
-            "google-oauth-credentials"
             "jwt-secret"
             "harbor-pull-secret"
             "videocall-cc7-wildcard-tls"
@@ -358,16 +357,14 @@ jobs:
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d)
 
-          # Get OAuth credentials
-          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-id}' | base64 -d)
-          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n ${NAMESPACE} -o jsonpath='{.data.client-secret}' | base64 -d)
-
           echo "Deploying Meeting API to ${NAMESPACE} with OAuth enabled..."
 
           # On Ascend:
           #  * Postgres is the existing "postgres-postgresql" service, database "actix-api-db".
           #  * TLS terminates at HAProxy; ingress uses plain HTTP.
-          #  * OAuth callback URL must be registered with Google for conceptcar7 domain.
+          #  * OAuth uses identity-service (id.conceptcar7.com) as the OIDC provider.
+          #    The frontend handles the PKCE flow; the meeting-api validates Bearer
+          #    tokens via JWKS fetched from the identity-service issuer.
           #  * consoleLogs: 200Gi PVC (ebs-sc is now expandable in-place if needed).
 
           helm upgrade --install videocall-api helm/meeting-api/ \
@@ -386,33 +383,31 @@ jobs:
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.videocall.conceptcar7.com" \
             --set "env[4].name=OAUTH_ISSUER" \
-            --set "env[4].value=https://accounts.google.com" \
+            --set "env[4].value=https://id.conceptcar7.com" \
             --set "env[5].name=OAUTH_CLIENT_ID" \
-            --set "env[5].value=${OAUTH_CLIENT_ID}" \
-            --set "env[6].name=OAUTH_SECRET" \
-            --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
-            --set "env[7].name=OAUTH_REDIRECT_URL" \
-            --set "env[7].value=https://api.videocall.conceptcar7.com/login/callback" \
-            --set "env[8].name=AFTER_LOGIN_URL" \
-            --set "env[8].value=https://app.videocall.conceptcar7.com" \
-            --set "env[9].name=OAUTH_SCOPES" \
-            --set "env[9].value=openid email profile" \
-            --set "env[10].name=ALLOWED_REDIRECT_URLS" \
-            --set "env[10].value=https://app.videocall.conceptcar7.com" \
-            --set "env[11].name=LISTEN_ADDR" \
-            --set "env[11].value=0.0.0.0:8081" \
-            --set "env[12].name=RUST_LOG" \
-            --set "env[12].value=info" \
-            --set "env[13].name=COOKIE_NAME" \
-            --set "env[13].value=videocall-session" \
-            --set "env[14].name=COOKIE_SECURE" \
-            --set-string "env[14].value=true" \
-            --set "env[15].name=SERVICE_VERSION_URLS" \
-            --set "env[15].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
-            --set "env[16].name=TOKEN_TTL_SECS" \
-            --set-string "env[16].value=86400" \
-            --set "env[17].name=NATS_URL" \
-            --set "env[17].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[5].value=client_01KRGZ7VSEAEMBJW0RF110J8R2" \
+            --set "env[6].name=OAUTH_REDIRECT_URL" \
+            --set "env[6].value=https://app.videocall.conceptcar7.com/auth/callback" \
+            --set "env[7].name=OAUTH_SCOPES" \
+            --set "env[7].value=openid email profile" \
+            --set "env[8].name=OAUTH_BROWSER_PKCE" \
+            --set-string "env[8].value=true" \
+            --set "env[9].name=ALLOWED_REDIRECT_URLS" \
+            --set "env[9].value=https://app.videocall.conceptcar7.com" \
+            --set "env[10].name=LISTEN_ADDR" \
+            --set "env[10].value=0.0.0.0:8081" \
+            --set "env[11].name=RUST_LOG" \
+            --set "env[11].value=info" \
+            --set "env[12].name=COOKIE_NAME" \
+            --set "env[12].value=videocall-session" \
+            --set "env[13].name=COOKIE_SECURE" \
+            --set-string "env[13].value=true" \
+            --set "env[14].name=SERVICE_VERSION_URLS" \
+            --set "env[14].value=http://videocall-websocket:8080/version\,http://videocall-webtransport-lb:444/version\,http://videocall-dioxus-ui:80/version.json" \
+            --set "env[15].name=TOKEN_TTL_SECS" \
+            --set-string "env[15].value=86400" \
+            --set "env[16].name=NATS_URL" \
+            --set "env[16].value=nats://nats.${NAMESPACE}.svc.cluster.local:4222" \
             --set resources.requests.cpu=100m \
             --set resources.requests.memory=128Mi \
             --set resources.limits.cpu=500m \
@@ -457,7 +452,9 @@ jobs:
             --set "runtimeConfig.webTransportHost=https://webtransport.videocall.conceptcar7.com:30056" \
             --set-string "runtimeConfig.webTransportEnabled=true" \
             --set-string "runtimeConfig.oauthEnabled=true" \
-            --set-string "runtimeConfig.oauthProvider=google" \
+            --set-string "runtimeConfig.oauthFlow=pkce" \
+            --set "runtimeConfig.oauthClientId=client_01KRGZ7VSEAEMBJW0RF110J8R2" \
+            --set "runtimeConfig.oauthIssuer=https://id.conceptcar7.com" \
             --set-string "runtimeConfig.e2eeEnabled=false" \
             --set-string "runtimeConfig.firefoxEnabled=false" \
             --set "runtimeConfig.usersAllowedToStream=" \

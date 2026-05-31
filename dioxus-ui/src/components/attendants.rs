@@ -2039,17 +2039,31 @@ pub fn AttendantsComponent(
                 if current_override != last_override {
                     // User override engaging: distinguish user-chosen caps from
                     // auto-shed in triage. Fixed(n) = manual hard cap; Auto = resume.
-                    match current_override {
-                        DecodeBudgetOverride::Fixed(n) => log::info!(
-                            "DecodeBudget: override=fixed n={} prev=auto natural={}",
-                            n,
-                            natural,
-                        ),
-                        DecodeBudgetOverride::Auto => log::info!(
-                            "DecodeBudget: override=auto prev=fixed natural={} cap={}",
-                            natural,
-                            *decode_budget_cap.peek(),
-                        ),
+                    match (last_override, current_override) {
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=auto natural={}",
+                                n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=fixed prev_n={} natural={}",
+                                n,
+                                prev_n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Auto) => {
+                            log::info!(
+                                "DecodeBudget: override=auto prev=fixed prev_n={} natural={} cap={}",
+                                prev_n,
+                                natural,
+                                *decode_budget_cap.peek(),
+                            )
+                        }
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Auto) => {}
                     }
                     if current_override == DecodeBudgetOverride::Auto {
                         state = BudgetState {

@@ -49,6 +49,7 @@ use protobuf::Message;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
@@ -77,7 +78,19 @@ pub struct ViewportSender {
     packet_tx: Sender<OutboundFrame>,
     /// Counter for total VIEWPORT packets sent.
     pub viewports_sent: Arc<AtomicU64>,
+    /// When the last *reconnect re-assert* (via [`Self::resend_on_reconnect`])
+    /// went out. Rate-limits the re-assert so a frequent reconnect/diagnostic
+    /// hook cannot spam identical VIEWPORTs. `None` until the first re-assert.
+    /// The change-driven [`Self::on_source_seen`] path is NOT gated by this —
+    /// it only fires when the visible set genuinely changes.
+    last_resend: Option<Instant>,
 }
+
+/// Minimum spacing between two reconnect re-asserts. The bot has no
+/// connection-state event (unlike the browser client), so the re-assert is
+/// driven off a periodic hook; this bound keeps an unconditional re-send from
+/// exceeding roughly one packet per interval even if that hook fires often.
+const MIN_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 
 impl ViewportSender {
     /// Create a new viewport sender. `visible_count == None` disables emission.
@@ -94,6 +107,7 @@ impl ViewportSender {
             has_sent: false,
             packet_tx,
             viewports_sent: Arc::new(AtomicU64::new(0)),
+            last_resend: None,
         }
     }
 
@@ -133,6 +147,58 @@ impl ViewportSender {
             return;
         }
 
+        self.emit_viewport(visible, "change");
+    }
+
+    /// Re-assert the CURRENT viewport after a reconnect / re-election.
+    ///
+    /// On disconnect the relay drops this bot's viewport subscription and a
+    /// reconnect allocates a fresh empty viewport (fail-open → the bot starts
+    /// receiving ALL video again, silently under-filtered). The browser client
+    /// re-sends its viewport on the `Connected` state edge for exactly this
+    /// reason (`video_call_client.rs::reset_for_reconnect`); the bot mirrors
+    /// that intent here.
+    ///
+    /// This is a no-op when:
+    ///   - legacy mode (`visible_count == None`) — the bot never filters,
+    ///   - nothing has ever been sent (`!has_sent`) — there is no prior viewport
+    ///     to restore, so a first-connect caller never double-sends, and
+    ///   - the current visible subset is empty — an empty VIEWPORT is a relay
+    ///     no-op (fail-open).
+    ///
+    /// Unlike the change-driven [`Self::on_source_seen`], this re-sends the
+    /// current set *unconditionally* (the relay's copy is stale even though the
+    /// local set is unchanged), but it is rate-limited by [`MIN_RESEND_INTERVAL`]
+    /// so a periodic reconnect hook cannot spam identical packets. The
+    /// `known_sources` set is deliberately preserved across the reconnect, so
+    /// the re-send reflects exactly what the bot was rendering before the drop.
+    pub fn resend_on_reconnect(&mut self) {
+        // Legacy mode, or no viewport ever established → nothing to restore.
+        if self.visible_count.is_none() || !self.has_sent {
+            return;
+        }
+
+        // Rate-limit: skip if a re-assert went out within the last interval.
+        if let Some(last) = self.last_resend {
+            if last.elapsed() < MIN_RESEND_INTERVAL {
+                return;
+            }
+        }
+
+        let visible = self.compute_visible();
+        if visible.is_empty() {
+            return;
+        }
+
+        if self.emit_viewport(visible, "reconnect") {
+            self.last_resend = Some(Instant::now());
+        }
+    }
+
+    /// Build and send a VIEWPORT for `visible`, updating `last_sent` / counters
+    /// on success. `reason` only labels the log line ("change" vs "reconnect").
+    /// Returns `true` if the packet was queued, `false` on build/channel error.
+    fn emit_viewport(&mut self, visible: Vec<u64>, reason: &str) -> bool {
         match build_viewport(&self.self_user_id, &visible) {
             Ok(bytes) => {
                 let frame = OutboundFrame::new(MediaTypeLabel::Other, bytes);
@@ -142,17 +208,20 @@ impl ViewportSender {
                         self.self_user_id,
                         visible.len()
                     );
+                    false
                 } else {
                     self.last_sent = visible.clone();
                     self.has_sent = true;
                     self.viewports_sent.fetch_add(1, Ordering::Relaxed);
                     info!(
-                        "[{}] Sent VIEWPORT rendering {} of {} known peer(s): {:?}",
+                        "[{}] Sent VIEWPORT ({}) rendering {} of {} known peer(s): {:?}",
                         self.self_user_id,
+                        reason,
                         visible.len(),
                         self.known_sources.len(),
                         visible
                     );
+                    true
                 }
             }
             Err(e) => {
@@ -160,6 +229,7 @@ impl ViewportSender {
                     "[{}] Failed to build VIEWPORT packet: {}",
                     self.self_user_id, e
                 );
+                false
             }
         }
     }
@@ -271,5 +341,89 @@ mod tests {
         vs.on_source_seen(5);
         assert!(rx.try_recv().is_err());
         assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_resends_current_viewport() {
+        // After a viewport is established, a reconnect must re-assert the SAME
+        // current visible subset unconditionally (the relay forgot it on the
+        // drop), even though the local set did not change. This is the #988
+        // fidelity fix: without it the bot silently receives all video again.
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
+
+        vs.on_source_seen(10); // [10]
+        vs.on_source_seen(20); // [10, 20]
+        let (_, ids) = parse_sent(&rx.try_recv().expect("emit 1").bytes);
+        assert_eq!(ids, vec![10]);
+        let (_, ids) = parse_sent(&rx.try_recv().expect("emit 2").bytes);
+        assert_eq!(ids, vec![10, 20]);
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
+
+        // Reconnect: known_sources is preserved (mirrors InboundStats::reset
+        // take/restore), so the re-assert re-sends the current [10, 20] subset.
+        vs.resend_on_reconnect();
+        let (uid, ids) = parse_sent(&rx.try_recv().expect("reconnect re-send").bytes);
+        assert_eq!(uid, b"bot-1");
+        assert_eq!(ids, vec![10, 20]);
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn reconnect_no_resend_when_never_sent() {
+        // A bot that has just connected and never rendered anyone must NOT emit
+        // on a reconnect hook — this is the first-connect double-send guard.
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
+
+        vs.resend_on_reconnect();
+        assert!(
+            rx.try_recv().is_err(),
+            "no viewport established yet → reconnect must be a no-op"
+        );
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reconnect_no_resend_in_legacy_mode() {
+        // Legacy mode (visible_count == None) never filters, so a reconnect
+        // re-assert must stay silent.
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let mut vs = ViewportSender::new("bot-1".to_string(), None, tx);
+        for sid in 1..=3 {
+            vs.on_source_seen(sid);
+        }
+        vs.resend_on_reconnect();
+        assert!(
+            rx.try_recv().is_err(),
+            "legacy mode must not emit on reconnect"
+        );
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reconnect_resend_is_rate_limited() {
+        // Two reconnect re-asserts in quick succession (well under
+        // MIN_RESEND_INTERVAL) must collapse to a single packet on the wire —
+        // a frequent reconnect/diagnostic hook cannot spam identical VIEWPORTs.
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
+
+        vs.on_source_seen(7); // [7]
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 1);
+
+        vs.resend_on_reconnect();
+        let (_, ids) = parse_sent(&rx.try_recv().expect("first re-assert").bytes);
+        assert_eq!(ids, vec![7]);
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
+
+        // Immediately again: inside the rate-limit window → suppressed.
+        vs.resend_on_reconnect();
+        assert!(
+            rx.try_recv().is_err(),
+            "re-assert within MIN_RESEND_INTERVAL must be suppressed"
+        );
+        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
     }
 }

@@ -36,6 +36,7 @@ Introduced in PR #564 on branch `feat/bot-adaptive-quality-and-netsim`:
 | V16 | Costume video resolution limitation (720p fixed) doesn't break AQ decisions | ⚠️ KNOWN LIMITATION | documented; AQ logs warning when tier requests <720p |
 | V17 | Bot `media_kind` lets the relay viewport-filter bot VIDEO (no longer optimistic) | 🟦 DESIGN COMPLETE — PENDING REAL RUN | code done on `feat/988-bot-and-relay-observability`; unit tests + clippy green; not yet exercised against a live #988 relay |
 | V18 | Bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end | 🟦 DESIGN COMPLETE — PENDING REAL RUN | code + 5 `viewport_sender` unit tests green; E2E `video_bytes` drop not yet measured on a cluster |
+| V19 | Bot re-asserts its `VIEWPORT` after a viewport-subscription loss (reconnect / re-election / relay idle) so filtering does not silently lapse | 🟦 DESIGN COMPLETE — PENDING REAL RUN | `resend_on_reconnect()` + 4 unit tests green (re-send current set, no-send-when-never-sent, no-send-in-legacy, rate-limited); E2E recovery not yet measured |
 
 ### #988 viewport-fidelity validation detail
 
@@ -68,6 +69,36 @@ How to verify (needs a #988-enabled relay):
 2. Read the bot's own `inbound_stats` RX-STATS line (the 10s `video=… KB` field in `inbound_stats.rs::report`) — per-source `video_bytes` for the 6 *hidden* sources should fall to ~0 after the VIEWPORT is sent, while the 3 visible sources keep flowing. AUDIO for all 9 stays unaffected.
 3. Compare against a `viewport_visible_count: null` (legacy) control run: every source's `video_bytes` should remain non-zero (relay fails open, forwards all VIDEO).
 4. Cross-check `relay_viewport_filtered_total` increments on the relay in lockstep with the bot's `video_bytes` drop.
+
+**V19 — bot re-asserts its `VIEWPORT` after a subscription loss.**
+The relay drops a receiver's viewport subscription on disconnect; on reconnect /
+re-election it allocates a fresh empty viewport (fail-open → all VIDEO flows
+again). The browser client recovers by re-sending its viewport on the
+`Connected` state edge (`video_call_client.rs::reset_for_reconnect`). The bot has
+no equivalent connection-state event, and `InboundStats::reset()` preserves the
+`ViewportSender` (take/restore) across its 10s diagnostic window — so the
+sender's `known_sources` / `last_sent` / `has_sent` survive, and the
+change-driven `on_source_seen` path would NOT re-emit (the sources are already
+known). Without a re-assert the bot would silently receive all VIDEO again for
+the rest of the run, masking the very saving #988 measures.
+
+`ViewportSender::resend_on_reconnect()` re-sends the CURRENT visible subset
+unconditionally (the relay's copy is stale even though the local set is
+unchanged). It is invoked from `InboundStats::reset()` after the sender is
+restored. It is a no-op when legacy (`visible_count == None`), when no viewport
+was ever established (`has_sent == false` → first-connect never double-sends),
+or when the visible subset is empty; and it is rate-limited
+(`MIN_RESEND_INTERVAL = 5s`) so the 10s reset cadence cannot spam identical
+packets. Because the trigger is periodic rather than edge-driven, the re-assert
+heals ANY subscription loss (reconnect, re-election, relay idle-timeout), not
+just an in-process reconnect — the bot currently has no in-process reconnect
+loop, so this is the robust forward-looking hook.
+
+How to verify (needs a #988-enabled relay):
+1. Run a fleet with `viewport_visible_count: N` and establish steady-state filtering (per V18: hidden sources' `video_bytes` ≈ 0).
+2. Force a viewport-subscription loss for one bot (restart the relay pod it is pinned to, or trigger a re-election) without restarting the bot process.
+3. Confirm the hidden sources' `video_bytes` briefly rises (relay re-allocated an empty fail-open viewport) then falls back to ≈ 0 within one 10s reset window as the bot re-asserts; `relay_viewport_filtered_total` resumes incrementing.
+4. Confirm the bot log shows `Sent VIEWPORT (reconnect) ...` and `viewports_sent` increments on the re-assert.
 
 ## Test runs
 

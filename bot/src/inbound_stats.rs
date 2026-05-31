@@ -423,6 +423,28 @@ impl InboundStats {
         {
             self.metrics = metrics;
         }
+
+        // Re-assert the VIEWPORT (#988 load-test fidelity). The relay drops a
+        // bot's viewport subscription on disconnect, and a reconnect / re-election
+        // allocates a fresh empty viewport (fail-open → the bot silently receives
+        // ALL video again). The real browser client re-sends its viewport on the
+        // `Connected` state edge to recover from this; the bot has no such event,
+        // so we re-assert off this periodic reset hook instead.
+        //
+        // reset-vs-first-connect: this hook is the 10s diagnostic-window reset,
+        // NOT a dedicated reconnect callback, so it also fires during a healthy
+        // connection. `resend_on_reconnect` is therefore idempotent and guarded:
+        // it no-ops until a viewport has actually been established (`has_sent`),
+        // so a bot that just connected and has not yet rendered anyone never
+        // double-sends, and it is rate-limited (MIN_RESEND_INTERVAL) so the 10s
+        // cadence cannot spam identical packets. The `known_sources` set is
+        // preserved across reset (it is take/restored above), so the re-assert
+        // reflects exactly the subset the bot was rendering. Net effect: any
+        // subscription loss is healed within one reset window, while a steady
+        // connection re-asserts a tiny control packet at most once per window.
+        if let Some(ref mut vs) = self.viewport_sender {
+            vs.resend_on_reconnect();
+        }
     }
 
     /// Remove entries from ALL per-sender maps for senders not seen within `max_age`.

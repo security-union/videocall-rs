@@ -216,6 +216,11 @@ services:
       - WEBTRANSPORT_ENABLED=true
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
+      # Enable the mock-peers debug feature so layout-driven specs (e.g.
+      # decode-budget.spec.ts, issue #987 task 1a.6) can synthesize peer tiles
+      # without spinning up N real browser contexts. This flag also gates the
+      # test-only `window.__videocall_inject_render_fps` injection hook.
+      - MOCK_PEERS_ENABLED=true
       - USERS_ALLOWED_TO_STREAM=
       - DIOXUS_SERVE_MODE=${DIOXUS_SERVE_MODE:-dev}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target

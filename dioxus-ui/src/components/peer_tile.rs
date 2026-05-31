@@ -70,6 +70,14 @@ pub fn PeerTile(
     /// popup-state map keys on `(peer_id, meter_mode)`.
     #[props(default = SignalMeterMode::Full)]
     meter_mode: SignalMeterMode,
+    /// Issue #987, task 1a.4: render this tile as an off-budget avatar tile.
+    /// When `true`, the adaptive decode-budget controller has excluded the peer
+    /// from `active_decode_set`, so the tile shows the avatar/initials
+    /// placeholder instead of a live video canvas (no decode pipeline is bound)
+    /// while keeping the peer's name, mic state and host controls. Defaults to
+    /// `false`, so existing call sites render exactly as before.
+    #[props(default = false)]
+    force_avatar: bool,
     on_toggle_pin: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
@@ -515,6 +523,7 @@ pub fn PeerTile(
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,
+        force_avatar,
     )
 }
 

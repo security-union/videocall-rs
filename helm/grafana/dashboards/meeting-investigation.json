@@ -1591,7 +1591,242 @@
         "h": 1,
         "w": 24,
         "x": 0,
+        "y": 54
+      },
+      "id": 43,
+      "title": "Decode-Budget (Client-Side)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
         "y": 55
+      },
+      "id": 44,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_decode_budget_effective_cap{meeting_id=~\"$meeting\"}",
+          "legendFormat": "{{display_name}} cap",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_decode_budget_natural{meeting_id=~\"$meeting\"}",
+          "legendFormat": "{{display_name}} natural",
+          "refId": "B"
+        }
+      ],
+      "title": "Decode Budget: Effective Cap vs Natural",
+      "description": "Per-session effective visible-tile cap (what the client is decoding) vs the natural/unconstrained tile count. The gap natural - cap = tiles shed to avatars under decode pressure. A widening gap on a session means that client is shedding video.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 55
+      },
+      "id": 45,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(videocall_decode_budget_pressured{meeting_id=~\"$meeting\"})",
+          "legendFormat": "sessions under pressure",
+          "refId": "A"
+        }
+      ],
+      "title": "Decode Budget: Sessions Under Pressure",
+      "description": "Count of sessions with the pressured latch engaged (decode_budget_pressured==1), i.e. actively shedding tiles to avatars. A fleet-wide rise = widespread weak-hardware distress.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "unspecified",
+                  "index": 0
+                },
+                "1": {
+                  "text": "auto",
+                  "index": 1
+                },
+                "2": {
+                  "text": "fixed",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 55
+      },
+      "id": 46,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_decode_budget_override_mode{meeting_id=~\"$meeting\"}",
+          "legendFormat": "mode {{display_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_decode_budget_override_fixed_n{meeting_id=~\"$meeting\"}",
+          "legendFormat": "fixed-n {{display_name}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Decode Budget: Override Mode & Fixed Cap",
+      "description": "User override mode per session (0=unspecified, 1=auto, 2=fixed) with the chosen fixed cap (override_fixed_n) overlaid. mode=2 means the user manually capped tiles (user-chosen), vs auto-shed by the system - important for triage.",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
       },
       "id": 26,
       "title": "Meeting Overview",
@@ -1630,7 +1865,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 46
+        "y": 65
       },
       "id": 27,
       "options": {
@@ -1692,7 +1927,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 46
+        "y": 65
       },
       "id": 28,
       "options": {
@@ -1757,7 +1992,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 46
+        "y": 65
       },
       "id": 29,
       "options": {
@@ -1791,7 +2026,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 63
       },
       "id": 30,
       "title": "Server Resources (CPU & Memory vs Limits)",
@@ -1845,7 +2080,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 64
       },
       "id": 31,
       "options": {
@@ -1924,7 +2159,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 64
       },
       "id": 32,
       "options": {
@@ -1993,7 +2228,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 64
       },
       "id": 33,
       "options": {
@@ -2060,7 +2295,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 63
+        "y": 72
       },
       "id": 34,
       "options": {
@@ -2108,7 +2343,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 63
+        "y": 72
       },
       "id": 35,
       "options": {
@@ -2159,7 +2394,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 63
+        "y": 72
       },
       "id": 36,
       "options": {
@@ -2187,7 +2422,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 80
       },
       "id": 42,
       "title": "Adaptive Quality Debugging",

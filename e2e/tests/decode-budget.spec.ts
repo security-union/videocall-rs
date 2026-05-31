@@ -217,11 +217,10 @@ test.describe("Adaptive decode budget (#987)", () => {
       return;
     }
 
-    // Baseline (review FIX 1): in Auto the cap SEEDS directly at the natural
-    // peer count the moment the loop sees it — no MIN_CAP climb, no warm-up
-    // ramp. So all 12 mock tiles decode with no pressure → cap == natural, and
-    // there are no off-budget avatars. The timeout covers only the seed latch
-    // closing on the first ~1 Hz loop tick after the peers materialize.
+    // Baseline (review FIX 1 + FIX 2): in un-pressured Auto the effective cap is
+    // DERIVED at render time as `total_tiles` — it tracks the natural peer count
+    // exactly with NO dependence on a `client_render_fps` loop tick. So all 12
+    // mock tiles decode immediately with zero off-budget avatars.
     await expect(decodedTiles(page)).toHaveCount(12, { timeout: 15_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
 
@@ -316,9 +315,10 @@ test.describe("Adaptive decode budget (#987)", () => {
     );
     await closeSettingsModal(page);
 
-    // Baseline (review FIX 1): the cap seeds directly at the natural peer count,
-    // so with no injected pressure all mock tiles decode immediately and none
-    // are off-budget — cap == natural from the start, no warm-up ramp.
+    // Baseline (review FIX 1 + FIX 2): the un-pressured Auto cap is render-derived
+    // as `total_tiles`, so with no injected pressure all mock tiles decode
+    // immediately and none are off-budget — cap == natural from the start, no
+    // warm-up ramp and no dependence on a loop tick.
     await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
 
@@ -362,5 +362,93 @@ test.describe("Adaptive decode budget (#987)", () => {
     // timing-dependent.
     const decodedAfterUp = await injectUntil(HIGH_FPS, MAX_UP_SAMPLES, (d) => d > decodedAfterDown);
     expect(decodedAfterUp).toBeGreaterThan(decodedAfterDown);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 3 — manual override takes effect with NO render-fps event (review
+  // FIX 1). REGRESSION GUARD: the effective cap is derived at render time from
+  // the override signal, so selecting Fixed(n) must produce exactly n decoded
+  // tiles WITHOUT any `client_render_fps` event advancing the control loop.
+  // This test deliberately NEVER calls the injection hook before asserting.
+  // ──────────────────────────────────────────────────────────────────────
+  test("manual override takes effect immediately without any render-fps event", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    // Wide viewport so all mock tiles fit the natural layout (no +N badge): the
+    // off-budget assertion stays about the BUDGET cap, not layout overflow.
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "override_no_fps_event");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+
+    // Start in Auto, un-pressured: all tiles decode immediately (render-derived
+    // cap == natural). We do NOT inject any FPS sample at any point in this test.
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await page.locator('[data-testid="decode-budget-6"]').click();
+    await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+
+    // KEY ASSERTION: exactly 6 decoded tiles and 6 off-budget avatars appear
+    // purely from the override change re-running render — no FPS event was
+    // injected, so the control loop never advanced. (Finding 1 regression guard.)
+    await expect(decodedTiles(page)).toHaveCount(6, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(MOCK_PEERS - 6, { timeout: 15_000 });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 4 — un-pressured Auto decodes staggered joins immediately (review
+  // FIX 2). A healthy machine that never measured pressure must show ALL peers,
+  // including ones that join LATER. We start with a low mock count (all
+  // decoded), then RAISE the count (simulating staggered joins) and assert every
+  // new peer is decoded immediately — no off-budget avatars — WITHOUT injecting
+  // any low-FPS pressure.
+  // ──────────────────────────────────────────────────────────────────────
+  test("un-pressured auto decodes staggered peer joins immediately", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "auto_staggered_joins");
+
+    const hasMockPeers = await setMockPeers(page, 4);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+
+    // Ensure Auto (default, but explicit & resilient). No FPS pressure is ever
+    // injected in this test, so the machine stays un-pressured throughout.
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+
+    // Initial healthy state: all 4 tiles decode, no avatars.
+    await expect(decodedTiles(page)).toHaveCount(4, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    // Staggered joins: raise the mock count to 12. Every new peer must decode
+    // immediately — the un-pressured Auto cap tracks `total_tiles` at render
+    // time, so it grows with the join in a single render (no per-tick climb, no
+    // off-budget avatars). (Finding 2 regression guard.)
+    await setMockPeers(page, 12);
+    await expect(decodedTiles(page)).toHaveCount(12, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
   });
 });

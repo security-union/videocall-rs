@@ -880,6 +880,33 @@ mod tests {
     }
 
     #[test]
+    fn first_down_step_starts_from_natural_not_stale_seed() {
+        // Pressured-latch model (HCL #987 review FIX 1 + FIX 2): while NOT
+        // pressured, the control loop keeps `state.cap` synced to the displayed
+        // `natural` count, so the FIRST pressure-driven down-step's magnitude is
+        // computed against what is actually on screen — never a stale MIN_CAP
+        // seed. This pins that contract at the pure layer: with cap == natural
+        // and catastrophic FPS, the proportional drop is ceil(natural * 0.25),
+        // and applying it lands at natural - that magnitude (floored at MIN_CAP).
+        let natural = 20;
+        // Loop syncs state.cap to natural before pressure hits.
+        let state = state_with_cap(natural);
+        let severe = [
+            fps_sample(FPS_SEVERE - 1.0),
+            fps_sample(FPS_SEVERE),
+            fps_sample(FPS_SEVERE - 2.0),
+        ];
+        let step = decide_step(&severe, &state, natural, PAST_COOLDOWN);
+        // ceil(20 * 0.25) = 5.
+        assert_eq!(step, BudgetStep::Down(5));
+        if let BudgetStep::Down(magnitude) = step {
+            // This mirrors the loop's first-down-step application off `natural`.
+            let applied = natural.saturating_sub(magnitude).max(MIN_CAP);
+            assert_eq!(applied, 15, "first down-step lands at natural - magnitude");
+        }
+    }
+
+    #[test]
     fn hysteresis_band_holds_between_thresholds() {
         // Median FPS sits in the dead-band (above STEP_DOWN, below STEP_UP):
         // neither step fires regardless of recovery hold.

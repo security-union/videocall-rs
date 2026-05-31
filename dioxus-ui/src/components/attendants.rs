@@ -583,41 +583,45 @@ pub fn AttendantsComponent(
     // Loaded first so the initial `decode_budget_cap` can honour a persisted
     // `Fixed(n)` immediately (no first-render flash; HCL #987 review FIX 2).
     let decode_budget_override = use_signal(load_decode_budget_override);
-    // `decode_budget_cap` is the actuator output: the maximum number of video
-    // tiles the layout is allowed to render.
+    // `decode_budget_cap` is the control-loop-owned cap: the maximum number of
+    // video tiles the layout may decode AFTER the loop has measured real
+    // pressure. It is NOT the actuator on its own — see the render-side
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2).
     //
-    // Seeding (HCL #987 review FIX 1 + FIX 2):
-    //   - In `Auto`, seed DIRECTLY at the natural tile count (floored at
-    //     MIN_CAP). At mount no peers have joined yet, so `natural` is 0 and the
-    //     seed is MIN_CAP; render republishes the live `total_tiles` and the
-    //     control loop's non-distress growth gate tracks the cap up to it. The
-    //     key invariant: from the first render a HEALTHY machine shows ALL
-    //     natural tiles with ZERO ramp and ZERO avatars — tiles only ever DROP
-    //     under measured pressure. (The old MIN_CAP seed + warm-up climb caused
-    //     a dead-band trap on 30 Hz / throttled panels that report ~29 fps and
-    //     never reached the strict FPS_STEP_UP=30 recovery gate, leaving a
-    //     healthy user stuck at a single decoded tile.)
-    //   - In `Fixed(n)`, seed directly to the clamped `n` so a saved hard
-    //     override applies on the very first render instead of flashing the Auto
-    //     value for one loop tick.
+    // Cap-ownership model (replaces the old one-shot seed latches):
+    //   - `Fixed(n)`: the render-side `effective_cap` clamps `n` directly, so a
+    //     manual "show N tiles" choice takes effect on the NEXT render with NO
+    //     dependency on a `client_render_fps` diagnostics event. The loop also
+    //     clamps `decode_budget_cap` as a backstop / state bookkeeping.
+    //   - `Auto`, never pressured: `effective_cap` tracks the live natural tile
+    //     count EXACTLY (== `total_tiles`, ∩ CANVAS_LIMIT). A healthy machine
+    //     therefore shows ALL natural tiles from the first render and keeps
+    //     showing every peer that joins later (staggered joins) with ZERO
+    //     avatars — independent of any FPS-event timing. `decode_budget_cap` is
+    //     NOT consulted on this path; the loop keeps `state.cap` synced to
+    //     `natural` so the first down-step starts from the displayed value.
+    //   - `Auto`, pressured: once the loop has measured sustained pressure and
+    //     taken a down-step, `decode_budget_pressured` latches true and the loop
+    //     becomes the sole owner of `decode_budget_cap`, applying its
+    //     conservative anti-oscillation growth. `effective_cap` then reads
+    //     `decode_budget_cap`.
     let initial_cap = match *decode_budget_override.peek() {
         DecodeBudgetOverride::Fixed(n) => n.clamp(MIN_CAP, CANVAS_LIMIT),
         DecodeBudgetOverride::Auto => MIN_CAP,
     };
     let mut decode_budget_cap = use_signal(|| initial_cap);
-    // One-shot render-side seed latch (HCL #987 review FIX 1). The cap signal is
-    // created at mount before any peers exist (Auto seed = MIN_CAP). The async
-    // control loop seeds the cap up to the natural count, but it is driven off
-    // the ~1 Hz `client_render_fps` diagnostics event, so relying on it alone
-    // would leave a freshly joined Auto user showing a single decoded tile +
-    // avatars for up to ~1 s until the first event lands. To honour the
-    // invariant "a healthy machine shows ALL natural tiles from the first
-    // render", the render body ALSO snaps the cap up to the live `total_tiles`
-    // the first time peers appear under Auto — independent of the event cadence.
-    // The latch fires exactly once per Auto session (re-armed on a Fixed -> Auto
-    // transition by the override-change effect) so it never fights the loop's
-    // measured-pressure down-steps.
-    let mut decode_budget_seeded = use_signal(|| false);
+    // "Has a pressure-driven down-step occurred this Auto session?" (HCL #987
+    // review FIX 1 + FIX 2). While `false`, an Auto cap tracks the natural tile
+    // count exactly (render-side `effective_cap`), so a capable machine shows
+    // every peer — including staggered joins — with no avatars and no dependence
+    // on the ~1 Hz control-loop cadence. The control loop latches this `true`
+    // the first time `decide_step` returns `Down`, after which the loop owns the
+    // cap with its conservative growth. The latch stays set for the rest of the
+    // Auto session (a machine that has demonstrated it can struggle stays in
+    // conservative adaptive mode — safe, and only affects machines that genuinely
+    // hit pressure). It is reset to `false` on a Fixed -> Auto transition so
+    // resuming Auto re-reveals all natural tiles immediately.
+    let mut decode_budget_pressured = use_signal(|| false);
     // The uncapped layout tile count (`total_tiles`), republished from render
     // so the async control loop can pass it to `decide_step` as `natural_count`
     // and never raise the cap above what the layout would actually show.
@@ -1906,6 +1910,24 @@ pub fn AttendantsComponent(
     // breaks, and on an applied Down/Up step updates `cap` and sets
     // `last_step_ms = now_ms`. Cadence is driven off the 1 Hz render-fps event,
     // never the 5 s health-reporter tick.
+    //
+    // Pressured-latch cap-ownership model (HCL #987 review FIX 1 + FIX 2,
+    // replaces the old one-shot seed latches):
+    //   - While NOT pressured (Auto): the render-side `effective_cap` tracks the
+    //     live `natural` tile count exactly, so a capable machine shows ALL
+    //     tiles (including staggered joins) with no avatars and NO dependence on
+    //     this loop's cadence. This loop does NOT write `decode_budget_cap` on
+    //     that path; it only keeps `state.cap` synced to `natural` so that, when
+    //     pressure first hits, `decide_step`'s down-step starts from the value
+    //     actually on screen rather than a stale seed. The FIRST time
+    //     `decide_step` returns `Down`, the loop latches `decode_budget_pressured`
+    //     true, applies the down-step, and writes `decode_budget_cap`.
+    //   - While pressured (Auto): this loop is the SOLE owner of
+    //     `decode_budget_cap`, running the existing Down/Up/Hold-growth logic
+    //     (including the non-distress growth gate, which now correctly governs
+    //     only RE-growth after real pressure). The latch stays set for the
+    //     session (a machine that demonstrated it can struggle stays in
+    //     conservative adaptive mode). It is reset on a Fixed -> Auto transition.
     let mut decode_budget_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
     use_effect(move || {
         let task = spawn(async move {
@@ -1935,15 +1957,6 @@ pub fn AttendantsComponent(
             // Tracks the last override we acted on so we can detect a transition
             // back to Auto and cleanly re-seed `state` from the live cap.
             let mut last_override = *decode_budget_override.peek();
-            // One-shot seed-at-natural latch (HCL #987 review FIX 1). The cap
-            // signal is created at mount, before any peers exist, so its Auto
-            // seed is MIN_CAP. The instant the loop first sees a live `natural`
-            // count it snaps the cap UP to it (no pressure ⇒ show everyone). This
-            // is NOT a per-tick climb: it fires once per Auto session so a freshly
-            // joined healthy machine shows ALL natural tiles immediately. It is
-            // re-armed on a Fixed -> Auto transition so resuming Auto re-reveals
-            // tiles up to natural at once.
-            let mut needs_seed = matches!(last_override, DecodeBudgetOverride::Auto);
 
             while let Ok(evt) = rx.recv().await {
                 if evt.subsystem != "client_perf" {
@@ -1998,13 +2011,12 @@ pub fn AttendantsComponent(
                             last_step_ms: now_ms() as f64,
                             direction_hold: 0,
                         };
-                        // Re-arm BOTH seed-at-natural latches so a return to Auto
-                        // re-reveals all natural tiles at once on a healthy
-                        // machine (HCL #987 review FIX 1): `needs_seed` for this
-                        // loop and `decode_budget_seeded` for the render-side
-                        // fast path.
-                        needs_seed = true;
-                        decode_budget_seeded.set(false);
+                        // Resuming Auto clears the pressured latch so the
+                        // render-side `effective_cap` re-reveals ALL natural
+                        // tiles immediately on a healthy machine (HCL #987 review
+                        // FIX 1 + FIX 2). The loop will only re-take ownership of
+                        // the cap if it measures fresh pressure.
+                        decode_budget_pressured.set(false);
                     }
                     last_override = current_override;
                 }
@@ -2029,22 +2041,43 @@ pub fn AttendantsComponent(
 
                 // ---- Auto path ----
                 let now = now_ms() as f64;
+                let pressured = *decode_budget_pressured.peek();
 
-                // Seed-at-natural (HCL #987 review FIX 1). The cap signal was
-                // created at mount with an Auto seed of MIN_CAP because `natural`
-                // was 0 then. The first time the loop sees a live `natural`,
-                // snap the cap straight up to it: a healthy machine shows ALL
-                // tiles from the start with no ramp and no avatars. Tiles only
-                // ever drop later under measured pressure. Fires once per Auto
-                // session (re-armed on Fixed -> Auto).
-                if needs_seed && natural > MIN_CAP {
-                    let seeded = natural.min(CANVAS_LIMIT);
-                    state.cap = seeded;
-                    state.last_step_ms = now;
-                    decode_budget_cap.set(seeded);
-                    needs_seed = false;
+                if !pressured {
+                    // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
+                    // render-side `effective_cap` already shows ALL natural tiles
+                    // here (including staggered joins), so this loop does NOT
+                    // write `decode_budget_cap`. It only keeps `state.cap` synced
+                    // to the live `natural` so that, when pressure FIRST hits,
+                    // `decide_step` computes the down-step from the value actually
+                    // on screen rather than a stale MIN_CAP seed. Likewise keep
+                    // `direction_hold` book-keeping live so the strict-recovery
+                    // gate is warm if we ever do step down then recover.
+                    state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+
+                    let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
+                    if qualifies {
+                        state.direction_hold = state.direction_hold.saturating_add(1);
+                    } else {
+                        state.direction_hold = 0;
+                    }
+
+                    // Only a DOWN decision matters before pressure: it latches
+                    // the controller into ownership of the cap. Up/Hold are
+                    // irrelevant here because the un-pressured cap already equals
+                    // natural (the maximum the loop would ever grow to).
+                    if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
+                    {
+                        decode_budget_pressured.set(true);
+                        state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                        state.last_step_ms = now;
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                    }
+                    continue;
                 }
 
+                // ---- Pressured Auto path: the loop is the sole cap owner ----
                 let step = decide_step(&samples, &state, natural, now);
 
                 // Controller owns direction_hold: increment per consecutive
@@ -2107,8 +2140,9 @@ pub fn AttendantsComponent(
                         //
                         // Why this avoids the dead band: a steady 29 fps idle
                         // machine satisfies `>= FPS_STEP_DOWN`, so the cap can
-                        // climb to == natural and HOLD there. A 60 fps machine
-                        // likewise reaches natural (and was already seeded there).
+                        // RE-grow back toward == natural and HOLD there after a
+                        // pressure-driven down-step. (This arm only runs once
+                        // pressured; the un-pressured cap already equals natural.)
                         //
                         // Why this still preserves anti-oscillation: growth is
                         // rate-limited to one tile per STEP_UP_COOLDOWN_MS using
@@ -2253,21 +2287,6 @@ pub fn AttendantsComponent(
     if *decode_budget_natural.peek() != total_tiles {
         decode_budget_natural.set(total_tiles);
     }
-    // Render-side one-shot seed (HCL #987 review FIX 1): the first time peers
-    // appear under Auto, snap the cap straight up to the natural tile count so a
-    // healthy machine shows ALL tiles immediately — without waiting for the
-    // control loop's ~1 Hz event-driven seed. Fires once per Auto session
-    // (latch re-armed on Fixed -> Auto). Guarded on the latch (not on
-    // `cap == MIN_CAP`) so it never re-fires after the loop steps the cap down
-    // to the MIN_CAP floor under real pressure. Writing only on the latching
-    // transition keeps this off the per-render hot path.
-    if matches!(*decode_budget_override.peek(), DecodeBudgetOverride::Auto)
-        && !*decode_budget_seeded.peek()
-        && total_tiles > MIN_CAP
-    {
-        decode_budget_cap.set(total_tiles.min(CANVAS_LIMIT));
-        decode_budget_seeded.set(true);
-    }
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
     let vw = window()
@@ -2394,16 +2413,28 @@ pub fn AttendantsComponent(
     };
 
     // --- Adaptive decode-budget actuator (issue #987, task 1a.3) ---
-    // The control loop publishes a `decode_budget_cap` ceiling on the number of
-    // RENDERED video tiles. Fold it into the same overflow path that density /
-    // min-tile-width already use, by treating the budget as one more upper bound
-    // on how many tiles fit. Under Auto, `decode_budget_cap` is SEEDED directly
-    // at the natural tile count (`total_tiles`) the first time peers appear —
-    // both by the render-side one-shot latch above and by the control loop
-    // (HCL #987 review FIX 1) — and the loop/override never exceed `total_tiles`,
-    // so on a healthy, unpressured machine this `min()` is a no-op and all peers
-    // decode, including the mock-peer / `debug_peer_count` path. The cap only
-    // drops below `total_tiles` once the loop measures real pressure.
+    // `effective_cap` is the real actuator: the ceiling on the number of RENDERED
+    // video tiles, folded into the same overflow path that density /
+    // min-tile-width already use (one more upper bound on how many tiles fit).
+    //
+    // It is derived HERE, in render scope, from REACTIVE reads of the override
+    // and pressured signals (`.read()`, not `.peek()`), so the render re-runs the
+    // instant either changes — this is what makes a manual "show N tiles" choice
+    // (HCL #987 review FIX 1) and an un-pressured Auto machine's staggered-join
+    // tracking (HCL #987 review FIX 2) take effect on the NEXT render with NO
+    // dependency on the ~1 Hz control-loop / `client_render_fps` event:
+    //
+    //   - `Fixed(n)`           → clamp `n` to [MIN_CAP, total_tiles ∩ CANVAS_LIMIT]
+    //   - `Auto`, NOT pressured → `total_tiles ∩ CANVAS_LIMIT` (== natural; tracks
+    //                             joins immediately, ZERO avatars)
+    //   - `Auto`, pressured     → `decode_budget_cap()` (the loop owns the cap
+    //                             with its conservative anti-oscillation growth)
+    //
+    // On a healthy, unpressured machine (or one showing exactly `n` <= natural
+    // tiles) `effective_cap >= layout_limit`, so the `min()` below is a no-op and
+    // all displayed peers decode, including the mock-peer / `debug_peer_count`
+    // path. Avatars only materialise once Auto has measured real pressure and the
+    // loop steps `decode_budget_cap` below the layout capacity.
     //
     // Capping `visible_tile_count` here naturally shrinks `visible_tiles` (the
     // slice below) and therefore the `active_decode_set` derived from it, so we
@@ -2427,21 +2458,38 @@ pub fn AttendantsComponent(
     //
     // CRITICAL no-cap invariant: whether the `+N` badge appears depends ONLY on
     // the layout capacity (`effective_visible`), never on the budget cap. When
-    // the controller is idle (healthy, unpressured), `decode_budget_cap()` sits
-    // at its seeded natural-count value (`total_tiles`, ∩ CANVAS_LIMIT) and the
-    // loop/override never exceed `total_tiles`, so `budget_cap >=
-    // effective_visible` always holds: `decoded_limit == layout_limit`,
-    // `avatar_count == 0`, and `visible_tile_count` / `overflow_count` are
-    // byte-for-byte identical to the pre-1a.4 values. The avatar tier only
-    // materialises when `decode_budget_cap < effective_visible` — i.e. after the
-    // loop steps the cap down under measured pressure.
+    // the controller is idle (healthy, unpressured Auto), `effective_cap` equals
+    // `total_tiles ∩ CANVAS_LIMIT`, so `budget_cap >= effective_visible` always
+    // holds: `decoded_limit == layout_limit`, `avatar_count == 0`, and
+    // `visible_tile_count` / `overflow_count` are byte-for-byte identical to the
+    // pre-1a.4 values. The avatar tier only materialises when `effective_cap <
+    // effective_visible` — i.e. after the loop steps the cap down under measured
+    // pressure (Auto, pressured), or under an explicit `Fixed(n)` below natural.
     //
     // Audio note: `active_decode_set` (built below from `visible_tiles`) gates
     // ONLY video decode via `client.set_active_decode_set`. Audio playback runs
     // through the independent NetEQ path and the per-peer diagnostics stream
     // every `PeerTile` subscribes to globally, neither of which consults this
     // set. Avatar-tier (and even +N-overflow) peers therefore remain audible.
-    let budget_cap = decode_budget_cap();
+    //
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2). Reactive reads
+    // (`.read()`) so a change to either signal re-runs render immediately, with
+    // no dependence on the 1 Hz control loop.
+    let canvas_capped_natural = total_tiles.min(CANVAS_LIMIT);
+    let effective_cap = match *decode_budget_override.read() {
+        // Manual hard override takes effect on the NEXT render, no FPS event
+        // required. `total_tiles.clamp(MIN_CAP, CANVAS_LIMIT)` floors a 0-peer
+        // upper bound at MIN_CAP so `clamp` never sees `max < min`.
+        DecodeBudgetOverride::Fixed(n) => {
+            n.clamp(MIN_CAP, total_tiles.clamp(MIN_CAP, CANVAS_LIMIT))
+        }
+        // Un-pressured Auto: cap == natural, so staggered joins are decoded
+        // immediately and no avatars appear.
+        DecodeBudgetOverride::Auto if !decode_budget_pressured() => canvas_capped_natural,
+        // Pressured Auto: the control loop owns the cap.
+        DecodeBudgetOverride::Auto => decode_budget_cap(),
+    };
+    let budget_cap = effective_cap;
     // Natural layout capacity (already bounded by CANVAS_LIMIT through
     // `total_tiles`/`capped_real`). This decides the +N badge boundary.
     let layout_limit = effective_visible;

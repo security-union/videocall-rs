@@ -2295,7 +2295,8 @@ fn handle_msg(
         // Drop the packet iff ALL of the following hold:
         //   1. the cleartext envelope `media_kind` is VIDEO, AND
         //   2. this receiver has a non-empty desired-streams (viewport) set, AND
-        //   3. the packet's source `session_id` is NOT in that set.
+        //   3. the SUBJECT-DERIVED source session (NOT the forgeable payload
+        //      `session_id`) is NOT in that set.
         //
         // Everything else forwards. In particular:
         //   - AUDIO is NEVER filtered (off-screen speakers must be heard;
@@ -2316,11 +2317,38 @@ fn handle_msg(
             let is_video = pw.media_kind.enum_value()
                 == Ok(videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO);
             if is_video {
+                // SOURCE IDENTITY MUST come from the NATS subject, NEVER from
+                // the payload `pw.session_id`. The wrapper `session_id` is
+                // attacker-controllable (ingress only stamps it when the
+                // client sends 0; see the self-echo note above), so a modified
+                // client could forge it to a receiver-VISIBLE peer's id and
+                // smuggle off-screen VIDEO past this filter. The subject —
+                // `room.{room}.{publisher_session}` — is set by the relay from
+                // the authenticated connection and cannot be forged by a peer,
+                // exactly as relied on for `subject_self` and VIEWPORT
+                // ownership. We parse the trailing session token from it.
+                //
+                // Room IDs match `^[a-zA-Z0-9_-]*$` (no dots) and the session
+                // is a pure-digit u64, so the part after the LAST `.` is the
+                // publisher session. If it does not parse (shouldn't happen for
+                // normal media), FAIL OPEN — never drop on an unparseable
+                // source.
+                let source = msg
+                    .subject
+                    .as_str()
+                    .rsplit('.')
+                    .next()
+                    .and_then(|tok| tok.parse::<u64>().ok());
+
                 // Read the viewport set; a poisoned lock fails OPEN (forward).
-                let drop_video = desired_streams
-                    .read()
-                    .map(|st| !st.ids.is_empty() && !st.ids.contains(&pw.session_id))
-                    .unwrap_or(false);
+                // An unparseable source (`None`) also fails OPEN.
+                let drop_video = match source {
+                    Some(src) => desired_streams
+                        .read()
+                        .map(|st| !st.ids.is_empty() && !st.ids.contains(&src))
+                        .unwrap_or(false),
+                    None => false,
+                };
                 if drop_video {
                     // Intentional, viewport-driven drop — accounted on a
                     // DEDICATED counter so it never pollutes the backpressure
@@ -2329,8 +2357,8 @@ fn handle_msg(
                         .with_label_values(&[&room])
                         .inc();
                     trace!(
-                        "Dropping off-screen VIDEO from source {} for session {} in room {}",
-                        pw.session_id,
+                        "Dropping off-screen VIDEO from subject-derived source {:?} for session {} in room {}",
+                        source,
                         session,
                         room
                     );
@@ -4559,7 +4587,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4570,6 +4598,84 @@ mod tests {
             count.load(Ordering::Relaxed),
             0,
             "VIDEO from a session NOT in the viewport set MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_forged_media_session_id_does_not_bypass_filter() {
+        // P1 regression (PR #994): the VIDEO source identity used for the
+        // viewport containment test MUST come from the NATS subject, never the
+        // forgeable payload `session_id`. Here the receiver renders {200, 300}.
+        // A malicious publisher (real session 999, off-screen) forges the
+        // payload `session_id` to 200 (a VISIBLE peer) hoping the filter sees
+        // "200 is in the set → forward". Because the packet necessarily arrives
+        // on the attacker's OWN subject `room.vp-room.999`, the subject-derived
+        // source is 999 (not in the set), so it MUST still be DROPPED.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200, 300]),
+        );
+
+        // Forged payload session_id = 200 (visible), but arrives on 999's subject.
+        let nats_msg = make_nats_message(
+            "room.vp-room.999",
+            make_media_packet_bytes(MediaKind::VIDEO, 200),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "forged payload session_id MUST NOT bypass the viewport filter; \
+             subject-derived source (999) governs and is off-screen"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_unparseable_subject_source_fails_open() {
+        // Defensive: if the subject's trailing token is not a u64 (should never
+        // happen for normal media), the source is unknown and we FAIL OPEN
+        // (forward) rather than drop. Receiver renders {200} but the source
+        // cannot be derived from a non-numeric subject token.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.not-a-number",
+            make_media_packet_bytes(MediaKind::VIDEO, 999),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "an unparseable subject-derived source MUST fail open (forward)"
         );
     }
 
@@ -4590,8 +4696,9 @@ mod tests {
             desired_streams_with(&[200, 300]),
         );
 
+        // Subject-derived source = 200 (in the viewport set).
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.200",
             make_media_packet_bytes(MediaKind::VIDEO, 200),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4624,7 +4731,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4658,7 +4765,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::AUDIO, 999),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4691,7 +4798,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::SCREEN, 999),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4725,7 +4832,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::MEDIA_KIND_UNSPECIFIED, 999),
         );
         let parsed = parse_pw(&nats_msg);
@@ -4762,7 +4869,7 @@ mod tests {
         );
 
         let nats_msg = make_nats_message(
-            "room.vp-room.sender",
+            "room.vp-room.999",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
         let parsed = parse_pw(&nats_msg);

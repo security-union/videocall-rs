@@ -622,6 +622,13 @@ pub fn AttendantsComponent(
     // hit pressure). It is reset to `false` on a Fixed -> Auto transition so
     // resuming Auto re-reveals all natural tiles immediately.
     let mut decode_budget_pressured = use_signal(|| false);
+    // Previous value of `decode_budget_override`, tracked in render scope so a
+    // render-driven `use_effect` can detect a Fixed -> Auto transition and reset
+    // the pressured latch IMMEDIATELY, with no dependence on the ~1 Hz control
+    // loop (HCL #987 review). Seeded to the current override so the very first
+    // render observes no transition. Read via `.peek()` inside the effect (never
+    // reactively) so writing it back cannot self-retrigger the effect.
+    let mut prev_override = use_signal(|| *decode_budget_override.peek());
     // The uncapped layout tile count (`total_tiles`), republished from render
     // so the async control loop can pass it to `decide_step` as `natural_count`
     // and never raise the cap above what the layout would actually show.
@@ -2011,12 +2018,14 @@ pub fn AttendantsComponent(
                             last_step_ms: now_ms() as f64,
                             direction_hold: 0,
                         };
-                        // Resuming Auto clears the pressured latch so the
-                        // render-side `effective_cap` re-reveals ALL natural
-                        // tiles immediately on a healthy machine (HCL #987 review
-                        // FIX 1 + FIX 2). The loop will only re-take ownership of
-                        // the cap if it measures fresh pressure.
-                        decode_budget_pressured.set(false);
+                        // Loop-local hygiene: re-seed BudgetState so the loop
+                        // resumes cleanly without a phantom step. The pressured
+                        // latch reset now happens RENDER-SIDE (a `use_effect`
+                        // watching `decode_budget_override`), so resuming Auto
+                        // re-reveals all natural tiles immediately without waiting
+                        // for this FPS-gated loop to advance (HCL #987 review).
+                        // The loop re-latches pressured=true below only if it
+                        // measures fresh pressure after the Auto resume.
                     }
                     last_override = current_override;
                 }
@@ -2287,6 +2296,30 @@ pub fn AttendantsComponent(
     if *decode_budget_natural.peek() != total_tiles {
         decode_budget_natural.set(total_tiles);
     }
+
+    // Render-driven Fixed -> Auto pressured-reset (HCL #987 review). Reads
+    // `decode_budget_override` REACTIVELY so this effect re-runs the instant the
+    // override changes — independent of the ~1 Hz control loop. On a transition
+    // INTO Auto from a non-Auto value, clear the pressured latch so the
+    // render-side `effective_cap` re-reveals ALL natural tiles on the very next
+    // render (a previously-pressured machine no longer waits for an FPS tick to
+    // drop its reduced `decode_budget_cap`).
+    //
+    // It fires ONLY on the transition: `prev_override` is peeked (not read
+    // reactively), so writing it back does not self-retrigger, and while the
+    // override stays Auto `prev == current == Auto` makes the body a no-op — it
+    // therefore never fights the loop's mid-Auto pressure latch (the loop sets
+    // pressured=true on a real down-step; this effect leaves that alone).
+    use_effect(move || {
+        let current = decode_budget_override();
+        let previous = *prev_override.peek();
+        if previous != DecodeBudgetOverride::Auto && current == DecodeBudgetOverride::Auto {
+            decode_budget_pressured.set(false);
+        }
+        if previous != current {
+            prev_override.set(current);
+        }
+    });
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
     let vw = window()

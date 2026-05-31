@@ -451,4 +451,104 @@ test.describe("Adaptive decode budget (#987)", () => {
     await expect(decodedTiles(page)).toHaveCount(12, { timeout: 15_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 5 — pressured Auto resumes ALL tiles immediately on Fixed -> Auto,
+  // with NO further render-fps event (HCL #987 review, pressured-resume case).
+  //
+  // REGRESSION GUARD: the Fixed -> Auto pressured-latch reset is render-driven
+  // (a `use_effect` watching `decode_budget_override`), NOT gated on the ~1 Hz
+  // control loop. So a machine that has ALREADY been driven into the pressured
+  // state (reduced `decode_budget_cap`, off-budget avatars visible) must, the
+  // instant it returns to Auto, re-reveal every natural tile WITHOUT waiting for
+  // the next `client_render_fps` tick.
+  //
+  // Flow:
+  //   1. Auto + sustained low FPS  -> pressured latch set, decoded count drops
+  //      below MOCK_PEERS, off-budget avatars appear.
+  //   2. Switch to Fixed(6)        -> hard override, exactly 6 decoded.
+  //   3. Switch back to Auto       -> assert ALL MOCK_PEERS tiles decode and
+  //      zero avatars remain, injecting NO further FPS samples after the toggle.
+  //
+  // If the reset were still loop-gated (the old bug), step 3 would keep showing
+  // the stale reduced cap (avatars) until the next injected FPS tick — which
+  // this test deliberately never sends after the toggle.
+  // ──────────────────────────────────────────────────────────────────────
+  test("pressured auto resumes all tiles immediately on Fixed->Auto with no fps event", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "pressured_resume");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+
+    // The injection hook is only attached when MOCK_PEERS_ENABLED is true; we
+    // need it to drive the machine into the pressured state deterministically.
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    // Ensure Auto (default, but explicit & resilient).
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+
+    // Baseline: un-pressured Auto decodes all tiles, no avatars.
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    // --- Step 1: drive DOWN into the pressured state with sustained low FPS. ---
+    // Inject mild-band low FPS once per bucket until the decoded count drops
+    // below MOCK_PEERS (the first down-step latches `pressured` true).
+    let decoded = await decodedTiles(page).count();
+    for (let i = 0; i < MAX_DOWN_SAMPLES && decoded >= MOCK_PEERS; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+      decoded = await decodedTiles(page).count();
+    }
+    // Confirm we are genuinely pressured: at least one off-budget avatar and a
+    // decoded count below the natural total.
+    await expect(offBudgetTiles(page)).not.toHaveCount(0, { timeout: 15_000 });
+    expect(decoded).toBeLessThan(MOCK_PEERS);
+    expect(decoded).toBeGreaterThanOrEqual(1); // MIN_CAP floor
+
+    // --- Step 2: switch to a hard Fixed(6) override. ---
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-6"]').click();
+    await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+    await expect(decodedTiles(page)).toHaveCount(6, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(MOCK_PEERS - 6, { timeout: 15_000 });
+
+    // --- Step 3: switch back to Auto. KEY ASSERTION. ---
+    // From here on we inject NO further FPS samples. The render-driven
+    // pressured-reset must clear the latch on the Fixed->Auto transition, so the
+    // effective cap snaps back to `total_tiles` and every natural tile decodes
+    // again on the next render. A loop-gated reset (the old bug) would leave the
+    // reduced cap in place — avatars would persist — because no FPS tick follows.
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+  });
 });

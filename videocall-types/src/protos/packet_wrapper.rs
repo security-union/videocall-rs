@@ -36,8 +36,8 @@ pub struct PacketWrapper {
     pub data: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:PacketWrapper.session_id)
     pub session_id: u64,
-    ///  Cleartext discriminator; see MediaKind. Field 5 is free on this
-    ///  branch (off PR-staging). Default 0 = unspecified = fail-open.
+    ///  field 5 reserved for simulcast_layer_id (#989/PR #993); see discussion #890
+    ///  Cleartext discriminator; see MediaKind. Default 0 = unspecified = fail-open.
     // @@protoc_insertion_point(field:PacketWrapper.media_kind)
     pub media_kind: ::protobuf::EnumOrUnknown<packet_wrapper::MediaKind>,
     // special fields
@@ -114,7 +114,7 @@ impl ::protobuf::Message for PacketWrapper {
                 32 => {
                     self.session_id = is.read_uint64()?;
                 },
-                40 => {
+                48 => {
                     self.media_kind = is.read_enum_or_unknown()?;
                 },
                 tag => {
@@ -142,7 +142,7 @@ impl ::protobuf::Message for PacketWrapper {
             my_size += ::protobuf::rt::uint64_size(4, self.session_id);
         }
         if self.media_kind != ::protobuf::EnumOrUnknown::new(packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED) {
-            my_size += ::protobuf::rt::int32_size(5, self.media_kind.value());
+            my_size += ::protobuf::rt::int32_size(6, self.media_kind.value());
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -163,7 +163,7 @@ impl ::protobuf::Message for PacketWrapper {
             os.write_uint64(4, self.session_id)?;
         }
         if self.media_kind != ::protobuf::EnumOrUnknown::new(packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED) {
-            os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.media_kind))?;
+            os.write_enum(6, ::protobuf::EnumOrUnknown::value(&self.media_kind))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -424,7 +424,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
     e\x12\x17\n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\x12\n\x04data\
     \x18\x03\x20\x01(\x0cR\x04data\x12\x1d\n\nsession_id\x18\x04\x20\x01(\
-    \x04R\tsessionId\x127\n\nmedia_kind\x18\x05\x20\x01(\x0e2\x18.PacketWrap\
+    \x04R\tsessionId\x127\n\nmedia_kind\x18\x06\x20\x01(\x0e2\x18.PacketWrap\
     per.MediaKindR\tmediaKind\"\xcc\x01\n\nPacketType\x12\x17\n\x13PACKET_TY\
     PE_UNKNOWN\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\
     \x10\x02\x12\t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\x04\x12\x0f\
@@ -432,7 +432,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x10\x07\x12\x14\n\x10SESSION_ASSIGNED\x10\x08\x12\x0e\n\nCONGESTION\x10\
     \t\x12\x0e\n\nPEER_EVENT\x10\n\x12\x0c\n\x08VIEWPORT\x10\x0b\"I\n\tMedia\
     Kind\x12\x1a\n\x16MEDIA_KIND_UNSPECIFIED\x10\0\x12\t\n\x05VIDEO\x10\x01\
-    \x12\t\n\x05AUDIO\x10\x02\x12\n\n\x06SCREEN\x10\x03J\x99\x11\n\x06\x12\
+    \x12\t\n\x05AUDIO\x10\x02\x12\n\n\x06SCREEN\x10\x03J\xb4\x11\n\x06\x12\
     \x04\0\00\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\
     \x02\00\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x15\n\x0c\n\x04\x04\0\
     \x04\0\x12\x04\x03\x02\x14\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\
@@ -503,12 +503,13 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x04\0\x02\x02\x03\x12\x03+\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03,\
     \x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03,\x02\x08\n\x0c\n\x05\x04\
     \0\x02\x03\x01\x12\x03,\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03,\x16\
-    \x17\n\x8e\x01\n\x04\x04\0\x02\x04\x12\x03/\x02\x1b\x1a\x80\x01\x20Clear\
-    text\x20discriminator;\x20see\x20MediaKind.\x20Field\x205\x20is\x20free\
-    \x20on\x20this\n\x20branch\x20(off\x20PR-staging).\x20Default\x200\x20=\
-    \x20unspecified\x20=\x20fail-open.\n\n\x0c\n\x05\x04\0\x02\x04\x06\x12\
-    \x03/\x02\x0b\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03/\x0c\x16\n\x0c\n\x05\
-    \x04\0\x02\x04\x03\x12\x03/\x19\x1ab\x06proto3\
+    \x17\n\xa9\x01\n\x04\x04\0\x02\x04\x12\x03/\x02\x1b\x1a\x9b\x01\x20field\
+    \x205\x20reserved\x20for\x20simulcast_layer_id\x20(#989/PR\x20#993);\x20\
+    see\x20discussion\x20#890\n\x20Cleartext\x20discriminator;\x20see\x20Med\
+    iaKind.\x20Default\x200\x20=\x20unspecified\x20=\x20fail-open.\n\n\x0c\n\
+    \x05\x04\0\x02\x04\x06\x12\x03/\x02\x0b\n\x0c\n\x05\x04\0\x02\x04\x01\
+    \x12\x03/\x0c\x16\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03/\x19\x1ab\x06pro\
+    to3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

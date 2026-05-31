@@ -2314,6 +2314,12 @@ impl Inner {
                     }
                 }
             }
+            Ok(PacketType::VIEWPORT) => {
+                // VIEWPORT is a client -> relay ONLY control packet (HCL issue
+                // #988): the relay consumes it for viewport-aware video
+                // filtering and never forwards it to peers. A client should
+                // never receive one; ignore it defensively if it ever appears.
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

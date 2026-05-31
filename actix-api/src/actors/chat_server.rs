@@ -33,6 +33,7 @@ use actix::{
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
@@ -236,6 +237,21 @@ pub struct LeaveContext<'a> {
     pub end_on_host_leave: bool,
 }
 
+/// Per-session "desired streams" (viewport) set, shared between the
+/// session's NATS subscription task and [`ChatServer`].
+///
+/// The set holds the `session_id`s that the owning receiver is currently
+/// rendering, as reported by VIEWPORT control packets (HCL issue #988).
+/// It is read on the hot forwarding path to drop VIDEO for off-screen
+/// peers and written by the same session's NATS loop when a fresh VIEWPORT
+/// packet arrives. An `Arc<RwLock<..>>` is used (rather than a plain
+/// actor-owned `HashMap`) so the spawned per-session subscription task can
+/// read it per-packet without a round-trip back into the actor.
+///
+/// **Fail-open invariant:** an empty set means "no viewport signal yet" and
+/// the relay forwards everything, behaving exactly as it did before #988.
+type DesiredStreams = Arc<RwLock<std::collections::HashSet<u64>>>;
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -283,6 +299,18 @@ pub struct ChatServer {
     /// Per-session server-authoritative guest flag, sourced from the JWT
     /// `is_guest` claim captured at `JoinRoom`.
     session_is_guest: HashMap<SessionId, bool>,
+    /// Per-session viewport / "desired streams" set (HCL issue #988).
+    ///
+    /// Maps a receiver `SessionId` to the set of source `session_id`s it is
+    /// currently rendering. Populated from VIEWPORT control packets and read
+    /// on the forwarding path to drop VIDEO for off-screen peers. The
+    /// `Arc<RwLock<..>>` value is shared with the session's NATS task so the
+    /// task can read/update it without re-entering the actor.
+    ///
+    /// Absent or empty = fail-open (forward all video). This is a
+    /// **subtract-only** filter layered AFTER JWT/observer authorization; it
+    /// never grants access. See [`DesiredStreams`].
+    session_desired_streams: HashMap<SessionId, DesiredStreams>,
 }
 
 impl ChatServer {
@@ -300,6 +328,7 @@ impl ChatServer {
             instance_index: HashMap::new(),
             session_instance: HashMap::new(),
             session_is_guest: HashMap::new(),
+            session_desired_streams: HashMap::new(),
         }
     }
 
@@ -317,6 +346,11 @@ impl ChatServer {
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
         }
+
+        // Drop the per-session viewport set (HCL issue #988). Mirrors the
+        // cleanup in `forget_session`; both teardown paths must release this
+        // so the map cannot leak entries for departed sessions.
+        let _ = self.session_desired_streams.remove(session_id);
 
         // Clean up instance_index via reverse map: O(1) instead of O(n) retain.
         // If the entry was already replaced by a newer session (eviction), the
@@ -633,6 +667,7 @@ impl ChatServer {
         let _ = self.connection_states.remove(&session_id);
         let _ = self.suppress_join_broadcast.remove(&session_id);
         let _ = self.session_is_guest.remove(&session_id);
+        let _ = self.session_desired_streams.remove(&session_id);
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
         // evict them while a departure is pending, we want the new session to
@@ -1575,6 +1610,17 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
+        // Allocate this session's viewport / "desired streams" set (HCL issue
+        // #988). It starts empty = fail-open (forward all video) and is shared
+        // with the NATS subscription task below: the task's VIEWPORT
+        // interceptor writes it and `handle_msg` reads it on the forwarding
+        // path. A reconnection runs `JoinRoom` under a fresh `session_id`, so a
+        // new empty set is allocated and the client re-sends its viewport — no
+        // stale viewport state survives a reconnect.
+        let desired_streams: DesiredStreams = Default::default();
+        self.session_desired_streams
+            .insert(session, desired_streams.clone());
+
         // Collect existing non-observer room members for notifying the new joiner.
         // On reconnection, we still send the existing member list so the
         // reconnecting client knows who is in the room.
@@ -1653,6 +1699,8 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
         let server_addr = ctx.address();
+        // Shared viewport set for this session's NATS loop (HCL issue #988).
+        let desired_streams_for_loop = desired_streams.clone();
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -1750,12 +1798,23 @@ impl Handler<JoinRoom> for ChatServer {
                             continue;
                         }
 
+                        // VIEWPORT control packets (HCL issue #988) are
+                        // consumed by the relay and never re-broadcast. When
+                        // the packet is THIS session's own viewport echo, the
+                        // interceptor records the desired-streams set; for any
+                        // other session's VIEWPORT it just drops it. Either
+                        // way we `continue` so it never reaches `handle_msg`.
+                        if try_intercept_viewport(&msg, session_clone, &desired_streams_for_loop) {
+                            continue;
+                        }
+
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
                             room_clone.clone(),
                             session_clone,
                             observer,
                             user_id_clone.clone(),
+                            desired_streams_for_loop.clone(),
                         )(msg)
                         {
                             error!("Error handling message: {}", e);
@@ -1789,6 +1848,90 @@ async fn send_meeting_info(
         Ok(_) => info!("Sent meeting start time {} to {}", start_time_ms, subject),
         Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
     }
+}
+
+/// Checks whether `msg` is a VIEWPORT control packet (HCL issue #988) and, if
+/// so, intercepts it so it is NEVER re-broadcast to other peers.
+///
+/// Returns `true` when the packet was a VIEWPORT (caller must `continue` the
+/// NATS loop) and `false` when the caller should fall through to `handle_msg`.
+///
+/// # Behaviour
+///
+/// The room's NATS fan-out delivers every published packet — including each
+/// session's own VIEWPORT — to every session loop. This function runs in the
+/// per-session loop for `receiver_session`:
+///
+/// * If the VIEWPORT packet's wire `session_id` matches `receiver_session`,
+///   this is the receiver's OWN viewport: we overwrite its `DesiredStreams`
+///   set with the reported `session_ids`. The receiver's own session_id is
+///   never added (a session does not render itself); this also makes a
+///   single-element `[self]` list collapse to "empty = fail-open" rather than
+///   accidentally dropping all remote video.
+/// * For any other (or absent/`0`) `session_id`, this is some other peer's
+///   VIEWPORT (or an unscoped one): we drop it without recording. A session
+///   may only set its OWN viewport — it can never alter what another session
+///   receives. This keeps the filter strictly self-scoped.
+///
+/// # Security
+///
+/// The viewport set is **subtract-only** and is consumed purely for VIDEO
+/// drop decisions in `handle_msg`. It never widens authorization. The set is
+/// not logged at info level (it is "who is watching whom" metadata).
+fn try_intercept_viewport(
+    msg: &async_nats::Message,
+    receiver_session: SessionId,
+    desired_streams: &DesiredStreams,
+) -> bool {
+    let wrapper = match PacketWrapper::parse_from_bytes(&msg.payload) {
+        Ok(w) => w,
+        // Unparseable payloads are not our concern; let `handle_msg` apply its
+        // own fail-closed handling.
+        Err(_) => return false,
+    };
+
+    if wrapper.packet_type != PacketType::VIEWPORT.into() {
+        return false;
+    }
+
+    // From here on the packet IS a VIEWPORT and must never be forwarded:
+    // every return path below yields `true`.
+
+    // Only the session that owns the viewport may mutate its own set. The
+    // wire `session_id` is stamped by `Handler<ClientMessage>` from the
+    // sender's connection, so it is trustworthy for self-scoping here.
+    if wrapper.session_id != receiver_session {
+        return true;
+    }
+
+    if let Ok(viewport) =
+        videocall_types::protos::viewport_packet::ViewportPacket::parse_from_bytes(&wrapper.data)
+    {
+        let next: std::collections::HashSet<u64> = viewport
+            .session_ids
+            .into_iter()
+            // A session never renders itself; dropping it keeps a lone
+            // `[self]` viewport from collapsing into "drop everything".
+            .filter(|sid| *sid != receiver_session)
+            .collect();
+
+        // Overwrite (not merge): the latest VIEWPORT is the full current
+        // visible set. `write()` only fails on a poisoned lock, which would
+        // mean another holder panicked; in that case we leave the previous
+        // set untouched (fail-open relative to the new, smaller set).
+        if let Ok(mut guard) = desired_streams.write() {
+            *guard = next;
+        } else {
+            warn!(
+                "Viewport set lock poisoned for session {}; keeping previous set",
+                receiver_session
+            );
+        }
+    }
+    // Malformed inner payload: still consume the packet (drop it) but leave
+    // the existing set unchanged — fail-open to the prior behaviour.
+
+    true
 }
 
 /// Checks whether `msg` is a `PARTICIPANT_DISPLAY_NAME_CHANGED` system event.
@@ -1951,6 +2094,7 @@ fn handle_msg(
     session: SessionId,
     observer: bool,
     receiver_user_id: String,
+    desired_streams: DesiredStreams,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         // Parse the PacketWrapper once and reuse the result for every
@@ -2066,6 +2210,58 @@ fn handle_msg(
                     room
                 );
                 return Ok(());
+            }
+        }
+
+        // Viewport-aware VIDEO filtering (HCL issue #988).
+        //
+        // This is a SUBTRACT-ONLY filter that runs strictly AFTER the observer
+        // authorization allowlist above. It can only reduce what an
+        // already-authorized session receives; it never grants access and
+        // never short-circuits the observer gate. JWT/JoinRoom membership +
+        // the observer allowlist remain the sole authorization boundary.
+        //
+        // Drop the packet iff ALL of the following hold:
+        //   1. the cleartext envelope `media_kind` is VIDEO, AND
+        //   2. this receiver has a non-empty desired-streams (viewport) set, AND
+        //   3. the packet's source `session_id` is NOT in that set.
+        //
+        // Everything else forwards. In particular:
+        //   - AUDIO is NEVER filtered (off-screen speakers must be heard;
+        //     keying audio off a client-supplied list would let a client
+        //     silence a target — a security non-starter).
+        //   - SCREEN is NEVER filtered by the camera-tile viewport (a separate
+        //     future signal governs screen-share).
+        //   - HEARTBEAT / RTT / KEYFRAME_REQUEST and every non-MEDIA packet
+        //     type are NEVER filtered (control/liveness).
+        //   - `media_kind` UNSPECIFIED (0) fails OPEN (forwards) so older
+        //     clients and any packet without the discriminator are unaffected.
+        //   - An empty desired set fails OPEN (no viewport signal yet).
+        //
+        // NOTE: this filter intentionally inspects ONLY the cleartext outer
+        // `media_kind`. It never parses the (possibly E2EE-sealed) inner
+        // MediaPacket, so it is correct whether or not E2EE is enabled.
+        if let Some(pw) = parsed.as_ref() {
+            let is_video = pw.media_kind.enum_value()
+                == Ok(videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO);
+            if is_video {
+                // Read the viewport set; a poisoned lock fails OPEN (forward).
+                let drop_video = desired_streams
+                    .read()
+                    .map(|set| !set.is_empty() && !set.contains(&pw.session_id))
+                    .unwrap_or(false);
+                if drop_video {
+                    RELAY_PACKET_DROPS_TOTAL
+                        .with_label_values(&[&room, "viewport_filter", "off_screen_video"])
+                        .inc();
+                    trace!(
+                        "Dropping off-screen VIDEO from source {} for session {} in room {}",
+                        pw.session_id,
+                        session,
+                        room
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -3586,6 +3782,7 @@ mod tests {
             9001,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3616,6 +3813,7 @@ mod tests {
             9002,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3646,6 +3844,7 @@ mod tests {
             9003,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3676,6 +3875,7 @@ mod tests {
             9004,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3706,6 +3906,7 @@ mod tests {
             9005,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -3737,6 +3938,7 @@ mod tests {
             9007,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3767,6 +3969,7 @@ mod tests {
             9008,
             true, // observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3797,6 +4000,7 @@ mod tests {
             9006,
             false, // NOT an observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3841,6 +4045,7 @@ mod tests {
             7777,
             false, // not an observer
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3876,6 +4081,7 @@ mod tests {
             8888,
             false,
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         // Subject points at a DIFFERENT session id; payload session_id is
@@ -3912,6 +4118,7 @@ mod tests {
             5555,
             false,
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3947,6 +4154,7 @@ mod tests {
             6666,
             false,
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -3981,6 +4189,7 @@ mod tests {
             4242,
             false,
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -4017,6 +4226,7 @@ mod tests {
             0,
             false,
             "recv-user".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -4067,6 +4277,7 @@ mod tests {
             1111,
             false,
             "alice".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -4097,6 +4308,7 @@ mod tests {
             2222,
             false,
             "bob".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -4127,6 +4339,7 @@ mod tests {
             3333,
             true,
             "alice".to_string(),
+            DesiredStreams::default(),
         );
 
         let nats_msg = make_nats_message(
@@ -4157,6 +4370,7 @@ mod tests {
             4444,
             false,
             "alice".to_string(),
+            DesiredStreams::default(),
         );
 
         let mut pw = PacketWrapper::new();
@@ -4176,6 +4390,348 @@ mod tests {
             0,
             "PEER_EVENT with unparseable inner payload MUST be dropped"
         );
+    }
+
+    // ======================================================================
+    // Viewport-aware VIDEO filtering (HCL issue #988)
+    // ======================================================================
+    //
+    // These exercise the cleartext-`media_kind` drop check in `handle_msg`
+    // and the `try_intercept_viewport` control-packet interceptor in
+    // isolation. None of them require NATS.
+
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+    use videocall_types::protos::viewport_packet::ViewportPacket;
+
+    /// Build a MEDIA `PacketWrapper` with an explicit cleartext `media_kind`
+    /// and source `session_id`, serialized to bytes.
+    fn make_media_packet_bytes(media_kind: MediaKind, source_session: u64) -> Vec<u8> {
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::MEDIA.into();
+        pw.user_id = b"sender".to_vec();
+        pw.session_id = source_session;
+        pw.media_kind = media_kind.into();
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    /// Build a `DesiredStreams` pre-populated with the given session_ids.
+    fn desired_streams_with(ids: &[u64]) -> DesiredStreams {
+        Arc::new(RwLock::new(ids.iter().copied().collect()))
+    }
+
+    /// Build a VIEWPORT `PacketWrapper` whose wire `session_id` is `owner`
+    /// (the receiver claiming the viewport) listing `visible` session_ids.
+    fn make_viewport_packet_bytes(owner: u64, visible: &[u64]) -> Vec<u8> {
+        let inner = ViewportPacket {
+            session_ids: visible.to_vec(),
+            ..Default::default()
+        };
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::VIEWPORT.into();
+        pw.session_id = owner;
+        pw.data = inner
+            .write_to_bytes()
+            .expect("ViewportPacket serialization should succeed");
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_off_screen_video() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver renders sessions {200, 300}; video from 999 is off-screen.
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200, 300]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::VIDEO, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "VIDEO from a session NOT in the viewport set MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_forwards_on_screen_video() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200, 300]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::VIDEO, 200),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "VIDEO from a session IN the viewport set MUST be forwarded"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_empty_viewport_forwards_all_video() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Empty set = no viewport signal yet = fail-open.
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::VIDEO, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "Empty viewport set MUST fail open (forward all VIDEO)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_never_filters_audio() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Off-screen sender, but AUDIO must NEVER be filtered (security:
+        // off-screen speakers must be heard).
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::AUDIO, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "AUDIO MUST NEVER be filtered by the viewport set"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_never_filters_screen() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // SCREEN is not governed by the camera-tile viewport.
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::SCREEN, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "SCREEN MUST NOT be filtered by the camera-tile viewport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_unspecified_media_kind_fails_open() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // UNSPECIFIED (e.g. an older client) must fail open even with an
+        // active viewport set and an off-screen source.
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            desired_streams_with(&[200]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::MEDIA_KIND_UNSPECIFIED, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "UNSPECIFIED media_kind MUST fail open (forward)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_viewport_does_not_affect_observer_gate() {
+        // The viewport filter runs AFTER the observer allowlist. An observer
+        // must still be denied MEDIA regardless of viewport set contents
+        // (the allowlist drops it first).
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "vp-room".to_string(),
+            100,
+            true, // observer
+            "recv".to_string(),
+            // Even a viewport set that "includes" the source must not let an
+            // observer receive MEDIA.
+            desired_streams_with(&[999]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.vp-room.sender",
+            make_media_packet_bytes(MediaKind::VIDEO, 999),
+        );
+        handler(nats_msg).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Observer gate MUST take precedence; viewport set cannot grant MEDIA"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_records_own_set() {
+        // A VIEWPORT whose wire session_id == receiver updates the set.
+        let desired = DesiredStreams::default();
+        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[200, 300]));
+        let intercepted = try_intercept_viewport(&msg, 100, &desired);
+        assert!(intercepted, "VIEWPORT packet must be intercepted (dropped)");
+        let set = desired.read().unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&200) && set.contains(&300));
+    }
+
+    #[test]
+    fn test_intercept_viewport_excludes_self_session() {
+        // The receiver's own session_id is never added to its set, so a
+        // lone `[self]` viewport collapses to empty = fail-open.
+        let desired = DesiredStreams::default();
+        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[100]));
+        assert!(try_intercept_viewport(&msg, 100, &desired));
+        assert!(
+            desired.read().unwrap().is_empty(),
+            "self session_id must be filtered out of the viewport set"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_other_session_does_not_mutate() {
+        // A VIEWPORT for a DIFFERENT session is dropped but must NOT mutate
+        // this receiver's set — a session can only set its own viewport.
+        let desired = desired_streams_with(&[200]);
+        // Owner 555 != receiver 100.
+        let msg = make_nats_message("room.r.555", make_viewport_packet_bytes(555, &[999]));
+        let intercepted = try_intercept_viewport(&msg, 100, &desired);
+        assert!(
+            intercepted,
+            "another session's VIEWPORT must still be intercepted (never re-broadcast)"
+        );
+        let set = desired.read().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(
+            set.contains(&200),
+            "receiver's own set must be untouched by another session's VIEWPORT"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_ignores_non_viewport() {
+        // A non-VIEWPORT packet must fall through (return false) so the loop
+        // hands it to handle_msg.
+        let desired = DesiredStreams::default();
+        let msg = make_nats_message("room.r.100", make_packet_bytes(PacketType::MEDIA));
+        assert!(
+            !try_intercept_viewport(&msg, 100, &desired),
+            "non-VIEWPORT packets must fall through to handle_msg"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_overwrites_previous_set() {
+        // The latest VIEWPORT replaces (does not merge with) the prior set.
+        let desired = desired_streams_with(&[1, 2, 3]);
+        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[7]));
+        assert!(try_intercept_viewport(&msg, 100, &desired));
+        let set = desired.read().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&7) && !set.contains(&1));
     }
 
     /// Returns all RoomMemberInfo entries for a given room.

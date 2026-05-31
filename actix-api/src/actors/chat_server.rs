@@ -17,7 +17,7 @@
  */
 
 use crate::{
-    constants::RECONNECT_GRACE_PERIOD,
+    constants::{RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL},
     messages::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
@@ -38,7 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
-use crate::metrics::{RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL};
+use crate::metrics::{
+    RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
+};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -237,20 +239,30 @@ pub struct LeaveContext<'a> {
     pub end_on_host_leave: bool,
 }
 
-/// Per-session "desired streams" (viewport) set, shared between the
-/// session's NATS subscription task and [`ChatServer`].
+/// Per-session viewport state (HCL issue #988): the set of source
+/// `session_id`s the owning receiver is currently rendering, plus the time of
+/// the last accepted VIEWPORT update (used to rate-limit updates).
 ///
-/// The set holds the `session_id`s that the owning receiver is currently
-/// rendering, as reported by VIEWPORT control packets (HCL issue #988).
-/// It is read on the hot forwarding path to drop VIDEO for off-screen
-/// peers and written by the same session's NATS loop when a fresh VIEWPORT
-/// packet arrives. An `Arc<RwLock<..>>` is used (rather than a plain
-/// actor-owned `HashMap`) so the spawned per-session subscription task can
-/// read it per-packet without a round-trip back into the actor.
+/// **Fail-open invariant:** an empty `ids` set means "no viewport signal yet"
+/// and the relay forwards everything, behaving exactly as it did before #988.
+#[derive(Default)]
+struct ViewportState {
+    /// Source session_ids the receiver is rendering. Empty = fail-open.
+    ids: std::collections::HashSet<u64>,
+    /// Instant of the last accepted VIEWPORT update, for rate-limiting.
+    /// `None` until the first accepted update.
+    last_update: Option<std::time::Instant>,
+}
+
+/// Per-session viewport state, shared between the session's NATS subscription
+/// task and [`ChatServer`].
 ///
-/// **Fail-open invariant:** an empty set means "no viewport signal yet" and
-/// the relay forwards everything, behaving exactly as it did before #988.
-type DesiredStreams = Arc<RwLock<std::collections::HashSet<u64>>>;
+/// It is read on the hot forwarding path to drop VIDEO for off-screen peers
+/// and written by the same session's NATS loop when a fresh VIEWPORT packet
+/// arrives. An `Arc<RwLock<..>>` is used (rather than a plain actor-owned
+/// `HashMap`) so the spawned per-session subscription task can read it
+/// per-packet without a round-trip back into the actor.
+type DesiredStreams = Arc<RwLock<ViewportState>>;
 
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
@@ -1787,9 +1799,33 @@ impl Handler<JoinRoom> for ChatServer {
 
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
+                    // Build the forwarding closure once; it is cheap to call
+                    // per packet and avoids re-cloning the config on every
+                    // message.
+                    let forward = handle_msg(
+                        session_recipient.clone(),
+                        room_clone.clone(),
+                        session_clone,
+                        observer,
+                        user_id_clone.clone(),
+                        desired_streams_for_loop.clone(),
+                    );
+                    let self_subject =
+                        format!("room.{room_clone}.{session_clone}").replace(' ', "_");
                     while let Some(msg) = sub.next().await {
+                        // Parse the PacketWrapper EXACTLY ONCE per packet and
+                        // share the result with every consumer below. This is
+                        // the relay's hottest path (every media frame × every
+                        // receiver × every room), so the previous
+                        // parse-in-each-interceptor approach doubled the
+                        // protobuf decode + allocation cost. Unparseable
+                        // payloads yield `None`, which every consumer treats
+                        // as its fail-closed/fall-through default.
+                        let parsed = PacketWrapper::parse_from_bytes(&msg.payload).ok();
+
                         if try_intercept_display_name_change(
                             &msg,
+                            parsed.as_ref(),
                             &room_clone,
                             session_clone,
                             &session_recipient,
@@ -1799,24 +1835,24 @@ impl Handler<JoinRoom> for ChatServer {
                         }
 
                         // VIEWPORT control packets (HCL issue #988) are
-                        // consumed by the relay and never re-broadcast. When
-                        // the packet is THIS session's own viewport echo, the
-                        // interceptor records the desired-streams set; for any
-                        // other session's VIEWPORT it just drops it. Either
-                        // way we `continue` so it never reaches `handle_msg`.
-                        if try_intercept_viewport(&msg, session_clone, &desired_streams_for_loop) {
+                        // consumed by the relay and never re-broadcast. A
+                        // VIEWPORT is recorded ONLY when it arrived on THIS
+                        // session's own publish subject (the trustworthy
+                        // identity bound to the authenticated connection at
+                        // JoinRoom); any other VIEWPORT is dropped without
+                        // mutating state. Either way we `continue` so it never
+                        // reaches `handle_msg`.
+                        if try_intercept_viewport(
+                            &msg,
+                            parsed.as_ref(),
+                            &self_subject,
+                            session_clone,
+                            &desired_streams_for_loop,
+                        ) {
                             continue;
                         }
 
-                        if let Err(e) = handle_msg(
-                            session_recipient.clone(),
-                            room_clone.clone(),
-                            session_clone,
-                            observer,
-                            user_id_clone.clone(),
-                            desired_streams_for_loop.clone(),
-                        )(msg)
-                        {
+                        if let Err(e) = forward(msg, parsed.as_ref()) {
                             error!("Error handling message: {}", e);
                             break;
                         }
@@ -1853,41 +1889,53 @@ async fn send_meeting_info(
 /// Checks whether `msg` is a VIEWPORT control packet (HCL issue #988) and, if
 /// so, intercepts it so it is NEVER re-broadcast to other peers.
 ///
+/// `parsed` is the already-decoded `PacketWrapper` for `msg` (parsed once per
+/// packet in the NATS loop and shared with every consumer); `None` means the
+/// payload was unparseable.
+///
 /// Returns `true` when the packet was a VIEWPORT (caller must `continue` the
 /// NATS loop) and `false` when the caller should fall through to `handle_msg`.
 ///
-/// # Behaviour
+/// # Ownership / security (HCL #988 hardening)
 ///
 /// The room's NATS fan-out delivers every published packet — including each
-/// session's own VIEWPORT — to every session loop. This function runs in the
-/// per-session loop for `receiver_session`:
+/// session's own VIEWPORT — to every session loop. A receiver may only mutate
+/// its OWN viewport. Ownership is decided by the NATS SUBJECT the packet
+/// arrived on, NOT by any payload field:
 ///
-/// * If the VIEWPORT packet's wire `session_id` matches `receiver_session`,
-///   this is the receiver's OWN viewport: we overwrite its `DesiredStreams`
-///   set with the reported `session_ids`. The receiver's own session_id is
-///   never added (a session does not render itself); this also makes a
-///   single-element `[self]` list collapse to "empty = fail-open" rather than
-///   accidentally dropping all remote video.
-/// * For any other (or absent/`0`) `session_id`, this is some other peer's
-///   VIEWPORT (or an unscoped one): we drop it without recording. A session
-///   may only set its OWN viewport — it can never alter what another session
-///   receives. This keeps the filter strictly self-scoped.
+/// * A VIEWPORT is "mine" iff it arrived on this session's own publish subject
+///   `self_subject` == `room.{room}.{receiver_session}`. The subject is set by
+///   the relay from the authenticated connection (`Handler<ClientMessage>`
+///   publishes to `room.{room}.{session}`), so it cannot be forged by a peer.
+/// * Any VIEWPORT arriving on a DIFFERENT subject is dropped WITHOUT mutating
+///   state. This closes the cross-session tampering vector where an attacker
+///   crafts `PacketWrapper{ session_id: victim, .. }`: the payload
+///   `session_id` is attacker-controllable (it is only stamped when the client
+///   sends 0) and is therefore NEVER consulted for ownership here.
 ///
-/// # Security
+/// The receiver's own session_id is filtered out of the recorded set (a
+/// session does not render itself), so a lone `[self]` viewport collapses to
+/// "empty = fail-open" rather than dropping all remote video.
 ///
-/// The viewport set is **subtract-only** and is consumed purely for VIDEO
-/// drop decisions in `handle_msg`. It never widens authorization. The set is
-/// not logged at info level (it is "who is watching whom" metadata).
+/// Accepted updates are bounded ([`VIEWPORT_MAX_SESSION_IDS`]) and rate-limited
+/// ([`VIEWPORT_MIN_UPDATE_INTERVAL`]) to blunt DoS via oversized / spammed
+/// lists.
+///
+/// The viewport set is **subtract-only** and consumed purely for VIDEO drop
+/// decisions in `handle_msg`. It never widens authorization and is not logged
+/// at info level (it is "who is watching whom" metadata).
 fn try_intercept_viewport(
     msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
+    self_subject: &str,
     receiver_session: SessionId,
     desired_streams: &DesiredStreams,
 ) -> bool {
-    let wrapper = match PacketWrapper::parse_from_bytes(&msg.payload) {
-        Ok(w) => w,
-        // Unparseable payloads are not our concern; let `handle_msg` apply its
-        // own fail-closed handling.
-        Err(_) => return false,
+    // Unparseable payloads are not our concern; let `handle_msg` apply its own
+    // fail-closed handling.
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return false,
     };
 
     if wrapper.packet_type != PacketType::VIEWPORT.into() {
@@ -1897,19 +1945,25 @@ fn try_intercept_viewport(
     // From here on the packet IS a VIEWPORT and must never be forwarded:
     // every return path below yields `true`.
 
-    // Only the session that owns the viewport may mutate its own set. The
-    // wire `session_id` is stamped by `Handler<ClientMessage>` from the
-    // sender's connection, so it is trustworthy for self-scoping here.
-    if wrapper.session_id != receiver_session {
+    // Ownership is established by the SUBJECT, not the payload. A peer can
+    // forge `wrapper.session_id`, but it cannot publish onto another session's
+    // subject — the relay derives the subject from the authenticated
+    // connection. If this VIEWPORT did not arrive on our own subject it is not
+    // ours: drop it without touching our set.
+    if msg.subject.as_str() != self_subject {
         return true;
     }
 
     if let Ok(viewport) =
         videocall_types::protos::viewport_packet::ViewportPacket::parse_from_bytes(&wrapper.data)
     {
+        // DoS bound: cap the number of session_ids we will process. Truncate
+        // rather than reject so an over-long list still applies its first N
+        // entries (fail-open on the excess).
         let next: std::collections::HashSet<u64> = viewport
             .session_ids
             .into_iter()
+            .take(VIEWPORT_MAX_SESSION_IDS)
             // A session never renders itself; dropping it keeps a lone
             // `[self]` viewport from collapsing into "drop everything".
             .filter(|sid| *sid != receiver_session)
@@ -1919,13 +1973,25 @@ fn try_intercept_viewport(
         // visible set. `write()` only fails on a poisoned lock, which would
         // mean another holder panicked; in that case we leave the previous
         // set untouched (fail-open relative to the new, smaller set).
-        if let Ok(mut guard) = desired_streams.write() {
-            *guard = next;
-        } else {
-            warn!(
-                "Viewport set lock poisoned for session {}; keeping previous set",
-                receiver_session
-            );
+        match desired_streams.write() {
+            Ok(mut guard) => {
+                // Rate-limit: ignore updates that arrive sooner than
+                // VIEWPORT_MIN_UPDATE_INTERVAL after the last accepted one.
+                let now = std::time::Instant::now();
+                let too_soon = guard
+                    .last_update
+                    .is_some_and(|last| now.duration_since(last) < VIEWPORT_MIN_UPDATE_INTERVAL);
+                if !too_soon {
+                    guard.ids = next;
+                    guard.last_update = Some(now);
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "Viewport set lock poisoned for session {}; keeping previous set",
+                    receiver_session
+                );
+            }
         }
     }
     // Malformed inner payload: still consume the packet (drop it) but leave
@@ -1941,6 +2007,7 @@ fn try_intercept_viewport(
 /// `false` when the caller should fall through to `handle_msg`.
 fn try_intercept_display_name_change(
     msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
     room_id: &str,
     session: SessionId,
     recipient: &Recipient<Message>,
@@ -1950,9 +2017,11 @@ fn try_intercept_display_name_change(
         return false;
     }
 
-    let wrapper = match PacketWrapper::parse_from_bytes(&msg.payload) {
-        Ok(w) => w,
-        Err(_) => return false,
+    // Reuse the wrapper parsed once in the NATS loop. An unparseable payload
+    // falls through to `handle_msg` exactly as before.
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return false,
     };
 
     if wrapper.packet_type != PacketType::MEETING.into() {
@@ -2036,7 +2105,10 @@ fn try_intercept_display_name_change(
     let patched = inner;
 
     let forwarded = patched.write_to_bytes().and_then(|ib| {
-        let mut pw = wrapper;
+        // Clone the shared wrapper only on this rare rename path so we can
+        // rebuild it with the sanitized inner payload. The common case
+        // (non-`.system` packets) never reaches here.
+        let mut pw = wrapper.clone();
         pw.data = ib;
         pw.write_to_bytes()
     });
@@ -2095,17 +2167,15 @@ fn handle_msg(
     observer: bool,
     receiver_user_id: String,
     desired_streams: DesiredStreams,
-) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
-    move |msg| {
-        // Parse the PacketWrapper once and reuse the result for every
-        // payload-aware decision below (self-skip carve-out, observer
-        // allowlist, PEER_EVENT unicast filter). Unparseable payloads fall
-        // through with `None`, which every downstream check treats as the
-        // "fail-closed" default.
-        let parsed = PacketWrapper::parse_from_bytes(&msg.payload).ok();
-
+) -> impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error> {
+    // `parsed` is the PacketWrapper decoded ONCE per packet by the NATS loop
+    // and shared with every consumer (display-name interceptor, viewport
+    // interceptor, and this closure). Decoding here as well would double the
+    // protobuf parse on the relay's hottest path. Unparseable payloads arrive
+    // as `None`, which every downstream check treats as its "fail-closed"
+    // default.
+    move |msg, parsed| {
         let is_congestion = parsed
-            .as_ref()
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
 
@@ -2136,7 +2206,6 @@ fn handle_msg(
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
         let inner_session_self = parsed
-            .as_ref()
             .map(|pw| pw.session_id != 0 && pw.session_id == session)
             .unwrap_or(false);
 
@@ -2159,7 +2228,6 @@ fn handle_msg(
         // below means observers never see it, which is the desired
         // fail-closed default.
         let is_peer_event = parsed
-            .as_ref()
             .map(|pw| pw.packet_type == PacketType::PEER_EVENT.into())
             .unwrap_or(false);
         if is_peer_event {
@@ -2167,7 +2235,6 @@ fn handle_msg(
             // publisher does not need an error path because this is best-
             // effort confirmation feedback.
             let target_match = parsed
-                .as_ref()
                 .and_then(|pw| {
                     videocall_types::protos::peer_event::PeerEvent::parse_from_bytes(&pw.data).ok()
                 })
@@ -2194,7 +2261,6 @@ fn handle_msg(
         // added here to reach observer sessions.
         if observer {
             let allowed = parsed
-                .as_ref()
                 .map(|pw| {
                     matches!(
                         pw.packet_type.enum_value(),
@@ -2241,18 +2307,21 @@ fn handle_msg(
         // NOTE: this filter intentionally inspects ONLY the cleartext outer
         // `media_kind`. It never parses the (possibly E2EE-sealed) inner
         // MediaPacket, so it is correct whether or not E2EE is enabled.
-        if let Some(pw) = parsed.as_ref() {
+        if let Some(pw) = parsed {
             let is_video = pw.media_kind.enum_value()
                 == Ok(videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO);
             if is_video {
                 // Read the viewport set; a poisoned lock fails OPEN (forward).
                 let drop_video = desired_streams
                     .read()
-                    .map(|set| !set.is_empty() && !set.contains(&pw.session_id))
+                    .map(|st| !st.ids.is_empty() && !st.ids.contains(&pw.session_id))
                     .unwrap_or(false);
                 if drop_video {
-                    RELAY_PACKET_DROPS_TOTAL
-                        .with_label_values(&[&room, "viewport_filter", "off_screen_video"])
+                    // Intentional, viewport-driven drop — accounted on a
+                    // DEDICATED counter so it never pollutes the backpressure
+                    // (mailbox-full) drop metric / its dashboards & alerts.
+                    RELAY_VIEWPORT_FILTERED_TOTAL
+                        .with_label_values(&[&room])
                         .inc();
                     trace!(
                         "Dropping off-screen VIDEO from source {} for session {} in room {}",
@@ -3789,7 +3858,8 @@ mod tests {
             "room.room1.other_session",
             make_packet_bytes(PacketType::MEDIA),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3820,7 +3890,8 @@ mod tests {
             "room.room2.other_session",
             make_packet_bytes(PacketType::AES_KEY),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3851,7 +3922,8 @@ mod tests {
             "room.room3.other_session",
             make_packet_bytes(PacketType::RSA_PUB_KEY),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3882,7 +3954,8 @@ mod tests {
             "room.room4.other_session",
             make_packet_bytes(PacketType::MEETING),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3914,7 +3987,8 @@ mod tests {
             "room.room5.other_session",
             vec![0xFF, 0xFE, 0xFD, 0x00, 0x01],
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3945,7 +4019,8 @@ mod tests {
             "room.room7.other_session",
             make_packet_bytes(PacketType::SESSION_ASSIGNED),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -3976,7 +4051,8 @@ mod tests {
             "room.room8.other_session",
             make_packet_bytes(PacketType::CONNECTION),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4007,7 +4083,8 @@ mod tests {
             "room.room6.other_session",
             make_packet_bytes(PacketType::MEDIA),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4052,7 +4129,8 @@ mod tests {
             "room.selfskip-room.7777",
             make_packet_bytes(PacketType::DIAGNOSTICS),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4090,7 +4168,8 @@ mod tests {
             "room.reconnect-room.999999",
             make_packet_bytes_with_session(PacketType::DIAGNOSTICS, 8888),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4125,7 +4204,8 @@ mod tests {
             "room.congestion-room.5555",
             make_packet_bytes(PacketType::CONGESTION),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4161,7 +4241,8 @@ mod tests {
             "room.congestion-inner-room.99",
             make_packet_bytes_with_session(PacketType::CONGESTION, 6666),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4196,7 +4277,8 @@ mod tests {
             "room.media-self-room.999999",
             make_packet_bytes_with_session(PacketType::MEDIA, 4242),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4233,7 +4315,8 @@ mod tests {
             "room.zero-session-room.peer",
             make_packet_bytes_with_session(PacketType::MEDIA, 0),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4284,7 +4367,8 @@ mod tests {
             "room.peer-event-room.peer",
             make_peer_event_packet_bytes("alice"),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4315,7 +4399,8 @@ mod tests {
             "room.peer-event-room.peer",
             make_peer_event_packet_bytes("alice"),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4346,7 +4431,8 @@ mod tests {
             "room.peer-event-room.peer",
             make_peer_event_packet_bytes("alice"),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4382,7 +4468,8 @@ mod tests {
             pw.write_to_bytes()
                 .expect("PacketWrapper serialization should succeed"),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4417,11 +4504,22 @@ mod tests {
 
     /// Build a `DesiredStreams` pre-populated with the given session_ids.
     fn desired_streams_with(ids: &[u64]) -> DesiredStreams {
-        Arc::new(RwLock::new(ids.iter().copied().collect()))
+        Arc::new(RwLock::new(ViewportState {
+            ids: ids.iter().copied().collect(),
+            last_update: None,
+        }))
+    }
+
+    /// Parse the payload of an `async_nats::Message` into an optional
+    /// `PacketWrapper`, mirroring the single-parse the NATS loop performs.
+    fn parse_pw(msg: &async_nats::Message) -> Option<PacketWrapper> {
+        PacketWrapper::parse_from_bytes(&msg.payload).ok()
     }
 
     /// Build a VIEWPORT `PacketWrapper` whose wire `session_id` is `owner`
-    /// (the receiver claiming the viewport) listing `visible` session_ids.
+    /// (NOTE: ownership is decided by SUBJECT, not this field — `owner` is
+    /// retained so tests can deliberately forge it to prove it is ignored)
+    /// listing `visible` session_ids.
     fn make_viewport_packet_bytes(owner: u64, visible: &[u64]) -> Vec<u8> {
         let inner = ViewportPacket {
             session_ids: visible.to_vec(),
@@ -4459,7 +4557,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4490,7 +4589,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::VIDEO, 200),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4522,7 +4622,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4555,7 +4656,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::AUDIO, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4587,7 +4689,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::SCREEN, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4620,7 +4723,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::MEDIA_KIND_UNSPECIFIED, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4656,7 +4760,8 @@ mod tests {
             "room.vp-room.sender",
             make_media_packet_bytes(MediaKind::VIDEO, 999),
         );
-        handler(nats_msg).expect("handler should not return Err");
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
         tokio::task::yield_now().await;
         assert_eq!(
@@ -4666,16 +4771,26 @@ mod tests {
         );
     }
 
+    // Ownership in `try_intercept_viewport` is decided by the SUBJECT the
+    // packet arrived on. The receiver's own subject is `room.{room}.{session}`
+    // with spaces replaced by `_` — these tests build the matching subject.
+    fn self_subject_for(room: &str, session: u64) -> String {
+        format!("room.{room}.{session}").replace(' ', "_")
+    }
+
     #[test]
     fn test_intercept_viewport_records_own_set() {
-        // A VIEWPORT whose wire session_id == receiver updates the set.
+        // A VIEWPORT arriving on the receiver's OWN subject updates the set.
         let desired = DesiredStreams::default();
-        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[200, 300]));
-        let intercepted = try_intercept_viewport(&msg, 100, &desired);
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[200, 300]));
+        let parsed = parse_pw(&msg);
+        let intercepted =
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
         assert!(intercepted, "VIEWPORT packet must be intercepted (dropped)");
-        let set = desired.read().unwrap();
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(&200) && set.contains(&300));
+        let st = desired.read().unwrap();
+        assert_eq!(st.ids.len(), 2);
+        assert!(st.ids.contains(&200) && st.ids.contains(&300));
     }
 
     #[test]
@@ -4683,31 +4798,73 @@ mod tests {
         // The receiver's own session_id is never added to its set, so a
         // lone `[self]` viewport collapses to empty = fail-open.
         let desired = DesiredStreams::default();
-        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[100]));
-        assert!(try_intercept_viewport(&msg, 100, &desired));
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[100]));
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_viewport(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            100,
+            &desired
+        ));
         assert!(
-            desired.read().unwrap().is_empty(),
+            desired.read().unwrap().ids.is_empty(),
             "self session_id must be filtered out of the viewport set"
         );
     }
 
     #[test]
-    fn test_intercept_viewport_other_session_does_not_mutate() {
-        // A VIEWPORT for a DIFFERENT session is dropped but must NOT mutate
-        // this receiver's set — a session can only set its own viewport.
+    fn test_intercept_viewport_other_subject_does_not_mutate() {
+        // A VIEWPORT that arrived on a DIFFERENT publisher's subject is
+        // dropped but must NOT mutate this receiver's set.
         let desired = desired_streams_with(&[200]);
-        // Owner 555 != receiver 100.
+        let self_subject = self_subject_for("r", 100);
+        // Packet arrived on session 555's subject, not ours (100).
         let msg = make_nats_message("room.r.555", make_viewport_packet_bytes(555, &[999]));
-        let intercepted = try_intercept_viewport(&msg, 100, &desired);
+        let parsed = parse_pw(&msg);
+        let intercepted =
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
         assert!(
             intercepted,
             "another session's VIEWPORT must still be intercepted (never re-broadcast)"
         );
-        let set = desired.read().unwrap();
-        assert_eq!(set.len(), 1);
+        let st = desired.read().unwrap();
+        assert_eq!(st.ids.len(), 1);
         assert!(
-            set.contains(&200),
-            "receiver's own set must be untouched by another session's VIEWPORT"
+            st.ids.contains(&200),
+            "receiver's own set must be untouched by another subject's VIEWPORT"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_forged_payload_session_id_does_not_mutate() {
+        // HIGH/BLOCKING regression (HCL #988 security): an attacker forges the
+        // PAYLOAD `session_id` to equal the victim's session (100), but the
+        // packet necessarily arrives on the ATTACKER's subject (room.r.555),
+        // not the victim's. Ownership is decided by subject, so the victim's
+        // set MUST NOT be mutated. This is the vector the old payload-based
+        // ownership check missed.
+        let desired = desired_streams_with(&[200]);
+        let self_subject = self_subject_for("r", 100); // victim's subject
+                                                       // Forged payload session_id = 100 (victim) but arrives on 555's subject.
+        let msg = make_nats_message("room.r.555", make_viewport_packet_bytes(100, &[999]));
+        let parsed = parse_pw(&msg);
+        let intercepted =
+            try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired);
+        assert!(
+            intercepted,
+            "forged cross-session VIEWPORT must still be intercepted (never re-broadcast)"
+        );
+        let st = desired.read().unwrap();
+        assert_eq!(
+            st.ids.len(),
+            1,
+            "victim's set MUST NOT be mutated by a forged payload session_id"
+        );
+        assert!(
+            st.ids.contains(&200) && !st.ids.contains(&999),
+            "attacker-controlled session_ids must never reach the victim's set"
         );
     }
 
@@ -4716,10 +4873,25 @@ mod tests {
         // A non-VIEWPORT packet must fall through (return false) so the loop
         // hands it to handle_msg.
         let desired = DesiredStreams::default();
-        let msg = make_nats_message("room.r.100", make_packet_bytes(PacketType::MEDIA));
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, make_packet_bytes(PacketType::MEDIA));
+        let parsed = parse_pw(&msg);
         assert!(
-            !try_intercept_viewport(&msg, 100, &desired),
+            !try_intercept_viewport(&msg, parsed.as_ref(), &self_subject, 100, &desired),
             "non-VIEWPORT packets must fall through to handle_msg"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_unparseable_falls_through() {
+        // An unparseable payload (`parsed == None`) must fall through so
+        // handle_msg's fail-closed logic governs it.
+        let desired = DesiredStreams::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, vec![0xff, 0xfe, 0xfd]);
+        assert!(
+            !try_intercept_viewport(&msg, None, &self_subject, 100, &desired),
+            "unparseable payloads must fall through to handle_msg"
         );
     }
 
@@ -4727,11 +4899,108 @@ mod tests {
     fn test_intercept_viewport_overwrites_previous_set() {
         // The latest VIEWPORT replaces (does not merge with) the prior set.
         let desired = desired_streams_with(&[1, 2, 3]);
-        let msg = make_nats_message("room.r.100", make_viewport_packet_bytes(100, &[7]));
-        assert!(try_intercept_viewport(&msg, 100, &desired));
-        let set = desired.read().unwrap();
-        assert_eq!(set.len(), 1);
-        assert!(set.contains(&7) && !set.contains(&1));
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[7]));
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_viewport(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            100,
+            &desired
+        ));
+        let st = desired.read().unwrap();
+        assert_eq!(st.ids.len(), 1);
+        assert!(st.ids.contains(&7) && !st.ids.contains(&1));
+    }
+
+    #[test]
+    fn test_intercept_viewport_caps_session_ids() {
+        // A VIEWPORT with more than VIEWPORT_MAX_SESSION_IDS entries is
+        // truncated to the cap (DoS bound).
+        let desired = DesiredStreams::default();
+        let self_subject = self_subject_for("r", 100);
+        // Oversized list of distinct session_ids (none == receiver 100).
+        let big: Vec<u64> = (1000..1000 + (VIEWPORT_MAX_SESSION_IDS as u64) + 50).collect();
+        let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &big));
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_viewport(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            100,
+            &desired
+        ));
+        let st = desired.read().unwrap();
+        assert_eq!(
+            st.ids.len(),
+            VIEWPORT_MAX_SESSION_IDS,
+            "accepted session_ids must be capped at VIEWPORT_MAX_SESSION_IDS"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_rate_limited() {
+        // A second VIEWPORT arriving immediately after an accepted one is
+        // consumed (dropped, returns true) but must NOT mutate the set.
+        let desired = DesiredStreams::default();
+        let self_subject = self_subject_for("r", 100);
+
+        let msg1 = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[200, 300]));
+        let parsed1 = parse_pw(&msg1);
+        assert!(try_intercept_viewport(
+            &msg1,
+            parsed1.as_ref(),
+            &self_subject,
+            100,
+            &desired
+        ));
+        assert_eq!(desired.read().unwrap().ids.len(), 2);
+
+        // Immediate second update (well within VIEWPORT_MIN_UPDATE_INTERVAL).
+        let msg2 = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[999]));
+        let parsed2 = parse_pw(&msg2);
+        assert!(
+            try_intercept_viewport(&msg2, parsed2.as_ref(), &self_subject, 100, &desired),
+            "rate-limited VIEWPORT must still be intercepted (never re-broadcast)"
+        );
+        let st = desired.read().unwrap();
+        assert_eq!(
+            st.ids.len(),
+            2,
+            "a too-soon VIEWPORT update must be ignored (set unchanged)"
+        );
+        assert!(
+            st.ids.contains(&200) && !st.ids.contains(&999),
+            "rate-limited update must not replace the set"
+        );
+    }
+
+    #[test]
+    fn test_intercept_viewport_accepts_update_after_interval() {
+        // After VIEWPORT_MIN_UPDATE_INTERVAL has elapsed, a new VIEWPORT is
+        // accepted. Simulate elapsed time by rewinding `last_update`.
+        let desired = desired_streams_with(&[200, 300]);
+        if let Ok(mut guard) = desired.write() {
+            guard.last_update =
+                Some(std::time::Instant::now() - (VIEWPORT_MIN_UPDATE_INTERVAL * 2));
+        }
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(&self_subject, make_viewport_packet_bytes(100, &[7]));
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_viewport(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            100,
+            &desired
+        ));
+        let st = desired.read().unwrap();
+        assert_eq!(st.ids.len(), 1);
+        assert!(
+            st.ids.contains(&7),
+            "an update after the min interval must be accepted"
+        );
     }
 
     /// Returns all RoomMemberInfo entries for a given room.

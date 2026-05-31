@@ -527,13 +527,34 @@ lazy_static! {
     // filter ~96% of series. If cardinality becomes a problem, switch
     // counters to room-less aggregates or add periodic label cleanup.
 
-    /// Total packet drops from try_send() failures on outbound channels/mailboxes
+    /// Total packet drops from try_send() failures on outbound channels/mailboxes.
+    ///
+    /// This counter is for UNINTENTIONAL backpressure loss only (full outbound
+    /// queue / actor mailbox). Intentional, policy-driven drops (e.g. viewport
+    /// filtering) are tracked on their own metric so backpressure dashboards
+    /// and alerts that sum across labels are not polluted. See
+    /// [`RELAY_VIEWPORT_FILTERED_TOTAL`].
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "relay_packet_drops_total",
-        "Total packets dropped due to full outbound queue or mailbox",
+        "Total packets dropped due to full outbound queue or mailbox (backpressure loss only; intentional viewport drops are counted by relay_viewport_filtered_total)",
         &["room", "transport", "drop_reason"]
     )
     .expect("Failed to create relay_packet_drops_total metric");
+
+    /// VIDEO packets INTENTIONALLY not forwarded because the receiver's
+    /// viewport set (HCL issue #988) does not include the source session.
+    ///
+    /// This is an expected, bandwidth-saving drop — NOT a backpressure loss —
+    /// so it is deliberately kept off `relay_packet_drops_total`.
+    ///
+    /// CARDINALITY: `room` is user-provided (unbounded over time), same
+    /// caveats as the other room-labeled counters above.
+    pub static ref RELAY_VIEWPORT_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_filtered_total",
+        "Total VIDEO packets intentionally dropped by viewport-aware relay filtering (off-screen source not in receiver's viewport)",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_filtered_total metric");
 
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(

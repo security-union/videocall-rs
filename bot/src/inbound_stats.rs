@@ -31,6 +31,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use crate::aq_controller::BotAq;
 use crate::keyframe_requester::KeyframeRequester;
 use crate::rtt_probe::RttProbeState;
+use crate::viewport_sender::ViewportSender;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -89,6 +90,10 @@ pub struct InboundStats {
     /// Optional keyframe requester. When set, new peers trigger a
     /// KEYFRAME_REQUEST for VIDEO the first time they are observed.
     keyframe_requester: Option<KeyframeRequester>,
+    /// Optional viewport sender. When set, the source session_id of every
+    /// inbound media packet is fed here so the bot can emit VIEWPORT control
+    /// packets like a real client (HCL issue #988).
+    viewport_sender: Option<ViewportSender>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -122,6 +127,13 @@ impl InboundStats {
     /// a KEYFRAME_REQUEST for VIDEO.
     pub fn set_keyframe_requester(&mut self, requester: KeyframeRequester) {
         self.keyframe_requester = Some(requester);
+    }
+
+    /// Attach a viewport sender. When set, the relay-stamped source session_id
+    /// of every inbound media packet is fed to it so the bot emits VIEWPORT
+    /// control packets mimicking a real client's on-screen tile set (#988).
+    pub fn set_viewport_sender(&mut self, sender: ViewportSender) {
+        self.viewport_sender = Some(sender);
     }
 
     /// Install (or replace) the Prometheus metrics handle. Calls made before
@@ -253,6 +265,16 @@ impl InboundStats {
             kr.on_peer_seen(&sender);
         }
 
+        // Feed the relay-stamped source session_id to the viewport sender so it
+        // can emit VIEWPORT control packets like a real client (#988). The
+        // relay stamps `wrapper.session_id` to the publisher's session on
+        // forward (it is 0 only for unstamped/legacy packets, which the sender
+        // ignores). This mirrors how the browser derives peers from
+        // `PacketWrapper.session_id` on the decode path.
+        if let Some(ref mut vs) = self.viewport_sender {
+            vs.on_source_seen(wrapper.session_id);
+        }
+
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {
                 #[cfg(feature = "metrics")]
@@ -382,6 +404,7 @@ impl InboundStats {
         let aq = self.aq.take();
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
+        let viewport_sender = self.viewport_sender.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         *self = Self::default();
@@ -395,6 +418,7 @@ impl InboundStats {
         self.aq = aq;
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
+        self.viewport_sender = viewport_sender;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;

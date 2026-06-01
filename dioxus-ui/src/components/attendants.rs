@@ -3965,11 +3965,14 @@ pub fn AttendantsComponent(
                                                             role: "option",
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
+                                                                let was_closed = !device_settings_open();
+                                                                device_settings_open.set(true);
+                                                                if was_closed {
+                                                                    device_settings_generation
+                                                                        .set(device_settings_generation() + 1);
+                                                                }
                                                                 device_settings_initial_section
                                                                     .set(Some("appearance".to_string()));
-                                                                device_settings_generation
-                                                                    .set(device_settings_generation() + 1);
-                                                                device_settings_open.set(true);
                                                                 dock_menu_open.set(false);
                                                             },
                                                             "Dock Settings\u{2026}"

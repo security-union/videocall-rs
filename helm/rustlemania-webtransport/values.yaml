@@ -50,6 +50,12 @@ env:
   # video for slow receivers — the priority-drop policy + CONGESTION
   # feedback are the correct response, not a bigger buffer). Override
   # here only for exceptional workloads.
+  #
+  # Shedding is NOT env-tunable: the priority-drop policy lives in
+  # actix-api/src/actors/priority_drop.rs and uses fixed fill ratios
+  # (video/screen shed at 0.80, audio at 0.95, control/critical never
+  # preempted). There is no WT_OUTBOUND_SHEDDING_THRESHOLD env var — the
+  # old dead var was removed in #731.
   # - name: WT_OUTBOUND_CHANNEL_CAPACITY
   #   value: "1024"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.

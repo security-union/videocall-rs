@@ -303,6 +303,22 @@ pub struct EncoderBitrateController {
     diagnostic_packets: DiagnosticPackets,
     last_correction_time: f64,
     correction_throttle_ms: f64,
+    /// One-shot flag that forces the *next* call to
+    /// [`Self::process_diagnostics_packet_with_time`] to bypass the PID
+    /// correction throttle so a freshly-computed (lower) bitrate target reaches
+    /// the encoder in the same diagnostics-loop iteration.
+    ///
+    /// Set by [`Self::force_congestion_cut`] (issue #702): the aggressive cut
+    /// drops resolution/keyframe/audio tiers immediately via `take_tier_changed`,
+    /// but the encoder's actual bitrate target only updates from the value
+    /// `process_diagnostics_packet` returns. Without this bypass, a CONGESTION
+    /// signal arriving <1s after any prior AQ correction would be throttled
+    /// (returns `None`), leaving the rate-controlled codec targeting the old,
+    /// higher bitrate for up to ~1s — roughly the same bytes/sec on the wire,
+    /// defeating the buffer-drain intent of the cut. The flag is consumed (reset
+    /// to `false`) the next time the throttle guard is evaluated, so it only ever
+    /// bypasses a single correction and never weakens the normal 1s PID throttle.
+    force_next_correction: bool,
     /// Adaptive quality state machine for tier selection.
     quality_manager: AdaptiveQualityManager,
     /// Set to `true` after any tier transition, cleared by the caller via
@@ -417,6 +433,7 @@ impl EncoderBitrateController {
             diagnostic_packets,
             last_correction_time: 0.0,
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
+            force_next_correction: false,
             quality_manager,
             tier_changed: false,
             last_fps_ratio: 0.0,
@@ -457,9 +474,14 @@ impl EncoderBitrateController {
         // Add the packet to our diagnostic packet manager
         self.diagnostic_packets.process_packet(packet.clone(), now);
 
-        // Apply throttling - check if sufficient time has passed since last correction
+        // Apply throttling - check if sufficient time has passed since last correction.
+        // A one-shot bypass (armed by force_congestion_cut, issue #702) lets the
+        // aggressive cut's lower bitrate target land immediately instead of waiting
+        // out the throttle; it is consumed here so it never weakens the normal PID
+        // throttle on subsequent corrections.
+        let force_correction = std::mem::take(&mut self.force_next_correction);
         let time_since_last_correction = now - self.last_correction_time;
-        if time_since_last_correction < self.correction_throttle_ms {
+        if !force_correction && time_since_last_correction < self.correction_throttle_ms {
             log::debug!(
                 "Throttling bitrate correction: {:.0}ms since last correction (throttle: {:.0}ms)",
                 time_since_last_correction,
@@ -770,6 +792,14 @@ impl EncoderBitrateController {
         let changed = self.quality_manager.force_congestion_cut(now);
         if changed {
             self.tier_changed = true;
+            // Arm a one-shot throttle bypass so the next process_diagnostics_packet
+            // recomputes and emits the new (lower) clamped bitrate immediately,
+            // even if a prior PID correction occurred <1s ago. The held tier's
+            // congestion-hold ceiling pin (controller.rs ~line 627) keeps that
+            // recomputed bitrate <= the tier ideal, so the cut lands once at the
+            // held tier's clamped bitrate rather than being deferred ~1s. See
+            // `force_next_correction` field docs (issue #702).
+            self.force_next_correction = true;
             let old_bitrate = self.ideal_bitrate_kbps;
             let new_tier = self.quality_manager.current_video_tier();
             self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
@@ -2151,6 +2181,96 @@ mod tests {
             high_max,
             result,
             max_step,
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_bypasses_throttle_immediately() {
+        use crate::clock::TestClock;
+        use crate::constants::{DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
+
+        // The aggressive congestion cut (#702) must drop the *bitrate* target
+        // immediately, not just resolution/keyframe tiers. The encoder's bitrate
+        // only updates from the value process_diagnostics_packet returns, so if a
+        // CONGESTION arrives <1s after a prior PID correction, the normal throttle
+        // would return None and the codec would keep targeting the old (higher)
+        // bitrate for ~1s — defeating the buffer-drain intent of the cut.
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].ideal_bitrate_kbps;
+        let mut controller = EncoderBitrateController::with_clock(
+            ideal_bitrate_kbps,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+
+        // Warm up past the initialization gate so corrections actually emit.
+        // Start well past the manager's 5s warmup window (created_at = base_ms),
+        // and hold a steady ~0.60 fps ratio (18/30) — between the 0.50 degrade and
+        // 0.70 recover thresholds — so no tier transition fires during warm-up and
+        // the min-transition-interval guard cannot block the congestion cut.
+        let stable_fps = 18.0_f32;
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm =
+            warm_up_for_slew_test(&mut controller, base_time, stable_fps, ideal_bitrate_kbps);
+
+        // Perform one normal correction so last_correction_time is recent.
+        let correction_time = last_warm + 1100.0;
+        let prior = controller
+            .process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+                correction_time,
+            )
+            .expect("warm-up correction should emit a bitrate");
+        assert!(prior > 0.0, "prior correction should be positive");
+
+        // A self-targeted CONGESTION arrives only 200ms later — well inside the
+        // 1s PID correction throttle. Align the clock so force_congestion_cut's
+        // drain-hold window is anchored to the same timeline as the packet below.
+        let congestion_time = correction_time + 200.0;
+        clock.set_ms(congestion_time as u64);
+        let cut_changed = controller.force_congestion_cut();
+        assert!(
+            cut_changed,
+            "congestion cut should change tier from the default starting tier"
+        );
+
+        // The very next diagnostics packet — still <1s since the prior correction —
+        // must NOT be throttled: the one-shot bypass forces a fresh computation so
+        // the lower bitrate reaches the encoder in this same iteration.
+        let held_tier = controller.current_video_tier();
+        let held_ideal = held_tier.ideal_bitrate_kbps as f64;
+        let result = controller
+            .process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+                congestion_time,
+            )
+            .expect("congestion cut must bypass the throttle and emit a bitrate immediately");
+
+        // The emitted bitrate must respect the congestion-hold ceiling pin: it is
+        // clamped at or below the held (lower) tier's ideal, proving the cut landed
+        // immediately rather than being deferred to the old higher target.
+        assert!(
+            result <= held_ideal + 0.5,
+            "post-cut bitrate {result:.1} must be <= held tier ideal {held_ideal:.1} \
+             (congestion-hold ceiling pin); cut was not applied immediately"
+        );
+        assert!(
+            result < prior,
+            "post-cut bitrate {result:.1} must be lower than the pre-cut target {prior:.1}"
+        );
+
+        // The bypass is one-shot: a follow-up packet still inside the throttle
+        // window must be throttled again (the normal 1s PID throttle is intact).
+        let throttled = controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+            congestion_time + 100.0,
+        );
+        assert!(
+            throttled.is_none(),
+            "the throttle bypass must be one-shot; the normal 1s throttle must \
+             still apply to the following correction"
         );
     }
 

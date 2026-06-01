@@ -567,6 +567,16 @@ impl AdaptiveQualityManager {
         }
 
         // --- Audio step UP ---
+        // DELIBERATE ASYMMETRY (issue #702): unlike video step-up (see the
+        // `!self.congestion_hold_active(now_ms)` guard on `should_recover` ~line 440),
+        // audio recovery is intentionally NOT gated on the congestion-hold window.
+        // A self-targeted CONGESTION drain hold protects audio precisely by shedding
+        // video bandwidth (the ~350kbps video cut); audio is the priority stream and
+        // its recovery step is only ~15-30kbps, negligible against the freed video
+        // budget and far too small to refill the draining relay buffer. Suppressing
+        // audio recovery here would keep the priority stream degraded for the full
+        // ~2.5s hold for no meaningful buffer benefit, so we let it climb back
+        // immediately. Do not add a congestion-hold guard to this branch.
         let should_recover_audio = fps_ratio > AUDIO_TIER_RECOVER_FPS_RATIO;
 
         if should_recover_audio && self.audio_tier_index > 0 {

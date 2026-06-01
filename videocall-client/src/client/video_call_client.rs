@@ -21,6 +21,7 @@ use super::super::connection::{
     MediaStreamKey,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
@@ -30,6 +31,7 @@ use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::LocalBoxFuture;
+use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -53,6 +55,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::protos::viewport_packet::ViewportPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
@@ -421,13 +424,33 @@ struct Inner {
 /// `VideoCallClient` is cheaply cloneable (`Rc`-based interior mutability)
 /// and is passed to encoders and other subsystems so they can send packets
 /// and query connection state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
+    /// Send-side state machine for the viewport control packet (HCL issue
+    /// #988). Tracks the last-sent vs. pending active-decode-set so we only
+    /// emit a `VIEWPORT` packet on an actual change. See [`ViewportSender`].
+    viewport_sender: Rc<RefCell<ViewportSender>>,
+    /// Debounce timer that coalesces a burst of active-decode-set changes
+    /// (scroll / relayout) into a single `VIEWPORT` send. Holding the
+    /// [`Timeout`] keeps it armed; dropping/replacing it cancels the pending
+    /// fire. `None` when no flush is scheduled.
+    viewport_debounce_timer: Rc<RefCell<Option<Timeout>>>,
+}
+
+// `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
+// non-Debug fields so `VideoCallClient` stays printable for logging.
+impl std::fmt::Debug for VideoCallClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoCallClient")
+            .field("options", &self.options)
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for VideoCallClient {
@@ -435,6 +458,68 @@ impl PartialEq for VideoCallClient {
         Rc::ptr_eq(&self.inner, &other.inner)
             && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
             && self.options == other.options
+    }
+}
+
+/// Build a cleartext `VIEWPORT` control packet for `session_ids` and dispatch
+/// it on the reliable Control stream (HCL issue #988).
+///
+/// Free function taking the shared `connection_controller` cell directly so
+/// both the debounce-flush path (which holds a `VideoCallClient`) and the
+/// reconnect re-send closure (which only holds a `Weak<RefCell<Inner>>`, to
+/// avoid an `Rc` cycle through the connection callback) can share one
+/// serialization + send implementation. The cell is the same `Rc` held by both
+/// `VideoCallClient` and `Inner`.
+///
+/// The `ViewportPacket` is NOT E2EE-sealed — it is pure relay routing metadata
+/// that the relay consumes and never forwards to peers. The `session_ids` are
+/// the relay/peer session_ids (u64) the relay indexes on, sent unchanged.
+fn send_viewport_via(
+    connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    user_id: &str,
+    session_ids: Vec<u64>,
+) {
+    // Log the actual contents (capped) so a "froze my video" / wrongly-filtered
+    // support log shows exactly which streams the client asked the relay to keep
+    // (HCL issue #988). The list is unbounded in principle, so cap the logged
+    // sample; the `log::debug!` args are only evaluated when DEBUG is enabled, so
+    // the slice + format costs nothing at higher log levels.
+    const VIEWPORT_LOG_SAMPLE: usize = 8;
+    debug!(
+        "Sending VIEWPORT packet: first {} of {} session_id(s): {:?}",
+        session_ids.len().min(VIEWPORT_LOG_SAMPLE),
+        session_ids.len(),
+        &session_ids[..session_ids.len().min(VIEWPORT_LOG_SAMPLE)]
+    );
+    let viewport = ViewportPacket {
+        session_ids,
+        ..Default::default()
+    };
+    let data = match viewport.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize ViewportPacket: {e}");
+            return;
+        }
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::VIEWPORT.into(),
+        user_id: user_id.as_bytes().to_vec(),
+        data,
+        ..Default::default()
+    };
+    // VIEWPORT rides the reliable Control stream, like other signaling, so it
+    // is never stalled behind a large video keyframe write.
+    match connection_controller.try_borrow() {
+        Ok(cc) => match cc.as_ref() {
+            Some(controller) => {
+                if let Err(e) = controller.send_packet(wrapper, MediaStreamKey::Control) {
+                    debug!("Failed to send VIEWPORT packet: {e}");
+                }
+            }
+            None => debug!("No connection controller available; dropping VIEWPORT packet"),
+        },
+        Err(_) => warn!("connection_controller busy; dropping VIEWPORT packet"),
     }
 }
 
@@ -596,6 +681,8 @@ impl VideoCallClient {
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
+            viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
+            viewport_debounce_timer: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -712,6 +799,13 @@ impl VideoCallClient {
                 let on_connected = self.options.on_connected.clone();
                 let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
+                // VIEWPORT re-send on reconnect (HCL issue #988). Captured by
+                // strong Rc clones: `ViewportSender` does NOT reference the
+                // connection controller, so this forms no Rc cycle through the
+                // callback the controller holds. user_id is needed to stamp the
+                // outgoing PacketWrapper.
+                let viewport_sender = self.viewport_sender.clone();
+                let viewport_user_id = self.options.user_id.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -730,6 +824,54 @@ impl VideoCallClient {
                     match state {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
+
+                            // On (re)connect the session_id changed and the
+                            // relay allocated a fresh empty viewport (fail-open
+                            // → all streams). Re-send the current viewport so
+                            // filtering resumes; without this the user silently
+                            // gets every stream again after any re-election.
+                            // Sent directly (one event per reconnect — no
+                            // debounce needed) using the same path as the
+                            // debounced flush.
+                            let to_send = match viewport_sender.try_borrow_mut() {
+                                Ok(mut s) => {
+                                    if s.reset_for_reconnect() {
+                                        s.take_if_changed()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(_) => {
+                                    warn!("VIEWPORT reconnect re-send: sender busy, skipping");
+                                    None
+                                }
+                            };
+                            if let Some(session_ids) = to_send {
+                                if let Some(inner) = Weak::upgrade(&inner) {
+                                    if let Ok(inner) = inner.try_borrow() {
+                                        // `Inner` holds a clone of the same
+                                        // connection_controller cell; use it so
+                                        // the closure never strong-captures the
+                                        // controller (no Rc cycle).
+                                        let resent_count = session_ids.len();
+                                        send_viewport_via(
+                                            &inner.connection_controller,
+                                            &viewport_user_id,
+                                            session_ids,
+                                        );
+                                        // Log the recovery edge explicitly (HCL
+                                        // issue #988): only the failure paths were
+                                        // logged before, so a support log could not
+                                        // confirm the client re-subscribed its
+                                        // viewport after a transport flap / re-election.
+                                        info!(
+                                            "VIEWPORT reconnect re-send: re-sent viewport with {resent_count} session_id(s) after reconnect"
+                                        );
+                                    } else {
+                                        warn!("VIEWPORT reconnect re-send: inner busy, skipping");
+                                    }
+                                }
+                            }
                         }
                         ConnectionState::Failed { error, .. } => {
                             on_connection_lost.emit(ConnectionLostReason::HandshakeFailed(error));
@@ -1456,6 +1598,77 @@ impl VideoCallClient {
             inner
                 .peer_decode_manager
                 .set_active_decode_set(active_session_ids);
+        }
+
+        // Relay the rendered set to the relay as a VIEWPORT control packet so
+        // it can drop VIDEO for peers we are not looking at (HCL issue #988).
+        // `active_session_ids` are the relay/peer session_ids (u64) — the exact
+        // keys `PeerDecodeManager` and the relay index on — so they go on the
+        // wire unchanged. We only (re)arm the debounce timer when the set
+        // actually changed, so repeated identical layout passes are free.
+        let changed = match self.viewport_sender.try_borrow_mut() {
+            Ok(mut sender) => sender.record(active_session_ids),
+            Err(_) => {
+                warn!("set_active_decode_set: viewport_sender busy, skipping viewport update");
+                return;
+            }
+        };
+        if changed {
+            self.schedule_viewport_flush();
+        }
+    }
+
+    /// Arm (or re-arm) the debounce timer that emits a single `VIEWPORT`
+    /// packet once the active-decode-set settles. Replacing the stored
+    /// [`Timeout`] cancels any previously-scheduled fire, so a burst of
+    /// changes coalesces into one send `VIEWPORT_DEBOUNCE_MS` after the last
+    /// change (HCL issue #988; see CLAUDE.md storm-avoidance policy).
+    fn schedule_viewport_flush(&self) {
+        // Capture WEAK refs to the shared cells (and an owned user_id) rather
+        // than a full `self.clone()`. A strong clone here would create a
+        // transient Rc cycle (client -> debounce_timer cell -> Timeout closure
+        // -> client) that leaks the whole client until the timer fires. Weak
+        // refs keep the closure from extending any lifetime; if the client is
+        // dropped before the timer fires, the upgrades simply fail and the
+        // flush is skipped.
+        let sender = Rc::downgrade(&self.viewport_sender);
+        let timer_slot = Rc::downgrade(&self.viewport_debounce_timer);
+        let controller = Rc::downgrade(&self.connection_controller);
+        let user_id = self.options.user_id.clone();
+
+        let timeout = Timeout::new(VIEWPORT_DEBOUNCE_MS, move || {
+            // Clear our own handle first so a re-arm doesn't observe a stale,
+            // already-fired timer.
+            if let Some(slot) = timer_slot.upgrade() {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = None;
+                }
+            }
+            let (Some(sender), Some(controller)) = (sender.upgrade(), controller.upgrade()) else {
+                // Client was dropped while the timer was armed; nothing to do.
+                return;
+            };
+            let session_ids = match sender.try_borrow_mut() {
+                Ok(mut sender) => sender.take_if_changed(),
+                Err(_) => {
+                    warn!("flush_viewport: viewport_sender busy, will retry on next change");
+                    return;
+                }
+            };
+            if let Some(session_ids) = session_ids {
+                send_viewport_via(&controller, &user_id, session_ids);
+            }
+        });
+
+        if let Ok(mut slot) = self.viewport_debounce_timer.try_borrow_mut() {
+            // Replacing the stored Timeout drops (cancels) any previously
+            // scheduled fire, coalescing a burst of changes into one send.
+            *slot = Some(timeout);
+        } else {
+            // Timer slot is busy (should not happen on the single-threaded
+            // wasm runtime); forget the timeout so it still fires rather than
+            // being dropped/cancelled.
+            timeout.forget();
         }
     }
 
@@ -2313,6 +2526,12 @@ impl Inner {
                         error!("Failed to parse PeerEvent: {e}");
                     }
                 }
+            }
+            Ok(PacketType::VIEWPORT) => {
+                // VIEWPORT is a client -> relay ONLY control packet (HCL issue
+                // #988): the relay consumes it for viewport-aware video
+                // filtering and never forwards it to peers. A client should
+                // never receive one; ignore it defensively if it ever appears.
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(

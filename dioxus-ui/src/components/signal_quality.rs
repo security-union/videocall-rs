@@ -19,6 +19,118 @@ use crate::theme::color as theme_color;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Scope filter for [`SignalQualityPopup`].
+///
+/// Drives which metric series (audio, video, screen) the popup renders in the
+/// chart, legend, and tooltip. Introduced for HCL bug #2 so the LEFT panel of
+/// the screen-share split layout can show ONLY the screen-share series, and
+/// peer tiles can suppress the screen-share series (the shared-content tile
+/// has its own popup for that).
+///
+/// Two distinct popups can therefore be open simultaneously for the same
+/// publisher: one anchored to the screen-share tile (`ScreenOnly`) and one
+/// anchored to that peer's video tile (`NoScreen`). The popup-state map keys
+/// on `(peer_id, mode)` so they coexist without colliding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum SignalMeterMode {
+    /// Show every metric series the sample has data for. Used by legacy
+    /// callers (e.g. the diagnostics overview) where the popup isn't paired
+    /// with a specific tile mode.
+    #[default]
+    Full,
+    /// Show ONLY the screen-share series. Used by the shared-content tile in
+    /// the split layout — clicking its signal-meter icon must surface only the
+    /// screen-share metric, not camera or audio.
+    ScreenOnly,
+    /// Show audio + video, hide the screen-share series. Originally used
+    /// by peer tiles to suppress double-rendering of the screen-share
+    /// metric (the LEFT-panel `ScreenOnly` popup was the dedicated
+    /// source). The peer-tile default has since been moved back to
+    /// `Full` so the peer-tile popup surfaces screen-share metrics when
+    /// the peer starts sharing — `has_screen_data` already gates the
+    /// Screen legend / tooltip line on samples actually carrying
+    /// `screen_enabled == true`, so the suppression is a no-op for
+    /// non-sharing peers and was hiding live data for sharing peers
+    /// (caught by `peer-screen-diagnostics` / `peer-screen-static-fps`
+    /// E2Es). The variant is retained so external callers / future
+    /// surface areas (e.g. a settings preference) can opt back in
+    /// without breaking the popup-state-map key shape.
+    #[allow(dead_code)]
+    NoScreen,
+}
+
+impl SignalMeterMode {
+    /// Whether this mode renders the audio series.
+    pub fn shows_audio(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the camera-video series.
+    pub fn shows_video(self) -> bool {
+        matches!(self, Self::Full | Self::NoScreen)
+    }
+
+    /// Whether this mode renders the screen-share series.
+    pub fn shows_screen(self) -> bool {
+        matches!(self, Self::Full | Self::ScreenOnly)
+    }
+
+    /// Short stable string for DOM ids. The popup-state map keys on
+    /// `(peer_id, mode)` and we serialise both halves into the DOM id so
+    /// CSS / Playwright selectors can target each popup independently.
+    pub fn id_suffix(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ScreenOnly => "screen",
+            Self::NoScreen => "peer",
+        }
+    }
+}
+
+/// Per-popup persistent state, lifted out of the per-tile `PeerTile` so
+/// mid-meeting peer leaves / layout switches don't unmount the popup
+/// containers and close every other popup (HCL bug #8). Stored in a
+/// context-provided `Signal<HashMap<(peer_id, mode), SignalPopupState>>`
+/// so multiple popups can coexist independently.
+///
+/// `position` honours the drag-and-drop rule from HCL bug #9: when the user
+/// drags a popup, we transition from `Anchored` (auto-follow the tile) to
+/// `Free` (fixed viewport coordinates). The popup's header carries a 📌
+/// reanchor button that resets the state back to `Anchored`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SignalPopupState {
+    pub position: SignalPopupPosition,
+}
+
+impl Default for SignalPopupState {
+    fn default() -> Self {
+        Self {
+            position: SignalPopupPosition::Anchored,
+        }
+    }
+}
+
+/// Viewport-space position for a signal-quality popup. `Anchored` reads the
+/// tile's `getBoundingClientRect()` and tracks the tile through layout
+/// reflows; `Free { left, top }` pins the popup to fixed viewport
+/// coordinates regardless of where the tile moves (drag-and-drop result).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SignalPopupPosition {
+    Anchored,
+    Free { left: f64, top: f64 },
+}
+
+impl SignalPopupPosition {
+    /// Convenience predicate. Currently unused by the popup itself (the
+    /// `data-anchor-mode` attribute on the popup DOM element is the source of
+    /// truth for `reposition_popup`), but exposed for tests and downstream
+    /// callers that want to inspect the state.
+    #[allow(dead_code)]
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free { .. })
+    }
+}
+
 /// Discrete signal quality level shown as 0-5 filled bars.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SignalLevel {
@@ -569,6 +681,13 @@ pub struct SignalInfo {
     /// observed yet. Renders as a header badge in [`SignalQualityPopup`];
     /// not part of the time-series chart.
     pub transport: Option<String>,
+    /// HCL bug #2: scope filter for the popup. `Full` (legacy) shows every
+    /// series; `ScreenOnly` restricts the chart / legend / tooltip to the
+    /// screen-share series (used by the shared-content tile in the split
+    /// layout); `NoScreen` hides the screen-share series (used by peer
+    /// tiles so the screen metric only renders in the dedicated
+    /// shared-content popup).
+    pub meter_mode: SignalMeterMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +720,27 @@ pub struct SignalQualityPopupProps {
     /// join/leave keeps the popup glued to the right tile instead of
     /// stranding it where the tile used to be.
     anchor_id: String,
+    /// HCL bug #2: scope filter for which metric series the popup shows.
+    /// Defaults to `Full` so legacy call sites unaffected by bug #2 keep
+    /// rendering every series.
+    #[props(default)]
+    meter_mode: SignalMeterMode,
+    /// HCL bug #9: when `Some`, position the popup at fixed viewport
+    /// coordinates instead of anchoring to the tile. `None` re-engages
+    /// the anchored-follow behaviour. Owned by the popup-state context
+    /// map (`SignalPopupStateMap`).
+    #[props(default)]
+    free_position: Option<(f64, f64)>,
+    /// HCL bug #9: invoked when the user drags the popup to a new viewport
+    /// position. The host installs this callback to commit the new free
+    /// position into the popup-state map.
+    #[props(default)]
+    on_drag_commit: EventHandler<(f64, f64)>,
+    /// HCL bug #9: invoked when the user clicks the reanchor button in the
+    /// popup header. The host installs this callback to reset
+    /// `free_position` to `None` so the popup snaps back to the tile.
+    #[props(default)]
+    on_reanchor: EventHandler<()>,
     /// Called when the user dismisses the popup.
     on_close: EventHandler<()>,
 }
@@ -609,12 +749,23 @@ pub struct SignalQualityPopupProps {
 // Popup positioning math (portal-mode)
 // ---------------------------------------------------------------------------
 
-/// Margin in CSS pixels between the popup and the tile edge / viewport edge.
-const POPUP_GAP_PX: f64 = 8.0;
 /// Minimum spacing between the popup and the viewport edges.  The popup is
 /// clamped inside `[VIEWPORT_MARGIN_PX .. viewport - VIEWPORT_MARGIN_PX]`
 /// on both axes so it never sits flush against a screen edge.
 const VIEWPORT_MARGIN_PX: f64 = 8.0;
+/// HCL follow-up (@token-exempt): fraction of the signal-quality button's
+/// width at which the popup's RIGHT edge lands. `0.25` means the popup's
+/// right edge sits 25% across the button from its left, so the popup
+/// horizontally overlays only the LEFT QUARTER of the button — the body
+/// of the popup extends to the LEFT of the button.
+const POPUP_BUTTON_OVERLAY_X_FRACTION: f64 = 0.25;
+/// HCL follow-up (@token-exempt): fraction of the signal-quality button's
+/// height at which the popup's TOP edge lands. `0.5` puts the popup's
+/// top edge at the button's vertical midpoint, so the popup hangs BELOW
+/// the upper half of the button. Combined with the X fraction above, the
+/// popup's upper-right corner touches the button at (25% from button
+/// left, vertical midpoint).
+const POPUP_BUTTON_OVERLAY_Y_FRACTION: f64 = 0.5;
 
 /// Axis-aligned bounding box in viewport (CSS pixel) coordinates.  Mirrors
 /// the fields of `DOMRect` we care about so the position-math helpers can
@@ -637,20 +788,27 @@ impl Rect {
 }
 
 /// Compute the viewport-coordinate `(left, top)` for the signal-quality
-/// popup given the source tile rect, the popup's own size, and the
-/// viewport size.
+/// popup given the source anchor (the tile's signal-quality button) rect,
+/// the popup's own size, and the viewport size.
+///
+/// HCL follow-up (@token-exempt): the popup's UPPER-RIGHT corner lands at
+/// `(button.left + button.width * POPUP_BUTTON_OVERLAY_X_FRACTION,
+///   button.top  + button.height * POPUP_BUTTON_OVERLAY_Y_FRACTION)`.
+/// With the defaults (`0.25`, `0.5`) that means the popup's right edge
+/// sits 25% across the button from its left, and the popup's top edge
+/// sits at the button's vertical midpoint. The popup body therefore
+/// hangs mostly to the LEFT of, and BELOW the upper half of, the button
+/// — overlaying only the button's upper-left quadrant slightly.
 ///
 /// Anchoring rules (in order of preference):
-///   1. Place the popup adjacent to the tile's right edge, top-aligned
-///      with the tile.  This mirrors the historical visual relationship
-///      where the popup hung off the top-right corner of the tile.
-///   2. If that would overflow the right viewport edge, flip to the
-///      tile's left side.
-///   3. If still overflowing (popup wider than the available space on
-///      either side), clamp to the viewport edge with `VIEWPORT_MARGIN_PX`
-///      breathing room.
-///   4. Vertically, clamp to the viewport so the popup never extends
-///      above or below the visible area.
+///   1. Place the popup's upper-right corner at the (X, Y) point above —
+///      i.e. `target_left = btn.left + btn.width * X_FRAC - popup_w`
+///      and  `target_top  = btn.top  + btn.height * Y_FRAC`.
+///   2. Clamp the result into `[VIEWPORT_MARGIN_PX, viewport - popup - margin]`
+///      on both axes so the popup never extends past a screen edge.
+///      Buttons near the viewport left can otherwise push `target_left`
+///      negative; buttons near the bottom can otherwise push the popup
+///      off the bottom edge.
 ///
 /// The function operates on pure data, so unit tests can drive every
 /// edge-case path without a browser.
@@ -661,30 +819,25 @@ pub(crate) fn compute_popup_position(
     viewport_w: f64,
     viewport_h: f64,
 ) -> (f64, f64) {
-    // Horizontal: prefer right-of-tile, then left-of-tile, then clamp.
-    let right_of_left = anchor.right + POPUP_GAP_PX;
-    let left_of_left = anchor.left - POPUP_GAP_PX - popup_w;
-
+    // Horizontal: the popup's RIGHT edge lands at
+    // `btn.left + btn.width * X_FRAC`, so `target_left = right - popup_w`.
+    // Clamp into the viewport so a button near the left edge can't push
+    // the popup off-screen on the left, and a narrow viewport can't let
+    // it spill off on the right.
     let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
     let min_left = VIEWPORT_MARGIN_PX;
+    let target_right = anchor.left + anchor.width() * POPUP_BUTTON_OVERLAY_X_FRACTION;
+    let target_left = target_right - popup_w;
+    let left = target_left.clamp(min_left, max_left.max(min_left));
 
-    let left = if right_of_left + popup_w <= viewport_w - VIEWPORT_MARGIN_PX {
-        // Fits to the right of the tile.
-        right_of_left
-    } else if left_of_left >= VIEWPORT_MARGIN_PX {
-        // Fits to the left of the tile.
-        left_of_left
-    } else {
-        // Neither side fits — overlay the tile, anchored to the right
-        // edge of the viewport.  This is the dense-grid worst case.
-        max_left
-    };
-    let left = left.clamp(min_left, max_left.max(min_left));
-
-    // Vertical: prefer top-aligned with the tile, then clamp into viewport.
+    // Vertical: the popup's TOP edge lands at the button's vertical
+    // midpoint (`btn.top + btn.height * Y_FRAC`). Clamp into the viewport
+    // so a button near the bottom edge can't push the popup off-screen,
+    // and a button scrolled above the viewport can't yield a negative top.
     let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
     let min_top = VIEWPORT_MARGIN_PX;
-    let top = anchor.top.clamp(min_top, max_top.max(min_top));
+    let target_top = anchor.top + anchor.height() * POPUP_BUTTON_OVERLAY_Y_FRACTION;
+    let top = target_top.clamp(min_top, max_top.max(min_top));
 
     (left, top)
 }
@@ -705,17 +858,40 @@ fn element_rect(el: &web_sys::Element) -> Rect {
 /// No-ops silently if either element is missing from the DOM — that's the
 /// normal state when the source tile has just unmounted from a peer leave
 /// but the popup has not yet finished its own unmount cycle.
+///
+/// HCL bug #9: the popup carries a `data-anchor-mode` attribute reflecting
+/// its current anchor state. `"free"` / `"dragging"` means the user has
+/// dragged it; the JS-driven reposition must NOT overwrite the user's
+/// coordinates in that case, so we early-return when the attribute is
+/// `"free"`/`"dragging"`. This is the lever that lets the resize / scroll
+/// / ResizeObserver callbacks coexist with drag-and-drop without re-
+/// snapping the popup back to the tile mid-drag.
 fn reposition_popup(anchor_id: &str, popup_id: &str) {
     let doc = gloo_utils::document();
     let win = match web_sys::window() {
         Some(w) => w,
         None => return,
     };
-    let anchor = match doc.get_element_by_id(anchor_id) {
+    let popup = match doc.get_element_by_id(popup_id) {
         Some(el) => el,
         None => return,
     };
-    let popup = match doc.get_element_by_id(popup_id) {
+
+    // Bug #9: respect the user's manual drag position.
+    if popup
+        .get_attribute("data-anchor-mode")
+        .as_deref()
+        .map(|m| m == "free" || m == "dragging")
+        .unwrap_or(false)
+    {
+        // Free popups are positioned by the user; only clamp them so they
+        // remain within the current viewport. This handles window-resize
+        // edge cases where a free popup would otherwise spill off-screen.
+        clamp_free_popup_to_viewport(&popup, &win);
+        return;
+    }
+
+    let anchor = match doc.get_element_by_id(anchor_id) {
         Some(el) => el,
         None => return,
     };
@@ -745,6 +921,166 @@ fn reposition_popup(anchor_id: &str, popup_id: &str) {
     let style = html_popup.style();
     let _ = style.set_property("left", &format!("{left:.0}px"));
     let _ = style.set_property("top", &format!("{top:.0}px"));
+}
+
+/// HCL follow-up 952 (@token-exempt): snap a popup back to its anchor
+/// immediately, in response to the reanchor button click.
+///
+/// Without this helper, the click only commits `Anchored` to the
+/// popup-state map. `reposition_popup` then runs ONLY when the next
+/// resize / scroll / ResizeObserver fires — until then the popup keeps
+/// the stale inline `left`/`top` written by the drag handler and the
+/// user perceives nothing happening on click.
+///
+/// We flip `data-anchor-mode` to `anchored` so `reposition_popup` no
+/// longer early-returns into the free-clamp branch, clear the inline
+/// position styles the drag wrote, and run one immediate reposition
+/// pass. The Dioxus re-render that follows the state-map write
+/// confirms the same attribute / style declaratively, so the two paths
+/// agree.
+///
+/// HCL follow-up 957: split-layout regression — clicking pin while a
+/// peer was sharing left the popup parked at its dragged coordinates.
+/// To make this robust across layout transitions (grid ↔ split panels):
+///
+///   1. The anchor id is read from the popup's live
+///      `data-popup-anchor-id` attribute every call — not from a Rust
+///      string captured at popup-open time, which could go stale if
+///      the layout switched mid-session.
+///   2. If the captured id no longer matches a live DOM element, we
+///      fall back to the closest `[data-tile-root]` ancestor of the
+///      popup and search inside it for a `.floating-name` element.
+///      This gives the snap-back a "land somewhere sane" path even
+///      when an anchor id mismatch would otherwise leave the popup
+///      stranded.
+///   3. The popup element itself is re-queried every call, so a stale
+///      handle from a prior render can never cause a no-op.
+fn snap_popup_back_to_anchor(popup_id: &str) {
+    let doc = gloo_utils::document();
+    let popup = match doc.get_element_by_id(popup_id) {
+        Some(el) => el,
+        None => return,
+    };
+    // Flip the mode FIRST so any subsequent reposition pass does not
+    // early-return into the free-clamp branch.
+    let _ = popup.set_attribute("data-anchor-mode", "anchored");
+
+    // Clear drag-written inline coordinates so the reposition writes
+    // below are the source of truth for the post-snap position.
+    let html_popup: web_sys::HtmlElement = popup.clone().unchecked_into();
+    let style = html_popup.style();
+    let _ = style.remove_property("left");
+    let _ = style.remove_property("top");
+
+    // Resolve the anchor element. We prefer the popup's own live
+    // `data-popup-anchor-id` attribute (set declaratively by Dioxus on
+    // every render so it is always current for the active tile-mode);
+    // when that lookup fails we fall back to a tile-relative
+    // `.floating-name` search before giving up.
+    let anchor_id = popup
+        .get_attribute("data-popup-anchor-id")
+        .unwrap_or_default();
+    let anchor_el = if anchor_id.is_empty() {
+        None
+    } else {
+        doc.get_element_by_id(&anchor_id)
+    };
+    let anchor_el = anchor_el.or_else(|| find_fallback_anchor(&popup));
+    let Some(anchor_el) = anchor_el else {
+        return;
+    };
+
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let anchor_rect = element_rect(&anchor_el);
+    let popup_rect = element_rect(&popup);
+    let (left, top) = compute_popup_position(
+        anchor_rect,
+        popup_rect.width(),
+        popup_rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+    let _ = style.set_property("left", &format!("{left:.0}px"));
+    let _ = style.set_property("top", &format!("{top:.0}px"));
+}
+
+/// HCL follow-up 957: tile-relative fallback used when the popup's
+/// stored anchor id does not match a live DOM element (popup mounts
+/// before the new tile DOM commits; grid ↔ split transition tears down
+/// the button mid-snap). Walks up from the popup to its owning tile
+/// root (`[data-tile-root]`) and returns the first `.signal-indicator`
+/// button it finds inside — the new anchor target. Returns `None` when
+/// no tile root is found or the tile has no signal-indicator button —
+/// in that case `snap_popup_back_to_anchor` gives up rather than
+/// guessing.
+fn find_fallback_anchor(popup: &web_sys::Element) -> Option<web_sys::Element> {
+    let tile_root = popup.closest("[data-tile-root]").ok().flatten()?;
+    tile_root.query_selector(".signal-indicator").ok().flatten()
+}
+
+/// HCL bug #9: clamp a `Free` popup so it stays within the viewport when
+/// the window resizes. We don't touch the popup if it already fits — the
+/// user dragged it there deliberately and we should not drift it.
+fn clamp_free_popup_to_viewport(popup: &web_sys::Element, win: &web_sys::Window) {
+    let html_popup: web_sys::HtmlElement = popup.clone().unchecked_into();
+    let rect = element_rect(&html_popup);
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let (left, top) = clamp_free_position(
+        rect.left,
+        rect.top,
+        rect.width(),
+        rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+    if (left - rect.left).abs() > 0.5 || (top - rect.top).abs() > 0.5 {
+        let style = html_popup.style();
+        let _ = style.set_property("left", &format!("{left:.0}px"));
+        let _ = style.set_property("top", &format!("{top:.0}px"));
+    }
+}
+
+/// Clamp a free-mode popup position to keep it inside the viewport with
+/// the same `VIEWPORT_MARGIN_PX` breathing room used by
+/// [`compute_popup_position`]. Extracted so unit tests can drive every
+/// clamp branch without a browser.
+pub(crate) fn clamp_free_position(
+    left: f64,
+    top: f64,
+    popup_w: f64,
+    popup_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> (f64, f64) {
+    let max_left = (viewport_w - popup_w - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_left = VIEWPORT_MARGIN_PX;
+    let max_top = (viewport_h - popup_h - VIEWPORT_MARGIN_PX).max(VIEWPORT_MARGIN_PX);
+    let min_top = VIEWPORT_MARGIN_PX;
+    let l = left.clamp(min_left, max_left.max(min_left));
+    let t = top.clamp(min_top, max_top.max(min_top));
+    (l, t)
 }
 
 /// Install everything the `SignalQualityPopup` needs to behave like a
@@ -843,6 +1179,22 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
             // re-distributes available space).  `window` resize covers
             // viewport changes, but the grid can reflow without any
             // viewport change — that's the case this observer handles.
+            //
+            // HCL iter2 follow-up: we also observe the POPUP element itself.
+            // The popup body switches between two rsx branches as the peer's
+            // signal history populates ("No data yet" vs. the chart UI). The
+            // popup's height (and on first paint, briefly its measured
+            // width) changes across that transition. Without observing the
+            // popup, the initial rAF reposition runs against the empty-body
+            // dimensions and the position is never re-evaluated against the
+            // populated-body dimensions — observed in HCL e2e iter2 as a
+            // ~36px X delta on the LEFT-panel split-screen-tile popup snap-
+            // back assertion (the snap-back recomputed against the wider
+            // populated popup; the test's `initial` snapshot still reflected
+            // the narrower empty-body measurement). Observing the popup
+            // makes reposition fire when the body grows, so the
+            // `compute_popup_position` math is always evaluated against the
+            // popup's final dimensions and snap-back stays within tolerance.
             let observer_cb: Closure<dyn FnMut(js_sys::Array)> = Closure::new({
                 let rep = reposition.clone();
                 move |_entries: js_sys::Array| rep()
@@ -852,6 +1204,9 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
                 let doc = gloo_utils::document();
                 if let Some(anchor_el) = doc.get_element_by_id(&anchor_id_for_init) {
                     obs.observe(&anchor_el);
+                }
+                if let Some(popup_el) = doc.get_element_by_id(&popup_id_for_init) {
+                    obs.observe(&popup_el);
                 }
             }
 
@@ -888,6 +1243,233 @@ fn install_popup_anchor(anchor_id: String, popup_id: String, _on_close: EventHan
                 }
                 if let Some(obs) = s.observer.as_ref() {
                     obs.disconnect();
+                }
+            }
+        }
+    });
+}
+
+/// HCL bug #9: install drag-and-drop on the popup header so users can
+/// pull the popup off its tile anchor and place it wherever they like.
+///
+/// The header carries a `data-drag-handle` attribute. We attach
+/// `mousedown` to the popup root (and filter to events that originated
+/// inside the header). On mousedown we capture the pointer's offset from
+/// the popup's current top-left, set `data-anchor-mode="dragging"` (which
+/// `reposition_popup` honours by skipping its auto-layout math), and
+/// install temporary `mousemove` / `mouseup` listeners on the window.
+///
+/// `mousemove` writes the new `left`/`top` directly to the popup's inline
+/// style — using inline styles instead of a Dioxus signal keeps the drag
+/// 60fps even when the popup tree is otherwise expensive to re-render.
+/// On `mouseup` we commit the final position to the popup-state map via
+/// the `on_drag_commit` callback, which clears the `dragging` data-attr
+/// and flips it to `"free"` (the durable state). Touch support is
+/// intentionally out of scope for the first cut — desktop drag is the
+/// primary UX.
+fn install_popup_drag(popup_id: String, on_drag_commit: EventHandler<(f64, f64)>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::closure::Closure;
+
+    struct DragState {
+        win: web_sys::Window,
+        mousedown_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        mousemove_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        mouseup_cb: Option<Closure<dyn FnMut(web_sys::MouseEvent)>>,
+        popup_el: Option<web_sys::Element>,
+    }
+
+    let state: Rc<RefCell<Option<DragState>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    {
+        let state = state.clone();
+        let popup_id_for_init = popup_id.clone();
+        let on_drag_commit_for_init = on_drag_commit;
+        use_hook(move || {
+            let win = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+
+            // HCL follow-up 946 (@token-exempt): defer the `popup_el` lookup until after
+            // Dioxus has committed the DOM. Without this rAF guard,
+            // `doc.get_element_by_id(popup_id)` can race the same render
+            // cycle that mounted the popup, returning `None` — the
+            // listeners then never bind and drag silently fails. Mirrors
+            // the rAF pattern `install_popup_anchor` uses for the same
+            // mount-race reason ("Initial paint can race the popup
+            // actually being attached to the DOM").
+            //
+            // If the popup unmounts before this rAF fires, the lookup
+            // returns `None` and we silently bail. `state` stays at
+            // `None`, so `use_drop` (below) is a no-op. No listener leak.
+            let win_for_raf = win.clone();
+            let popup_id_for_raf = popup_id_for_init;
+            let state_for_raf = state;
+            let on_drag_commit_for_raf = on_drag_commit_for_init;
+            let raf_cb = Closure::once_into_js(move |_ts: f64| {
+                let win = win_for_raf;
+                let state = state_for_raf;
+                let popup_id_for_init = popup_id_for_raf;
+                let on_drag_commit_for_init = on_drag_commit_for_raf;
+
+                let doc = gloo_utils::document();
+                let popup_el = match doc.get_element_by_id(&popup_id_for_init) {
+                    Some(el) => el,
+                    None => return, // popup unmounted before rAF fired
+                };
+
+                // Per-drag-session offset of the cursor inside the popup so the
+                // drag preserves the click point. Reset on every mousedown.
+                let offset: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((0.0, 0.0)));
+                // Whether a drag is currently active. Drives `mousemove` early-out
+                // when the user isn't dragging.
+                let active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+                // mousedown handler attached to the popup root. We bubble-listen
+                // and filter by `closest('[data-drag-handle]')` so only clicks
+                // inside the header start a drag. Buttons inside the header
+                // (close, reanchor) carry `data-no-drag` so they're excluded.
+                let mousedown_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let offset = offset.clone();
+                    let active = active.clone();
+                    move |evt: web_sys::MouseEvent| {
+                        let target = match evt.target() {
+                            Some(t) => t,
+                            None => return,
+                        };
+                        let target_el: web_sys::Element = match target.dyn_into() {
+                            Ok(el) => el,
+                            Err(_) => return,
+                        };
+                        // Bail on no-drag controls (close button, reanchor button).
+                        if let Ok(Some(_)) = target_el.closest("[data-no-drag]") {
+                            return;
+                        }
+                        // Only fire when the click landed in the drag handle.
+                        let in_handle =
+                            matches!(target_el.closest("[data-drag-handle]"), Ok(Some(_)));
+                        if !in_handle {
+                            return;
+                        }
+                        if evt.button() != 0 {
+                            return;
+                        }
+                        evt.prevent_default();
+                        let rect = popup_el.get_bounding_client_rect();
+                        let dx = evt.client_x() as f64 - rect.left();
+                        let dy = evt.client_y() as f64 - rect.top();
+                        *offset.borrow_mut() = (dx, dy);
+                        *active.borrow_mut() = true;
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let _ = html_popup.set_attribute("data-anchor-mode", "dragging");
+                    }
+                });
+                let _ = popup_el.add_event_listener_with_callback(
+                    "mousedown",
+                    mousedown_cb.as_ref().unchecked_ref(),
+                );
+
+                // mousemove handler on window — runs only while a drag is
+                // active, so the early-out keeps the cost negligible when
+                // the user is just moving the cursor.
+                let mousemove_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let offset = offset.clone();
+                    let active = active.clone();
+                    let win_inner = win.clone();
+                    move |evt: web_sys::MouseEvent| {
+                        if !*active.borrow() {
+                            return;
+                        }
+                        let (dx, dy) = *offset.borrow();
+                        let target_left = evt.client_x() as f64 - dx;
+                        let target_top = evt.client_y() as f64 - dy;
+                        let rect = popup_el.get_bounding_client_rect();
+                        let viewport_w = win_inner
+                            .inner_width()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let viewport_h = win_inner
+                            .inner_height()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let (l, t) = clamp_free_position(
+                            target_left,
+                            target_top,
+                            rect.width(),
+                            rect.height(),
+                            viewport_w,
+                            viewport_h,
+                        );
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let style = html_popup.style();
+                        let _ = style.set_property("left", &format!("{l:.0}px"));
+                        let _ = style.set_property("top", &format!("{t:.0}px"));
+                    }
+                });
+                let _ = win.add_event_listener_with_callback(
+                    "mousemove",
+                    mousemove_cb.as_ref().unchecked_ref(),
+                );
+
+                // mouseup commits the final position.
+                let mouseup_cb: Closure<dyn FnMut(web_sys::MouseEvent)> = Closure::new({
+                    let popup_el = popup_el.clone();
+                    let active = active.clone();
+                    move |_evt: web_sys::MouseEvent| {
+                        if !*active.borrow() {
+                            return;
+                        }
+                        *active.borrow_mut() = false;
+                        let html_popup: web_sys::HtmlElement = popup_el.clone().unchecked_into();
+                        let rect = html_popup.get_bounding_client_rect();
+                        let _ = html_popup.set_attribute("data-anchor-mode", "free");
+                        on_drag_commit_for_init.call((rect.left(), rect.top()));
+                    }
+                });
+                let _ = win.add_event_listener_with_callback(
+                    "mouseup",
+                    mouseup_cb.as_ref().unchecked_ref(),
+                );
+
+                *state.borrow_mut() = Some(DragState {
+                    win: win.clone(),
+                    mousedown_cb: Some(mousedown_cb),
+                    mousemove_cb: Some(mousemove_cb),
+                    mouseup_cb: Some(mouseup_cb),
+                    popup_el: Some(popup_el),
+                });
+            });
+            let _ = win.request_animation_frame(raf_cb.as_ref().unchecked_ref());
+        });
+    }
+
+    use_drop({
+        let state = state.clone();
+        move || {
+            if let Some(s) = state.borrow_mut().take() {
+                if let (Some(el), Some(cb)) = (s.popup_el.as_ref(), s.mousedown_cb.as_ref()) {
+                    let _ = el.remove_event_listener_with_callback(
+                        "mousedown",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+                if let Some(cb) = s.mousemove_cb.as_ref() {
+                    let _ = s.win.remove_event_listener_with_callback(
+                        "mousemove",
+                        cb.as_ref().unchecked_ref(),
+                    );
+                }
+                if let Some(cb) = s.mouseup_cb.as_ref() {
+                    let _ = s.win.remove_event_listener_with_callback(
+                        "mouseup",
+                        cb.as_ref().unchecked_ref(),
+                    );
                 }
             }
         }
@@ -1332,7 +1914,14 @@ fn hide_body_tooltip() {
 pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let history = &props.history;
     let on_close = props.on_close;
-    let popup_title = format!("Signal Quality - {}", props.peer_name);
+    let on_drag_commit = props.on_drag_commit;
+    let on_reanchor = props.on_reanchor;
+    let meter_mode = props.meter_mode;
+    let free_position = props.free_position;
+    let popup_title = match meter_mode {
+        SignalMeterMode::ScreenOnly => format!("Screen Share Quality - {}", props.peer_name),
+        _ => format!("Signal Quality - {}", props.peer_name),
+    };
 
     // Derive the transport badge tuple once, before rsx, so we don't pay
     // for repeated `String::as_str` / match work inside the rsx! macro
@@ -1367,21 +1956,56 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // All closures + the ResizeObserver are torn down via `use_drop` when
     // the popup unmounts, so reopening it on a different tile attaches
     // a fresh anchor cleanly.
-    let popup_id = format!("signal-quality-popup-{}", props.peer_id);
+    //
+    // HCL bug #2: DOM id includes the meter-mode suffix so a peer's
+    // screen-only popup and their no-screen peer popup can both exist
+    // simultaneously without colliding on the same id. Legacy callers
+    // (`meter_mode == Full`) get the original `signal-quality-popup-<peer_id>`
+    // shape, which keeps the existing portal Playwright spec passing
+    // unchanged.
+    let popup_id = match meter_mode {
+        SignalMeterMode::Full => format!("signal-quality-popup-{}", props.peer_id),
+        other => format!(
+            "signal-quality-popup-{}-{}",
+            props.peer_id,
+            other.id_suffix()
+        ),
+    };
     {
         let anchor_id = props.anchor_id.clone();
         let popup_id_for_hook = popup_id.clone();
         install_popup_anchor(anchor_id, popup_id_for_hook, on_close);
     }
+    {
+        // HCL bug #9: install drag-and-drop handlers on the header. The
+        // drag installer is a no-op until the user mousedowns on
+        // `.popup-header` (which carries `data-drag-handle`).
+        let popup_id_for_drag = popup_id.clone();
+        install_popup_drag(popup_id_for_drag, on_drag_commit);
+    }
 
     // Which legend help text is currently expanded (if any).
     let mut help_visible = use_signal(|| None::<&'static str>);
 
-    // Per-metric visibility toggles (all on by default).
-    let mut show_audio = use_signal(|| true);
-    let mut show_video = use_signal(|| true);
-    let mut show_screen = use_signal(|| true);
+    // Per-metric visibility toggles. Defaults follow the meter mode so the
+    // popup opens with the right scope already applied (HCL bug #2). The
+    // user can still toggle these checkboxes inside the popup if they
+    // want to override the default for a single session.
+    let mut show_audio = use_signal(|| meter_mode.shows_audio());
+    let mut show_video = use_signal(|| meter_mode.shows_video());
+    let mut show_screen = use_signal(|| meter_mode.shows_screen());
     let mut show_latency = use_signal(|| true);
+
+    // HCL bug #9: compute the initial `data-anchor-mode` and inline
+    // position style from the `free_position` prop. `data-anchor-mode`
+    // is the lever `reposition_popup` reads to decide whether to skip
+    // the auto-layout math; the inline `left`/`top` style covers the
+    // first paint before any reposition tick runs.
+    let (anchor_mode_attr, position_style) = match free_position {
+        Some((l, t)) => ("free", format!("left: {l:.0}px; top: {t:.0}px;")),
+        None => ("anchored", String::new()),
+    };
+    let show_reanchor = free_position.is_some();
 
     // Unique scroll container ID so multiple popups don't collide.
     let scroll_id = format!("signal-chart-scroll-{}", props.peer_id);
@@ -1396,12 +2020,56 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let draw_height = chart_height - padding_top - padding_bottom;
 
     if history.is_empty() {
+        // HCL follow-up 952 (@token-exempt): capture the popup + anchor ids
+        // so the reanchor button onclick can snap the popup back to its
+        // tile-name anchor immediately rather than waiting for the next
+        // resize/scroll/ResizeObserver tick. HCL follow-up 957: the
+        // anchor id is published on the popup itself via
+        // `data-popup-anchor-id` so `snap_popup_back_to_anchor` reads
+        // it back live (rather than from a captured closure that could
+        // go stale across a grid ↔ split layout transition).
+        let popup_id_for_reanchor_empty = popup_id.clone();
+        let popup_anchor_id_attr_empty = props.anchor_id.clone();
         return rsx! {
             div {
                 id: "{popup_id}",
                 class: "signal-quality-popup signal-quality-popup-portal",
+                "data-anchor-mode": "{anchor_mode_attr}",
+                "data-meter-mode": "{meter_mode.id_suffix()}",
+                "data-popup-anchor-id": "{popup_anchor_id_attr_empty}",
+                style: "{position_style}",
                 onclick: move |e| e.stop_propagation(),
-                div { class: "popup-header",
+                div {
+                    class: "popup-header",
+                    "data-drag-handle": "true",
+                    // HCL follow-up 952 (@token-exempt): visual drag-handle
+                    // affordance so users discover the popup is draggable.
+                    // Carries `data-drag-handle` so the existing mousedown
+                    // closest('[data-drag-handle]') filter recognises clicks
+                    // on the grip itself as drag starts. Six dots arranged
+                    // in a 3x2 grid (the canonical "grip" iconography).
+                    span {
+                        class: "signal-popup-drag-handle",
+                        "data-drag-handle": "true",
+                        "aria-hidden": "true",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "12",
+                            height: "22",
+                            view_box: "0 0 12 22",
+                            fill: "currentColor",
+                            circle { cx: "3", cy: "3", r: "1.2" }
+                            circle { cx: "3", cy: "7", r: "1.2" }
+                            circle { cx: "3", cy: "11", r: "1.2" }
+                            circle { cx: "3", cy: "15", r: "1.2" }
+                            circle { cx: "3", cy: "19", r: "1.2" }
+                            circle { cx: "8", cy: "3", r: "1.2" }
+                            circle { cx: "8", cy: "7", r: "1.2" }
+                            circle { cx: "8", cy: "11", r: "1.2" }
+                            circle { cx: "8", cy: "15", r: "1.2" }
+                            circle { cx: "8", cy: "19", r: "1.2" }
+                        }
+                    }
                     span { class: "popup-title", "{popup_title}" }
                     div { class: "popup-header-actions",
                         span {
@@ -1409,8 +2077,22 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             title: "{transport_title}",
                             "{transport_label}"
                         }
+                        if show_reanchor {
+                            button {
+                                class: "popup-reanchor",
+                                title: "Reanchor to tile",
+                                "aria-label": "Reanchor to tile",
+                                "data-no-drag": "true",
+                                onclick: move |_| {
+                                    snap_popup_back_to_anchor(&popup_id_for_reanchor_empty);
+                                    on_reanchor.call(());
+                                },
+                                "\u{1F4CC}"
+                            }
+                        }
                         button {
                             class: "popup-close",
+                            "data-no-drag": "true",
                             onclick: move |_| on_close.call(()),
                             "X"
                         }
@@ -1520,14 +2202,54 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
         }
     });
 
+    // HCL follow-up 952 (@token-exempt) / 957: see the empty-history branch
+    // above. The anchor id is also published as `data-popup-anchor-id` on
+    // the popup div so `snap_popup_back_to_anchor` reads it live (defending
+    // against any stale captured closure across a grid ↔ split layout
+    // switch).
+    let popup_id_for_reanchor = popup_id.clone();
+    let popup_anchor_id_attr = props.anchor_id.clone();
     rsx! {
         div {
             id: "{popup_id}",
             class: "signal-quality-popup signal-quality-popup-portal",
+            "data-anchor-mode": "{anchor_mode_attr}",
+            "data-meter-mode": "{meter_mode.id_suffix()}",
+            "data-popup-anchor-id": "{popup_anchor_id_attr}",
+            style: "{position_style}",
             // Stop clicks inside the popup from bubbling to tile handlers
             // (e.g. the mobile-pin onclick on `.canvas-container`).
             onclick: move |e| e.stop_propagation(),
-            div { class: "popup-header",
+            div {
+                class: "popup-header",
+                "data-drag-handle": "true",
+                // HCL follow-up 952 (@token-exempt): visual drag-handle
+                // affordance — see the empty-history branch above for the
+                // full rationale. Carries `data-drag-handle` so the
+                // existing mousedown handler picks up clicks on the grip
+                // itself as a drag start.
+                span {
+                    class: "signal-popup-drag-handle",
+                    "data-drag-handle": "true",
+                    "aria-hidden": "true",
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "12",
+                        height: "22",
+                        view_box: "0 0 12 22",
+                        fill: "currentColor",
+                        circle { cx: "3", cy: "3", r: "1.2" }
+                        circle { cx: "3", cy: "7", r: "1.2" }
+                        circle { cx: "3", cy: "11", r: "1.2" }
+                        circle { cx: "3", cy: "15", r: "1.2" }
+                        circle { cx: "3", cy: "19", r: "1.2" }
+                        circle { cx: "8", cy: "3", r: "1.2" }
+                        circle { cx: "8", cy: "7", r: "1.2" }
+                        circle { cx: "8", cy: "11", r: "1.2" }
+                        circle { cx: "8", cy: "15", r: "1.2" }
+                        circle { cx: "8", cy: "19", r: "1.2" }
+                    }
+                }
                 span { class: "popup-title", "{popup_title}" }
                 div { class: "popup-header-actions",
                     span {
@@ -1535,8 +2257,22 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         title: "{transport_title}",
                         "{transport_label}"
                     }
+                    if show_reanchor {
+                        button {
+                            class: "popup-reanchor",
+                            title: "Reanchor to tile",
+                            "aria-label": "Reanchor to tile",
+                            "data-no-drag": "true",
+                            onclick: move |_| {
+                                snap_popup_back_to_anchor(&popup_id_for_reanchor);
+                                on_reanchor.call(());
+                            },
+                            "\u{1F4CC}"
+                        }
+                    }
                     button {
                         class: "popup-close",
+                        "data-no-drag": "true",
                         onclick: move |_| on_close.call(()),
                         "X"
                     }
@@ -1768,51 +2504,58 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
             }
             // Tooltip is rendered directly on <body> via show_body_tooltip/hide_body_tooltip
             // to escape all grid-item stacking contexts.
-            // Legend with visibility checkboxes
+            // Legend with visibility checkboxes. HCL bug #2: each row is
+            // gated on `meter_mode` so a `ScreenOnly` popup only exposes the
+            // Screen + RTT toggles, and a `NoScreen` popup hides the Screen
+            // toggle (the dedicated shared-content tile owns it).
             div { class: "signal-chart-legend",
-                label { class: "legend-item",
-                    input {
-                        r#type: "checkbox",
-                        checked: show_audio(),
-                        onchange: move |_| show_audio.set(!show_audio()),
-                    }
-                    span { class: "dot", style: "background: {theme_color::SIGNAL_AUDIO};" }
-                    "Audio"
-                    button {
-                        class: "legend-help-btn",
-                        onclick: move |_| {
-                            let current = help_visible();
-                            if current == Some("audio") {
-                                help_visible.set(None);
-                            } else {
-                                help_visible.set(Some("audio"));
-                            }
-                        },
-                        "?"
-                    }
-                }
-                label { class: "legend-item",
-                    input {
-                        r#type: "checkbox",
-                        checked: show_video(),
-                        onchange: move |_| show_video.set(!show_video()),
-                    }
-                    span { class: "dot", style: "background: {theme_color::SIGNAL_VIDEO};" }
-                    "Video"
-                    button {
-                        class: "legend-help-btn",
-                        onclick: move |_| {
-                            let current = help_visible();
-                            if current == Some("video") {
-                                help_visible.set(None);
-                            } else {
-                                help_visible.set(Some("video"));
-                            }
-                        },
-                        "?"
+                if meter_mode.shows_audio() {
+                    label { class: "legend-item",
+                        input {
+                            r#type: "checkbox",
+                            checked: show_audio(),
+                            onchange: move |_| show_audio.set(!show_audio()),
+                        }
+                        span { class: "dot", style: "background: {theme_color::SIGNAL_AUDIO};" }
+                        "Audio"
+                        button {
+                            class: "legend-help-btn",
+                            onclick: move |_| {
+                                let current = help_visible();
+                                if current == Some("audio") {
+                                    help_visible.set(None);
+                                } else {
+                                    help_visible.set(Some("audio"));
+                                }
+                            },
+                            "?"
+                        }
                     }
                 }
-                if has_screen_data {
+                if meter_mode.shows_video() {
+                    label { class: "legend-item",
+                        input {
+                            r#type: "checkbox",
+                            checked: show_video(),
+                            onchange: move |_| show_video.set(!show_video()),
+                        }
+                        span { class: "dot", style: "background: {theme_color::SIGNAL_VIDEO};" }
+                        "Video"
+                        button {
+                            class: "legend-help-btn",
+                            onclick: move |_| {
+                                let current = help_visible();
+                                if current == Some("video") {
+                                    help_visible.set(None);
+                                } else {
+                                    help_visible.set(Some("video"));
+                                }
+                            },
+                            "?"
+                        }
+                    }
+                }
+                if has_screen_data && meter_mode.shows_screen() {
                     label { class: "legend-item",
                         input {
                             r#type: "checkbox",
@@ -2900,8 +3643,10 @@ mod tests {
     // `compute_popup_position` is the pure-data heart of the portal anchor;
     // every browser-side branch (initial render, resize, scroll,
     // ResizeObserver fire) ultimately funnels into this function.  Cover
-    // each branch — right-of-tile fit, flip-left, dense-grid clamp,
-    // vertical clamp — so a future refactor cannot silently strand the
+    // each branch — basic placement (popup upper-right corner at the
+    // button's (25% across, vertical midpoint) point), left-edge clamp,
+    // right-edge clamp, top-edge clamp, bottom-edge clamp, and the
+    // dense-grid sweep — so a future refactor cannot silently strand the
     // popup off-screen.
 
     /// Build a `Rect` from `(left, top, w, h)`.
@@ -2915,47 +3660,80 @@ mod tests {
     }
 
     #[test]
-    fn popup_anchors_to_right_of_tile_when_space_available() {
-        // 1920x1080 viewport, 400x300 tile at top-left, 420x300 popup.
-        // Plenty of room to the right of the tile — the popup should
-        // be placed at `tile.right + 8` and top-aligned with the tile.
-        let anchor = rect_from(100.0, 100.0, 400.0, 300.0);
-        let (left, top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
+    fn popup_overlays_button_upper_left_quadrant_when_space_available() {
+        // 1920x1080 viewport, 40x20 anchor (signal-quality button) at
+        // (300,200), 200x100 popup. Plenty of room — the popup's
+        // upper-right corner should land at
+        //   (btn.left + btn.width  * X_FRAC, btn.top + btn.height * Y_FRAC)
+        // = (300 + 40*0.25, 200 + 20*0.5) = (310, 210).
+        // So popup_left = 310 - 200 = 110, popup_top = 210.
+        let anchor = rect_from(300.0, 200.0, 40.0, 20.0);
+        let popup_w = 200.0;
+        let popup_h = 100.0;
+        let (left, top) = super::compute_popup_position(anchor, popup_w, popup_h, 1920.0, 1080.0);
+        let expected_right = 300.0 + 40.0 * super::POPUP_BUTTON_OVERLAY_X_FRACTION;
+        let expected_left = expected_right - popup_w;
+        let expected_top = 200.0 + 20.0 * super::POPUP_BUTTON_OVERLAY_Y_FRACTION;
         assert!(
-            (left - (500.0 + super::POPUP_GAP_PX)).abs() < 0.01,
-            "expected left == tile.right+gap, got {left}"
+            (left - expected_left).abs() < 0.01,
+            "expected left == {expected_left}, got {left}"
         );
         assert!(
-            (top - 100.0).abs() < 0.01,
-            "expected top == tile.top, got {top}"
+            (top - expected_top).abs() < 0.01,
+            "expected top == {expected_top}, got {top}"
+        );
+        // Sanity: the popup's body sits mostly to the LEFT of the button
+        // (its right edge is at 25% across the button, so its bulk is
+        // to the left).
+        let popup_right = left + popup_w;
+        assert!(
+            (popup_right - expected_right).abs() < 0.01,
+            "popup right edge should sit at {expected_right} (25% across button), got {popup_right}"
+        );
+        assert!(
+            popup_right < anchor.right,
+            "popup right edge should sit inside the button, not past its right edge"
+        );
+        // And the popup's top edge sits at the button's vertical midpoint.
+        let btn_vmid = anchor.top + anchor.height() * 0.5;
+        assert!(
+            (top - btn_vmid).abs() < 0.01,
+            "popup top should sit at button vertical midpoint ({btn_vmid}), got {top}"
         );
     }
 
     #[test]
-    fn popup_flips_to_left_when_right_overflows() {
-        // 1920x1080 viewport, tile near the right edge.  Right-of-tile
-        // doesn't fit, but there's room on the left — popup flips.
-        // tile.right = 1850, popup_w = 420, right-of-tile placement
-        // would land at 1858 (overflows).  Left-of-tile = 1450-8-420 =
-        // 1022 — fits.
-        let anchor = rect_from(1450.0, 200.0, 400.0, 300.0);
+    fn popup_clamps_left_when_button_near_left_edge() {
+        // Anchor near the left edge: `target_left = btn.left + btn.width*X_FRAC
+        // - popup_w` goes deeply negative, so the clamp pulls the popup
+        // back to `VIEWPORT_MARGIN_PX`.
+        let anchor = rect_from(4.0, 200.0, 32.0, 32.0);
         let (left, _top) = super::compute_popup_position(anchor, 420.0, 300.0, 1920.0, 1080.0);
         assert!(
-            (left - (1450.0 - super::POPUP_GAP_PX - 420.0)).abs() < 0.01,
-            "expected left of tile, got {left}"
+            (left - super::VIEWPORT_MARGIN_PX).abs() < 0.01,
+            "expected clamp to left margin {}, got {left}",
+            super::VIEWPORT_MARGIN_PX
         );
     }
 
     #[test]
-    fn popup_clamps_when_neither_side_fits() {
-        // Very narrow viewport: tile + popup widths exceed viewport
-        // width.  Should clamp to the right margin (popup overlays tile
-        // in this dense-grid worst case rather than disappearing).
-        let anchor = rect_from(50.0, 50.0, 300.0, 200.0);
+    fn popup_clamps_when_button_near_right_edge() {
+        // Narrow viewport with the button hugging the right edge. The
+        // unclamped target_left would push the popup's right edge past
+        // the viewport margin, so the clamp should pull it back to
+        // `viewport_w - popup_w - margin`.
+        let anchor = rect_from(495.0, 50.0, 40.0, 32.0);
         let viewport_w = 500.0;
         let popup_w = 420.0;
         let (left, _top) = super::compute_popup_position(anchor, popup_w, 200.0, viewport_w, 800.0);
         let expected_max_left = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        // Sanity: the unclamped target really did overflow the right margin.
+        let target_right = anchor.left + anchor.width() * super::POPUP_BUTTON_OVERLAY_X_FRACTION;
+        let target_left_unclamped = target_right - popup_w;
+        assert!(
+            target_left_unclamped > expected_max_left,
+            "test sanity: unclamped target_left ({target_left_unclamped}) should exceed max_left ({expected_max_left})"
+        );
         assert!(
             (left - expected_max_left).abs() < 0.01,
             "expected clamp to right margin {expected_max_left}, got {left}"
@@ -2965,10 +3743,11 @@ mod tests {
     }
 
     #[test]
-    fn popup_clamps_vertically_when_tile_is_near_bottom() {
-        // Tile is at the bottom of the viewport — popup top would force
-        // it off-screen.  Should clamp to viewport - popup_h - margin.
-        let anchor = rect_from(100.0, 900.0, 400.0, 300.0);
+    fn popup_clamps_vertically_when_button_is_near_bottom() {
+        // Anchor at the bottom of the viewport — the downward Y_FRAC
+        // shift would push the popup off-screen, so the clamp pulls
+        // it back to `viewport_h - popup_h - margin`.
+        let anchor = rect_from(100.0, 950.0, 32.0, 32.0);
         let popup_h = 500.0;
         let viewport_h = 1000.0;
         let (_left, top) =
@@ -2982,11 +3761,12 @@ mod tests {
     }
 
     #[test]
-    fn popup_clamps_vertically_when_tile_is_above_viewport() {
-        // Negative tile.top (scrolled above viewport).  Popup must still
-        // sit inside the visible region with at least VIEWPORT_MARGIN_PX
-        // breathing room from the top edge.
-        let anchor = rect_from(100.0, -200.0, 400.0, 300.0);
+    fn popup_clamps_vertically_when_button_is_above_viewport() {
+        // Negative `btn.top` (scrolled above viewport) deep enough that
+        // even after the downward Y_FRAC shift the target is still
+        // negative. Popup must still sit inside the visible region with
+        // at least VIEWPORT_MARGIN_PX breathing room from the top edge.
+        let anchor = rect_from(100.0, -200.0, 32.0, 32.0);
         let (_left, top) = super::compute_popup_position(anchor, 420.0, 400.0, 1920.0, 1080.0);
         assert!(
             top >= super::VIEWPORT_MARGIN_PX,
@@ -3018,5 +3798,141 @@ mod tests {
                 "popup off-screen at anchor=({left},{top}): pos=({l},{t})"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #2: SignalMeterMode scope filter.
+    //
+    // The mode-driven helpers gate which series the popup renders. These
+    // are pure-data predicates so they're trivially unit-testable; the
+    // contract is contractual for the popup body that reads them and the
+    // call sites in `attendants.rs` that pick the mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn meter_mode_full_shows_every_series() {
+        let m = super::SignalMeterMode::Full;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_screen_only_shows_only_screen() {
+        let m = super::SignalMeterMode::ScreenOnly;
+        assert!(!m.shows_audio());
+        assert!(!m.shows_video());
+        assert!(m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_no_screen_hides_screen() {
+        let m = super::SignalMeterMode::NoScreen;
+        assert!(m.shows_audio());
+        assert!(m.shows_video());
+        assert!(!m.shows_screen());
+    }
+
+    #[test]
+    fn meter_mode_id_suffix_is_stable() {
+        // The suffix is load-bearing for the popup-state map key and the
+        // DOM id, so a refactor that renames a variant would break
+        // every open popup's DOM identity. Lock it down.
+        assert_eq!(super::SignalMeterMode::Full.id_suffix(), "full");
+        assert_eq!(super::SignalMeterMode::ScreenOnly.id_suffix(), "screen");
+        assert_eq!(super::SignalMeterMode::NoScreen.id_suffix(), "peer");
+    }
+
+    #[test]
+    fn meter_mode_default_is_full() {
+        // Default is `Full` so legacy callers (e.g. the diagnostics
+        // popup) that don't supply a mode keep showing every series.
+        assert_eq!(
+            super::SignalMeterMode::default(),
+            super::SignalMeterMode::Full
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: clamp_free_position keeps a dragged popup inside the
+    // viewport. Sweep every clamp branch (no clamp, both axes clamped,
+    // tiny viewport that flips min/max math).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn clamp_free_inside_viewport_is_noop() {
+        // Popup that already fits inside the viewport with breathing room
+        // should pass through unchanged.
+        let (l, t) = super::clamp_free_position(100.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - 100.0).abs() < 0.01);
+        assert!((t - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clamp_free_left_overflow_clamps_to_margin() {
+        // Negative target left -> clamp to VIEWPORT_MARGIN_PX.
+        let (l, _) = super::clamp_free_position(-50.0, 100.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    #[test]
+    fn clamp_free_right_overflow_clamps_to_max_left() {
+        // Target left that would push the popup off the right edge -> clamp
+        // to (viewport_w - popup_w - margin).
+        let viewport_w = 1920.0;
+        let popup_w = 420.0;
+        let (l, _) = super::clamp_free_position(2000.0, 100.0, popup_w, 400.0, viewport_w, 1080.0);
+        let expected = viewport_w - popup_w - super::VIEWPORT_MARGIN_PX;
+        assert!((l - expected).abs() < 0.01, "got {l}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_top_overflow_clamps_to_margin() {
+        // Negative target top -> clamp to VIEWPORT_MARGIN_PX.
+        let (_, t) = super::clamp_free_position(100.0, -50.0, 420.0, 400.0, 1920.0, 1080.0);
+        assert!((t - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {t}");
+    }
+
+    #[test]
+    fn clamp_free_bottom_overflow_clamps_to_max_top() {
+        // Target top that would push the popup off the bottom edge ->
+        // clamp to (viewport_h - popup_h - margin).
+        let viewport_h = 1080.0;
+        let popup_h = 400.0;
+        let (_, t) = super::clamp_free_position(100.0, 2000.0, 420.0, popup_h, 1920.0, viewport_h);
+        let expected = viewport_h - popup_h - super::VIEWPORT_MARGIN_PX;
+        assert!((t - expected).abs() < 0.01, "got {t}, expected {expected}");
+    }
+
+    #[test]
+    fn clamp_free_handles_oversized_popup() {
+        // Popup wider than the viewport: max_left math goes negative and
+        // the `.max()` keeps the result at VIEWPORT_MARGIN_PX. The popup
+        // should sit at the left margin, not at a negative coordinate.
+        let (l, _) = super::clamp_free_position(500.0, 100.0, 1000.0, 400.0, 600.0, 1080.0);
+        assert!((l - super::VIEWPORT_MARGIN_PX).abs() < 0.01, "got {l}");
+    }
+
+    // -----------------------------------------------------------------
+    // HCL bug #9: SignalPopupState defaults to Anchored. The popup body
+    // reads this to decide whether to render the 📌 reanchor button —
+    // legacy callers that don't bother to insert a state value get the
+    // expected anchored behaviour.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn signal_popup_state_default_is_anchored() {
+        let s = super::SignalPopupState::default();
+        assert_eq!(s.position, super::SignalPopupPosition::Anchored);
+        assert!(!s.position.is_free());
+    }
+
+    #[test]
+    fn signal_popup_position_free_is_free() {
+        let p = super::SignalPopupPosition::Free {
+            left: 100.0,
+            top: 200.0,
+        };
+        assert!(p.is_free());
     }
 }

@@ -29,7 +29,8 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::constants::{
     KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_PER_SEC,
-    KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER, KEYFRAME_REQUEST_WINDOW_MS,
+    KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
+    KEYFRAME_REQUEST_WINDOW_MS,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -202,8 +203,29 @@ impl KeyframeRequestLimiter {
     }
 
     /// Check whether a KEYFRAME_REQUEST aimed at `target_user_id` should be
+    /// allowed through, using the strict steady-state per-pair budget.
+    ///
+    /// Equivalent to [`KeyframeRequestLimiter::allow_with_congestion`] with
+    /// `congested = false`. Retained as the simple entry point for callers
+    /// (and tests) that have no congestion signal.
+    pub fn allow(&mut self, target_user_id: &[u8]) -> bool {
+        self.allow_with_congestion(target_user_id, false)
+    }
+
+    /// Check whether a KEYFRAME_REQUEST aimed at `target_user_id` should be
     /// allowed through. Both the per-pair budget and the global cap must
     /// admit the request.
+    ///
+    /// `congested` indicates the requesting receiver is in active congestion
+    /// (issue #979): the relay has recently had to drop inbound media
+    /// destined for it, so its decoder is likely frozen and in genuine need
+    /// of a fresh keyframe. When set, the **per-pair** budget is relaxed from
+    /// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] to
+    /// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`] so recovery is
+    /// possible even if some keyframe responses are themselves lost. The
+    /// global per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`]) is
+    /// **never** relaxed, so the pre-existing keyframe-storm risk (OSS #814)
+    /// stays bounded — this relaxes the cap, it does not remove it.
     ///
     /// Behaviour:
     /// - If the per-pair bucket is full, returns `false` and does not
@@ -216,9 +238,15 @@ impl KeyframeRequestLimiter {
     /// Stale entries (target senders that have not been requested from
     /// for `KEYFRAME_REQUEST_WINDOW_MS * 10`) are cleaned up every
     /// [`KEYFRAME_LIMITER_CLEANUP_INTERVAL`] calls to bound memory.
-    pub fn allow(&mut self, target_user_id: &[u8]) -> bool {
+    pub fn allow_with_congestion(&mut self, target_user_id: &[u8], congested: bool) -> bool {
         let now = Instant::now();
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
+
+        let per_pair_max = if congested {
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED
+        } else {
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER
+        };
 
         self.calls_since_cleanup = self.calls_since_cleanup.wrapping_add(1);
         if self.calls_since_cleanup >= KEYFRAME_LIMITER_CLEANUP_INTERVAL {
@@ -232,7 +260,7 @@ impl KeyframeRequestLimiter {
             .per_target
             .entry(target_user_id.to_vec())
             .or_insert_with(|| WindowCounter::new(now));
-        if !per_pair_entry.try_consume(now, window, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER) {
+        if !per_pair_entry.try_consume(now, window, per_pair_max) {
             return false;
         }
 
@@ -709,6 +737,85 @@ mod tests {
             limiter.allow(pair),
             "per-pair budget must be refunded when global cap denies"
         );
+    }
+
+    // =====================================================================
+    // KeyframeRequestLimiter — congestion-relaxed budget (issue #979)
+    // =====================================================================
+
+    #[test]
+    fn test_keyframe_limiter_congested_admits_request_strict_would_deny() {
+        // The core acceptance proof for issue #979: a per-pair request that
+        // the strict steady-state budget (1/sec) would reject must be
+        // admitted when the requesting receiver is flagged congested.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = b"frozen-sender";
+
+        // First request always admitted under either budget.
+        assert!(limiter.allow_with_congestion(target, false));
+
+        // Second request to the same target within the window is denied by
+        // the strict per-pair budget...
+        assert!(
+            !limiter.allow_with_congestion(target, false),
+            "strict per-pair budget must deny the 2nd request within the window"
+        );
+
+        // ...but is admitted under the relaxed congested budget, letting a
+        // frozen receiver re-request a keyframe to recover.
+        assert!(
+            limiter.allow_with_congestion(target, true),
+            "congested receiver must be allowed a relaxed retry (issue #979)"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_congested_still_bounded_by_relaxed_per_pair() {
+        // Relaxing the per-pair budget must NOT uncap it — the keyframe-storm
+        // risk (OSS #814) requires the per-pair budget stay bounded. Exactly
+        // KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED requests are
+        // admitted within the window; the next is denied.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = b"sender-c";
+
+        for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED {
+            assert!(
+                limiter.allow_with_congestion(target, true),
+                "congested request {i} within the relaxed budget must be admitted"
+            );
+        }
+        assert!(
+            !limiter.allow_with_congestion(target, true),
+            "relaxed per-pair budget must still be bounded (no uncapping — OSS #814)"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_congested_does_not_relax_global_cap() {
+        // The global per-receiver ceiling must NOT be relaxed by congestion:
+        // it is the storm safety net. Saturate the global cap with distinct
+        // targets, then verify a congested request to a fresh target is still
+        // denied by the global ceiling.
+        let mut limiter = KeyframeRequestLimiter::new();
+        for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
+            let target = format!("g-{i}");
+            assert!(limiter.allow_with_congestion(target.as_bytes(), true));
+        }
+        let extra = format!("g-{KEYFRAME_REQUEST_MAX_PER_SEC}");
+        assert!(
+            !limiter.allow_with_congestion(extra.as_bytes(), true),
+            "global per-receiver cap must hold even under congestion (OSS #814)"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_allow_matches_uncongested_path() {
+        // `allow()` must behave identically to `allow_with_congestion(.., false)`.
+        let mut a = KeyframeRequestLimiter::new();
+        let mut b = KeyframeRequestLimiter::new();
+        let target = b"sender-eq";
+        assert_eq!(a.allow(target), b.allow_with_congestion(target, false));
+        assert_eq!(a.allow(target), b.allow_with_congestion(target, false));
     }
 
     #[test]

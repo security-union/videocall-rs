@@ -188,7 +188,6 @@ test.describe("Meeting settings – Options toggles", () => {
 
     // Reload the page
     await page.reload();
-    await page.waitForTimeout(2000);
     await expect(page.getByText("Options")).toBeVisible({ timeout: 10_000 });
 
     // Both toggles should reflect the persisted state
@@ -214,7 +213,6 @@ test.describe("Meeting settings – Options toggles", () => {
 
     // Reload and verify state persists
     await page.reload();
-    await page.waitForTimeout(2000);
     await expect(page.getByText("Options")).toBeVisible({ timeout: 10_000 });
     await expect(optionToggle(page, "End meeting when host leaves")).toHaveAttribute(
       "aria-checked",
@@ -307,7 +305,6 @@ async function hostJoinAndConfigureEohl(
   const joinButton = hostPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   await expect(joinButton).toBeVisible({ timeout: 20_000 });
   await joinButton.click();
-  await hostPage.waitForTimeout(3000);
   await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 }
 
@@ -407,7 +404,6 @@ test.describe("Meeting settings – End meeting when host leaves lifecycle", () 
 
       // Host hangs up — triggers Leave message → MEETING_ENDED broadcast
       await hostPage.locator("button.video-control-button.danger").click();
-      await hostPage.waitForTimeout(2000);
 
       // Guest should see the meeting-ended overlay
       await expect(guestPage.locator(".meeting-ended-overlay")).toBeVisible({ timeout: 20_000 });

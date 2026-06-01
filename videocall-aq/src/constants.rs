@@ -310,6 +310,36 @@ pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
 /// within a similar window as audio.
 pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
 
+/// Fraction of `target_fps` at or above which a single peer is considered
+/// "healthy" for the small-peer-count outlier guard in
+/// `DiagnosticPackets::get_p75_fps` (issue #1012).
+///
+/// With 2 reporting peers the p75 aggregation degenerates to the minimum, so a
+/// single constrained receiver (e.g. a peer on a 5.8 Mbps link with a
+/// 640×480@15fps camera, per discussion #980) would otherwise define the PID
+/// setpoint and drag the sender's bitrate down for everyone. The guard only
+/// rescues the setpoint toward the *higher* reporter when at least one peer is
+/// genuinely healthy — i.e. at/above this fraction of target. If NO peer clears
+/// this bar, all peers are struggling: that is real congestion, and the
+/// conservative minimum is kept so the sender still steps down.
+///
+/// Defaults to the recover ratio (0.70) so "healthy enough to not be an
+/// outlier" is tied to "healthy enough for the tier to recover". First-guess
+/// value — pending a performance-reviewer pass. DO NOT treat as final.
+pub const AQ_OUTLIER_HEALTH_FPS_RATIO: f64 = VIDEO_TIER_RECOVER_FPS_RATIO;
+
+/// Maximum ratio of the lower peer's FPS to the higher peer's FPS for the lower
+/// one to count as a clear outlier in the small-peer-count guard (issue #1012).
+///
+/// At 2 peers `[a ≤ b]`, the guard treats `a` as an outlier only when
+/// `a < b * AQ_OUTLIER_GAP_FPS_RATIO` — i.e. `a` is more than ~40% below `b`.
+/// This prevents rescuing on ordinary jitter (two healthy peers a few fps
+/// apart) and fires only on the genuine "one fine, one badly degraded" split.
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+pub const AQ_OUTLIER_GAP_FPS_RATIO: f64 = 0.60;
+
 /// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
 /// Bitrate ratio above which we step UP one video tier (must be sustained).
@@ -1280,6 +1310,35 @@ pub const CONGESTION_WINDOW_MS: u64 = 1000;
 /// (milliseconds). Prevents flooding the sender with congestion signals when
 /// many packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Number of quality tiers to drop in a single self-targeted CONGESTION cut.
+///
+/// A self-targeted CONGESTION signal means the relay is actively dropping *our*
+/// outbound packets — the buffer is already overflowing. A gentle one-tier
+/// step-down (as used for WebSocket backpressure) is too slow: it sheds only
+/// ~20-30% of bitrate per step and waits `MIN_TIER_TRANSITION_INTERVAL_MS`
+/// between steps, so the relay buffer keeps overflowing for several seconds.
+///
+/// Dropping two tiers at once maps to roughly a 50% bitrate cut across most of
+/// the (non-uniform) camera ladder — e.g. from the default "medium" tier
+/// (index 4, ideal 600 kbps) two tiers down to index 6 (ideal 250 kbps) is a
+/// ~58% reduction, and "hd" (index 2, ideal 1500) → index 4 (ideal 600) is a
+/// 60% reduction. This sheds enough bitrate immediately to let the relay buffer
+/// drain instead of bleeding it down one slow step at a time.
+pub const CONGESTION_CUT_TIERS: usize = 2;
+
+/// Duration (milliseconds) to pin the PID bitrate ceiling to the post-cut tier
+/// after a self-targeted CONGESTION cut.
+///
+/// After the cut we must keep the effective bitrate low long enough for the
+/// already-overflowing relay buffer to drain. Without a hold the PID — which
+/// fine-tunes bitrate *within* a tier — would immediately ramp back toward the
+/// new tier's max, re-filling the buffer before it has drained. Pinning the
+/// ceiling to the post-cut tier's lower bound for this window guarantees the
+/// buffer gets a real chance to recover. 2.5s comfortably covers a typical
+/// relay buffer drain even on high-latency links while remaining short enough
+/// that recovery is not penalized for long.
+pub const CONGESTION_HOLD_MS: f64 = 2500.0;
 
 // ---------------------------------------------------------------------------
 // Client-Side WebSocket Backpressure Self-Detection

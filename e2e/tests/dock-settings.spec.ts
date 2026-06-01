@@ -129,10 +129,46 @@ test.describe("Dock settings", () => {
     });
   });
 
+  test("first-time user defaults to autohide off (action bar stays visible)", async ({ page }) => {
+    // Regression guard for the default-off fix: when no `vc_dock_autohide`
+    // preference is persisted, the action bar must remain visible without
+    // any focus or mouse interaction. We sit idle for 3s after joining and
+    // confirm the controls have not picked up the `controls-hidden` class.
+    await joinMeeting(page, "default_autohide_off");
+
+    // Sanity check: no autohide preference was persisted by joinMeeting.
+    const stored = await page.evaluate(() => localStorage.getItem("vc_dock_autohide"));
+    expect(stored).toBeNull();
+
+    // Move the mouse away to a neutral spot so we are not artificially
+    // keeping the controls visible via hover, then sit idle.
+    await page.mouse.move(0, 0);
+    await page.waitForTimeout(3_000);
+
+    await expect(page.locator(".video-controls-container")).not.toHaveClass(/controls-hidden/);
+
+    // And the dock menu's hiding toggle should read "Turn Hiding On" (i.e.
+    // hiding is currently off), confirming the signal initialised to false.
+    await openDockMenu(page);
+    await expect(
+      page.locator('.glass-select-option[role="option"]').filter({ hasText: "Turn Hiding On" }),
+    ).toBeVisible();
+  });
+
   test("Turn Hiding Off disables autohide", async ({ page }) => {
     await joinMeeting(page, "hide-off");
 
+    // The new default-off behaviour means autohide may already be off; flip
+    // it on first so the subsequent "Turn Hiding Off" click is meaningful.
     await openDockMenu(page);
+    const hidingOn = page
+      .locator('.glass-select-option[role="option"]')
+      .filter({ hasText: "Turn Hiding On" });
+    if ((await hidingOn.count()) > 0) {
+      await hidingOn.click();
+      await openDockMenu(page);
+    }
+
     await page
       .locator('.glass-select-option[role="option"]')
       .filter({ hasText: "Turn Hiding Off" })
@@ -154,15 +190,20 @@ test.describe("Dock settings", () => {
   test("Turn Hiding On re-enables autohide", async ({ page }) => {
     await joinMeeting(page, "hide-on");
 
-    // First disable autohide
+    // With the default-off fix, autohide may already be disabled on first
+    // load. Make sure it's off before re-enabling so this test always exercises
+    // the off -> on transition. If the menu already shows "Turn Hiding On"
+    // (i.e. hiding is currently off), skip the "Turn Hiding Off" click.
     await openDockMenu(page);
-    await page
+    const hidingOff = page
       .locator('.glass-select-option[role="option"]')
-      .filter({ hasText: "Turn Hiding Off" })
-      .click();
+      .filter({ hasText: "Turn Hiding Off" });
+    if ((await hidingOff.count()) > 0) {
+      await hidingOff.click();
+      await openDockMenu(page);
+    }
 
-    // Then re-enable autohide
-    await openDockMenu(page);
+    // Now re-enable autohide
     await page
       .locator('.glass-select-option[role="option"]')
       .filter({ hasText: "Turn Hiding On" })
@@ -216,8 +257,19 @@ test.describe("Dock settings", () => {
   test("autohide persists via localStorage", async ({ page }) => {
     await joinMeeting(page, "persist_autohide");
 
-    // Toggle autohide off
+    // With the default-off fix, autohide is off on first load and the menu
+    // shows "Turn Hiding On". Flip it on first so the subsequent "Turn
+    // Hiding Off" click writes an explicit `false` to localStorage.
     await openDockMenu(page);
+    const hidingOn = page
+      .locator('.glass-select-option[role="option"]')
+      .filter({ hasText: "Turn Hiding On" });
+    if ((await hidingOn.count()) > 0) {
+      await hidingOn.click();
+      await openDockMenu(page);
+    }
+
+    // Toggle autohide off
     await page
       .locator('.glass-select-option[role="option"]')
       .filter({ hasText: "Turn Hiding Off" })

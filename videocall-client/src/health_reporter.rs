@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
+    decode_budget::OverrideMode as PbOverrideMode, DecodeBudget as PbDecodeBudget,
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
     PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
@@ -131,6 +132,28 @@ pub struct ClimbLimiterSnapshot {
     pub step_up_blocked_screen_share: u64,
 }
 
+/// Snapshot of the adaptive decode-budget controller's current decision (#987).
+///
+/// Captured from the `decode_budget` diagnostics subsystem (published by the
+/// Dioxus control loop) and folded into each HEALTH packet so population-scale
+/// dashboards can observe the receiver-side tile-cap decision that today only
+/// exists in client console logs. Mirrors how the AdaptiveQuality tier atomics
+/// ride the health packet.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeBudgetSnapshot {
+    /// Current effective cap on simultaneously decoded video tiles.
+    pub effective_cap: u32,
+    /// Natural/unconstrained tile count the layout would show (∩ CANVAS_LIMIT).
+    pub natural: u32,
+    /// Whether the pressured latch is engaged (the loop owns the cap).
+    pub pressured: bool,
+    /// Override mode, as the proto `OverrideMode` enum integer value
+    /// (1 = Auto, 2 = Fixed; 0 = unset/Auto).
+    pub override_mode: u32,
+    /// User's hard tile cap; meaningful only when `override_mode` is Fixed.
+    pub override_fixed_n: u32,
+}
+
 /// Shared buffer of tier transition records from camera and screen encoders.
 type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
 
@@ -201,6 +224,10 @@ pub struct HealthReporter {
     longtask_buffer: Rc<RefCell<Vec<f64>>>,
     /// TELEM-9: Latest render FPS reading from the rAF cadence observer.
     render_fps: Rc<RefCell<Option<f64>>>,
+    /// #987: Latest adaptive decode-budget snapshot from the `decode_budget`
+    /// diagnostics subsystem. `None` until the controller publishes its first
+    /// decision (no peers / pre-warmup), in which case the field is omitted.
+    decode_budget: Rc<RefCell<Option<DecodeBudgetSnapshot>>>,
 }
 
 /// Static client metadata read from JS globals (TELEM-7).
@@ -377,6 +404,7 @@ impl HealthReporter {
             shutdown: Rc::new(AtomicBool::new(false)),
             longtask_buffer: Rc::new(RefCell::new(Vec::new())),
             render_fps: Rc::new(RefCell::new(None)),
+            decode_budget: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -503,6 +531,7 @@ impl HealthReporter {
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
         let longtask_buffer = Rc::downgrade(&self.longtask_buffer);
         let render_fps_state = Rc::downgrade(&self.render_fps);
+        let decode_budget_state = Rc::downgrade(&self.decode_budget);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -584,6 +613,36 @@ impl HealthReporter {
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+                    }
+                    // #987: capture the adaptive decode-budget snapshot. The
+                    // Dioxus control loop publishes one event per decision change
+                    // (state-change driven, not per render), so we simply overwrite
+                    // the latest snapshot here and read it at packet-assembly time.
+                    if event.subsystem == "decode_budget" {
+                        if let Some(db_rc) = Weak::upgrade(&decode_budget_state) {
+                            let mut snap = DecodeBudgetSnapshot::default();
+                            for m in &event.metrics {
+                                if let MetricValue::U64(v) = &m.value {
+                                    match m.name {
+                                        "decode_budget_effective_cap" => {
+                                            snap.effective_cap = *v as u32
+                                        }
+                                        "decode_budget_natural" => snap.natural = *v as u32,
+                                        "decode_budget_pressured" => snap.pressured = *v != 0,
+                                        "decode_budget_override_mode" => {
+                                            snap.override_mode = *v as u32
+                                        }
+                                        "decode_budget_override_fixed_n" => {
+                                            snap.override_fixed_n = *v as u32
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Ok(mut cell) = db_rc.try_borrow_mut() {
+                                *cell = Some(snap);
                             }
                         }
                     }
@@ -769,6 +828,21 @@ impl HealthReporter {
                             }
                             _ => {}
                         },
+                        // Freeze observability (#1013): windowed per-stream
+                        // packet-loss rate and keyframe-request rate, emitted by
+                        // the decoder. Stored in the camera/screen video_stats
+                        // bucket (split by is_screen) so they fold into the
+                        // per-peer health packet and the video quality score.
+                        "video_seq_loss_per_sec" => {
+                            if let MetricValue::F64(loss) = &metric.value {
+                                video_stats["video_seq_loss_per_sec"] = json!(loss);
+                            }
+                        }
+                        "keyframe_requests_per_sec" => {
+                            if let MetricValue::F64(kf) = &metric.value {
+                                video_stats["keyframe_requests_per_sec"] = json!(kf);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -824,6 +898,7 @@ impl HealthReporter {
         let dwell_samples = self.dwell_samples.clone();
         let longtask_buffer = self.longtask_buffer.clone();
         let render_fps_cell = self.render_fps.clone();
+        let decode_budget_cell = self.decode_budget.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -950,6 +1025,11 @@ impl HealthReporter {
                         // TELEM-9: read latest render FPS
                         let current_render_fps = render_fps_cell.try_borrow().ok().and_then(|v| *v);
 
+                        // #987: read latest decode-budget snapshot (None until the
+                        // controller has published its first decision).
+                        let decode_budget_snapshot =
+                            decode_budget_cell.try_borrow().ok().and_then(|v| *v);
+
                         // TELEM-7: read client metadata from JS globals
                         let client_meta = read_client_metadata();
 
@@ -987,6 +1067,7 @@ impl HealthReporter {
                             drained_longtasks,
                             current_render_fps,
                             client_meta,
+                            decode_budget_snapshot,
                         );
 
                         if let Some(packet) = health_packet {
@@ -1038,6 +1119,7 @@ impl HealthReporter {
         longtask_durations: Vec<f64>,
         render_fps: Option<f64>,
         client_metadata: ClientMetadata,
+        decode_budget: Option<DecodeBudgetSnapshot>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -1232,6 +1314,26 @@ impl HealthReporter {
         // TELEM-9: Render FPS
         pb.render_fps = render_fps;
 
+        // #987: Adaptive decode-budget controller snapshot. Only present once the
+        // controller has published a decision (so a no-peer / pre-warmup packet
+        // omits it). Mirrors how the AdaptiveQuality tier fields ride the packet.
+        if let Some(db) = decode_budget {
+            let mut pb_db = PbDecodeBudget::new();
+            pb_db.effective_cap = db.effective_cap;
+            pb_db.natural = db.natural;
+            pb_db.pressured = db.pressured;
+            // Map the integer override mode (1 = Auto, 2 = Fixed; 0/other = Auto)
+            // to the proto enum. `override_fixed_n` is only meaningful for Fixed.
+            pb_db.override_mode = ::protobuf::EnumOrUnknown::new(match db.override_mode {
+                2 => PbOverrideMode::OVERRIDE_MODE_FIXED,
+                _ => PbOverrideMode::OVERRIDE_MODE_AUTO,
+            });
+            if db.override_mode == 2 {
+                pb_db.override_fixed_n = db.override_fixed_n;
+            }
+            pb.decode_budget = ::protobuf::MessageField::some(pb_db);
+        }
+
         // Tab visibility and throttling
         #[cfg(target_arch = "wasm32")]
         {
@@ -1410,6 +1512,20 @@ impl HealthReporter {
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+
+                // Freeze observability (#1013): windowed per-stream loss /
+                // keyframe-request rates (camera only this pass). These feed the
+                // video quality score so a frozen-but-still-decoding stream
+                // (fps reads ~30, video visually stuck) no longer scores 100.
+                if let Some(loss) = video.get("video_seq_loss_per_sec").and_then(|v| v.as_f64()) {
+                    ps.video_seq_loss_per_sec = Some(loss);
+                }
+                if let Some(kf) = video
+                    .get("keyframe_requests_per_sec")
+                    .and_then(|v| v.as_f64())
+                {
+                    ps.keyframe_requests_per_sec = Some(kf);
+                }
             }
 
             // Screen share video mapping (new field, separate from camera)
@@ -1468,29 +1584,27 @@ impl HealthReporter {
             }
 
             // Video quality (0-100): only meaningful when frames are actively arriving.
-            // fps > 0.0 already proves video is flowing; video_enabled (sender self-report
-            // from peer_status events) is not required here and would suppress scores
-            // if peer_status hasn't arrived yet.
+            // fps > 0.0 already proves decode CALLS are flowing; video_enabled (sender
+            // self-report from peer_status events) is not required here and would suppress
+            // scores if peer_status hasn't arrived yet.
+            //
+            // Freeze observability (#1013): during a freeze, fps_received still reads ~30
+            // because decode calls keep firing fire-and-forget, yet the picture is visually
+            // frozen because packets are lost and the stream is stuck requesting keyframes.
+            // We fold the windowed loss rate and keyframe-request rate into the score so it
+            // drops well below 100 in that state.
             let fps = ps
                 .video_stats
                 .as_ref()
                 .map(|v| v.fps_received)
                 .unwrap_or(0.0);
             if video_fresh && fps > 0.0 {
-                let dropped = ps.frames_dropped_per_sec;
-
-                // Video health: measures whether video is present and stable, not
-                // hardware FPS capability. A 15fps camera in low light is not a
-                // "problem" — it is the camera doing auto-exposure correctly.
-                //
-                // fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
-                // fps 1–4   → 0–50 (near-frozen; something is likely wrong)
-                // fps == 0  → handled by outer guard; score is absent (None)
-                let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
-                // Decode error penalty: 0/s→0, 10+/s→−50
-                let drop_penalty = (dropped / 10.0).min(1.0) * 50.0;
-                let score = (video_health - drop_penalty).clamp(0.0, 100.0);
-                ps.video_quality_score = Some(score);
+                ps.video_quality_score = video_quality_score(
+                    fps,
+                    ps.frames_dropped_per_sec,
+                    ps.video_seq_loss_per_sec.unwrap_or(0.0),
+                    ps.keyframe_requests_per_sec.unwrap_or(0.0),
+                );
             }
 
             // Call quality: worst of whichever streams are active
@@ -1546,6 +1660,57 @@ impl HealthReporter {
     }
 }
 
+/// Compute the per-peer video quality score (0–100), or `None` when no frames
+/// are flowing.
+///
+/// Freeze observability (#1013): a broadcast-relay stream can read fps ≈ 30
+/// while being visually frozen — decode CALLS keep firing fire-and-forget even
+/// as packets are lost and the stream is stuck requesting keyframes. fps alone
+/// therefore cannot detect a freeze. We add two penalties on top of the
+/// fps/decode-error health so a sustained loss or keyframe storm forces the
+/// score well below 100:
+///
+/// * `loss_per_sec` — windowed packet-loss rate from `SequenceTracker`.
+///   `5 lost/s → −30`. Mirrors the audio `loss_penalty` shape.
+/// * `kf_per_sec`   — windowed keyframe-request (PLI) rate. A stream that is
+///   continuously asking for keyframes is, by definition, not decoding cleanly,
+///   so even a *sustained* ≥1 PLI/s is a strong freeze signal: `1 PLI/s → −40`.
+///
+/// The caller applies the outer `video_fresh && fps > 0.0` guard, so a true
+/// freeze with zero fps yields `None` (Grafana renders a gap) rather than a
+/// misleading 0 — `None` is the correct "no signal" state.
+///
+/// Returns `None` only when `fps <= 0.0` (defensive; the caller already
+/// guards this), otherwise `Some(score)` clamped to `0..=100`.
+fn video_quality_score(
+    fps: f64,
+    dropped_per_sec: f64,
+    loss_per_sec: f64,
+    kf_per_sec: f64,
+) -> Option<f64> {
+    if fps <= 0.0 {
+        return None;
+    }
+
+    // Video health: measures whether video is present and stable, not hardware
+    // FPS capability. A 15fps camera in low light is not a "problem" — it is the
+    // camera doing auto-exposure correctly.
+    //   fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
+    //   fps 1–4   → 0–50 (near-frozen; something is likely wrong)
+    let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
+
+    // Decode error penalty: 0/s→0, 10+/s→−50.
+    let drop_penalty = (dropped_per_sec / 10.0).min(1.0) * 50.0;
+    // Packet-loss penalty: 0/s→0, 5+/s→−30 (mirrors the audio loss penalty).
+    let loss_penalty = (loss_per_sec / 5.0).min(1.0) * 30.0;
+    // Keyframe-storm penalty: a sustained ≥1 PLI/s means the decoder cannot make
+    // forward progress → −40.
+    let kf_penalty = (kf_per_sec / 1.0).min(1.0) * 40.0;
+
+    let score = (video_health - drop_penalty - loss_penalty - kf_penalty).clamp(0.0, 100.0);
+    Some(score)
+}
+
 // ===================================================================
 // Security: HealthPacket credential-leak guard
 // ===================================================================
@@ -1559,6 +1724,58 @@ mod tests {
     use super::*;
     use protobuf::Message;
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+
+    // ── Freeze observability (#1013): video_quality_score ────────────────
+
+    /// Healthy stream: fps≥5, no loss, no keyframe storm → score 100.
+    #[test]
+    fn video_quality_score_healthy_is_100() {
+        assert_eq!(video_quality_score(30.0, 0.0, 0.0, 0.0), Some(100.0));
+    }
+
+    /// fps == 0 yields None (absent), not 0 — a freeze with zero fps must show
+    /// a Grafana gap, not a misleading zero.
+    #[test]
+    fn video_quality_score_zero_fps_is_none() {
+        assert_eq!(video_quality_score(0.0, 0.0, 0.0, 0.0), None);
+    }
+
+    /// The core #1013 case: fps reads a healthy ~30 (decode calls still firing)
+    /// but the stream is under sustained packet loss AND a keyframe storm. The
+    /// score MUST drop well below 100 (it used to read 100 here — the bug).
+    #[test]
+    fn video_quality_score_drops_during_freeze_with_loss_and_keyframe_storm() {
+        // 30 fps, no decode errors, 5 lost/s (-30), 1 PLI/s (-40) => 100-30-40=30.
+        let score = video_quality_score(30.0, 0.0, 5.0, 1.0).expect("fps>0 => Some");
+        assert!(
+            score < 80.0,
+            "freeze (loss + keyframe storm) should score well below 80, got {score}"
+        );
+        assert!((score - 30.0).abs() < 1e-9, "expected 30.0, got {score}");
+    }
+
+    /// Loss alone (no keyframe storm) still pulls the score down.
+    #[test]
+    fn video_quality_score_loss_only_penalty() {
+        // 30 fps, 5 lost/s (-30) => 70.
+        let score = video_quality_score(30.0, 0.0, 5.0, 0.0).expect("fps>0 => Some");
+        assert!((score - 70.0).abs() < 1e-9, "expected 70.0, got {score}");
+    }
+
+    /// A sustained keyframe-request rate alone is a strong freeze signal.
+    #[test]
+    fn video_quality_score_keyframe_storm_only_penalty() {
+        // 30 fps, 1 PLI/s (-40) => 60.
+        let score = video_quality_score(30.0, 0.0, 0.0, 1.0).expect("fps>0 => Some");
+        assert!((score - 60.0).abs() < 1e-9, "expected 60.0, got {score}");
+    }
+
+    /// Penalties saturate and the score clamps at 0, never negative.
+    #[test]
+    fn video_quality_score_clamps_at_zero() {
+        let score = video_quality_score(30.0, 100.0, 100.0, 100.0).expect("fps>0 => Some");
+        assert_eq!(score, 0.0);
+    }
 
     /// Construct a `HealthPacket` via the production `create_health_packet`
     /// path, passing a `Some(...)` URL containing a JWT, and assert that the
@@ -1612,6 +1829,7 @@ mod tests {
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None,
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
@@ -1639,6 +1857,115 @@ mod tests {
         // transport identity and RTT.
         assert_eq!(pb.active_server_type, "webtransport");
         assert_eq!(pb.active_server_rtt_ms, 42.0);
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// with the given decode-budget snapshot, then round-trip it through the
+    /// protobuf so the assertions are on exactly what goes on the wire (#987).
+    fn health_packet_with_decode_budget(
+        decode_budget: Option<DecodeBudgetSnapshot>,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            decode_budget,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_pressured_auto() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 5,
+            natural: 12,
+            pressured: true,
+            override_mode: 1, // Auto
+            override_fixed_n: 0,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 5);
+        assert_eq!(db.natural, 12);
+        assert!(db.pressured);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_AUTO
+        );
+        // override_fixed_n is meaningless in Auto and left at its default.
+        assert_eq!(db.override_fixed_n, 0);
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_fixed_override() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 3,
+            natural: 12,
+            pressured: false,
+            override_mode: 2, // Fixed
+            override_fixed_n: 3,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 3);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_FIXED
+        );
+        assert_eq!(db.override_fixed_n, 3);
+    }
+
+    #[test]
+    fn decode_budget_absent_when_no_snapshot() {
+        // No snapshot (controller pre-warmup / no peers) → field omitted so a
+        // healthy no-peer packet stays minimal and backward-compatible.
+        let pb = health_packet_with_decode_budget(None);
+        assert!(pb.decode_budget.is_none());
     }
 
     #[test]

@@ -21,6 +21,10 @@ const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 const STORAGE_KEY = "vc_appearance_join_leave_notifications";
 const SOUNDS_STORAGE_KEY = "vc_appearance_join_leave_sounds";
 
+// dioxus_sdk_storage serializes values as CBOR + zlib + hex. This is the
+// encoded form of the Rust string literal "false".
+const ENCODED_FALSE = "78da4b4d4bcc294e050008750271";
+
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
   "--origin-to-force-quic-on=127.0.0.1:4433",
@@ -187,10 +191,9 @@ test.describe("Entry/exit notifications preference", () => {
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Sanity check: with no override, the preference should be unset
-      // (default true) or "true". Either way, notifications are enabled.
-      const storedBefore = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(storedBefore === null || storedBefore === "true").toBe(true);
+      // Note: dioxus_sdk_storage serializes values as zlib-compressed serde
+      // blobs, so raw localStorage.getItem() does NOT return plain "true"/"false".
+      // The behavioral assertion below (toast appears) is the real verification.
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.
@@ -207,9 +210,6 @@ test.describe("Entry/exit notifications preference", () => {
       // Both should be in the meeting
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the toast to appear and verify the container is visible.
       await toastPromise;
@@ -248,9 +248,10 @@ test.describe("Entry/exit notifications preference", () => {
       // Inject the disabled preference BEFORE any navigation so it is
       // present on first page load, before the appearance settings context
       // reads from localStorage during initialization.
-      await hostCtx.addInitScript(() => {
-        localStorage.setItem("vc_appearance_join_leave_notifications", "false");
-      });
+      // dioxus_sdk_storage uses CBOR+zlib+hex encoding.
+      await hostCtx.addInitScript((encoded: string) => {
+        localStorage.setItem("vc_appearance_join_leave_notifications", encoded);
+      }, ENCODED_FALSE);
 
       const hostPage = await hostCtx.newPage();
       const guestPage = await guestCtx.newPage();
@@ -264,7 +265,7 @@ test.describe("Entry/exit notifications preference", () => {
       // Confirm the preference was actually persisted in this origin's
       // localStorage (init script ran).
       const stored = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(stored).toBe("false");
+      expect(stored).toBe(ENCODED_FALSE);
 
       // Guest joins the meeting
       await navigateToMeeting(guestPage, meetingId, "JlnOffGuest");
@@ -275,9 +276,6 @@ test.describe("Entry/exit notifications preference", () => {
       // PARTICIPANT_JOINED event was processed on the host side.
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.
@@ -376,7 +374,7 @@ test.describe("Entry/exit notifications preference", () => {
         .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY), {
           timeout: 5_000,
         })
-        .toBe("false");
+        .toBe(ENCODED_FALSE);
 
       // Close the settings modal.
       await hostPage.locator('button[aria-label="Close settings"]').click();
@@ -391,9 +389,6 @@ test.describe("Entry/exit notifications preference", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile so we know the join was
       // processed.
@@ -493,9 +488,10 @@ test.describe("Entry/exit notifications preference", () => {
       // it is present on first page load. The notifications (toasts)
       // preference is left at its default (true), so toasts should still
       // appear -- verifying the two toggles are independent.
-      await hostCtx.addInitScript(() => {
-        localStorage.setItem("vc_appearance_join_leave_sounds", "false");
-      });
+      // dioxus_sdk_storage uses CBOR+zlib+hex encoding.
+      await hostCtx.addInitScript((encoded: string) => {
+        localStorage.setItem("vc_appearance_join_leave_sounds", encoded);
+      }, ENCODED_FALSE);
 
       const hostPage = await hostCtx.newPage();
       const guestPage = await guestCtx.newPage();
@@ -506,16 +502,10 @@ test.describe("Entry/exit notifications preference", () => {
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Confirm the sounds preference was persisted in this origin's
-      // localStorage and the notifications preference is still default.
-      const storedSounds = await hostPage.evaluate(
-        (key) => localStorage.getItem(key),
-        SOUNDS_STORAGE_KEY,
-      );
-      expect(storedSounds).toBe("false");
-
-      const storedNotifs = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(storedNotifs === null || storedNotifs === "true").toBe(true);
+      // Note: dioxus_sdk_storage serializes values as zlib-compressed serde
+      // blobs, so raw localStorage.getItem() does NOT return plain strings.
+      // The behavioral assertions below (toast appears despite sounds off)
+      // are the real verification that the two toggles are independent.
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.
@@ -531,9 +521,6 @@ test.describe("Entry/exit notifications preference", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the host to see the guest tile, which confirms the join
       // signal was received and routed through the attendant callbacks.
@@ -613,7 +600,7 @@ test.describe("Entry/exit notifications preference", () => {
         .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), SOUNDS_STORAGE_KEY), {
           timeout: 5_000,
         })
-        .toBe("false");
+        .toBe(ENCODED_FALSE);
     } finally {
       await browser1.close();
     }

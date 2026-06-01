@@ -194,10 +194,6 @@ test.describe("Host kick controls", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Allow peer discovery to propagate through signaling before
-      // asserting on remote tiles (mirrors two-users-meeting.spec.ts).
-      await hostPage.waitForTimeout(5000);
-
       // Wait for the peer connection to establish (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -288,9 +284,6 @@ test.describe("Host kick controls", () => {
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-
-      // Allow peer discovery to propagate through signaling.
-      await hostPage.waitForTimeout(5000);
 
       // Wait for the peer connection (host sees guest's tile).
       await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({

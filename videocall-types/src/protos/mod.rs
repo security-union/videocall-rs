@@ -10,3 +10,4 @@ pub mod packet_wrapper;
 pub mod peer_event;
 pub mod rsa_packet;
 pub mod server_connection_packet;
+pub mod viewport_packet;

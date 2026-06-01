@@ -23,9 +23,9 @@ use std::sync::Arc;
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
     screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
-    MAX_BITRATE_SLEW_KBPS_PER_SEC, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
-    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
-    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO, MAX_BITRATE_SLEW_KBPS_PER_SEC,
+    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
+    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -218,11 +218,24 @@ impl DiagnosticPackets {
     /// boundary stays consistent with the actual data feeding the p75.
     ///
     /// **Small-n behavior:** at n=3 the 0.75 quantile collapses to the median
-    /// (index `floor(2 * 0.75)` = 1 out of \[0,1,2\]). For 1–2 peers the method
-    /// falls back to the minimum. The adaptive quality manager compensates by
-    /// using `VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT` (0.30 vs 0.50) when
-    /// `effective_peer_count < 3`, so the two pieces form a balanced pair.
-    pub fn get_p75_fps(&self) -> Option<(f64, usize)> {
+    /// (index `floor(2 * 0.75)` = 1 out of \[0,1,2\]). For n=1 the method
+    /// returns that peer's value. For **n=2** it applies an outlier guard
+    /// (issue #1012): if exactly one of the two peers is genuinely healthy
+    /// (`>= health_floor_fps`) and the other is a clear outlier below it
+    /// (`lower < higher * AQ_OUTLIER_GAP_FPS_RATIO`), it returns the *healthy*
+    /// peer's value — so a single constrained receiver cannot define the PID
+    /// setpoint and drag the sender's bitrate down for everyone. When no peer
+    /// clears the health floor (all struggling = real congestion) or the two
+    /// are close (no clear outlier), it keeps the conservative minimum, exactly
+    /// as before. The adaptive quality manager still uses
+    /// `VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT` (0.30 vs 0.50) when
+    /// `effective_peer_count < 3`, complementing this input-side guard.
+    ///
+    /// `health_floor_fps` is the absolute FPS at/above which a peer counts as
+    /// healthy (the caller passes `target_fps * AQ_OUTLIER_HEALTH_FPS_RATIO`).
+    /// A non-positive floor disables the rescue (falls back to minimum), so an
+    /// unknown/zero target can never spuriously raise the setpoint.
+    pub fn get_p75_fps(&self, health_floor_fps: f64) -> Option<(f64, usize)> {
         if self.peer_windows.is_empty() {
             return None;
         }
@@ -239,10 +252,27 @@ impl DiagnosticPackets {
         }
 
         let n = fps_values.len();
-        if n <= 2 {
-            // For 1-2 peers, return the minimum (conservative fallback).
-            // Lenient threshold in update_video_tier() compensates for this conservatism.
-            return fps_values.iter().copied().reduce(f64::min).map(|v| (v, n));
+        if n == 1 {
+            // Single peer: its value is the only signal we have. Can't tell an
+            // outlier from the truth, so return it verbatim.
+            return Some((fps_values[0], n));
+        }
+        if n == 2 {
+            let (lo, hi) = if fps_values[0] <= fps_values[1] {
+                (fps_values[0], fps_values[1])
+            } else {
+                (fps_values[1], fps_values[0])
+            };
+            // Outlier guard (#1012): rescue the setpoint toward the healthy peer
+            // ONLY when one peer is genuinely healthy AND the other is a clear
+            // outlier well below it. Otherwise (both low = real congestion, or
+            // both close = no outlier) keep the conservative minimum.
+            let healthy_peer_exists = health_floor_fps > 0.0 && hi >= health_floor_fps;
+            let clear_outlier = lo < hi * AQ_OUTLIER_GAP_FPS_RATIO;
+            if healthy_peer_exists && clear_outlier {
+                return Some((hi, n));
+            }
+            return Some((lo, n));
         }
 
         // Sort ascending and pick the 75th percentile.
@@ -273,6 +303,22 @@ pub struct EncoderBitrateController {
     diagnostic_packets: DiagnosticPackets,
     last_correction_time: f64,
     correction_throttle_ms: f64,
+    /// One-shot flag that forces the *next* call to
+    /// [`Self::process_diagnostics_packet_with_time`] to bypass the PID
+    /// correction throttle so a freshly-computed (lower) bitrate target reaches
+    /// the encoder in the same diagnostics-loop iteration.
+    ///
+    /// Set by [`Self::force_congestion_cut`] (issue #702): the aggressive cut
+    /// drops resolution/keyframe/audio tiers immediately via `take_tier_changed`,
+    /// but the encoder's actual bitrate target only updates from the value
+    /// `process_diagnostics_packet` returns. Without this bypass, a CONGESTION
+    /// signal arriving <1s after any prior AQ correction would be throttled
+    /// (returns `None`), leaving the rate-controlled codec targeting the old,
+    /// higher bitrate for up to ~1s — roughly the same bytes/sec on the wire,
+    /// defeating the buffer-drain intent of the cut. The flag is consumed (reset
+    /// to `false`) the next time the throttle guard is evaluated, so it only ever
+    /// bypasses a single correction and never weakens the normal 1s PID throttle.
+    force_next_correction: bool,
     /// Adaptive quality state machine for tier selection.
     quality_manager: AdaptiveQualityManager,
     /// Set to `true` after any tier transition, cleared by the caller via
@@ -387,6 +433,7 @@ impl EncoderBitrateController {
             diagnostic_packets,
             last_correction_time: 0.0,
             correction_throttle_ms: PID_CORRECTION_THROTTLE_MS,
+            force_next_correction: false,
             quality_manager,
             tier_changed: false,
             last_fps_ratio: 0.0,
@@ -427,9 +474,14 @@ impl EncoderBitrateController {
         // Add the packet to our diagnostic packet manager
         self.diagnostic_packets.process_packet(packet.clone(), now);
 
-        // Apply throttling - check if sufficient time has passed since last correction
+        // Apply throttling - check if sufficient time has passed since last correction.
+        // A one-shot bypass (armed by force_congestion_cut, issue #702) lets the
+        // aggressive cut's lower bitrate target land immediately instead of waiting
+        // out the throttle; it is consumed here so it never weakens the normal PID
+        // throttle on subsequent corrections.
+        let force_correction = std::mem::take(&mut self.force_next_correction);
         let time_since_last_correction = now - self.last_correction_time;
-        if time_since_last_correction < self.correction_throttle_ms {
+        if !force_correction && time_since_last_correction < self.correction_throttle_ms {
             log::debug!(
                 "Throttling bitrate correction: {:.0}ms since last correction (throttle: {:.0}ms)",
                 time_since_last_correction,
@@ -438,13 +490,18 @@ impl EncoderBitrateController {
             return None; // Too soon since last correction, don't emit a new one
         }
 
+        let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
+
         // Get the p75 FPS across all reporting peers. effective_peer_count is
         // the number of peers that contributed FPS data,
         // which may be less than peer_windows.len() (some peers may lack metrics).
-        let (worst_fps, effective_peer_count) = self.diagnostic_packets.get_p75_fps()?;
+        // The health floor lets the small-peer-count outlier guard (#1012)
+        // distinguish "one constrained receiver" from "everyone is struggling".
+        let health_floor_fps = target_fps * AQ_OUTLIER_HEALTH_FPS_RATIO;
+        let (worst_fps, effective_peer_count) =
+            self.diagnostic_packets.get_p75_fps(health_floor_fps)?;
         self.last_p75_peer_fps = worst_fps;
 
-        let target_fps = self.target_fps.load(Ordering::Relaxed) as f64;
         let fps_received = worst_fps.min(target_fps);
         if target_fps <= 0.0 {
             self.last_correction_time = now;
@@ -584,7 +641,16 @@ impl EncoderBitrateController {
         // Clamp the PID output to the current tier's bitrate bounds.
         let tier = self.quality_manager.current_video_tier();
         let tier_min = tier.min_bitrate_kbps as f64;
-        let tier_max = tier.max_bitrate_kbps as f64;
+        // While a self-targeted CONGESTION drain hold is active, pin the PID's
+        // max output to the tier's *ideal* (lower bound of the usable range)
+        // rather than its max, so the PID cannot ramp bitrate back up within
+        // the new tier and re-fill the still-draining relay buffer. The hold
+        // expires by timestamp, after which the normal tier max applies again.
+        let tier_max = if self.quality_manager.congestion_hold_active(now) {
+            (tier.ideal_bitrate_kbps as f64).max(tier_min)
+        } else {
+            tier.max_bitrate_kbps as f64
+        };
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
 
         let outside_previous_tier =
@@ -705,6 +771,41 @@ impl EncoderBitrateController {
             self.pid.reset();
             log::info!(
                 "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: force_step_down)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+        changed
+    }
+
+    /// Aggressively cut video quality in response to a self-targeted server
+    /// CONGESTION signal (the relay is dropping our outbound packets).
+    ///
+    /// Delegates to [`AdaptiveQualityManager::force_congestion_cut`], which
+    /// drops multiple tiers at once and arms a short drain hold that pins the
+    /// PID's bitrate ceiling so the overflowing relay buffer can recover.
+    /// Returns `true` if the tier actually changed.
+    pub fn force_congestion_cut(&mut self) -> bool {
+        let now = self.clock.now_ms();
+        let changed = self.quality_manager.force_congestion_cut(now);
+        if changed {
+            self.tier_changed = true;
+            // Arm a one-shot throttle bypass so the next process_diagnostics_packet
+            // recomputes and emits the new (lower) clamped bitrate immediately,
+            // even if a prior PID correction occurred <1s ago. The held tier's
+            // congestion-hold ceiling pin (controller.rs ~line 627) keeps that
+            // recomputed bitrate <= the tier ideal, so the cut lands once at the
+            // held tier's clamped bitrate rather than being deferred ~1s. See
+            // `force_next_correction` field docs (issue #702).
+            self.force_next_correction = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: congestion_cut)",
                 old_bitrate,
                 self.ideal_bitrate_kbps,
                 new_tier.label,
@@ -1697,7 +1798,8 @@ mod tests {
 
         assert_eq!(packets.peer_count(), 5);
 
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        // n>=3 uses the true percentile; the health floor is irrelevant here.
+        let (p75, effective_n) = packets.get_p75_fps(21.0).unwrap();
         assert_eq!(effective_n, 5);
         // With 5 values [0, 28, 28, 28, 28] sorted ascending,
         // p75_index = floor(4 * 0.75) = 3, so p75 = 28.0
@@ -1723,7 +1825,7 @@ mod tests {
 
         assert_eq!(packets.peer_count(), 5);
 
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        let (p75, effective_n) = packets.get_p75_fps(21.0).unwrap();
         assert_eq!(effective_n, 5);
         // With 5 values [5, 5, 5, 5, 28] sorted ascending,
         // p75_index = floor(4 * 0.75) = 3, so p75 = 5.0
@@ -1743,7 +1845,8 @@ mod tests {
         packets.process_packet(packet, base);
 
         assert_eq!(packets.peer_count(), 1);
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        // n=1 returns the peer's value verbatim; health floor is irrelevant.
+        let (p75, effective_n) = packets.get_p75_fps(21.0).unwrap();
         assert_eq!(effective_n, 1);
         assert!(
             (p75 - 12.0).abs() < 0.001,
@@ -1752,22 +1855,98 @@ mod tests {
     }
 
     #[test]
-    fn test_two_peers_p75_returns_minimum() {
-        // With 2 peers, get_p75_fps should return the minimum of the two.
+    fn test_two_peers_outlier_rescues_to_healthy_peer() {
+        // #1012: with 2 peers where one is healthy and the other is a clear
+        // outlier below it, get_p75_fps returns the HEALTHY peer's value so a
+        // single constrained receiver cannot define the setpoint. Target 30fps
+        // → health floor 21fps; peer at 28 is healthy, peer at 12 is a clear
+        // outlier (12 < 28 * 0.60 = 16.8), so the result is 28, not 12.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+        let health_floor = 30.0 * AQ_OUTLIER_HEALTH_FPS_RATIO; // 21.0
+
+        packets.process_packet(create_test_packet("sender", "peer1", 12.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 28.0, 500),
+            base + 100.0,
+        );
+
+        assert_eq!(packets.peer_count(), 2);
+        let (p75, effective_n) = packets.get_p75_fps(health_floor).unwrap();
+        assert_eq!(effective_n, 2);
+        assert!(
+            (p75 - 28.0).abs() < 0.001,
+            "outlier guard should rescue to the healthy peer (28.0), got {p75}"
+        );
+    }
+
+    #[test]
+    fn test_two_peers_both_low_keeps_minimum() {
+        // #1012 masking guard: when NEITHER peer is healthy (real congestion),
+        // the outlier guard must NOT fire — keep the conservative minimum so
+        // the sender still steps down. Target 30fps → floor 21; both peers
+        // (14, 16) are below the floor, so the result is the minimum (14).
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+        let health_floor = 30.0 * AQ_OUTLIER_HEALTH_FPS_RATIO; // 21.0
+
+        packets.process_packet(create_test_packet("sender", "peer1", 14.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 16.0, 500),
+            base + 100.0,
+        );
+
+        assert_eq!(packets.peer_count(), 2);
+        let (p75, effective_n) = packets.get_p75_fps(health_floor).unwrap();
+        assert_eq!(effective_n, 2);
+        assert!(
+            (p75 - 14.0).abs() < 0.001,
+            "both-low (real congestion) must keep the minimum (14.0), got {p75}"
+        );
+    }
+
+    #[test]
+    fn test_two_peers_both_healthy_keeps_minimum() {
+        // #1012: two healthy peers a few fps apart are NOT an outlier split
+        // (28 is not < 30 * 0.60 = 18), so the guard does not fire and the
+        // minimum is kept — which is fine because both are healthy anyway.
+        let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
+        let base = 1000.0;
+        let health_floor = 30.0 * AQ_OUTLIER_HEALTH_FPS_RATIO; // 21.0
+
+        packets.process_packet(create_test_packet("sender", "peer1", 28.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 30.0, 500),
+            base + 100.0,
+        );
+
+        assert_eq!(packets.peer_count(), 2);
+        let (p75, effective_n) = packets.get_p75_fps(health_floor).unwrap();
+        assert_eq!(effective_n, 2);
+        assert!(
+            (p75 - 28.0).abs() < 0.001,
+            "two close healthy peers should keep the minimum (28.0), got {p75}"
+        );
+    }
+
+    #[test]
+    fn test_two_peers_outlier_guard_disabled_without_target() {
+        // #1012: a non-positive health floor (unknown/zero target_fps) disables
+        // the rescue entirely, so the setpoint can never be spuriously raised.
+        // Falls back to the conservative minimum (12.0).
         let mut packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
         let base = 1000.0;
 
-        let packet1 = create_test_packet("sender", "peer1", 12.0, 500);
-        packets.process_packet(packet1, base);
-        let packet2 = create_test_packet("sender", "peer2", 28.0, 500);
-        packets.process_packet(packet2, base + 100.0);
+        packets.process_packet(create_test_packet("sender", "peer1", 12.0, 500), base);
+        packets.process_packet(
+            create_test_packet("sender", "peer2", 28.0, 500),
+            base + 100.0,
+        );
 
-        assert_eq!(packets.peer_count(), 2);
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
-        assert_eq!(effective_n, 2);
+        let (p75, _) = packets.get_p75_fps(0.0).unwrap();
         assert!(
             (p75 - 12.0).abs() < 0.001,
-            "Two-peer p75 should be the minimum (12.0), got {p75}"
+            "zero health floor must disable rescue and keep the minimum (12.0), got {p75}"
         );
     }
 
@@ -1790,7 +1969,7 @@ mod tests {
         );
 
         assert_eq!(packets.peer_count(), 3);
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        let (p75, effective_n) = packets.get_p75_fps(21.0).unwrap();
         assert_eq!(effective_n, 3);
         assert!(
             (p75 - 25.0).abs() < 0.001,
@@ -1826,15 +2005,17 @@ mod tests {
         assert_eq!(packets.peer_count(), 3);
 
         // But only 2 contributed FPS data
-        let (p75, effective_n) = packets.get_p75_fps().unwrap();
+        let (p75, effective_n) = packets.get_p75_fps(21.0).unwrap();
         assert_eq!(
             effective_n, 2,
             "effective_n should be 2 (peer_no_fps has no FPS data), got {effective_n}"
         );
-        // With 2 peers, p75 degenerates to min([25, 28]) = 25
+        // With 2 effective peers [25, 28] and health floor 21: 28 is healthy
+        // but 25 is NOT a clear outlier (25 >= 28 * 0.60 = 16.8), so the
+        // outlier guard does not fire and the minimum (25) is kept.
         assert!(
             (p75 - 25.0).abs() < 0.001,
-            "p75 should be 25.0 (min of 2 effective peers), got {p75}"
+            "p75 should be 25.0 (min of 2 effective, no outlier), got {p75}"
         );
     }
 
@@ -2000,6 +2181,96 @@ mod tests {
             high_max,
             result,
             max_step,
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_bypasses_throttle_immediately() {
+        use crate::clock::TestClock;
+        use crate::constants::{DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
+
+        // The aggressive congestion cut (#702) must drop the *bitrate* target
+        // immediately, not just resolution/keyframe tiers. The encoder's bitrate
+        // only updates from the value process_diagnostics_packet returns, so if a
+        // CONGESTION arrives <1s after a prior PID correction, the normal throttle
+        // would return None and the codec would keep targeting the old (higher)
+        // bitrate for ~1s — defeating the buffer-drain intent of the cut.
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].ideal_bitrate_kbps;
+        let mut controller = EncoderBitrateController::with_clock(
+            ideal_bitrate_kbps,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+
+        // Warm up past the initialization gate so corrections actually emit.
+        // Start well past the manager's 5s warmup window (created_at = base_ms),
+        // and hold a steady ~0.60 fps ratio (18/30) — between the 0.50 degrade and
+        // 0.70 recover thresholds — so no tier transition fires during warm-up and
+        // the min-transition-interval guard cannot block the congestion cut.
+        let stable_fps = 18.0_f32;
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm =
+            warm_up_for_slew_test(&mut controller, base_time, stable_fps, ideal_bitrate_kbps);
+
+        // Perform one normal correction so last_correction_time is recent.
+        let correction_time = last_warm + 1100.0;
+        let prior = controller
+            .process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+                correction_time,
+            )
+            .expect("warm-up correction should emit a bitrate");
+        assert!(prior > 0.0, "prior correction should be positive");
+
+        // A self-targeted CONGESTION arrives only 200ms later — well inside the
+        // 1s PID correction throttle. Align the clock so force_congestion_cut's
+        // drain-hold window is anchored to the same timeline as the packet below.
+        let congestion_time = correction_time + 200.0;
+        clock.set_ms(congestion_time as u64);
+        let cut_changed = controller.force_congestion_cut();
+        assert!(
+            cut_changed,
+            "congestion cut should change tier from the default starting tier"
+        );
+
+        // The very next diagnostics packet — still <1s since the prior correction —
+        // must NOT be throttled: the one-shot bypass forces a fresh computation so
+        // the lower bitrate reaches the encoder in this same iteration.
+        let held_tier = controller.current_video_tier();
+        let held_ideal = held_tier.ideal_bitrate_kbps as f64;
+        let result = controller
+            .process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+                congestion_time,
+            )
+            .expect("congestion cut must bypass the throttle and emit a bitrate immediately");
+
+        // The emitted bitrate must respect the congestion-hold ceiling pin: it is
+        // clamped at or below the held (lower) tier's ideal, proving the cut landed
+        // immediately rather than being deferred to the old higher target.
+        assert!(
+            result <= held_ideal + 0.5,
+            "post-cut bitrate {result:.1} must be <= held tier ideal {held_ideal:.1} \
+             (congestion-hold ceiling pin); cut was not applied immediately"
+        );
+        assert!(
+            result < prior,
+            "post-cut bitrate {result:.1} must be lower than the pre-cut target {prior:.1}"
+        );
+
+        // The bypass is one-shot: a follow-up packet still inside the throttle
+        // window must be throttled again (the normal 1s PID throttle is intact).
+        let throttled = controller.process_diagnostics_packet_with_time(
+            create_test_packet("s", "peer1", stable_fps, ideal_bitrate_kbps),
+            congestion_time + 100.0,
+        );
+        assert!(
+            throttled.is_none(),
+            "the throttle bypass must be one-shot; the normal 1s throttle must \
+             still apply to the following correction"
         );
     }
 

@@ -45,13 +45,19 @@ env:
     value: "4"
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
-  # WT outbound mpsc capacity per session. Default in code is 4096 (up
-  # from 1024 to absorb 17+ peer fan-out bursts; codifies the value Jay
-  # applied manually on the HCL daily deployment after the 2026-05-11
-  # incident, per Discussion #699). Override here only for
-  # exceptionally large meetings.
+  # WT outbound mpsc capacity per session. Default in code is 512
+  # (fail-fast per issue #979: a deep queue only buffers stale, useless
+  # video for slow receivers — the priority-drop policy + CONGESTION
+  # feedback are the correct response, not a bigger buffer). Override
+  # here only for exceptional workloads.
+  #
+  # Shedding is NOT env-tunable: the priority-drop policy lives in
+  # actix-api/src/actors/priority_drop.rs and uses fixed fill ratios
+  # (video/screen shed at 0.80, audio at 0.95, control/critical never
+  # preempted). There is no WT_OUTBOUND_SHEDDING_THRESHOLD env var — the
+  # old dead var was removed in #731.
   # - name: WT_OUTBOUND_CHANNEL_CAPACITY
-  #   value: "8192"
+  #   value: "1024"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET
@@ -64,9 +70,9 @@ resources:
   # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
   # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
   # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
-  # ample headroom for the 4096-slot per-session queue (each slot is a
+  # ample headroom for the 512-slot per-session queue (each slot is a
   # `WtOutbound` enum holding at most one ~1200-byte datagram or a
-  # bounded stream message, so worst-case per-session queue ~5 MiB and
+  # bounded stream message, so worst-case per-session queue <1 MiB and
   # the dominant memory line item remains the codec/session state, not
   # the queue) while keeping the customer-facing default right-sized
   # rather than over-inflated.

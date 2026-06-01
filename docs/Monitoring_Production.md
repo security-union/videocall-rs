@@ -131,7 +131,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|
 | `RelayPacketDrops` | `rate(relay_packet_drops_total[1m]) > 0` for 1m | critical |
 | `RelayNATSLatencyHigh` | NATS publish p99 > 50ms for 2m | warning |
-| `RelayQueueNearFull` | Queue depth > 200/256 for 30s | warning |
+| `RelayQueueNearFull` | Queue depth > 410/512 for 30s | warning |
 | `MeetingQualityDegraded` | Avg call quality < 50 for 2m | warning |
 | `LowAudioConnectivity` | Peer can't hear for 1m | critical |
 | `ContainerCPUHigh` | CPU > 85% of limit for 3m | warning |
@@ -144,9 +144,15 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|---|
 | `relay_packet_drops_total` | Counter | room, transport, drop_reason | Packets dropped due to full queue/mailbox |
 | `relay_nats_publish_latency_ms` | Histogram | — | Time to publish media packet to NATS |
-| `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (capacity 256) |
+| `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (default capacity 512, env `WT_OUTBOUND_CHANNEL_CAPACITY`) |
 | `relay_active_sessions_per_room` | Gauge | room, transport | Connections per meeting |
 | `relay_room_bytes_total` | Counter | room, direction | Bytes forwarded (use `rate()` for bps) |
+| `relay_viewport_filtered_total` | Counter | room | VIDEO packets dropped by viewport-aware filtering (off-screen source not in receiver's viewport, HCL #988) |
+| `relay_viewport_forwarded_total` | Counter | room | VIDEO packets forwarded after passing the viewport filter — denominator for "% filtered" = `filtered / (filtered + forwarded)` (HCL #988) |
+| `relay_viewport_set_size` | Gauge | room | Most recently accepted viewport (desired-streams) set size per room. A collapse toward 0/1 while peers still publish is the wrongly-dropping / "froze my video" signature (HCL #988) |
+| `relay_viewport_updates_total` | Counter | room, outcome | VIEWPORT control-packet update outcomes (`accepted` \| `rate_limited` \| `truncated` \| `ignored_other_subject`) — makes the DoS-guard caps fire visibly without labeling normal fan-out ignores as ownership failures (HCL #988) |
+
+> **Viewport metrics (HCL #988) are Category B (dashboard, not alert page).** They back the "Viewport" panels on the *Relay Health (Server-Side)* row of the meeting-investigation dashboard; investigate "% filtered" spikes and set-size collapse there. No alert rule fires on them — a filtered-VIDEO drop is intentional bandwidth saving, not a fault. Per-source forensics ("who dropped what from whom") are deliberately NOT labels (session IDs are unbounded); enable a scoped `RUST_LOG=...chat_server=debug` on the relay to reconstruct per-room drop detail from the VIDEO-drop debug log.
 
 ### Client quality metrics (via metrics_server)
 | Metric | Description |
@@ -157,6 +163,17 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | `videocall_neteq_expand_ops_per_sec` | Audio concealment rate (key audio health signal) |
 | `videocall_neteq_target_delay_ms` | Jitter estimate |
 | `videocall_audio_concealment_pct` | Audio concealment percentage |
+
+### Decode-budget metrics (client-side, via metrics_server)
+Receiver-side decode-budget state reported by each client in its health packet. All are `meeting_id`-keyed per-session gauges (not relay `room`-keyed), and surface in the **Decode-Budget (Client-Side)** dashboard row.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `videocall_decode_budget_effective_cap` | Gauge | meeting_id, session_id, peer_id, display_name | Current effective visible-tile cap the client is decoding. When `pressured==1`, `natural - effective_cap` is the shed magnitude (tiles dropped to avatars); a collapse here = that client is shedding video under decode pressure (HCL #987) |
+| `videocall_decode_budget_natural` | Gauge | meeting_id, session_id, peer_id, display_name | Natural/unconstrained tile count — what the client would decode unthrottled. The gap above `effective_cap` is the shed magnitude (HCL #987) |
+| `videocall_decode_budget_pressured` | Gauge | meeting_id, session_id, peer_id, display_name | 0/1 pressured latch; 1 = the budget loop is actively shedding tiles. A fleet-wide rise in the `sum()` = widespread weak-hardware distress (HCL #987) |
+| `videocall_decode_budget_override_mode` | Gauge | meeting_id, session_id, peer_id, display_name | User override mode: 0=unspecified, 1=auto, 2=fixed. mode=2 = user manually capped tiles (user-chosen) vs auto-shed by the system — distinguishes user choice from system-forced shedding for triage (HCL #987) |
+| `videocall_decode_budget_override_fixed_n` | Gauge | meeting_id, session_id, peer_id, display_name | The user's fixed tile cap when `override_mode==2` (fixed) (HCL #987) |
 
 ### Container resource metrics (via cAdvisor)
 | Metric | Description |

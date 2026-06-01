@@ -36,6 +36,7 @@ use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
 use bot::rtt_probe::spawn_rtt_probe;
 use bot::transport::{self, OutboundFrame, TransportClient};
 use bot::video_producer::VideoProducer;
+use bot::viewport_sender::ViewportSender;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -675,6 +676,28 @@ async fn run_client(
         }
         counter
     };
+
+    // --- Viewport sender (HCL issue #988) ---
+    // Mimic a real browser that only renders its on-screen tiles: emit a
+    // VIEWPORT control packet listing the first N discovered peers (sorted for
+    // reproducibility). A #988-enabled relay then stops forwarding VIDEO from
+    // off-screen peers, so the load test measures realistic relay fan-out.
+    // `None` keeps legacy behaviour (no VIEWPORT — relay forwards everything).
+    {
+        let vs = ViewportSender::new(
+            user_id.clone(),
+            bot_config.viewport_visible_count,
+            packet_tx.clone(),
+        );
+        if vs.is_enabled() {
+            info!(
+                "[{}] VIEWPORT fidelity enabled: rendering up to {:?} peer(s)",
+                user_id, bot_config.viewport_visible_count
+            );
+        }
+        let mut s = stats.lock().unwrap();
+        s.set_viewport_sender(vs);
+    }
 
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.

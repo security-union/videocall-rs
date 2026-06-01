@@ -110,11 +110,11 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
 
     const uiURL = baseURL || "http://localhost:3001";
     const ts = Date.now();
-    const meetingId = `e2e_ownership_${ts}`;
-    const userAEmail = `ownership-a-${ts}@videocall.rs`;
-    const userAName = "OwnershipUserA";
-    const userBEmail = `ownership-b-${ts}@videocall.rs`;
-    const userBName = "OwnershipUserB";
+    const meetingId = `e2e_owngate_${ts}`;
+    const userAEmail = `owngate-a-${ts}@videocall.rs`;
+    const userAName = "PropUserA";
+    const userBEmail = `owngate-b-${ts}@videocall.rs`;
+    const userBName = "PropUserB";
 
     const browserA = await chromium.launch({ args: BROWSER_ARGS });
     const browserB = await chromium.launch({ args: BROWSER_ARGS });

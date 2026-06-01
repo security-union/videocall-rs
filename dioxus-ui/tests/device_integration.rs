@@ -60,9 +60,9 @@ async fn enumerate_real_fake_devices_returns_labeled_devices() {
 use std::cell::RefCell;
 
 thread_local! {
-    static FAKE_MICS: RefCell<Vec<web_sys::MediaDeviceInfo>> = RefCell::new(Vec::new());
-    static FAKE_CAMS: RefCell<Vec<web_sys::MediaDeviceInfo>> = RefCell::new(Vec::new());
-    static FAKE_SPKS: RefCell<Vec<web_sys::MediaDeviceInfo>> = RefCell::new(Vec::new());
+    static FAKE_MICS: RefCell<Vec<web_sys::MediaDeviceInfo>> = const { RefCell::new(Vec::new()) };
+    static FAKE_CAMS: RefCell<Vec<web_sys::MediaDeviceInfo>> = const { RefCell::new(Vec::new()) };
+    static FAKE_SPKS: RefCell<Vec<web_sys::MediaDeviceInfo>> = const { RefCell::new(Vec::new()) };
 }
 
 fn wrapper_with_fake_devices() -> Element {

@@ -202,9 +202,6 @@ test.describe("Peer screen-share aspect ratio", () => {
       const hostPage = members[0].page;
       const guestPage = members[1].page;
 
-      // Wait for mesh to settle so the host has the guest tile.
-      await hostPage.waitForTimeout(8000);
-
       await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {
         timeout: 30_000,
       });

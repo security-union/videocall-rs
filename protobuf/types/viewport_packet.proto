@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+// Client -> relay viewport / "desired streams" control payload.
+//
+// Carried inside a PacketWrapper whose `packet_type` is VIEWPORT. The
+// sending client lists the session_ids it is currently rendering (its
+// visible viewport). The relay records this per receiver session and
+// stops forwarding VIDEO for peers that are NOT in the set, saving
+// downstream bandwidth.
+//
+// Security: this list is SUBTRACT-ONLY. It can only reduce what an
+// already-authorized session receives; it never grants access. An empty
+// `session_ids` (or no VIEWPORT packet at all) means "no viewport signal"
+// and the relay forwards everything (fail-open to legacy behaviour).
+// AUDIO is NEVER filtered by this set — off-screen speakers must still be
+// heard, and keying audio off a client-supplied list would let a client
+// silence a target. This packet is consumed by the relay and never
+// re-broadcast to other peers.
+message ViewportPacket {
+  // The session_ids the sender is currently rendering (desired/visible
+  // set). Empty = no viewport constraint.
+  repeated uint64 session_ids = 1;
+}

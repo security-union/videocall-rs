@@ -296,7 +296,7 @@ test.describe("Screen share right panel layout", () => {
   // to a split layout where the right panel uses a 2-column CSS grid
   // with `.split-peer-tile` elements for peer video tiles.
   // ──────────────────────────────────────────────────────────────────────
-  test("right panel renders 2-column grid during screen share", async ({ baseURL }) => {
+  test("right panel renders 2-column grid during screen share @bvt1", async ({ baseURL }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_panel_grid_${Date.now()}`;
@@ -336,17 +336,27 @@ test.describe("Screen share right panel layout", () => {
       // Verify the screen share tile is visible on the left
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 10_000 });
 
-      // Verify the right panel has grid-template-columns with 2 columns (1fr 1fr)
-      // The right panel is the second child of #grid-container with inline
-      // style containing "grid-template-columns: 1fr 1fr"
-      // Right panel is the 3rd child: left + resize-handle + right.
+      // Verify the right panel has grid-template-columns with fixed-width
+      // tile-sized columns (HCL #3/#4 fix in PR #940). The right panel is
+      // the 3rd child: left + resize-handle + right.
+      //
+      // Pre-#940 form: `grid-template-columns: 1fr 1fr` (or `1fr` when
+      // narrow). That regex still appears in this codebase only as a
+      // negative assertion — the post-fix form is
+      // `repeat(2, <ss_tile_w>px)` (or `<ss_tile_w>px` when narrow) paired
+      // with `justify-content: start` so tiles pack to the left edge.
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
       const rightPanelStyle = await rightPanel.getAttribute("style");
       expect(rightPanelStyle).toBeTruthy();
-      // 2-column when >1 peer, 1-column when only 1 peer in right panel.
-      expect(rightPanelStyle).toMatch(/grid-template-columns: 1fr( 1fr)?/);
+      // 2-column (>=2 peers) or 1-column (1 peer) variant, both with
+      // fixed-width tile-sized tracks.
+      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
+      // Bug #3: tiles must pack to the left edge (not stretch / center).
+      expect(rightPanelStyle).toContain("justify-content: start");
+      // Stale "1fr" tracks must never reappear (regression guard).
+      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");
@@ -494,6 +504,111 @@ test.describe("Screen share right panel layout", () => {
       expect(containerStyle).toBeTruthy();
       expect(containerStyle).toContain("grid-template-columns");
       expect(containerStyle).toContain("grid-template-rows");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 4. HCL bugs #3 + #4: side-strip tiles left-justify and hold 3:2 cap
+  //    on a wide viewport.
+  //
+  // Bug #3 (left-justification): pre-fix the right panel used `1fr 1fr`
+  // tracks with `place-self: center`, which centered each 3:2-capped
+  // `.split-peer-tile` in a viewport-wide cell → large left/right gaps,
+  // tiles visually "floating in the middle of the side-strip". Post-fix
+  // the panel uses fixed-width `(ss_tile_h * 1.5)px` tracks plus
+  // `justify-content: start` so tiles pack to the LEFT edge of the
+  // panel. Verifiable by computing the gap between the panel's left
+  // edge and each tile's left edge: it must be `padding-left` (~6px),
+  // NOT half the cell surplus.
+  //
+  // Bug #4 (3:2 cap on wide screens): same root cause as #3 — the
+  // stretched 1fr cell let `.split-peer-tile` honour its 3:2 cap, but
+  // the cell footprint itself wasn't 3:2, so the surrounding chrome
+  // looked stretched. Post-fix each cell IS exactly the 3:2 tile
+  // footprint (column width is `ss_tile_h * 1.5`), and the tile
+  // stretches to fill the cell. The resulting `.split-peer-tile`
+  // bounding-box aspect must be ~1.5 (3:2) even on a wide viewport.
+  //
+  // The test runs on a deliberately WIDE viewport (1600x900) so the
+  // pre-fix code path would distribute surplus into both cells —
+  // exactly the regression scenario the user reported.
+  // ──────────────────────────────────────────────────────────────────────
+  test("right panel left-justifies tiles with 3:2 footprint on wide viewport (HCL #3+#4) @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_left_justify_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSLeftJustHost",
+      "SSLeftJustGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      // Wide viewport: pre-fix, this maximizes the centering surplus.
+      await hostPage.setViewportSize({ width: 1600, height: 900 });
+      await hostPage.waitForTimeout(3000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted; mockDisplayMedia not effective.");
+        return;
+      }
+
+      // Let the split layout settle.
+      await hostPage.waitForTimeout(2000);
+
+      const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
+      await expect(rightPanel).toBeVisible({ timeout: 10_000 });
+
+      // ── Bug #3 STRUCTURAL: justify-content: start packs tiles left.
+      const rightPanelStyle = (await rightPanel.getAttribute("style")) || "";
+      expect(rightPanelStyle).toContain("justify-content: start");
+      // ── Bug #3 STRUCTURAL: fixed-width pixel tracks (NOT `1fr`).
+      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
+      // ── Bug #3 REGRESSION GUARD: `1fr` tracks must not reappear.
+      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
+
+      // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
+      // panel's left edge plus its padding (~6px), not centered.
+      const firstTile = hostPage.locator(".split-peer-tile").first();
+      await expect(firstTile).toBeVisible({ timeout: 10_000 });
+      const offsets = await firstTile.evaluate((tile) => {
+        const panel = tile.closest("#grid-container > div:nth-child(3)") as HTMLElement;
+        const tr = tile.getBoundingClientRect();
+        const pr = panel.getBoundingClientRect();
+        return { tileLeft: tr.left, panelLeft: pr.left, panelWidth: pr.width };
+      });
+      const leftInset = offsets.tileLeft - offsets.panelLeft;
+      // Padding is `6px`; allow 4-20px for sub-pixel + scrollbar.
+      expect(leftInset).toBeGreaterThanOrEqual(0);
+      expect(leftInset).toBeLessThanOrEqual(20);
+      // The pre-fix CENTERED tile would sit at panel midpoint ≫ 20px in.
+      // (We don't compare to half-width because we'd need to know the cell
+      // surplus; the absolute bound above is sufficient.)
+
+      // ── Bug #4 GEOMETRIC: each tile's bounding-box aspect must be ~3:2.
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThan(0);
+      for (let i = 0; i < tileCount; i++) {
+        const dims = await tiles.nth(i).evaluate((el) => {
+          const r = el.getBoundingClientRect();
+          return { w: r.width, h: r.height };
+        });
+        if (dims.w === 0 || dims.h === 0) continue;
+        const aspect = dims.w / dims.h;
+        // 3:2 = 1.5; allow 7% tolerance for borders + sub-pixel rounding.
+        expect(aspect).toBeGreaterThan(1.5 * 0.93);
+        expect(aspect).toBeLessThan(1.5 * 1.07);
+      }
     } finally {
       await browser1.close();
       await browser2.close();

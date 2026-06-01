@@ -67,6 +67,19 @@ message PeerStats {
 
   // Screen share video stats (separate from camera video_stats field 6)
   VideoStats screen_video_stats = 14;
+
+  // Freeze-detection metrics (issue #1013). videocall_video_fps counts decode
+  // calls, not visually distinct frames, so it reads ~30fps while video is
+  // frozen. These surface the loss signal that actually proves a freeze.
+  // Per-peer sequence loss rate (lost packets/sec, windowed) observed for this
+  // peer's video stream. Sustained loss => frozen/glitched video even when
+  // fps_received looks healthy.
+  optional double video_seq_loss_per_sec = 15;
+  // Per-peer keyframe (PLI) requests/sec this client sent TO this peer
+  // (windowed). A sustained nonzero rate is the direct symptom of a stream
+  // that cannot recover — feeds video_quality_score so it can't read 100/100
+  // during a keyframe storm.
+  optional double keyframe_requests_per_sec = 16;
 }
 
 message HealthPacket {
@@ -172,6 +185,32 @@ message HealthPacket {
 
   // Compatibility field added after TELEM-7/8/9 consumed 56-66.
   optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
+
+  // Adaptive decode-budget controller state (#987). Surfaces the receiver-side
+  // tile-cap decision so population-scale dashboards can see the adaptive loop's
+  // reasoning server-side instead of only in client console logs. Absent when
+  // the controller has not produced a snapshot yet (no peers / pre-warmup).
+  optional DecodeBudget decode_budget = 68;
+}
+
+// Receiver-side adaptive decode-budget state (#987). Mirrors the
+// AdaptiveQuality tier fields on HealthPacket: a periodic snapshot of the
+// current decision the local controller has reached for how many video tiles
+// to decode.
+message DecodeBudget {
+  uint32 effective_cap = 1;        // Current effective cap on simultaneously decoded tiles
+  uint32 natural = 2;              // Natural/unconstrained tile count the layout would show
+  bool pressured = 3;              // Pressured latch engaged (loop owns the cap)
+  OverrideMode override_mode = 4;  // Auto vs Fixed
+  // Set only when override_mode == OVERRIDE_MODE_FIXED: the user's hard tile cap.
+  uint32 override_fixed_n = 5;
+
+  // Manual override mode for the controller.
+  enum OverrideMode {
+    OVERRIDE_MODE_UNSPECIFIED = 0; // Treated as Auto by readers
+    OVERRIDE_MODE_AUTO = 1;        // Adaptive loop decides the cap
+    OVERRIDE_MODE_FIXED = 2;       // User hard-pinned the cap (see override_fixed_n)
+  }
 }
 
 message TierTransition {

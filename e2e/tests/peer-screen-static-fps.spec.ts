@@ -275,9 +275,6 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
       const hostPage = members[0].page;
       const guestPage = members[1].page;
 
-      // Wait for mesh to settle.
-      await hostPage.waitForTimeout(8000);
-
       await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {
         timeout: 30_000,
       });

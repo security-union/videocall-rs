@@ -36,8 +36,12 @@ pub struct PacketWrapper {
     pub data: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:PacketWrapper.session_id)
     pub session_id: u64,
+    ///  Simulcast layer id (#989/PR #993); see discussion #890.
     // @@protoc_insertion_point(field:PacketWrapper.simulcast_layer_id)
     pub simulcast_layer_id: u32,
+    ///  Cleartext discriminator; see MediaKind. Default 0 = unspecified = fail-open.
+    // @@protoc_insertion_point(field:PacketWrapper.media_kind)
+    pub media_kind: ::protobuf::EnumOrUnknown<packet_wrapper::MediaKind>,
     // special fields
     // @@protoc_insertion_point(special_field:PacketWrapper.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -55,7 +59,7 @@ impl PacketWrapper {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "packet_type",
@@ -81,6 +85,11 @@ impl PacketWrapper {
             "simulcast_layer_id",
             |m: &PacketWrapper| { &m.simulcast_layer_id },
             |m: &mut PacketWrapper| { &mut m.simulcast_layer_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "media_kind",
+            |m: &PacketWrapper| { &m.media_kind },
+            |m: &mut PacketWrapper| { &mut m.media_kind },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<PacketWrapper>(
             "PacketWrapper",
@@ -115,6 +124,9 @@ impl ::protobuf::Message for PacketWrapper {
                 40 => {
                     self.simulcast_layer_id = is.read_uint32()?;
                 },
+                48 => {
+                    self.media_kind = is.read_enum_or_unknown()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -142,6 +154,9 @@ impl ::protobuf::Message for PacketWrapper {
         if self.simulcast_layer_id != 0 {
             my_size += ::protobuf::rt::uint32_size(5, self.simulcast_layer_id);
         }
+        if self.media_kind != ::protobuf::EnumOrUnknown::new(packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED) {
+            my_size += ::protobuf::rt::int32_size(6, self.media_kind.value());
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -162,6 +177,9 @@ impl ::protobuf::Message for PacketWrapper {
         }
         if self.simulcast_layer_id != 0 {
             os.write_uint32(5, self.simulcast_layer_id)?;
+        }
+        if self.media_kind != ::protobuf::EnumOrUnknown::new(packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED) {
+            os.write_enum(6, ::protobuf::EnumOrUnknown::value(&self.media_kind))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -185,6 +203,7 @@ impl ::protobuf::Message for PacketWrapper {
         self.data.clear();
         self.session_id = 0;
         self.simulcast_layer_id = 0;
+        self.media_kind = ::protobuf::EnumOrUnknown::new(packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED);
         self.special_fields.clear();
     }
 
@@ -195,6 +214,7 @@ impl ::protobuf::Message for PacketWrapper {
             data: ::std::vec::Vec::new(),
             session_id: 0,
             simulcast_layer_id: 0,
+            media_kind: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -245,6 +265,8 @@ pub mod packet_wrapper {
         CONGESTION = 9,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.PEER_EVENT)
         PEER_EVENT = 10,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.VIEWPORT)
+        VIEWPORT = 11,
     }
 
     impl ::protobuf::Enum for PacketType {
@@ -267,6 +289,7 @@ pub mod packet_wrapper {
                 8 => ::std::option::Option::Some(PacketType::SESSION_ASSIGNED),
                 9 => ::std::option::Option::Some(PacketType::CONGESTION),
                 10 => ::std::option::Option::Some(PacketType::PEER_EVENT),
+                11 => ::std::option::Option::Some(PacketType::VIEWPORT),
                 _ => ::std::option::Option::None
             }
         }
@@ -284,6 +307,7 @@ pub mod packet_wrapper {
                 "SESSION_ASSIGNED" => ::std::option::Option::Some(PacketType::SESSION_ASSIGNED),
                 "CONGESTION" => ::std::option::Option::Some(PacketType::CONGESTION),
                 "PEER_EVENT" => ::std::option::Option::Some(PacketType::PEER_EVENT),
+                "VIEWPORT" => ::std::option::Option::Some(PacketType::VIEWPORT),
                 _ => ::std::option::Option::None
             }
         }
@@ -300,6 +324,7 @@ pub mod packet_wrapper {
             PacketType::SESSION_ASSIGNED,
             PacketType::CONGESTION,
             PacketType::PEER_EVENT,
+            PacketType::VIEWPORT,
         ];
     }
 
@@ -326,61 +351,186 @@ pub mod packet_wrapper {
             ::protobuf::reflect::GeneratedEnumDescriptorData::new::<PacketType>("PacketWrapper.PacketType")
         }
     }
+
+    ///  Cleartext media-kind discriminator on the OUTER envelope.
+    ///
+    ///  Under E2EE_ENABLED=true the inner MediaPacket (including its own
+    ///  `media_type`) is AES-sealed, so the relay — which never decrypts —
+    ///  cannot tell VIDEO from AUDIO/SCREEN. This field lets the publisher
+    ///  advertise the media kind in cleartext so the relay can apply
+    ///  viewport-aware VIDEO filtering while ALWAYS forwarding AUDIO.
+    ///
+    ///  Set only by the publishing client on MEDIA packets. Other packet
+    ///  types leave it unspecified. The default (UNSPECIFIED = 0) MUST be
+    ///  treated as fail-open (forward) by the relay so that older clients,
+    ///  non-media packets, and any future packet type keep working unchanged.
+    #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+    // @@protoc_insertion_point(enum:PacketWrapper.MediaKind)
+    pub enum MediaKind {
+        // @@protoc_insertion_point(enum_value:PacketWrapper.MediaKind.MEDIA_KIND_UNSPECIFIED)
+        MEDIA_KIND_UNSPECIFIED = 0,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.MediaKind.VIDEO)
+        VIDEO = 1,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.MediaKind.AUDIO)
+        AUDIO = 2,
+        // @@protoc_insertion_point(enum_value:PacketWrapper.MediaKind.SCREEN)
+        SCREEN = 3,
+    }
+
+    impl ::protobuf::Enum for MediaKind {
+        const NAME: &'static str = "MediaKind";
+
+        fn value(&self) -> i32 {
+            *self as i32
+        }
+
+        fn from_i32(value: i32) -> ::std::option::Option<MediaKind> {
+            match value {
+                0 => ::std::option::Option::Some(MediaKind::MEDIA_KIND_UNSPECIFIED),
+                1 => ::std::option::Option::Some(MediaKind::VIDEO),
+                2 => ::std::option::Option::Some(MediaKind::AUDIO),
+                3 => ::std::option::Option::Some(MediaKind::SCREEN),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        fn from_str(str: &str) -> ::std::option::Option<MediaKind> {
+            match str {
+                "MEDIA_KIND_UNSPECIFIED" => ::std::option::Option::Some(MediaKind::MEDIA_KIND_UNSPECIFIED),
+                "VIDEO" => ::std::option::Option::Some(MediaKind::VIDEO),
+                "AUDIO" => ::std::option::Option::Some(MediaKind::AUDIO),
+                "SCREEN" => ::std::option::Option::Some(MediaKind::SCREEN),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        const VALUES: &'static [MediaKind] = &[
+            MediaKind::MEDIA_KIND_UNSPECIFIED,
+            MediaKind::VIDEO,
+            MediaKind::AUDIO,
+            MediaKind::SCREEN,
+        ];
+    }
+
+    impl ::protobuf::EnumFull for MediaKind {
+        fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| super::file_descriptor().enum_by_package_relative_name("PacketWrapper.MediaKind").unwrap()).clone()
+        }
+
+        fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+            let index = *self as usize;
+            Self::enum_descriptor().value_by_index(index)
+        }
+    }
+
+    impl ::std::default::Default for MediaKind {
+        fn default() -> Self {
+            MediaKind::MEDIA_KIND_UNSPECIFIED
+        }
+    }
+
+    impl MediaKind {
+        pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+            ::protobuf::reflect::GeneratedEnumDescriptorData::new::<MediaKind>("PacketWrapper.MediaKind")
+        }
+    }
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/packet_wrapper.proto\"\x86\x03\n\rPacketWrapper\x12:\n\x0bpa\
+    \n\x1atypes/packet_wrapper.proto\"\x98\x04\n\rPacketWrapper\x12:\n\x0bpa\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
     e\x12\x17\n\x07user_id\x18\x02\x20\x01(\x0cR\x06userId\x12\x12\n\x04data\
     \x18\x03\x20\x01(\x0cR\x04data\x12\x1d\n\nsession_id\x18\x04\x20\x01(\
     \x04R\tsessionId\x12,\n\x12simulcast_layer_id\x18\x05\x20\x01(\rR\x10sim\
-    ulcastLayerId\"\xbe\x01\n\nPacketType\x12\x17\n\x13PACKET_TYPE_UNKNOWN\
-    \x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\x10\x02\x12\
-    \t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\x04\x12\x0f\n\x0bDIAGNOS\
-    TICS\x10\x05\x12\n\n\x06HEALTH\x10\x06\x12\x0b\n\x07MEETING\x10\x07\x12\
-    \x14\n\x10SESSION_ASSIGNED\x10\x08\x12\x0e\n\nCONGESTION\x10\t\x12\x0e\n\
-    \nPEER_EVENT\x10\nJ\xde\x06\n\x06\x12\x04\0\0\x16\x01\n\x08\n\x01\x0c\
-    \x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x16\x01\n\n\n\x03\x04\0\
-    \x01\x12\x03\x02\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\x0f\x03\
-    \n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\x04\0\x04\0\
-    \x02\0\x12\x03\x04\x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\
-    \x04\x17\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x1a\x1b\n\r\n\x06\
-    \x04\0\x04\0\x02\x01\x12\x03\x05\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x01\
-    \x01\x12\x03\x05\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\
-    \x12\x13\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x10\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x02\x01\x12\x03\x06\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\
-    \x02\x02\x12\x03\x06\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\
-    \x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\t\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x03\x02\x12\x03\x07\x0c\r\n\r\n\x06\x04\0\x04\0\x02\
-    \x04\x12\x03\x08\x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\x08\
-    \x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\x11\x12\n\r\n\
-    \x06\x04\0\x04\0\x02\x05\x12\x03\t\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\
-    \x05\x01\x12\x03\t\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\x12\x03\t\
-    \x12\x13\n\r\n\x06\x04\0\x04\0\x02\x06\x12\x03\n\x04\x0f\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x06\x01\x12\x03\n\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\
-    \x12\x03\n\r\x0e\n\r\n\x06\x04\0\x04\0\x02\x07\x12\x03\x0b\x04\x10\n\x0e\
-    \n\x07\x04\0\x04\0\x02\x07\x01\x12\x03\x0b\x04\x0b\n\x0e\n\x07\x04\0\x04\
-    \0\x02\x07\x02\x12\x03\x0b\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x08\x12\x03\
-    \x0c\x04\x19\n\x0e\n\x07\x04\0\x04\0\x02\x08\x01\x12\x03\x0c\x04\x14\n\
-    \x0e\n\x07\x04\0\x04\0\x02\x08\x02\x12\x03\x0c\x17\x18\n\r\n\x06\x04\0\
-    \x04\0\x02\t\x12\x03\r\x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\t\x01\x12\x03\
-    \r\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\t\x02\x12\x03\r\x11\x12\n\r\n\x06\
-    \x04\0\x04\0\x02\n\x12\x03\x0e\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\n\x01\
-    \x12\x03\x0e\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\n\x02\x12\x03\x0e\x11\
-    \x13\n\x0b\n\x04\x04\0\x02\0\x12\x03\x11\x02\x1d\n\x0c\n\x05\x04\0\x02\0\
-    \x06\x12\x03\x11\x02\x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x11\r\x18\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x11\x1b\x1c\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x12\x02\x14\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x12\x02\x07\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x12\x08\x0f\n\x0c\n\x05\x04\0\x02\
-    \x01\x03\x12\x03\x12\x12\x13\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x13\x02\
-    \x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x13\x02\x07\n\x0c\n\x05\x04\0\
-    \x02\x02\x01\x12\x03\x13\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\
-    \x13\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x14\x02\x18\n\x0c\n\x05\
-    \x04\0\x02\x03\x05\x12\x03\x14\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\
-    \x03\x14\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x14\x16\x17\n\x0b\n\
-    \x04\x04\0\x02\x04\x12\x03\x15\x02\x20\n\x0c\n\x05\x04\0\x02\x04\x05\x12\
-    \x03\x15\x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x15\t\x1b\n\x0c\n\
-    \x05\x04\0\x02\x04\x03\x12\x03\x15\x1e\x1fb\x06proto3\
+    ulcastLayerId\x127\n\nmedia_kind\x18\x06\x20\x01(\x0e2\x18.PacketWrapper\
+    .MediaKindR\tmediaKind\"\xcc\x01\n\nPacketType\x12\x17\n\x13PACKET_TYPE_\
+    UNKNOWN\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\x10\
+    \x02\x12\t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\x04\x12\x0f\n\
+    \x0bDIAGNOSTICS\x10\x05\x12\n\n\x06HEALTH\x10\x06\x12\x0b\n\x07MEETING\
+    \x10\x07\x12\x14\n\x10SESSION_ASSIGNED\x10\x08\x12\x0e\n\nCONGESTION\x10\
+    \t\x12\x0e\n\nPEER_EVENT\x10\n\x12\x0c\n\x08VIEWPORT\x10\x0b\"I\n\tMedia\
+    Kind\x12\x1a\n\x16MEDIA_KIND_UNSPECIFIED\x10\0\x12\t\n\x05VIDEO\x10\x01\
+    \x12\t\n\x05AUDIO\x10\x02\x12\n\n\x06SCREEN\x10\x03J\xd7\x11\n\x06\x12\
+    \x04\0\01\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\
+    \x02\01\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x15\n\x0c\n\x04\x04\0\
+    \x04\0\x12\x04\x03\x02\x14\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\
+    \x07\x11\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x04\x04\x1c\n\x0e\n\x07\x04\
+    \0\x04\0\x02\0\x01\x12\x03\x04\x04\x17\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\
+    \x12\x03\x04\x1a\x1b\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x05\x04\x14\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\x05\x04\x0f\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x01\x02\x12\x03\x05\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x02\x12\
+    \x03\x06\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x06\x04\x0b\
+    \n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\x06\x0e\x0f\n\r\n\x06\x04\0\
+    \x04\0\x02\x03\x12\x03\x07\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\
+    \x12\x03\x07\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x07\x0c\r\
+    \n\r\n\x06\x04\0\x04\0\x02\x04\x12\x03\x08\x04\x13\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x04\x01\x12\x03\x08\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\
+    \x12\x03\x08\x11\x12\n\r\n\x06\x04\0\x04\0\x02\x05\x12\x03\t\x04\x14\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\t\x04\x0f\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x05\x02\x12\x03\t\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x06\x12\
+    \x03\n\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x06\x01\x12\x03\n\x04\n\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\n\r\x0e\n\r\n\x06\x04\0\x04\0\x02\
+    \x07\x12\x03\x0b\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x07\x01\x12\x03\x0b\
+    \x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x07\x02\x12\x03\x0b\x0e\x0f\n\r\n\
+    \x06\x04\0\x04\0\x02\x08\x12\x03\x0c\x04\x19\n\x0e\n\x07\x04\0\x04\0\x02\
+    \x08\x01\x12\x03\x0c\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x08\x02\x12\x03\
+    \x0c\x17\x18\n\r\n\x06\x04\0\x04\0\x02\t\x12\x03\r\x04\x13\n\x0e\n\x07\
+    \x04\0\x04\0\x02\t\x01\x12\x03\r\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\t\
+    \x02\x12\x03\r\x11\x12\n\r\n\x06\x04\0\x04\0\x02\n\x12\x03\x0e\x04\x14\n\
+    \x0e\n\x07\x04\0\x04\0\x02\n\x01\x12\x03\x0e\x04\x0e\n\x0e\n\x07\x04\0\
+    \x04\0\x02\n\x02\x12\x03\x0e\x11\x13\n\xa0\x02\n\x06\x04\0\x04\0\x02\x0b\
+    \x12\x03\x13\x04\x12\x1a\x90\x02\x20Client\x20->\x20relay\x20ONLY\x20con\
+    trol\x20packet.\x20Carries\x20the\x20set\x20of\x20session_ids\n\x20the\
+    \x20sender\x20is\x20currently\x20rendering\x20(its\x20viewport\x20/\x20\
+    \"desired\x20streams\"\n\x20set).\x20The\x20relay\x20consumes\x20this\
+    \x20to\x20filter\x20VIDEO\x20it\x20forwards\x20downstream\n\x20(see\x20V\
+    iewportPacket).\x20It\x20is\x20never\x20re-broadcast\x20to\x20other\x20p\
+    eers.\n\n\x0e\n\x07\x04\0\x04\0\x02\x0b\x01\x12\x03\x13\x04\x0c\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x0b\x02\x12\x03\x13\x0f\x11\n\xa7\x05\n\x04\x04\0\
+    \x04\x01\x12\x04\"\x02'\x03\x1a\x98\x05\x20Cleartext\x20media-kind\x20di\
+    scriminator\x20on\x20the\x20OUTER\x20envelope.\n\n\x20Under\x20E2EE_ENAB\
+    LED=true\x20the\x20inner\x20MediaPacket\x20(including\x20its\x20own\n\
+    \x20`media_type`)\x20is\x20AES-sealed,\x20so\x20the\x20relay\x20\xe2\x80\
+    \x94\x20which\x20never\x20decrypts\x20\xe2\x80\x94\n\x20cannot\x20tell\
+    \x20VIDEO\x20from\x20AUDIO/SCREEN.\x20This\x20field\x20lets\x20the\x20pu\
+    blisher\n\x20advertise\x20the\x20media\x20kind\x20in\x20cleartext\x20so\
+    \x20the\x20relay\x20can\x20apply\n\x20viewport-aware\x20VIDEO\x20filteri\
+    ng\x20while\x20ALWAYS\x20forwarding\x20AUDIO.\n\n\x20Set\x20only\x20by\
+    \x20the\x20publishing\x20client\x20on\x20MEDIA\x20packets.\x20Other\x20p\
+    acket\n\x20types\x20leave\x20it\x20unspecified.\x20The\x20default\x20(UN\
+    SPECIFIED\x20=\x200)\x20MUST\x20be\n\x20treated\x20as\x20fail-open\x20(f\
+    orward)\x20by\x20the\x20relay\x20so\x20that\x20older\x20clients,\n\x20no\
+    n-media\x20packets,\x20and\x20any\x20future\x20packet\x20type\x20keep\
+    \x20working\x20unchanged.\n\n\x0c\n\x05\x04\0\x04\x01\x01\x12\x03\"\x07\
+    \x10\n\r\n\x06\x04\0\x04\x01\x02\0\x12\x03#\x04\x1f\n\x0e\n\x07\x04\0\
+    \x04\x01\x02\0\x01\x12\x03#\x04\x1a\n\x0e\n\x07\x04\0\x04\x01\x02\0\x02\
+    \x12\x03#\x1d\x1e\n\r\n\x06\x04\0\x04\x01\x02\x01\x12\x03$\x04\x0e\n\x0e\
+    \n\x07\x04\0\x04\x01\x02\x01\x01\x12\x03$\x04\t\n\x0e\n\x07\x04\0\x04\
+    \x01\x02\x01\x02\x12\x03$\x0c\r\n\r\n\x06\x04\0\x04\x01\x02\x02\x12\x03%\
+    \x04\x0e\n\x0e\n\x07\x04\0\x04\x01\x02\x02\x01\x12\x03%\x04\t\n\x0e\n\
+    \x07\x04\0\x04\x01\x02\x02\x02\x12\x03%\x0c\r\n\r\n\x06\x04\0\x04\x01\
+    \x02\x03\x12\x03&\x04\x0f\n\x0e\n\x07\x04\0\x04\x01\x02\x03\x01\x12\x03&\
+    \x04\n\n\x0e\n\x07\x04\0\x04\x01\x02\x03\x02\x12\x03&\r\x0e\n\x0b\n\x04\
+    \x04\0\x02\0\x12\x03)\x02\x1d\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03)\x02\
+    \x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03)\r\x18\n\x0c\n\x05\x04\0\x02\0\
+    \x03\x12\x03)\x1b\x1c\n\x0b\n\x04\x04\0\x02\x01\x12\x03*\x02\x14\n\x0c\n\
+    \x05\x04\0\x02\x01\x05\x12\x03*\x02\x07\n\x0c\n\x05\x04\0\x02\x01\x01\
+    \x12\x03*\x08\x0f\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03*\x12\x13\n\x0b\n\
+    \x04\x04\0\x02\x02\x12\x03+\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\
+    \x03+\x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03+\x08\x0c\n\x0c\n\x05\
+    \x04\0\x02\x02\x03\x12\x03+\x0f\x10\n\x0b\n\x04\x04\0\x02\x03\x12\x03,\
+    \x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03,\x02\x08\n\x0c\n\x05\x04\
+    \0\x02\x03\x01\x12\x03,\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03,\x16\
+    \x17\nF\n\x04\x04\0\x02\x04\x12\x03.\x02\x20\x1a9\x20Simulcast\x20layer\
+    \x20id\x20(#989/PR\x20#993);\x20see\x20discussion\x20#890.\n\n\x0c\n\x05\
+    \x04\0\x02\x04\x05\x12\x03.\x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\
+    \x03.\t\x1b\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03.\x1e\x1f\n[\n\x04\x04\
+    \0\x02\x05\x12\x030\x02\x1b\x1aN\x20Cleartext\x20discriminator;\x20see\
+    \x20MediaKind.\x20Default\x200\x20=\x20unspecified\x20=\x20fail-open.\n\
+    \n\x0c\n\x05\x04\0\x02\x05\x06\x12\x030\x02\x0b\n\x0c\n\x05\x04\0\x02\
+    \x05\x01\x12\x030\x0c\x16\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x030\x19\x1a\
+    b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -400,8 +550,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             let mut deps = ::std::vec::Vec::with_capacity(0);
             let mut messages = ::std::vec::Vec::with_capacity(1);
             messages.push(PacketWrapper::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            let mut enums = ::std::vec::Vec::with_capacity(2);
             enums.push(packet_wrapper::PacketType::generated_enum_descriptor_data());
+            enums.push(packet_wrapper::MediaKind::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

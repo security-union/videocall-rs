@@ -303,6 +303,22 @@ lazy_static! {
     )
     .expect("Failed to create video_quality_score metric");
 
+    /// Per-peer windowed video sequence packet-loss rate (freeze indicator)
+    pub static ref VIDEO_SEQ_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_video_seq_loss_per_sec",
+        "Per-peer windowed video sequence packet-loss rate (lost packets/sec) observed by the receiver; freeze indicator",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_seq_loss_per_sec metric");
+
+    /// Per-peer windowed rate of keyframe (PLI) requests sent to the peer
+    pub static ref KEYFRAME_REQUESTS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_keyframe_requests_per_sec",
+        "Per-peer windowed rate of keyframe (PLI) requests this client sent to the peer; sustained nonzero => stream cannot recover",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create keyframe_requests_per_sec metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",

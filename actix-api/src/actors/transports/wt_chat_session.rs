@@ -138,7 +138,7 @@ pub struct StopSession;
 /// persistent uni-stream writer task and one feeding the datagram writer
 /// task. The split mirrors the QUIC primitives:
 ///
-/// * `unistream_tx` (capacity = [`wt_outbound_channel_capacity`], today 4096)
+/// * `unistream_tx` (capacity = [`wt_outbound_channel_capacity`], default 512)
 ///   absorbs video, screen, and any oversized audio/control. This is where
 ///   QUIC flow control surfaces; the priority-drop policy applies here.
 /// * `datagram_tx` (capacity = [`WT_DATAGRAM_CHANNEL_CAPACITY`], 512) carries

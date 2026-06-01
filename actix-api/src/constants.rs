@@ -60,29 +60,36 @@ pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
 /// packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Default bounded channel capacity for WebTransport outbound relay queue.
+/// Default bounded channel capacity for WebTransport outbound **unistream**
+/// relay queue.
 ///
-/// Sized for MTU-limited datagrams (~1200 bytes) and small stream
-/// messages. The previous 256-slot bound was exceeded by ~1.6x during
-/// a 17-peer cc7tp meeting on 2026-05-06, producing ~38.5k
-/// `Outbound channel full` drops over the meeting (~480 inbound
-/// msg/sec/receiver into a 256-slot queue).
+/// **Fail-fast rationale (issue #979).** This queue exists to absorb
+/// short actor/writer scheduling bursts, NOT to buffer for a slow
+/// receiver. A deep queue is actively harmful for real-time video: once
+/// a receiver's link cannot drain the queue, every frame that sits in it
+/// arrives too late to be useful and only delays the frames behind it.
+/// At ~30 fps a video stream produces ~30 packets/sec, so the prior
+/// 4096-slot bound represented well over a minute of stale backlog per
+/// session — a 10-second-late video frame is already useless, never mind
+/// a 60-second-late one. Holding that much in memory simply defers the
+/// inevitable drop while inflating per-session memory and latency.
 ///
-/// 4096 codifies the value Jay applied manually via
-/// `WT_OUTBOUND_CHANNEL_CAPACITY` on the HCL daily deployment after a
-/// follow-up 2026-05-11 incident where the previous 1024 default still
-/// bottomed out under fan-out bursts. Setting it as the default removes
-/// the requirement for each cluster operator to know to override the
-/// env var. The value can still be raised further at deploy-time via
-/// `WT_OUTBOUND_CHANNEL_CAPACITY` for exceptionally large meetings.
+/// 512 caps the unistream backlog at ~16 seconds of single-stream video
+/// (512 / 30 fps), which is already generous for burst absorption, and
+/// deliberately aligns the unistream bound with the already-512 datagram
+/// bound ([`WT_DATAGRAM_CHANNEL_CAPACITY`]). Once the queue saturates,
+/// the priority-drop policy (see `priority_drop.rs`) sheds video before
+/// audio before control, and the per-sender CONGESTION feedback path
+/// tells fast senders to step their quality down — both of which are the
+/// *correct* response to a slow receiver, far better than hoarding stale
+/// frames in a 4096-deep buffer.
 ///
-/// **Stopgap, not the real fix.** Priority-aware dropping (Discussion
-/// #699 recommendation #1, tracked in Issue 1) is the proper solution
-/// — under load the queue should shed low-priority video before audio
-/// or media-info packets rather than rely on raw queue depth alone.
-/// Bumping the bound here trades a 4x worst-case per-session memory
-/// increase for fewer drops until that work lands.
-pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 4096;
+/// The previous 4096 default was a 2026-05-11 stopgap chosen before the
+/// priority-drop policy (discussion #699) and congestion feedback existed.
+/// With those landed, the large buffer is no longer needed and is lowered
+/// here per issue #979. Operators with an exceptional workload can still
+/// raise the bound at deploy-time via `WT_OUTBOUND_CHANNEL_CAPACITY`.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 512;
 
 /// Resolve the WebTransport outbound channel capacity from the
 /// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable, falling back
@@ -151,9 +158,9 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// outbound channel is split into two: a unistream channel and a
 /// datagram channel. Splitting the channels is the architectural change;
 /// the unistream side keeps the env-tunable
-/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (currently 4096) since it
-/// continues to absorb video + screen + oversized control packets, while
-/// the datagram side is sized small on purpose:
+/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (now 512, see issue #979)
+/// since it continues to absorb video + screen + oversized control
+/// packets, while the datagram side is sized small on purpose:
 ///
 /// * Datagram traffic is small (~80 audio packets/sec/sender at ~80B
 ///   each, plus heartbeats / RTT echoes / non-media control under MTU).
@@ -201,6 +208,41 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 32;
 /// global-only limiter at 2/sec, a fresh joiner into a 17-peer meeting could
 /// only get keyframes for the first 2 of the 16 existing senders.
 pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER: u32 = 1;
+
+/// Relaxed per-`(receiver, target_sender)` KEYFRAME_REQUEST budget that
+/// applies while the requesting receiver is in **active congestion**
+/// (issue #979).
+///
+/// When the relay has recently had to drop inbound media destined for a
+/// receiver (i.e. its [`CongestionTracker`] crossed the drop threshold
+/// within [`KEYFRAME_CONGESTION_RELAX_WINDOW`]), that receiver's video is
+/// the most likely to be frozen and in genuine need of a fresh keyframe to
+/// recover. The normal steady-state per-pair budget of
+/// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] (1/sec) is too tight for
+/// recovery: a single dropped keyframe response leaves the receiver frozen
+/// for a full second before it may retry.
+///
+/// This raises the per-pair budget to 4/sec **only** for congested
+/// receivers. It deliberately does NOT uncap the limiter: the global
+/// per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`]) still applies
+/// unchanged, so the pre-existing PLI/keyframe-storm risk (OSS #814:
+/// WebTransport per-packet uni streams can amplify keyframe requests into a
+/// storm) remains bounded. 4/sec is enough to recover within a few hundred
+/// ms even if some requests are lost, while staying well under the global
+/// cap and far short of a storm.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED: u32 = 4;
+
+/// How recently the requesting receiver must have been flagged congested
+/// (its [`CongestionTracker`] crossed the drop threshold) for the relaxed
+/// keyframe budget [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`] to
+/// apply (issue #979).
+///
+/// 2 seconds: long enough to cover the recovery window after a congestion
+/// burst (during which the receiver is re-requesting keyframes to unfreeze)
+/// without leaving the relaxed budget armed indefinitely once the link has
+/// recovered. After this window the limiter reverts to the strict 1/sec
+/// steady-state budget.
+pub const KEYFRAME_CONGESTION_RELAX_WINDOW: Duration = Duration::from_secs(2);
 
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
@@ -252,19 +294,19 @@ mod tests {
     #[test]
     fn resolve_wt_outbound_channel_capacity_valid_value_used_verbatim() {
         // Sample values intentionally chosen so neither equals
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` — otherwise the assertion
-        // would pass even if the env value were silently ignored.
-        assert_eq!(resolve_wt_outbound_channel_capacity(Some("512")), 512);
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (512) — otherwise the
+        // assertion would pass even if the env value were silently ignored.
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("1024")), 1024);
         assert_eq!(resolve_wt_outbound_channel_capacity(Some("8192")), 8192);
     }
 
     #[test]
-    fn wt_outbound_channel_capacity_default_is_4096() {
-        // Sentinel test pinning the documented stopgap value. If this needs
-        // to change, update the doc comment on
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays)
-        // first, then this assertion.
-        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 4096);
+    fn wt_outbound_channel_capacity_default_is_512() {
+        // Sentinel test pinning the documented fail-fast value (issue #979).
+        // If this needs to change, update the doc comment on
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays /
+        // operator docs) first, then this assertion.
+        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512);
     }
 
     #[test]

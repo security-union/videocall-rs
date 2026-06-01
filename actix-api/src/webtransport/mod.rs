@@ -416,8 +416,8 @@ async fn handle_webtransport_session(
     // channels are drained by independent writer tasks.
     //
     // * UniStream channel: env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY`,
-    //   currently defaults to 4096. Carries video / screen / oversized
-    //   audio/control. Where QUIC flow control surfaces.
+    //   defaults to 512 (fail-fast per issue #979). Carries video / screen /
+    //   oversized audio/control. Where QUIC flow control surfaces.
     // * Datagram channel: small, fixed `WT_DATAGRAM_CHANNEL_CAPACITY`.
     //   Carries small audio media + non-media control under MTU.
     let (unistream_tx, unistream_rx) =

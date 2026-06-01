@@ -56,13 +56,14 @@ use sec_api::metrics::{
     DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
     DECODE_BUDGET_PRESSURED, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
     ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS,
+    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -307,6 +308,8 @@ fn remove_per_peer_metrics(
     let _ = PEER_VIDEO_ENABLED.remove_label_values(&labels);
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
+    let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
     let _ = DECODER_ERRORS_TOTAL.remove_label_values(&labels);
@@ -930,6 +933,20 @@ fn process_health_packet_to_metrics_pb(
                     DECODER_ERRORS_TOTAL
                         .with_label_values(&peer_labels)
                         .set(total as f64);
+                }
+
+                // Freeze indicators: video packet loss + keyframe-request storms.
+                // Always set when present -- lets gauges recover to 0.0 when a
+                // loss burst or PLI storm clears, instead of latching the last bad value.
+                if let Some(loss) = peer_data.video_seq_loss_per_sec {
+                    VIDEO_SEQ_LOSS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set(loss);
+                }
+                if let Some(kf) = peer_data.keyframe_requests_per_sec {
+                    KEYFRAME_REQUESTS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set(kf);
                 }
 
                 // Audio concealment percentage (from NetEQ expand events)

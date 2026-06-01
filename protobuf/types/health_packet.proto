@@ -67,6 +67,19 @@ message PeerStats {
 
   // Screen share video stats (separate from camera video_stats field 6)
   VideoStats screen_video_stats = 14;
+
+  // Freeze-detection metrics (issue #1013). videocall_video_fps counts decode
+  // calls, not visually distinct frames, so it reads ~30fps while video is
+  // frozen. These surface the loss signal that actually proves a freeze.
+  // Per-peer sequence loss rate (lost packets/sec, windowed) observed for this
+  // peer's video stream. Sustained loss => frozen/glitched video even when
+  // fps_received looks healthy.
+  optional double video_seq_loss_per_sec = 15;
+  // Per-peer keyframe (PLI) requests/sec this client sent TO this peer
+  // (windowed). A sustained nonzero rate is the direct symptom of a stream
+  // that cannot recover — feeds video_quality_score so it can't read 100/100
+  // during a keyframe storm.
+  optional double keyframe_requests_per_sec = 16;
 }
 
 message HealthPacket {

@@ -57,6 +57,13 @@
 # | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
 #
+# | KEYFRAME_REQUEST                            | keyframe_req_count  | videocall-client/src/decode/peer_decode_manager.rs     |
+# | CameraEncoder: forcing keyframe             | pli_received_count  | videocall-client/src/encode/camera_encoder.rs          |
+# | AdaptiveQuality: video stepped DOWN         | aq_step_down_count  | videocall-aq/src/controller.rs                         |
+# | FPS: target=N received=N                    | pid_received_fps    | videocall-aq/src/controller.rs                         |
+# | network=                                    | net_downlink, net_rtt | preamble (Navigator.connection API)                  |
+# | battery=                                    | battery_state       | preamble (Navigator.getBattery API)                    |
+#
 # RELAY-POD patterns (when --relay-wt=PATH is provided):
 # | Phrase matched                              | Extracts                         | Emitter                                         |
 # |---------------------------------------------|----------------------------------|-------------------------------------------------|
@@ -278,6 +285,30 @@ for key in "${ALL_KEYS[@]}"; do
       }
     }' 2>/dev/null || echo '{"n":0,"median_ms":null,"n_nonzero":0,"median_nonzero_ms":null}')
 
+  # Pass 5: Keyframe requests sent, PLIs received, AQ step-downs, PID received FPS
+  # Single zcat pass to avoid decompressing 150+ files multiple times
+  read -r keyframe_requests pli_received aq_step_downs pid_received_median < <(
+    zcat "${files[@]}" 2>/dev/null | \
+    $AWK '
+      /KEYFRAME_REQUEST/ { kf++ }
+      /CameraEncoder: forcing keyframe/ { pli++ }
+      /stepped DOWN/ { aq++ }
+      /received=[0-9.]/ {
+        match($0, /received=([0-9.]+)/, m)
+        if (m[1] != "") { fps[++nfps] = m[1]+0 }
+      }
+      END {
+        if (nfps > 0) { asort(fps); med = int(fps[int(nfps/2)+1]) } else { med = "" }
+        printf "%d %d %d %s\n", kf+0, pli+0, aq+0, (med == "" ? "\"\"" : med)
+      }
+    ' 2>/dev/null || echo "0 0 0 \"\""
+  )
+  # Ensure valid integers for jq
+  keyframe_requests=${keyframe_requests:-0}
+  pli_received=${pli_received:-0}
+  aq_step_downs=${aq_step_downs:-0}
+  pid_received_median=${pid_received_median:-""}
+
   # Pass 4: preamble (client machine specs) — first chunk only, emits one
   # "level":"preamble" line near the top. Extract cores / memory / platform /
   # architecture / gpu. All fields are semicolon-delimited key=value pairs in
@@ -292,6 +323,12 @@ for key in "${ALL_KEYS[@]}"; do
   pre_gpu=$(echo "$preamble_msg" | grep -oE 'gpu=[^;]+' | head -1 | cut -d= -f2-)
   pre_screen=$(echo "$preamble_msg" | grep -oE 'screen=[^;]+' | head -1 | cut -d= -f2-)
   pre_app_version=$(echo "$preamble_msg" | grep -oE 'appVersion=[^;]+' | head -1 | cut -d= -f2-)
+  pre_network=$(echo "$preamble_msg" | grep -oE 'network=[^;]+' | head -1 | cut -d= -f2-)
+  pre_battery=$(echo "$preamble_msg" | grep -oE 'battery=[^;]+' | head -1 | cut -d= -f2-)
+
+  # Parse network into components (format: "4g/5.8Mbps/rtt100ms")
+  pre_net_downlink=$(echo "$pre_network" | grep -oE '[0-9.]+Mbps' | head -1 | sed 's/Mbps//')
+  pre_net_rtt=$(echo "$pre_network" | grep -oE 'rtt[0-9]+ms' | head -1 | sed 's/rtt//;s/ms//')
 
   # Flag underpowered client (discussion #562): cores < 6, or older Intel Mac
   # (macOS 14/15 AND cores <= 8). Emitted as simple bool so markdown can add ⚠.
@@ -301,6 +338,17 @@ for key in "${ALL_KEYS[@]}"; do
   elif [[ "$pre_platform" == "macOS 14"* || "$pre_platform" == "macOS 15"* ]] \
        && [[ -n "$pre_cores" && "$pre_cores" -le 8 ]]; then
     underpowered=true
+  fi
+
+  # Flag bandwidth-constrained: reported downlink < 8 Mbps
+  bandwidth_constrained=false
+  if [[ -n "$pre_net_downlink" ]]; then
+    bandwidth_constrained=$($AWK "BEGIN { print ($pre_net_downlink < 8) ? \"true\" : \"false\" }")
+  fi
+  # Flag on-battery
+  on_battery=false
+  if [[ "$pre_battery" == discharging* ]]; then
+    on_battery=true
   fi
 
   # First/last timestamps from filename sort (filename IS the session_ts, last chunk = most recent)
@@ -325,6 +373,10 @@ for key in "${ALL_KEYS[@]}"; do
     --argjson error_count "$error_count" \
     --argjson speaking_transitions "$speaking_transitions" \
     --argjson audio_buffer "$audio_buffer_stats" \
+    --argjson keyframe_requests "$keyframe_requests" \
+    --argjson pli_received "$pli_received" \
+    --argjson aq_step_downs "$aq_step_downs" \
+    --arg pid_received_median "$pid_received_median" \
     --arg pre_cores "$pre_cores" \
     --arg pre_memory "$pre_memory" \
     --arg pre_platform "$pre_platform" \
@@ -332,7 +384,13 @@ for key in "${ALL_KEYS[@]}"; do
     --arg pre_gpu "$pre_gpu" \
     --arg pre_screen "$pre_screen" \
     --arg pre_app_version "$pre_app_version" \
+    --arg pre_network "$pre_network" \
+    --arg pre_net_downlink "$pre_net_downlink" \
+    --arg pre_net_rtt "$pre_net_rtt" \
+    --arg pre_battery "$pre_battery" \
     --argjson underpowered "$underpowered" \
+    --argjson bandwidth_constrained "$bandwidth_constrained" \
+    --argjson on_battery "$on_battery" \
     '{
       email: $email,
       session_ts: $session_ts,
@@ -353,6 +411,10 @@ for key in "${ALL_KEYS[@]}"; do
       error_count: $error_count,
       speaking_transitions: $speaking_transitions,
       audio_buffer: $audio_buffer,
+      keyframe_requests: $keyframe_requests,
+      pli_received: $pli_received,
+      aq_step_downs: $aq_step_downs,
+      pid_received_median: $pid_received_median,
       first_ts: $first_ts,
       last_ts: $last_ts,
       preamble: {
@@ -363,7 +425,13 @@ for key in "${ALL_KEYS[@]}"; do
         gpu: $pre_gpu,
         screen: $pre_screen,
         app_version: $pre_app_version,
-        underpowered: $underpowered
+        network: $pre_network,
+        net_downlink_mbps: $pre_net_downlink,
+        net_rtt_ms: $pre_net_rtt,
+        battery: $pre_battery,
+        underpowered: $underpowered,
+        bandwidth_constrained: $bandwidth_constrained,
+        on_battery: $on_battery
       }
     }' > "$TMPDIR_WORK/${key//[: @]/_}.json" 2>/dev/null || true
 done
@@ -521,6 +589,9 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "handshake failed"
     "Speaking changed: false -> true"
     "audio health (buffer:"
+    "KEYFRAME_REQUEST"
+    "CameraEncoder: forcing keyframe"
+    "stepped DOWN"
   )
 
   verify_failed=0
@@ -610,8 +681,8 @@ echo "### Sessions"
 echo ""
 echo "_Cores/Platform sourced from \`\"level\":\"preamble\"\` in first chunk. ⚠ flags clients likely to struggle in meetings ≥ 10 peers (underpowered) or with concurrent duplicate sessions (NetEQ duplication — NETEQ-1) — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
 echo ""
-echo "| Email | Name | Start (UTC) | Transport | RTT Base | Reelect | Chunks | Implaus RTT | Speak | Buf med | Errors | End | Cores | Platform | Concurrent |"
-echo "|-------|------|-------------|-----------|----------|---------|--------|-------------|-------|---------|--------|-----|-------|----------|------------|"
+echo "| Email | Name | Start (UTC) | Transport | RTT Base | Net dl | Battery | Reelect | Chunks | KF Req | PLI Rx | AQ dwn | PID fps | Speak | Buf med | Errors | End | Cores | Platform | Concurrent |"
+echo "|-------|------|-------------|-----------|----------|--------|---------|---------|--------|--------|--------|--------|---------|-------|---------|--------|-----|-------|----------|------------|"
 
 for s in "${session_jsons[@]}"; do
   email=$(echo "$s" | jq -r '.email')
@@ -640,6 +711,40 @@ for s in "${session_jsons[@]}"; do
   [[ -z "$platform" ]] && platform="?"
   cores_flag=""
   [[ "$underpowered" == "true" ]] && cores_flag=" ⚠"
+  # Network/battery columns
+  net_dl=$(echo "$s" | jq -r '.preamble.net_downlink_mbps // ""')
+  battery=$(echo "$s" | jq -r '.preamble.battery // ""')
+  bw_flag=$(echo "$s" | jq -r '.preamble.bandwidth_constrained')
+  bat_flag=$(echo "$s" | jq -r '.preamble.on_battery')
+  # Keyframe/PLI/AQ/PID columns
+  kf_req=$(echo "$s" | jq -r '.keyframe_requests // 0')
+  pli_rx=$(echo "$s" | jq -r '.pli_received // 0')
+  aq_downs=$(echo "$s" | jq -r '.aq_step_downs // 0')
+  pid_p75=$(echo "$s" | jq -r '.pid_received_median // ""')
+  # Format net display
+  if [[ -n "$net_dl" && "$net_dl" != "null" && "$net_dl" != "" ]]; then
+    net_display="${net_dl}M"
+    [[ "$bw_flag" == "true" ]] && net_display="${net_display} ⚠"
+  else
+    net_display="?"
+  fi
+  # Format battery display (bat = on battery, ac = plugged in)
+  if [[ "$bat_flag" == "true" ]]; then
+    bat_display="bat"
+  elif [[ -n "$battery" && "$battery" != "null" && "$battery" != "" ]]; then
+    bat_display="ac"
+  else
+    bat_display="?"
+  fi
+  # Format PID fps display
+  if [[ -n "$pid_p75" && "$pid_p75" != "null" && "$pid_p75" != "" && "$pid_p75" != "\"\"" ]]; then
+    pid_display="${pid_p75}fps"
+  else
+    pid_display="--"
+  fi
+  # AQ step-downs: flag if >3
+  aq_display="$aq_downs"
+  [[ "$aq_downs" -gt 3 ]] 2>/dev/null && aq_display="${aq_downs} ⚠"
   # Concurrent sessions (overlap with other sessions for same email)
   session_ts=$(echo "$s" | jq -r '.session_ts')
   concurrent="${CONCURRENT_MAP[${email}::${session_ts}]:-1}"
@@ -650,11 +755,11 @@ for s in "${session_jsons[@]}"; do
   # the overall median. Meaningful signal is the buffer depth while
   # audio was actually arriving.
   if [[ "$buf_n_nonzero" == "0" || "$buf_n_nonzero" == "null" ]]; then
-    buf_display="—"
+    buf_display="--"
   else
     buf_display="${buf_median_nz}ms"
   fi
-  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${reelect} | ${chunks} | ${impl} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
+  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${net_display} | ${bat_display} | ${reelect} | ${chunks} | ${kf_req} | ${pli_rx} | ${aq_display} | ${pid_display} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
 done
 
 echo ""
@@ -718,6 +823,33 @@ for s in "${session_jsons[@]}"; do
   echo "- **${name} (${email})**: cores=${cores}, memory=${memory}, platform=${platform}"
 done
 [[ $has_uw -eq 0 ]] && echo "_None._"
+echo ""
+
+echo "### Capacity Warnings"
+echo ""
+echo "_Flagged by preamble network/battery fields. ⚠ on Net dl = downlink < 8 Mbps (marginal for 3+ peers at full HD). bat = on battery (potential WiFi/CPU throttling). Deduplicated per email._"
+echo ""
+
+has_capacity_warn=0
+declare -A CAPACITY_SEEN
+for s in "${session_jsons[@]}"; do
+  email=$(echo "$s" | jq -r '.email')
+  [[ -n "${CAPACITY_SEEN[$email]:-}" ]] && continue
+  bw_flag=$(echo "$s" | jq -r '.preamble.bandwidth_constrained')
+  bat_flag=$(echo "$s" | jq -r '.preamble.on_battery')
+  [[ "$bw_flag" != "true" && "$bat_flag" != "true" ]] && continue
+  CAPACITY_SEEN[$email]=1
+  has_capacity_warn=1
+  name=$(echo "$s" | jq -r '.display_name')
+  net=$(echo "$s" | jq -r '.preamble.network // "?"')
+  battery=$(echo "$s" | jq -r '.preamble.battery // "?"')
+  cores=$(echo "$s" | jq -r '.preamble.cores // "?"')
+  flags=""
+  [[ "$bw_flag" == "true" ]] && flags="${flags}bandwidth-constrained "
+  [[ "$bat_flag" == "true" ]] && flags="${flags}on-battery "
+  echo "- **${name}** (${email}): ${flags}-- network=${net}, battery=${battery}, cores=${cores}"
+done
+[[ $has_capacity_warn -eq 0 ]] && echo "_None._"
 echo ""
 
 echo "### Concurrent Session Overlaps (NetEQ duplication risk)"

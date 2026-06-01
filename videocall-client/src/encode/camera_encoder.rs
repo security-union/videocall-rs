@@ -295,9 +295,9 @@ impl CameraEncoder {
                 // takes effect immediately.
                 if congestion_flag.swap(false, Ordering::AcqRel) {
                     log::warn!(
-                        "CameraEncoder: server CONGESTION signal received, forcing video step-down"
+                        "CameraEncoder: server CONGESTION signal received, forcing aggressive congestion cut"
                     );
-                    encoder_control.force_video_step_down();
+                    encoder_control.force_congestion_cut();
                 }
 
                 // Client-side WebSocket backpressure detection.

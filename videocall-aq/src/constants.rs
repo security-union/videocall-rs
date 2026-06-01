@@ -1311,6 +1311,35 @@ pub const CONGESTION_WINDOW_MS: u64 = 1000;
 /// many packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;
 
+/// Number of quality tiers to drop in a single self-targeted CONGESTION cut.
+///
+/// A self-targeted CONGESTION signal means the relay is actively dropping *our*
+/// outbound packets — the buffer is already overflowing. A gentle one-tier
+/// step-down (as used for WebSocket backpressure) is too slow: it sheds only
+/// ~20-30% of bitrate per step and waits `MIN_TIER_TRANSITION_INTERVAL_MS`
+/// between steps, so the relay buffer keeps overflowing for several seconds.
+///
+/// Dropping two tiers at once maps to roughly a 50% bitrate cut across most of
+/// the (non-uniform) camera ladder — e.g. from the default "medium" tier
+/// (index 4, ideal 600 kbps) two tiers down to index 6 (ideal 250 kbps) is a
+/// ~58% reduction, and "hd" (index 2, ideal 1500) → index 4 (ideal 600) is a
+/// 60% reduction. This sheds enough bitrate immediately to let the relay buffer
+/// drain instead of bleeding it down one slow step at a time.
+pub const CONGESTION_CUT_TIERS: usize = 2;
+
+/// Duration (milliseconds) to pin the PID bitrate ceiling to the post-cut tier
+/// after a self-targeted CONGESTION cut.
+///
+/// After the cut we must keep the effective bitrate low long enough for the
+/// already-overflowing relay buffer to drain. Without a hold the PID — which
+/// fine-tunes bitrate *within* a tier — would immediately ramp back toward the
+/// new tier's max, re-filling the buffer before it has drained. Pinning the
+/// ceiling to the post-cut tier's lower bound for this window guarantees the
+/// buffer gets a real chance to recover. 2.5s comfortably covers a typical
+/// relay buffer drain even on high-latency links while remaining short enough
+/// that recovery is not penalized for long.
+pub const CONGESTION_HOLD_MS: f64 = 2500.0;
+
 // ---------------------------------------------------------------------------
 // Client-Side WebSocket Backpressure Self-Detection
 // ---------------------------------------------------------------------------

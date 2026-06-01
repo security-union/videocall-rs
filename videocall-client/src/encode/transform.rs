@@ -24,7 +24,10 @@ use protobuf::Message;
 use std::rc::Rc;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
-    packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
+    packet_wrapper::{
+        packet_wrapper::{MediaKind, PacketType},
+        PacketWrapper,
+    },
 };
 use web_sys::EncodedVideoChunk;
 
@@ -67,6 +70,9 @@ pub fn transform_video_chunk(
         data,
         user_id: user_id.as_bytes().to_vec(),
         packet_type: PacketType::MEDIA.into(),
+        // Cleartext discriminator so the relay can apply viewport-aware VIDEO
+        // filtering without decrypting the inner MediaPacket (HCL issue #988).
+        media_kind: MediaKind::VIDEO.into(),
         ..Default::default()
     }
 }
@@ -132,6 +138,9 @@ pub fn transform_screen_chunk(
         data,
         user_id: user_id.as_bytes().to_vec(),
         packet_type: PacketType::MEDIA.into(),
+        // Cleartext discriminator so the relay can apply viewport-aware VIDEO
+        // filtering without decrypting the inner MediaPacket (HCL issue #988).
+        media_kind: MediaKind::SCREEN.into(),
         ..Default::default()
     }
 }

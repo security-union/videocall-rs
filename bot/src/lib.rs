@@ -41,5 +41,6 @@ pub mod token;
 pub mod transport;
 pub mod video_encoder;
 pub mod video_producer;
+pub mod viewport_sender;
 pub mod websocket_client;
 pub mod webtransport_client;

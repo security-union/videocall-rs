@@ -321,12 +321,195 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      },
+      "id": 43,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "100 * sum by (room)(rate(relay_viewport_filtered_total{room=~\"$meeting\"}[5m])) / clamp_min(sum by (room)(rate(relay_viewport_filtered_total{room=~\"$meeting\"}[5m])) + sum by (room)(rate(relay_viewport_forwarded_total{room=~\"$meeting\"}[5m])), 1)",
+          "legendFormat": "{{room}} % filtered",
+          "refId": ""
+        }
+      ],
+      "title": "Viewport: % VIDEO Filtered",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      },
+      "id": 44,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "relay_viewport_set_size{room=~\"$meeting\"}",
+          "legendFormat": "{{room}} set size",
+          "refId": ""
+        }
+      ],
+      "title": "Viewport Set Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "id": 45,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (room, outcome)(rate(relay_viewport_updates_total{room=~\"$meeting\"}[1m]))",
+          "legendFormat": "{{room}} {{outcome}}",
+          "refId": ""
+        }
+      ],
+      "title": "Viewport Updates/sec by Outcome",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "id": 7,
       "title": "Meeting-Wide Quality",
@@ -366,7 +549,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 10
+        "y": 18
       },
       "id": 8,
       "options": {
@@ -428,7 +611,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 10
+        "y": 18
       },
       "id": 9,
       "options": {
@@ -490,7 +673,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 10
+        "y": 18
       },
       "id": 10,
       "options": {
@@ -524,7 +707,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "id": 11,
       "title": "Audio Deep Dive",
@@ -564,7 +747,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 19
+        "y": 27
       },
       "id": 12,
       "options": {
@@ -625,7 +808,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 19
+        "y": 27
       },
       "id": 13,
       "options": {
@@ -686,7 +869,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 19
+        "y": 27
       },
       "id": 14,
       "options": {
@@ -747,7 +930,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 19
+        "y": 27
       },
       "id": 15,
       "options": {
@@ -781,7 +964,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 35
       },
       "id": 16,
       "title": "Video & Network",
@@ -821,7 +1004,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 28
+        "y": 36
       },
       "id": 17,
       "options": {
@@ -882,7 +1065,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 28
+        "y": 36
       },
       "id": 18,
       "options": {
@@ -943,7 +1126,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 28
+        "y": 36
       },
       "id": 19,
       "options": {
@@ -1004,7 +1187,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 28
+        "y": 36
       },
       "id": 20,
       "options": {
@@ -1038,7 +1221,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "id": 21,
       "title": "Client Health",
@@ -1077,7 +1260,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 37
+        "y": 45
       },
       "id": 22,
       "options": {
@@ -1138,7 +1321,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 37
+        "y": 45
       },
       "id": 23,
       "options": {
@@ -1199,7 +1382,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 37
+        "y": 45
       },
       "id": 24,
       "options": {
@@ -1261,7 +1444,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 37
+        "y": 45
       },
       "id": 25,
       "options": {
@@ -1300,7 +1483,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       },
       "id": 37,
       "title": "Receiver-Side Quality",
@@ -1347,7 +1530,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 46
+        "y": 54
       },
       "id": 38,
       "options": {
@@ -1418,7 +1601,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 46
+        "y": 54
       },
       "id": 39,
       "options": {
@@ -1444,7 +1627,7 @@
         }
       ],
       "title": "Keyframe Requests/sec",
-      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures — the receiver is asking the sender to re-sync.",
+      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures \u2014 the receiver is asking the sender to re-sync.",
       "type": "timeseries"
     },
     {
@@ -1484,7 +1667,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 46
+        "y": 54
       },
       "id": 40,
       "options": {
@@ -1551,7 +1734,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 46
+        "y": 54
       },
       "id": 41,
       "options": {
@@ -1572,252 +1755,17 @@
       "targets": [
         {
           "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} → {{peer_name}}",
+          "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
           "refId": "A"
         },
         {
           "expr": "videocall_video_fps{meeting_id=~\"$meeting\"}",
-          "legendFormat": "fps: {{reporter_name}} → {{peer_name}}",
+          "legendFormat": "fps: {{reporter_name}} \u2192 {{peer_name}}",
           "refId": "B"
         }
       ],
       "title": "Decode Errors & FPS (Receiver)",
       "description": "Video decode errors/sec and received FPS per peer pair. Decode errors indicate corrupted frames; FPS drop indicates frozen video.",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 54
-      },
-      "id": 43,
-      "title": "Decode-Budget (Client-Side)",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "none"
-            }
-          },
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 55
-      },
-      "id": 44,
-      "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "min",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "videocall_decode_budget_effective_cap{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{display_name}} cap",
-          "refId": "A"
-        },
-        {
-          "expr": "videocall_decode_budget_natural{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{display_name}} natural",
-          "refId": "B"
-        }
-      ],
-      "title": "Decode Budget: Effective Cap vs Natural",
-      "description": "Per-session effective visible-tile cap (what the client is decoding) vs the natural/unconstrained tile count. The gap natural - cap = tiles shed to avatars under decode pressure. A widening gap on a session means that client is shedding video.",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "none"
-            }
-          },
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 55
-      },
-      "id": 45,
-      "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "min",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum(videocall_decode_budget_pressured{meeting_id=~\"$meeting\"})",
-          "legendFormat": "sessions under pressure",
-          "refId": "A"
-        }
-      ],
-      "title": "Decode Budget: Sessions Under Pressure",
-      "description": "Count of sessions with the pressured latch engaged (decode_budget_pressured==1), i.e. actively shedding tiles to avatars. A fleet-wide rise = widespread weak-hardware distress.",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "none"
-            }
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "unspecified",
-                  "index": 0
-                },
-                "1": {
-                  "text": "auto",
-                  "index": 1
-                },
-                "2": {
-                  "text": "fixed",
-                  "index": 2
-                }
-              }
-            }
-          ],
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 55
-      },
-      "id": 46,
-      "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "min",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "videocall_decode_budget_override_mode{meeting_id=~\"$meeting\"}",
-          "legendFormat": "mode {{display_name}}",
-          "refId": "A"
-        },
-        {
-          "expr": "videocall_decode_budget_override_fixed_n{meeting_id=~\"$meeting\"}",
-          "legendFormat": "fixed-n {{display_name}}",
-          "refId": "B"
-        }
-      ],
-      "title": "Decode Budget: Override Mode & Fixed Cap",
-      "description": "User override mode per session (0=unspecified, 1=auto, 2=fixed) with the chosen fixed cap (override_fixed_n) overlaid. mode=2 means the user manually capped tiles (user-chosen), vs auto-shed by the system - important for triage.",
       "type": "timeseries"
     },
     {
@@ -1865,7 +1813,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 64
+        "y": 54
       },
       "id": 27,
       "options": {
@@ -1927,7 +1875,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 64
+        "y": 54
       },
       "id": 28,
       "options": {
@@ -1992,7 +1940,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 64
+        "y": 54
       },
       "id": 29,
       "options": {
@@ -2026,7 +1974,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 62
       },
       "id": 30,
       "title": "Server Resources (CPU & Memory vs Limits)",
@@ -2080,7 +2028,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 73
+        "y": 63
       },
       "id": 31,
       "options": {
@@ -2159,7 +2107,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 73
+        "y": 63
       },
       "id": 32,
       "options": {
@@ -2228,7 +2176,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 73
+        "y": 63
       },
       "id": 33,
       "options": {
@@ -2295,7 +2243,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 71
       },
       "id": 34,
       "options": {
@@ -2343,7 +2291,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 71
       },
       "id": 35,
       "options": {
@@ -2394,7 +2342,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 71
       },
       "id": 36,
       "options": {
@@ -2422,7 +2370,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 79
       },
       "id": 42,
       "title": "Adaptive Quality Debugging",
@@ -2539,7 +2487,7 @@
                   },
                   {
                     "color": "red",
-                    "value": 0.70
+                    "value": 0.7
                   }
                 ]
               },
@@ -2555,7 +2503,10 @@
                   {
                     "id": "custom.lineStyle",
                     "value": {
-                      "dash": [10, 10],
+                      "dash": [
+                        10,
+                        10
+                      ],
                       "fill": "dash"
                     }
                   },
@@ -2581,7 +2532,10 @@
                   {
                     "id": "custom.lineStyle",
                     "value": {
-                      "dash": [10, 10],
+                      "dash": [
+                        10,
+                        10
+                      ],
                       "fill": "dash"
                     }
                   },
@@ -2778,10 +2732,237 @@
             }
           ],
           "title": "Decoder Errors (per receiver)",
-          "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread.",
-          "type": "timeseries"
+        "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread.",
+        "type": "timeseries"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 91
+      },
+      "id": 46,
+      "title": "Decode-Budget (Client-Side)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 92
+      },
+      "id": 47,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_decode_budget_effective_cap{meeting_id=~\"$meeting\"}",
+          "legendFormat": "{{display_name}} cap",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_decode_budget_natural{meeting_id=~\"$meeting\"}",
+          "legendFormat": "{{display_name}} natural",
+          "refId": "B"
+        }
+      ],
+      "title": "Decode Budget: Effective Cap vs Natural",
+      "description": "Per-session effective visible-tile cap (what the client is decoding) vs the natural/unconstrained tile count. The gap natural - cap = tiles shed to avatars under decode pressure. A widening gap on a session means that client is shedding video.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 92
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(videocall_decode_budget_pressured{meeting_id=~\"$meeting\"})",
+          "legendFormat": "sessions under pressure",
+          "refId": "A"
+        }
+      ],
+      "title": "Decode Budget: Sessions Under Pressure",
+      "description": "Count of sessions with the pressured latch engaged (decode_budget_pressured==1), i.e. actively shedding tiles to avatars. A fleet-wide rise = widespread weak-hardware distress.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "unspecified",
+                  "index": 0
+                },
+                "1": {
+                  "text": "auto",
+                  "index": 1
+                },
+                "2": {
+                  "text": "fixed",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 92
+      },
+      "id": 49,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_decode_budget_override_mode{meeting_id=~\"$meeting\"}",
+          "legendFormat": "mode {{display_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_decode_budget_override_fixed_n{meeting_id=~\"$meeting\"}",
+          "legendFormat": "fixed-n {{display_name}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Decode Budget: Override Mode & Fixed Cap",
+      "description": "User override mode per session (0=unspecified, 1=auto, 2=fixed) with the chosen fixed cap (override_fixed_n) overlaid. mode=2 means the user manually capped tiles (user-chosen), vs auto-shed by the system - important for triage.",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

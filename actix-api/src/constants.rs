@@ -211,6 +211,32 @@ pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
 /// O(n) `retain()` cost. Mirrors the strategy used by `CongestionTracker`.
 pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
 
+/// Maximum number of `session_ids` the relay will accept from a single
+/// VIEWPORT control packet (HCL issue #988).
+///
+/// `ViewportPacket.session_ids` is an unbounded `repeated uint64`. Because the
+/// relay's NATS fan-out delivers every packet to every receiver, an attacker
+/// spamming huge VIEWPORT lists would impose O(list length) collect work per
+/// packet. This cap bounds that work. It is sized comfortably above the number
+/// of camera tiles realistically visible at once in our target 20-user rooms
+/// (a 20-tile grid leaves ample headroom), so legitimate clients are never
+/// truncated. Packets exceeding the cap have their list truncated to the first
+/// [`VIEWPORT_MAX_SESSION_IDS`] entries (fail-open on the excess rather than
+/// rejecting the whole update).
+pub const VIEWPORT_MAX_SESSION_IDS: usize = 64;
+
+/// Minimum interval between accepted VIEWPORT updates for a single session
+/// (HCL issue #988).
+///
+/// VIEWPORT packets are client-driven (viewport scroll / tile-visibility
+/// changes) and should be infrequent. This throttle bounds how often a session
+/// can mutate its desired-streams set, blunting a client that spams VIEWPORT
+/// updates to force repeated set rebuilds. Updates that arrive sooner than this
+/// after the last accepted one are dropped (the packet is still consumed and
+/// never re-broadcast). 200ms = up to 5 viewport updates/sec, well above any
+/// human-driven scroll cadence.
+pub const VIEWPORT_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -210,6 +210,16 @@ pub fn load_decode_budget_override() -> DecodeBudgetOverride {
 
 /// Persist the decode-budget override to localStorage.
 pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
+    // User override engaging: log the user's explicit choice (Fixed cap vs Auto
+    // resume) so support can distinguish a user-chosen cap from an auto-shed.
+    match value {
+        DecodeBudgetOverride::Fixed(n) => {
+            log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::Auto => {
+            log::info!("DecodeBudget: override=auto source=user_setting")
+        }
+    }
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(
             DECODE_BUDGET_OVERRIDE_KEY,

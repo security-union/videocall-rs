@@ -374,6 +374,46 @@ pub fn decide_step(
     BudgetStep::Hold
 }
 
+/// Resolve the **effective decode cap**: the number of on-screen tiles that may
+/// actually decode video, given the current override mode and adaptive state.
+///
+/// This is the single source of truth for the three-mode actuator. Both the
+/// render path (which uses the result to split tiles into video vs avatar) and
+/// the telemetry producer (which reports it on the HEALTH packet) call this so
+/// the reported value can never silently drift from what is on screen — the
+/// drift risk flagged in the HCL #987 review. The arms are:
+///
+/// - **`Fixed(n)`** — a hard manual override: exactly `n` tiles, clamped into
+///   `[MIN_CAP, min(natural, CANVAS_LIMIT)]`. The upper bound is floored at
+///   `MIN_CAP` so the `clamp` never sees `max < min` when `natural` is 0
+///   (0-peer layouts), and capped at [`CANVAS_LIMIT`] so a tampered
+///   localStorage value can't exceed the canvas.
+/// - **`Auto`, not pressured** — show every natural tile (capped at
+///   [`CANVAS_LIMIT`]); the adaptive loop is idle so a capable machine decodes
+///   all peers immediately, including staggered joins.
+/// - **`Auto`, pressured** — the adaptive control loop owns the cap; return it
+///   verbatim (`cap`).
+///
+/// `natural` is the uncapped layout tile count and `cap` is the loop-owned
+/// adaptive cap (only consulted on the pressured-Auto path).
+pub fn effective_cap(
+    override_mode: crate::context::DecodeBudgetOverride,
+    pressured: bool,
+    natural: usize,
+    cap: usize,
+) -> usize {
+    use crate::context::DecodeBudgetOverride;
+
+    match override_mode {
+        DecodeBudgetOverride::Fixed(n) => n.clamp(
+            MIN_CAP,
+            natural.clamp(MIN_CAP, crate::constants::CANVAS_LIMIT),
+        ),
+        DecodeBudgetOverride::Auto if !pressured => natural.min(crate::constants::CANVAS_LIMIT),
+        DecodeBudgetOverride::Auto => cap,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +957,79 @@ mod tests {
         assert_eq!(
             decide_step(&samples, &state, 9, PAST_COOLDOWN),
             BudgetStep::Hold
+        );
+    }
+
+    // ── effective_cap: the shared three-mode actuator ────────────────────────
+    //
+    // These pin the contract that the render path and the telemetry producer
+    // share (HCL #987 review FIX): the reported decode-budget cap must equal
+    // what is actually rendered, across all three modes plus the clamps.
+    use crate::constants::CANVAS_LIMIT;
+    use crate::context::DecodeBudgetOverride;
+
+    #[test]
+    fn effective_cap_auto_unpressured_is_natural_capped_at_canvas() {
+        // Un-pressured Auto shows every natural tile, bounded by CANVAS_LIMIT.
+        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, false, 5, 99), 5);
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, CANVAS_LIMIT + 7, 99),
+            CANVAS_LIMIT,
+            "natural above the canvas limit is capped at CANVAS_LIMIT"
+        );
+        // `cap` is irrelevant on the un-pressured path.
+        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, false, 4, 1), 4);
+    }
+
+    #[test]
+    fn effective_cap_auto_pressured_uses_loop_cap() {
+        // Pressured Auto: the control loop owns the cap; return it verbatim.
+        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, true, 12, 3), 3);
+        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, true, 12, 1), 1);
+    }
+
+    #[test]
+    fn effective_cap_fixed_clamps_into_natural_and_canvas() {
+        // Fixed(n) is bounded above by min(natural, CANVAS_LIMIT)...
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Fixed(6), false, 10, 99),
+            6
+        );
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Fixed(9), false, 4, 99),
+            4,
+            "Fixed cannot exceed the natural tile count"
+        );
+        assert_eq!(
+            effective_cap(
+                DecodeBudgetOverride::Fixed(CANVAS_LIMIT + 5),
+                false,
+                CANVAS_LIMIT + 5,
+                99
+            ),
+            CANVAS_LIMIT,
+            "Fixed is clamped to CANVAS_LIMIT even when natural is larger"
+        );
+        // Pressured flag is ignored under a Fixed override.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Fixed(6), true, 10, 2),
+            6
+        );
+    }
+
+    #[test]
+    fn effective_cap_floors_at_min_cap_for_zero_peers() {
+        // 0-peer layout: the clamp upper bound is floored at MIN_CAP so the
+        // result is never below MIN_CAP and `clamp` never sees max < min.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, 0, 0),
+            0,
+            "un-pressured Auto reports the raw natural (0) — caller floors at render"
+        );
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Fixed(4), false, 0, 0),
+            MIN_CAP,
+            "Fixed never returns below MIN_CAP even with 0 natural tiles"
         );
     }
 }

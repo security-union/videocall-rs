@@ -52,15 +52,17 @@ use sec_api::metrics::{
     CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
     CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
     CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, ENCODER_BITRATE_RATIO,
-    ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
-    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS,
+    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
+    ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -196,6 +198,11 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_TARGET_BITRATE_KBPS.remove_label_values(&reporter_labels);
     let _ = ENCODER_BITRATE_RATIO.remove_label_values(&reporter_labels);
+    let _ = DECODE_BUDGET_EFFECTIVE_CAP.remove_label_values(&reporter_labels);
+    let _ = DECODE_BUDGET_NATURAL.remove_label_values(&reporter_labels);
+    let _ = DECODE_BUDGET_PRESSURED.remove_label_values(&reporter_labels);
+    let _ = DECODE_BUDGET_OVERRIDE_MODE.remove_label_values(&reporter_labels);
+    let _ = DECODE_BUDGET_OVERRIDE_FIXED_N.remove_label_values(&reporter_labels);
 
     // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
     let telem_labels: [&str; 3] = [
@@ -649,6 +656,25 @@ fn process_health_packet_to_metrics_pb(
             ENCODER_BITRATE_RATIO
                 .with_label_values(&reporter_labels)
                 .set(ratio);
+        }
+
+        // Decode-budget state (#987 / PR #999)
+        if let Some(db) = health_packet.decode_budget.as_ref() {
+            DECODE_BUDGET_EFFECTIVE_CAP
+                .with_label_values(&reporter_labels)
+                .set(db.effective_cap as f64);
+            DECODE_BUDGET_NATURAL
+                .with_label_values(&reporter_labels)
+                .set(db.natural as f64);
+            DECODE_BUDGET_PRESSURED
+                .with_label_values(&reporter_labels)
+                .set(if db.pressured { 1.0 } else { 0.0 });
+            DECODE_BUDGET_OVERRIDE_MODE
+                .with_label_values(&reporter_labels)
+                .set(db.override_mode.value() as f64);
+            DECODE_BUDGET_OVERRIDE_FIXED_N
+                .with_label_values(&reporter_labels)
+                .set(db.override_fixed_n as f64);
         }
 
         // Tier transition events (P2): increment counter for each transition

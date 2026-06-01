@@ -164,6 +164,17 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | `videocall_neteq_target_delay_ms` | Jitter estimate |
 | `videocall_audio_concealment_pct` | Audio concealment percentage |
 
+### Decode-budget metrics (client-side, via metrics_server)
+Receiver-side decode-budget state reported by each client in its health packet. All are `meeting_id`-keyed per-session gauges (not relay `room`-keyed), and surface in the **Decode-Budget (Client-Side)** dashboard row.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `videocall_decode_budget_effective_cap` | Gauge | meeting_id, session_id, peer_id, display_name | Current effective visible-tile cap the client is decoding. When `pressured==1`, `natural - effective_cap` is the shed magnitude (tiles dropped to avatars); a collapse here = that client is shedding video under decode pressure (HCL #987) |
+| `videocall_decode_budget_natural` | Gauge | meeting_id, session_id, peer_id, display_name | Natural/unconstrained tile count — what the client would decode unthrottled. The gap above `effective_cap` is the shed magnitude (HCL #987) |
+| `videocall_decode_budget_pressured` | Gauge | meeting_id, session_id, peer_id, display_name | 0/1 pressured latch; 1 = the budget loop is actively shedding tiles. A fleet-wide rise in the `sum()` = widespread weak-hardware distress (HCL #987) |
+| `videocall_decode_budget_override_mode` | Gauge | meeting_id, session_id, peer_id, display_name | User override mode: 0=unspecified, 1=auto, 2=fixed. mode=2 = user manually capped tiles (user-chosen) vs auto-shed by the system — distinguishes user choice from system-forced shedding for triage (HCL #987) |
+| `videocall_decode_budget_override_fixed_n` | Gauge | meeting_id, session_id, peer_id, display_name | The user's fixed tile cap when `override_mode==2` (fixed) (HCL #987) |
+
 ### Container resource metrics (via cAdvisor)
 | Metric | Description |
 |---|---|

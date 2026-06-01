@@ -17,7 +17,7 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -636,6 +636,13 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Last decode-budget snapshot published to the diagnostics bus (for the
+    // HEALTH packet, #987 P3): (effective_cap, natural_capped, pressured,
+    // is_fixed, fixed_n). Tracked so the publisher effect only emits a bus
+    // event when the decision actually moves, never per unrelated render. Read
+    // via `.peek()` inside that effect (never reactively) so writing it back
+    // cannot self-retrigger the effect.
+    let mut prev_db_snapshot = use_signal(|| (MIN_CAP, MIN_CAP, false, false, 0usize));
     // Viewport size signal — updated on window resize so layout recomputes.
     let mut viewport_version = use_signal(|| 0u32);
     {
@@ -1939,9 +1946,34 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let task = spawn(async move {
             use crate::components::decode_budget::{
-                non_distress_growth_qualifying, recovery_qualifying, STEP_UP_COOLDOWN_MS,
-                SUSTAIN_SAMPLES,
+                median_render_fps, non_distress_growth_qualifying, recovery_qualifying, FPS_SEVERE,
+                LONGTASK_SEVERE_MS_PER_SEC, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
+
+            /// Severe-tier label for a multi-tile (`magnitude > 1`) down-step,
+            /// reproducing `decide_step`'s catastrophic-pressure test EXACTLY so
+            /// the log is not misled by a single closing sample. FPS uses the
+            /// window median (`<= FPS_SEVERE`); long-task uses the SUSTAINED
+            /// window check (every one of the last `SUSTAIN_SAMPLES` samples at or
+            /// above `LONGTASK_SEVERE_MS_PER_SEC`) — the same condition
+            /// `decide_step` evaluates. Both may be true at once, hence the
+            /// `fps+longtask_severe` combined label. Observation only.
+            fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
+                let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
+                let longtask_severe = samples.len() >= SUSTAIN_SAMPLES
+                    && samples[samples.len() - SUSTAIN_SAMPLES..]
+                        .iter()
+                        .all(|s| s.longtask_ms_per_sec >= LONGTASK_SEVERE_MS_PER_SEC);
+                match (fps_severe, longtask_severe) {
+                    (true, true) => "fps+longtask_severe",
+                    (true, false) => "fps_severe",
+                    (false, true) => "longtask_severe",
+                    // Unreachable in practice: decide_step only returns magnitude>1
+                    // when at least one severe condition holds. Logged as `unknown`
+                    // rather than asserting, so logging can never panic.
+                    (false, false) => "unknown_severe",
+                }
+            }
             use videocall_diagnostics::{now_ms, MetricValue};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
@@ -2012,6 +2044,34 @@ pub fn AttendantsComponent(
                 // Detect a return to Auto and re-seed BudgetState from the live
                 // cap so the loop resumes cleanly without a phantom step.
                 if current_override != last_override {
+                    // User override engaging: distinguish user-chosen caps from
+                    // auto-shed in triage. Fixed(n) = manual hard cap; Auto = resume.
+                    match (last_override, current_override) {
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=auto natural={}",
+                                n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=fixed prev_n={} natural={}",
+                                n,
+                                prev_n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Auto) => {
+                            log::info!(
+                                "DecodeBudget: override=auto prev=fixed prev_n={} natural={} cap={}",
+                                prev_n,
+                                natural,
+                                *decode_budget_cap.peek(),
+                            )
+                        }
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Auto) => {}
+                    }
                     if current_override == DecodeBudgetOverride::Auto {
                         state = BudgetState {
                             cap: *decode_budget_cap.peek(),
@@ -2077,11 +2137,53 @@ pub fn AttendantsComponent(
                     // natural (the maximum the loop would ever grow to).
                     if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
                     {
+                        // Closing-sample rationale for the decision logs below.
+                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                        let cur_fps = samples.last().and_then(|s| s.render_fps);
+                        let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+                        let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+
                         decode_budget_pressured.set(true);
                         state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
                         state.last_step_ms = now;
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
+
+                        // Pressured-latch edge (false->true): the controller now
+                        // owns the cap. Trigger is the first measured down-step.
+                        log::info!(
+                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={} cap={}",
+                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask,
+                            natural,
+                            state.cap,
+                        );
+                        // Severe-tier entry: a multi-tile down-step. The label
+                        // reproduces `decide_step`'s catastrophic test exactly
+                        // (median FPS + SUSTAINED long-task window), NOT a single
+                        // closing-sample inference. WITHOUT changing decide_step's
+                        // signature.
+                        if magnitude > 1 {
+                            log::info!(
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                magnitude,
+                                severe_label(&samples, median),
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                            );
+                        }
+                        // First cap transition (un-pressured -> pressured down-step).
+                        log::info!(
+                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                            prev_cap,
+                            state.cap,
+                            magnitude,
+                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask,
+                            natural,
+                        );
                     }
                     continue;
                 }
@@ -2101,12 +2203,23 @@ pub fn AttendantsComponent(
                     state.direction_hold = 0;
                 }
 
+                // Closing-sample rationale shared by every decision log in this
+                // arm. Cheap copies only — the `format!` allocations are inlined
+                // lazily into each `log::info!` so they are skipped both on the
+                // steady-state Hold path (no log fires) AND when the log level is
+                // disabled. `median` is also read by the `magnitude > 1` severe
+                // check. Observation only.
+                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                let cur_fps = samples.last().and_then(|s| s.render_fps);
+                let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+
                 // Apply the step: the controller owns cap + last_step_ms.
                 match step {
                     BudgetStep::Down(magnitude) => {
                         // Proportional/multi-tile down-step (HCL #987 review
                         // FIX 4): `magnitude` is 1 under mild pressure, larger
                         // under catastrophic pressure. Floor at MIN_CAP.
+                        let prev_cap = state.cap;
                         state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
                         state.last_step_ms = now;
                         // A down-step ends the recovery streak. Because the
@@ -2116,14 +2229,52 @@ pub fn AttendantsComponent(
                         // instantly re-add it (anti-oscillation).
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
+                        // Severe-tier entry: multi-tile down-step. The label
+                        // reproduces `decide_step`'s catastrophic test exactly
+                        // (median FPS + SUSTAINED long-task window), NOT a single
+                        // closing-sample inference. No `decide_step` signature
+                        // change.
+                        if magnitude > 1 {
+                            log::info!(
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                magnitude,
+                                severe_label(&samples, median),
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                            );
+                        }
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                magnitude,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
+                        }
                     }
                     BudgetStep::Up => {
+                        let prev_cap = state.cap;
                         state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
                         state.last_step_ms = now;
                         // A consumed up-step resets the recovery streak so the
                         // next up-step must re-earn RECOVERY_HOLD samples.
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
+                        }
                     }
                     BudgetStep::Hold => {
                         // Non-distress growth gate (HCL #987 review FIX 1).
@@ -2175,9 +2326,22 @@ pub fn AttendantsComponent(
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
                         if state.cap < target && up_cooldown_elapsed && not_distressed {
+                            let prev_cap = state.cap;
                             state.cap += 1;
                             state.last_step_ms = now;
                             decode_budget_cap.set(state.cap);
+                            // Non-distress growth: cap re-grows toward natural while
+                            // `decide_step` is Holding. dir=growth distinguishes this
+                            // from the strict-recovery dir=up step above.
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
                         }
                     }
                 }
@@ -2315,10 +2479,89 @@ pub fn AttendantsComponent(
         let previous = *prev_override.peek();
         if previous != DecodeBudgetOverride::Auto && current == DecodeBudgetOverride::Auto {
             decode_budget_pressured.set(false);
+            // Pressured-latch edge (true->false): leaving a Fixed override for Auto
+            // clears the latch render-side so all natural tiles re-reveal at once.
+            log::info!("DecodeBudget: pressured_latch=false trigger=override_resume_auto");
         }
         if previous != current {
             prev_override.set(current);
         }
+    });
+
+    // Publish the adaptive decode-budget decision onto the diagnostics bus so
+    // the HealthReporter (videocall-client) can fold it into the periodic
+    // HEALTH packet (#987 P3). This mirrors how the AdaptiveQuality tier state
+    // already rides the health packet: the controller's decision lives only in
+    // client console logs today, so population-scale dashboards are blind to it
+    // server-side. We publish the SNAPSHOT (current state), not a drained
+    // transition buffer — the snapshot is the must-have for dashboards.
+    //
+    // Reactive reads (`.read()`/calling the signal) of all four authoritative
+    // signals mean this effect re-runs the instant any of them changes, and the
+    // change-guard `prev_db_snapshot` ensures we only emit a bus event when the
+    // decision actually moved — not on every unrelated render. The effective
+    // cap is recomputed with the SAME three-mode logic as the render-side
+    // `effective_cap` actuator below (Fixed clamp / un-pressured == natural /
+    // pressured == loop-owned cap) so the reported value matches what is on
+    // screen. `decode_budget_natural` already equals the live `total_tiles`
+    // (written just above), so `natural_capped` here matches the render-side
+    // `canvas_capped_natural`.
+    use_effect(move || {
+        let override_mode = decode_budget_override();
+        let pressured = decode_budget_pressured();
+        let natural = decode_budget_natural();
+        let cap = decode_budget_cap();
+
+        let natural_capped = natural.min(CANVAS_LIMIT);
+        // Shared three-mode actuator: identical to the render-side
+        // `effective_cap` below, so reported telemetry can never drift from
+        // what is on screen (HCL #987 review FIX).
+        let effective = effective_cap(override_mode, pressured, natural, cap);
+
+        // Compact, comparable snapshot. Only emit on a real change so the
+        // diagnostics bus (and the health packet) is not spammed per render.
+        // `override_fixed_n` is 0 in Auto and meaningless to readers there
+        // (the proto enum carries the Auto/Fixed discriminator).
+        // Clamp the reported fixed cap to CANVAS_LIMIT so telemetry matches the
+        // displayed semantics: `parse_decode_budget_override` accepts any
+        // `usize > 0` from localStorage, but a tampered value above u32::MAX
+        // would otherwise silently truncate on the `as u64 -> as u32` path in
+        // the consumer. `effective_cap` is already clamped, so this only aligns
+        // the telemetry `override_fixed_n` with what is actually rendered.
+        let fixed_n = match override_mode {
+            DecodeBudgetOverride::Fixed(n) => n.min(CANVAS_LIMIT),
+            DecodeBudgetOverride::Auto => 0,
+        };
+        let is_fixed = matches!(override_mode, DecodeBudgetOverride::Fixed(_));
+        let snapshot = (effective, natural_capped, pressured, is_fixed, fixed_n);
+        if *prev_db_snapshot.peek() == snapshot {
+            return;
+        }
+        prev_db_snapshot.set(snapshot);
+
+        // Override mode encoded as the proto OverrideMode enum's integer value
+        // (1 = Auto, 2 = Fixed) so the HealthReporter can map it directly.
+        let override_mode_i = if is_fixed { 2u64 } else { 1u64 };
+        videocall_diagnostics::global_sender()
+            .try_broadcast(videocall_diagnostics::DiagEvent {
+                subsystem: "decode_budget",
+                stream_id: None,
+                ts_ms: videocall_diagnostics::now_ms(),
+                metrics: vec![
+                    videocall_diagnostics::metric!("decode_budget_effective_cap", effective as u64),
+                    videocall_diagnostics::metric!("decode_budget_natural", natural_capped as u64),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_pressured",
+                        if pressured { 1u64 } else { 0u64 }
+                    ),
+                    videocall_diagnostics::metric!("decode_budget_override_mode", override_mode_i),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_override_fixed_n",
+                        fixed_n as u64
+                    ),
+                ],
+            })
+            .ok();
     });
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
@@ -2508,20 +2751,17 @@ pub fn AttendantsComponent(
     // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2). Reactive reads
     // (`.read()`) so a change to either signal re-runs render immediately, with
     // no dependence on the 1 Hz control loop.
-    let canvas_capped_natural = total_tiles.min(CANVAS_LIMIT);
-    let effective_cap = match *decode_budget_override.read() {
-        // Manual hard override takes effect on the NEXT render, no FPS event
-        // required. `total_tiles.clamp(MIN_CAP, CANVAS_LIMIT)` floors a 0-peer
-        // upper bound at MIN_CAP so `clamp` never sees `max < min`.
-        DecodeBudgetOverride::Fixed(n) => {
-            n.clamp(MIN_CAP, total_tiles.clamp(MIN_CAP, CANVAS_LIMIT))
-        }
-        // Un-pressured Auto: cap == natural, so staggered joins are decoded
-        // immediately and no avatars appear.
-        DecodeBudgetOverride::Auto if !decode_budget_pressured() => canvas_capped_natural,
-        // Pressured Auto: the control loop owns the cap.
-        DecodeBudgetOverride::Auto => decode_budget_cap(),
-    };
+    // Shared three-mode actuator (HCL #987 review FIX): the SAME function the
+    // telemetry producer uses, so the reported cap can never drift from what is
+    // rendered here. Fixed(n) clamps into [MIN_CAP, min(natural, CANVAS_LIMIT)];
+    // un-pressured Auto == natural (staggered joins decode immediately, no
+    // avatars); pressured Auto defers to the loop-owned cap.
+    let effective_cap = effective_cap(
+        *decode_budget_override.read(),
+        decode_budget_pressured(),
+        total_tiles,
+        decode_budget_cap(),
+    );
     let budget_cap = effective_cap;
     // Natural layout capacity (already bounded by CANVAS_LIMIT through
     // `total_tiles`/`capped_real`). This decides the +N badge boundary.
@@ -3082,6 +3322,14 @@ pub fn AttendantsComponent(
         // Dedup: only push to client when the set actually changed.
         let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
         if *previous_active_decode_set != active_decode_set {
+            // Render actuator: the effective decode-budget cap applied to the
+            // visible tile set. Logged at debug to correlate with the info-level
+            // cap-transition decisions above without spamming the steady state.
+            log::debug!(
+                "DecodeBudget: active_decode_set size={} budget_cap={}",
+                active_decode_set.len(),
+                budget_cap,
+            );
             client.set_active_decode_set(&active_decode_set);
             *previous_active_decode_set = active_decode_set.clone();
         }

@@ -828,6 +828,21 @@ impl HealthReporter {
                             }
                             _ => {}
                         },
+                        // Freeze observability (#1013): windowed per-stream
+                        // packet-loss rate and keyframe-request rate, emitted by
+                        // the decoder. Stored in the camera/screen video_stats
+                        // bucket (split by is_screen) so they fold into the
+                        // per-peer health packet and the video quality score.
+                        "video_seq_loss_per_sec" => {
+                            if let MetricValue::F64(loss) = &metric.value {
+                                video_stats["video_seq_loss_per_sec"] = json!(loss);
+                            }
+                        }
+                        "keyframe_requests_per_sec" => {
+                            if let MetricValue::F64(kf) = &metric.value {
+                                video_stats["keyframe_requests_per_sec"] = json!(kf);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1497,6 +1512,20 @@ impl HealthReporter {
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+
+                // Freeze observability (#1013): windowed per-stream loss /
+                // keyframe-request rates (camera only this pass). These feed the
+                // video quality score so a frozen-but-still-decoding stream
+                // (fps reads ~30, video visually stuck) no longer scores 100.
+                if let Some(loss) = video.get("video_seq_loss_per_sec").and_then(|v| v.as_f64()) {
+                    ps.video_seq_loss_per_sec = Some(loss);
+                }
+                if let Some(kf) = video
+                    .get("keyframe_requests_per_sec")
+                    .and_then(|v| v.as_f64())
+                {
+                    ps.keyframe_requests_per_sec = Some(kf);
+                }
             }
 
             // Screen share video mapping (new field, separate from camera)
@@ -1555,29 +1584,27 @@ impl HealthReporter {
             }
 
             // Video quality (0-100): only meaningful when frames are actively arriving.
-            // fps > 0.0 already proves video is flowing; video_enabled (sender self-report
-            // from peer_status events) is not required here and would suppress scores
-            // if peer_status hasn't arrived yet.
+            // fps > 0.0 already proves decode CALLS are flowing; video_enabled (sender
+            // self-report from peer_status events) is not required here and would suppress
+            // scores if peer_status hasn't arrived yet.
+            //
+            // Freeze observability (#1013): during a freeze, fps_received still reads ~30
+            // because decode calls keep firing fire-and-forget, yet the picture is visually
+            // frozen because packets are lost and the stream is stuck requesting keyframes.
+            // We fold the windowed loss rate and keyframe-request rate into the score so it
+            // drops well below 100 in that state.
             let fps = ps
                 .video_stats
                 .as_ref()
                 .map(|v| v.fps_received)
                 .unwrap_or(0.0);
             if video_fresh && fps > 0.0 {
-                let dropped = ps.frames_dropped_per_sec;
-
-                // Video health: measures whether video is present and stable, not
-                // hardware FPS capability. A 15fps camera in low light is not a
-                // "problem" — it is the camera doing auto-exposure correctly.
-                //
-                // fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
-                // fps 1–4   → 0–50 (near-frozen; something is likely wrong)
-                // fps == 0  → handled by outer guard; score is absent (None)
-                let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
-                // Decode error penalty: 0/s→0, 10+/s→−50
-                let drop_penalty = (dropped / 10.0).min(1.0) * 50.0;
-                let score = (video_health - drop_penalty).clamp(0.0, 100.0);
-                ps.video_quality_score = Some(score);
+                ps.video_quality_score = video_quality_score(
+                    fps,
+                    ps.frames_dropped_per_sec,
+                    ps.video_seq_loss_per_sec.unwrap_or(0.0),
+                    ps.keyframe_requests_per_sec.unwrap_or(0.0),
+                );
             }
 
             // Call quality: worst of whichever streams are active
@@ -1633,6 +1660,57 @@ impl HealthReporter {
     }
 }
 
+/// Compute the per-peer video quality score (0–100), or `None` when no frames
+/// are flowing.
+///
+/// Freeze observability (#1013): a broadcast-relay stream can read fps ≈ 30
+/// while being visually frozen — decode CALLS keep firing fire-and-forget even
+/// as packets are lost and the stream is stuck requesting keyframes. fps alone
+/// therefore cannot detect a freeze. We add two penalties on top of the
+/// fps/decode-error health so a sustained loss or keyframe storm forces the
+/// score well below 100:
+///
+/// * `loss_per_sec` — windowed packet-loss rate from `SequenceTracker`.
+///   `5 lost/s → −30`. Mirrors the audio `loss_penalty` shape.
+/// * `kf_per_sec`   — windowed keyframe-request (PLI) rate. A stream that is
+///   continuously asking for keyframes is, by definition, not decoding cleanly,
+///   so even a *sustained* ≥1 PLI/s is a strong freeze signal: `1 PLI/s → −40`.
+///
+/// The caller applies the outer `video_fresh && fps > 0.0` guard, so a true
+/// freeze with zero fps yields `None` (Grafana renders a gap) rather than a
+/// misleading 0 — `None` is the correct "no signal" state.
+///
+/// Returns `None` only when `fps <= 0.0` (defensive; the caller already
+/// guards this), otherwise `Some(score)` clamped to `0..=100`.
+fn video_quality_score(
+    fps: f64,
+    dropped_per_sec: f64,
+    loss_per_sec: f64,
+    kf_per_sec: f64,
+) -> Option<f64> {
+    if fps <= 0.0 {
+        return None;
+    }
+
+    // Video health: measures whether video is present and stable, not hardware
+    // FPS capability. A 15fps camera in low light is not a "problem" — it is the
+    // camera doing auto-exposure correctly.
+    //   fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
+    //   fps 1–4   → 0–50 (near-frozen; something is likely wrong)
+    let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
+
+    // Decode error penalty: 0/s→0, 10+/s→−50.
+    let drop_penalty = (dropped_per_sec / 10.0).min(1.0) * 50.0;
+    // Packet-loss penalty: 0/s→0, 5+/s→−30 (mirrors the audio loss penalty).
+    let loss_penalty = (loss_per_sec / 5.0).min(1.0) * 30.0;
+    // Keyframe-storm penalty: a sustained ≥1 PLI/s means the decoder cannot make
+    // forward progress → −40.
+    let kf_penalty = (kf_per_sec / 1.0).min(1.0) * 40.0;
+
+    let score = (video_health - drop_penalty - loss_penalty - kf_penalty).clamp(0.0, 100.0);
+    Some(score)
+}
+
 // ===================================================================
 // Security: HealthPacket credential-leak guard
 // ===================================================================
@@ -1646,6 +1724,58 @@ mod tests {
     use super::*;
     use protobuf::Message;
     use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+
+    // ── Freeze observability (#1013): video_quality_score ────────────────
+
+    /// Healthy stream: fps≥5, no loss, no keyframe storm → score 100.
+    #[test]
+    fn video_quality_score_healthy_is_100() {
+        assert_eq!(video_quality_score(30.0, 0.0, 0.0, 0.0), Some(100.0));
+    }
+
+    /// fps == 0 yields None (absent), not 0 — a freeze with zero fps must show
+    /// a Grafana gap, not a misleading zero.
+    #[test]
+    fn video_quality_score_zero_fps_is_none() {
+        assert_eq!(video_quality_score(0.0, 0.0, 0.0, 0.0), None);
+    }
+
+    /// The core #1013 case: fps reads a healthy ~30 (decode calls still firing)
+    /// but the stream is under sustained packet loss AND a keyframe storm. The
+    /// score MUST drop well below 100 (it used to read 100 here — the bug).
+    #[test]
+    fn video_quality_score_drops_during_freeze_with_loss_and_keyframe_storm() {
+        // 30 fps, no decode errors, 5 lost/s (-30), 1 PLI/s (-40) => 100-30-40=30.
+        let score = video_quality_score(30.0, 0.0, 5.0, 1.0).expect("fps>0 => Some");
+        assert!(
+            score < 80.0,
+            "freeze (loss + keyframe storm) should score well below 80, got {score}"
+        );
+        assert!((score - 30.0).abs() < 1e-9, "expected 30.0, got {score}");
+    }
+
+    /// Loss alone (no keyframe storm) still pulls the score down.
+    #[test]
+    fn video_quality_score_loss_only_penalty() {
+        // 30 fps, 5 lost/s (-30) => 70.
+        let score = video_quality_score(30.0, 0.0, 5.0, 0.0).expect("fps>0 => Some");
+        assert!((score - 70.0).abs() < 1e-9, "expected 70.0, got {score}");
+    }
+
+    /// A sustained keyframe-request rate alone is a strong freeze signal.
+    #[test]
+    fn video_quality_score_keyframe_storm_only_penalty() {
+        // 30 fps, 1 PLI/s (-40) => 60.
+        let score = video_quality_score(30.0, 0.0, 0.0, 1.0).expect("fps>0 => Some");
+        assert!((score - 60.0).abs() < 1e-9, "expected 60.0, got {score}");
+    }
+
+    /// Penalties saturate and the score clamps at 0, never negative.
+    #[test]
+    fn video_quality_score_clamps_at_zero() {
+        let score = video_quality_score(30.0, 100.0, 100.0, 100.0).expect("fps>0 => Some");
+        assert_eq!(score, 0.0);
+    }
 
     /// Construct a `HealthPacket` via the production `create_health_packet`
     /// path, passing a `Some(...)` URL containing a JWT, and assert that the

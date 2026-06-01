@@ -310,6 +310,36 @@ pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
 /// within a similar window as audio.
 pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
 
+/// Fraction of `target_fps` at or above which a single peer is considered
+/// "healthy" for the small-peer-count outlier guard in
+/// `DiagnosticPackets::get_p75_fps` (issue #1012).
+///
+/// With 2 reporting peers the p75 aggregation degenerates to the minimum, so a
+/// single constrained receiver (e.g. a peer on a 5.8 Mbps link with a
+/// 640×480@15fps camera, per discussion #980) would otherwise define the PID
+/// setpoint and drag the sender's bitrate down for everyone. The guard only
+/// rescues the setpoint toward the *higher* reporter when at least one peer is
+/// genuinely healthy — i.e. at/above this fraction of target. If NO peer clears
+/// this bar, all peers are struggling: that is real congestion, and the
+/// conservative minimum is kept so the sender still steps down.
+///
+/// Defaults to the recover ratio (0.70) so "healthy enough to not be an
+/// outlier" is tied to "healthy enough for the tier to recover". First-guess
+/// value — pending a performance-reviewer pass. DO NOT treat as final.
+pub const AQ_OUTLIER_HEALTH_FPS_RATIO: f64 = VIDEO_TIER_RECOVER_FPS_RATIO;
+
+/// Maximum ratio of the lower peer's FPS to the higher peer's FPS for the lower
+/// one to count as a clear outlier in the small-peer-count guard (issue #1012).
+///
+/// At 2 peers `[a ≤ b]`, the guard treats `a` as an outlier only when
+/// `a < b * AQ_OUTLIER_GAP_FPS_RATIO` — i.e. `a` is more than ~40% below `b`.
+/// This prevents rescuing on ordinary jitter (two healthy peers a few fps
+/// apart) and fires only on the genuine "one fine, one badly degraded" split.
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+pub const AQ_OUTLIER_GAP_FPS_RATIO: f64 = 0.60;
+
 /// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
 pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
 /// Bitrate ratio above which we step UP one video tier (must be sustained).

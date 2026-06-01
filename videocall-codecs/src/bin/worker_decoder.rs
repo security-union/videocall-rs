@@ -269,6 +269,32 @@ impl Decodable for WebDecoder {
                 return;
             }
 
+            // Second buffer stage observability (issue #1020). Frames handed to
+            // `VideoDecoder.decode()` sit in WebCodecs' own internal queue, which is unpaced: even
+            // with the jitter-buffer freshness deadline in place, a burst of frames can still pile
+            // up here and be painted back-to-back, partially defeating the buffer-side fix. We read
+            // the decoder's queue depth so the backlog is at least visible.
+            //
+            // TODO(#1020): turn this read into real backpressure. The correct fix is to consult
+            // `decode_queue_size()` *before the jitter buffer releases a frame* (i.e. in
+            // `JitterBuffer::find_and_move_continuous_frames`) and stop pulling new frames while the
+            // WebCodecs queue is above a small high-water mark (e.g. > 2-3 frames), letting the
+            // decoder drain at display rate instead of as fast as it can. That requires threading
+            // the live queue depth from this worker back into the jitter buffer (e.g. a
+            // `decode_queue_depth: Rc<Cell<u32>>` shared handle, or a `can_accept()` callback
+            // injected at `JitterBuffer::new`). Dropping a frame *here* is not an option: the frame
+            // has already been removed from the jitter buffer, so skipping it would create a
+            // reference gap and force a `DataError: A key frame is required` reset. Deferred to keep
+            // this pass confined to the (already substantial) jitter-buffer deadline; admission
+            // gating must live on the release side, not the post-release side.
+            let decode_queue_size = decoder.decode_queue_size();
+            if decode_queue_size > WEBCODECS_QUEUE_WARN_DEPTH {
+                log::debug!(
+                    "[WORKER] WebCodecs decode queue backing up: {decode_queue_size} chunks pending (seq {})",
+                    frame.sequence_number()
+                );
+            }
+
             let chunk_type = match frame.frame.frame_type {
                 videocall_codecs::frame::FrameType::KeyFrame => EncodedVideoChunkType::Key,
                 videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
@@ -329,6 +355,10 @@ thread_local! {
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
+/// Depth of the WebCodecs `VideoDecoder` internal queue above which we log a backlog warning.
+/// At ~30fps a healthy queue stays at 0-1; sustained depth here means frames are being shoveled
+/// faster than the decoder paints them (issue #1020, second buffer stage).
+const WEBCODECS_QUEUE_WARN_DEPTH: u32 = 3;
 const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]

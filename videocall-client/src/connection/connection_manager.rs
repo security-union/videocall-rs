@@ -3846,6 +3846,24 @@ mod tests {
     }
 
     #[test]
+    fn self_packet_filter_never_filters_without_own_session_id() {
+        // Before SESSION_ASSIGNED arrives there is no own_session_id, so nothing
+        // is self-filtered — CONGESTION (and everything else) must forward. Locks
+        // in that the None early-return precedes the CONGESTION type check.
+        let pkt = packet(PacketType::CONGESTION, 42);
+        assert!(!should_filter_self_packet(&pkt, None));
+    }
+
+    #[test]
+    fn self_packet_filter_never_filters_zero_session_id() {
+        // session_id == 0 is the unstamped sentinel and is never treated as a
+        // self-match. Asserted with CONGESTION to lock in that the sentinel
+        // early-return precedes the CONGESTION type check.
+        let pkt = packet(PacketType::CONGESTION, 0);
+        assert!(!should_filter_self_packet(&pkt, Some(0)));
+    }
+
+    #[test]
     fn inbound_callback_forwards_self_targeted_congestion() {
         let forwarded = forwarded_packets_for(packet(PacketType::CONGESTION, 42), Some(42));
 
@@ -3874,7 +3892,11 @@ mod tests {
     }
 
     #[test]
-    fn inbound_callback_handles_session_assigned_before_self_filter() {
+    fn inbound_callback_forwards_self_session_assigned_via_early_intercept() {
+        // SESSION_ASSIGNED is intercepted and forwarded upstream of the
+        // self-packet filter, so a self-matching session_id never reaches the
+        // filter and the packet still forwards. (Not a self-filter ordering
+        // test — it asserts the early-intercept path.)
         let forwarded = forwarded_packets_for(packet(PacketType::SESSION_ASSIGNED, 42), Some(42));
 
         assert_eq!(forwarded.len(), 1);

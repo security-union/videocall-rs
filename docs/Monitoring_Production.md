@@ -131,7 +131,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|
 | `RelayPacketDrops` | `rate(relay_packet_drops_total[1m]) > 0` for 1m | critical |
 | `RelayNATSLatencyHigh` | NATS publish p99 > 50ms for 2m | warning |
-| `RelayQueueNearFull` | Queue depth > 200/256 for 30s | warning |
+| `RelayQueueNearFull` | Queue depth > 410/512 for 30s | warning |
 | `MeetingQualityDegraded` | Avg call quality < 50 for 2m | warning |
 | `LowAudioConnectivity` | Peer can't hear for 1m | critical |
 | `ContainerCPUHigh` | CPU > 85% of limit for 3m | warning |
@@ -144,7 +144,7 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 |---|---|---|---|
 | `relay_packet_drops_total` | Counter | room, transport, drop_reason | Packets dropped due to full queue/mailbox |
 | `relay_nats_publish_latency_ms` | Histogram | — | Time to publish media packet to NATS |
-| `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (capacity 256) |
+| `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (default capacity 512, env `WT_OUTBOUND_CHANNEL_CAPACITY`) |
 | `relay_active_sessions_per_room` | Gauge | room, transport | Connections per meeting |
 | `relay_room_bytes_total` | Counter | room, direction | Bytes forwarded (use `rate()` for bps) |
 | `relay_viewport_filtered_total` | Counter | room | VIDEO packets dropped by viewport-aware filtering (off-screen source not in receiver's viewport, HCL #988) |

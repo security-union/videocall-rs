@@ -576,40 +576,48 @@ mod tests {
 
     // ----- realistic capacity sanity checks -------------------------------
     //
-    // The WT default is 1024 and WS is 128. Verify the thresholds map
-    // sensibly to slot counts on both. (The constants in
+    // The WT default is 512 (issue #979) and WS is 128. Verify the
+    // thresholds map sensibly to slot counts on both. (The constants in
     // crate::constants are not imported here to keep this module
     // self-contained, but the slot maths match those values.)
 
     #[test]
-    fn wt_1024_thresholds_make_sense() {
-        // 1024 slots: video starts dropping at ~819 used, audio at ~973.
-        let total = 1024usize;
+    fn wt_512_thresholds_make_sense() {
+        // 512 slots (issue #979 fail-fast cap): video starts dropping at
+        // ~410 used (512 * 0.80), audio at ~486 (512 * 0.95).
+        let total = 512usize;
 
-        // 818 used → fill 79.9%, video admit.
-        let free_at_818 = total - 818;
+        // 408 used → fill 79.7%, video admit.
+        let free_at_408 = total - 408;
         assert_eq!(
-            evaluate(OutboundPriority::Video, free_at_818, total),
+            evaluate(OutboundPriority::Video, free_at_408, total),
             PriorityDropDecision::Admit,
         );
 
-        // 820 used → fill 80.1%, video drop.
-        let free_at_820 = total - 820;
+        // 410 used → fill 80.1%, video drop.
+        let free_at_410 = total - 410;
         assert!(matches!(
-            evaluate(OutboundPriority::Video, free_at_820, total),
+            evaluate(OutboundPriority::Video, free_at_410, total),
             PriorityDropDecision::Drop { .. }
         ));
 
-        // 820 used → audio still admit.
+        // 410 used → audio still admit (protected until ~486).
         assert_eq!(
-            evaluate(OutboundPriority::Audio, free_at_820, total),
+            evaluate(OutboundPriority::Audio, free_at_410, total),
             PriorityDropDecision::Admit,
         );
 
-        // 980 used → fill 95.7%, audio drop.
-        let free_at_980 = total - 980;
+        // 485 used → fill 94.7%, audio still admit.
+        let free_at_485 = total - 485;
+        assert_eq!(
+            evaluate(OutboundPriority::Audio, free_at_485, total),
+            PriorityDropDecision::Admit,
+        );
+
+        // 488 used → fill 95.3%, audio drop.
+        let free_at_488 = total - 488;
         assert!(matches!(
-            evaluate(OutboundPriority::Audio, free_at_980, total),
+            evaluate(OutboundPriority::Audio, free_at_488, total),
             PriorityDropDecision::Drop { .. }
         ));
     }
@@ -656,7 +664,9 @@ mod tests {
     fn spec_video_dropped_first_at_80_percent() {
         // "VIDEO / SCREEN frames first — start dropping when channel
         //  is ≥80% full."
-        let total = 1024usize;
+        // Uses the real 512-slot default (issue #979); video drops at
+        // ~410 used.
+        let total = 512usize;
         let used = (total as f32 * 0.81) as usize;
         let free = total - used;
 
@@ -692,28 +702,33 @@ mod tests {
         // "AUDIO frames — only when channel is ≥95% full (critical)"
         //
         // Two probes:
-        //  - At 94% fill, audio is admitted (one percentage point below
-        //    the drop threshold — proves the policy gives audio the
-        //    requested cushion).
-        //  - At 95% fill, audio drops with the documented label.
-        let total = 1024usize;
+        //  - At the last sub-threshold slot, audio is admitted (proves the
+        //    policy gives audio the requested cushion).
+        //  - At the first slot that reaches 95% fill, audio drops with the
+        //    documented label.
+        // Uses the real 512-slot default (issue #979). 95% of 512 = 486.4,
+        // so 486 used is still admitted (486/512 = 0.949 < 0.95) and 487 is
+        // the first slot that drops (487/512 = 0.951 >= 0.95). Probes are
+        // explicit slot counts, NOT `(total * ratio) as usize`, whose
+        // truncation lands just under the threshold at this capacity.
+        let total = 512usize;
 
-        let used_94 = (total as f32 * 0.94) as usize;
+        let used_admit = 486usize; // last protected slot (0.949 fill)
         assert_eq!(
-            evaluate(OutboundPriority::Audio, total - used_94, total),
+            evaluate(OutboundPriority::Audio, total - used_admit, total),
             PriorityDropDecision::Admit,
-            "spec: AUDIO must be admitted just below 95%"
+            "spec: AUDIO must be admitted at the last sub-95% slot (486/512)"
         );
 
-        let used_95 = (total as f32 * 0.951) as usize;
+        let used_drop = 487usize; // first slot at/over 95% (0.951 fill)
         assert!(
             matches!(
-                evaluate(OutboundPriority::Audio, total - used_95, total),
+                evaluate(OutboundPriority::Audio, total - used_drop, total),
                 PriorityDropDecision::Drop {
                     reason: "priority_drop_audio"
                 }
             ),
-            "spec: AUDIO must drop at >=95% fill with label priority_drop_audio"
+            "spec: AUDIO must drop at >=95% fill (487/512) with label priority_drop_audio"
         );
     }
 

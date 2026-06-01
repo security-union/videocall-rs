@@ -37,13 +37,13 @@ use crate::clock::{default_clock, Clock};
 use crate::constants::{
     AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
     AUDIO_TIER_RECOVER_FPS_RATIO, CLIMB_COOLDOWN_BACKOFF, CLIMB_COOLDOWN_BASE_MS,
-    CLIMB_COOLDOWN_MAX_MS, CRASH_MEMORY_RESET_MS, DEFAULT_SCREEN_TIER_INDEX,
-    DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS, MIN_TIER_TRANSITION_INTERVAL_MS,
-    RECOVERY_SLOWDOWN_DECAY_MS, RECOVERY_SLOWDOWN_FACTOR, REELECTION_CEILING_SUPPRESSION_MS,
-    SCREEN_QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
-    VIDEO_TIER_DEGRADE_BITRATE_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO,
-    VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT, VIDEO_TIER_RECOVER_BITRATE_RATIO,
-    VIDEO_TIER_RECOVER_FPS_RATIO, YOYO_DETECTION_WINDOW_MS,
+    CLIMB_COOLDOWN_MAX_MS, CONGESTION_CUT_TIERS, CONGESTION_HOLD_MS, CRASH_MEMORY_RESET_MS,
+    DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS,
+    MIN_TIER_TRANSITION_INTERVAL_MS, RECOVERY_SLOWDOWN_DECAY_MS, RECOVERY_SLOWDOWN_FACTOR,
+    REELECTION_CEILING_SUPPRESSION_MS, SCREEN_QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
+    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT,
+    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO, YOYO_DETECTION_WINDOW_MS,
 };
 
 /// Record of a single tier transition event, captured for health reporting.
@@ -137,6 +137,15 @@ pub struct AdaptiveQualityManager {
     /// timestamp do not arm the crash ceiling.
     reelection_completed_at_ms: Option<f64>,
 
+    /// Timestamp (ms) until which a self-targeted CONGESTION cut pins the
+    /// effective bitrate ceiling to the post-cut tier's lower bound. While
+    /// `now_ms < congestion_hold_until_ms` the PID may not ramp bitrate back up
+    /// within the new tier and tier step-up is blocked, so the already-
+    /// overflowing relay buffer gets a chance to drain. Expires naturally by
+    /// timestamp comparison — see [`congestion_hold_active`](Self::congestion_hold_active).
+    /// `None` means no hold is active.
+    congestion_hold_until_ms: Option<f64>,
+
     /// Running count of video step-downs since session start. Included in
     /// climb-limiter log messages to correlate ceiling events with the
     /// overall degradation history.
@@ -218,6 +227,7 @@ impl AdaptiveQualityManager {
             recovered_since_ceiling: false,
             slowdown_activated_at_ms: None,
             reelection_completed_at_ms: None,
+            congestion_hold_until_ms: None,
             step_down_count: 0,
             // Telemetry
             step_up_blocked_ceiling: 0,
@@ -423,7 +433,12 @@ impl AdaptiveQualityManager {
         }
 
         // --- Step UP ---
-        let should_recover = fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
+        // Suppress step-up entirely while a self-targeted CONGESTION drain hold
+        // is active: the relay buffer is still draining and climbing tiers now
+        // would re-fill it. The hold expires by timestamp, after which recovery
+        // resumes normally.
+        let should_recover = !self.congestion_hold_active(now_ms)
+            && fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
             && bitrate_ratio > VIDEO_TIER_RECOVER_BITRATE_RATIO;
 
         // Respect both the screen share coordination ceiling and crash ceiling.
@@ -661,6 +676,119 @@ impl AdaptiveQualityManager {
         self.maybe_arm_ceiling(self.video_tier_index, now_ms);
         self.last_step_down_ms = Some(now_ms);
         true
+    }
+
+    /// Aggressively cut video quality in response to a *self-targeted* server
+    /// CONGESTION signal — the relay is actively dropping our outbound packets.
+    ///
+    /// Unlike [`force_video_step_down`](Self::force_video_step_down) (a gentle
+    /// one-tier step used for WebSocket backpressure), this drops
+    /// [`CONGESTION_CUT_TIERS`] tiers at once (~50% bitrate on most of the
+    /// non-uniform ladder) and then pins the effective bitrate ceiling to the
+    /// post-cut tier for [`CONGESTION_HOLD_MS`] so the overflowing relay buffer
+    /// can drain before the PID ramps bitrate back up.
+    ///
+    /// Like `force_video_step_down`, this respects the warmup guard and the
+    /// minimum transition interval — those guards exist to avoid reacting to
+    /// startup noise and to avoid cascading transitions, and the user chose to
+    /// keep them rather than bypass them for congestion.
+    ///
+    /// # Crash-ceiling / yo-yo handling
+    ///
+    /// This deliberately does **not** call
+    /// [`maybe_arm_ceiling`](Self::maybe_arm_ceiling) and does **not** touch
+    /// `step_down_count` / `last_step_down_ms`. A self-targeted CONGESTION cut
+    /// is a response to an *external* relay signal, not to client-side quality
+    /// oscillation. Feeding it into yo-yo detection would let a single network
+    /// hiccup arm the crash ceiling (and its backoff up to
+    /// `CLIMB_COOLDOWN_MAX_MS`), capping recovery to a low tier for minutes
+    /// after the congestion has cleared — exactly the over-conservative
+    /// behaviour this aggressive cut is meant to avoid. The short
+    /// `CONGESTION_HOLD_MS` window already provides the necessary "let the
+    /// buffer drain" pause without the long-lived ceiling.
+    ///
+    /// # Return value
+    ///
+    /// Returns `true` if the tier actually changed. If we are already at (or
+    /// within one tier of) the lowest tier so no tier change occurs, this still
+    /// arms the hold window — a cut at the floor must still let the buffer
+    /// drain — but returns `false` to signal "no tier change to apply".
+    pub fn force_congestion_cut(&mut self, now_ms: f64) -> bool {
+        // Warmup guard: same as update()/force_video_step_down() — suppress
+        // forced cuts during encoder startup when zero-FPS readings would be
+        // misleading and no real media is flowing yet.
+        if now_ms - self.created_at_ms < self.warmup_ms {
+            return false;
+        }
+
+        // Min-interval guard: avoid cascading cuts from a burst of congestion
+        // signals. (Kept rather than bypassed — see method docs.)
+        let time_since_last = now_ms - self.last_transition_time_ms;
+        if time_since_last < MIN_TIER_TRANSITION_INTERVAL_MS as f64 {
+            log::debug!(
+                "AdaptiveQuality: congestion cut blocked by min transition interval ({:.0}ms < {}ms)",
+                time_since_last,
+                MIN_TIER_TRANSITION_INTERVAL_MS,
+            );
+            return false;
+        }
+
+        // Arm the drain hold regardless of whether the tier can move further —
+        // a cut while already at the floor must still pause the PID so the
+        // relay buffer drains.
+        self.congestion_hold_until_ms = Some(now_ms + CONGESTION_HOLD_MS);
+
+        let max_video_index = self.video_tiers.len().saturating_sub(1);
+        let target_index = (self.video_tier_index + CONGESTION_CUT_TIERS).min(max_video_index);
+        if target_index == self.video_tier_index {
+            // Already at the last tier: hold is armed (above) but there is no
+            // tier change for the caller to apply.
+            log::warn!(
+                "AdaptiveQuality: CONGESTION cut at floor tier '{}' (index {}); drain hold armed for {:.0}ms",
+                self.video_tiers[self.video_tier_index].label,
+                self.video_tier_index,
+                CONGESTION_HOLD_MS,
+            );
+            return false;
+        }
+
+        self.record_dwell(now_ms);
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.video_tier_index = target_index;
+        self.last_transition_time_ms = now_ms;
+        self.degrade_start_ms = None;
+        self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction: "down",
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "congestion",
+        });
+        log::warn!(
+            "AdaptiveQuality: CONGESTION cut dropped {} tiers to '{}' (index {}); \
+             drain hold armed for {:.0}ms",
+            CONGESTION_CUT_TIERS,
+            to_tier,
+            self.video_tier_index,
+            CONGESTION_HOLD_MS,
+        );
+
+        // NB: intentionally do NOT arm the crash ceiling or update yo-yo state
+        // here — see the method docs for why an external relay signal must not
+        // feed client-side oscillation detection.
+        true
+    }
+
+    /// Whether a self-targeted CONGESTION drain hold is currently active.
+    ///
+    /// While active, the effective bitrate ceiling is pinned to the post-cut
+    /// tier's lower bound and tier step-up is blocked. Expires naturally when
+    /// `now_ms` passes `congestion_hold_until_ms`; no explicit clear is needed.
+    pub fn congestion_hold_active(&self, now_ms: f64) -> bool {
+        self.congestion_hold_until_ms
+            .is_some_and(|until| now_ms < until)
     }
 
     /// Set a quality ceiling that prevents step-up from going below (better
@@ -2238,6 +2366,171 @@ mod tests {
             initial_decay / 1000.0,
             expected_decay / 1000.0,
             new_decay / 1000.0,
+        );
+    }
+
+    // =====================================================================
+    // Self-targeted CONGESTION cut tests (#702)
+    // =====================================================================
+
+    #[test]
+    fn test_congestion_cut_drops_two_tiers_and_halves_bitrate() {
+        // From the default start tier, a single congestion cut should drop
+        // CONGESTION_CUT_TIERS (>= 2) tiers and shed >= 50% of the ideal bitrate.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+        let start_index = mgr.video_tier_index();
+        let start_ideal = VIDEO_QUALITY_TIERS[start_index].ideal_bitrate_kbps as f64;
+
+        let changed = mgr.force_congestion_cut(10000.0);
+        assert!(changed, "Congestion cut should change the tier");
+
+        let dropped = mgr.video_tier_index() - start_index;
+        assert!(
+            dropped >= 2,
+            "Congestion cut should drop >= 2 tiers, dropped {dropped}"
+        );
+        assert_eq!(dropped, CONGESTION_CUT_TIERS);
+
+        let new_ideal = mgr.current_video_tier().ideal_bitrate_kbps as f64;
+        assert!(
+            new_ideal <= start_ideal * 0.5,
+            "Congestion cut should shed >= 50% of ideal bitrate: {start_ideal} -> {new_ideal}"
+        );
+
+        // The congestion cut records a transition tagged "congestion".
+        let transitions = mgr.drain_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].trigger, "congestion");
+        assert_eq!(transitions[0].direction, "down");
+    }
+
+    #[test]
+    fn test_congestion_cut_at_floor_arms_hold_but_returns_false() {
+        // A cut while already at the lowest tier cannot move the tier, but must
+        // still arm the drain hold and report "no tier change".
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+        let mut mgr = new_test_manager_at(VIDEO_QUALITY_TIERS, max_idx);
+
+        let now = 10000.0;
+        let changed = mgr.force_congestion_cut(now);
+        assert!(!changed, "Cut at floor should report no tier change");
+        assert_eq!(mgr.video_tier_index(), max_idx, "Tier should not move");
+        assert!(
+            mgr.congestion_hold_active(now + 1.0),
+            "Hold must be armed even at the floor so the buffer drains"
+        );
+    }
+
+    #[test]
+    fn test_congestion_hold_blocks_step_up_then_expires() {
+        // During the hold window, good conditions must NOT raise the tier.
+        // After CONGESTION_HOLD_MS elapses, recovery is allowed again.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        let cut_at = 10000.0;
+        let changed = mgr.force_congestion_cut(cut_at);
+        assert!(changed);
+        let post_cut_index = mgr.video_tier_index();
+
+        // Drive sustained good conditions during the hold. Step-up must stay blocked.
+        // (Use ideal_bitrate so bitrate_ratio = 1.0 > recover threshold.)
+        let ideal = mgr.current_video_tier().ideal_bitrate_kbps as f64;
+        let mut t = cut_at + 100.0;
+        while t < cut_at + CONGESTION_HOLD_MS {
+            assert!(
+                mgr.congestion_hold_active(t),
+                "Hold should be active at {t}"
+            );
+            mgr.update(29.0, 30.0, ideal, ideal, t, 5);
+            assert_eq!(
+                mgr.video_tier_index(),
+                post_cut_index,
+                "Step-up must be blocked during the congestion hold (t={t})"
+            );
+            t += 400.0;
+        }
+
+        // After the hold expires, sustained good conditions allow step-up again.
+        assert!(!mgr.congestion_hold_active(cut_at + CONGESTION_HOLD_MS + 1.0));
+        let base = cut_at + CONGESTION_HOLD_MS + 1000.0;
+        let mut stepped_up = false;
+        for i in 0..=12 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(29.0, 30.0, ideal, ideal, t, 5);
+            if mgr.video_tier_index() < post_cut_index {
+                stepped_up = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_up,
+            "Recovery should resume after the congestion hold expires"
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_does_not_arm_crash_ceiling() {
+        // A self-targeted congestion cut is an external relay signal, not client
+        // oscillation: it must NOT arm the crash ceiling or feed yo-yo state.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        let step_down_count_before = mgr.step_down_count;
+
+        let changed = mgr.force_congestion_cut(10000.0);
+        assert!(changed);
+
+        assert!(
+            mgr.crash_ceiling_info().is_none(),
+            "Congestion cut must not arm the crash ceiling"
+        );
+        assert!(
+            mgr.last_step_down_ms.is_none(),
+            "Congestion cut must not feed yo-yo detection (last_step_down_ms)"
+        );
+        assert_eq!(
+            mgr.step_down_count, step_down_count_before,
+            "Congestion cut must not increment step_down_count"
+        );
+
+        // A second congestion cut shortly after (within YOYO window) must still
+        // not arm the ceiling.
+        let changed =
+            mgr.force_congestion_cut(10000.0 + MIN_TIER_TRANSITION_INTERVAL_MS as f64 + 1.0);
+        let _ = changed; // may be false if it hit the floor; either way:
+        assert!(
+            mgr.crash_ceiling_info().is_none(),
+            "Repeated congestion cuts must never arm the crash ceiling"
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_respects_warmup_and_min_interval() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        mgr.created_at_ms = 1000.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        // During warmup: no cut, no hold.
+        let changed = mgr.force_congestion_cut(2000.0);
+        assert!(!changed, "Cut should be suppressed during warmup");
+        assert!(
+            !mgr.congestion_hold_active(2001.0),
+            "Hold must not arm during warmup"
+        );
+
+        // Past warmup, first cut succeeds.
+        let t = 1000.0 + DEFAULT_WARMUP_MS + 1000.0;
+        let changed = mgr.force_congestion_cut(t);
+        assert!(changed, "Cut should fire after warmup");
+
+        // Immediate second cut is blocked by the min transition interval.
+        let changed = mgr.force_congestion_cut(t + 100.0);
+        assert!(
+            !changed,
+            "Second cut within MIN_TIER_TRANSITION_INTERVAL_MS should be blocked"
         );
     }
 }

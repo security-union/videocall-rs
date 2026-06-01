@@ -619,7 +619,16 @@ impl EncoderBitrateController {
         // Clamp the PID output to the current tier's bitrate bounds.
         let tier = self.quality_manager.current_video_tier();
         let tier_min = tier.min_bitrate_kbps as f64;
-        let tier_max = tier.max_bitrate_kbps as f64;
+        // While a self-targeted CONGESTION drain hold is active, pin the PID's
+        // max output to the tier's *ideal* (lower bound of the usable range)
+        // rather than its max, so the PID cannot ramp bitrate back up within
+        // the new tier and re-fill the still-draining relay buffer. The hold
+        // expires by timestamp, after which the normal tier max applies again.
+        let tier_max = if self.quality_manager.congestion_hold_active(now) {
+            (tier.ideal_bitrate_kbps as f64).max(tier_min)
+        } else {
+            tier.max_bitrate_kbps as f64
+        };
         let tier_clamped = final_bitrate.clamp(tier_min, tier_max);
 
         let outside_previous_tier =
@@ -740,6 +749,33 @@ impl EncoderBitrateController {
             self.pid.reset();
             log::info!(
                 "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: force_step_down)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+        changed
+    }
+
+    /// Aggressively cut video quality in response to a self-targeted server
+    /// CONGESTION signal (the relay is dropping our outbound packets).
+    ///
+    /// Delegates to [`AdaptiveQualityManager::force_congestion_cut`], which
+    /// drops multiple tiers at once and arms a short drain hold that pins the
+    /// PID's bitrate ceiling so the overflowing relay buffer can recover.
+    /// Returns `true` if the tier actually changed.
+    pub fn force_congestion_cut(&mut self) -> bool {
+        let now = self.clock.now_ms();
+        let changed = self.quality_manager.force_congestion_cut(now);
+        if changed {
+            self.tier_changed = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: congestion_cut)",
                 old_bitrate,
                 self.ideal_bitrate_kbps,
                 new_tier.label,

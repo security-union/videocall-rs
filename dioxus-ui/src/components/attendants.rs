@@ -17,7 +17,7 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -2513,13 +2513,10 @@ pub fn AttendantsComponent(
         let cap = decode_budget_cap();
 
         let natural_capped = natural.min(CANVAS_LIMIT);
-        let effective = match override_mode {
-            DecodeBudgetOverride::Fixed(n) => {
-                n.clamp(MIN_CAP, natural.clamp(MIN_CAP, CANVAS_LIMIT))
-            }
-            DecodeBudgetOverride::Auto if !pressured => natural_capped,
-            DecodeBudgetOverride::Auto => cap,
-        };
+        // Shared three-mode actuator: identical to the render-side
+        // `effective_cap` below, so reported telemetry can never drift from
+        // what is on screen (HCL #987 review FIX).
+        let effective = effective_cap(override_mode, pressured, natural, cap);
 
         // Compact, comparable snapshot. Only emit on a real change so the
         // diagnostics bus (and the health packet) is not spammed per render.
@@ -2754,20 +2751,17 @@ pub fn AttendantsComponent(
     // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2). Reactive reads
     // (`.read()`) so a change to either signal re-runs render immediately, with
     // no dependence on the 1 Hz control loop.
-    let canvas_capped_natural = total_tiles.min(CANVAS_LIMIT);
-    let effective_cap = match *decode_budget_override.read() {
-        // Manual hard override takes effect on the NEXT render, no FPS event
-        // required. `total_tiles.clamp(MIN_CAP, CANVAS_LIMIT)` floors a 0-peer
-        // upper bound at MIN_CAP so `clamp` never sees `max < min`.
-        DecodeBudgetOverride::Fixed(n) => {
-            n.clamp(MIN_CAP, total_tiles.clamp(MIN_CAP, CANVAS_LIMIT))
-        }
-        // Un-pressured Auto: cap == natural, so staggered joins are decoded
-        // immediately and no avatars appear.
-        DecodeBudgetOverride::Auto if !decode_budget_pressured() => canvas_capped_natural,
-        // Pressured Auto: the control loop owns the cap.
-        DecodeBudgetOverride::Auto => decode_budget_cap(),
-    };
+    // Shared three-mode actuator (HCL #987 review FIX): the SAME function the
+    // telemetry producer uses, so the reported cap can never drift from what is
+    // rendered here. Fixed(n) clamps into [MIN_CAP, min(natural, CANVAS_LIMIT)];
+    // un-pressured Auto == natural (staggered joins decode immediately, no
+    // avatars); pressured Auto defers to the loop-owned cap.
+    let effective_cap = effective_cap(
+        *decode_budget_override.read(),
+        decode_budget_pressured(),
+        total_tiles,
+        decode_budget_cap(),
+    );
     let budget_cap = effective_cap;
     // Natural layout capacity (already bounded by CANVAS_LIMIT through
     // `total_tiles`/`capped_real`). This decides the +N badge boundary.

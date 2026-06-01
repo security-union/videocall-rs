@@ -479,9 +479,17 @@ fn send_viewport_via(
     user_id: &str,
     session_ids: Vec<u64>,
 ) {
+    // Log the actual contents (capped) so a "froze my video" / wrongly-filtered
+    // support log shows exactly which streams the client asked the relay to keep
+    // (HCL issue #988). The list is unbounded in principle, so cap the logged
+    // sample; the `log::debug!` args are only evaluated when DEBUG is enabled, so
+    // the slice + format costs nothing at higher log levels.
+    const VIEWPORT_LOG_SAMPLE: usize = 8;
     debug!(
-        "Sending VIEWPORT packet with {} session_id(s)",
-        session_ids.len()
+        "Sending VIEWPORT packet: first {} of {} session_id(s): {:?}",
+        session_ids.len().min(VIEWPORT_LOG_SAMPLE),
+        session_ids.len(),
+        &session_ids[..session_ids.len().min(VIEWPORT_LOG_SAMPLE)]
     );
     let viewport = ViewportPacket {
         session_ids,
@@ -845,10 +853,19 @@ impl VideoCallClient {
                                         // connection_controller cell; use it so
                                         // the closure never strong-captures the
                                         // controller (no Rc cycle).
+                                        let resent_count = session_ids.len();
                                         send_viewport_via(
                                             &inner.connection_controller,
                                             &viewport_user_id,
                                             session_ids,
+                                        );
+                                        // Log the recovery edge explicitly (HCL
+                                        // issue #988): only the failure paths were
+                                        // logged before, so a support log could not
+                                        // confirm the client re-subscribed its
+                                        // viewport after a transport flap / re-election.
+                                        info!(
+                                            "VIEWPORT reconnect re-send: re-sent viewport with {resent_count} session_id(s) after reconnect"
                                         );
                                     } else {
                                         warn!("VIEWPORT reconnect re-send: inner busy, skipping");

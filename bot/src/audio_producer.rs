@@ -31,7 +31,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 const RMS_SPEAKING_ENTER: f32 = 0.012;
@@ -349,6 +349,10 @@ impl AudioProducer {
                         data: media_packet.write_to_bytes()?,
                         user_id: user_id_bytes.clone(),
                         packet_type: PacketType::MEDIA.into(),
+                        // Cleartext discriminator so the relay always forwards
+                        // AUDIO regardless of viewport (HCL issue #988). Matches
+                        // the real client (microphone_encoder.rs).
+                        media_kind: MediaKind::AUDIO.into(),
                         ..Default::default()
                     };
 

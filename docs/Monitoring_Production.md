@@ -147,6 +147,12 @@ Config: `helm/global/us-east/prometheus/values.yaml`
 | `relay_outbound_queue_depth` | Gauge | room | WT channel occupancy (capacity 256) |
 | `relay_active_sessions_per_room` | Gauge | room, transport | Connections per meeting |
 | `relay_room_bytes_total` | Counter | room, direction | Bytes forwarded (use `rate()` for bps) |
+| `relay_viewport_filtered_total` | Counter | room | VIDEO packets dropped by viewport-aware filtering (off-screen source not in receiver's viewport, HCL #988) |
+| `relay_viewport_forwarded_total` | Counter | room | VIDEO packets forwarded after passing the viewport filter — denominator for "% filtered" = `filtered / (filtered + forwarded)` (HCL #988) |
+| `relay_viewport_set_size` | Gauge | room | Most recently accepted viewport (desired-streams) set size per room. A collapse toward 0/1 while peers still publish is the wrongly-dropping / "froze my video" signature (HCL #988) |
+| `relay_viewport_updates_total` | Counter | room, outcome | VIEWPORT control-packet update outcomes (`accepted` \| `rate_limited` \| `truncated` \| `ignored_other_subject`) — makes the DoS-guard caps fire visibly without labeling normal fan-out ignores as ownership failures (HCL #988) |
+
+> **Viewport metrics (HCL #988) are Category B (dashboard, not alert page).** They back the "Viewport" panels on the *Relay Health (Server-Side)* row of the meeting-investigation dashboard; investigate "% filtered" spikes and set-size collapse there. No alert rule fires on them — a filtered-VIDEO drop is intentional bandwidth saving, not a fault. Per-source forensics ("who dropped what from whom") are deliberately NOT labels (session IDs are unbounded); enable a scoped `RUST_LOG=...chat_server=debug` on the relay to reconstruct per-room drop detail from the VIDEO-drop debug log.
 
 ### Client quality metrics (via metrics_server)
 | Metric | Description |

@@ -34,6 +34,71 @@ Introduced in PR #564 on branch `feat/bot-adaptive-quality-and-netsim`:
 | V14 | `audio_concealment_pct` populates meaningfully for lossy bot | ❓ UNCLEAR | 2026-05-06 — showed 0% even for alice; root cause not investigated |
 | V15 | Simulated loss rate measured end-to-end matches configured loss_pct | ⏳ PENDING | netsim unit tests pass but not E2E validated |
 | V16 | Costume video resolution limitation (720p fixed) doesn't break AQ decisions | ⚠️ KNOWN LIMITATION | documented; AQ logs warning when tier requests <720p |
+| V17 | Bot `media_kind` lets the relay viewport-filter bot VIDEO (no longer optimistic) | 🟦 DESIGN COMPLETE — PENDING REAL RUN | code done on `feat/988-bot-and-relay-observability`; unit tests + clippy green; not yet exercised against a live #988 relay |
+| V18 | Bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end | 🟦 DESIGN COMPLETE — PENDING REAL RUN | code + 5 `viewport_sender` unit tests green; E2E `video_bytes` drop not yet measured on a cluster |
+| V19 | Bot re-asserts its `VIEWPORT` after a viewport-subscription loss (reconnect / re-election / relay idle) so filtering does not silently lapse | 🟦 DESIGN COMPLETE — PENDING REAL RUN | `resend_on_reconnect()` + 4 unit tests green (re-send current set, no-send-when-never-sent, no-send-in-legacy, rate-limited); E2E recovery not yet measured |
+
+### #988 viewport-fidelity validation detail
+
+**V17 — bot `media_kind` enables relay viewport filtering.**
+The bot now stamps the cleartext `PacketWrapper.media_kind` exactly like a real
+client: `VIDEO` on both the VP9 (`video_producer.rs`) and costume
+(`video_producer.rs`) paths, and `AUDIO` on the Opus path
+(`audio_producer.rs`). Before this, bot packets carried
+`MEDIA_KIND_UNSPECIFIED` (0), which the relay's #988 filter treats as fail-open
+— so bot VIDEO was *never* filtered for any receiver and the load test reported
+more relay headroom than a real, filtered fleet would leave.
+
+How to verify (needs a #988-enabled relay):
+1. Run a fleet where at least one receiver (a browser or a `viewport_visible_count`-configured bot) renders a strict subset of peers, excluding bot `X`.
+2. On the relay, watch `relay_viewport_filtered_total{room=…}` (the dedicated counter at `chat_server.rs`). It must increment for bot `X`'s VIDEO toward that receiver — proving the relay now recognizes bot VIDEO as filterable.
+3. Negative control: with all packets at `media_kind=0` (old binary), the counter stays flat. Confirms the discriminator, not some other change, drives the filtering.
+Note: AUDIO is intentionally never filtered, so `media_kind=AUDIO` should *not* cause any drop — only ensure it doesn't regress audio delivery.
+
+**V18 — bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end.**
+With `viewport_visible_count: N` set in the bot config, each bot emits a
+`VIEWPORT` packet listing only the first `N` source `session_id`s it has
+discovered (ascending order → deterministic across runs). A #988 relay then
+stops forwarding VIDEO from the hidden sources to that bot. The visible-peer
+choice lives in `viewport_sender.rs::compute_visible`; the source `session_id`
+is read from the relay-stamped `PacketWrapper.session_id` fed in via
+`inbound_stats.rs::record_packet`.
+
+How to verify (needs a #988-enabled relay):
+1. Run e.g. 10 bots with `viewport_visible_count: 3`. Each bot should render 3 of the other 9 peers.
+2. Read the bot's own `inbound_stats` RX-STATS line (the 10s `video=… KB` field in `inbound_stats.rs::report`) — per-source `video_bytes` for the 6 *hidden* sources should fall to ~0 after the VIEWPORT is sent, while the 3 visible sources keep flowing. AUDIO for all 9 stays unaffected.
+3. Compare against a `viewport_visible_count: null` (legacy) control run: every source's `video_bytes` should remain non-zero (relay fails open, forwards all VIDEO).
+4. Cross-check `relay_viewport_filtered_total` increments on the relay in lockstep with the bot's `video_bytes` drop.
+
+**V19 — bot re-asserts its `VIEWPORT` after a subscription loss.**
+The relay drops a receiver's viewport subscription on disconnect; on reconnect /
+re-election it allocates a fresh empty viewport (fail-open → all VIDEO flows
+again). The browser client recovers by re-sending its viewport on the
+`Connected` state edge (`video_call_client.rs::reset_for_reconnect`). The bot has
+no equivalent connection-state event, and `InboundStats::reset()` preserves the
+`ViewportSender` (take/restore) across its 10s diagnostic window — so the
+sender's `known_sources` / `last_sent` / `has_sent` survive, and the
+change-driven `on_source_seen` path would NOT re-emit (the sources are already
+known). Without a re-assert the bot would silently receive all VIDEO again for
+the rest of the run, masking the very saving #988 measures.
+
+`ViewportSender::resend_on_reconnect()` re-sends the CURRENT visible subset
+unconditionally (the relay's copy is stale even though the local set is
+unchanged). It is invoked from `InboundStats::reset()` after the sender is
+restored. It is a no-op when legacy (`visible_count == None`), when no viewport
+was ever established (`has_sent == false` → first-connect never double-sends),
+or when the visible subset is empty; and it is rate-limited
+(`MIN_RESEND_INTERVAL = 5s`) so the 10s reset cadence cannot spam identical
+packets. Because the trigger is periodic rather than edge-driven, the re-assert
+heals ANY subscription loss (reconnect, re-election, relay idle-timeout), not
+just an in-process reconnect — the bot currently has no in-process reconnect
+loop, so this is the robust forward-looking hook.
+
+How to verify (needs a #988-enabled relay):
+1. Run a fleet with `viewport_visible_count: N` and establish steady-state filtering (per V18: hidden sources' `video_bytes` ≈ 0).
+2. Force a viewport-subscription loss for one bot (restart the relay pod it is pinned to, or trigger a re-election) without restarting the bot process.
+3. Confirm the hidden sources' `video_bytes` briefly rises (relay re-allocated an empty fail-open viewport) then falls back to ≈ 0 within one 10s reset window as the bot re-asserts; `relay_viewport_filtered_total` resumes incrementing.
+4. Confirm the bot log shows `Sent VIEWPORT (reconnect) ...` and `viewports_sent` increments on the re-assert.
 
 ## Test runs
 
@@ -112,6 +177,8 @@ Every peer scored alice **20–30 points lower** than bob. Unanimous signal. Net
 - [ ] **V9 — browser-as-ground-truth.** Have a real browser in the meeting with 3 bots: 1 passthrough, 1 `congested_wifi`, 1 `lossy_mobile`. Watch their tiles. Record subjective impressions alongside Prometheus metrics. Goal: confirm the numbers match human-observable video/audio quality differences.
 - [ ] **V13 — fix bot tier_transitions reporting.** Wire `AdaptiveQualityManager::drain_transitions()` (or equivalent) into `bot/src/health_reporter.rs::build_health_wrapper`. Small commit on feat branch. Then re-run and confirm `videocall_tier_transition_total` counter increments for bots.
 - [ ] **V14 — audio concealment investigation.** Increase alice's outbound impairment (lower uplink_kbps, higher loss_pct) and see if concealment registers. Also check whether the bot's software DTX is suppressing meaningful audio entirely.
+- [ ] **V17 — bot `media_kind` enables relay filtering.** On a #988-enabled relay, run a fleet with at least one receiver rendering a strict subset, and confirm `relay_viewport_filtered_total` increments for a bot whose VIDEO is off-screen. Negative control with the old (media_kind=0) binary keeps the counter flat. Code complete; not yet run against a live relay.
+- [ ] **V18 — bot `VIEWPORT` drops inbound `video_bytes`.** Run 10 bots with `viewport_visible_count: 3`; confirm each bot's `inbound_stats` per-source `video_bytes` falls to ~0 for the 6 hidden sources while the 3 visible sources keep flowing, and AUDIO is unaffected. Compare against a `viewport_visible_count: null` control (all sources keep flowing). Code + unit tests complete; E2E `video_bytes` drop not yet measured.
 
 ### Medium-term
 

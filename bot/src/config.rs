@@ -79,6 +79,24 @@ pub struct BotConfig {
     pub warmup_secs: Option<u64>,
     /// Number of participants that broadcast A/V. 0 (or omitted) means all broadcast.
     pub broadcasters: Option<usize>,
+    /// Viewport fidelity for load tests (HCL issue #988): "render N of M peers".
+    ///
+    /// When set, each bot emits a `VIEWPORT` control packet listing only the
+    /// first `N` source session_ids it has discovered (sorted ascending for
+    /// reproducibility). A #988-enabled relay then stops forwarding VIDEO from
+    /// the off-screen peers, so the load test measures realistic relay fan-out
+    /// instead of the optimistic "every bot decodes everyone" case.
+    ///
+    /// `None` (the default) preserves legacy behaviour: the bot never sends a
+    /// VIEWPORT and the relay forwards every stream (fail-open).
+    ///
+    /// Note the relay treats an *empty* viewport as "no signal → fail-open", so
+    /// the bot only emits a VIEWPORT once it has selected at least one visible
+    /// peer. `Some(0)` therefore behaves like `None` in practice (nothing to
+    /// render means nothing to signal); use a small positive `N` to exercise
+    /// filtering.
+    #[serde(default)]
+    pub viewport_visible_count: Option<usize>,
     /// CLI-only: apply this preset to every participant that has no `network:`
     /// block of its own. Never overrides manifest settings; only fills gaps.
     #[serde(default, skip)]

@@ -283,8 +283,13 @@ impl SessionManager {
             return None;
         }
         let subject = format!("room.{}.{}", room_id.replace(' ', "_"), requester_session);
-        let bytes =
-            Self::build_peer_joined_packet(room_id, user_id, responder_session, display_name, is_guest);
+        let bytes = Self::build_peer_joined_packet(
+            room_id,
+            user_id,
+            responder_session,
+            display_name,
+            is_guest,
+        );
         Some((subject, bytes))
     }
 
@@ -489,7 +494,13 @@ mod tests {
         // Not-yet-Active responder → no reply (only elected connections announce).
         assert!(
             SessionManager::rebroadcast_reply_publication(
-                "my-room", "alice@x.com", "Alice", 10, 20, false, /*active*/ false,
+                "my-room",
+                "alice@x.com",
+                "Alice",
+                10,
+                20,
+                false,
+                /*active*/ false,
                 /*requester_local*/ false,
             )
             .is_none(),
@@ -500,7 +511,13 @@ mod tests {
         // a NATS reply would duplicate on the client). This is the short-circuit.
         assert!(
             SessionManager::rebroadcast_reply_publication(
-                "my-room", "alice@x.com", "Alice", 10, 20, false, /*active*/ true,
+                "my-room",
+                "alice@x.com",
+                "Alice",
+                10,
+                20,
+                false,
+                /*active*/ true,
                 /*requester_local*/ true,
             )
             .is_none(),
@@ -511,7 +528,13 @@ mod tests {
         // requester's per-session subject, carrying the responder's
         // PARTICIPANT_JOINED.
         let (subject, bytes) = SessionManager::rebroadcast_reply_publication(
-            "my room", "alice@x.com", "Alice", 10, 20, true, /*active*/ true,
+            "my room",
+            "alice@x.com",
+            "Alice",
+            10,
+            20,
+            true,
+            /*active*/ true,
             /*requester_local*/ false,
         )
         .expect("Active responder + remote requester must produce a reply");

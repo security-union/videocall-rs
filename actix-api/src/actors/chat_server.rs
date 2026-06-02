@@ -2201,7 +2201,7 @@ fn try_intercept_participant_list_request(
     if wrapper.packet_type != PacketType::MEETING.into() {
         return false;
     }
-    
+
     if wrapper.user_id != SYSTEM_USER_ID.as_bytes() {
         return false;
     }
@@ -4825,8 +4825,10 @@ mod tests {
             DesiredStreams::default(),
         );
 
-        let nats_msg =
-            make_nats_message("room.disc-room.7001", make_packet_bytes(PacketType::MEETING));
+        let nats_msg = make_nats_message(
+            "room.disc-room.7001",
+            make_packet_bytes(PacketType::MEETING),
+        );
         let parsed = parse_pw(&nats_msg);
         handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 
@@ -4859,8 +4861,10 @@ mod tests {
         );
 
         // Reply addressed to session 9999, not us (7001).
-        let nats_msg =
-            make_nats_message("room.disc-room.9999", make_packet_bytes(PacketType::MEETING));
+        let nats_msg = make_nats_message(
+            "room.disc-room.9999",
+            make_packet_bytes(PacketType::MEETING),
+        );
         let parsed = parse_pw(&nats_msg);
         handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
 

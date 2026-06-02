@@ -19,7 +19,10 @@
 use crate::{
     constants::{RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL},
     messages::{
-        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave, RebroadcastPresence},
+        server::{
+            ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave,
+            RebroadcastPresence,
+        },
         session::Message,
     },
     models::build_subject_and_queue,
@@ -1077,8 +1080,7 @@ impl Handler<ActivateConnection> for ChatServer {
                     }
                 }
                 if let Some((room_id, user_id)) = room_user {
-                    let evicted =
-                        self.evict_stale_session(&iid, &room_id, &user_id, session, ctx);
+                    let evicted = self.evict_stale_session(&iid, &room_id, &user_id, session, ctx);
                     if evicted {
                         self.suppress_join_broadcast.insert(session);
                     }
@@ -1244,7 +1246,11 @@ impl Handler<RebroadcastPresence> for ChatServer {
             // Address the reply to the requesting joiner's per-session subject
             // so only that joiner forwards it to its client (the MEETING
             // unicast filter in handle_msg drops it for everyone else).
-            let subject = format!("room.{}.{}", room_id.replace(' ', "_"), msg.requester_session);
+            let subject = format!(
+                "room.{}.{}",
+                room_id.replace(' ', "_"),
+                msg.requester_session
+            );
             info!(
                 "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
                 user_id, msg.session, msg.requester_session, subject
@@ -1252,7 +1258,10 @@ impl Handler<RebroadcastPresence> for ChatServer {
             let nc = self.nats_connection.clone();
             let fut = async move {
                 if let Err(e) = nc.publish(subject, bytes.into()).await {
-                    error!("RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}", e);
+                    error!(
+                        "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
+                        e
+                    );
                 }
             };
             ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
@@ -1928,8 +1937,7 @@ impl Handler<JoinRoom> for ChatServer {
                             &room_clone,
                             session_clone,
                         );
-                        let subject_req =
-                            format!("room.{}.system", room_clone.replace(' ', "_"));
+                        let subject_req = format!("room.{}.system", room_clone.replace(' ', "_"));
                         if let Err(e) = nc2.publish(subject_req, request_bytes.into()).await {
                             warn!(
                                 "Failed to publish PARTICIPANT_LIST_REQUEST for {} in {}: {}",
@@ -1978,7 +1986,7 @@ impl Handler<JoinRoom> for ChatServer {
                             continue;
                         }
 
-                        // PARTICIPANT_LIST_REQUEST: a joiner asking existing 
+                        // PARTICIPANT_LIST_REQUEST: a joiner asking existing
                         // peers to re-announce themselves.
                         // Consumed by the relay; never forwarded to clients.
                         if try_intercept_participant_list_request(

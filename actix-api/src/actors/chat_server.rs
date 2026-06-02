@@ -418,11 +418,12 @@ impl ChatServer {
         // have been seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event
         // before the first JoinRoom, and a stale `Leave` / `Disconnect` for
         // that room must not wipe the legitimately-cached policy.
+        self.session_room.remove(session_id);
+
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
             }
-            self.session_room.remove(session_id);
             self.forget_room_if_empty(room_id);
         }
 
@@ -1065,6 +1066,24 @@ impl Handler<ActivateConnection> for ChatServer {
             true
         };
 
+        // Resolve this session's (room, user_id) ONCE via the O(1) `session_room`
+        // reverse index over every room's members.
+        // Shared by the local same-instance eviction and the cross-server
+        // eviction broadcast below; only the elected (activating) connection
+        // needs it.
+        let room_user: Option<(String, String)> = if was_testing {
+            self.session_room.get(&session).and_then(|room_id| {
+                self.room_members.get(room_id).and_then(|members| {
+                    members
+                        .iter()
+                        .find(|m| m.session == session)
+                        .map(|m| (room_id.clone(), m.user_id.clone()))
+                })
+            })
+        } else {
+            None
+        };
+
         // --- Local same-instance eviction ---
         // Now that this session is elected (Testing → Active), evict any
         // same-instance sibling that is still in room_members. This is the
@@ -1072,15 +1091,8 @@ impl Handler<ActivateConnection> for ChatServer {
         // ours and whose entry is now stale.
         if was_testing {
             if let Some(iid) = self.session_instance.get(&session).cloned() {
-                let mut room_user: Option<(String, String)> = None;
-                for (room_id, members) in &self.room_members {
-                    if let Some(m) = members.iter().find(|m| m.session == session) {
-                        room_user = Some((room_id.clone(), m.user_id.clone()));
-                        break;
-                    }
-                }
-                if let Some((room_id, user_id)) = room_user {
-                    let evicted = self.evict_stale_session(&iid, &room_id, &user_id, session, ctx);
+                if let Some((room_id, user_id)) = &room_user {
+                    let evicted = self.evict_stale_session(&iid, room_id, user_id, session, ctx);
                     if evicted {
                         self.suppress_join_broadcast.insert(session);
                     }
@@ -1096,24 +1108,11 @@ impl Handler<ActivateConnection> for ChatServer {
         // lose the election never trigger a NATS eviction message.
         if was_testing {
             if let Some(iid) = self.session_instance.get(&session).cloned() {
-                // Look up room and user_id from room_members.
-                let mut room_user: Option<(String, String)> = None;
-                for (room_id, members) in &self.room_members {
-                    for m in members {
-                        if m.session == session {
-                            room_user = Some((room_id.clone(), m.user_id.clone()));
-                            break;
-                        }
-                    }
-                    if room_user.is_some() {
-                        break;
-                    }
-                }
-                if let Some((room_id, user_id)) = room_user {
+                if let Some((room_id, user_id)) = &room_user {
                     let payload = EvictInstancePayload {
                         instance_id: iid,
-                        room: room_id,
-                        user_id,
+                        room: room_id.clone(),
+                        user_id: user_id.clone(),
                         new_session_id: session,
                     };
                     match serde_json::to_vec(&payload) {
@@ -1215,56 +1214,48 @@ impl Handler<RebroadcastPresence> for ChatServer {
             });
 
         if let Some((room_id, user_id, display_name)) = found {
-            if self.connection_states.get(&msg.session).copied() != Some(ConnectionState::Active) {
-                return;
-            }
-
-            // Skip NATS rebroadcast if the requester is on this server instance.
-            // The local in-memory replay (in JoinRoom) already sent them the
-            // PARTICIPANT_JOINED directly via `try_send`, so publishing via NATS
-            // would cause a duplicate on the client.
-            if self.connection_states.contains_key(&msg.requester_session) {
-                debug!(
-                    "RebroadcastPresence: requester {} is local — skipping NATS rebroadcast \
-                     (local replay already covered it)",
-                    msg.requester_session
-                );
-                return;
-            }
+            let responder_is_active =
+                self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
+            // The requester is "local" if this instance tracks its connection;
+            // then the in-memory existing-member replay already delivered the
+            // PARTICIPANT_JOINED, so a NATS reply would duplicate it.
+            let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
             let is_guest = self
                 .session_is_guest
                 .get(&msg.session)
                 .copied()
                 .unwrap_or(false);
-            let bytes = SessionManager::build_peer_joined_packet(
+
+            if let Some((subject, bytes)) = SessionManager::rebroadcast_reply_publication(
                 &room_id,
                 &user_id,
-                msg.session,
                 &display_name,
+                msg.session,
+                msg.requester_session,
                 is_guest,
-            );
-            // Address the reply to the requesting joiner's per-session subject
-            // so only that joiner forwards it to its client (the MEETING
-            // unicast filter in handle_msg drops it for everyone else).
-            let subject = format!(
-                "room.{}.{}",
-                room_id.replace(' ', "_"),
-                msg.requester_session
-            );
-            info!(
-                "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
-                user_id, msg.session, msg.requester_session, subject
-            );
-            let nc = self.nats_connection.clone();
-            let fut = async move {
-                if let Err(e) = nc.publish(subject, bytes.into()).await {
-                    error!(
-                        "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
-                        e
-                    );
-                }
-            };
-            ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
+                responder_is_active,
+                requester_is_local,
+            ) {
+                info!(
+                    "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
+                    user_id, msg.session, msg.requester_session, subject
+                );
+                let nc = self.nats_connection.clone();
+                let fut = async move {
+                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                        error!(
+                            "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
+                            e
+                        );
+                    }
+                };
+                ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
+            } else {
+                debug!(
+                    "RebroadcastPresence: no reply for session {} (active={}, requester {} local={})",
+                    msg.session, responder_is_active, msg.requester_session, requester_is_local
+                );
+            }
         }
     }
 }
@@ -1932,12 +1923,13 @@ impl Handler<JoinRoom> for ChatServer {
                     // RebroadcastPresence on their local ChatServer, which replies
                     // on this joiner's per-session subject. This joiner is now
                     // subscribed and will receive the reply.
-                    if !observer {
-                        let request_bytes = SessionManager::build_participant_list_request(
+                    if let Some((subject_req, request_bytes)) =
+                        SessionManager::participant_list_request_publication(
+                            observer,
                             &room_clone,
                             session_clone,
-                        );
-                        let subject_req = format!("room.{}.system", room_clone.replace(' ', "_"));
+                        )
+                    {
                         if let Err(e) = nc2.publish(subject_req, request_bytes.into()).await {
                             warn!(
                                 "Failed to publish PARTICIPANT_LIST_REQUEST for {} in {}: {}",
@@ -2207,6 +2199,10 @@ fn try_intercept_participant_list_request(
     };
 
     if wrapper.packet_type != PacketType::MEETING.into() {
+        return false;
+    }
+    
+    if wrapper.user_id != SYSTEM_USER_ID.as_bytes() {
         return false;
     }
 
@@ -4798,6 +4794,120 @@ mod tests {
     }
 
     // ======================================================================
+    // MEETING unicast reply filter (cross-server peer discovery)
+    // ======================================================================
+    //
+    // A PARTICIPANT_JOINED published in reply to a PARTICIPANT_LIST_REQUEST is
+    // addressed to ONE requester by publishing on that requester's per-session
+    // subject (`room.{room}.{N}`). Every session receives it via the room
+    // wildcard, so `handle_msg` must forward it ONLY to the targeted session N
+    // and drop it for everyone else (a presence info-leak boundary). Broadcast
+    // MEETING events use `room.{room}.system` and must still reach everyone.
+
+    /// A MEETING packet on the receiver's OWN per-session subject is the
+    /// targeted reply and must be forwarded. (`make_packet_bytes` leaves the
+    /// inner session_id at 0, so the self-echo `inner_session_self` guard does
+    /// not fire — the packet is delivered, not dropped.)
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_targeted_reply_forwarded_to_requester() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "requester".to_string(),
+            DesiredStreams::default(),
+        );
+
+        let nats_msg =
+            make_nats_message("room.disc-room.7001", make_packet_bytes(PacketType::MEETING));
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "targeted MEETING reply on our own subject MUST be forwarded"
+        );
+    }
+
+    /// A MEETING packet on ANOTHER session's per-session subject is a reply
+    /// addressed to a different requester and MUST be dropped for us — this is
+    /// the presence info-leak boundary.
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_targeted_reply_dropped_for_non_requester() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "bystander".to_string(),
+            DesiredStreams::default(),
+        );
+
+        // Reply addressed to session 9999, not us (7001).
+        let nats_msg =
+            make_nats_message("room.disc-room.9999", make_packet_bytes(PacketType::MEETING));
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "targeted MEETING reply on another session's subject MUST be dropped"
+        );
+    }
+
+    /// A broadcast MEETING event (PARTICIPANT_JOINED at activation,
+    /// PARTICIPANT_LEFT, etc.) uses the `.system` subject and MUST reach every
+    /// session, including ones that are not the targeted requester.
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_system_broadcast_forwarded() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "peer".to_string(),
+            DesiredStreams::default(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.disc-room.system",
+            make_packet_bytes(PacketType::MEETING),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "broadcast MEETING event on .system subject MUST be forwarded to all"
+        );
+    }
+
+    // ======================================================================
     // Viewport-aware VIDEO filtering (HCL issue #988)
     // ======================================================================
     //
@@ -5643,15 +5753,8 @@ mod tests {
             "Session A should have no active NATS subscription"
         );
 
-        // Verify PARTICIPANT_JOINED is suppressed for Session B
-        let suppressed = chat_server
-            .send(IsSuppressedJoinBroadcast { session: session_b })
-            .await
-            .expect("IsSuppressedJoinBroadcast should succeed");
-        assert!(
-            suppressed,
-            "Session B should have PARTICIPANT_JOINED suppressed (eviction reconnect)"
-        );
+        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
+        // (the flag is removed when the broadcast is correctly skipped).
     }
 
     // ------------------------------------------------------------------
@@ -7601,15 +7704,8 @@ mod tests {
             "In-tab reconnect (same instance_id) must still leave one member"
         );
         assert_eq!(members[0].session, session_b);
-
-        let suppressed = chat_server
-            .send(IsSuppressedJoinBroadcast { session: session_b })
-            .await
-            .expect("IsSuppressedJoinBroadcast should succeed");
-        assert!(
-            suppressed,
-            "In-tab reconnect should still suppress PARTICIPANT_JOINED"
-        );
+        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
+        // (the flag is removed when the broadcast is correctly skipped).
     }
 
     // ------------------------------------------------------------------

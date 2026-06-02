@@ -120,6 +120,7 @@ pub(crate) fn promote_speakers(
 ///
 /// Returns the (possibly escalated) `DensityMode`.  If even `Maximum` cannot
 /// fit all speakers, `Maximum` is returned (never panics).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_effective_density(
     user_mode: DensityMode,
     total_tiles: usize,

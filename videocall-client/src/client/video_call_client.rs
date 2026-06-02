@@ -2462,6 +2462,13 @@ impl Inner {
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
+                        Ok(MeetingEventType::PARTICIPANT_LIST_REQUEST) => {
+                            // Server-internal event: a joiner asking existing
+                            // peers to re-announce themselves. The relay consumes
+                            // it and never forwards it to clients, so reaching the
+                            // client is unexpected — ignore it.
+                            debug!("Ignoring server-internal PARTICIPANT_LIST_REQUEST");
+                        }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",

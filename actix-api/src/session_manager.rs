@@ -219,6 +219,23 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build PARTICIPANT_LIST_REQUEST packet.
+    pub fn build_participant_list_request(room_id: &str, requester_session: u64) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_LIST_REQUEST.into(),
+            room_id: room_id.to_string(),
+            session_id: requester_session,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
@@ -358,6 +375,31 @@ mod tests {
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.target_user_id, to_user_id_bytes("alice"));
         assert_eq!(inner.session_id, 99);
+    }
+
+    #[tokio::test]
+    async fn test_build_participant_list_request() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // The requesting joiner's session is carried in `session_id` so peers
+        // can ignore their own request and address the reply back to it.
+        let requester_session = 4242u64;
+        let packet = SessionManager::build_participant_list_request("my-room", requester_session);
+
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        // Must be a server-authoritative MEETING packet; `classify_packet`
+        // drops client-originated MEETING packets, so clients cannot forge it.
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_LIST_REQUEST.into()
+        );
+        assert_eq!(inner.room_id, "my-room");
+        assert_eq!(inner.session_id, requester_session);
     }
 
     /// Verify that build_peer_joined_packet and build_peer_left_packet are

@@ -105,3 +105,21 @@ pub struct Leave {
 pub struct ActivateConnection {
     pub session: SessionId,
 }
+
+/// Sent from a session's NATS loop when it receives a PARTICIPANT_LIST_REQUEST
+/// event. The ChatServer re-publishes this session's PARTICIPANT_JOINED so the
+/// requesting joiner learns about this peer.
+///
+/// The reply is published to the requester's per-session subject
+/// (`room.{room}.{requester_session}`) so that, although every session receives
+/// it via the room wildcard subscription, only the requester forwards it to its
+/// client (see the MEETING unicast filter in `handle_msg`).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct RebroadcastPresence {
+    /// The responding peer's own session (the peer being announced).
+    pub session: SessionId,
+    /// The joiner that asked for the participant list; the reply is addressed
+    /// to this session.
+    pub requester_session: SessionId,
+}

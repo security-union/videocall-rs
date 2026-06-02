@@ -19,7 +19,7 @@
 use crate::{
     constants::{RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL},
     messages::{
-        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave, RebroadcastPresence},
         session::Message,
     },
     models::build_subject_and_queue,
@@ -329,6 +329,11 @@ pub struct ChatServer {
     /// exists purely to own the shared handle and bound its lifetime (entries
     /// are removed on `leave_rooms`/`forget_session`), not as a read source.
     session_desired_streams: HashMap<SessionId, DesiredStreams>,
+    /// Reverse index: `SessionId` → `room_id`. Enables O(1) room lookup in
+    /// paths like `RebroadcastPresence` instead of scanning all rooms.
+    /// Populated for non-observer sessions at JoinRoom; removed at
+    /// `leave_rooms` / `forget_session`.
+    session_room: HashMap<SessionId, String>,
 }
 
 impl ChatServer {
@@ -347,6 +352,7 @@ impl ChatServer {
             session_instance: HashMap::new(),
             session_is_guest: HashMap::new(),
             session_desired_streams: HashMap::new(),
+            session_room: HashMap::new(),
         }
     }
 
@@ -413,6 +419,7 @@ impl ChatServer {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
             }
+            self.session_room.remove(session_id);
             self.forget_room_if_empty(room_id);
         }
 
@@ -696,6 +703,7 @@ impl ChatServer {
         let _ = self.suppress_join_broadcast.remove(&session_id);
         let _ = self.session_is_guest.remove(&session_id);
         let _ = self.session_desired_streams.remove(&session_id);
+        let _ = self.session_room.remove(&session_id);
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
         // evict them while a departure is pending, we want the new session to
@@ -1054,6 +1062,32 @@ impl Handler<ActivateConnection> for ChatServer {
             true
         };
 
+        // --- Local same-instance eviction ---
+        // Now that this session is elected (Testing → Active), evict any
+        // same-instance sibling that is still in room_members. This is the
+        // losing RTT-election candidate (WS or WT) whose JoinRoom ran BEFORE
+        // ours and whose entry is now stale.
+        if was_testing {
+            if let Some(iid) = self.session_instance.get(&session).cloned() {
+                let mut room_user: Option<(String, String)> = None;
+                for (room_id, members) in &self.room_members {
+                    if let Some(m) = members.iter().find(|m| m.session == session) {
+                        room_user = Some((room_id.clone(), m.user_id.clone()));
+                        break;
+                    }
+                }
+                if let Some((room_id, user_id)) = room_user {
+                    let evicted =
+                        self.evict_stale_session(&iid, &room_id, &user_id, session, ctx);
+                    if evicted {
+                        self.suppress_join_broadcast.insert(session);
+                    }
+                }
+                // Claim the forward mapping now that we are the elected winner.
+                self.instance_index.insert(iid, session);
+            }
+        }
+
         // --- Cross-server eviction broadcast ---
         // Deferred from JoinRoom to here so that only the elected connection
         // (the winner of RTT election) publishes. Testing connections that
@@ -1159,6 +1193,69 @@ impl Handler<ActivateConnection> for ChatServer {
                     session
                 );
             }
+        }
+    }
+}
+
+impl Handler<RebroadcastPresence> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: RebroadcastPresence, ctx: &mut Self::Context) -> Self::Result {
+        let found = self
+            .session_room
+            .get(&msg.session)
+            .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
+            .and_then(|(room_id, members)| {
+                members
+                    .iter()
+                    .find(|m| m.session == msg.session)
+                    .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
+            });
+
+        if let Some((room_id, user_id, display_name)) = found {
+            if self.connection_states.get(&msg.session).copied() != Some(ConnectionState::Active) {
+                return;
+            }
+
+            // Skip NATS rebroadcast if the requester is on this server instance.
+            // The local in-memory replay (in JoinRoom) already sent them the
+            // PARTICIPANT_JOINED directly via `try_send`, so publishing via NATS
+            // would cause a duplicate on the client.
+            if self.connection_states.contains_key(&msg.requester_session) {
+                debug!(
+                    "RebroadcastPresence: requester {} is local — skipping NATS rebroadcast \
+                     (local replay already covered it)",
+                    msg.requester_session
+                );
+                return;
+            }
+            let is_guest = self
+                .session_is_guest
+                .get(&msg.session)
+                .copied()
+                .unwrap_or(false);
+            let bytes = SessionManager::build_peer_joined_packet(
+                &room_id,
+                &user_id,
+                msg.session,
+                &display_name,
+                is_guest,
+            );
+            // Address the reply to the requesting joiner's per-session subject
+            // so only that joiner forwards it to its client (the MEETING
+            // unicast filter in handle_msg drops it for everyone else).
+            let subject = format!("room.{}.{}", room_id.replace(' ', "_"), msg.requester_session);
+            info!(
+                "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
+                user_id, msg.session, msg.requester_session, subject
+            );
+            let nc = self.nats_connection.clone();
+            let fut = async move {
+                if let Err(e) = nc.publish(subject, bytes.into()).await {
+                    error!("RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}", e);
+                }
+            };
+            ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
         }
     }
 }
@@ -1532,25 +1629,13 @@ impl Handler<JoinRoom> for ChatServer {
         // Sanitize instance_id: reject oversized values to prevent memory abuse.
         let instance_id = instance_id.filter(|iid| !iid.is_empty() && iid.len() <= 64);
 
-        // --- Live session eviction by instance_id ---
-        // If the client provides an instance_id (stable UUID per tab/meeting),
-        // look up the instance_index to find the previous session for this
-        // client instance. If found (and it belongs to the same user), evict
-        // the stale session silently so peers don't see a spurious leave/join.
-        // This handles the common case where the client reconnects before the
-        // server's heartbeat timeout detects the old session is dead.
-        let mut evicted_old_session = false;
+        // Record session→iid now; the forward index and eviction are deferred to
+        // ActivateConnection. During RTT election both WS and WT candidates share
+        // one instance_id — evicting at JoinRoom would kill the earlier candidate's
+        // NATS task before we know which one wins, breaking PARTICIPANT_LIST_REQUEST
+        // responses.
         if let Some(ref iid) = instance_id {
-            evicted_old_session = self.evict_stale_session(iid, &room, &user_id, session, ctx);
-
-            // Register/update this instance_id → session mapping (both directions).
-            self.instance_index.insert(iid.clone(), session);
             self.session_instance.insert(session, iid.clone());
-
-            // Cross-server eviction broadcast is deferred to ActivateConnection.
-            // During RTT election, multiple connections (WS + WT) fire JoinRoom,
-            // but only the winner activates. Publishing here would send 2-4
-            // unnecessary NATS messages per connect.
         }
 
         // --- Multi-session-per-user is allowed (issue #828) ---
@@ -1618,8 +1703,10 @@ impl Handler<JoinRoom> for ChatServer {
         // Mark reconnection and observer sessions so ActivateConnection does not
         // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
         // "left" from peers' perspective; observers are never announced.
-        // Also suppress for instance_id-based evictions (same client instance).
-        if is_reconnection || evicted_old_session || observer {
+        // Instance_id-based eviction suppression is NOT set here — eviction is
+        // deferred to ActivateConnection, which adds the elected session to
+        // `suppress_join_broadcast` itself if it evicted a predecessor.
+        if is_reconnection || observer {
             self.suppress_join_broadcast.insert(session);
         }
 
@@ -1684,6 +1771,7 @@ impl Handler<JoinRoom> for ChatServer {
 
         // Track this session in room_members (only for non-observers)
         if !observer {
+            self.session_room.insert(session, room.clone());
             self.room_members
                 .entry(room.clone())
                 .or_default()
@@ -1769,7 +1857,7 @@ impl Handler<JoinRoom> for ChatServer {
             // Reconnection joins also skip the broadcast (the user never
             // "left" from peers' perspective), and observer joins are
             // never broadcast either.
-            if is_reconnection || evicted_old_session {
+            if is_reconnection {
                 info!(
                     "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
                      (deferred broadcast also skipped)",
@@ -1828,6 +1916,27 @@ impl Handler<JoinRoom> for ChatServer {
                     );
                     let self_subject =
                         format!("room.{room_clone}.{session_clone}").replace(' ', "_");
+
+                    // Publish PARTICIPANT_LIST_REQUEST to the room system subject
+                    // so peers on other servers re-broadcast their PARTICIPANT_JOINED.
+                    // Those peers receive this request in their NATS loops and call
+                    // RebroadcastPresence on their local ChatServer, which replies
+                    // on this joiner's per-session subject. This joiner is now
+                    // subscribed and will receive the reply.
+                    if !observer {
+                        let request_bytes = SessionManager::build_participant_list_request(
+                            &room_clone,
+                            session_clone,
+                        );
+                        let subject_req =
+                            format!("room.{}.system", room_clone.replace(' ', "_"));
+                        if let Err(e) = nc2.publish(subject_req, request_bytes.into()).await {
+                            warn!(
+                                "Failed to publish PARTICIPANT_LIST_REQUEST for {} in {}: {}",
+                                user_id_clone, room_clone, e
+                            );
+                        }
+                    }
                     while let Some(msg) = sub.next().await {
                         // Parse the PacketWrapper EXACTLY ONCE per packet and
                         // share the result with every consumer below. This is
@@ -1865,6 +1974,18 @@ impl Handler<JoinRoom> for ChatServer {
                             session_clone,
                             &desired_streams_for_loop,
                             &room_clone,
+                        ) {
+                            continue;
+                        }
+
+                        // PARTICIPANT_LIST_REQUEST: a joiner asking existing 
+                        // peers to re-announce themselves.
+                        // Consumed by the relay; never forwarded to clients.
+                        if try_intercept_participant_list_request(
+                            &msg,
+                            parsed.as_ref(),
+                            session_clone,
+                            &server_addr,
                         ) {
                             continue;
                         }
@@ -2053,6 +2174,60 @@ fn try_intercept_viewport(
     true
 }
 
+/// Checks whether `msg` is a `PARTICIPANT_LIST_REQUEST` system event.
+/// If so, asks the local ChatServer (via `RebroadcastPresence`) to re-publish
+/// this session's own PARTICIPANT_JOINED addressed to the requesting joiner, so
+/// a cross-server joiner — whose NATS subscription was established after the
+/// original deferred PARTICIPANT_JOINED was published — learns about this peer.
+///
+/// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
+/// Returns `true` when intercepted (caller must `continue`); `false` otherwise.
+fn try_intercept_participant_list_request(
+    msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
+    own_session: SessionId,
+    server: &Addr<ChatServer>,
+) -> bool {
+    // The request is broadcast on the room system subject only.
+    if !msg.subject.ends_with(".system") {
+        return false;
+    }
+
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return false,
+    };
+
+    if wrapper.packet_type != PacketType::MEETING.into() {
+        return false;
+    }
+
+    let inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if inner.event_type != MeetingEventType::PARTICIPANT_LIST_REQUEST.into() {
+        return false;
+    }
+
+    // Ignore our own request (we published it; no need to answer ourselves).
+    if inner.session_id == own_session {
+        return true;
+    }
+
+    debug!(
+        "PARTICIPANT_LIST_REQUEST received (requester session={}), re-broadcasting own presence \
+         for session {}",
+        inner.session_id, own_session
+    );
+    server.do_send(RebroadcastPresence {
+        session: own_session,
+        requester_session: inner.session_id,
+    });
+    true
+}
+
 /// Checks whether `msg` is a `PARTICIPANT_DISPLAY_NAME_CHANGED` system event.
 /// If so, validates and sanitises the packet, updates actor state via `server`,
 /// and forwards the rebuilt packet to `recipient`. Returns `true` when the
@@ -2232,6 +2407,11 @@ fn handle_msg(
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
 
+        let is_meeting = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::MEETING.into())
+            .unwrap_or(false);
+
         // Self-skip prevents echo of our own broadcasts. We treat a packet
         // as "from this session" if EITHER:
         //
@@ -2262,8 +2442,35 @@ fn handle_msg(
             .map(|pw| pw.session_id != 0 && pw.session_id == session)
             .unwrap_or(false);
 
-        if (subject_self || inner_session_self) && !is_congestion {
+        // MEETING packets are server-authoritative — clients never publish them
+        // (`classify_packet` drops client MEETING packets). So a MEETING packet
+        // arriving on our OWN per-session subject is never an echo of our own
+        // traffic; it is a server message addressed to us (a PARTICIPANT_JOINED
+        // reply to our PARTICIPANT_LIST_REQUEST). MEETING packets therefore
+        // bypass the subject-based self-skip, but are still dropped by
+        // `inner_session_self` when they announce our own session.
+        let drop_self_echo = if is_meeting {
+            inner_session_self
+        } else {
+            subject_self || inner_session_self
+        };
+        if drop_self_echo && !is_congestion {
             return Ok(());
+        }
+
+        // Unicast MEETING reply filter (see `RebroadcastPresence`): a
+        // PARTICIPANT_JOINED sent in reply to a PARTICIPANT_LIST_REQUEST is
+        // addressed to a single requester by publishing on that requester's
+        // per-session subject (`room.{room}.{N}`). Every session receives it via
+        // the room wildcard, so drop it unless it targets us. Broadcast MEETING
+        // events (PARTICIPANT_JOINED at activation, PARTICIPANT_LEFT, etc.) use
+        // the `room.{room}.system` subject and are left untouched.
+        if is_meeting && !subject_self {
+            let is_system_subject =
+                msg.subject == format!("room.{room}.system").replace(' ', "_").into();
+            if !is_system_subject {
+                return Ok(());
+            }
         }
 
         // PEER_EVENT packets are unicast at the application layer: the

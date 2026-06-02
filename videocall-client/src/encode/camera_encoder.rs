@@ -95,6 +95,7 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
+use videocall_aq::fit_within_preserving_aspect;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -1007,9 +1008,24 @@ impl CameraEncoder {
                         local_tier_max_width = new_tier_w;
                         local_tier_max_height = new_tier_h;
 
-                        // Constrain current encoder dimensions to the tier max.
-                        let constrained_w = current_encoder_width.min(local_tier_max_width);
-                        let constrained_h = current_encoder_height.min(local_tier_max_height);
+                        // Constrain current encoder dimensions to the tier max,
+                        // preserving the source aspect ratio (issue #1037).
+                        //
+                        // `current_encoder_*` always carries the source aspect:
+                        // it is seeded from the native track dimensions and is
+                        // only ever updated via this same uniform fit (or from a
+                        // raw VideoFrame's native dims on the per-frame path
+                        // below), so using it as the "source" here keeps the
+                        // ratio intact while the tier ceiling tightens. A
+                        // per-axis `.min()` here would stretch/squash whenever
+                        // the source aspect (e.g. 4:3 webcam) differs from the
+                        // 16:9 tier ceiling.
+                        let (constrained_w, constrained_h) = fit_within_preserving_aspect(
+                            current_encoder_width,
+                            current_encoder_height,
+                            local_tier_max_width,
+                            local_tier_max_height,
+                        );
 
                         log::info!(
                             "CameraEncoder: tier dimension change -> {}x{} (was {}x{})",
@@ -1080,19 +1096,30 @@ impl CameraEncoder {
                                 .unchecked_into::<VideoFrame>();
 
                             // Check for dimension changes (rotation, camera switch).
-                            // Also constrain to current tier max dimensions.
+                            // Also constrain to current tier max dimensions while
+                            // preserving the frame's native aspect ratio (#1037).
+                            //
+                            // `display_width()` / `display_height()` are the raw
+                            // native VideoFrame dimensions — the true source
+                            // aspect. Fitting them uniformly (rather than a
+                            // per-axis `.min()`) prevents the encoder from baking
+                            // a stretch/squash into the stream when the source
+                            // (e.g. a 4:3 webcam) does not match the 16:9 tier.
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
-                            let clamped_width = if frame_width > 0 {
-                                frame_width.min(local_tier_max_width)
-                            } else {
-                                frame_width
-                            };
-                            let clamped_height = if frame_height > 0 {
-                                frame_height.min(local_tier_max_height)
-                            } else {
-                                frame_height
-                            };
+                            let (clamped_width, clamped_height) =
+                                if frame_width > 0 && frame_height > 0 {
+                                    fit_within_preserving_aspect(
+                                        frame_width,
+                                        frame_height,
+                                        local_tier_max_width,
+                                        local_tier_max_height,
+                                    )
+                                } else {
+                                    // Degenerate frame dims: leave as-is so the
+                                    // `> 0` change-detection below skips reconfigure.
+                                    (frame_width, frame_height)
+                                };
 
                             if clamped_width > 0
                                 && clamped_height > 0

@@ -305,16 +305,25 @@ pub fn DeviceSettingsModal(
     #[props(default)] initial_section: Option<String>,
 ) -> Element {
     let is_ios_safari = is_ios();
-    // The parent uses a `key` (generation counter) to recreate this component
-    // each time the modal opens, so `use_signal`'s initializer runs fresh with
-    // the correct starting section.  No render-body signal mutations needed.
-    let initial = match initial_section.as_deref() {
+    // Map the parent's requested section string to the enum.
+    let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
         Some("network") => SettingsSection::Network,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
     };
-    let mut active_section = use_signal(move || initial);
+    // The parent uses a `key` (generation counter) to recreate this component
+    // when the modal first opens, so `use_signal`'s initializer runs fresh.
+    let mut active_section = use_signal(move || requested);
+    // Defensive: detect parent-driven section switches while the modal stays
+    // mounted. Currently unreachable (the fullscreen overlay prevents clicking
+    // "Dock Settings…" while open), but guards against future callers that may
+    // change `initial_section` without a key remount.
+    let mut prev_section_prop = use_signal(move || initial_section.clone());
+    if *prev_section_prop.read() != initial_section {
+        prev_section_prop.set(initial_section.clone());
+        active_section.set(requested);
+    }
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
     let mut sticky_transport = use_signal(load_transport_sticky);
     let mut pending_protocol = use_signal(|| transport_preference);

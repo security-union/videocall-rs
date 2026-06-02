@@ -388,6 +388,17 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
+    /// Which simulcast layer (issue #989) this receiver decodes for this peer.
+    ///
+    /// VIDEO `PacketWrapper`s whose cleartext `simulcast_layer_id` does not
+    /// match this value are dropped BEFORE sequence tracking and decode, so a
+    /// peer publishing N>1 layers only ever costs this receiver one layer's
+    /// decode. The first-cut default is **0 (the lowest layer)** unconditionally
+    /// — which is also exactly what every pre-simulcast publisher emits, so
+    /// behaviour is unchanged for them. Viewport/tile-size-driven layer
+    /// selection (raising this to a higher layer for the focused tile) is
+    /// deferred to a later PR.
+    selected_video_layer: u32,
     /// Reorder-tolerant sequence tracker for video packets.
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
@@ -538,6 +549,9 @@ impl Peer {
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
+            // Default to the lowest layer (0). Pre-simulcast publishers send 0,
+            // so this is unchanged behaviour for them.
+            selected_video_layer: 0,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             // HCL bug #1: 0 means "no media frame observed yet". The
@@ -616,6 +630,16 @@ impl Peer {
         // have.  Resetting the flag would let straggler frames through until
         // the next heartbeat, which is the opposite of what we want.
         Ok(())
+    }
+
+    /// Select which simulcast layer (issue #989) this receiver decodes for this
+    /// peer. VIDEO packets tagged with a different `simulcast_layer_id` are
+    /// dropped before sequence tracking and decode. Defaults to 0 (lowest
+    /// layer). Reserved for viewport/tile-size-driven selection in a later PR;
+    /// in PR A it always stays 0.
+    #[allow(dead_code)]
+    pub fn set_selected_video_layer(&mut self, layer: u32) {
+        self.selected_video_layer = layer;
     }
 
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
@@ -706,6 +730,13 @@ impl Peer {
             return Err(PeerDecodeError::IncorrectPacketType);
         }
 
+        // Read the cleartext simulcast layer id from the OUTER wrapper (issue
+        // #989) before `packet` is shadowed by the decrypted inner MediaPacket.
+        // Pre-simulcast publishers (and the single-layer default) send 0, so
+        // this is 0 for them. The VIDEO arm uses it to drop non-selected layers
+        // before any sequence tracking / decode.
+        let incoming_video_layer = packet.simulcast_layer_id;
+
         let packet = match self.aes {
             Some(aes) => {
                 let data = aes
@@ -722,6 +753,21 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Simulcast layer-select guard (issue #989). Drop any VIDEO
+                // packet that is not the layer this receiver is decoding for
+                // this peer — BEFORE sequence tracking and BEFORE decode.
+                //
+                // This MUST run before `track_sequence`: each simulcast layer
+                // carries an independent dense sequence, so feeding a
+                // non-selected layer's sequence into our single per-peer
+                // `video_seq_tracker` would manufacture phantom loss
+                // (~(N-1)/N) and trigger spurious PLI storms. For
+                // pre-simulcast publishers `incoming_video_layer` is 0 and
+                // `selected_video_layer` defaults to 0, so nothing is dropped.
+                if incoming_video_layer != self.selected_video_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // Track sequence numbers for gap detection (PLI) and windowed
                 // loss/keyframe-rate accounting (freeze observability #1013).
                 let seq = self.track_sequence(media_type, &packet);
@@ -1959,6 +2005,28 @@ mod tests {
         wrap(&media, session_id)
     }
 
+    /// A VIDEO `PacketWrapper` carrying an outer `simulcast_layer_id` and an
+    /// inner `VideoMetadata.sequence`, used by the receiver layer-select guard
+    /// tests (issue #989).
+    fn layered_video_packet(session_id: u64, layer: u32, seq: u64) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: "test@test.com".into(),
+            data: vec![0u8; 10],
+            frame_type: "key".to_string(),
+            video_metadata: Some(VideoMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let mut wrapper = packet_wrapper(&media, session_id);
+        wrapper.simulcast_layer_id = layer;
+        Arc::new(wrapper)
+    }
+
     /// Create a `Peer` with no-op decoders (no browser APIs required).
     /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
     /// decoder's muted state for test assertions.
@@ -1989,6 +2057,7 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -3472,6 +3541,93 @@ mod tests {
         );
     }
 
+    /// Receiver simulcast layer-select guard (issue #989).
+    ///
+    /// A peer publishing three layers (0/1/2) with independent dense per-layer
+    /// sequences, arriving interleaved 0,1,2,0,1,2,…, must:
+    ///   * only have layer 0 (the selected default) reach the decoder, and
+    ///   * produce ZERO phantom loss in `video_seq_tracker` — proving the guard
+    ///     runs before `track_sequence`, so the tracker only ever sees layer 0's
+    ///     dense 0,1,2,… stream rather than the merged 0,0,0,1,1,1,… that would
+    ///     manufacture ~2/3 loss and storm PLIs.
+    #[wasm_bindgen_test]
+    fn simulcast_guard_drops_non_selected_layers_and_keeps_loss_zero() {
+        let (mut peer, _muted) = make_test_peer(901);
+        // Make the peer eligible to actually decode: visible + video on, and
+        // pretend a heartbeat arrived so the straggler-inference path is skipped.
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        // Default selected layer is 0 (assert the invariant explicitly).
+        assert_eq!(peer.selected_video_layer, 0);
+
+        let mut decoded_video = 0usize;
+        let mut skipped_video = 0usize;
+
+        // Interleaved arrival: per layer the sequence is dense (0,1,2,…); across
+        // layers the wire order is 0,1,2,0,1,2,…
+        for seq in 0..6u64 {
+            for layer in 0..3u32 {
+                let pkt = layered_video_packet(901, layer, seq);
+                let (mt, status, _kf) = peer
+                    .decode(&pkt, "test@test.com")
+                    .expect("decode should not error");
+                assert_eq!(mt, MediaType::VIDEO);
+                // SKIPPED is signalled by rendered == false && first_frame == false
+                // for the dropped layers; layer 0 reaches the noop decoder.
+                if layer == 0 {
+                    decoded_video += 1;
+                } else if !status.rendered && !status.first_frame {
+                    skipped_video += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            decoded_video, 6,
+            "exactly the 6 layer-0 packets should reach the decoder"
+        );
+        assert_eq!(
+            skipped_video, 12,
+            "all 12 non-selected (layer 1 & 2) packets should be dropped"
+        );
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "guard must run before track_sequence so only layer 0's dense \
+             sequence is tracked → zero phantom loss"
+        );
+    }
+
+    /// Selecting a non-zero layer flips which layer is decoded and still keeps
+    /// loss at zero (the selected layer's sequence is dense).
+    #[wasm_bindgen_test]
+    fn simulcast_guard_honors_selected_layer() {
+        let (mut peer, _muted) = make_test_peer(902);
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.set_selected_video_layer(1);
+        assert_eq!(peer.selected_video_layer, 1);
+
+        let mut decoded_video = 0usize;
+        for seq in 0..4u64 {
+            for layer in 0..3u32 {
+                let pkt = layered_video_packet(902, layer, seq);
+                let (_mt, _status, _kf) = peer
+                    .decode(&pkt, "test@test.com")
+                    .expect("decode should not error");
+                if layer == 1 {
+                    decoded_video += 1;
+                }
+            }
+        }
+        assert_eq!(decoded_video, 4, "only layer 1 should reach the decoder");
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "selected layer's dense sequence → zero phantom loss"
+        );
+    }
+
     /// A MeetingPacket embedded in a PacketWrapper with MEETING type should
     /// be extractable via parse_from_bytes on the wrapper's data field.
     #[wasm_bindgen_test]
@@ -4248,6 +4404,7 @@ mod tests {
                 audio_level: 0.0,
                 transport_type: TransportType::TRANSPORT_UNKNOWN,
                 vad_threshold: None,
+                selected_video_layer: 0,
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
                 last_screen_frame_ms: 0,
@@ -4336,6 +4493,7 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -4395,6 +4553,7 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,

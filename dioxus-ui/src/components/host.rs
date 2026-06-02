@@ -100,6 +100,14 @@ pub fn Host(
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
 
+        // Simulcast layer ceiling (issue #989): the lesser of the runtime flag
+        // (`simulcastMaxLayers`, defaults to 1 = OFF) and what this device can
+        // actually encode without stalling. Defaults keep this at 1 →
+        // single-layer, byte-identical to the pre-simulcast publisher.
+        let effective_max_layers = simulcast_max_layers()
+            .min(crate::components::capability_check::capability_max_simulcast_layers());
+        log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
+
         let cam_settings_cell = camera_settings_handler.clone();
         let camera_settings_cb = VcCallback::from(move |settings: String| {
             if let Some(handler) = cam_settings_cell.borrow().as_ref() {
@@ -118,6 +126,7 @@ pub fn Host(
             video_bitrate,
             camera_settings_cb,
             camera_error_cb,
+            effective_max_layers,
         );
 
         let mic_settings_cell = mic_settings_handler.clone();

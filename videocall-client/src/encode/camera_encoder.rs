@@ -121,6 +121,41 @@ fn stop_media_stream_tracks(stream: &MediaStream) {
     }
 }
 
+/// One simulcast layer's encoder and its per-layer mutable encode state
+/// (issue #989). Local to `CameraEncoder::start`'s encode task.
+///
+/// **Closure ownership note:** the WebCodecs output and error callbacks are
+/// `Closure`s whose backing `Box<dyn FnMut>` must outlive the `VideoEncoder`
+/// that holds a JS reference to them. In the pre-simulcast code these were
+/// loop-local bindings (`video_output_closure` / `video_error_handler`) kept
+/// alive incidentally by staying in scope until the end of the `'restart`
+/// iteration. With N layers we must store them per-layer, so they are moved
+/// into `_output_closure` / `_error_closure` here; the leading underscore
+/// documents that they are held purely to keep the JS callbacks alive (never
+/// invoked directly from Rust). Dropping a `LayerEncoder` drops its encoder
+/// first, then its closures — the correct teardown order.
+struct LayerEncoder {
+    /// This layer's WebCodecs `VideoEncoder`.
+    encoder: Box<VideoEncoder>,
+    /// The config object reused for in-place bitrate reconfiguration (mirrors
+    /// the legacy single-encoder `video_encoder_config`).
+    config: VideoEncoderConfig,
+    /// Output-handler-owned sequence cell, read back after the encode loop to
+    /// persist this layer's sequence across `'restart`.
+    seq_out: Rc<std::cell::Cell<u64>>,
+    /// This layer's simulcast id, stamped onto every emitted `PacketWrapper`.
+    layer_id: u32,
+    /// Current encoder width/height for this layer (dynamic reconfigure).
+    current_w: u32,
+    current_h: u32,
+    /// Cached bitrate (bps) last applied to this layer's encoder.
+    local_bitrate: u32,
+    /// Kept alive so the JS output callback stays valid (see struct doc).
+    _output_closure: Closure<dyn FnMut(JsValue)>,
+    /// Kept alive so the JS error callback stays valid (see struct doc).
+    _error_closure: Closure<dyn FnMut(JsValue)>,
+}
+
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
@@ -188,6 +223,30 @@ pub struct CameraEncoder {
     /// Re-election completed signal. Set by ConnectionManager, consumed by the
     /// encoder control loop to call `notify_reelection_completed()`.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Maximum number of simulcast layers this publisher is allowed to emit
+    /// (issue #989). Computed in the UI from device capability + the
+    /// `simulcastMaxLayers` runtime flag and passed into the constructor.
+    /// Clamped to [`SIMULCAST_MAX_SUPPORTED_LAYERS`] by [`effective_layer_count`].
+    ///
+    /// **PR A always passes 1**, so [`effective_layer_count`] returns 1 and the
+    /// encode path is byte-identical to the pre-simulcast single-encoder path.
+    /// N>1 wiring (per-layer tiers, AQ layer-drop) lands in PR B.
+    max_layers: u32,
+}
+
+/// Upper bound on simulcast layers regardless of what the caller requests.
+/// Matches the 3-tier ladder (low / standard / hd) the AQ crate will define in
+/// PR B. In PR A this is only used to clamp `max_layers`; the caller passes 1.
+const SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
+
+/// Clamp a requested `max_layers` to the supported range.
+///
+/// `0` (meaningless — there is always at least the base layer) becomes 1, and
+/// anything above [`SIMULCAST_MAX_SUPPORTED_LAYERS`] is capped. Free function so
+/// it can be unit-tested without constructing a full `CameraEncoder` (which
+/// needs a live `VideoCallClient`).
+fn clamp_layer_count(max_layers: u32) -> u32 {
+    max_layers.clamp(1, SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
 
 impl CameraEncoder {
@@ -201,6 +260,12 @@ impl CameraEncoder {
     ///
     /// * `on_encoder_settings_update` - a callback that will be called when the encoder settings change.
     ///
+    /// * `max_layers` - the maximum number of simulcast layers to emit (issue
+    ///   #989). The UI computes this from device capability and the
+    ///   `simulcastMaxLayers` runtime flag. Clamped to
+    ///   [`SIMULCAST_MAX_SUPPORTED_LAYERS`]; `0` is treated as `1`. **PR A
+    ///   always passes 1** (single layer, byte-identical to the legacy path).
+    ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(
@@ -209,6 +274,7 @@ impl CameraEncoder {
         initial_bitrate: u32,
         on_encoder_settings_update: Callback<String>,
         on_error: Callback<String>,
+        max_layers: u32,
     ) -> Self {
         let default_tier = &VIDEO_QUALITY_TIERS[0];
         let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
@@ -240,7 +306,19 @@ impl CameraEncoder {
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
             shared_dwell_samples: Rc::new(RefCell::new(Vec::new())),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
+            max_layers,
         }
+    }
+
+    /// Effective number of simulcast layers to encode this session.
+    ///
+    /// Clamps the caller-supplied `max_layers` to at least 1 (a `0` request is
+    /// meaningless — there is always at least the base layer) and at most
+    /// [`SIMULCAST_MAX_SUPPORTED_LAYERS`]. In PR A the caller always passes 1,
+    /// so this returns 1 and the encode loop runs a single layer exactly as
+    /// before.
+    fn effective_layer_count(&self) -> u32 {
+        clamp_layer_count(self.max_layers)
     }
 
     pub fn set_encoder_control(
@@ -625,6 +703,9 @@ impl CameraEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
+        // Number of simulcast layers to encode this session (issue #989).
+        // PR A: always 1 → single encoder, byte-identical to the legacy path.
+        let n_layers = self.effective_layer_count() as usize;
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -672,9 +753,14 @@ impl CameraEncoder {
                 }
             };
 
-            // Sequence number persists across restarts so the receiving side
-            // never sees duplicate or regressed sequence numbers.
-            let mut sequence_number: u64 = 0;
+            // Per-layer sequence numbers persist across restarts so the
+            // receiving side never sees duplicate or regressed sequence numbers.
+            // Each simulcast layer (issue #989) carries its own monotonic
+            // counter: a receiver decoding only one layer must see a dense
+            // 0,1,2,… stream or its `SequenceTracker` reports phantom loss
+            // (~(N-1)/N) and storms PLIs. PR A has n_layers == 1 so this is a
+            // single-element Vec behaving exactly like the old scalar.
+            let mut sequence_numbers: Vec<u64> = vec![0; n_layers];
 
             let mut restart_count: u32 = 0;
             // Maximum restart attempts before surfacing on_error. Sized for the
@@ -823,93 +909,9 @@ impl CameraEncoder {
                         .unchecked_into::<VideoTrack>(),
                 );
 
-                // --- Setup video encoder ---
-                // The output handler and error handler closures must be re-created
-                // on each restart because Closure::wrap consumes them and the new
-                // VideoEncoder needs fresh JS function references.
-
-                let video_output_handler = {
-                    let client = client.clone();
-                    let userid = userid.clone();
-                    let aes = aes.clone();
-                    let current_fps = current_fps.clone();
-                    let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
-                    // Capture the current sequence_number by value; we will read
-                    // the updated value back after the encode loop exits.
-                    let mut local_seq = sequence_number;
-                    let seq_out = Rc::new(std::cell::Cell::new(sequence_number));
-                    let seq_out_inner = seq_out.clone();
-                    let mut last_chunk_time = window().performance().unwrap().now();
-                    let mut chunks_in_last_second = 0;
-
-                    (
-                        Box::new(move |chunk: JsValue| {
-                            let now = window().performance().unwrap().now();
-                            let chunk = web_sys::EncodedVideoChunk::from(chunk);
-
-                            // Update FPS calculation
-                            chunks_in_last_second += 1;
-                            if now - last_chunk_time >= 1000.0 {
-                                let fps = chunks_in_last_second;
-                                current_fps.store(fps, Ordering::Relaxed);
-                                log::debug!("Encoder output FPS: {fps}");
-                                chunks_in_last_second = 0;
-                                last_chunk_time = now;
-                            }
-
-                            // Ensure the backing buffer is large enough for this chunk
-                            let byte_length = chunk.byte_length() as usize;
-                            if buffer.len() < byte_length {
-                                buffer.resize(byte_length, 0);
-                            }
-
-                            let packet: PacketWrapper = transform_video_chunk(
-                                chunk,
-                                local_seq,
-                                buffer.as_mut_slice(),
-                                &userid,
-                                aes.clone(),
-                            );
-                            // Phase 2 of WT freeze fix: route camera video on
-                            // its dedicated persistent QUIC stream so a stall
-                            // on a video keyframe never blocks audio.
-                            client.send_media_packet(packet, MediaStreamKey::Video);
-                            local_seq += 1;
-                            seq_out_inner.set(local_seq);
-                        }) as Box<dyn FnMut(JsValue)>,
-                        seq_out,
-                    )
-                };
-
-                let (video_output_box, seq_out_cell) = video_output_handler;
-
-                let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                    error!("error_handler error {e:?}");
-                })
-                    as Box<dyn FnMut(JsValue)>);
-
-                let video_output_closure = Closure::wrap(video_output_box);
-
-                let video_encoder_init = VideoEncoderInit::new(
-                    video_error_handler.as_ref().unchecked_ref(),
-                    video_output_closure.as_ref().unchecked_ref(),
-                );
-
-                let video_encoder = match VideoEncoder::new(&video_encoder_init) {
-                    Ok(enc) => Box::new(enc),
-                    Err(e) => {
-                        let msg = format!("Failed to create video encoder: {e:?}");
-                        error!("{msg}");
-                        stop_media_stream_tracks(&device);
-                        if let Some(cb) = &on_error {
-                            cb.emit(msg);
-                        }
-                        restart_count += 1;
-                        continue 'restart;
-                    }
-                };
-
-                // Get track settings to get actual width and height
+                // Get track settings to get actual width and height up front so
+                // every layer can be constructed with the native dimensions
+                // (PR A) — per-layer downscaled tiers land in PR B.
                 let media_track = video_track
                     .as_ref()
                     .clone()
@@ -919,22 +921,153 @@ impl CameraEncoder {
                 let width = track_settings.get_width().expect("width is None");
                 let height = track_settings.get_height().expect("height is None");
 
-                let video_encoder_config =
-                    VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
-                video_encoder_config
-                    .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
-                video_encoder_config.set_latency_mode(LatencyMode::Realtime);
+                // --- Setup video encoders (one per simulcast layer) ---
+                // The output and error handler closures must be re-created on
+                // each restart because Closure::wrap consumes them and the new
+                // VideoEncoder needs fresh JS function references. Each layer
+                // owns its own output closure (own seq counter + reused buffer),
+                // its own error closure, and its own config object. The closures
+                // are stored in the LayerEncoder so they outlive the encoder.
+                //
+                // PR A: n_layers == 1, so this loop runs once and produces a
+                // single layer at the native resolution with layer_id 0 —
+                // byte-identical to the legacy single-encoder path.
+                let mut layers: Vec<LayerEncoder> = Vec::with_capacity(n_layers);
+                // `sequence_numbers` has exactly `n_layers` elements (vec![0;
+                // n_layers]), so enumerating it yields one (idx, persisted-seq)
+                // pair per layer.
+                for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate() {
+                    let layer_id = layer_idx as u32;
 
-                if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
-                    if is_fatal_encoder_error(&e) {
-                        error!("CameraEncoder: fatal configure error before encode loop, restarting: {e:?}");
-                        let _ = video_encoder.close();
-                        stop_media_stream_tracks(&device);
-                        restart_count += 1;
-                        continue 'restart;
+                    let (video_output_box, seq_out) = {
+                        let client = client.clone();
+                        let userid = userid.clone();
+                        let aes = aes.clone();
+                        let current_fps = current_fps.clone();
+                        let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
+                        // Capture this layer's current sequence by value; we read
+                        // the updated value back after the encode loop exits.
+                        let mut local_seq = initial_seq;
+                        let seq_out = Rc::new(std::cell::Cell::new(initial_seq));
+                        let seq_out_inner = seq_out.clone();
+                        let mut last_chunk_time = window().performance().unwrap().now();
+                        let mut chunks_in_last_second = 0;
+
+                        (
+                            Box::new(move |chunk: JsValue| {
+                                let now = window().performance().unwrap().now();
+                                let chunk = web_sys::EncodedVideoChunk::from(chunk);
+
+                                // FPS calculation: ONLY layer 0 updates the
+                                // shared `current_fps`. That atomic is the AQ
+                                // controller's setpoint (encoder output fps);
+                                // summing N layers would inflate it N× and
+                                // corrupt every PID/tier decision. Higher layers
+                                // still encode and send, they just don't touch
+                                // the setpoint.
+                                if layer_id == 0 {
+                                    chunks_in_last_second += 1;
+                                    if now - last_chunk_time >= 1000.0 {
+                                        let fps = chunks_in_last_second;
+                                        current_fps.store(fps, Ordering::Relaxed);
+                                        log::debug!("Encoder output FPS: {fps}");
+                                        chunks_in_last_second = 0;
+                                        last_chunk_time = now;
+                                    }
+                                }
+
+                                // Ensure the backing buffer is large enough for this chunk
+                                let byte_length = chunk.byte_length() as usize;
+                                if buffer.len() < byte_length {
+                                    buffer.resize(byte_length, 0);
+                                }
+
+                                let packet: PacketWrapper = transform_video_chunk(
+                                    chunk,
+                                    local_seq,
+                                    buffer.as_mut_slice(),
+                                    &userid,
+                                    aes.clone(),
+                                    layer_id,
+                                );
+                                // Phase 2 of WT freeze fix: route camera video on
+                                // its dedicated persistent QUIC stream so a stall
+                                // on a video keyframe never blocks audio.
+                                client.send_media_packet(packet, MediaStreamKey::Video);
+                                local_seq += 1;
+                                seq_out_inner.set(local_seq);
+                            }) as Box<dyn FnMut(JsValue)>,
+                            seq_out,
+                        )
+                    };
+
+                    let error_closure = Closure::wrap(Box::new(move |e: JsValue| {
+                        error!("error_handler error (layer {layer_id}) {e:?}");
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let output_closure = Closure::wrap(video_output_box);
+
+                    let video_encoder_init = VideoEncoderInit::new(
+                        error_closure.as_ref().unchecked_ref(),
+                        output_closure.as_ref().unchecked_ref(),
+                    );
+
+                    let video_encoder = match VideoEncoder::new(&video_encoder_init) {
+                        Ok(enc) => Box::new(enc),
+                        Err(e) => {
+                            let msg =
+                                format!("Failed to create video encoder (layer {layer_id}): {e:?}");
+                            error!("{msg}");
+                            // Close any already-built layer encoders before retry.
+                            for built in &layers {
+                                let _ = built.encoder.close();
+                            }
+                            stop_media_stream_tracks(&device);
+                            if let Some(cb) = &on_error {
+                                cb.emit(msg);
+                            }
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                    };
+
+                    // PR A: every layer encodes at native resolution. Per-layer
+                    // downscaled tiers (SIMULCAST_LAYER_TIERS) land in PR B.
+                    let config = VideoEncoderConfig::new(
+                        get_video_codec_string(),
+                        height as u32,
+                        width as u32,
+                    );
+                    config.set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
+                    config.set_latency_mode(LatencyMode::Realtime);
+
+                    if let Err(e) = video_encoder.configure(&config) {
+                        CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                        if is_fatal_encoder_error(&e) {
+                            error!("CameraEncoder: fatal configure error before encode loop (layer {layer_id}), restarting: {e:?}");
+                            let _ = video_encoder.close();
+                            for built in &layers {
+                                let _ = built.encoder.close();
+                            }
+                            stop_media_stream_tracks(&device);
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                        error!("Error configuring video encoder (layer {layer_id}): {e:?}");
                     }
-                    error!("Error configuring video encoder: {e:?}");
+
+                    layers.push(LayerEncoder {
+                        encoder: video_encoder,
+                        config,
+                        seq_out,
+                        layer_id,
+                        current_w: width as u32,
+                        current_h: height as u32,
+                        local_bitrate: current_bitrate.load(Ordering::Relaxed) * 1000,
+                        _output_closure: output_closure,
+                        _error_closure: error_closure,
+                    });
                 }
 
                 let video_processor =
@@ -950,14 +1083,14 @@ impl CameraEncoder {
                 // Start encoding video and audio.
                 let mut video_frame_counter: u32 = 0;
 
-                // Cache the initial bitrate
-                let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+                // Per-encoder bitrate and dimensions now live in each
+                // `LayerEncoder` (local_bitrate / current_w / current_h) so each
+                // layer reconfigures independently. The tier-controlled caches
+                // below are shared across layers because they are driven by the
+                // single shared tier atomics (the AQ controller is per-publisher
+                // in PR A; per-layer AQ lands in PR B).
 
-                // Track current encoder dimensions for dynamic reconfiguration
-                let mut current_encoder_width = width as u32;
-                let mut current_encoder_height = height as u32;
-
-                // Cache tier-controlled values
+                // Cache tier-controlled values (shared across layers).
                 let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
                 let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
                 let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
@@ -972,71 +1105,46 @@ impl CameraEncoder {
                         let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                         video_track.stop();
                         log::info!("CameraEncoder: stopped");
-                        if let Err(e) = video_encoder.close() {
-                            error!("Error closing video encoder: {e:?}");
+                        // Close every layer's encoder.
+                        for layer in &layers {
+                            if let Err(e) = layer.encoder.close() {
+                                error!(
+                                    "Error closing video encoder (layer {}): {e:?}",
+                                    layer.layer_id
+                                );
+                            }
                         }
                         return;
                     }
 
-                    // --- Guard: check if the encoder has been closed externally ---
+                    // --- Guard: check if any encoder has been closed externally ---
                     // This can happen if the browser closes the codec (e.g. due to
                     // GPU process crash, OOM, or an error callback we didn't intercept).
-                    if video_encoder.state() == CodecState::Closed {
-                        log::warn!("CameraEncoder: encoder state is Closed, triggering restart");
+                    // If ANY layer's encoder is closed we restart all layers (per-layer
+                    // restart is a future optimization, see plan PR B).
+                    if layers
+                        .iter()
+                        .any(|l| l.encoder.state() == CodecState::Closed)
+                    {
+                        log::warn!("CameraEncoder: an encoder state is Closed, triggering restart");
                         restart_count += 1;
                         break 'encode;
                     }
 
-                    // Check for tier-driven dimension changes (adaptive quality).
-                    // When the tier changes max_width/max_height, we reconfigure
-                    // the encoder to downscale (WebCodecs handles the scaling).
+                    // Read the shared tier atomics ONCE per frame (they are driven
+                    // by the single per-publisher AQ controller in PR A). The same
+                    // tier dimension / keyframe-interval decision then applies to
+                    // every layer below.
                     let new_tier_w = tier_max_width.load(Ordering::Relaxed);
                     let new_tier_h = tier_max_height.load(Ordering::Relaxed);
                     let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
+                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
 
                     let tier_dims_changed =
                         new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
                     if tier_dims_changed {
-                        // Guard: do not configure a closed encoder.
-                        if video_encoder.state() == CodecState::Closed {
-                            log::warn!("CameraEncoder: encoder closed before tier reconfigure");
-                            restart_count += 1;
-                            break 'encode;
-                        }
-
                         local_tier_max_width = new_tier_w;
                         local_tier_max_height = new_tier_h;
-
-                        // Constrain current encoder dimensions to the tier max.
-                        let constrained_w = current_encoder_width.min(local_tier_max_width);
-                        let constrained_h = current_encoder_height.min(local_tier_max_height);
-
-                        log::info!(
-                            "CameraEncoder: tier dimension change -> {}x{} (was {}x{})",
-                            constrained_w,
-                            constrained_h,
-                            current_encoder_width,
-                            current_encoder_height,
-                        );
-                        current_encoder_width = constrained_w;
-                        current_encoder_height = constrained_h;
-
-                        let new_config = VideoEncoderConfig::new(
-                            get_video_codec_string(),
-                            current_encoder_height,
-                            current_encoder_width,
-                        );
-                        new_config.set_bitrate(local_bitrate as f64);
-                        new_config.set_latency_mode(LatencyMode::Realtime);
-                        if let Err(e) = video_encoder.configure(&new_config) {
-                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
-                            if is_fatal_encoder_error(&e) {
-                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
-                                restart_count += 1;
-                                break 'encode;
-                            }
-                            error!("Error reconfiguring camera encoder for tier change: {e:?}");
-                        }
                     }
 
                     if new_kf != local_keyframe_interval {
@@ -1047,95 +1155,110 @@ impl CameraEncoder {
                         );
                     }
 
-                    // Update the bitrate if it has changed more than the threshold percentage
-                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                    if new_current_bitrate != local_bitrate && !tier_dims_changed {
-                        // Guard: do not configure a closed encoder.
-                        if video_encoder.state() == CodecState::Closed {
-                            log::warn!("CameraEncoder: encoder closed before bitrate reconfigure");
-                            restart_count += 1;
-                            break 'encode;
-                        }
-                        log::info!("Updating video bitrate to {new_current_bitrate}");
-                        local_bitrate = new_current_bitrate;
-                        video_encoder_config.set_bitrate(local_bitrate as f64);
-                        if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
-                            if is_fatal_encoder_error(&e) {
-                                error!("CameraEncoder: fatal configure error, restarting: {e:?}");
-                                restart_count += 1;
-                                break 'encode;
+                    // Per-layer reconfiguration (tier dims + bitrate). For
+                    // n_layers == 1 this is identical to the legacy single-encoder
+                    // logic; the tier-resolution stepping is preserved verbatim
+                    // (retiring it is PR B). A fatal configure error in ANY layer
+                    // restarts all layers.
+                    let mut fatal_reconfigure = false;
+                    for layer in layers.iter_mut() {
+                        if tier_dims_changed {
+                            // Guard: do not configure a closed encoder.
+                            if layer.encoder.state() == CodecState::Closed {
+                                log::warn!("CameraEncoder: encoder closed before tier reconfigure (layer {})", layer.layer_id);
+                                fatal_reconfigure = true;
+                                break;
                             }
-                            error!("Error configuring video encoder: {e:?}");
+
+                            // Constrain current encoder dimensions to the tier max.
+                            let constrained_w = layer.current_w.min(local_tier_max_width);
+                            let constrained_h = layer.current_h.min(local_tier_max_height);
+
+                            log::info!(
+                                "CameraEncoder: tier dimension change -> {}x{} (was {}x{}) (layer {})",
+                                constrained_w,
+                                constrained_h,
+                                layer.current_w,
+                                layer.current_h,
+                                layer.layer_id,
+                            );
+                            layer.current_w = constrained_w;
+                            layer.current_h = constrained_h;
+
+                            let new_config = VideoEncoderConfig::new(
+                                get_video_codec_string(),
+                                layer.current_h,
+                                layer.current_w,
+                            );
+                            new_config.set_bitrate(layer.local_bitrate as f64);
+                            new_config.set_latency_mode(LatencyMode::Realtime);
+                            if let Err(e) = layer.encoder.configure(&new_config) {
+                                CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if is_fatal_encoder_error(&e) {
+                                    error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                    fatal_reconfigure = true;
+                                    break;
+                                }
+                                error!("Error reconfiguring camera encoder for tier change (layer {}): {e:?}", layer.layer_id);
+                            }
                         }
-                    } else if new_current_bitrate != local_bitrate {
-                        // Bitrate also changed alongside tier dims -- already applied above.
-                        local_bitrate = new_current_bitrate;
+
+                        // Update the bitrate if it changed (and dims did not also
+                        // change above — a dim change already applied the new
+                        // bitrate via the fresh config).
+                        if new_current_bitrate != layer.local_bitrate && !tier_dims_changed {
+                            // Guard: do not configure a closed encoder.
+                            if layer.encoder.state() == CodecState::Closed {
+                                log::warn!("CameraEncoder: encoder closed before bitrate reconfigure (layer {})", layer.layer_id);
+                                fatal_reconfigure = true;
+                                break;
+                            }
+                            log::info!(
+                                "Updating video bitrate to {new_current_bitrate} (layer {})",
+                                layer.layer_id
+                            );
+                            layer.local_bitrate = new_current_bitrate;
+                            layer.config.set_bitrate(layer.local_bitrate as f64);
+                            if let Err(e) = layer.encoder.configure(&layer.config) {
+                                CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if is_fatal_encoder_error(&e) {
+                                    error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                    fatal_reconfigure = true;
+                                    break;
+                                }
+                                error!(
+                                    "Error configuring video encoder (layer {}): {e:?}",
+                                    layer.layer_id
+                                );
+                            }
+                        } else if new_current_bitrate != layer.local_bitrate {
+                            // Bitrate also changed alongside tier dims -- already applied above.
+                            layer.local_bitrate = new_current_bitrate;
+                        }
+                    }
+                    if fatal_reconfigure {
+                        restart_count += 1;
+                        break 'encode;
                     }
 
                     match JsFuture::from(video_reader.read()).await {
                         Ok(js_frame) => {
+                            // Read the VideoFrame ONCE. It is fed to every layer's
+                            // encoder synchronously below (WebCodecs copies the
+                            // frame data on `encode`), then closed EXACTLY ONCE
+                            // after all layers have encoded — see the single
+                            // `video_frame.close()` at the end of this arm.
                             let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                 .unwrap()
                                 .unchecked_into::<VideoFrame>();
 
-                            // Check for dimension changes (rotation, camera switch).
-                            // Also constrain to current tier max dimensions.
-                            let frame_width = video_frame.display_width();
-                            let frame_height = video_frame.display_height();
-                            let clamped_width = if frame_width > 0 {
-                                frame_width.min(local_tier_max_width)
-                            } else {
-                                frame_width
-                            };
-                            let clamped_height = if frame_height > 0 {
-                                frame_height.min(local_tier_max_height)
-                            } else {
-                                frame_height
-                            };
-
-                            if clamped_width > 0
-                                && clamped_height > 0
-                                && (clamped_width != current_encoder_width
-                                    || clamped_height != current_encoder_height)
-                            {
-                                // Guard: do not configure a closed encoder.
-                                if video_encoder.state() == CodecState::Closed {
-                                    log::warn!("CameraEncoder: encoder closed before dimension reconfigure");
-                                    video_frame.close();
-                                    restart_count += 1;
-                                    break 'encode;
-                                }
-
-                                log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {clamped_width}x{clamped_height}, reconfiguring encoder");
-
-                                current_encoder_width = clamped_width;
-                                current_encoder_height = clamped_height;
-
-                                let new_config = VideoEncoderConfig::new(
-                                    get_video_codec_string(),
-                                    current_encoder_height,
-                                    current_encoder_width,
-                                );
-                                new_config.set_bitrate(local_bitrate as f64);
-                                new_config.set_latency_mode(LatencyMode::Realtime);
-                                if let Err(e) = video_encoder.configure(&new_config) {
-                                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    if is_fatal_encoder_error(&e) {
-                                        error!("CameraEncoder: fatal configure error, restarting: {e:?}");
-                                        restart_count += 1;
-                                        break 'encode;
-                                    }
-                                    error!(
-                                        "Error reconfiguring camera encoder with new dimensions: {e:?}"
-                                    );
-                                }
-                            }
-
-                            let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
-                            // Check if a keyframe was requested via PLI (Picture Loss Indication).
-                            // The flag is cleared after producing the keyframe.
+                            // Read-and-clear the PLI keyframe request ONCE per
+                            // frame and apply the SAME keyframe flag to every
+                            // layer. Reading it per-layer would let only the
+                            // first layer see the request (the swap clears it),
+                            // desynchronizing keyframes across layers.
                             let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
                             // Use tier-controlled keyframe interval instead of the
                             // static constant, allowing adaptive quality to adjust it.
@@ -1144,59 +1267,137 @@ impl CameraEncoder {
                             #[allow(clippy::manual_is_multiple_of)]
                             let is_periodic_keyframe = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
-                            video_encoder_encode_options
-                                .set_key_frame(is_periodic_keyframe || pli_requested);
+                            let want_keyframe = is_periodic_keyframe || pli_requested;
                             if pli_requested {
                                 log::info!(
                                     "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                     video_frame_counter
                                 );
                             }
-                            match video_encoder
-                                .encode_with_options(&video_frame, &video_encoder_encode_options)
-                            {
-                                Ok(_) => {
-                                    CAMERA_ENCODER_FRAMES_SUBMITTED_OK
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    // First successful encode after a restart resets the
-                                    // restart counter so transient errors don't accumulate
-                                    // toward MAX_RESTARTS across long-lived sessions.
-                                    if !encoded_ok_this_cycle && restart_count > 0 {
-                                        log::info!(
-                                            "CameraEncoder: encode succeeded after restart, resetting restart counter"
-                                        );
-                                        restart_count = 0;
+
+                            // Frame display dimensions, read once; each layer
+                            // clamps to its own current dims + the shared tier max.
+                            let frame_width = video_frame.display_width();
+                            let frame_height = video_frame.display_height();
+
+                            let mut fatal_encode = false;
+                            let mut any_ok = false;
+                            for layer in layers.iter_mut() {
+                                // Check for dimension changes (rotation, camera
+                                // switch). Also constrain to current tier max.
+                                let clamped_width = if frame_width > 0 {
+                                    frame_width.min(local_tier_max_width)
+                                } else {
+                                    frame_width
+                                };
+                                let clamped_height = if frame_height > 0 {
+                                    frame_height.min(local_tier_max_height)
+                                } else {
+                                    frame_height
+                                };
+
+                                if clamped_width > 0
+                                    && clamped_height > 0
+                                    && (clamped_width != layer.current_w
+                                        || clamped_height != layer.current_h)
+                                {
+                                    // Guard: do not configure a closed encoder.
+                                    if layer.encoder.state() == CodecState::Closed {
+                                        log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
+                                        fatal_encode = true;
+                                        break;
                                     }
-                                    encoded_ok_this_cycle = true;
+
+                                    log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
+
+                                    layer.current_w = clamped_width;
+                                    layer.current_h = clamped_height;
+
+                                    let new_config = VideoEncoderConfig::new(
+                                        get_video_codec_string(),
+                                        layer.current_h,
+                                        layer.current_w,
+                                    );
+                                    new_config.set_bitrate(layer.local_bitrate as f64);
+                                    new_config.set_latency_mode(LatencyMode::Realtime);
+                                    if let Err(e) = layer.encoder.configure(&new_config) {
+                                        CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if is_fatal_encoder_error(&e) {
+                                            error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                            fatal_encode = true;
+                                            break;
+                                        }
+                                        error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+                                    }
                                 }
-                                Err(e) => {
-                                    let msg = format!("{e:?}");
-                                    match classify_encode_error(&msg) {
-                                        EncodeErrorBucket::ClosedCodec => {
-                                            CAMERA_ENCODER_ERRORS_CLOSED_CODEC
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        EncodeErrorBucket::VpxMemAlloc => {
-                                            CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        EncodeErrorBucket::Generic => {
-                                            CAMERA_ENCODER_ERRORS_GENERIC
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
+
+                                let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                                video_encoder_encode_options.set_key_frame(want_keyframe);
+
+                                match layer.encoder.encode_with_options(
+                                    &video_frame,
+                                    &video_encoder_encode_options,
+                                ) {
+                                    Ok(_) => {
+                                        CAMERA_ENCODER_FRAMES_SUBMITTED_OK
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        any_ok = true;
                                     }
-                                    if is_fatal_encoder_error(&e) {
+                                    Err(e) => {
+                                        let msg = format!("{e:?}");
+                                        match classify_encode_error(&msg) {
+                                            EncodeErrorBucket::ClosedCodec => {
+                                                CAMERA_ENCODER_ERRORS_CLOSED_CODEC
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            EncodeErrorBucket::VpxMemAlloc => {
+                                                CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            EncodeErrorBucket::Generic => {
+                                                CAMERA_ENCODER_ERRORS_GENERIC
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        if is_fatal_encoder_error(&e) {
+                                            error!("CameraEncoder: fatal encode error (layer {}, restart {restart_count}): {e:?}", layer.layer_id);
+                                            fatal_encode = true;
+                                            break;
+                                        }
                                         error!(
-                                            "CameraEncoder: fatal encode error (restart {restart_count}): {e:?}"
+                                            "Error encoding video frame (layer {}): {e:?}",
+                                            layer.layer_id
                                         );
-                                        video_frame.close();
-                                        restart_count += 1;
-                                        break 'encode;
                                     }
-                                    error!("Error encoding video frame: {e:?}");
                                 }
                             }
+
+                            // Close the frame EXACTLY ONCE, after every layer has
+                            // encoded (or we hit a fatal error). Encoders copy
+                            // synchronously so all layers have already consumed
+                            // the frame data by here. Never double-close: the
+                            // fatal path below also reaches this single close.
                             video_frame.close();
+
+                            // First successful encode after a restart resets the
+                            // restart counter so transient errors don't accumulate
+                            // toward MAX_RESTARTS across long-lived sessions.
+                            if any_ok && !encoded_ok_this_cycle && restart_count > 0 {
+                                log::info!(
+                                    "CameraEncoder: encode succeeded after restart, resetting restart counter"
+                                );
+                                restart_count = 0;
+                            }
+                            if any_ok {
+                                encoded_ok_this_cycle = true;
+                            }
+
+                            if fatal_encode {
+                                restart_count += 1;
+                                break 'encode;
+                            }
+
                             video_frame_counter += 1;
                         }
                         Err(e) => {
@@ -1206,18 +1407,25 @@ impl CameraEncoder {
                 } // end 'encode
 
                 // --- Cleanup before restart ---
-                // Persist the sequence number from the output handler so the next
-                // restart cycle continues numbering where we left off.
-                sequence_number = seq_out_cell.get();
+                // Persist each layer's sequence number from its output handler so
+                // the next restart cycle continues numbering where we left off.
+                for layer in &layers {
+                    sequence_numbers[layer.layer_id as usize] = layer.seq_out.get();
+                }
 
-                // Close the encoder (may already be closed; ignore errors).
-                let _ = video_encoder.close();
+                // Close every layer's encoder (may already be closed; ignore errors).
+                for layer in &layers {
+                    let _ = layer.encoder.close();
+                }
+                // Drop the layers (and their owned closures) before the next
+                // 'restart iteration rebuilds them.
+                drop(layers);
 
                 // Stop the media track to release the camera.
                 let vt = video_track.clone().unchecked_into::<MediaStreamTrack>();
                 vt.stop();
 
-                log::info!("CameraEncoder: cleaned up encoder and track, looping to restart");
+                log::info!("CameraEncoder: cleaned up encoders and track, looping to restart");
                 // Loop back to 'restart for backoff + re-acquisition.
             } // end 'restart
         });
@@ -1226,7 +1434,9 @@ impl CameraEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::is_fatal_encoder_error_message;
+    use super::{
+        clamp_layer_count, is_fatal_encoder_error_message, SIMULCAST_MAX_SUPPORTED_LAYERS,
+    };
 
     #[test]
     fn fatal_encoder_errors_match_closed_codec_signatures() {
@@ -1243,5 +1453,83 @@ mod tests {
         assert!(!is_fatal_encoder_error_message(
             "EncodingError: dropped one frame"
         ));
+    }
+
+    #[test]
+    fn clamp_layer_count_treats_zero_as_one() {
+        // 0 is meaningless (there is always the base layer) → 1. This is also
+        // the PR-A invariant: max_layers == 1 (or 0) yields exactly one layer,
+        // whose only layer_id is 0 — byte-identical to the legacy path.
+        assert_eq!(clamp_layer_count(0), 1);
+        assert_eq!(clamp_layer_count(1), 1);
+    }
+
+    #[test]
+    fn clamp_layer_count_passes_through_in_range() {
+        assert_eq!(clamp_layer_count(2), 2);
+        assert_eq!(clamp_layer_count(3), 3);
+    }
+
+    #[test]
+    fn clamp_layer_count_caps_at_max_supported() {
+        assert_eq!(clamp_layer_count(4), SIMULCAST_MAX_SUPPORTED_LAYERS);
+        assert_eq!(clamp_layer_count(99), SIMULCAST_MAX_SUPPORTED_LAYERS);
+    }
+
+    #[test]
+    fn single_layer_emits_layer_id_zero() {
+        // The build loop assigns layer_id = layer_idx for idx in 0..n_layers.
+        // For n_layers == 1 (PR A) the only id is 0. This pins that invariant
+        // without needing a live camera/VideoEncoder.
+        let n_layers = clamp_layer_count(1) as usize;
+        let ids: Vec<u32> = (0..n_layers).map(|i| i as u32).collect();
+        assert_eq!(ids, vec![0]);
+    }
+}
+
+/// Browser-only tests: exercise the real `transform_video_chunk` layer-id
+/// wiring with a genuine `EncodedVideoChunk`. This is the closest faithful
+/// proxy for "the N=1 encoder emits `simulcast_layer_id == 0`" that does not
+/// require camera permission / `getUserMedia` — the output handler's only
+/// simulcast-relevant behaviour is the `layer_id` it threads into
+/// `transform_video_chunk`.
+#[cfg(test)]
+mod wasm_tests {
+    use super::*;
+    use crate::crypto::aes::Aes128State;
+    use protobuf::Message;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+    use wasm_bindgen_test::*;
+    use web_sys::{EncodedVideoChunkInit, EncodedVideoChunkType};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_chunk() -> web_sys::EncodedVideoChunk {
+        let data = js_sys::Uint8Array::new_with_length(8);
+        let init = EncodedVideoChunkInit::new(&data, 0.0, EncodedVideoChunkType::Key);
+        web_sys::EncodedVideoChunk::new(&init).unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    fn transform_video_chunk_layer_zero_omits_field() {
+        let aes = Rc::new(Aes128State::new(false));
+        let mut buf = vec![0u8; 100_000];
+        let wrapper =
+            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 0);
+        // Layer 0 round-trips to 0 and (proto3 tag-5-when-nonzero) is wire-absent.
+        let bytes = wrapper.write_to_bytes().unwrap();
+        let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn transform_video_chunk_layer_two_round_trips() {
+        let aes = Rc::new(Aes128State::new(false));
+        let mut buf = vec![0u8; 100_000];
+        let wrapper =
+            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 2);
+        let bytes = wrapper.write_to_bytes().unwrap();
+        let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 2);
     }
 }

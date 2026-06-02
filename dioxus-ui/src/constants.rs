@@ -113,10 +113,32 @@ pub struct RuntimeConfig {
     #[serde(rename = "mockPeersEnabled")]
     #[serde(default)]
     pub mock_peers_enabled: String,
+    /// Maximum simulcast layers a publisher may emit (issue #989), the runtime
+    /// half of the simulcast feature flag.
+    ///
+    /// The effective layer count is `min(this, device-capability ceiling)`, so
+    /// raising it never forces a weak device above what it can encode. Defaults
+    /// to **1 (feature OFF)** via [`default_simulcast_max_layers`].
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): this is
+    /// `#[serde(default = ...)]` so a stale bind-mounted `config.js` that
+    /// predates this key still parses — a missing key yields 1, never a parse
+    /// failure that would brick startup. Keep the committed `config.js` in sync,
+    /// but never rely on it being present.
+    #[serde(rename = "simulcastMaxLayers")]
+    #[serde(default = "default_simulcast_max_layers")]
+    pub simulcast_max_layers: u32,
 }
 
 fn default_vad_threshold() -> f32 {
     0.02
+}
+
+/// Default simulcast layer ceiling when `simulcastMaxLayers` is absent from
+/// `config.js` — 1 layer, i.e. the feature is OFF and the publisher behaves
+/// byte-identically to the pre-simulcast build (issue #989).
+fn default_simulcast_max_layers() -> u32 {
+    1
 }
 
 pub fn app_config() -> Result<RuntimeConfig, String> {
@@ -146,6 +168,11 @@ pub fn screen_bitrate_kbps() -> Result<u32, String> {
 }
 pub fn vad_threshold() -> Result<f32, String> {
     app_config().map(|c| c.vad_threshold)
+}
+/// Runtime simulcast layer ceiling (issue #989). Defaults to 1 (feature off)
+/// when `config.js` lacks the key or the config can't be read.
+pub fn simulcast_max_layers() -> u32 {
+    app_config().map(|c| c.simulcast_max_layers).unwrap_or(1)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

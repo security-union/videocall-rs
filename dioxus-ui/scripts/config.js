@@ -36,5 +36,10 @@ window.__APP_CONFIG = ({
   oauthFlow: "",
   searchApiBaseUrl: "http://localhost:3000/api/search/v2",
   consoleLogUploadEnabled: "false",
-  mockPeersEnabled: "false"
+  mockPeersEnabled: "false",
+  // Max simulcast layers a publisher may emit (issue #989). 1 = feature OFF
+  // (single stream, identical to pre-simulcast). Effective layers =
+  // min(this, device-capability ceiling). Raise to 2/3 only in controlled
+  // test meetings until relay per-receiver layer selection lands.
+  simulcastMaxLayers: 1
 });

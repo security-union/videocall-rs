@@ -422,109 +422,9 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
-/// Aspect ratio of a rendered tile in the participant grid.
-///
-/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
-/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
-/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
-/// than the tile and `place-self: center` will surface as visible internal
-/// padding around every tile.
-const TILE_AR: f64 = 3.0 / 2.0;
-
-/// Google Meet–style layout: try every column count, compute the maximum
-/// 3:2 tile size for each, and pick the variant with the largest tile area.
-/// Returns `(cols, rows, tile_width)`.
-fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
-    if n == 0 {
-        return (1, 1, w);
-    }
-    let mut best_cols = 1_usize;
-    let mut best_rows = 1_usize;
-    let mut best_area = 0.0_f64;
-    let mut best_tw = 0.0_f64;
-    let ar: f64 = TILE_AR;
-
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-
-        let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
-        let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
-
-        let mut tw = avail_w / cols as f64;
-        let mut th = tw / ar;
-
-        if th * rows as f64 > avail_h {
-            th = avail_h / rows as f64;
-            tw = th * ar;
-        }
-
-        let area = tw * th;
-        if area > best_area {
-            best_area = area;
-            best_cols = cols;
-            best_rows = rows;
-            best_tw = tw;
-        }
-    }
-
-    (best_cols, best_rows, best_tw)
-}
-
-/// Promote overflow speakers into the visible portion of a tile list.
-///
-/// When there are more tiles than fit on screen, tiles beyond `visible_count`
-/// are "overflow". If an overflow peer spoke within `active_ms` of `now_ms`,
-/// swap them with the least-recently-active visible peer that is NOT speaking.
-/// The loudest overflow speaker (most recent) gets priority.
-fn promote_speakers(
-    tiles: &mut [String],
-    visible_count: usize,
-    speech_map: &HashMap<String, f64>,
-    join_map: &HashMap<String, f64>,
-    now_ms: f64,
-    active_ms: f64,
-) {
-    if visible_count >= tiles.len() {
-        return;
-    }
-
-    // Effective timestamp: last speech time if exists, else join time.
-    let eff_ts = |peer: &str| -> f64 {
-        speech_map
-            .get(peer)
-            .copied()
-            .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
-    };
-
-    // Overflow tiles that are actively speaking (most recent first).
-    let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-    for (i, peer) in tiles.iter().enumerate().skip(visible_count) {
-        if let Some(&ts) = speech_map.get(peer) {
-            if now_ms - ts < active_ms {
-                overflow_speakers.push((i, ts));
-            }
-        }
-    }
-    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Visible non-speaking tiles as swap candidates (least recently active first).
-    let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
-        .filter(|&i| {
-            speech_map
-                .get(&tiles[i])
-                .is_none_or(|&ts| now_ms - ts >= active_ms)
-        })
-        .map(|i| (i, eff_ts(&tiles[i])))
-        .collect();
-    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Swap pairs — all indices are disjoint so order doesn't matter.
-    let num_swaps = overflow_speakers.len().min(swap_candidates.len());
-    for i in 0..num_swaps {
-        tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
-    }
-}
-
+use super::attendants_layout::{
+    compute_effective_density, compute_layout, promote_speakers, TILE_AR,
+};
 use super::density::{DensityMode, DENSITY_MODES};
 
 #[component]
@@ -2625,54 +2525,17 @@ pub fn AttendantsComponent(
     };
 
     // --- Determine effective density mode ---
-    // If the user's chosen mode can't show all active speakers, auto-escalate
-    // to a denser mode so every speaker is always visible.
     let user_mode = density_mode();
-    let modes_by_density = [
-        DensityMode::Standard,
-        DensityMode::Auto,
-        DensityMode::Dense,
-        DensityMode::Maximum,
-    ];
-    let user_rank = modes_by_density
-        .iter()
-        .position(|&m| m == user_mode)
-        .unwrap_or(1);
-
-    let effective_mode = if active_speaker_count > 0 {
-        let mut chosen = user_mode;
-        for &mode in &modes_by_density[user_rank..] {
-            chosen = mode;
-            let mtw = mode.min_tile_width(vw);
-            // Find the max tile count where compute_layout yields tw >= mtw.
-            // Since tile_width is monotonically non-increasing as tile count
-            // grows, we can scan downward from total_tiles (fast in practice
-            // since the breakpoint is usually close to total_tiles).
-            let capacity = {
-                let mut t = total_tiles;
-                while t > 1 {
-                    let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
-                    if tw >= mtw {
-                        break;
-                    }
-                    t -= 1;
-                }
-                t
-            };
-            let vis = if total_tiles > capacity {
-                capacity.saturating_sub(1).max(1)
-            } else {
-                total_tiles
-            };
-            let vis_real = num_display_peers.min(vis);
-            if vis_real >= active_speaker_count {
-                break;
-            }
-        }
-        chosen
-    } else {
-        user_mode
-    };
+    let effective_mode = compute_effective_density(
+        user_mode,
+        total_tiles,
+        avail_w,
+        avail_h,
+        gap,
+        active_speaker_count,
+        num_display_peers,
+        vw,
+    );
 
     // --- Determine visible tile count ---
     let min_tw = effective_mode.min_tile_width(vw);

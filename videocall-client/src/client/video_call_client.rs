@@ -2352,38 +2352,45 @@ impl Inner {
                                 is_targeted_at_self
                             );
                             let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the mute-all fast path can exclude
+                            // the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
-                            // #1034: for a SPECIFIC-target host mute, immediately
-                            // reflect the muted state on every other peer's tile
-                            // (the non-target clients) instead of waiting out the
-                            // heartbeat freshness window (~5s freeze). A host
-                            // command is authoritative, so this bypasses
+                            // #1034 / #1036: reflect the muted state on every
+                            // affected peer's tile immediately instead of waiting
+                            // out the heartbeat freshness window (~5s freeze). A
+                            // host command is authoritative, so this bypasses
                             // `apply_heartbeat_enabled_flag`. The self path
                             // (below) still performs the target's own local mute
                             // via `on_host_mute`.
                             //
-                            // `force_peer_media_off` looks up peers by user_id and
-                            // is a safe no-op on the target's own client and the
-                            // host's own client (neither holds a peer entry for
-                            // itself).
-                            //
-                            // Mute-all (empty target) is intentionally NOT
-                            // force-offed here: at the `videocall-client` layer we
-                            // have no owner/host identity (`is_owner` lives in the
-                            // dioxus-ui layer), so iterating all peers would also
-                            // force the *host's* tile off on every participant's
-                            // screen — wrong, since mute-all mutes participants but
-                            // not the host. Mute-all therefore stays on the
-                            // existing heartbeat-based path, which already excludes
-                            // the host correctly (the host keeps sending
-                            // affirmative heartbeats). The pre-existing latency for
-                            // the all-case is out of scope for #1034.
+                            // Three cases:
+                            //   * SPECIFIC target (non-empty target): force-mute
+                            //     just that peer via `force_peer_media_off`, a
+                            //     safe no-op on the target's and host's own
+                            //     clients (neither holds a peer entry for itself).
+                            //   * MUTE-ALL with a non-empty `creator_id`: #1036
+                            //     makes this a host-excluded fast path too —
+                            //     force-mute every peer EXCEPT the issuing host
+                            //     (whose user_id the server put in `creator_id`),
+                            //     so the host's tile is never force-muted on any
+                            //     participant's screen.
+                            //   * MUTE-ALL with an EMPTY `creator_id` (older
+                            //     server, or any edge case): do NOTHING new and
+                            //     fall back to the slow heartbeat path — the safe
+                            //     fallback that avoids the host-mute regression,
+                            //     since without the host id we cannot exclude it.
                             if !is_mute_all {
                                 self.peer_decode_manager.force_peer_media_off(
                                     &target_str,
                                     true,
                                     false,
                                 );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, true, false);
                             }
 
                             if is_mute_all || is_targeted_at_self {
@@ -2412,27 +2419,37 @@ impl Inner {
                                 is_targeted_at_self
                             );
                             let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the disable-all fast path can
+                            // exclude the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
-                            // #1034: for a SPECIFIC-target host disable-video,
-                            // immediately flip every other peer's tile to
-                            // video-off, clearing the frozen last frame via the
-                            // decoder flush in `force_peer_media_off`, instead of
-                            // waiting out the heartbeat freshness window. Self/host
-                            // paths are unaffected (no self peer entry).
-                            //
-                            // Disable-video-all (empty target) is intentionally
-                            // NOT force-offed here: see the matching note in the
-                            // HOST_MUTE_PARTICIPANT handler — without owner/host
-                            // identity at this layer, force-offing all peers would
-                            // also disable the host's tile on every participant's
-                            // screen. Disable-all stays on the existing
-                            // heartbeat-based path (out of scope for #1034).
+                            // #1034 / #1036: immediately flip every affected
+                            // peer's tile to video-off, clearing the frozen last
+                            // frame via the decoder flush, instead of waiting out
+                            // the heartbeat freshness window. Self/host local
+                            // paths are unaffected (no self peer entry). Mirrors
+                            // the HOST_MUTE_PARTICIPANT handler's three cases:
+                            //   * SPECIFIC target → `force_peer_media_off`.
+                            //   * DISABLE-ALL with non-empty `creator_id` (#1036)
+                            //     → host-excluded fast path: force video-off on
+                            //     every peer EXCEPT the issuing host (from
+                            //     `creator_id`), so the host's tile is never
+                            //     force-disabled on any participant's screen.
+                            //   * DISABLE-ALL with EMPTY `creator_id` → do nothing
+                            //     new, fall back to the slow heartbeat path (safe
+                            //     fallback; without the host id we cannot exclude
+                            //     it, so we must not iterate all peers).
                             if !is_disable_all {
                                 self.peer_decode_manager.force_peer_media_off(
                                     &target_str,
                                     false,
                                     true,
                                 );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, false, true);
                             }
 
                             if is_disable_all || is_targeted_at_self {

@@ -319,9 +319,10 @@ pub fn DeviceSettingsModal(
     // mounted. Currently unreachable (the fullscreen overlay prevents clicking
     // "Dock Settings…" while open), but guards against future callers that may
     // change `initial_section` without a key remount.
-    let mut prev_section_prop = use_signal(move || initial_section.clone());
+    let initial_section_clone = initial_section.clone();
+    let mut prev_section_prop = use_signal(move || initial_section_clone);
     if *prev_section_prop.read() != initial_section {
-        prev_section_prop.set(initial_section.clone());
+        prev_section_prop.set(initial_section);
         active_section.set(requested);
     }
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);

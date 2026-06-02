@@ -163,6 +163,112 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
 /// resolutions when the network is constrained.
 pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 
+// ---------------------------------------------------------------------------
+// Simulcast Layer Catalog (issue #989, Phase 1b)
+// ---------------------------------------------------------------------------
+
+/// Indices into [`VIDEO_QUALITY_TIERS`] that define the simulcast layer ladder.
+///
+/// Simulcast (issue #989) lets a publisher encode the *same* camera feed at
+/// several fixed quality layers simultaneously, tagging each encoded chunk with
+/// a cleartext layer id. This is the **single source of truth** for which
+/// resolution/bitrate each simulcast layer uses — the layers are expressed as
+/// indices into the existing `VIDEO_QUALITY_TIERS` rather than duplicating the
+/// tier values, so there is one place to tune.
+///
+/// The full 3-layer ladder, ordered **lowest layer first** (`layer_id` ==
+/// position in the slice), is:
+///
+/// - layer 0 = `low`      (idx 5: 640×360 / ideal 400 kbps)
+/// - layer 1 = `standard` (idx 3: 960×540 / ideal 900 kbps)
+/// - layer 2 = `hd`       (idx 2: 1280×720 / ideal 1500 kbps)
+///
+/// Ordering lowest-first matches the receiver guard (PR A) that defaults to
+/// decoding the lowest layer (`layer_id == 0`): the base layer is the cheapest
+/// to decode and the most resilient under congestion, and dropping the **top**
+/// active layer under congestion sheds the highest-cost stream first.
+const SIMULCAST_LAYER_TIER_INDICES: &[usize] = &[5, 3, 2];
+
+/// Maximum number of simulcast layers in the full ladder.
+///
+/// Equal to `SIMULCAST_LAYER_TIER_INDICES.len()`. Mirrors
+/// `SIMULCAST_MAX_SUPPORTED_LAYERS` in `videocall-client`'s `camera_encoder.rs`
+/// (kept in sync deliberately — the client clamps requested layers, the AQ
+/// crate owns the tier mapping).
+pub const SIMULCAST_MAX_LAYERS: usize = 3;
+
+/// Resolve the simulcast layer tiers for an `n`-layer ladder.
+///
+/// Returns a slice of [`VideoQualityTier`] references, **lowest layer first**
+/// (index in the returned slice == `layer_id`). The mapping is derived from
+/// [`SIMULCAST_LAYER_TIER_INDICES`]:
+///
+/// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
+///   device is too weak; the AQ controller treats this exactly like today's
+///   single-stream path, so this tier is *not* used to override the adaptive
+///   single-stream resolution — see `camera_encoder.rs`).
+/// - `n == 2` → `[low, hd]` (skip the middle `standard` tier so the two layers
+///   are well separated in resolution/bitrate).
+/// - `n == 3` → `[low, standard, hd]` (full ladder).
+///
+/// # Panics
+/// Panics if `n` is not in `{1, 2, 3}`. Callers must clamp first (the client's
+/// `clamp_layer_count` guarantees this); an out-of-range `n` is a programmer
+/// error, not a runtime condition.
+pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
+    // Static, build-once tables so the function can return `&'static`.
+    // Each entry is a reference into VIDEO_QUALITY_TIERS (no value duplication
+    // — we copy the *struct* into a fixed array sized per ladder, since
+    // VideoQualityTier is plain data and the source tiers are themselves
+    // 'static). To keep returns `&'static [VideoQualityTier]` without copying,
+    // we build the per-ladder slices lazily via `OnceLock`.
+    use std::sync::OnceLock;
+
+    fn ladder(n: usize) -> Vec<VideoQualityTier> {
+        // Take the lowest `n` rungs of the ladder definition. The ladder is
+        // authored low→high in SIMULCAST_LAYER_TIER_INDICES, but the 2-layer
+        // subset is [low, hd] (skip standard), so select explicitly per n.
+        let indices: &[usize] = match n {
+            1 => &SIMULCAST_LAYER_TIER_INDICES[0..1], // [low]
+            2 => &[
+                SIMULCAST_LAYER_TIER_INDICES[0],
+                SIMULCAST_LAYER_TIER_INDICES[2],
+            ], // [low, hd]
+            3 => SIMULCAST_LAYER_TIER_INDICES,        // [low, standard, hd]
+            other => panic!("simulcast_layers: n must be in {{1,2,3}}, got {other}"),
+        };
+        indices
+            .iter()
+            .map(|&i| {
+                let t = &VIDEO_QUALITY_TIERS[i];
+                // VideoQualityTier is Copy-able plain data; clone field-by-field
+                // so the returned vec owns 'static-compatible values.
+                VideoQualityTier {
+                    label: t.label,
+                    max_width: t.max_width,
+                    max_height: t.max_height,
+                    target_fps: t.target_fps,
+                    ideal_bitrate_kbps: t.ideal_bitrate_kbps,
+                    min_bitrate_kbps: t.min_bitrate_kbps,
+                    max_bitrate_kbps: t.max_bitrate_kbps,
+                    keyframe_interval_frames: t.keyframe_interval_frames,
+                }
+            })
+            .collect()
+    }
+
+    static LADDER_1: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+    static LADDER_2: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+    static LADDER_3: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+
+    match n {
+        1 => LADDER_1.get_or_init(|| ladder(1)).as_slice(),
+        2 => LADDER_2.get_or_init(|| ladder(2)).as_slice(),
+        3 => LADDER_3.get_or_init(|| ladder(3)).as_slice(),
+        other => panic!("simulcast_layers: n must be in {{1,2,3}}, got {other}"),
+    }
+}
+
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
 ///
 /// When screen share starts, the camera is forced to this tier and capped here
@@ -937,6 +1043,133 @@ mod tests {
                 lower.target_fps,
             );
         }
+    }
+
+    // =====================================================================
+    // Simulcast layer catalog validation (issue #989)
+    // =====================================================================
+
+    #[test]
+    fn test_simulcast_layer_indices_in_bounds() {
+        for &idx in SIMULCAST_LAYER_TIER_INDICES {
+            assert!(
+                idx < VIDEO_QUALITY_TIERS.len(),
+                "simulcast layer tier index {idx} out of bounds (len={})",
+                VIDEO_QUALITY_TIERS.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_simulcast_max_layers_matches_ladder_len() {
+        assert_eq!(
+            SIMULCAST_MAX_LAYERS,
+            SIMULCAST_LAYER_TIER_INDICES.len(),
+            "SIMULCAST_MAX_LAYERS must equal the ladder length"
+        );
+    }
+
+    #[test]
+    fn test_simulcast_layers_returns_expected_labels() {
+        // n=1 → [low]
+        let l1 = simulcast_layers(1);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].label, "low");
+
+        // n=2 → [low, hd] (skip standard)
+        let l2 = simulcast_layers(2);
+        assert_eq!(l2.len(), 2);
+        assert_eq!(l2[0].label, "low");
+        assert_eq!(l2[1].label, "hd");
+
+        // n=3 → [low, standard, hd]
+        let l3 = simulcast_layers(3);
+        assert_eq!(l3.len(), 3);
+        assert_eq!(l3[0].label, "low");
+        assert_eq!(l3[1].label, "standard");
+        assert_eq!(l3[2].label, "hd");
+    }
+
+    #[test]
+    fn test_simulcast_layers_resolutions_positive_and_ascending() {
+        // Layers are ordered lowest→highest, so resolution must be
+        // non-decreasing as layer_id increases (the opposite of the main
+        // VIDEO_QUALITY_TIERS ordering, which is highest→lowest).
+        for n in [1usize, 2, 3] {
+            let layers = simulcast_layers(n);
+            for layer in layers {
+                assert!(
+                    layer.max_width > 0 && layer.max_height > 0,
+                    "n={n}: layer '{}' resolution must be positive ({}x{})",
+                    layer.label,
+                    layer.max_width,
+                    layer.max_height,
+                );
+            }
+            for window in layers.windows(2) {
+                let lower = &window[0];
+                let higher = &window[1];
+                let lower_px = lower.max_width as u64 * lower.max_height as u64;
+                let higher_px = higher.max_width as u64 * higher.max_height as u64;
+                assert!(
+                    higher_px >= lower_px,
+                    "n={n}: layer '{}' ({}px) must have >= pixels than lower layer '{}' ({}px)",
+                    higher.label,
+                    higher_px,
+                    lower.label,
+                    lower_px,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_simulcast_layers_bitrate_ordering_within_and_across() {
+        for n in [1usize, 2, 3] {
+            let layers = simulcast_layers(n);
+            for layer in layers {
+                // Within-tier bitrate sanity (mirrors test_video_tier_bitrate_ordering).
+                assert!(
+                    layer.min_bitrate_kbps < layer.max_bitrate_kbps,
+                    "n={n}: layer '{}' min_bitrate ({}) must be < max_bitrate ({})",
+                    layer.label,
+                    layer.min_bitrate_kbps,
+                    layer.max_bitrate_kbps,
+                );
+                assert!(
+                    layer.ideal_bitrate_kbps >= layer.min_bitrate_kbps
+                        && layer.ideal_bitrate_kbps <= layer.max_bitrate_kbps,
+                    "n={n}: layer '{}' ideal_bitrate ({}) must be within [{}, {}]",
+                    layer.label,
+                    layer.ideal_bitrate_kbps,
+                    layer.min_bitrate_kbps,
+                    layer.max_bitrate_kbps,
+                );
+            }
+            // Across layers: ideal bitrate must be non-decreasing with layer_id.
+            for window in layers.windows(2) {
+                assert!(
+                    window[1].ideal_bitrate_kbps >= window[0].ideal_bitrate_kbps,
+                    "n={n}: layer '{}' ideal ({}) must be >= lower layer '{}' ideal ({})",
+                    window[1].label,
+                    window[1].ideal_bitrate_kbps,
+                    window[0].label,
+                    window[0].ideal_bitrate_kbps,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "n must be in")]
+    fn test_simulcast_layers_rejects_zero() {
+        let _ = simulcast_layers(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "n must be in")]
+    fn test_simulcast_layers_rejects_too_many() {
+        let _ = simulcast_layers(SIMULCAST_MAX_LAYERS + 1);
     }
 
     #[test]

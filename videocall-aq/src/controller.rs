@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
-    screen_share_camera_ceiling_index, AudioQualityTier, VideoQualityTier,
+    screen_share_camera_ceiling_index, simulcast_layers, AudioQualityTier, VideoQualityTier,
     AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO, MAX_BITRATE_SLEW_KBPS_PER_SEC,
     PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
     PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
@@ -292,6 +292,68 @@ impl DiagnosticPackets {
     }
 }
 
+/// Upper bitrate clamp (kbps) for one simulcast layer (issue #989, PR B).
+///
+/// Mirrors the single-stream drain-hold pin in
+/// [`EncoderBitrateController::process_diagnostics_packet_with_time`]: while a
+/// self-targeted CONGESTION drain hold is active, the layer's upper bound is its
+/// tier **ideal** (clamped up to at least `min_bitrate_kbps` for degenerate
+/// tiers) so the layer cannot ramp bitrate back up and re-fill the draining
+/// relay buffer; otherwise it is the tier **max**. Extracted as a pure function
+/// so the pin decision is unit-testable independently of PID arithmetic.
+fn layer_upper_clamp_kbps(tier: &VideoQualityTier, congestion_hold: bool) -> f64 {
+    if congestion_hold {
+        (tier.ideal_bitrate_kbps as f64).max(tier.min_bitrate_kbps as f64)
+    } else {
+        tier.max_bitrate_kbps as f64
+    }
+}
+
+/// Per-simulcast-layer bitrate PID state (issue #989, PR B).
+///
+/// Each active simulcast layer encodes at a *fixed* resolution (its
+/// `SIMULCAST_LAYER_TIERS` rung) and a per-layer adaptive bitrate. This struct
+/// owns one layer's PID + slew state so a layer's bitrate can be fine-tuned
+/// inside its own tier's `[min, max]` band, independently of the other layers.
+///
+/// The single fps setpoint (p75 across peers, shared by all layers) still
+/// drives the *drop/add-top-layer* decision in the manager; the per-layer PIDs
+/// only fine-tune bitrate *within* the active layers. This mirrors the
+/// single-stream design where one PID fine-tunes bitrate and the manager
+/// selects the tier — here the manager selects the active-layer count and each
+/// active layer runs the same clamp/slew logic against its own fixed tier.
+struct LayerPidState {
+    /// This layer's tier (fixed resolution + bitrate bounds). Lives in the
+    /// `&'static` simulcast ladder so a reference is cheap and stable.
+    tier: &'static VideoQualityTier,
+    /// Per-layer PID controller (same gains/limits as the single-stream PID).
+    pid: pidgeon::PidController,
+    /// Last bitrate (kbps) emitted for this layer, for the slew limiter.
+    last_target_bitrate_kbps: f64,
+}
+
+impl LayerPidState {
+    fn new(tier: &'static VideoQualityTier, initial_target_fps: f64) -> Self {
+        let cfg = pidgeon::ControllerConfig::builder()
+            .with_kp(PID_KP)
+            .with_ki(PID_KI)
+            .with_kd(PID_KD)
+            .with_setpoint(initial_target_fps)
+            .with_deadband(PID_DEADBAND_FPS)
+            .with_output_limits(PID_OUTPUT_MIN, PID_OUTPUT_MAX)
+            .with_anti_windup(true)
+            .build()
+            .expect("per-layer PID controller config is valid");
+        Self {
+            tier,
+            pid: pidgeon::PidController::new(cfg),
+            // Seed at the tier ideal so the first slew step starts from a sane
+            // baseline rather than 0 (which would bypass the slew limiter).
+            last_target_bitrate_kbps: tier.ideal_bitrate_kbps as f64,
+        }
+    }
+}
+
 pub struct EncoderBitrateController {
     pid: pidgeon::PidController,
     last_update: f64,
@@ -345,6 +407,19 @@ pub struct EncoderBitrateController {
     /// [`SystemClock`]: crate::clock::SystemClock
     /// [`TestClock`]: crate::clock::TestClock
     clock: Arc<dyn Clock>,
+
+    // --- Simulcast per-layer state (issue #989, PR B) — ADDITIVE ---
+    /// Per-layer PID/slew state, one entry per simulcast layer in the ladder
+    /// (lowest layer first, index == `layer_id`). Empty in single-stream mode,
+    /// in which case every simulcast code path is skipped and the controller
+    /// behaves exactly as before. Populated by
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers).
+    layer_pids: Vec<LayerPidState>,
+    /// Last per-layer target bitrates (kbps), `layer_pids.len()` entries.
+    /// Only the first `active_layer_count` are meaningful for the encoder; the
+    /// rest are retained so a layer that is re-added resumes near its last
+    /// target rather than jumping. Empty in single-stream mode.
+    last_layer_target_bitrates_kbps: Vec<f64>,
 }
 
 impl EncoderBitrateController {
@@ -443,7 +518,41 @@ impl EncoderBitrateController {
             last_aq_summary_ms: 0.0,
             pid_saturated_since_ms: None,
             clock,
+            // Simulcast: single-stream by default (empty vecs). Enabled via
+            // set_simulcast_layers().
+            layer_pids: Vec::new(),
+            last_layer_target_bitrates_kbps: Vec::new(),
         }
+    }
+
+    /// Enable simulcast for this controller with an `n`-layer ladder
+    /// (issue #989, PR B).
+    ///
+    /// Configures the quality manager's active-layer state and builds one
+    /// per-layer PID against the corresponding [`simulcast_layers`] rung.
+    /// `n == 1` (or `0`) leaves the controller in single-stream mode — the
+    /// per-layer vecs stay empty and every existing code path is unchanged,
+    /// which is exactly what the bot and all current callers get.
+    ///
+    /// Call once after construction, before the first diagnostics packet.
+    pub fn set_simulcast_layers(&mut self, n: usize) {
+        // Clamp + configure the manager (single source of truth for the count).
+        self.quality_manager.set_simulcast_layers(n);
+        let effective = self.quality_manager.simulcast_layer_count();
+        if effective <= 1 {
+            // Single-stream mode: nothing to build, behave exactly as before.
+            self.layer_pids.clear();
+            self.last_layer_target_bitrates_kbps.clear();
+            return;
+        }
+        let initial_target = self.target_fps.load(Ordering::Relaxed) as f64;
+        let tiers = simulcast_layers(effective);
+        self.layer_pids = tiers
+            .iter()
+            .map(|tier| LayerPidState::new(tier, initial_target))
+            .collect();
+        self.last_layer_target_bitrates_kbps =
+            tiers.iter().map(|t| t.ideal_bitrate_kbps as f64).collect();
     }
 
     // Calculate the standard deviation of FPS values to measure jitter
@@ -613,6 +722,12 @@ impl EncoderBitrateController {
         // with the actual peers feeding the p75 aggregation.
         let tier = self.quality_manager.current_video_tier();
         let ideal_for_tier = tier.ideal_bitrate_kbps as f64;
+        // Capture the tier index BEFORE update() so that, in simulcast mode, we
+        // can translate the manager's incident-hardened degrade/recover decision
+        // (which moves video_tier_index) into a top-layer drop/add. This reuses
+        // ALL the existing hysteresis / crash-ceiling / yo-yo / re-election /
+        // congestion-hold gating for free, without changing tier semantics.
+        let tier_index_before = self.quality_manager.video_tier_index();
         let tier_changed = self.quality_manager.update(
             fps_received,
             target_fps,
@@ -621,6 +736,20 @@ impl EncoderBitrateController {
             now,
             effective_peer_count,
         );
+        // Simulcast layer re-target (issue #989, PR B): a step DOWN sheds the
+        // top active layer; a step UP restores it. The single fps setpoint
+        // (p75) that drove the tier decision drives this. No-op in single-stream
+        // mode (is_simulcast() == false).
+        if self.quality_manager.is_simulcast() && tier_changed {
+            let tier_index_after = self.quality_manager.video_tier_index();
+            if tier_index_after > tier_index_before {
+                if self.quality_manager.drop_top_layer() {
+                    self.tier_changed = true;
+                }
+            } else if tier_index_after < tier_index_before && self.quality_manager.add_top_layer() {
+                self.tier_changed = true;
+            }
+        }
         if tier_changed {
             self.tier_changed = true;
             // Update internal ideal bitrate to match the new tier so PID
@@ -691,8 +820,103 @@ impl EncoderBitrateController {
             );
         }
 
+        // --- Per-layer bitrate PID (issue #989, PR B) ---
+        // In simulcast mode, additionally compute a per-layer target bitrate for
+        // every layer in the ladder, each clamped to its OWN fixed tier's
+        // [min, max] band and slew-limited like the single-stream path. The
+        // single fps setpoint (`fps_received`) drives all layers; the manager
+        // (above) decides how many are active. The encoder only encodes+sends
+        // the first `active_layer_count` of these. No-op in single-stream mode.
+        if self.quality_manager.is_simulcast() && !self.layer_pids.is_empty() {
+            // Mirror the single-stream drain-hold pin on the per-layer axis: while
+            // a self-targeted CONGESTION drain hold is active, each layer's max is
+            // pinned to its tier *ideal* (not its tier max) so surviving layers
+            // cannot ramp back up and re-fill the still-draining relay buffer.
+            // Computed here (not inside the mutable layer loop) to avoid borrowing
+            // `quality_manager` while `layer_pids` is mutably borrowed.
+            let congestion_hold = self.quality_manager.congestion_hold_active(now);
+            self.compute_layer_bitrates(fps_received, target_fps, jitter, dt, congestion_hold);
+        }
+
         self.last_correction_time = now;
         Some(slewed)
+    }
+
+    /// Compute and store per-layer target bitrates for the active simulcast
+    /// ladder (issue #989, PR B). Reuses the same PID→reduction→jitter→clamp→slew
+    /// pipeline as the single-stream path, but per layer against the layer's own
+    /// fixed tier bounds. Called only in simulcast mode.
+    ///
+    /// `congestion_hold` mirrors the single-stream drain-hold pin: when `true`,
+    /// each layer's upper clamp is its tier *ideal* rather than its tier max, so
+    /// the surviving layers cannot ramp bitrate back up during a self-targeted
+    /// CONGESTION drain hold and re-fill the relay buffer the cut is draining.
+    fn compute_layer_bitrates(
+        &mut self,
+        fps_received: f64,
+        target_fps: f64,
+        jitter: f64,
+        dt: f64,
+        congestion_hold: bool,
+    ) {
+        for i in 0..self.layer_pids.len() {
+            // Keep each layer's setpoint synced to the (possibly changing) target.
+            if let Err(e) = self.layer_pids[i].pid.set_setpoint(target_fps) {
+                log::warn!("Failed to update layer {i} PID setpoint: {e}");
+            }
+
+            let layer = &mut self.layer_pids[i];
+            let base = layer.tier.ideal_bitrate_kbps as f64;
+
+            let pid_output = match layer.pid.compute(fps_received, dt) {
+                Ok(o) => o,
+                Err(e) => {
+                    log::debug!("layer {i} PID compute error (dt={dt:.3}): {e}");
+                    0.0
+                }
+            };
+            // Reset the layer PID when error is within deadband so its bitrate
+            // can recover (mirrors the single-stream reset).
+            let current_error = target_fps - fps_received;
+            if current_error.abs() <= PID_DEADBAND_FPS && pid_output > 0.0 {
+                layer.pid.reset();
+            }
+
+            // PID output [0, MAX] -> reduction [0%, 90%], plus jitter penalty.
+            let reduction_pct = pid_output / PID_OUTPUT_MAX * 0.9;
+            let after_pid = base * (1.0 - reduction_pct);
+            let normalized_jitter = if target_fps > 0.0 {
+                jitter / target_fps
+            } else {
+                0.0
+            };
+            let jitter_factor = (normalized_jitter * 5.0).min(1.0);
+            let jitter_reduction = after_pid * (jitter_factor * PID_MAX_JITTER_PENALTY);
+            let corrected = after_pid - jitter_reduction;
+
+            // Clamp to THIS layer's fixed tier bounds. While a CONGESTION drain
+            // hold is active, pin the upper bound to the tier ideal (not max) so
+            // the layer cannot ramp back up and re-fill the draining buffer —
+            // exactly mirroring the single-stream pin in the main process loop.
+            let tier_min = layer.tier.min_bitrate_kbps as f64;
+            let tier_max = layer_upper_clamp_kbps(layer.tier, congestion_hold);
+            let clamped = if corrected.is_nan() {
+                base
+            } else {
+                corrected.clamp(tier_min, tier_max)
+            };
+
+            // Slew-limit per layer (skip on first sample / dt<=0).
+            let prev = layer.last_target_bitrate_kbps;
+            let slewed = if prev <= 0.0 || dt <= 0.0 {
+                clamped
+            } else {
+                let max_delta = MAX_BITRATE_SLEW_KBPS_PER_SEC as f64 * dt;
+                clamped.clamp(prev - max_delta, prev + max_delta)
+            };
+            layer.last_target_bitrate_kbps = slewed;
+            self.last_layer_target_bitrates_kbps[i] = slewed;
+        }
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -736,6 +960,46 @@ impl EncoderBitrateController {
         self.quality_manager.audio_tier_index()
     }
 
+    // -----------------------------------------------------------------
+    // Simulcast accessors (issue #989, PR B) — ADDITIVE
+    // -----------------------------------------------------------------
+
+    /// Whether this controller is in simulcast mode (`> 1` layers).
+    pub fn is_simulcast(&self) -> bool {
+        self.quality_manager.is_simulcast()
+    }
+
+    /// Number of simulcast layers in the configured ladder (`1` in
+    /// single-stream mode).
+    pub fn simulcast_layer_count(&self) -> usize {
+        self.quality_manager.simulcast_layer_count()
+    }
+
+    /// Number of simulcast layers currently active (encoded + sent). `1` in
+    /// single-stream mode. The encoder shuts down layers with `layer_id >=`
+    /// this value.
+    pub fn active_layer_count(&self) -> usize {
+        self.quality_manager.active_layer_count()
+    }
+
+    /// Per-layer target bitrates in kbps, lowest layer first (index ==
+    /// `layer_id`). One entry per ladder layer; only the first
+    /// [`active_layer_count`](Self::active_layer_count) are encoded by the
+    /// caller, but all are returned so a re-added layer resumes near its last
+    /// target. Empty in single-stream mode.
+    pub fn layer_target_bitrates_kbps(&self) -> &[f64] {
+        &self.last_layer_target_bitrates_kbps
+    }
+
+    /// Fixed resolution `(width, height)` for a given simulcast `layer_id`, or
+    /// `None` if out of range / single-stream mode. Resolution is fixed by
+    /// [`simulcast_layers`]; only the bitrate adapts.
+    pub fn layer_resolution(&self, layer_id: usize) -> Option<(u32, u32)> {
+        self.layer_pids
+            .get(layer_id)
+            .map(|l| (l.tier.max_width, l.tier.max_height))
+    }
+
     /// Last computed fps_ratio (received / target) for health reporting.
     pub fn last_fps_ratio(&self) -> f64 {
         self.last_fps_ratio
@@ -762,7 +1026,29 @@ impl EncoderBitrateController {
     /// Returns `true` if the tier actually changed.
     pub fn force_video_step_down(&mut self) -> bool {
         let now = self.clock.now_ms();
+        // Capture the forced-transition guard state BEFORE the manager call,
+        // since a successful step-down updates last_transition_time_ms (which
+        // would then make forced_transition_guards_clear read false on the same
+        // tick). The layer shed below uses this so it fires only when the
+        // request was NOT blocked by warmup / min-interval — but, unlike the
+        // tier step-down, independent of the tier floor.
+        let guards_clear = self.quality_manager.forced_transition_guards_clear(now);
         let changed = self.quality_manager.force_video_step_down(now);
+        // Simulcast (issue #989): WS backpressure / a gentle congestion
+        // step-down sheds the top active layer too. Drive this off the LAYER
+        // floor, not off the manager's tier `changed` return: the manager
+        // returns `false` once `video_tier_index` is at its lowest tier, but the
+        // layer axis is independent of that tier floor (simulcast layers have
+        // FIXED resolutions). Coupling to `changed` would stop shedding layers
+        // the moment the tier index bottoms out. We still respect the warmup /
+        // min-interval guards via `guards_clear` so a blocked request sheds
+        // nothing. No-op in single-stream mode (drop_top_layer floors at 1).
+        if guards_clear
+            && self.quality_manager.is_simulcast()
+            && self.quality_manager.drop_top_layer()
+        {
+            self.tier_changed = true;
+        }
         if changed {
             self.tier_changed = true;
             let old_bitrate = self.ideal_bitrate_kbps;
@@ -790,6 +1076,39 @@ impl EncoderBitrateController {
     pub fn force_congestion_cut(&mut self) -> bool {
         let now = self.clock.now_ms();
         let changed = self.quality_manager.force_congestion_cut(now);
+        // Simulcast (issue #989): a self-targeted CONGESTION cut is the
+        // strongest signal — the relay is actively dropping our packets — so
+        // shed the top active layer to cut egress AND sender encode CPU
+        // immediately, in addition to the per-layer bitrate cut. The manager's
+        // `force_congestion_cut` already drops two *tiers* in single-stream mode;
+        // here we mirror that aggression on the layer axis by dropping the top
+        // layer once. (A two-layer drop is not warranted: dropping one HD/SD
+        // layer already sheds the bulk of the egress, and the per-layer bitrate
+        // PIDs continue to throttle the remaining layers under the same drain
+        // hold.)
+        //
+        // Gate the layer shed on the drain HOLD being active post-cut, NOT on
+        // the manager's `changed` return. `force_congestion_cut` returns `false`
+        // in two distinct cases: (a) blocked by the warmup / min-transition-
+        // interval guard — nothing happened, no hold armed; and (b) the tier is
+        // already at its floor but the hold IS armed (see manager.rs). We must
+        // shed a layer in case (b) but not (a). `congestion_hold_active(now)` is
+        // true iff the cut took effect cleanly — and it stays true at the tier
+        // floor, so this decouples the layer axis from the tier floor while
+        // still respecting the warmup / min-interval guards. No-op in
+        // single-stream mode (drop_top_layer floors at 1).
+        let cut_took_effect = self.quality_manager.congestion_hold_active(now);
+        let layer_shed = cut_took_effect
+            && self.quality_manager.is_simulcast()
+            && self.quality_manager.drop_top_layer();
+        if layer_shed {
+            self.tier_changed = true;
+            // A layer was shed but the tier index may NOT have moved (we were at
+            // the tier floor). Still arm the one-shot throttle bypass so the
+            // recomputed per-layer bitrates — now clamped by the just-armed drain
+            // hold — reach the encoder this iteration rather than ~1s later.
+            self.force_next_correction = true;
+        }
         if changed {
             self.tier_changed = true;
             // Arm a one-shot throttle bypass so the next process_diagnostics_packet
@@ -2272,6 +2591,341 @@ mod tests {
             "the throttle bypass must be one-shot; the normal 1s throttle must \
              still apply to the following correction"
         );
+    }
+
+    // =====================================================================
+    // Simulcast controller tests (#989, PR B) — ADDITIVE
+    // =====================================================================
+
+    #[test]
+    fn test_controller_single_stream_by_default() {
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let controller = EncoderBitrateController::new(500, target_fps);
+        assert!(!controller.is_simulcast());
+        assert_eq!(controller.simulcast_layer_count(), 1);
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(controller.layer_target_bitrates_kbps().is_empty());
+        assert_eq!(controller.layer_resolution(0), None);
+    }
+
+    #[test]
+    fn test_set_simulcast_layers_builds_per_layer_state() {
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(500, target_fps);
+        controller.set_simulcast_layers(3);
+
+        assert!(controller.is_simulcast());
+        assert_eq!(controller.simulcast_layer_count(), 3);
+        assert_eq!(controller.active_layer_count(), 3);
+        // Per-layer fixed resolutions match the ladder [low, standard, hd].
+        assert_eq!(controller.layer_resolution(0), Some((640, 360)));
+        assert_eq!(controller.layer_resolution(1), Some((960, 540)));
+        assert_eq!(controller.layer_resolution(2), Some((1280, 720)));
+        assert_eq!(controller.layer_resolution(3), None);
+        assert_eq!(controller.layer_target_bitrates_kbps().len(), 3);
+    }
+
+    #[test]
+    fn test_set_simulcast_layers_one_stays_single_stream() {
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(500, target_fps);
+        controller.set_simulcast_layers(1);
+        assert!(!controller.is_simulcast());
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(controller.layer_target_bitrates_kbps().is_empty());
+    }
+
+    #[test]
+    fn test_per_layer_bitrates_clamped_to_layer_tier_bounds() {
+        use crate::constants::simulcast_layers;
+
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(500, target_fps);
+        controller.set_simulcast_layers(3);
+
+        // Drive perfect conditions for many ticks; each layer's bitrate must
+        // stay within its own fixed tier [min, max] band.
+        let base = 1000.0;
+        for i in 0..20 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base + (i as f64 * 1100.0),
+            );
+        }
+
+        let tiers = simulcast_layers(3);
+        let bitrates = controller.layer_target_bitrates_kbps();
+        assert_eq!(bitrates.len(), 3);
+        for (i, &b) in bitrates.iter().enumerate() {
+            let tmin = tiers[i].min_bitrate_kbps as f64;
+            let tmax = tiers[i].max_bitrate_kbps as f64;
+            assert!(
+                b >= tmin - 0.5 && b <= tmax + 0.5,
+                "layer {i} bitrate {b} must be within tier bounds [{tmin}, {tmax}]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_congestion_cut_sheds_top_layer_in_simulcast() {
+        use crate::clock::TestClock;
+        use crate::constants::{DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let ideal = VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].ideal_bitrate_kbps;
+        let mut controller = EncoderBitrateController::with_clock(
+            ideal,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        // Warm past the manager's 5s warmup so the forced cut is allowed.
+        let stable_fps = 18.0_f32;
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, stable_fps, ideal);
+
+        clock.set_ms((last_warm + 1100.0) as u64);
+        let changed = controller.force_congestion_cut();
+        assert!(
+            changed,
+            "congestion cut should change tier from default start"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a congestion cut in simulcast mode must shed the top active layer"
+        );
+    }
+
+    #[test]
+    fn test_force_step_down_sheds_top_layer_in_simulcast() {
+        use crate::clock::TestClock;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::with_clock(
+            500,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+
+        // Warm past warmup so the forced step-down is allowed.
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 18.0, 500);
+        clock.set_ms((last_warm + 1100.0) as u64);
+
+        assert!(controller.force_video_step_down());
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "force_video_step_down in simulcast mode must shed the top active layer"
+        );
+    }
+
+    #[test]
+    fn test_single_stream_force_paths_do_not_touch_layers() {
+        use crate::clock::TestClock;
+
+        // In single-stream mode the force_* paths must NOT change active layers
+        // (it stays pinned at 1) — preserving today's behavior for the bot.
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::with_clock(
+            500,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        // No set_simulcast_layers → single-stream.
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 18.0, 500);
+        clock.set_ms((last_warm + 1100.0) as u64);
+
+        controller.force_video_step_down();
+        assert_eq!(controller.active_layer_count(), 1);
+        assert!(controller.layer_target_bitrates_kbps().is_empty());
+    }
+
+    #[test]
+    fn test_congestion_cut_sheds_layer_even_at_tier_floor() {
+        // Finding 2 regression: force_congestion_cut returns `false` once the
+        // tier index is at the floor (manager can't drop further), but it STILL
+        // arms the drain hold — so in simulcast mode it must still shed a layer
+        // while active_layer_count > 1. The layer axis is independent of the
+        // tier floor.
+        use crate::clock::TestClock;
+        use crate::constants::VIDEO_QUALITY_TIERS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::with_clock(
+            400,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        // Warm past warmup so the forced cut is allowed.
+        let base_time = base_ms as f64 + 6000.0;
+        let last_warm = warm_up_for_slew_test(&mut controller, base_time, 18.0, 400);
+
+        // Force the tier index to the floor WITHOUT shedding layers, so the cut
+        // below exercises the "manager returns false but hold is armed" path.
+        let floor = VIDEO_QUALITY_TIERS.len() - 1;
+        controller
+            .quality_manager
+            .force_video_step_to(floor, last_warm);
+        assert_eq!(controller.video_tier_index(), floor);
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "forcing the tier to the floor must not touch the layer axis"
+        );
+
+        // Cut > MIN_TIER_TRANSITION_INTERVAL_MS after the forced step-to so the
+        // guard is clear and the cut takes effect (arms the hold) at the floor.
+        let cut_at = last_warm + 1600.0;
+        clock.set_ms(cut_at as u64);
+        let changed = controller.force_congestion_cut();
+        assert!(
+            !changed,
+            "at the tier floor the manager reports no tier change"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a congestion cut must still shed a layer at the tier floor (drain hold armed)"
+        );
+        // The drain hold is armed, and a layer was shed, so the one-shot throttle
+        // bypass must be set so the held per-layer bitrates land immediately.
+        assert!(
+            controller
+                .quality_manager
+                .congestion_hold_active(cut_at + 1.0),
+            "drain hold must be armed even at the tier floor"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_bitrates_pinned_to_ideal_during_congestion_hold() {
+        // Finding 1 regression: while a CONGESTION drain hold is active, each
+        // surviving layer's bitrate must be clamped to its tier IDEAL (not max),
+        // mirroring the single-stream pin, so the layers can't ramp back up and
+        // re-fill the draining relay buffer.
+        use crate::clock::TestClock;
+        use crate::constants::{simulcast_layers, DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let ideal = VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX].ideal_bitrate_kbps;
+        let mut controller = EncoderBitrateController::with_clock(
+            ideal,
+            target_fps,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+
+        // Warm past warmup with PERFECT conditions so the PIDs want max bitrate.
+        let perfect_fps = 30.0_f32;
+        let base_time = base_ms as f64 + 6000.0;
+        let mut now = warm_up_for_slew_test(&mut controller, base_time, perfect_fps, ideal);
+
+        // Arm a congestion cut (also sheds a layer + arms the drain hold).
+        now += 1100.0;
+        clock.set_ms(now as u64);
+        let cut_at = now;
+        controller.force_congestion_cut();
+        let active = controller.active_layer_count();
+        assert!(active >= 1);
+
+        // Drive perfect-condition ticks DURING the hold window only. Each
+        // surviving layer's bitrate must stay at/below its tier ideal (the hold
+        // pin), never climbing toward its tier max. Stay strictly inside
+        // CONGESTION_HOLD_MS so the hold is guaranteed active each tick.
+        use crate::constants::CONGESTION_HOLD_MS;
+        let tiers = simulcast_layers(controller.simulcast_layer_count());
+        let mut ticks_in_hold = 0;
+        while now + 600.0 < cut_at + CONGESTION_HOLD_MS {
+            now += 600.0;
+            clock.set_ms(now as u64);
+            assert!(
+                controller.quality_manager.congestion_hold_active(now),
+                "hold should still be active at t={now}"
+            );
+            ticks_in_hold += 1;
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", perfect_fps, ideal),
+                now,
+            );
+            let bitrates = controller.layer_target_bitrates_kbps();
+            for layer_id in 0..active {
+                let tier = &tiers[layer_id];
+                let tier_ideal = tier.ideal_bitrate_kbps as f64;
+                let tier_max = tier.max_bitrate_kbps as f64;
+                assert!(
+                    tier_max > tier_ideal,
+                    "test precondition: layer {layer_id} ideal {tier_ideal} < max {tier_max}"
+                );
+                assert!(
+                    bitrates[layer_id] <= tier_ideal + 0.5,
+                    "layer {layer_id} bitrate {} must be pinned <= tier ideal {tier_ideal} during \
+                     the congestion hold (not ramping toward max {tier_max})",
+                    bitrates[layer_id],
+                );
+            }
+        }
+        assert!(
+            ticks_in_hold > 0,
+            "test must exercise at least one tick inside the congestion hold"
+        );
+
+        // Sanity: after the hold expires the per-layer clamp returns to using
+        // the tier max (verified deterministically by the pure-function test
+        // below — the PID itself is reduction-only and won't drive above ideal
+        // under perfect conditions, so we don't assert a numeric climb here).
+        assert!(!controller
+            .quality_manager
+            .congestion_hold_active(cut_at + CONGESTION_HOLD_MS + 1.0));
+    }
+
+    #[test]
+    fn test_layer_upper_clamp_pins_to_ideal_only_during_hold() {
+        // Finding 1, focused regression: the per-layer upper clamp is the tier
+        // IDEAL while a congestion drain hold is active, and the tier MAX
+        // otherwise — mirroring the single-stream pin. Deterministic and
+        // independent of PID arithmetic.
+        use crate::constants::simulcast_layers;
+
+        for tier in simulcast_layers(3) {
+            let ideal = tier.ideal_bitrate_kbps as f64;
+            let max = tier.max_bitrate_kbps as f64;
+            assert!(
+                max > ideal,
+                "precondition: tier '{}' max {max} must exceed ideal {ideal}",
+                tier.label
+            );
+            assert_eq!(
+                layer_upper_clamp_kbps(tier, true),
+                ideal,
+                "tier '{}': during the hold the upper clamp must be the IDEAL",
+                tier.label
+            );
+            assert_eq!(
+                layer_upper_clamp_kbps(tier, false),
+                max,
+                "tier '{}': without the hold the upper clamp must be the MAX",
+                tier.label
+            );
+        }
     }
 
     #[test]

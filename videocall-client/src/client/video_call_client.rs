@@ -2351,9 +2351,42 @@ impl Inner {
                                 is_mute_all,
                                 is_targeted_at_self
                             );
-                            if is_mute_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
 
+                            // #1034: for a SPECIFIC-target host mute, immediately
+                            // reflect the muted state on every other peer's tile
+                            // (the non-target clients) instead of waiting out the
+                            // heartbeat freshness window (~5s freeze). A host
+                            // command is authoritative, so this bypasses
+                            // `apply_heartbeat_enabled_flag`. The self path
+                            // (below) still performs the target's own local mute
+                            // via `on_host_mute`.
+                            //
+                            // `force_peer_media_off` looks up peers by user_id and
+                            // is a safe no-op on the target's own client and the
+                            // host's own client (neither holds a peer entry for
+                            // itself).
+                            //
+                            // Mute-all (empty target) is intentionally NOT
+                            // force-offed here: at the `videocall-client` layer we
+                            // have no owner/host identity (`is_owner` lives in the
+                            // dioxus-ui layer), so iterating all peers would also
+                            // force the *host's* tile off on every participant's
+                            // screen — wrong, since mute-all mutes participants but
+                            // not the host. Mute-all therefore stays on the
+                            // existing heartbeat-based path, which already excludes
+                            // the host correctly (the host keeps sending
+                            // affirmative heartbeats). The pre-existing latency for
+                            // the all-case is out of scope for #1034.
+                            if !is_mute_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    true,
+                                    false,
+                                );
+                            }
+
+                            if is_mute_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_mute", &target_str) {
                                     if let Some(cb) = &self.options.on_host_mute {
                                         cb.emit(());
@@ -2378,9 +2411,31 @@ impl Inner {
                                 is_disable_all,
                                 is_targeted_at_self
                             );
-                            if is_disable_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
 
+                            // #1034: for a SPECIFIC-target host disable-video,
+                            // immediately flip every other peer's tile to
+                            // video-off, clearing the frozen last frame via the
+                            // decoder flush in `force_peer_media_off`, instead of
+                            // waiting out the heartbeat freshness window. Self/host
+                            // paths are unaffected (no self peer entry).
+                            //
+                            // Disable-video-all (empty target) is intentionally
+                            // NOT force-offed here: see the matching note in the
+                            // HOST_MUTE_PARTICIPANT handler — without owner/host
+                            // identity at this layer, force-offing all peers would
+                            // also disable the host's tile on every participant's
+                            // screen. Disable-all stays on the existing
+                            // heartbeat-based path (out of scope for #1034).
+                            if !is_disable_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    false,
+                                    true,
+                                );
+                            }
+
+                            if is_disable_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_disable_video", &target_str)
                                 {
                                     if let Some(cb) = &self.options.on_host_disable_video {

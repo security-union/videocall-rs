@@ -231,25 +231,32 @@ test.describe("Host mute controls", () => {
       // are still available) but the "Mute" menu item inside is no longer
       // rendered because on_mute becomes None when audio_enabled is false.
       //
-      // The removal is gated on the guest's diagnostics re-broadcast carrying
-      // `audio_enabled=false` — a multi-hop async chain:
+      // #1034 supersedes #985 here. Previously the removal was gated on the
+      // guest's diagnostics RE-BROADCAST carrying `audio_enabled=false` — a
+      // slow multi-hop chain (host.mute -> NATS -> guest mutes locally ->
+      // guest's next diagnostics tick, ~1-5s -> host receives -> on_mute
+      // becomes None -> re-render). That ~5s+ lag is exactly why #985 widened
+      // this bound from 10s to 30s.
       //
-      //   host.mute -> NATS -> guest mutes locally -> guest's next
-      //   diagnostics tick (1-5s) -> host receives -> on_mute becomes None
-      //   -> Dioxus re-render removes the "Mute" menu item.
+      // With the #1034 fix the host's OWN client also receives the
+      // HOST_MUTE_PARTICIPANT broadcast it just sent, and
+      // `force_peer_media_off(target, audio_off=true)` sets the target peer's
+      // `audio_enabled=false` DIRECTLY on the host's decode manager
+      // (bypassing the heartbeat freshness window) and broadcasts peer-status.
+      // So `is_audio_enabled_for_peer(target)` is false within a render frame,
+      // on_mute becomes None, and the "Mute" item is removed almost
+      // immediately — no longer waiting on the guest's diagnostics tick.
       //
-      // The previous 10s timeout (PR #938 stabilization) was too tight under
-      // hcl-main push-runner load (issue #985 — 9+ consecutive failures with
-      // the same `Received: 1, Timeout: 10000ms` shape). 30s gives headroom
-      // for a ~5s diagnostics tick + propagation + rAF slack. Playwright's
-      // `toHaveCount(0)` returns as soon as the condition is met, so the
-      // wider bound does not slow the common fast-runner case.
+      // The bound is therefore tightened back to a FAR-below-30s value. 5s is
+      // generous slack for NATS round-trip + Dioxus re-render under busy-CI
+      // load, but a regression of #1034 (reverting to the heartbeat-only path)
+      // re-introduces the ~5s+ lag and would flake/fail this assertion.
       const hostActionsBtn = hostPage.getByTitle("Host actions");
       await hostActionsBtn.hover();
       await hostActionsBtn.click();
       await expect(hostPage.locator(".tile-context-menu-item", { hasText: "Mute" })).toHaveCount(
         0,
-        { timeout: 30_000 },
+        { timeout: 5_000 },
       );
     } finally {
       await browser1.close();
@@ -451,6 +458,131 @@ test.describe("Host mute controls", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  /**
+   * Test 4 (#1034): a NON-host, NON-target THIRD peer (the "observer") sees the
+   * target's mic icon flip to MUTED **immediately** after the host mutes the
+   * target — bypassing the receiver-side heartbeat freshness window.
+   *
+   * Before the fix, the observer's mic icon for the target lagged ~5s behind
+   * the host action, because the target's own off-heartbeat (audio_enabled
+   * false) was suppressed inside the `MEDIA_FRESH_WINDOW_MS` guard while
+   * straggler audio packets were still arriving. The fix makes the
+   * authoritative HOST_MUTE_PARTICIPANT command call `force_peer_media_off`
+   * on every client, setting the target peer's `audio_enabled=false` directly
+   * and broadcasting peer-status — so the observer's
+   * `is_audio_enabled_for_peer(target)` goes false at once and the tile's
+   * `MicIcon { muted: true }` renders.
+   *
+   * DOM signal: the muted MicIcon SVG (icons/mic.rs) renders a slash line
+   * `<line x1="1" y1="1" x2="23" y2="23">` that the unmuted icon never has
+   * (the unmuted icon's only `<line>` uses x1="12"). We scope to the target's
+   * tile by display name and assert that slash line appears within a TIGHT 3s
+   * bound. A regression to the heartbeat-only path would not surface the
+   * muted icon for ~5s and would blow this bound.
+   */
+  test("non-target third peer sees target muted immediately (#1034)", async ({ baseURL }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hostmute_observer_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+
+    // Display name of the target guest — the observer scopes the target's tile
+    // by this name (rendered in the tile's `h4.floating-name`).
+    const TARGET_NAME = "MuteObsTarget";
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-muteobserver@videocall.rs",
+        "MuteObsHost",
+        uiURL,
+      );
+      const targetCtx = await createAuthenticatedContext(
+        browser2,
+        "target-muteobserver@videocall.rs",
+        TARGET_NAME,
+        uiURL,
+      );
+      const observerCtx = await createAuthenticatedContext(
+        browser3,
+        "observer-muteobserver@videocall.rs",
+        "MuteObsObserver",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const targetPage = await targetCtx.newPage();
+      const observerPage = await observerCtx.newPage();
+
+      // ---- Host joins first (becomes owner) ----
+      await navigateToMeeting(hostPage, meetingId, "MuteObsHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // ---- Target joins and is admitted ----
+      await navigateToMeeting(targetPage, meetingId, TARGET_NAME);
+      const targetResult = await joinMeetingFromPage(targetPage);
+      await admitGuestIfNeeded(hostPage, targetPage, targetResult);
+
+      // ---- Observer joins and is admitted ----
+      await navigateToMeeting(observerPage, meetingId, "MuteObsObserver");
+      const observerResult = await joinMeetingFromPage(observerPage);
+      await admitGuestIfNeeded(hostPage, observerPage, observerResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(targetPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(observerPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      // Host must see the target's tile (per-tile host menu) so it can mute.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // Brief stabilization for audio track state to propagate before the
+      // target unmutes (mirrors Test 1).
+      await hostPage.waitForTimeout(2000);
+
+      // ---- Target turns its mic ON ----
+      await enableMic(targetPage);
+
+      // The observer's tile for the TARGET, scoped by the target's display
+      // name in the floating-name header.
+      const observerTargetTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: TARGET_NAME }),
+        })
+        .first();
+      await expect(observerTargetTile).toBeVisible({ timeout: 45_000 });
+
+      // Pre-state: the observer sees the target UNMUTED — the muted slash line
+      // is absent. This proves we observe a real mute transition rather than
+      // an already-muted tile. (The unmuted MicIcon has no `line[x1="1"]`.)
+      await expect(observerTargetTile.locator('.audio-indicator svg line[x1="1"]')).toHaveCount(0, {
+        timeout: 30_000,
+      });
+
+      // ---- Host mutes the target via the per-tile menu ----
+      await hostMutePeerViaTile(hostPage);
+
+      // ---- #1034: observer sees the target mic icon flip to MUTED FAST ----
+      // The muted MicIcon's slash line appears only when
+      // `is_audio_enabled_for_peer(target)` is false on the observer's client.
+      // With the fix, the authoritative host command flips that immediately
+      // (no heartbeat-window wait), so a TIGHT 3s bound holds. A regression to
+      // the heartbeat-only path would lag ~5s and fail this assertion.
+      await expect(
+        observerTargetTile.locator('.audio-indicator svg line[x1="1"]').first(),
+      ).toBeVisible({ timeout: 3_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+      await browser3.close();
     }
   });
 });

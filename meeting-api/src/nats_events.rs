@@ -207,45 +207,64 @@ pub async fn publish_participant_display_name_changed(
 
 /// Publish `HOST_MUTE_PARTICIPANT` for one participant — or, with an empty
 /// `target_user_id`, for every participant in the room (mute-all).
+///
+/// `host_user_id` is the authenticated issuing host's `user_id`. It is carried
+/// on the broadcast `MeetingPacket` via `creator_id` (UTF-8 bytes) so clients
+/// can exclude the host's own tile from a force-off on the mute-all path. On
+/// the targeted path it is harmless extra context (clients only consult it for
+/// the broadcast variant where `target_user_id` is empty). When `creator_id`
+/// is empty the frontend falls back to the slower heartbeat-driven path.
 pub async fn publish_host_mute(
     nats: Option<&async_nats::Client>,
     room_id: &str,
     target_user_id: &str,
+    host_user_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(nats) = nats else { return Ok(()) };
     let packet = MeetingPacket {
         event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
         room_id: room_id.to_string(),
         target_user_id: target_user_id.as_bytes().to_vec(),
+        creator_id: host_user_id.as_bytes().to_vec(),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     nats.publish(room_system_subject(room_id), bytes.into())
         .await?;
     tracing::debug!(
-        "Published HOST_MUTE_PARTICIPANT for room {room_id} target=\"{target_user_id}\""
+        "Published HOST_MUTE_PARTICIPANT for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
     );
     Ok(())
 }
 
 /// Publish `HOST_DISABLE_VIDEO` for one participant — or, with an empty
 /// `target_user_id`, for every participant in the room (disable-video-all).
+///
+/// `host_user_id` is the authenticated issuing host's `user_id`. It is carried
+/// on the broadcast `MeetingPacket` via `creator_id` (UTF-8 bytes) so clients
+/// can exclude the host's own tile from a force-off on the disable-video-all
+/// path. On the targeted path it is harmless extra context (clients only
+/// consult it for the broadcast variant where `target_user_id` is empty). When
+/// `creator_id` is empty the frontend falls back to the slower
+/// heartbeat-driven path.
 pub async fn publish_host_disable_video(
     nats: Option<&async_nats::Client>,
     room_id: &str,
     target_user_id: &str,
+    host_user_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(nats) = nats else { return Ok(()) };
     let packet = MeetingPacket {
         event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
         room_id: room_id.to_string(),
         target_user_id: target_user_id.as_bytes().to_vec(),
+        creator_id: host_user_id.as_bytes().to_vec(),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     nats.publish(room_system_subject(room_id), bytes.into())
         .await?;
-    tracing::debug!("Published HOST_DISABLE_VIDEO for room {room_id} target=\"{target_user_id}\"");
+    tracing::debug!("Published HOST_DISABLE_VIDEO for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\"");
     Ok(())
 }
 
@@ -415,6 +434,7 @@ mod tests {
             event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
             room_id: "test-room".to_string(),
             target_user_id: "carol@example.com".as_bytes().to_vec(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -428,6 +448,10 @@ mod tests {
             inner.target_user_id,
             "carol@example.com".as_bytes().to_vec()
         );
+        // The issuing host's user_id rides on `creator_id` so clients can
+        // exclude the host tile from a force-off (HCL issue #1036). Populated
+        // on the targeted path too for API uniformity.
+        assert_eq!(inner.creator_id, "host@example.com".as_bytes().to_vec());
         assert_eq!(inner.room_id, "test-room");
     }
 
@@ -437,6 +461,7 @@ mod tests {
             event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
             room_id: "test-room".to_string(),
             target_user_id: Vec::new(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -450,6 +475,14 @@ mod tests {
             inner.target_user_id.is_empty(),
             "mute-all uses empty target_user_id as the broadcast marker"
         );
+        // On the mute-all broadcast, `creator_id` carrying the host's user_id
+        // is what lets every client exclude the host's own tile from the
+        // force-off and take the fast path (HCL issue #1036).
+        assert_eq!(
+            inner.creator_id,
+            "host@example.com".as_bytes().to_vec(),
+            "mute-all must carry the issuing host's user_id in creator_id"
+        );
     }
 
     #[test]
@@ -458,6 +491,7 @@ mod tests {
             event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
             room_id: "test-room".to_string(),
             target_user_id: "dan@example.com".as_bytes().to_vec(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -468,6 +502,8 @@ mod tests {
             MeetingEventType::HOST_DISABLE_VIDEO.into()
         );
         assert_eq!(inner.target_user_id, "dan@example.com".as_bytes().to_vec());
+        // The issuing host's user_id rides on `creator_id` (HCL issue #1036).
+        assert_eq!(inner.creator_id, "host@example.com".as_bytes().to_vec());
         assert_eq!(inner.room_id, "test-room");
     }
 
@@ -477,6 +513,7 @@ mod tests {
             event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
             room_id: "test-room".to_string(),
             target_user_id: Vec::new(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
             ..Default::default()
         };
         let bytes = build_meeting_wrapper(&packet);
@@ -489,6 +526,14 @@ mod tests {
         assert!(
             inner.target_user_id.is_empty(),
             "disable-video-all uses empty target_user_id as the broadcast marker"
+        );
+        // On the disable-video-all broadcast, `creator_id` carrying the host's
+        // user_id is what lets every client exclude the host's own tile from
+        // the force-off and take the fast path (HCL issue #1036).
+        assert_eq!(
+            inner.creator_id,
+            "host@example.com".as_bytes().to_vec(),
+            "disable-video-all must carry the issuing host's user_id in creator_id"
         );
     }
 
@@ -588,9 +633,9 @@ mod tests {
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
         publish_meeting_settings_updated(None, "room").await;
-        let _ = publish_host_mute(None, "room", "user@test.com").await;
-        let _ = publish_host_mute(None, "room", "").await;
-        let _ = publish_host_disable_video(None, "room", "user@test.com").await;
-        let _ = publish_host_disable_video(None, "room", "").await;
+        let _ = publish_host_mute(None, "room", "user@test.com", "host@test.com").await;
+        let _ = publish_host_mute(None, "room", "", "host@test.com").await;
+        let _ = publish_host_disable_video(None, "room", "user@test.com", "host@test.com").await;
+        let _ = publish_host_disable_video(None, "room", "", "host@test.com").await;
     }
 }

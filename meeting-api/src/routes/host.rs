@@ -78,7 +78,7 @@ pub async fn mute_participant(
         ));
     }
 
-    nats_events::publish_host_mute(state.nats.as_ref(), &meeting_id, &body.user_id)
+    nats_events::publish_host_mute(state.nats.as_ref(), &meeting_id, &body.user_id, &user_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -106,7 +106,7 @@ pub async fn mute_all(
     }
     require_host(&state, meeting.id, &user_id).await?;
 
-    nats_events::publish_host_mute(state.nats.as_ref(), &meeting_id, "")
+    nats_events::publish_host_mute(state.nats.as_ref(), &meeting_id, "", &user_id)
         .await
         .map_err(|e| {
             tracing::error!("NATS publish failed for HOST_MUTE_ALL in room {meeting_id}: {e}");
@@ -150,12 +150,17 @@ pub async fn disable_video_participant(
         ));
     }
 
-    nats_events::publish_host_disable_video(state.nats.as_ref(), &meeting_id, &body.user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("NATS publish failed for HOST_DISABLE_VIDEO in room {meeting_id}: {e}");
-            AppError::internal("failed to broadcast disable-video event")
-        })?;
+    nats_events::publish_host_disable_video(
+        state.nats.as_ref(),
+        &meeting_id,
+        &body.user_id,
+        &user_id,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("NATS publish failed for HOST_DISABLE_VIDEO in room {meeting_id}: {e}");
+        AppError::internal("failed to broadcast disable-video event")
+    })?;
     Ok(Json(APIResponse::ok(())))
 }
 
@@ -176,7 +181,7 @@ pub async fn disable_video_all(
     }
     require_host(&state, meeting.id, &user_id).await?;
 
-    nats_events::publish_host_disable_video(state.nats.as_ref(), &meeting_id, "")
+    nats_events::publish_host_disable_video(state.nats.as_ref(), &meeting_id, "", &user_id)
         .await
         .map_err(|e| {
             tracing::error!(

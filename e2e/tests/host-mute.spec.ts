@@ -265,58 +265,139 @@ test.describe("Host mute controls", () => {
   });
 
   /**
-   * Test 2: "Mute all" broadcasts to every guest but NOT to the host.
+   * Test 2 (#1036): "Mute all" reflects on a non-host OBSERVER's screen
+   * immediately for EVERY other participant, while the host's OWN tile stays
+   * UNMUTED on that observer's screen.
    *
-   * The host's VideoCallClient is constructed with on_host_mute: None when
-   * is_owner=true, so the host never receives the mute callback even though
-   * the NATS broadcast reaches their transport layer.
+   * Three peers: host + a target guest + an observer guest. The host issues
+   * mute-all; the observer (a non-host third peer) is the witness.
+   *
+   * #1035 made the SPECIFIC-target host mute fast (force-off on every client)
+   * but left mute-all on the slow heartbeat path, because the client had no
+   * way to know which peer was the host and would otherwise force-mute the
+   * host's own tile too. #1036 fixes this: the server now carries the issuing
+   * host's `user_id` in the broadcast's `creator_id`, so the receiving client
+   * calls `force_all_peers_media_off_except(host_id, …)` — force-muting every
+   * peer EXCEPT the host, immediately and bypassing the ~5s heartbeat freshness
+   * window.
+   *
+   * Assertions, all from the observer's vantage point:
+   *   1. The TARGET guest's mic icon flips to MUTED within a TIGHT 3s bound
+   *      (the muted MicIcon's slash line `<line x1="1">` appears). A regression
+   *      to the heartbeat-only mute-all path would lag ~5s and fail this.
+   *   2. The HOST's own tile stays UNMUTED — the muted slash line never appears
+   *      on the host tile. This is the host-exclusion guarantee of #1036: a
+   *      regression that force-muted everyone (no `creator_id` exclusion) would
+   *      flip the host tile too and fail this.
+   * Plus the original guarantees: the guest sees the mute toast, the host does
+   * not (on_host_mute is None for owner), and the host's own mic stays active.
+   *
+   * Reuses the per-tile DOM selectors established by Test 4: tiles are scoped
+   * by `[data-tile-root="true"]` containing an `h4.floating-name`, and the
+   * muted state is the `.audio-indicator svg line[x1="1"]` slash.
    */
-  test("host mute-all mutes all guests but not the host", async ({ baseURL }) => {
-    test.setTimeout(120_000);
+  test("host mute-all mutes every guest but not the host (observer view, #1036)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_hostmute_all_${Date.now()}`;
 
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+
+    // Display names: the observer scopes the host's and target's tiles by these
+    // names rendered in each tile's `h4.floating-name`.
+    const HOST_NAME = "MuteAllHost";
+    const TARGET_NAME = "MuteAllTarget";
 
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
         "host-muteall@videocall.rs",
-        "MuteAllHost",
+        HOST_NAME,
         uiURL,
       );
-      const guestCtx = await createAuthenticatedContext(
+      const targetCtx = await createAuthenticatedContext(
         browser2,
-        "guest-muteall@videocall.rs",
-        "MuteAllGuest",
+        "target-muteall@videocall.rs",
+        TARGET_NAME,
+        uiURL,
+      );
+      const observerCtx = await createAuthenticatedContext(
+        browser3,
+        "observer-muteall@videocall.rs",
+        "MuteAllObserver",
         uiURL,
       );
 
       const hostPage = await hostCtx.newPage();
-      const guestPage = await guestCtx.newPage();
+      const targetPage = await targetCtx.newPage();
+      const observerPage = await observerCtx.newPage();
 
-      // ---- Both users join the meeting ----
-      await navigateToMeeting(hostPage, meetingId, "MuteAllHost");
+      // ---- Host joins first (becomes owner) ----
+      await navigateToMeeting(hostPage, meetingId, HOST_NAME);
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
 
-      await navigateToMeeting(guestPage, meetingId, "MuteAllGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+      // ---- Target joins and is admitted ----
+      await navigateToMeeting(targetPage, meetingId, TARGET_NAME);
+      const targetResult = await joinMeetingFromPage(targetPage);
+      await admitGuestIfNeeded(hostPage, targetPage, targetResult);
+
+      // ---- Observer joins and is admitted ----
+      await navigateToMeeting(observerPage, meetingId, "MuteAllObserver");
+      const observerResult = await joinMeetingFromPage(observerPage);
+      await admitGuestIfNeeded(hostPage, observerPage, observerResult);
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(targetPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(observerPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Enable mic on both sides so we can verify the host's stays active.
-      await enableMic(guestPage);
+      // Host must see a remote tile (peer connection established) before muting.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // Brief stabilization for audio track state to propagate before unmuting.
+      await hostPage.waitForTimeout(2000);
+
+      // Enable mic on the host and the target so the observer sees BOTH unmuted
+      // before mute-all. (The observer's own mic is irrelevant.)
       await enableMic(hostPage);
+      await enableMic(targetPage);
 
       // Confirm host mic is currently on — "Mute" tooltip means it's active.
       const hostActiveMicBtn = hostPage.locator("button.video-control-button", {
         has: hostPage.locator("span.tooltip", { hasText: "Mute" }),
       });
       await expect(hostActiveMicBtn).toBeVisible({ timeout: 5_000 });
+
+      // Observer's tiles for the TARGET and the HOST, scoped by display name.
+      const observerTargetTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: TARGET_NAME }),
+        })
+        .first();
+      const observerHostTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: HOST_NAME }),
+        })
+        .first();
+      await expect(observerTargetTile).toBeVisible({ timeout: 45_000 });
+      await expect(observerHostTile).toBeVisible({ timeout: 45_000 });
+
+      // Pre-state: the observer sees BOTH the target and the host UNMUTED — the
+      // muted slash line is absent on each. This proves we observe a real mute
+      // transition on the target, and that the host starts unmuted (so the
+      // post-mute-all "host stays unmuted" check is meaningful).
+      await expect(observerTargetTile.locator('.audio-indicator svg line[x1="1"]')).toHaveCount(0, {
+        timeout: 30_000,
+      });
+      await expect(observerHostTile.locator('.audio-indicator svg line[x1="1"]')).toHaveCount(0, {
+        timeout: 30_000,
+      });
 
       // ---- Host opens peer list then clicks "Mute all" via context menu ----
 
@@ -350,15 +431,31 @@ test.describe("Host mute controls", () => {
       await expect(muteAllItem).toBeVisible({ timeout: 5_000 });
       await muteAllItem.click();
 
-      // ---- Guest receives the NATS broadcast and sees the toast ----
-      const guestMuteToast = guestPage.locator(".peer-toast .toast-name", {
+      // ---- #1036: observer sees the TARGET's mic flip to MUTED FAST ----
+      // The muted MicIcon slash line appears only when
+      // `is_audio_enabled_for_peer(target)` is false on the observer's client.
+      // With #1036 the authoritative mute-all flips that immediately for every
+      // non-host peer (no heartbeat-window wait), so a TIGHT 3s bound holds.
+      await expect(
+        observerTargetTile.locator('.audio-indicator svg line[x1="1"]').first(),
+      ).toBeVisible({ timeout: 3_000 });
+
+      // ---- #1036 host-exclusion: the HOST's tile stays UNMUTED on the
+      // observer's screen. The host issued mute-all; it must not mute itself.
+      // The observer must NEVER see the muted slash on the host tile. We hold
+      // this for a window comfortably past the 3s fast-path bound to catch a
+      // regression that (wrongly) force-muted everyone including the host.
+      await expect(observerHostTile.locator('.audio-indicator svg line[x1="1"]')).toHaveCount(0);
+      await observerPage.waitForTimeout(3000);
+      await expect(observerHostTile.locator('.audio-indicator svg line[x1="1"]')).toHaveCount(0);
+
+      // ---- Target receives the NATS broadcast and sees the mute toast ----
+      const targetMuteToast = targetPage.locator(".peer-toast .toast-name", {
         hasText: "Host muted your microphone",
       });
-      await expect(guestMuteToast.first()).toBeVisible({ timeout: 15_000 });
+      await expect(targetMuteToast.first()).toBeVisible({ timeout: 15_000 });
 
       // ---- Host does NOT see the mute toast (on_host_mute is None for owner) ----
-      // Assert immediately after the guest's toast confirmed propagation, so
-      // the NATS event has had time to arrive at the host transport layer too.
       await expect(
         hostPage.locator(".peer-toast .toast-name", {
           hasText: "Host muted your microphone",
@@ -370,6 +467,7 @@ test.describe("Host mute controls", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+      await browser3.close();
     }
   });
 

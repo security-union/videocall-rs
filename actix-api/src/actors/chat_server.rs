@@ -2474,9 +2474,13 @@ fn handle_msg(
         // events (PARTICIPANT_JOINED at activation, PARTICIPANT_LEFT, etc.) use
         // the `room.{room}.system` subject and are left untouched.
         if is_meeting && !subject_self {
-            let is_system_subject =
-                msg.subject == format!("room.{room}.system").replace(' ', "_").into();
-            if !is_system_subject {
+            let targets_other_session = msg
+                .subject
+                .as_str()
+                .rsplit('.')
+                .next()
+                .is_some_and(|token| token.parse::<u64>().is_ok());
+            if targets_other_session {
                 return Ok(());
             }
         }
@@ -5562,6 +5566,13 @@ mod tests {
         // Allow the async JoinRoom task to start the NATS subscription
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+        // Activate session A so it is registered in instance_index. Eviction
+        // during B's ActivateConnection needs the forward mapping to find A.
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+
         // Verify Session A is in room_members
         let members = chat_server
             .send(GetRoomMembers {
@@ -5589,6 +5600,12 @@ mod tests {
 
         // Allow the async JoinRoom task to complete
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Activate session B — this triggers eviction of session A.
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection B should succeed");
 
         // Verify Session A is evicted and Session B is in room_members
         let members = chat_server
@@ -6053,6 +6070,15 @@ mod tests {
             .expect("Message delivery should succeed");
         assert!(result.is_ok(), "JoinRoom should succeed");
 
+        // Activate the session so instance_index is populated (eviction and the
+        // reverse lookup are deferred from JoinRoom to ActivateConnection).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
         // Verify session is tracked
         let stored = chat_server
             .send(GetInstanceSession {
@@ -6144,6 +6170,14 @@ mod tests {
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
 
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
         // Send eviction for UNKNOWN instance_id
         chat_server
             .send(EvictInstance(EvictInstancePayload {
@@ -6229,6 +6263,14 @@ mod tests {
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
 
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
         // Send eviction with new_session_id == the SAME session (self-delivery)
         chat_server
             .send(EvictInstance(EvictInstancePayload {
@@ -6313,6 +6355,14 @@ mod tests {
             .await
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
+
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Send eviction with DIFFERENT user_id (attacker scenario)
         chat_server
@@ -7501,6 +7551,13 @@ mod tests {
             .expect("JoinRoom A should return Ok");
         sleep(Duration::from_millis(150)).await;
 
+        // Activate session A so it is registered in instance_index. Eviction
+        // during B's ActivateConnection needs the forward mapping to find A.
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+
         // Session B with the SAME instance_id (in-tab transport reconnect).
         chat_server
             .send(Connect {
@@ -7525,6 +7582,12 @@ mod tests {
             .expect("Message delivery should succeed")
             .expect("JoinRoom B should return Ok");
         sleep(Duration::from_millis(150)).await;
+
+        // Activate session B — this triggers eviction of session A.
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection B should succeed");
 
         let members = chat_server
             .send(GetRoomMembers {

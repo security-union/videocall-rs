@@ -3,6 +3,7 @@
 pub mod about_modal;
 pub mod appearance_settings_panel;
 pub mod attendants;
+mod attendants_layout;
 pub mod browser_compatibility;
 pub mod call_timer;
 pub mod capability_check;

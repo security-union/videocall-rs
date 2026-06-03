@@ -279,6 +279,28 @@ lazy_static! {
     )
     .expect("Failed to create client_memory_total_bytes metric");
 
+    /// #1032: Client WASM linear-memory size in bytes
+    /// (WebAssembly.Memory.buffer.byteLength). Distinct from the JS heap above;
+    /// always available. Part of the non-heap memory telemetry for freeze
+    /// observability — the JS-heap gauge misses the multi-GB pressure.
+    pub static ref CLIENT_WASM_MEMORY_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_client_wasm_memory_bytes",
+        "WASM linear memory size of client in bytes (WebAssembly.Memory.buffer.byteLength)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_wasm_memory_bytes metric");
+
+    /// #1032: Client total agent memory in bytes from
+    /// performance.measureUserAgentSpecificMemory() — includes GPU-backed and
+    /// worker allocations. Chrome-only + crossOriginIsolated-gated, so this
+    /// series is absent for clients where the API is unavailable.
+    pub static ref CLIENT_AGENT_MEMORY_BYTES: GaugeVec = register_gauge_vec!(
+        "videocall_client_agent_memory_bytes",
+        "Total agent memory of client in bytes (measureUserAgentSpecificMemory; Chrome + crossOriginIsolated only)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_agent_memory_bytes metric");
+
     /// Video frames dropped by receiver
     pub static ref VIDEO_FRAMES_DROPPED: GaugeVec = register_gauge_vec!(
         "videocall_video_frames_dropped",

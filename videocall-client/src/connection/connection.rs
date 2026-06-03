@@ -55,7 +55,7 @@ use videocall_types::Callback;
 /// state at fire time, so a mute-then-unmute within the delay re-sends the
 /// final (unmuted) state and causes no false-mute flicker. Delivery is
 /// reliable (Control stream), so a single resend suffices.
-const STATE_CHANGE_RESEND_DELAY_MS: u32 = 600;
+pub(crate) const STATE_CHANGE_RESEND_DELAY_MS: u32 = 600;
 
 #[derive(Clone, Copy, Debug)]
 enum Status {
@@ -419,6 +419,135 @@ impl Drop for Connection {
     fn drop(&mut self) {
         log::debug!("Dropping Connection to {}", strip_query_for_log(&self.url));
         self.stop_heartbeat();
+    }
+}
+
+#[cfg(test)]
+impl Connection {
+    pub(crate) fn new_for_test() -> Self {
+        let key = vec![1u8; 16];
+        let iv = vec![2u8; 16];
+        Self {
+            task: Rc::new(Task::stub()),
+            heartbeat: None,
+            heartbeat_monitor: None,
+            status: Rc::new(Cell::new(Status::Connected)),
+            aes: Rc::new(Aes128State::from_vecs(key, iv, true)),
+            audio_enabled: Rc::new(AtomicBool::new(false)),
+            video_enabled: Rc::new(AtomicBool::new(false)),
+            screen_enabled: Rc::new(AtomicBool::new(false)),
+            is_speaking: Rc::new(AtomicBool::new(false)),
+            session_id: Rc::new(RefCell::new(None)),
+            userid: RefCell::new(Some("test-user".to_string())),
+            state_resend: RefCell::new(None),
+            url: "test://stub".to_string(),
+            transport_type: TransportType::TRANSPORT_WEBSOCKET,
+        }
+    }
+
+    pub(crate) fn new_for_test_without_userid() -> Self {
+        let mut conn = Self::new_for_test();
+        *conn.userid.borrow_mut() = None;
+        conn
+    }
+
+    pub(crate) fn state_resend_is_pending(&self) -> bool {
+        self.state_resend.borrow().is_some()
+    }
+
+    pub(crate) fn stop_heartbeat_for_test(&mut self) {
+        self.stop_heartbeat();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task::StubSendKind;
+    use super::webmedia::MediaStreamKey;
+    use super::*;
+
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn state_resend_scheduled_on_audio_toggle() {
+        let conn = Connection::new_for_test();
+        assert!(
+            !conn.state_resend_is_pending(),
+            "no resend before a state transition"
+        );
+        conn.set_audio_enabled(true);
+        assert!(
+            conn.state_resend_is_pending(),
+            "audio toggle must schedule the one-shot state resend"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn state_resend_not_scheduled_without_userid() {
+        let conn = Connection::new_for_test_without_userid();
+        conn.set_audio_enabled(true);
+        assert!(
+            !conn.state_resend_is_pending(),
+            "schedule_state_resend must no-op when heartbeat identity is unset"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn state_resend_cleared_on_teardown() {
+        let mut conn = Connection::new_for_test();
+        conn.set_audio_enabled(true);
+        assert!(conn.state_resend_is_pending());
+        conn.stop_heartbeat_for_test();
+        assert!(
+            !conn.state_resend_is_pending(),
+            "stop_heartbeat must take and cancel the pending resend timer"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn state_resend_slot_replaced_on_second_transition() {
+        let conn = Connection::new_for_test();
+        conn.set_audio_enabled(true);
+        assert!(conn.state_resend_is_pending());
+        conn.set_video_enabled(true);
+        assert!(
+            conn.state_resend_is_pending(),
+            "a second media transition must keep the single resend slot occupied \
+             (prior Timeout dropped on replace)"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn immediate_heartbeat_uses_control_stream_not_datagram() {
+        let conn = Connection::new_for_test();
+        conn.task.clear_last_send_for_test();
+
+        conn.set_audio_enabled(true);
+
+        let (kind, stream_key) = conn
+            .task
+            .take_last_send_for_test()
+            .expect("immediate heartbeat must send on state change");
+        assert_eq!(
+            kind,
+            StubSendKind::Reliable,
+            "edge-triggered heartbeats must use the reliable path, not datagrams"
+        );
+        assert_eq!(
+            stream_key,
+            MediaStreamKey::Control,
+            "immediate heartbeat must ride the Control stream"
+        );
+        assert!(
+            conn.task.take_last_send_for_test().is_none(),
+            "periodic keepalive datagram path must not run without start_heartbeat"
+        );
     }
 }
 

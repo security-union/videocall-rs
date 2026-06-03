@@ -479,7 +479,7 @@ const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 /// path, where a post-frame `false` heartbeat is already authoritative).
 /// This replaces the previous ~5s lag, which came from reusing the
 /// screen-sized window for these continuous streams.
-const LIVE_STREAM_FRESH_WINDOW_MS: u64 = 500;
+pub(crate) const LIVE_STREAM_FRESH_WINDOW_MS: u64 = 500;
 
 /// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
 /// arrives, given:
@@ -2640,6 +2640,19 @@ mod tests {
             LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
             "the audio/video window must be strictly shorter than the screen \
              window — reusing the screen window re-introduces the ~5s lag"
+        );
+    }
+
+    /// Sender resend must fire AFTER the receiver's short suppression window.
+    /// Constants live in different modules; pin the ordering so a future edit
+    /// cannot silently re-introduce the ~5s mute/camera-off lag.
+    #[wasm_bindgen_test]
+    fn state_change_resend_delay_exceeds_live_stream_fresh_window() {
+        use crate::connection::connection::STATE_CHANGE_RESEND_DELAY_MS;
+        assert!(
+            STATE_CHANGE_RESEND_DELAY_MS as u64 > LIVE_STREAM_FRESH_WINDOW_MS,
+            "STATE_CHANGE_RESEND_DELAY_MS must exceed LIVE_STREAM_FRESH_WINDOW_MS \
+             or the one-shot resend lands inside the suppression window"
         );
     }
 

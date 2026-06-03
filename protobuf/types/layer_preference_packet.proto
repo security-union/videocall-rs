@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+// Client -> relay simulcast layer-preference control payload (#989, Phase 1b;
+// see discussion #890).
+//
+// Carried inside a PacketWrapper whose `packet_type` is LAYER_PREFERENCE. The
+// sending (receiving) client lists, per source session it is rendering, which
+// simulcast layer it wants the relay to forward. The relay records this per
+// receiver session and drops simulcast VIDEO layers that do NOT match the
+// recorded preference for that source, saving downstream bandwidth.
+//
+// Layer semantics (these describe the relay's IMPLEMENTED behavior — a client
+// producer MUST follow them exactly):
+//   * NO ENTRY for a source session = "no preference": the relay forwards
+//     EVERY layer from that source (fail-open). This is the only way to say
+//     "send me whatever". To stop constraining a source, OMIT its entry — do
+//     NOT send an entry with desired_layer = 0.
+//   * A recorded Entry with `desired_layer = N` (N != 0) = "forward ONLY
+//     layer N from this source": the relay drops every other non-base layer
+//     from it.
+//   * A recorded Entry with `desired_layer = 0` is therefore "BASE LAYER
+//     ONLY", NOT "no preference". Layer 0 on a media PacketWrapper is the base
+//     / unspecified layer and is ALWAYS forwarded (see PacketWrapper field 5),
+//     so an entry of 0 keeps base flowing while dropping every upgraded layer
+//     from that source.
+//
+// Security: like ViewportPacket this signal is SUBTRACT-ONLY and consumed
+// purely for VIDEO layer-drop decisions. It can only reduce what an
+// already-authorized session receives; it never grants access. No recorded
+// preference (or no LAYER_PREFERENCE packet at all) means "no layer signal"
+// and the relay forwards every layer (fail-open to pre-#989 behaviour). The
+// relay does NOT validate that the requested layer is actually being produced
+// by the source: a client requesting an absent layer black-tiles ITSELF; the
+// client-side clamp (only request observed-arriving layers) is the mitigation
+// and is a separate frontend increment. AUDIO/SCREEN are NEVER filtered by
+// this signal. This packet is consumed by the relay and never re-broadcast.
+message LayerPreferencePacket {
+  // One desired-layer entry: for a given source session, the simulcast layer
+  // the receiver wants forwarded.
+  message Entry {
+    // The source session_id (publisher) this preference applies to. This is
+    // the SUBJECT-derived publisher session the relay matches against on the
+    // forwarding path, NOT a forgeable inner field.
+    uint64 session_id = 1;
+    // The simulcast layer the receiver wants from `session_id`. Matched
+    // against the cleartext `PacketWrapper.simulcast_layer_id` (field 5).
+    // 0 = BASE LAYER ONLY (drop upgraded layers from this source), NOT "no
+    // preference" — to express "no preference / forward all", omit the entry
+    // for this source entirely (see the message-level comment above).
+    uint32 desired_layer = 2;
+  }
+
+  // Per-source desired-layer entries. Empty = no layer constraint (fail-open).
+  repeated Entry entries = 1;
+}

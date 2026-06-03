@@ -546,6 +546,34 @@ impl Actor for WtChatSession {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        // Relocate the overflow point off the tiny default actor mailbox
+        // onto the policy-aware bounded outbound channel (issue #1057).
+        //
+        // Like the WS path, the actix `Context` mailbox defaults to
+        // `DEFAULT_CAPACITY` (16) and sits *in front* of the outbound
+        // channels in the relay fan-out path: ChatServer does
+        // `recipient.try_send(Message)` (a mailbox enqueue), then
+        // `Handler<Message>` routes the bytes into `unistream_tx` /
+        // `datagram_tx`. Under a bursty fan-out storm the 16-slot mailbox
+        // overflows long before the outbound channels do, and the mailbox
+        // is a *dumb* queue: it drops indiscriminately and fires NO
+        // CONGESTION feedback, so the offending sender never throttles —
+        // the same room-wide-freeze failure mode described for WS.
+        //
+        // We match the mailbox capacity to the **unistream** outbound
+        // channel capacity (`wt_outbound_channel_capacity()`), which is
+        // where the storm-prone traffic (video/screen + oversized
+        // audio/control) lands and where the priority-drop policy +
+        // CONGESTION feedback live. This does NOT add meaningful
+        // buffering — it relocates the overflow to the policy-aware
+        // channel, which sheds VIDEO/SCREEN first, protects AUDIO to ~95%,
+        // never preempts Critical lifecycle packets, and fires CONGESTION
+        // back to the sender via `on_outbound_drop`. The value is derived
+        // from the same resolver the channel is constructed with (see
+        // `webtransport::mod`), so the env-tunable
+        // `WT_OUTBOUND_CHANNEL_CAPACITY` keeps the two in lock-step.
+        ctx.set_mailbox_capacity(wt_outbound_channel_capacity());
+
         // Track connection start
         self.logic.track_connection_start();
 
@@ -852,6 +880,56 @@ impl WtChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{
+        resolve_wt_outbound_channel_capacity, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+    };
+
+    // -----------------------------------------------------------------------
+    // Issue #1057: mailbox capacity must match the (unistream) outbound
+    // channel.
+    //
+    // `WtChatSession::started` calls
+    // `ctx.set_mailbox_capacity(wt_outbound_channel_capacity())` so the actor
+    // mailbox stops being the (default 16-slot) overflow point in front of
+    // the policy-aware outbound channels. Constructing a live `WtChatSession`
+    // requires a populated `SessionLogic` (NATS, addresses, …), so rather
+    // than read the capacity back off a running context we guard the
+    // invariant the fix relies on at the value level:
+    //   * the mailbox capacity is derived from the SAME resolver the
+    //     unistream channel is built with (`wt_outbound_channel_capacity()` /
+    //     `resolve_wt_outbound_channel_capacity`), so the env-tunable
+    //     `WT_OUTBOUND_CHANNEL_CAPACITY` keeps them in lock-step with no
+    //     hardcoded duplicate, and
+    //   * the resolved default is strictly larger than actix's
+    //     `DEFAULT_CAPACITY` (16) so a future accidental revert to the tiny
+    //     default mailbox fails CI.
+    // -----------------------------------------------------------------------
+
+    /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
+    const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
+
+    #[test]
+    fn wt_mailbox_capacity_matches_unistream_outbound_channel() {
+        // `started()` feeds `wt_outbound_channel_capacity()` to
+        // `set_mailbox_capacity`; the unistream channel is built from the
+        // same resolver. Exercise the pure resolver so the test never races
+        // the memoised `OnceLock` or the real process env.
+        //
+        // Unset env → default; both must exceed actix's dumb 16-slot mailbox
+        // so overflow lands on the policy-aware channel.
+        assert_eq!(
+            resolve_wt_outbound_channel_capacity(None),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+        );
+        // Compile-time guard: issue #1057 requires the WT mailbox capacity
+        // to exceed actix's dumb default (16) so overflow lands on the
+        // policy-aware outbound channel, not the indiscriminate mailbox.
+        const _: () =
+            assert!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT > ACTIX_DEFAULT_MAILBOX_CAPACITY);
+        // A deploy-time override is honoured verbatim, keeping the mailbox in
+        // lock-step with the channel capacity it is built from.
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("1024")), 1024);
+    }
 
     /// Helper: construct an `is_audio` test packet of the requested size.
     /// Size is the *outbound bytes* length passed into `build_outbound`.

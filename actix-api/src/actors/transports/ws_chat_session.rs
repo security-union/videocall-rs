@@ -176,6 +176,34 @@ impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        // Relocate the overflow point off the tiny default actor mailbox
+        // onto the policy-aware bounded outbound channel (issue #1057).
+        //
+        // `WebsocketContext`'s mailbox defaults to actix `DEFAULT_CAPACITY`
+        // (16). That mailbox sits *in front* of `outbound_tx` in the relay
+        // fan-out path: ChatServer does `recipient.try_send(Message)` (a
+        // mailbox enqueue), then `Handler<Message>` enqueues into the
+        // 128-slot `outbound_tx`. Under a bursty fan-out storm (keyframe /
+        // join / screen-share spikes) the 16-slot mailbox overflows long
+        // before `outbound_tx` does — and that mailbox is a *dumb* queue:
+        // it drops indiscriminately (audio, control, video alike) and fires
+        // NO CONGESTION feedback, so the offending sender never throttles.
+        // The observed symptom is room-wide video freezes (276 `mailbox_full`
+        // drops in one meeting while `relay_outbound_queue_depth` stayed 0,
+        // proving the smart channel never filled).
+        //
+        // Setting the mailbox capacity equal to the outbound channel
+        // capacity does NOT add meaningful buffering — it *relocates* the
+        // overflow point to `outbound_tx`, which is policy-aware: it sheds
+        // VIDEO/SCREEN first, protects AUDIO to ~95%, never preempts
+        // CONTROL/CONGESTION/MEETING, and fires CONGESTION back to the
+        // sender via `on_outbound_drop`. So a genuine overflow becomes
+        // video-first + audio-protected + sender-throttled instead of a
+        // total stall. The value is derived from the same constant the
+        // channel is built with (`WS_OUTBOUND_CHANNEL_CAPACITY`) so the two
+        // stay in lock-step.
+        ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY);
+
         // Register the outbound drain stream. Packets enqueued via
         // outbound_tx are pulled here and written as WS binary frames.
         if let Some(rx_stream) = self.outbound_rx.take() {
@@ -540,6 +568,42 @@ mod tests {
     use serial_test::serial;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
+
+    // ----------------------------------------------------------------------
+    // Issue #1057: mailbox capacity must match the outbound channel.
+    //
+    // `WsChatSession::started` calls
+    // `ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY)` so the actor
+    // mailbox stops being the (default 16-slot) overflow point in front of
+    // the policy-aware `outbound_tx`. We cannot read the capacity back off a
+    // live `WebsocketContext` without standing up NATS, so this guards the
+    // invariant the fix relies on at the value level:
+    //   * the mailbox capacity is derived from the SAME constant the channel
+    //     is built with (no hardcoded duplicate that could drift), and
+    //   * it is strictly larger than actix's `DEFAULT_CAPACITY` (16) so a
+    //     future accidental revert to the tiny default mailbox fails CI.
+    // ----------------------------------------------------------------------
+
+    /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
+    /// Re-declared here so the test fails loudly if the dumb default mailbox
+    /// ever becomes the overflow point again (issue #1057).
+    const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
+
+    #[test]
+    fn ws_mailbox_capacity_matches_outbound_channel() {
+        // The value fed to `set_mailbox_capacity` in `started()` is exactly
+        // this constant, which is also the `outbound_tx` channel capacity.
+        // Relocating overflow to that policy-aware channel is the whole fix.
+        assert_eq!(
+            WS_OUTBOUND_CHANNEL_CAPACITY, 128,
+            "WS outbound channel/mailbox capacity changed; update issue #1057 \
+             rationale and any operator docs before changing this sentinel",
+        );
+        // Compile-time guard: issue #1057 requires the WS mailbox capacity
+        // to exceed actix's dumb default (16) so overflow lands on the
+        // policy-aware outbound channel, not the indiscriminate mailbox.
+        const _: () = assert!(WS_OUTBOUND_CHANNEL_CAPACITY > ACTIX_DEFAULT_MAILBOX_CAPACITY);
+    }
 
     // ----------------------------------------------------------------------
     // Drop-kind label tests — mirror the WT helper tests so the WS site

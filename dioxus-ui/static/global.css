@@ -192,6 +192,9 @@ html[data-theme="dark"] {
   --search-badge-idle-text: #facc15;
   --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
   --hairline: rgba(255, 255, 255, 0.14);
+  /* Generic interactive focus-ring outline color (keyboard focus-visible /
+     active control accents). Bright blue reads clearly over dark surfaces. */
+  --focus-ring: #6ea8fe;
 }
 
 html[data-theme="light"] {
@@ -246,6 +249,9 @@ html[data-theme="light"] {
   --search-badge-idle-text: #ff9500;
   --shadow-overlay: 0 8px 20px rgba(0, 0, 0, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.50);
   --hairline: rgba(100, 100, 120, 0.12);
+  /* Generic interactive focus-ring outline color. Deeper system blue keeps
+     contrast on the light theme's bright surfaces. */
+  --focus-ring: #0a84ff;
 }
 
 /* ============================================================
@@ -1144,6 +1150,9 @@ html[data-theme="light"] #invite-overlay p {
   --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
   --shadow-md: 0 8px 32px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+  /* Generic interactive focus-ring outline color — theme-agnostic baseline
+     (matches the default dark theme; light theme overrides above). */
+  --focus-ring: #6ea8fe;
   --motion-fast: 0.15s;
   --motion-base: 0.2s;
   --motion-emphasized: cubic-bezier(0.4, 0, 0.2, 1);

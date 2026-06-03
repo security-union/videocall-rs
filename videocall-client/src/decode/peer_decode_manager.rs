@@ -537,6 +537,55 @@ pub(crate) fn apply_heartbeat_enabled_flag(
     }
 }
 
+/// Resolve a CONTINUOUS live-stream (audio / camera-video) enabled flag
+/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`] so a
+/// real mute / camera-off reflects on remote peers sub-second.
+///
+/// Thin wrapper over [`apply_heartbeat_enabled_flag`] that BAKES IN the
+/// correct window. The window is the security-/correctness-critical knob here:
+/// a future "simplify by sharing one window" edit at the call site could
+/// silently widen audio/video back to the screen-sized window and reintroduce
+/// the ~5s mute/camera-off lag. Routing audio and camera-video through this
+/// wrapper makes that window non-passable at the call site.
+pub(crate) fn apply_live_stream_heartbeat_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    apply_heartbeat_enabled_flag(
+        current,
+        heartbeat_value,
+        last_frame_ms,
+        now_ms,
+        LIVE_STREAM_FRESH_WINDOW_MS,
+    )
+}
+
+/// Resolve the SCREEN-share enabled flag against a heartbeat, using the long
+/// [`MEDIA_FRESH_WINDOW_MS`]: screen is legitimately bursty/idle (encoders
+/// skip unchanged frames), so the multi-second window prevents a stale
+/// `false` heartbeat from collapsing a live split-share layout on WebTransport.
+///
+/// Companion to [`apply_live_stream_heartbeat_flag`]; BAKES IN the screen
+/// window for the same anti-misuse reason — the two media classes must NOT
+/// share a window, and which one each call site uses is no longer a free
+/// argument it can get wrong.
+pub(crate) fn apply_screen_heartbeat_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    apply_heartbeat_enabled_flag(
+        current,
+        heartbeat_value,
+        last_frame_ms,
+        now_ms,
+        MEDIA_FRESH_WINDOW_MS,
+    )
+}
+
 use std::fmt::Debug;
 
 impl Debug for Peer {
@@ -994,28 +1043,25 @@ impl Peer {
                     // on remote peers sub-second — not after the ~5s screen
                     // window. See `LIVE_STREAM_FRESH_WINDOW_MS` for the full
                     // rationale.
-                    let resolved_video = apply_heartbeat_enabled_flag(
+                    let resolved_video = apply_live_stream_heartbeat_flag(
                         self.video_enabled,
                         metadata.video_enabled,
                         self.last_video_frame_ms,
                         now,
-                        LIVE_STREAM_FRESH_WINDOW_MS,
                     );
                     // Audio likewise uses the short continuous-stream window
                     // so a real mute reflects on remote peers sub-second.
-                    let resolved_audio = apply_heartbeat_enabled_flag(
+                    let resolved_audio = apply_live_stream_heartbeat_flag(
                         self.audio_enabled,
                         metadata.audio_enabled,
                         self.last_audio_frame_ms,
                         now,
-                        LIVE_STREAM_FRESH_WINDOW_MS,
                     );
-                    let resolved_screen = apply_heartbeat_enabled_flag(
+                    let resolved_screen = apply_screen_heartbeat_flag(
                         self.screen_enabled,
                         metadata.screen_enabled,
                         self.last_screen_frame_ms,
                         now,
-                        MEDIA_FRESH_WINDOW_MS,
                     );
 
                     // Check if video is being turned off (on -> off transition)
@@ -2722,6 +2768,37 @@ mod tests {
             ),
             "sanity: at 4.9s the short window would clear the flag — screen's \
              protection comes specifically from keeping MEDIA_FRESH_WINDOW_MS"
+        );
+    }
+
+    /// The two type-safe wrappers must carry DIFFERENT windows. At a frame age
+    /// between the two windows (here 600ms: past the 500ms live window, well
+    /// inside the 5s screen window) the live-stream wrapper must honour a mute
+    /// / camera-off (returns `false`) while the screen wrapper must suppress it
+    /// (keeps `current = true`). This is the regression the wrappers exist to
+    /// prevent: it fails loudly if someone makes both wrappers share a window.
+    #[test]
+    fn live_stream_and_screen_wrappers_use_distinct_windows() {
+        let now = 10_000_u64;
+        // 600ms old: past LIVE_STREAM_FRESH_WINDOW_MS (500), inside
+        // MEDIA_FRESH_WINDOW_MS (5000). Pin the fixture against the constants
+        // so it tracks any future tuning.
+        let last_frame = now - 600;
+        assert!(
+            last_frame < now - LIVE_STREAM_FRESH_WINDOW_MS
+                && last_frame > now - MEDIA_FRESH_WINDOW_MS,
+            "fixture sanity: frame age must fall between the live and screen windows"
+        );
+
+        assert!(
+            !apply_live_stream_heartbeat_flag(true, false, last_frame, now),
+            "audio/video wrapper must honour a mute / camera-off once the frame \
+             ages past the short window — not wait for the screen-sized window"
+        );
+        assert!(
+            apply_screen_heartbeat_flag(true, false, last_frame, now),
+            "screen wrapper must still suppress a stale false at this age — its \
+             window is the long one, so the split-share layout does not collapse"
         );
     }
 

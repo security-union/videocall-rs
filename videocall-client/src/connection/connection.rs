@@ -344,6 +344,13 @@ impl Connection {
     /// produces a false mute. Only meaningful for audio/camera-video, whose
     /// receiver window is short; screen uses a deliberately long window and
     /// is intentionally not resent here.
+    ///
+    /// Audio and camera-video SHARE the single `state_resend` slot: a second
+    /// near-simultaneous toggle reschedules the one timer, so its resend can
+    /// drift toward (never past) the keepalive. This is safe — the resend
+    /// carries the full live state (audio + video + screen) read at fire time,
+    /// so both transitions are covered by whichever resend lands, and the
+    /// worst case is still far better than the old ~5s keepalive-only path.
     fn schedule_state_resend(&self) {
         // No heartbeat identity yet → nothing to resend.
         let userid = match self.userid.borrow().as_ref() {

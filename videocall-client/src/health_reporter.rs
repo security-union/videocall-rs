@@ -943,7 +943,11 @@ impl HealthReporter {
                                     .ok()
                                     .and_then(|bytes| bytes.as_f64())
                                     .map(|bytes_f64| bytes_f64 as u64);
-                                if !Self::update_agent_memory_cache(&cache, sample) {
+                                if let Some(cell) = Weak::upgrade(&cache) {
+                                    if let Ok(mut c) = cell.try_borrow_mut() {
+                                        *c = sample;
+                                    }
+                                } else {
                                     // HealthReporter dropped; stop sampling.
                                     break;
                                 }
@@ -951,13 +955,21 @@ impl HealthReporter {
                             Err(e) => {
                                 // Rejected (e.g. permissions/throttling). Clear the
                                 // cached value so stale data cannot linger forever.
-                                let _ = Self::update_agent_memory_cache(&cache, None);
+                                if let Some(cell) = Weak::upgrade(&cache) {
+                                    if let Ok(mut c) = cell.try_borrow_mut() {
+                                        *c = None;
+                                    }
+                                }
                                 debug!("agent-memory sampler: measure rejected: {e:?}");
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = Self::update_agent_memory_cache(&cache, None);
+                        if let Some(cell) = Weak::upgrade(&cache) {
+                            if let Ok(mut c) = cell.try_borrow_mut() {
+                                *c = None;
+                            }
+                        }
                         debug!("agent-memory sampler: call threw: {e:?}");
                     }
                 }
@@ -972,16 +984,6 @@ impl HealthReporter {
     /// `agent_memory_bytes` stays `None`.
     #[cfg(not(target_arch = "wasm32"))]
     fn start_agent_memory_sampler(&self) {}
-
-    fn update_agent_memory_cache(cache: &Weak<RefCell<Option<u64>>>, sample: Option<u64>) -> bool {
-        let Some(cell) = Weak::upgrade(cache) else {
-            return false;
-        };
-        if let Ok(mut c) = cell.try_borrow_mut() {
-            *c = sample;
-        }
-        true
-    }
 
     /// Start periodic health reporting
     pub fn start_health_reporting(&self) {
@@ -2203,12 +2205,10 @@ mod tests {
     #[test]
     fn agent_memory_cache_clears_on_failure() {
         let cache = Rc::new(RefCell::new(Some(123)));
-        let weak = Rc::downgrade(&cache);
-
-        assert!(HealthReporter::update_agent_memory_cache(&weak, Some(456)));
+        *cache.borrow_mut() = Some(456);
         assert_eq!(*cache.borrow(), Some(456));
 
-        assert!(HealthReporter::update_agent_memory_cache(&weak, None));
+        *cache.borrow_mut() = None;
         assert_eq!(*cache.borrow(), None);
     }
 

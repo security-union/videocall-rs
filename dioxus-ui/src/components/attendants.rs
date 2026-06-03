@@ -1834,6 +1834,47 @@ pub fn AttendantsComponent(
         });
     }
 
+    // Keep each pre-join <select>'s DOM `.value` in sync with the restored
+    // selection signal once devices are enumerated. (issue #959 restore bug)
+    //
+    // The selects first render with no options (pre-enumeration), so the browser
+    // settles their `.value` on the implicit "default" option. When `apply()`
+    // later populates the option list AND the restored `prejoin_selected_*`
+    // signal, Dioxus patches the `<option selected>` attribute — but a browser
+    // `<select>` does NOT re-derive `.value` from a post-parse attribute
+    // mutation, so the control stays stuck on "default". This effect reads the
+    // selection + device-list SIGNALS (so it re-runs reactively after `apply`)
+    // and sets the IDL `value` directly, which reliably moves the selection.
+    // It lives here (not in the card) because Dioxus 0.7 `use_effect` only
+    // re-runs on Signal reads, not on plain prop-value changes.
+    {
+        use crate::components::pre_join_settings_card::{
+            sync_select_value, PREVIEW_CAMERA_SELECT_ID, PREVIEW_MIC_SELECT_ID,
+            PREVIEW_SPEAKER_SELECT_ID,
+        };
+        use_effect(move || {
+            // Reactive deps: selection ids + whether option lists are populated.
+            let cam = prejoin_selected_camera();
+            let mic = prejoin_selected_mic();
+            let spk = prejoin_selected_speaker();
+            let has_cams = !prejoin_cameras.read().is_empty();
+            let has_mics = !prejoin_microphones.read().is_empty();
+            let has_spks = !prejoin_speakers.read().is_empty();
+            if !media_access_granted() || meeting_joined() {
+                return;
+            }
+            if has_cams {
+                sync_select_value(PREVIEW_CAMERA_SELECT_ID, cam.as_deref());
+            }
+            if has_mics {
+                sync_select_value(PREVIEW_MIC_SELECT_ID, mic.as_deref());
+            }
+            if has_spks && speaker_supported {
+                sync_select_value(PREVIEW_SPEAKER_SELECT_ID, spk.as_deref());
+            }
+        });
+    }
+
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
     // Only fires for users already in-meeting who had a prior denial — on the
     // pre-join screen (meeting_joined=false) this is a no-op.

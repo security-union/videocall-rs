@@ -2003,10 +2003,29 @@ select {
 }
 
 .meetings-toolbar-group {
+  /* Positioning context for the absolutely-anchored popover. NOTE: no
+     `z-index` here on purpose — a stacking context on the group would make the
+     trigger-vs-backdrop ordering depend on DOM order between the two groups
+     (so the fix would only work for one direction of the switch). Instead the
+     trigger BUTTONS are lifted above the backdrop globally (below), which is
+     symmetric regardless of which popover is open. */
   position: relative;
   display: flex;
   align-items: center;
   gap: 0.25rem;
+}
+
+/* Lift the trigger buttons above the popover backdrop (z 9290) GLOBALLY, so a
+   click on either trigger reaches the button directly rather than being
+   swallowed by the open popover's backdrop. Result: clicking the OTHER trigger
+   is a one-click direct switch (its onclick closes the open popover and opens
+   its own); clicking the SAME trigger toggles it closed; clicking anywhere
+   ELSE hits the backdrop and closes the popover. The popover (z 9300) still
+   paints above the triggers. */
+.meetings-toolbar-group > .meetings-icon-btn,
+.meetings-toolbar-group > .meetings-sort-btn {
+  position: relative;
+  z-index: 9291;
 }
 
 .meetings-icon-btn {

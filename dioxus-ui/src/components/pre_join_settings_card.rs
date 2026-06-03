@@ -19,6 +19,7 @@
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
 /// Stable selectors for the pre-join device preview (issue #959). Exposed as
@@ -408,6 +409,97 @@ fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<Dev
         .map(DeviceInfo::from_media_device_info)
 }
 
+/// Max number of animation frames `sync_select_value` will retry the imperative
+/// `select.value` write before giving up. The restore needs the matching
+/// `<option>` to be committed to the DOM first (setting `.value` to an id whose
+/// `<option>` does not yet exist is a SILENT no-op), and the enumeration render
+/// commit can lag the signal write by a frame or two. A handful of frames is
+/// plenty (≈ up to ~10 frames ≈ 160ms at 60fps) and costs nothing once the
+/// value has taken (we stop as soon as `select.value === id`).
+const SELECT_SYNC_MAX_FRAMES: u32 = 10;
+
+/// Decide what to do on one attempt of the select-value sync. Pure +
+/// host-testable so the retry/stop logic is covered without a DOM.
+///
+/// * `current` — the `<select>`'s current `.value`.
+/// * `target` — the device id we want selected.
+/// * `frames_left` — remaining retry budget BEFORE this attempt.
+///
+/// Returns `(should_set, should_retry)`:
+/// * already correct → don't set, don't retry (done);
+/// * not correct, budget remains → set, then retry next frame (the set is a
+///   no-op until the `<option>` exists, so we keep trying);
+/// * not correct, no budget → set one last time, don't retry.
+fn select_sync_step(current: &str, target: &str, frames_left: u32) -> (bool, bool) {
+    if current == target {
+        (false, false)
+    } else {
+        (true, frames_left > 0)
+    }
+}
+
+/// Set a `<select>`'s DOM `.value` (IDL property) to `value` by element id,
+/// retrying across animation frames until it takes.
+///
+/// Why the retry: the IDL `value` setter only moves the control's selection if
+/// an `<option>` with that value already exists in the DOM. On restore-after-
+/// reload the selection signal is set in the SAME render commit that first
+/// populates the `<option>` list, so a synchronous set runs before the options
+/// are committed and silently no-ops — leaving the control on the implicit
+/// first option ("default"). Deferring to `requestAnimationFrame` and re-trying
+/// until `select.value === value` (or the frame budget runs out) sidesteps the
+/// render-commit lag entirely. Stops early once correct, so steady state costs
+/// a single frame. Never fights a user mid-interaction: if `.value` already
+/// matches, it does nothing.
+pub fn sync_select_value(select_id: &str, value: Option<&str>) {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    schedule_select_sync(
+        select_id.to_string(),
+        value.to_string(),
+        SELECT_SYNC_MAX_FRAMES,
+    );
+}
+
+/// One attempt + self-rescheduling rAF tail for [`sync_select_value`].
+fn schedule_select_sync(select_id: String, value: String, frames_left: u32) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    let current = window
+        .document()
+        .and_then(|d| d.get_element_by_id(&select_id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlSelectElement>().ok())
+        .map(|select| {
+            let cur = select.value();
+            let (should_set, should_retry) = select_sync_step(&cur, &value, frames_left);
+            if should_set {
+                // No-op until the matching <option> is committed; harmless to
+                // call repeatedly. After it takes, `select.value()` reads back
+                // the target and the next step stops.
+                select.set_value(&value);
+            }
+            (select.value(), should_retry)
+        });
+
+    // If the element is gone (route changed / unmounted), stop.
+    let Some((after, should_retry)) = current else {
+        return;
+    };
+    if after == value || !should_retry {
+        return;
+    }
+
+    // Re-try on the next frame, by which point the enumeration render commit
+    // (and thus the <option> elements) should be in the DOM.
+    let cb = wasm_bindgen::closure::Closure::once_into_js(move || {
+        schedule_select_sync(select_id, value, frames_left.saturating_sub(1));
+    });
+    let _ = window.request_animation_frame(cb.unchecked_ref());
+}
+
 // ── Status icons ──────────────────────────────────────────────────────
 // Stroke-only, `currentColor` so they inherit the button/placeholder color.
 
@@ -739,5 +831,31 @@ fn DevicePreview(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_sync_step;
+
+    #[test]
+    fn step_stops_when_already_correct() {
+        // Value already matches → no set, no retry (steady state, one frame).
+        assert_eq!(select_sync_step("mic-b", "mic-b", 10), (false, false));
+        // Even with no budget, a correct value is just done.
+        assert_eq!(select_sync_step("mic-b", "mic-b", 0), (false, false));
+    }
+
+    #[test]
+    fn step_sets_and_retries_while_budget_remains() {
+        // Not correct yet (option not committed → set no-ops), retry next frame.
+        assert_eq!(select_sync_step("default", "mic-b", 5), (true, true));
+        assert_eq!(select_sync_step("default", "mic-b", 1), (true, true));
+    }
+
+    #[test]
+    fn step_sets_last_time_then_gives_up() {
+        // Out of budget: one final set attempt, then stop retrying.
+        assert_eq!(select_sync_step("default", "mic-b", 0), (true, false));
     }
 }

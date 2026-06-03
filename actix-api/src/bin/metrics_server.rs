@@ -114,6 +114,9 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
     }
 
     let mut removed_session_ids = Vec::new();
+    // Meetings that lost at least one session this pass; their participant gauge
+    // must be recomputed (and removed entirely if the meeting is now empty).
+    let mut affected_meetings: HashSet<String> = HashSet::new();
     for key in to_remove {
         if let Some(session_info) = tracker.remove(&key) {
             info!(
@@ -121,10 +124,20 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
                 session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
             );
             removed_session_ids.push(session_info.session_id.clone());
+            affected_meetings.insert(session_info.meeting_id.clone());
 
             // Remove all metrics for this session
             remove_session_metrics(&session_info);
         }
+    }
+
+    // Recompute the participant gauge for every meeting that lost a session so it
+    // decrements as sessions expire — and is removed when the meeting empties. This
+    // is the fix for the gauge leak (issue #1040): the count is now derived from the
+    // authoritative session tracker instead of being latched to one reporter's last
+    // health packet, so stale meetings drop to 0 / off the dashboards.
+    if !affected_meetings.is_empty() {
+        recompute_meeting_participants(&tracker, &affected_meetings);
     }
 
     // Prune display_name_map for removed sessions
@@ -135,6 +148,41 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
             .collect();
         let mut dn_map = display_name_map.lock().unwrap_or_else(|e| e.into_inner());
         dn_map.retain(|sid, _| active_session_ids.contains(sid.as_str()));
+    }
+}
+
+/// Recompute the `MEETING_PARTICIPANTS` gauge for the given meetings from the
+/// authoritative session tracker.
+///
+/// The participant count for a meeting is the number of distinct live sessions in
+/// the tracker for that `meeting_id` (one live reporting client == one participant;
+/// the per-session count already includes "self", so no `+1` is applied here). When
+/// a meeting has no live sessions left, its series is removed so idle meetings drop
+/// off dashboards — matching how the other per-session metrics are removed on cleanup.
+///
+/// The caller must hold the `session_tracker` lock; the locked map is passed in to
+/// avoid re-locking (and the resulting deadlock).
+fn recompute_meeting_participants(
+    tracker: &HashMap<String, SessionInfo>,
+    meetings: &HashSet<String>,
+) {
+    // Count distinct live sessions per affected meeting.
+    let mut counts: HashMap<&str, u64> = meetings.iter().map(|m| (m.as_str(), 0u64)).collect();
+    for info in tracker.values() {
+        if let Some(count) = counts.get_mut(info.meeting_id.as_str()) {
+            *count += 1;
+        }
+    }
+
+    for (meeting_id, count) in counts {
+        if count == 0 {
+            // Meeting is empty — drop the series entirely instead of leaving a phantom 0.
+            let _ = MEETING_PARTICIPANTS.remove_label_values(&[meeting_id]);
+        } else {
+            MEETING_PARTICIPANTS
+                .with_label_values(&[meeting_id])
+                .set(count as f64);
+        }
     }
 }
 
@@ -264,7 +312,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         );
     }
 
-    // Meeting participants is recomputed on next scrape; no need to force remove
+    // MEETING_PARTICIPANTS is intentionally NOT touched here: it is keyed only by
+    // meeting_id (not per-session), so it is recomputed/removed by
+    // recompute_meeting_participants() in cleanup_stale_sessions() once all of this
+    // meeting's stale sessions have been removed from the tracker.
     debug!(
         "Removed all series for session {} (meeting: {}, peer: {})",
         session_info.session_id, session_info.meeting_id, session_info.reporting_user_id
@@ -831,8 +882,6 @@ fn process_health_packet_to_metrics_pb(
                 }
             }
 
-            let participants_count = health_packet.peer_stats.len();
-
             for (peer_id, peer_data) in &health_packet.peer_stats {
                 let peer_dn = &peer_display_names[peer_id];
                 let peer_labels: [&str; 6] = [
@@ -981,10 +1030,18 @@ fn process_health_packet_to_metrics_pb(
                     .set(if peer_data.video_enabled { 1.0 } else { 0.0 });
             }
 
-            // Update meeting participants count (peers + self)
-            MEETING_PARTICIPANTS
-                .with_label_values(&[meeting_id])
-                .set((participants_count + 1) as f64);
+            // Update meeting participants from the authoritative session tracker
+            // (issue #1040). Counting distinct live sessions for this meeting — rather
+            // than this one reporter's `peer_stats.len() + 1` — fixes both the gauge
+            // leak (stale meetings now decrement to 0 / are removed via
+            // cleanup_stale_sessions) and the per-reporter skew where different
+            // reporters in the same meeting disagree on the peer count mid-join/leave.
+            {
+                let tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let mut meeting = HashSet::with_capacity(1);
+                meeting.insert(meeting_id.to_string());
+                recompute_meeting_participants(&tracker, &meeting);
+            }
         }
     }
 
@@ -2135,12 +2192,34 @@ mod tests {
         );
     }
 
+    /// Reads the current `videocall_meeting_participants` gauge value for a meeting.
+    /// Returns `None` if no series exists for that meeting (e.g. it was removed).
+    fn meeting_participants_value(meeting_id: &str) -> Option<f64> {
+        let families = prometheus::gather();
+        for family in &families {
+            if family.get_name() == "videocall_meeting_participants" {
+                for metric in family.get_metric() {
+                    for label in metric.get_label() {
+                        if label.get_name() == "meeting_id" && label.get_value() == meeting_id {
+                            return Some(metric.get_gauge().get_value());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     #[test]
-    fn test_meeting_participants_includes_self() {
+    fn test_meeting_participants_counts_live_sessions() {
+        // Issue #1040: the gauge is derived from the authoritative session tracker
+        // (distinct live sessions per meeting), NOT from one reporter's
+        // peer_stats.len() + 1. With a single live reporter, the meeting has exactly
+        // one tracked session, so the count is 1 even though the reporter sees peers.
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
         let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
 
-        // Reporter with 2 peers = 3 total participants
+        // One reporter (alice) that observes 2 peers.
         let (p1, ps1) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
         let (p2, ps2) = create_test_peer_stats("carol", true, true, 50.0, 2.0);
         let mut hp = create_test_health_packet("s20", "m20", "alice", HashMap::new());
@@ -2150,23 +2229,81 @@ mod tests {
         let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
         assert!(result.is_ok());
 
-        // Check the gauge value is 3 (2 peers + 1 self)
-        let families = prometheus::gather();
-        for family in &families {
-            if family.get_name() == "videocall_meeting_participants" {
-                for metric in family.get_metric() {
-                    for label in metric.get_label() {
-                        if label.get_name() == "meeting_id" && label.get_value() == "m20" {
-                            assert_eq!(
-                                metric.get_gauge().get_value(),
-                                3.0,
-                                "participants should be peers + 1 (self)"
-                            );
-                        }
-                    }
+        assert_eq!(
+            meeting_participants_value("m20"),
+            Some(1.0),
+            "one live reporting session => one participant"
+        );
+
+        // A second distinct participant (bob) reports in the same meeting.
+        let mut hp2 = create_test_health_packet("s21", "m20", "bob", HashMap::new());
+        let (p3, ps3) = create_test_peer_stats("alice", true, true, 50.0, 2.0);
+        hp2.peer_stats.insert(p3, ps3);
+        let result2 = process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map);
+        assert!(result2.is_ok());
+
+        assert_eq!(
+            meeting_participants_value("m20"),
+            Some(2.0),
+            "two distinct live sessions => two participants (no per-reporter skew)"
+        );
+    }
+
+    #[test]
+    fn test_meeting_participants_decrements_and_removed_on_stale() {
+        // Issue #1040 core bug: the gauge must decrement as sessions expire and be
+        // removed entirely when the meeting empties — instead of latching a phantom
+        // count forever.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Two distinct participants report in meeting "m_leak".
+        let mut hp_a = create_test_health_packet("s_a", "m_leak", "alice", HashMap::new());
+        let (pa, psa) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        hp_a.peer_stats.insert(pa, psa);
+        let mut hp_b = create_test_health_packet("s_b", "m_leak", "bob", HashMap::new());
+        let (pb, psb) = create_test_peer_stats("alice", true, true, 50.0, 2.0);
+        hp_b.peer_stats.insert(pb, psb);
+        assert!(process_health_packet_to_metrics_pb(&hp_a, &tracker, &dn_map).is_ok());
+        assert!(process_health_packet_to_metrics_pb(&hp_b, &tracker, &dn_map).is_ok());
+
+        assert_eq!(
+            meeting_participants_value("m_leak"),
+            Some(2.0),
+            "two live sessions => 2 participants"
+        );
+
+        // Expire only alice's session by backdating its last_seen past the timeout.
+        {
+            let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            for info in t.values_mut() {
+                if info.reporting_user_id == "alice" {
+                    info.last_seen = Instant::now() - Duration::from_secs(60);
                 }
             }
         }
+        cleanup_stale_sessions(&tracker, &dn_map);
+
+        assert_eq!(
+            meeting_participants_value("m_leak"),
+            Some(1.0),
+            "gauge must decrement to 1 after one session goes stale"
+        );
+
+        // Expire the remaining session — the meeting is now empty.
+        {
+            let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            for info in t.values_mut() {
+                info.last_seen = Instant::now() - Duration::from_secs(60);
+            }
+        }
+        cleanup_stale_sessions(&tracker, &dn_map);
+
+        assert_eq!(
+            meeting_participants_value("m_leak"),
+            None,
+            "gauge series must be removed once the meeting empties (no phantom participants)"
+        );
     }
 
     #[test]

@@ -2008,12 +2008,12 @@ select {
 }
 .meetings-icon-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
 .meetings-icon-btn:focus-visible {
-  outline: 2px solid var(--focus-ring, #6ea8fe);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 .meetings-icon-btn.is-active {
   color: var(--text-primary);
-  border-color: var(--focus-ring, #6ea8fe);
+  border-color: var(--focus-ring);
 }
 
 /* "N active" count badge on the filter icon (replaces the easily-missed dot).
@@ -2029,7 +2029,7 @@ select {
   align-items: center;
   justify-content: center;
   border-radius: 8px;
-  background: var(--focus-ring, #6ea8fe);
+  background: var(--focus-ring);
   color: #fff /* @token-exempt: badge text on accent fill */;
   font-size: 0.625rem;
   font-weight: 700;
@@ -2053,7 +2053,7 @@ select {
 }
 .meetings-sort-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
 .meetings-sort-btn:focus-visible {
-  outline: 2px solid var(--focus-ring, #6ea8fe);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 .meetings-sort-label { white-space: nowrap; }
@@ -2084,10 +2084,10 @@ select {
   max-height: calc(100vh - 24px);
   overflow-y: auto;
   padding: 0.5rem;
-  background: var(--surface-elevated, #1e2030);
+  background: var(--surface-elevated);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-card, 12px);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
@@ -2126,7 +2126,7 @@ select {
   border-radius: var(--radius-button, 8px);
 }
 .meetings-filter-option:hover { background: var(--field-bg); color: var(--text-primary); }
-.meetings-filter-option input { cursor: pointer; accent-color: var(--focus-ring, #6ea8fe); }
+.meetings-filter-option input { cursor: pointer; accent-color: var(--focus-ring); }
 
 .meetings-sort-popover { min-width: 180px; padding: 0.25rem; gap: 0; }
 .meetings-sort-option {
@@ -2142,7 +2142,7 @@ select {
 }
 .meetings-sort-option:hover { background: var(--field-bg); color: var(--text-primary); }
 .meetings-sort-option:focus-visible {
-  outline: 2px solid var(--focus-ring, #6ea8fe);
+  outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
 .meetings-sort-option.is-selected {
@@ -2171,7 +2171,7 @@ select {
 }
 .meetings-clear-filters-btn:hover { background: var(--glass-bg-hover); }
 .meetings-clear-filters-btn:focus-visible {
-  outline: 2px solid var(--focus-ring, #6ea8fe);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 

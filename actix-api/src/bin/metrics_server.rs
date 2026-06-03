@@ -49,21 +49,21 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
     AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
-    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC,
-    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
-    CLIENT_TAB_VISIBLE, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP,
-    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
-    DECODE_BUDGET_PRESSURED, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
-    ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
-    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
-    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
-    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
-    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
-    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
-    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
-    VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
+    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS,
+    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
+    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
+    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
+    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS,
+    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -170,6 +170,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         &session_info.display_name,
     ]);
     let _ = CLIENT_MEMORY_TOTAL_BYTES.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+    ]);
+    // #1032: non-heap memory series share the JS-heap label family.
+    let _ = CLIENT_WASM_MEMORY_BYTES.remove_label_values(&[
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+    ]);
+    let _ = CLIENT_AGENT_MEMORY_BYTES.remove_label_values(&[
         &session_info.meeting_id,
         &session_info.session_id,
         &session_info.reporting_user_id,
@@ -559,6 +572,31 @@ fn process_health_packet_to_metrics_pb(
                     reporter_display_name.as_str(),
                 ])
                 .set(mem_total as f64);
+        }
+
+        // #1032: WASM linear memory (always available on the client).
+        if let Some(wasm_mem) = health_packet.wasm_memory_bytes {
+            CLIENT_WASM_MEMORY_BYTES
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(wasm_mem as f64);
+        }
+
+        // #1032: total agent memory (Chrome + crossOriginIsolated only; absent
+        // otherwise, in which case the series simply never appears).
+        if let Some(agent_mem) = health_packet.agent_memory_bytes {
+            CLIENT_AGENT_MEMORY_BYTES
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                ])
+                .set(agent_mem as f64);
         }
 
         // Communication and browser state metrics
@@ -2209,6 +2247,61 @@ mod tests {
         assert!(
             series_exists("videocall_client_tab_throttled", &[("meeting_id", "m30")]),
             "tab_throttled should be exposed"
+        );
+    }
+
+    /// #1032: non-heap memory gauges are exported when present on the packet.
+    #[test]
+    fn test_nonheap_memory_metrics_exposed() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s1032", "m1032", "alice", HashMap::new());
+        hp.peer_stats.insert(peer_id, ps);
+        hp.wasm_memory_bytes = Some(67_108_864); // 64 MiB WASM linear memory
+        hp.agent_memory_bytes = Some(2_147_483_648); // 2 GiB total agent memory
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_wasm_memory_bytes",
+                &[("meeting_id", "m1032"), ("session_id", "s1032")]
+            ),
+            "wasm_memory_bytes should be exposed"
+        );
+        assert!(
+            series_exists(
+                "videocall_client_agent_memory_bytes",
+                &[("meeting_id", "m1032"), ("session_id", "s1032")]
+            ),
+            "agent_memory_bytes should be exposed"
+        );
+    }
+
+    /// #1032: when the client omits the non-heap fields (API unavailable), the
+    /// gauges are NOT exported — Grafana shows a gap, not a misleading zero.
+    #[test]
+    fn test_nonheap_memory_metrics_absent_when_omitted() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let (peer_id, ps) = create_test_peer_stats("bob", true, true, 50.0, 2.0);
+        let mut hp = create_test_health_packet("s1032b", "m1032b", "alice", HashMap::new());
+        hp.peer_stats.insert(peer_id, ps);
+        // wasm_memory_bytes / agent_memory_bytes deliberately left None.
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            !series_exists(
+                "videocall_client_agent_memory_bytes",
+                &[("meeting_id", "m1032b"), ("session_id", "s1032b")]
+            ),
+            "agent_memory_bytes must be absent when the client omits it"
         );
     }
 

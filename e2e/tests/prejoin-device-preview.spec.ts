@@ -135,13 +135,17 @@ test.describe("Pre-join device preview (#959)", () => {
     await expect(page.locator(SPEAKER_SELECT)).toBeVisible();
 
     // Device labels populate once permission is granted (empty before that).
+    // NOTE: <option> elements inside a (closed) <select> are never "visible" to
+    // Playwright, so we assert presence via count() and non-empty text/value via
+    // evaluate() rather than toBeVisible().
     const cameraOptions = page.locator(`${CAMERA_SELECT} option`);
     const micOptions = page.locator(`${MIC_SELECT} option`);
-    await expect(cameraOptions.first()).toBeVisible();
+    await expect(cameraOptions).not.toHaveCount(0);
     expect(await cameraOptions.count()).toBeGreaterThanOrEqual(1);
     expect(await micOptions.count()).toBeGreaterThanOrEqual(1);
     // A labeled option has non-empty text (fake devices report e.g. "fake_device_0").
     expect((await cameraOptions.first().textContent())?.trim().length ?? 0).toBeGreaterThan(0);
+    expect((await micOptions.first().textContent())?.trim().length ?? 0).toBeGreaterThan(0);
   });
 
   test("camera toggle starts and stops the live preview video", async ({ page }) => {
@@ -166,7 +170,9 @@ test.describe("Pre-join device preview (#959)", () => {
     // asserted best-effort: it confirms real frames in the standard e2e stack
     // but can lag on a degraded/headless compositor, so we don't hard-fail the
     // whole flow on decode timing — the live-track guarantee is the load-bearer.
-    await expect(video).toHaveJSProperty("srcObject", expect.anything());
+    // A MediaStream serializes to `{}` over the protocol, so toHaveJSProperty
+    // can't match it — assert via evaluate that srcObject is a non-null stream.
+    expect(await video.evaluate((v) => (v as HTMLVideoElement).srcObject !== null)).toBe(true);
     await expect
       .poll(async () => (await videoState(page)).liveVideoTracks, { timeout: 15_000 })
       .toBeGreaterThan(0);
@@ -269,7 +275,12 @@ test.describe("Pre-join device preview (#959)", () => {
       await expect
         .poll(async () => (await videoState(page)).liveVideoTracks, { timeout: 15_000 })
         .toBeGreaterThan(0);
-      await expect(page.locator(CAMERA_VIDEO)).toHaveJSProperty("srcObject", expect.anything());
+      // MediaStream serializes to {}, so assert non-null via evaluate.
+      expect(
+        await page
+          .locator(CAMERA_VIDEO)
+          .evaluate((v) => (v as HTMLVideoElement).srcObject !== null),
+      ).toBe(true);
       // The chosen device id is persisted.
       const persisted = await page.evaluate((k) => localStorage.getItem(k), LS_CAMERA_ID);
       expect(persisted).toBe(uniqueValues[1]);

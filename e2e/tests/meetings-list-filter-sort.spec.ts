@@ -100,16 +100,28 @@ async function renderedRowIds(page: Page): Promise<string[]> {
   return page.locator(MEETINGS_ROW_IDS).allTextContents();
 }
 
-/** Open the filter popover by clicking its trigger; assert it is visible. */
+/**
+ * Open the filter popover by clicking its trigger; assert it is visible. Robust
+ * to a sort popover already being open: clicking the filter trigger is a
+ * one-click direct switch (closes sort, opens filter), so we also assert the
+ * sort popover is gone afterwards.
+ */
 async function openFilterPopover(page: Page): Promise<void> {
   await page.locator(FILTER_TRIGGER).click();
   await expect(page.locator(FILTER_POPOVER)).toBeVisible();
+  await expect(page.locator(SORT_POPOVER)).toHaveCount(0);
 }
 
-/** Open the sort popover by clicking its trigger; assert it is visible. */
+/**
+ * Open the sort popover by clicking its trigger; assert it is visible. Robust to
+ * a filter popover already being open: clicking the sort trigger is a one-click
+ * direct switch (closes filter, opens sort), so we also assert the filter
+ * popover is gone afterwards.
+ */
 async function openSortPopover(page: Page): Promise<void> {
   await page.locator(SORT_TRIGGER).click();
   await expect(page.locator(SORT_POPOVER)).toBeVisible();
+  await expect(page.locator(FILTER_POPOVER)).toHaveCount(0);
 }
 
 /**
@@ -357,6 +369,14 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await openFilterPopover(page);
     await checkFilterOption(page, "Ended");
 
+    // Close the popover before interacting with the LIST: while a popover is
+    // open a transparent full-viewport backdrop sits over the list and would
+    // intercept clicks on the empty-state / Clear-filters button. Escape from
+    // the trigger closes the popover (and removes the backdrop).
+    await page.locator(FILTER_TRIGGER).press("Escape");
+    await expect(page.locator(FILTER_POPOVER)).toHaveCount(0);
+    await expect(page.locator(POPOVER_BACKDROP)).toHaveCount(0);
+
     // The filtered-empty state appears; no rows render. The generic empty
     // ("No meetings yet") must NOT be shown.
     await expect(page.locator(FILTERED_EMPTY)).toBeVisible();
@@ -466,7 +486,10 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await expect(filterTrigger).toHaveAttribute("aria-expanded", "true");
 
     // --- Escape closes the popover and returns focus to the trigger. ---
-    await page.locator(FILTER_POPOVER).press("Escape");
+    // Press Escape from the TRIGGER itself (the meaningful focus-on-trigger
+    // scenario): Escape must close the open popover from anywhere, including
+    // when focus is on the trigger, and return focus to that trigger.
+    await filterTrigger.press("Escape");
     await expect(page.locator(FILTER_POPOVER)).toHaveCount(0);
     await expect(filterTrigger).toHaveAttribute("aria-expanded", "false");
     await expect(filterTrigger).toBeFocused();
@@ -485,8 +508,9 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await expect(page.locator(FILTER_POPOVER)).toHaveCount(0);
     await expect(page.locator(SORT_POPOVER)).toBeVisible();
 
-    // Sort popover also closes on Escape and returns focus to the sort trigger.
-    await page.locator(SORT_POPOVER).press("Escape");
+    // Sort popover also closes on Escape (pressed from its trigger) and returns
+    // focus to the sort trigger.
+    await page.locator(SORT_TRIGGER).press("Escape");
     await expect(page.locator(SORT_POPOVER)).toHaveCount(0);
     await expect(page.locator(SORT_TRIGGER)).toBeFocused();
 

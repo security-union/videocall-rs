@@ -19,6 +19,7 @@
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
 /// Stable selectors for the pre-join device preview (issue #959). Exposed as
@@ -406,6 +407,28 @@ fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<Dev
         .iter()
         .find(|device| device.device_id() == device_id)
         .map(DeviceInfo::from_media_device_info)
+}
+
+/// Set a `<select>`'s DOM `.value` (IDL property) to `value` by element id.
+///
+/// Only writes when the current `.value` differs, so it never fights the user
+/// mid-interaction. The IDL setter — unlike a post-parse `selected`-attribute
+/// mutation — reliably moves the control's selection to the matching option,
+/// which is what makes the restored pre-join device survive a reload.
+pub fn sync_select_value(select_id: &str, value: Option<&str>) {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(select_id))
+    {
+        if let Ok(select) = el.dyn_into::<web_sys::HtmlSelectElement>() {
+            if select.value() != value {
+                select.set_value(value);
+            }
+        }
+    }
 }
 
 // ── Status icons ──────────────────────────────────────────────────────

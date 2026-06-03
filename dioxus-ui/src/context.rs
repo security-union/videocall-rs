@@ -1469,6 +1469,27 @@ mod tests {
     }
 
     #[test]
+    fn restore_device_id_stored_wins_over_default_first_entry() {
+        // Regression for the e2e restore-after-reload bug: Chrome's fake device
+        // set lists a pseudo "default" mic FIRST. A persisted non-default
+        // selection must win over that first "default" entry — restore must not
+        // collapse to the auto-selected first device.
+        let available = vec![
+            "default".to_string(),
+            "communications".to_string(),
+            "real-mic-id".to_string(),
+        ];
+        assert_eq!(
+            restore_device_id(Some("communications"), &available),
+            Some("communications".to_string())
+        );
+        assert_eq!(
+            restore_device_id(Some("real-mic-id"), &available),
+            Some("real-mic-id".to_string())
+        );
+    }
+
+    #[test]
     fn restore_device_id_empty_stored_falls_back() {
         let available = vec!["cam-a".to_string()];
         assert_eq!(

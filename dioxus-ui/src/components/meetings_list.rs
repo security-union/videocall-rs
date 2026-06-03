@@ -512,7 +512,19 @@ fn MeetingsToolbar(
     rsx! {
         div { class: "meetings-toolbar",
             // ---- Filter popover ------------------------------------------
-            div { class: "meetings-toolbar-group",
+            // Escape is handled at the GROUP level (not on the popover div) so a
+            // keydown from the focused trigger button — the common case, and
+            // what Playwright's `.press('Escape')` produces — bubbles up and
+            // closes the popover regardless of where focus sits while open.
+            div {
+                class: "meetings-toolbar-group",
+                onkeydown: move |e: KeyboardEvent| {
+                    if filter_open && e.key() == Key::Escape {
+                        e.stop_propagation();
+                        on_close_filter.call(());
+                        focus_element_by_id(FILTER_BTN_ID);
+                    }
+                },
                 button {
                     id: FILTER_BTN_ID,
                     class: if filters_active { "meetings-icon-btn is-active" } else { "meetings-icon-btn" },
@@ -555,15 +567,9 @@ fn MeetingsToolbar(
                         aria_label: "Filter meetings",
                         // Position is pure CSS (absolute, anchored to the
                         // toolbar-group wrapper) — see `.meetings-popover`.
-                        // Escape closes; stop propagation so a click inside the
-                        // panel never reaches the backdrop.
-                        onkeydown: move |e: KeyboardEvent| {
-                            if e.key() == Key::Escape {
-                                e.stop_propagation();
-                                on_close_filter.call(());
-                                focus_element_by_id(FILTER_BTN_ID);
-                            }
-                        },
+                        // Escape is handled on the enclosing group (above);
+                        // stop click propagation so a click inside the panel
+                        // never reaches the backdrop.
                         onclick: move |e: MouseEvent| e.stop_propagation(),
 
                         fieldset { class: "meetings-filter-group",
@@ -641,7 +647,17 @@ fn MeetingsToolbar(
             }
 
             // ---- Sort dropdown -------------------------------------------
-            div { class: "meetings-toolbar-group",
+            // Group-level Escape (see filter group comment) so a keydown from
+            // the focused sort trigger closes the popover.
+            div {
+                class: "meetings-toolbar-group",
+                onkeydown: move |e: KeyboardEvent| {
+                    if sort_open && e.key() == Key::Escape {
+                        e.stop_propagation();
+                        on_close_sort.call(());
+                        focus_element_by_id(SORT_BTN_ID);
+                    }
+                },
                 button {
                     id: SORT_BTN_ID,
                     class: "meetings-sort-btn",
@@ -699,13 +715,9 @@ fn MeetingsToolbar(
                     div {
                         class: "meetings-popover meetings-sort-popover",
                         aria_label: "Sort by",
-                        onkeydown: move |e: KeyboardEvent| {
-                            if e.key() == Key::Escape {
-                                e.stop_propagation();
-                                on_close_sort.call(());
-                                focus_element_by_id(SORT_BTN_ID);
-                            }
-                        },
+                        // Escape handled on the enclosing group (above); stop
+                        // click propagation so an in-panel click never reaches
+                        // the backdrop.
                         onclick: move |e: MouseEvent| e.stop_propagation(),
                         for key in SortKey::all() {
                             button {

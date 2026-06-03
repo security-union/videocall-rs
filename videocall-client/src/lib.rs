@@ -137,7 +137,8 @@
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
 //!     Callback::noop(),
-//!     Callback::noop() // on_error callback for camera errors
+//!     Callback::noop(), // on_error callback for camera errors
+//!     1,                // max simulcast layers (1 = single stream / off)
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),

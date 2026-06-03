@@ -36,5 +36,15 @@ window.__APP_CONFIG = ({
   oauthFlow: "",
   searchApiBaseUrl: "http://localhost:3000/api/search/v2",
   consoleLogUploadEnabled: "false",
-  mockPeersEnabled: "false"
+  mockPeersEnabled: "false",
+  // EXPERIMENTAL, TEST-ONLY: max simulcast layers a publisher may emit
+  // (issue #989). 1 = feature OFF (single stream, identical to pre-simulcast).
+  // Effective layers = min(this, device-capability ceiling).
+  // WARNING: values > 1 have NO playback benefit yet — layers are not
+  // tier-differentiated (PR B), receivers decode the base layer only, and the
+  // relay does not filter layers. Raising it purely multiplies encode CPU and
+  // uplink/relay egress. KEEP AT 1 IN PRODUCTION; raise to 2/3 only in
+  // controlled test meetings (and the load-test bot) until relay per-receiver
+  // layer selection lands.
+  experimentalSimulcastMaxLayers: 1
 });

@@ -42,6 +42,7 @@ pub fn transform_video_chunk(
     buffer: &mut [u8],
     user_id: &str,
     aes: Rc<Aes128State>,
+    simulcast_layer_id: u32,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
@@ -73,6 +74,12 @@ pub fn transform_video_chunk(
         // Cleartext discriminator so the relay can apply viewport-aware VIDEO
         // filtering without decrypting the inner MediaPacket (HCL issue #988).
         media_kind: MediaKind::VIDEO.into(),
+        // Cleartext simulcast layer id (issue #989). Tag 5 serializes only when
+        // non-zero (see videocall-types packet_wrapper.rs), so layer 0 — the
+        // single-layer default and what every pre-simulcast publisher emits —
+        // is wire-identical to today. The relay (steps 6-8, future) and the
+        // receiver layer-select guard read this to forward/decode one layer.
+        simulcast_layer_id,
         ..Default::default()
     }
 }
@@ -142,5 +149,67 @@ pub fn transform_screen_chunk(
         // filtering without decrypting the inner MediaPacket (HCL issue #988).
         media_kind: MediaKind::SCREEN.into(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The encoded `EncodedVideoChunk` body of `transform_video_chunk` requires
+    /// `web_sys` (a browser), so we cannot drive the full function natively.
+    /// What is load-bearing for issue #989, though, is purely the protobuf
+    /// behaviour of the cleartext `simulcast_layer_id` field on the outer
+    /// `PacketWrapper` — exactly the bytes the relay and the receiver
+    /// layer-select guard read. These tests pin that behaviour:
+    ///
+    ///   * `layer_id == 0` (single-layer default + every pre-simulcast
+    ///     publisher) MUST be wire-identical to a wrapper that never set the
+    ///     field — i.e. tag 5 is absent and parses back to 0.
+    ///   * `layer_id == 2` MUST round-trip to `2`.
+    ///
+    /// We build the wrapper with the same field assignment the function uses so
+    /// a future refactor that drops the field is caught here.
+    fn wrapper_with_layer(layer: u32) -> PacketWrapper {
+        PacketWrapper {
+            data: vec![1, 2, 3, 4],
+            user_id: b"alice".to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::VIDEO.into(),
+            simulcast_layer_id: layer,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layer_id_zero_is_wire_absent_and_round_trips_to_zero() {
+        let with_zero = wrapper_with_layer(0);
+        let zero_bytes = with_zero.write_to_bytes().unwrap();
+
+        // A wrapper that never touched the field must serialize identically —
+        // proves tag 5 is omitted entirely when the layer is 0.
+        let baseline = PacketWrapper {
+            data: vec![1, 2, 3, 4],
+            user_id: b"alice".to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::VIDEO.into(),
+            ..Default::default()
+        };
+        let baseline_bytes = baseline.write_to_bytes().unwrap();
+        assert_eq!(
+            zero_bytes, baseline_bytes,
+            "layer 0 must be byte-identical to a wrapper that never set the field"
+        );
+
+        let parsed = PacketWrapper::parse_from_bytes(&zero_bytes).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 0);
+    }
+
+    #[test]
+    fn layer_id_two_round_trips() {
+        let with_two = wrapper_with_layer(2);
+        let bytes = with_two.write_to_bytes().unwrap();
+        let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 2);
     }
 }

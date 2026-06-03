@@ -2939,6 +2939,209 @@ select {
 .settings-card-compact .settings-card-title { margin-bottom: 0.75rem; }
 
 /* ----------------------------------------------------------------
+   Pre-join device preview (issue #959)
+   ---------------------------------------------------------------- */
+.prejoin-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.prejoin-video-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  /* Theme-aware video letterbox — matches the in-meeting self-view
+     (.self-camera uses var(--bg)). */
+  background: var(--bg);
+  border-radius: var(--radius-input, 12px);
+  overflow: hidden;
+  border: 1px solid var(--settings-card-border);
+}
+
+.prejoin-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* No horizontal mirror: matches the in-meeting self-view (.self-camera),
+     which is not mirrored, so the preview is consistent with the call. */
+}
+
+.prejoin-video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-video-placeholder-text {
+  font-size: 0.85rem;
+}
+
+.prejoin-permission-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  text-align: center;
+  padding: 0.5rem 0;
+}
+
+.prejoin-permission-text {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.prejoin-controls-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.prejoin-toggle {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.prejoin-toggle-icon {
+  flex-shrink: 0;
+}
+
+/* ON: unmistakable green "active" treatment (independent of --accent, which is
+   Apple blue on this app). Uses the semantic --success token. */
+.prejoin-toggle.on {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--text-primary);
+}
+
+/* OFF: red-tinted danger treatment — joining muted/dark is the attention
+   state, so make it obvious rather than a faint border. Uses --error. */
+.prejoin-toggle.off.danger {
+  border-color: color-mix(in srgb, var(--error) 60%, var(--settings-card-border));
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  color: color-mix(in srgb, var(--error) 85%, var(--text-primary));
+}
+
+.prejoin-meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  transition: opacity 0.2s;
+}
+
+.prejoin-meter-row.muted {
+  opacity: 0.5;
+}
+
+.prejoin-meter-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-meter-glyph {
+  flex-shrink: 0;
+}
+
+.prejoin-meter {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--settings-card-border);
+  overflow: hidden;
+}
+
+.prejoin-meter-fill {
+  height: 100%;
+  /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping), all
+     semantic tokens. */
+  background: linear-gradient(
+    90deg,
+    var(--success) 0%,
+    var(--warning) 65%,
+    var(--error) 100%
+  );
+  border-radius: 4px;
+  /* Light smoothing between the engine's per-frame width writes. */
+  transition: width 0.06s linear;
+}
+
+.prejoin-selectors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.prejoin-select-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.prejoin-select-group label {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prejoin-select {
+  width: 100%;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.prejoin-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.prejoin-select-note {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+/* Focus-visible rings (WCAG 2.4.7) — keyboard only; mouse clicks stay clean. */
+.prejoin-toggle:focus-visible,
+.prejoin-select:focus-visible,
+.prejoin-permission-allow:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.prejoin-toggle:focus:not(:focus-visible),
+.prejoin-select:focus:not(:focus-visible),
+.prejoin-permission-allow:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ----------------------------------------------------------------
    Join Meeting header (non-owner pre-join card)
    Distinct from .settings-card-title — this is a prominent prompt,
    not an uppercase section label.

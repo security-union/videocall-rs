@@ -47,6 +47,23 @@ pub const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_upd
 /// `MEETING_ENDED_BY_HOST_SUBJECT`).
 pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 
+/// NATS subject consumed by `meeting-api` to write `state='idle'` to the
+/// `meetings` table when `actix-api` detects that a room became empty (the last
+/// present participant disconnected/left) for a meeting that did NOT end.
+/// Defines the presence-driven everyone-left → idle transition.
+///
+/// `actix-api` fires this ONCE per room-becomes-empty (when its in-memory
+/// per-room member count reaches zero), never per-disconnect, so the consumer
+/// is not subjected to an O(n) storm during a mass-disconnect. The consumer's
+/// `db_meetings::set_idle` guards on `state='active'`, so it is a no-op on an
+/// already-ended (terminal) or already-idle meeting — making the end-vs-idle
+/// race safe in either ordering.
+///
+/// The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_BECAME_EMPTY_SUBJECT`).
+pub const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
+
 /// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
 ///
 /// Carries the four per-meeting policy flags so chat_server can refresh
@@ -69,6 +86,17 @@ pub struct MeetingSettingsUpdatePayload {
 /// to `state='ended'`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingEndedByHostPayload {
+    pub room_id: String,
+}
+
+/// Payload consumed on [`MEETING_BECAME_EMPTY_SUBJECT`].
+///
+/// Sent by chat_server when the last present participant leaves a room whose
+/// meeting did not end. The `meeting-api` consumer looks up the meeting by
+/// `room_id` and transitions its DB row to `state='idle'` via
+/// `db_meetings::set_idle`. Mirrors [`MeetingEndedByHostPayload`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingBecameEmptyPayload {
     pub room_id: String,
 }
 

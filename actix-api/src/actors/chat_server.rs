@@ -107,6 +107,29 @@ const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated
 /// before `leave_rooms` runs, so this event is never published.
 const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 
+/// NATS subject for chat_server -> meeting-api notifications that a room just
+/// became empty (the last present participant disconnected/left) for a meeting
+/// that did NOT end. The meeting-api consumer writes `state='idle'` to the DB
+/// (via `db_meetings::set_idle`) so the meetings list reflects "no one is
+/// currently here" without ending the meeting.
+///
+/// Fired from two sites — the normal-departure path in
+/// [`ChatServer::leave_rooms`], and the `was_active=false` branch of
+/// [`ExecutePendingDeparture`]'s handler (a never-activated session, e.g. an
+/// RTT-election loser, whose grace period expired while it was the last member).
+/// In both cases the event is emitted only when the in-memory `room_members`
+/// count for the room reaches zero — exactly once per room-becomes-empty, not
+/// once per disconnect (the actor is single-threaded, so only the departure that
+/// drains the Vec to empty observes `is_empty()`). It is deliberately NOT
+/// emitted on the host-leave-ends-meeting path, where MEETING_ENDED +
+/// [`MEETING_ENDED_BY_HOST_SUBJECT`] fire instead and `ended` (terminal) must
+/// win. A non-ending host leave (`end_on_host_leave=false`) is treated as a
+/// normal departure and DOES contribute to this transition.
+///
+/// The consumer's `set_idle` guards on `state='active'`, so an idle event that
+/// races a host-leave END is harmless in either ordering.
+const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -144,6 +167,18 @@ struct MeetingSettingsUpdatePayload {
 /// clients' view of the meeting.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MeetingEndedByHostPayload {
+    room_id: String,
+}
+
+/// Payload for [`MEETING_BECAME_EMPTY_SUBJECT`].
+///
+/// Sent from chat_server to meeting-api when the last present participant left a
+/// room whose meeting did NOT end. The meeting-api consumer looks up the meeting
+/// by `room_id` and transitions its DB row to `state='idle'` (no-op if the
+/// meeting already ended). Mirrors [`MeetingEndedByHostPayload`] — a single
+/// `room_id` field, JSON over an internal subject.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MeetingBecameEmptyPayload {
     room_id: String,
 }
 
@@ -511,9 +546,21 @@ impl ChatServer {
         // that room must not wipe the legitimately-cached policy.
         self.session_room.remove(session_id);
 
+        // Track whether THIS removal drained the room to empty. We read the
+        // count from `room_members` — the in-memory, actor-synchronous presence
+        // map — which is the same authoritative source the host-leave→end path
+        // uses. Because the chat_server actor processes one message at a time,
+        // exactly one `leave_rooms` call can observe the Vec transition from
+        // non-empty to empty: during a mass-disconnect (reconnection wave) the
+        // N departures are serialized, and only the last one sees
+        // `members.is_empty()`. This is what makes the empty→idle NATS event
+        // fire ONCE per room-becomes-empty rather than once per disconnect, so
+        // there is no O(n) NATS storm.
+        let mut room_became_empty = false;
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
+                room_became_empty = members.is_empty();
             }
             self.forget_room_if_empty(room_id);
         }
@@ -668,6 +715,53 @@ impl ChatServer {
                         }
                         Err(e) => {
                             error!("Error ending session for room {}: {}", room_id, e);
+                        }
+                    }
+
+                    // Presence-driven empty→idle transition (everyone left a
+                    // meeting that did NOT end). We only reach here on the
+                    // normal-departure path — NOT the host-leave-ends-meeting
+                    // path above, where END must win and emitting an idle event
+                    // would be wrong. A non-ending host leave
+                    // (`end_on_host_leave=false`) flows through here too and is
+                    // treated as a normal departure that contributes to the
+                    // empty→idle transition, exactly as required.
+                    //
+                    // `room_became_empty` was computed synchronously in the
+                    // actor BEFORE this spawn, from the `room_members` count
+                    // reaching zero, so this publishes ONCE per
+                    // room-becomes-empty (not once per disconnect). meeting-api
+                    // resolves room_id->meeting and calls `set_idle`, which
+                    // no-ops on an already-ended meeting — so even if a stray
+                    // END races this idle event, ended (terminal) still wins.
+                    //
+                    // Multi-replica note: `room_members` is per-replica, the
+                    // same assumption the host-leave→end detection already
+                    // makes. "Empty" here means "empty on this replica". We do
+                    // not introduce a stronger cross-replica guarantee than the
+                    // existing host-leave path has.
+                    if room_became_empty {
+                        info!(
+                            "Room {} became empty after {} left - notifying meeting-api (empty->idle)",
+                            room_id, user_id
+                        );
+                        let payload = MeetingBecameEmptyPayload {
+                            room_id: room_id.clone(),
+                        };
+                        match serde_json::to_vec(&payload) {
+                            Ok(json) => {
+                                if let Err(e) =
+                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
+                                {
+                                    error!(
+                                        "Failed to publish {} for room {}: {}",
+                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
+                            }
                         }
                     }
                 }
@@ -1584,14 +1678,58 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 // empty-room policy-cache eviction rule stays in lockstep with
                 // the `leave_rooms` path (both paths must drop `room_policy`
                 // when, and only when, this removal drained the room to empty).
+                //
+                // We still check empty→idle here even though this never-active
+                // session never broadcast a JOIN: if it was the LAST member it
+                // could be draining the room to empty while an earlier active
+                // participant already left (that earlier departure saw this
+                // testing session still present, so it did NOT emit the
+                // empty event). Without this branch the meeting could stay
+                // `active` despite being empty. We do NOT emit on the
+                // host-leave-ends path here because a never-active session is
+                // never the host's ending session (that goes through
+                // `leave_rooms`). meeting-api's `set_idle` guards on
+                // `state='active'`, so if the meeting was never activated this
+                // is a harmless no-op.
+                let mut room_became_empty = false;
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != session);
+                    room_became_empty = members.is_empty();
                 }
                 self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
                         self.instance_index.remove(&iid);
                     }
+                }
+                if room_became_empty {
+                    let nc = self.nats_connection.clone();
+                    let room_id = room.clone();
+                    tokio::spawn(async move {
+                        info!(
+                            "Room {} became empty after a never-activated session expired - \
+                             notifying meeting-api (empty->idle)",
+                            room_id
+                        );
+                        let payload = MeetingBecameEmptyPayload {
+                            room_id: room_id.clone(),
+                        };
+                        match serde_json::to_vec(&payload) {
+                            Ok(json) => {
+                                if let Err(e) =
+                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
+                                {
+                                    error!(
+                                        "Failed to publish {} for room {}: {}",
+                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
+                            }
+                        }
+                    });
                 }
                 return;
             }
@@ -7028,6 +7166,27 @@ mod tests {
         }
     }
 
+    /// Drain `sub` for the full `deadline`, returning every payload received.
+    /// Unlike [`wait_for_first`] this does NOT stop at the first message, so it
+    /// can prove an event fired *exactly once* (and not once-per-disconnect).
+    async fn drain_all(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> Vec<Vec<u8>> {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        let start = Instant::now();
+        let mut out = Vec::new();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match timeout(remaining, sub.next()).await {
+                Ok(Some(msg)) => out.push(msg.payload.to_vec()),
+                _ => break,
+            }
+        }
+        out
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // TEST 1: Stable end_on_host_leave=true, host disconnects ->
     //         MEETING_ENDED broadcast AND internal.meeting_ended_by_host
@@ -7209,6 +7368,199 @@ mod tests {
         assert!(
             db_payload.is_none(),
             "internal.meeting_ended_by_host must NOT be published when no broadcast fires"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // EMPTY->IDLE TEST A: two non-host participants leave a meeting.
+    //         The became-empty event must fire EXACTLY ONCE — only after the
+    //         LAST participant leaves (room_members reaches zero), NOT once per
+    //         disconnect. This guards against an O(n) NATS storm on a mass
+    //         disconnect / reconnection wave.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_room_empty_publishes_idle_event_exactly_once() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-empty-idle-once";
+        let s1 = 9_700u64;
+        let s2 = 9_701u64;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        // Two participants join and activate.
+        for (sid, uid) in [(s1, "p1@example.com"), (s2, "p2@example.com")] {
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: uid.to_string(),
+                    display_name: uid.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    instance_id: None,
+                    is_host: false,
+                    end_on_host_leave: false,
+                })
+                .await
+                .expect("Message delivery should succeed")
+                .expect("JoinRoom should return Ok");
+            chat_server
+                .send(ActivateConnection { session: sid })
+                .await
+                .expect("ActivateConnection should succeed");
+        }
+        sleep(Duration::from_millis(300)).await;
+
+        // First participant leaves — room is NOT yet empty (s2 remains), so no
+        // became-empty event must fire.
+        chat_server
+            .send(Disconnect {
+                session: s1,
+                room: room.to_string(),
+                user_id: "p1@example.com".to_string(),
+                display_name: "p1@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait past the grace period for s1's departure to execute, then assert
+        // NO empty event yet.
+        let early = drain_all(&mut empty_sub, Duration::from_secs(5)).await;
+        assert!(
+            early.is_empty(),
+            "became-empty must NOT fire while a participant remains; got {} event(s)",
+            early.len()
+        );
+
+        // Second (last) participant leaves — room becomes empty now.
+        chat_server
+            .send(Disconnect {
+                session: s2,
+                room: room.to_string(),
+                user_id: "p2@example.com".to_string(),
+                display_name: "p2@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Drain the full window; expect exactly one became-empty event.
+        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "became-empty must fire EXACTLY ONCE when the room drains to empty, not once per \
+             disconnect; got {} event(s)",
+            events.len()
+        );
+        let parsed: MeetingBecameEmptyPayload =
+            serde_json::from_slice(&events[0]).expect("Payload should deserialize");
+        assert_eq!(parsed.room_id, room);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // EMPTY->IDLE TEST B: host leaves with end_on_host_leave=true. END must
+    //         win — the meeting ends, so the became-empty (idle) event must
+    //         NOT fire even though the room drained to empty.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_host_leave_eohl_true_does_not_emit_idle_event() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-empty-idle-eohl-true";
+        let session_id = 9_702u64;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host@example.com".to_string(),
+                display_name: "host@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host@example.com".to_string(),
+                display_name: "host@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // END wins: the host-leave path fires MEETING_ENDED + the ended-by-host
+        // event, NOT the became-empty idle event.
+        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
+        assert!(
+            events.is_empty(),
+            "became-empty (idle) must NOT fire when end_on_host_leave=true ends the meeting; \
+             got {} event(s)",
+            events.len()
         );
     }
 

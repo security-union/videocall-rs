@@ -522,6 +522,20 @@ mod tests {
         );
     }
 
+    /// Sender resend must fire AFTER the receiver's short suppression window.
+    /// Constants live in different modules; pin the ordering so a future edit
+    /// cannot silently re-introduce the ~5s mute/camera-off lag.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn state_change_resend_delay_exceeds_live_stream_fresh_window() {
+        use crate::decode::peer_decode_manager::LIVE_STREAM_FRESH_WINDOW_MS;
+        assert!(
+            STATE_CHANGE_RESEND_DELAY_MS as u64 > LIVE_STREAM_FRESH_WINDOW_MS,
+            "STATE_CHANGE_RESEND_DELAY_MS must exceed LIVE_STREAM_FRESH_WINDOW_MS \
+             or the one-shot resend lands inside the suppression window"
+        );
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen_test]
     fn immediate_heartbeat_uses_control_stream_not_datagram() {

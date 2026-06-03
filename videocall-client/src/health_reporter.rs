@@ -880,8 +880,8 @@ impl HealthReporter {
     ///     and `agent_memory_bytes` simply never appears for that client).
     ///
     /// Graceful degradation: any missing global, non-isolated context, thrown
-    /// exception, or malformed result leaves the cache untouched — we never
-    /// panic and never block the report cadence.
+    /// exception, or malformed result clears the cache — we never panic and
+    /// never block the report cadence.
     #[cfg(target_arch = "wasm32")]
     fn start_agent_memory_sampler(&self) {
         use wasm_bindgen::JsCast;
@@ -939,27 +939,25 @@ impl HealthReporter {
                         let promise: js_sys::Promise = promise_val.into();
                         match JsFuture::from(promise).await {
                             Ok(result) => {
-                                if let Ok(bytes) = js_sys::Reflect::get(&result, &"bytes".into()) {
-                                    if let Some(bytes_f64) = bytes.as_f64() {
-                                        if let Some(cell) = Weak::upgrade(&cache) {
-                                            if let Ok(mut c) = cell.try_borrow_mut() {
-                                                *c = Some(bytes_f64 as u64);
-                                            }
-                                        } else {
-                                            // HealthReporter dropped; stop sampling.
-                                            break;
-                                        }
-                                    }
+                                let sample = js_sys::Reflect::get(&result, &"bytes".into())
+                                    .ok()
+                                    .and_then(|bytes| bytes.as_f64())
+                                    .map(|bytes_f64| bytes_f64 as u64);
+                                if !Self::update_agent_memory_cache(&cache, sample) {
+                                    // HealthReporter dropped; stop sampling.
+                                    break;
                                 }
                             }
                             Err(e) => {
-                                // Rejected (e.g. permissions/throttling). Keep the
-                                // last cached value; never panic.
+                                // Rejected (e.g. permissions/throttling). Clear the
+                                // cached value so stale data cannot linger forever.
+                                let _ = Self::update_agent_memory_cache(&cache, None);
                                 debug!("agent-memory sampler: measure rejected: {e:?}");
                             }
                         }
                     }
                     Err(e) => {
+                        let _ = Self::update_agent_memory_cache(&cache, None);
                         debug!("agent-memory sampler: call threw: {e:?}");
                     }
                 }
@@ -974,6 +972,16 @@ impl HealthReporter {
     /// `agent_memory_bytes` stays `None`.
     #[cfg(not(target_arch = "wasm32"))]
     fn start_agent_memory_sampler(&self) {}
+
+    fn update_agent_memory_cache(cache: &Weak<RefCell<Option<u64>>>, sample: Option<u64>) -> bool {
+        let Some(cell) = Weak::upgrade(cache) else {
+            return false;
+        };
+        if let Ok(mut c) = cell.try_borrow_mut() {
+            *c = sample;
+        }
+        true
+    }
 
     /// Start periodic health reporting
     pub fn start_health_reporting(&self) {
@@ -1253,9 +1261,8 @@ impl HealthReporter {
         decode_budget: Option<DecodeBudgetSnapshot>,
         agent_memory_bytes: Option<u64>,
     ) -> Option<PacketWrapper> {
-        if health_map.is_empty() {
-            return None;
-        }
+        // Keep client-wide telemetry flowing even before any peer stats have
+        // been observed (solo sessions / warm-up).
 
         // Build protobuf HealthPacket with structured stats
         let mut pb = PbHealthPacket::new();
@@ -2136,6 +2143,73 @@ mod tests {
     fn agent_memory_absent_when_none() {
         let pb = health_packet_with_agent_memory(None);
         assert!(pb.agent_memory_bytes.is_none());
+    }
+
+    /// #1032: packet construction must not disappear just because the peer
+    /// health map is still empty; client-wide telemetry like non-heap memory
+    /// still needs to flow during solo sessions and warm-up.
+    #[test]
+    fn health_packet_still_emitted_with_empty_peer_map() {
+        let health_map = HashMap::new();
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            Some(512),
+        )
+        .expect("empty peer map must still produce a packet");
+
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+
+        assert!(pb.peer_stats.is_empty());
+        assert_eq!(pb.agent_memory_bytes, Some(512));
+    }
+
+    /// #1032: a failed sample must clear the cache instead of leaving the last
+    /// successful measurement visible forever.
+    #[test]
+    fn agent_memory_cache_clears_on_failure() {
+        let cache = Rc::new(RefCell::new(Some(123)));
+        let weak = Rc::downgrade(&cache);
+
+        assert!(HealthReporter::update_agent_memory_cache(&weak, Some(456)));
+        assert_eq!(*cache.borrow(), Some(456));
+
+        assert!(HealthReporter::update_agent_memory_cache(&weak, None));
+        assert_eq!(*cache.borrow(), None);
     }
 
     /// #1032: WASM linear memory is read inline in a `wasm32`-gated block, so on

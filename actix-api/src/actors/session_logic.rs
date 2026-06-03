@@ -442,7 +442,10 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
-            PacketKind::KeyframeRequest { target_user_id } => {
+            PacketKind::KeyframeRequest {
+                target_user_id,
+                layer,
+            } => {
                 if self.observer {
                     return InboundAction::Processed;
                 }
@@ -466,7 +469,7 @@ impl SessionLogic {
                 let congested = self.congestion_tracker.is_actively_congested();
                 if !self
                     .keyframe_limiter
-                    .allow_with_congestion(&target_user_id, congested)
+                    .allow_with_congestion(&target_user_id, layer, congested)
                 {
                     warn!(
                         "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting {}",

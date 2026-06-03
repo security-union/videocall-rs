@@ -39,9 +39,10 @@ kubectl exec "$API_POD" -n videocall -- \
 | `parse_meeting_console_logs.sh <log_dir> --json` | Same data in JSON. Feed into other tools or jq queries. |
 | `parse_meeting_console_logs.sh <log_dir> --verify` | Sanity check that every pattern the parser looks for still appears in the logs. Exits non-zero if a log message was renamed in client code and broke extraction silently. Use in CI or post-deploy spot-checks. |
 | `parse_meeting_console_logs.sh <log_dir> --relay-wt=PATH` | Optionally ingest a videocall-webtransport relay pod log and add a **Slow-drain Receivers** section — joins server-side `Outbound channel full` drops to the peer-email map. Surfaces memory-pressured / slow clients (the Yu-Guo / RELAY-2 pattern from discussion #562). Can combine with default markdown or `--json`. |
+| `parse_meeting_console_logs.sh <log_dir> --relay-ws=PATH` | Optionally ingest a videocall-**websocket** relay pod log and add a **WS Mailbox-Full Drops** section — joins server-side `Dropping inbound message ... (mailbox full)` drops to the peer-email map. This is the 16-slot actor-mailbox overflow that causes room-wide freezes (**issue #1057**); usually bursty fan-out storms (keyframe/join/screen-share spikes) that hit all receivers at once, including fast ones — NOT necessarily slow receivers. Prometheus equivalent: `relay_packet_drops_total{drop_reason="mailbox_full"}`. |
 | `parse_meeting_console_logs.sh -h` / `--help` | Show help summary. |
 
-To pull the relay log: `kubectl logs -n videocall <videocall-webtransport-POD> --since=12h > /tmp/relay-wt.log`
+To pull the relay logs: `kubectl logs -n videocall <videocall-webtransport-POD> --since=12h > /tmp/relay-wt.log` and `kubectl logs -n videocall <videocall-websocket-POD> --since=12h > /tmp/relay-ws.log`
 
 ## Sample output (markdown mode, trimmed)
 
@@ -62,7 +63,7 @@ _Cores/Platform sourced from "level":"preamble" in first chunk. ⚠ flags client
 | antonio.estrada@hcl-software.com | Tony Estrada | 15:01:01 | websocket(ws_0) | 73ms | 1 | 175 | 0 | 3 | clean | 12 | macOS 26.4.1 |
 ```
 
-Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
+Also prints sections for: **Re-election Events**, **Implausible RTT Discards**, **Client Hardware Warnings**, **Concurrent Session Overlaps**, **Slow-drain Receivers** (when `--relay-wt=` is provided), **WS Mailbox-Full Drops** (when `--relay-ws=` is provided), **Peer ID → Email Map**, and a **Prometheus Copy-Paste** block with START/END epoch parameters pre-filled.
 
 ## Column reference
 
@@ -96,7 +97,7 @@ If `--verify` fails, check the `PATTERN INVENTORY` block at the top of the scrip
 
 ## Background + design notes
 
-- Written 2026-05-05. Preamble columns + `--verify` mode added 2026-05-06. Concurrent-session detection + `--relay-wt` + speaking/buffer columns added 2026-05-08.
+- Written 2026-05-05. Preamble columns + `--verify` mode added 2026-05-06. Concurrent-session detection + `--relay-wt` + speaking/buffer columns added 2026-05-08. `--relay-ws` (WS mailbox-full drops, issue #1057) + `network=` field-reliability caveat added 2026-06-03.
 - Parser currently matches against free-text `msg` phrases from client code; this is fragile. Issue [#565](https://github01.hclpnp.com/labs-projects/videocall/issues/565) proposes adding a structured `event` field so parsers can key on stable event names instead.
 - Full analysis context (hardware baseline for meeting sizes, JWT TTL bug, "implausible RTT ≠ clock drift" hypothesis, NetEQ duplication on transport switch, follow-up action items): [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562).
 

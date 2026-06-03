@@ -89,7 +89,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -233,6 +233,19 @@ pub struct CameraEncoder {
     /// encode path is byte-identical to the pre-simulcast single-encoder path.
     /// N>1 wiring (per-layer tiers, AQ layer-drop) lands in PR B.
     max_layers: u32,
+    /// Number of simulcast layers currently active (encoded + sent), written by
+    /// the AQ control loop and read by the encode loop (issue #989, PR B).
+    /// In single-stream mode (effective layers == 1) this stays 1 and the
+    /// encode loop's per-layer gating is a no-op. The encode loop encodes only
+    /// layers with `layer_id < active_layer_count`, so dropping the top layer
+    /// cuts both egress and sender encode CPU.
+    shared_active_layer_count: Rc<AtomicU32>,
+    /// Per-layer target bitrate (bps), one atomic per ladder layer (lowest
+    /// first, index == `layer_id`). Written by the AQ control loop in simulcast
+    /// mode; read by the encode loop to reconfigure each layer's encoder. Empty
+    /// in single-stream mode (the legacy `current_bitrate` atomic is used
+    /// instead). Sized to `SIMULCAST_MAX_SUPPORTED_LAYERS` lazily on first use.
+    shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -328,6 +341,11 @@ impl CameraEncoder {
             shared_dwell_samples: Rc::new(RefCell::new(Vec::new())),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             max_layers,
+            // Simulcast active-layer state (issue #989, PR B). Initialized to the
+            // effective layer count so the encode loop knows how many layers to
+            // build; the control loop adjusts it down/up under congestion.
+            shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
+            shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -367,11 +385,25 @@ impl CameraEncoder {
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
         let shared_dwell_samples = self.shared_dwell_samples.clone();
         let reelection_completed_signal = self.reelection_completed_signal.clone();
+        let n_layers = self.effective_layer_count() as usize;
+        let shared_active_layer_count = self.shared_active_layer_count.clone();
+        let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );
+            // Enable simulcast on the controller when the effective layer count
+            // is > 1 (issue #989, PR B). n_layers == 1 leaves the controller in
+            // single-stream mode (no-op) — byte-identical to the legacy path.
+            if n_layers > 1 {
+                encoder_control.set_simulcast_layers(n_layers);
+                // Pre-size the per-layer bitrate atomics (lowest layer first).
+                let mut atomics = shared_layer_bitrates_bps.borrow_mut();
+                if atomics.len() != n_layers {
+                    *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
+                }
+            }
             let mut prev_screen_active = false;
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
@@ -546,6 +578,24 @@ impl CameraEncoder {
                         audio_tier.bitrate_kbps,
                         audio_tier.enable_fec,
                     );
+                }
+
+                // Simulcast (issue #989, PR B): publish the active-layer count
+                // and per-layer target bitrates to the encode loop every tick.
+                // In single-stream mode (is_simulcast() == false) this is
+                // skipped entirely, so behavior is byte-identical to before.
+                if encoder_control.is_simulcast() {
+                    let active = encoder_control.active_layer_count() as u32;
+                    shared_active_layer_count.store(active, Ordering::Relaxed);
+                    let per_layer = encoder_control.layer_target_bitrates_kbps();
+                    let atomics = shared_layer_bitrates_bps.borrow();
+                    for (i, atomic) in atomics.iter().enumerate() {
+                        if let Some(&kbps) = per_layer.get(i) {
+                            // kbps (f64) -> bps (u32), matching the encoder's
+                            // set_bitrate(bps) expectation elsewhere.
+                            atomic.store((kbps * 1000.0) as u32, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         });
@@ -725,8 +775,15 @@ impl CameraEncoder {
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
         // Number of simulcast layers to encode this session (issue #989).
-        // PR A: always 1 → single encoder, byte-identical to the legacy path.
+        // n_layers == 1 → single encoder, byte-identical to the legacy path
+        // (adaptive single-stream resolution preserved). n_layers > 1 → each
+        // layer encodes at a FIXED SIMULCAST_LAYER_TIERS resolution + adaptive
+        // per-layer bitrate, and the AQ controller sheds the top active layer
+        // under congestion.
         let n_layers = self.effective_layer_count() as usize;
+        let simulcast = n_layers > 1;
+        let shared_active_layer_count = self.shared_active_layer_count.clone();
+        let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -1053,14 +1110,32 @@ impl CameraEncoder {
                         }
                     };
 
-                    // PR A: every layer encodes at native resolution. Per-layer
-                    // downscaled tiers (SIMULCAST_LAYER_TIERS) land in PR B.
-                    let config = VideoEncoderConfig::new(
-                        get_video_codec_string(),
-                        height as u32,
-                        width as u32,
-                    );
-                    config.set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
+                    // Resolution + initial bitrate per layer:
+                    //  - single-stream (n_layers == 1): native camera resolution
+                    //    and the shared adaptive bitrate — the legacy path, with
+                    //    tier-resolution stepping preserved (see encode loop).
+                    //  - simulcast (n_layers > 1): each layer encodes at its
+                    //    FIXED SIMULCAST_LAYER_TIERS resolution (issue #989, PR B)
+                    //    and its own initial bitrate (tier ideal). Resolution is
+                    //    fixed for simulcast layers; only the bitrate adapts.
+                    let (layer_w, layer_h, init_bitrate_bps) = if simulcast {
+                        let tiers = simulcast_layers(n_layers);
+                        let tier = &tiers[layer_idx];
+                        (
+                            tier.max_width,
+                            tier.max_height,
+                            tier.ideal_bitrate_kbps as f64 * 1000.0,
+                        )
+                    } else {
+                        (
+                            width as u32,
+                            height as u32,
+                            current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
+                        )
+                    };
+                    let config =
+                        VideoEncoderConfig::new(get_video_codec_string(), layer_h, layer_w);
+                    config.set_bitrate(init_bitrate_bps);
                     config.set_latency_mode(LatencyMode::Realtime);
 
                     if let Err(e) = video_encoder.configure(&config) {
@@ -1083,9 +1158,9 @@ impl CameraEncoder {
                         config,
                         seq_out,
                         layer_id,
-                        current_w: width as u32,
-                        current_h: height as u32,
-                        local_bitrate: current_bitrate.load(Ordering::Relaxed) * 1000,
+                        current_w: layer_w,
+                        current_h: layer_h,
+                        local_bitrate: init_bitrate_bps as u32,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
                     });
@@ -1115,6 +1190,10 @@ impl CameraEncoder {
                 let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
                 let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
                 let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+                // Simulcast: how many layers are currently active (encoded+sent).
+                // In single-stream mode this is always 1 and gates nothing.
+                // Refreshed from the shared atomic at the top of every frame.
+                let mut local_active_layers: usize;
 
                 // Track whether we have successfully encoded at least one frame
                 // in this restart cycle. Used to reset restart_count on success.
@@ -1152,22 +1231,9 @@ impl CameraEncoder {
                         break 'encode;
                     }
 
-                    // Read the shared tier atomics ONCE per frame (they are driven
-                    // by the single per-publisher AQ controller in PR A). The same
-                    // tier dimension / keyframe-interval decision then applies to
-                    // every layer below.
-                    let new_tier_w = tier_max_width.load(Ordering::Relaxed);
-                    let new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                    // Read the shared tier/keyframe atomics ONCE per frame. The
+                    // keyframe interval is shared across all layers in both modes.
                     let new_kf = tier_keyframe_interval.load(Ordering::Relaxed);
-                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-
-                    let tier_dims_changed =
-                        new_tier_w != local_tier_max_width || new_tier_h != local_tier_max_height;
-                    if tier_dims_changed {
-                        local_tier_max_width = new_tier_w;
-                        local_tier_max_height = new_tier_h;
-                    }
-
                     if new_kf != local_keyframe_interval {
                         local_keyframe_interval = new_kf;
                         log::info!(
@@ -1175,14 +1241,78 @@ impl CameraEncoder {
                             local_keyframe_interval
                         );
                     }
+                    // Refresh the active-layer count each frame (simulcast only).
+                    local_active_layers =
+                        shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
-                    // Per-layer reconfiguration (tier dims + bitrate). For
-                    // n_layers == 1 this is identical to the legacy single-encoder
-                    // logic; the tier-resolution stepping is preserved verbatim
-                    // (retiring it is PR B). A fatal configure error in ANY layer
-                    // restarts all layers.
+                    // Single-stream tier dims + shared bitrate (only meaningful
+                    // when NOT simulcast — the adaptive single-stream resolution
+                    // path is preserved verbatim for n_layers == 1).
+                    let new_tier_w = tier_max_width.load(Ordering::Relaxed);
+                    let new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+                    let tier_dims_changed = !simulcast
+                        && (new_tier_w != local_tier_max_width
+                            || new_tier_h != local_tier_max_height);
+                    if tier_dims_changed {
+                        local_tier_max_width = new_tier_w;
+                        local_tier_max_height = new_tier_h;
+                    }
+
+                    // Per-layer reconfiguration.
+                    //
+                    //  - Single-stream (n_layers == 1): the legacy logic —
+                    //    tier-resolution stepping (tier dims) + shared adaptive
+                    //    bitrate, applied verbatim. N=1 behavior is unchanged.
+                    //  - Simulcast (n_layers > 1, issue #989 PR B): RESOLUTION IS
+                    //    FIXED per layer (set at construction from
+                    //    SIMULCAST_LAYER_TIERS), so tier-resolution stepping is
+                    //    retired here; only the per-layer adaptive bitrate is
+                    //    reconfigured. Layers with layer_id >= active count are
+                    //    skipped entirely (not reconfigured, not encoded) so a
+                    //    dropped top layer costs no encode CPU.
                     let mut fatal_reconfigure = false;
                     for layer in layers.iter_mut() {
+                        // Simulcast: skip inactive (shed) top layers entirely.
+                        if simulcast && (layer.layer_id as usize) >= local_active_layers {
+                            continue;
+                        }
+
+                        if simulcast {
+                            // Per-layer adaptive bitrate (fixed resolution).
+                            let new_layer_bitrate = {
+                                let atomics = shared_layer_bitrates_bps.borrow();
+                                atomics
+                                    .get(layer.layer_id as usize)
+                                    .map(|a| a.load(Ordering::Relaxed))
+                                    .unwrap_or(0)
+                            };
+                            if new_layer_bitrate > 0 && new_layer_bitrate != layer.local_bitrate {
+                                if layer.encoder.state() == CodecState::Closed {
+                                    log::warn!("CameraEncoder: encoder closed before per-layer bitrate reconfigure (layer {})", layer.layer_id);
+                                    fatal_reconfigure = true;
+                                    break;
+                                }
+                                layer.local_bitrate = new_layer_bitrate;
+                                layer.config.set_bitrate(layer.local_bitrate as f64);
+                                if let Err(e) = layer.encoder.configure(&layer.config) {
+                                    CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if is_fatal_encoder_error(&e) {
+                                        error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                        fatal_reconfigure = true;
+                                        break;
+                                    }
+                                    error!(
+                                        "Error configuring video encoder (layer {}): {e:?}",
+                                        layer.layer_id
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        // --- Single-stream legacy path (n_layers == 1) ---
                         if tier_dims_changed {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
@@ -1333,21 +1463,34 @@ impl CameraEncoder {
                             // change in the PR-A single-layer path.
                             let mut base_ok = false;
                             for layer in layers.iter_mut() {
-                                // Check for dimension changes (rotation, camera
-                                // switch). Also constrain to the current tier max
-                                // while preserving the frame's native aspect
+                                // Simulcast: skip inactive (shed) top layers — no
+                                // encode, no send, so a dropped layer costs zero
+                                // CPU/egress.
+                                if simulcast && (layer.layer_id as usize) >= local_active_layers {
+                                    continue;
+                                }
+
+                                // Dimension-change handling (rotation, camera
+                                // switch). SIMULCAST: each layer's resolution is
+                                // FIXED by its tier — the encoder downscales the
+                                // source frame automatically — so we do NOT track
+                                // frame dimensions or reconfigure on frame-size
+                                // change (the `!simulcast` gate below). SINGLE-
+                                // STREAM: keep the legacy behavior of following
+                                // the frame size, constrained to the current tier
+                                // max while preserving the frame's native aspect
                                 // ratio (#1037).
                                 //
                                 // `frame_width` / `frame_height` are the raw
                                 // native VideoFrame dimensions (the true source
                                 // aspect). Fitting them uniformly (rather than a
                                 // per-axis `.min()`) prevents the encoder from
-                                // baking a stretch/squash into the stream when
-                                // the source (e.g. a 4:3 webcam) does not match
-                                // the 16:9 tier ceiling. On PR A every layer
-                                // still follows the frame/tier dims, so applying
-                                // the same fit to each layer is correct; for
-                                // N==1 this matches the legacy single encoder.
+                                // baking a stretch/squash into the stream when the
+                                // source (e.g. a 4:3 webcam) does not match the
+                                // 16:9 tier ceiling. For N==1 this matches the
+                                // legacy single encoder; the computed values are
+                                // only consumed on the `!simulcast` reconfigure
+                                // path below.
                                 let (clamped_width, clamped_height) =
                                     if frame_width > 0 && frame_height > 0 {
                                         fit_within_preserving_aspect(
@@ -1363,7 +1506,8 @@ impl CameraEncoder {
                                         (frame_width, frame_height)
                                     };
 
-                                if clamped_width > 0
+                                if !simulcast
+                                    && clamped_width > 0
                                     && clamped_height > 0
                                     && (clamped_width != layer.current_w
                                         || clamped_height != layer.current_h)

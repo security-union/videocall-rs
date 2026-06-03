@@ -2648,7 +2648,7 @@ mod tests {
     /// cannot silently re-introduce the ~5s mute/camera-off lag.
     #[wasm_bindgen_test]
     fn state_change_resend_delay_exceeds_live_stream_fresh_window() {
-        use crate::connection::connection::STATE_CHANGE_RESEND_DELAY_MS;
+        use crate::connection::STATE_CHANGE_RESEND_DELAY_MS;
         assert!(
             STATE_CHANGE_RESEND_DELAY_MS as u64 > LIVE_STREAM_FRESH_WINDOW_MS,
             "STATE_CHANGE_RESEND_DELAY_MS must exceed LIVE_STREAM_FRESH_WINDOW_MS \

@@ -49,3 +49,6 @@ pub use connection_manager::{
     ConnectionState,
 };
 pub use webmedia::{ConnectOptions, MediaStreamKey};
+
+/// Re-exported for cross-module timing invariant tests (resend delay vs freshness window).
+pub(crate) use connection::STATE_CHANGE_RESEND_DELAY_MS;

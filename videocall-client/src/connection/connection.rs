@@ -446,7 +446,7 @@ impl Connection {
     }
 
     pub(crate) fn new_for_test_without_userid() -> Self {
-        let mut conn = Self::new_for_test();
+        let conn = Self::new_for_test();
         *conn.userid.borrow_mut() = None;
         conn
     }
@@ -462,8 +462,8 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::task::StubSendKind;
-    use super::webmedia::MediaStreamKey;
+    use crate::connection::task::StubSendKind;
+    use crate::connection::webmedia::MediaStreamKey;
     use super::*;
 
     #[cfg(target_arch = "wasm32")]

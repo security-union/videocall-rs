@@ -1,4 +1,4 @@
-import { test, expect, Page, chromium } from "@playwright/test";
+import { test, expect, Browser, BrowserContext, Page, chromium } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
@@ -82,22 +82,94 @@ const ACTIVE_TRANSITION_TIMEOUT = 30_000;
  * Start/Join button, and resolves once `#grid-container` is visible (the marker
  * that the in-meeting transport is up). Auto-join (grid appears without a
  * button) is handled too.
+ *
+ * This faithfully mirrors the PROVEN, CI-passing
+ * `two-users-meeting.spec.ts::joinMeetingFromPage`: it races FOUR outcomes
+ * (Start/Join button, "Waiting to be admitted", "Waiting for meeting to start",
+ * and an auto-joined `#grid-container`) and — when the button wins — uses the
+ * load-bearing settle delays (1s before the click so the button is interactive,
+ * 3s after so the join request settles) before asserting the grid. An earlier
+ * simplified version clicked the button immediately and only raced button-vs-
+ * grid; the too-early click was a no-op and the grid never appeared (30s
+ * timeout). The settle delays + four-way race are why the proven helper works
+ * through the #959 pre-join device-preview flow.
+ *
+ * The presence tests join as the owner of a `waitingRoomEnabled:false` meeting,
+ * so the expected path is button / auto-join. The waiting-room branches are
+ * mirrored only so an unexpected waiting state fails with a clear message
+ * instead of a blind grid timeout.
  */
+/**
+ * Build an authenticated context for the real-presence joins and seed the
+ * display name BEFORE any meeting page boots.
+ *
+ * `createAuthenticatedContext` (helpers/auth-context.ts) injects the session
+ * cookie + WT dev-cert hash but does NOT seed `vc_display_name`. The proven
+ * `two-users-meeting.spec.ts` flow establishes the name by typing it into the
+ * home-page username field before navigating to the meeting; because we navigate
+ * straight to `/meeting/{id}`, we instead pre-seed `localStorage.vc_display_name`
+ * via an init script exactly as `prejoin-device-preview.spec.ts` does. This
+ * guarantees the meeting page renders the pre-join "Start/Join" card rather than
+ * an inline display-name prompt, so the join reliably reaches the button.
+ */
+async function createPresenceContext(
+  browser: Browser,
+  email: string,
+  name: string,
+  uiURL: string,
+): Promise<BrowserContext> {
+  const ctx = await createAuthenticatedContext(browser, email, name, uiURL);
+  await ctx.addInitScript((displayName: string) => {
+    localStorage.setItem("vc_display_name", displayName);
+  }, name);
+  return ctx;
+}
+
 async function enterMeetingRoom(page: Page, meetingId: string): Promise<void> {
   await page.goto(`/meeting/${meetingId}`);
 
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+  const waitingRoom = page.getByText("Waiting to be admitted");
+  const waitingForMeeting = page.getByText("Waiting for meeting to start");
   const grid = page.locator("#grid-container");
 
   const arrival = await Promise.race([
     joinButton.waitFor({ timeout: 30_000 }).then(() => "button" as const),
+    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
+    waitingForMeeting.waitFor({ timeout: 30_000 }).then(() => "waiting-for-meeting" as const),
     grid.waitFor({ timeout: 30_000 }).then(() => "grid" as const),
   ]);
 
-  if (arrival === "button") {
-    await joinButton.click();
-    await expect(grid).toBeVisible({ timeout: 30_000 });
+  // The presence tests always join as the host of a waitingRoomEnabled:false
+  // meeting, so a waiting state is unexpected — fail loudly rather than fall
+  // through to a 30s grid timeout that hides the real cause.
+  if (arrival === "waiting") {
+    throw new Error(
+      `enterMeetingRoom(${meetingId}): unexpectedly landed in the waiting room — ` +
+        `the host should auto-admit when waitingRoomEnabled=false`,
+    );
   }
+  if (arrival === "waiting-for-meeting") {
+    throw new Error(
+      `enterMeetingRoom(${meetingId}): unexpectedly saw "Waiting for meeting to start" — ` +
+        `the host's own join should activate the meeting`,
+    );
+  }
+
+  // Auto-joined: the grid is already up, nothing to click.
+  if (arrival === "grid") {
+    await expect(grid).toBeVisible({ timeout: 30_000 });
+    return;
+  }
+
+  // Button path: the proven helper's settle delays are load-bearing. The button
+  // is not interactive the instant it renders (clicking too early is a silent
+  // no-op), and the join request needs a beat to settle before the grid mounts.
+  await page.waitForTimeout(1000);
+  await joinButton.click();
+  await page.waitForTimeout(3000);
+
+  await expect(grid).toBeVisible({ timeout: 30_000 });
 }
 
 test.describe("Meeting idle/active presence-driven state transitions", () => {
@@ -190,7 +262,7 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
     const browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
       // ── 1) Join → active ──────────────────────────────────────────────────
-      let ctx = await createAuthenticatedContext(browser, email, name, uiURL);
+      let ctx = await createPresenceContext(browser, email, name, uiURL);
       let page = await ctx.newPage();
       await enterMeetingRoom(page, meetingId);
 
@@ -214,7 +286,7 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
         .toBe("idle");
 
       // ── 3) Rejoin idle → active ───────────────────────────────────────────
-      ctx = await createAuthenticatedContext(browser, email, name, uiURL);
+      ctx = await createPresenceContext(browser, email, name, uiURL);
       page = await ctx.newPage();
       await enterMeetingRoom(page, meetingId);
 
@@ -247,7 +319,7 @@ test.describe("Meeting idle/active presence-driven state transitions", () => {
 
     const browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
-      const ctx = await createAuthenticatedContext(browser, email, name, uiURL);
+      const ctx = await createPresenceContext(browser, email, name, uiURL);
       const page = await ctx.newPage();
       await enterMeetingRoom(page, meetingId);
 

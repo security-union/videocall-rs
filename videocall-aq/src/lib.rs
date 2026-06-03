@@ -27,10 +27,13 @@
 //! Browser callers continue to import AQ types from `videocall_client::*`;
 //! the old paths are preserved via re-export shims.
 
+pub mod aspect;
 pub mod clock;
 pub mod constants;
 pub mod controller;
 pub mod manager;
+
+pub use aspect::fit_within_preserving_aspect;
 
 pub use clock::{default_clock, Clock, TestClock};
 

@@ -210,6 +210,15 @@ test.describe("Host disable-video controls", () => {
       // tile context menu no longer renders the "Disable video" item.
       // The "Host actions" toggle itself may still render for the mute item, so
       // we assert specifically on the inner menu item disappearing.
+      //
+      // #1034: the host's OWN client also receives the HOST_DISABLE_VIDEO
+      // broadcast it just sent, and `force_peer_media_off` flips the target
+      // peer's `video_enabled` to false on the host's decode manager
+      // immediately (bypassing the heartbeat freshness window). So the host's
+      // `is_video_enabled_for_peer(target)` is false right away, `on_disable_video`
+      // becomes None, and the menu item is removed within a render frame — no
+      // longer gated on the target's ~5s diagnostics re-broadcast. The tight
+      // 5s bound below is a regression guard for that fast path.
       // Re-open the menu in case it closed:
       const guestTile = hostPage.locator(".grid-item:has(.tile-mute-btn)").first();
       if (await guestTile.isVisible().catch(() => false)) {
@@ -221,7 +230,7 @@ test.describe("Host disable-video controls", () => {
       }
       await expect(
         hostPage.locator(".tile-context-menu-item", { hasText: "Disable video" }),
-      ).toHaveCount(0, { timeout: 10_000 });
+      ).toHaveCount(0, { timeout: 5_000 });
     } finally {
       await browser1.close();
       await browser2.close();
@@ -229,57 +238,138 @@ test.describe("Host disable-video controls", () => {
   });
 
   /**
-   * Test 2: "Disable video for all" broadcasts to every guest but NOT to the host.
+   * Test 2 (#1036): "Disable video for all" reflects on a non-host OBSERVER's
+   * screen immediately for EVERY other participant, while the host's OWN tile
+   * stays VIDEO-ON on that observer's screen.
    *
-   * The host's VideoCallClient is constructed with on_host_disable_video: None
-   * when is_owner=true, so the host never receives the disable-video callback
-   * even though the NATS broadcast reaches their transport layer.
+   * Three peers: host + a target guest + an observer guest. The host issues
+   * disable-video-all; the observer (a non-host third peer) is the witness.
+   *
+   * #1035 made the SPECIFIC-target host disable-video fast (force-off on every
+   * client, flushing the frozen frame) but left disable-all on the slow
+   * heartbeat path, because the client could not identify the host and would
+   * otherwise blank the host's own tile too. #1036 fixes this: the server now
+   * carries the issuing host's `user_id` in the broadcast's `creator_id`, so
+   * the receiving client calls `force_all_peers_media_off_except(host_id, …)` —
+   * forcing video-off on every peer EXCEPT the host, immediately and bypassing
+   * the ~5s heartbeat freshness window.
+   *
+   * Assertions, all from the observer's vantage point:
+   *   1. The TARGET guest's tile flips to the "Video Disabled" placeholder
+   *      within a TIGHT 3s bound (frozen frame cleared). A regression to the
+   *      heartbeat-only disable-all path would keep the frozen frame ~5s and
+   *      fail this.
+   *   2. The HOST's own tile stays VIDEO-ON — `.canvas-container.video-on`
+   *      persists and the "Video Disabled" placeholder never appears on it.
+   *      This is the host-exclusion guarantee of #1036: a regression that
+   *      blanked everyone (no `creator_id` exclusion) would flip the host tile
+   *      too and fail this.
+   * Plus the original guarantees: the guest sees the toast, the host does not
+   * (on_host_disable_video is None for owner), and the host's own camera stays
+   * on.
+   *
+   * Reuses the per-tile DOM selectors established by Test 4: tiles scoped by
+   * `[data-tile-root="true"]` containing an `h4.floating-name`; video-on is the
+   * `.canvas-container.video-on` class; video-off is the
+   * `span.placeholder-text` "Video Disabled".
    */
-  test("host disable-video-all disables all guests but not the host", async ({ baseURL }) => {
-    test.setTimeout(120_000);
+  test("host disable-video-all disables every guest but not the host (observer view, #1036)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_hostdisablevideo_all_${Date.now()}`;
 
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+
+    // Display names: the observer scopes the host's and target's tiles by these
+    // names rendered in each tile's `h4.floating-name`.
+    const HOST_NAME = "DVAllHost";
+    const TARGET_NAME = "DVAllTarget";
 
     try {
       const hostCtx = await createAuthenticatedContext(
         browser1,
         "host-dvall@videocall.rs",
-        "DVAllHost",
+        HOST_NAME,
         uiURL,
       );
-      const guestCtx = await createAuthenticatedContext(
+      const targetCtx = await createAuthenticatedContext(
         browser2,
-        "guest-dvall@videocall.rs",
-        "DVAllGuest",
+        "target-dvall@videocall.rs",
+        TARGET_NAME,
+        uiURL,
+      );
+      const observerCtx = await createAuthenticatedContext(
+        browser3,
+        "observer-dvall@videocall.rs",
+        "DVAllObserver",
         uiURL,
       );
 
       const hostPage = await hostCtx.newPage();
-      const guestPage = await guestCtx.newPage();
+      const targetPage = await targetCtx.newPage();
+      const observerPage = await observerCtx.newPage();
 
-      await navigateToMeeting(hostPage, meetingId, "DVAllHost");
+      // ---- Host joins first (becomes owner) ----
+      await navigateToMeeting(hostPage, meetingId, HOST_NAME);
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
 
-      await navigateToMeeting(guestPage, meetingId, "DVAllGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+      // ---- Target joins and is admitted ----
+      await navigateToMeeting(targetPage, meetingId, TARGET_NAME);
+      const targetResult = await joinMeetingFromPage(targetPage);
+      await admitGuestIfNeeded(hostPage, targetPage, targetResult);
+
+      // ---- Observer joins and is admitted ----
+      await navigateToMeeting(observerPage, meetingId, "DVAllObserver");
+      const observerResult = await joinMeetingFromPage(observerPage);
+      await admitGuestIfNeeded(hostPage, observerPage, observerResult);
 
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
-      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(targetPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(observerPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Enable camera on both sides so we can verify the host's stays on.
-      await enableCamera(guestPage);
+      // Host must see a remote tile (peer connection established) before acting.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // Enable camera on the host and the target so the observer sees BOTH
+      // video-on before disable-all. (The observer's own camera is irrelevant.)
       await enableCamera(hostPage);
+      await enableCamera(targetPage);
 
       // Confirm host camera is currently on — "Stop Video" tooltip = active.
       const hostActiveCamBtn = hostPage.locator("button.video-control-button", {
         has: hostPage.locator("span.tooltip", { hasText: "Stop Video" }),
       });
       await expect(hostActiveCamBtn).toBeVisible({ timeout: 5_000 });
+
+      // Observer's tiles for the TARGET and the HOST, scoped by display name.
+      const observerTargetTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: TARGET_NAME }),
+        })
+        .first();
+      const observerHostTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: HOST_NAME }),
+        })
+        .first();
+
+      // Pre-state: the observer must see BOTH the target and the host with video
+      // ON (`.canvas-container.video-on`). This proves a real transition on the
+      // target and that the host starts on (so the post-disable "host stays on"
+      // check is meaningful).
+      await expect(observerTargetTile.locator(".canvas-container.video-on")).toBeVisible({
+        timeout: 45_000,
+      });
+      await expect(observerHostTile.locator(".canvas-container.video-on")).toBeVisible({
+        timeout: 45_000,
+      });
 
       // ---- Host opens peer list then triggers "Disable video for all" ----
       await hostPage.locator(".video-controls-container").hover();
@@ -307,11 +397,37 @@ test.describe("Host disable-video controls", () => {
       await expect(disableAllItem).toBeVisible({ timeout: 5_000 });
       await disableAllItem.click();
 
-      // ---- Guest receives the NATS broadcast and sees the toast ----
-      const guestVideoOffToast = guestPage.locator(".peer-toast .toast-name", {
+      // ---- #1036: observer sees the TARGET tile flip to video-off FAST ----
+      // The placeholder ("Video Disabled") renders only when
+      // `is_video_enabled_for_peer(target)` is false on the observer's client.
+      // With #1036 the authoritative disable-all flips that immediately for
+      // every non-host peer (no heartbeat-window wait), so a TIGHT 3s bound
+      // holds.
+      await expect(observerTargetTile.locator("span.placeholder-text")).toHaveText(
+        /Video Disabled/,
+        { timeout: 3_000 },
+      );
+      await expect(observerTargetTile.locator(".canvas-container.video-on")).toHaveCount(0, {
+        timeout: 3_000,
+      });
+
+      // ---- #1036 host-exclusion: the HOST's tile stays VIDEO-ON on the
+      // observer's screen. The host issued disable-all; it must not blank
+      // itself. The observer must keep seeing `.canvas-container.video-on` on
+      // the host tile and never the "Video Disabled" placeholder. We hold this
+      // for a window comfortably past the 3s fast-path bound to catch a
+      // regression that (wrongly) blanked everyone including the host.
+      await expect(observerHostTile.locator(".canvas-container.video-on")).toBeVisible();
+      await expect(observerHostTile.locator("span.placeholder-text")).toHaveCount(0);
+      await observerPage.waitForTimeout(3000);
+      await expect(observerHostTile.locator(".canvas-container.video-on")).toBeVisible();
+      await expect(observerHostTile.locator("span.placeholder-text")).toHaveCount(0);
+
+      // ---- Target receives the NATS broadcast and sees the toast ----
+      const targetVideoOffToast = targetPage.locator(".peer-toast .toast-name", {
         hasText: "Host turned off your camera",
       });
-      await expect(guestVideoOffToast.first()).toBeVisible({ timeout: 15_000 });
+      await expect(targetVideoOffToast.first()).toBeVisible({ timeout: 15_000 });
 
       // ---- Host does NOT see the toast (on_host_disable_video is None for owner) ----
       await expect(
@@ -325,6 +441,7 @@ test.describe("Host disable-video controls", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+      await browser3.close();
     }
   });
 
@@ -411,6 +528,136 @@ test.describe("Host disable-video controls", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  /**
+   * Test 4 (#1034): a NON-host, NON-target THIRD peer (the "observer") sees the
+   * target's tile flip to video-off **immediately** after the host disables the
+   * target's video — bypassing the receiver-side heartbeat freshness window.
+   *
+   * This is the core regression guard for the #1034 fix. Before the fix, the
+   * observer's tile for the target kept rendering the last (frozen) video frame
+   * for ~5s, because the target's own off-heartbeat was suppressed inside the
+   * `MEDIA_FRESH_WINDOW_MS` guard while straggler frames were still in flight.
+   * The fix makes the authoritative host command (`HOST_DISABLE_VIDEO`)
+   * call `force_peer_media_off` on EVERY client on receipt of the broadcast,
+   * which sets the target peer's `video_enabled=false` directly, flushes the
+   * frozen frame, and broadcasts peer-status — so the observer's
+   * `is_video_enabled_for_peer(target)` goes false at once and the tile renders
+   * the "Video Disabled" placeholder.
+   *
+   * We assert on the observer's view of the TARGET's tile (scoped by the
+   * target's floating display name) showing the "Video Disabled" placeholder
+   * within a TIGHT 3s bound. A regression of the fix (reverting to the
+   * heartbeat-only path) would not clear the frozen frame for ~5s and would
+   * blow this bound.
+   */
+  test("non-target third peer sees target video-off immediately (#1034)", async ({ baseURL }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_hostdisablevideo_observer_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+
+    // Display name of the target guest — the observer scopes the target's tile
+    // by this name (rendered in the tile's `h4.floating-name`).
+    const TARGET_NAME = "DVObsTarget";
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-dvobserver@videocall.rs",
+        "DVObsHost",
+        uiURL,
+      );
+      const targetCtx = await createAuthenticatedContext(
+        browser2,
+        "target-dvobserver@videocall.rs",
+        TARGET_NAME,
+        uiURL,
+      );
+      const observerCtx = await createAuthenticatedContext(
+        browser3,
+        "observer-dvobserver@videocall.rs",
+        "DVObsObserver",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const targetPage = await targetCtx.newPage();
+      const observerPage = await observerCtx.newPage();
+
+      // ---- Host joins first (becomes owner) ----
+      await navigateToMeeting(hostPage, meetingId, "DVObsHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // ---- Target joins and is admitted ----
+      await navigateToMeeting(targetPage, meetingId, TARGET_NAME);
+      const targetResult = await joinMeetingFromPage(targetPage);
+      await admitGuestIfNeeded(hostPage, targetPage, targetResult);
+
+      // ---- Observer joins and is admitted ----
+      await navigateToMeeting(observerPage, meetingId, "DVObsObserver");
+      const observerResult = await joinMeetingFromPage(observerPage);
+      await admitGuestIfNeeded(hostPage, observerPage, observerResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(targetPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(observerPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      // Host must see the target's tile (per-tile host menu) so it can disable.
+      await expect(hostPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // ---- Target turns its camera ON ----
+      await enableCamera(targetPage);
+
+      // The observer's tile for the TARGET, scoped by the target's display
+      // name in the floating-name header. `data-tile-root` marks each peer
+      // tile root; we find the one whose floating-name reads TARGET_NAME.
+      const observerTargetTile = observerPage
+        .locator('[data-tile-root="true"]', {
+          has: observerPage.locator("h4.floating-name", { hasText: TARGET_NAME }),
+        })
+        .first();
+
+      // Observer must first SEE the target's video ON — the tile's
+      // `.canvas-container` carries the `video-on` class only while
+      // `is_video_enabled_for_peer` is true. This proves the pre-state so the
+      // post-disable flip is meaningful (we are observing a real transition,
+      // not an already-off tile).
+      await expect(observerTargetTile.locator(".canvas-container.video-on")).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // ---- Host disables the target's video via the per-tile menu ----
+      await hostDisableVideoForPeerViaTile(hostPage);
+
+      // ---- #1034: observer sees the target tile flip to video-off FAST ----
+      // The placeholder ("Video Disabled") renders only when
+      // `is_video_enabled_for_peer(target)` is false on the observer's client.
+      // With the fix, the authoritative host command flips that immediately on
+      // the observer (no heartbeat-window wait), so a TIGHT 3s bound holds. A
+      // regression to the heartbeat-only path would keep the frozen frame for
+      // ~5s and fail this assertion.
+      await expect(observerTargetTile.locator("span.placeholder-text")).toHaveText(
+        /Video Disabled/,
+        { timeout: 3_000 },
+      );
+
+      // And the `video-on` class is gone from the observer's target tile.
+      await expect(observerTargetTile.locator(".canvas-container.video-on")).toHaveCount(0, {
+        timeout: 3_000,
+      });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+      await browser3.close();
     }
   });
 });

@@ -95,6 +95,7 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
+use videocall_aq::fit_within_preserving_aspect;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -1190,9 +1191,26 @@ impl CameraEncoder {
                                 break;
                             }
 
-                            // Constrain current encoder dimensions to the tier max.
-                            let constrained_w = layer.current_w.min(local_tier_max_width);
-                            let constrained_h = layer.current_h.min(local_tier_max_height);
+                            // Constrain current encoder dimensions to the tier
+                            // max, preserving the source aspect ratio (#1037).
+                            //
+                            // `layer.current_w/current_h` carry the source
+                            // aspect (seeded from native track dims and only
+                            // ever updated via this same uniform fit or from a
+                            // raw VideoFrame's native dims on the per-frame path
+                            // below), so using them as the "source" keeps the
+                            // ratio intact while the tier ceiling tightens. A
+                            // per-axis `.min()` here would stretch/squash
+                            // whenever the source aspect (e.g. a 4:3 webcam)
+                            // differs from the 16:9 tier ceiling. For N==1 this
+                            // produces the same dims the legacy single encoder
+                            // computed via `fit_within_preserving_aspect`.
+                            let (constrained_w, constrained_h) = fit_within_preserving_aspect(
+                                layer.current_w,
+                                layer.current_h,
+                                local_tier_max_width,
+                                local_tier_max_height,
+                            );
 
                             log::info!(
                                 "CameraEncoder: tier dimension change -> {}x{} (was {}x{}) (layer {})",
@@ -1316,17 +1334,34 @@ impl CameraEncoder {
                             let mut base_ok = false;
                             for layer in layers.iter_mut() {
                                 // Check for dimension changes (rotation, camera
-                                // switch). Also constrain to current tier max.
-                                let clamped_width = if frame_width > 0 {
-                                    frame_width.min(local_tier_max_width)
-                                } else {
-                                    frame_width
-                                };
-                                let clamped_height = if frame_height > 0 {
-                                    frame_height.min(local_tier_max_height)
-                                } else {
-                                    frame_height
-                                };
+                                // switch). Also constrain to the current tier max
+                                // while preserving the frame's native aspect
+                                // ratio (#1037).
+                                //
+                                // `frame_width` / `frame_height` are the raw
+                                // native VideoFrame dimensions (the true source
+                                // aspect). Fitting them uniformly (rather than a
+                                // per-axis `.min()`) prevents the encoder from
+                                // baking a stretch/squash into the stream when
+                                // the source (e.g. a 4:3 webcam) does not match
+                                // the 16:9 tier ceiling. On PR A every layer
+                                // still follows the frame/tier dims, so applying
+                                // the same fit to each layer is correct; for
+                                // N==1 this matches the legacy single encoder.
+                                let (clamped_width, clamped_height) =
+                                    if frame_width > 0 && frame_height > 0 {
+                                        fit_within_preserving_aspect(
+                                            frame_width,
+                                            frame_height,
+                                            local_tier_max_width,
+                                            local_tier_max_height,
+                                        )
+                                    } else {
+                                        // Degenerate frame dims: leave as-is so
+                                        // the `> 0` change-detection below skips
+                                        // the reconfigure.
+                                        (frame_width, frame_height)
+                                    };
 
                                 if clamped_width > 0
                                     && clamped_height > 0

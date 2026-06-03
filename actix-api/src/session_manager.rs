@@ -219,6 +219,80 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build PARTICIPANT_LIST_REQUEST packet.
+    pub fn build_participant_list_request(room_id: &str, requester_session: u64) -> Vec<u8> {
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_LIST_REQUEST.into(),
+            room_id: room_id.to_string(),
+            session_id: requester_session,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: meeting_packet.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
+    /// Resolve the `(subject, bytes)` a joiner should publish to ask existing
+    /// peers to re-announce themselves, or `None` for observer sessions (which
+    /// never request a peer list).
+    ///
+    /// The request goes to the room system subject (`room.{room}.system`); the
+    /// reply comes back addressed to `requester_session`.
+    pub fn participant_list_request_publication(
+        observer: bool,
+        room_id: &str,
+        requester_session: u64,
+    ) -> Option<(String, Vec<u8>)> {
+        if observer {
+            return None;
+        }
+        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+        let bytes = Self::build_participant_list_request(room_id, requester_session);
+        Some((subject, bytes))
+    }
+
+    /// Resolve the `(subject, bytes)` a peer should publish in reply to a
+    /// PARTICIPANT_LIST_REQUEST, or `None` when no reply should be sent.
+    ///
+    /// The reply is a PARTICIPANT_JOINED for the responding peer, addressed to
+    /// the requester's per-session subject (`room.{room}.{requester}`) so the
+    /// `handle_msg` unicast filter delivers it only to that requester.
+    ///
+    /// Returns `None` when:
+    /// * the responder is not yet `Active` (`responder_is_active == false`) —
+    ///   only elected connections announce themselves; or
+    /// * the requester is on THIS server instance (`requester_is_local`) — the
+    ///   in-memory existing-member replay in JoinRoom already delivered the
+    ///   PARTICIPANT_JOINED directly, so a NATS reply would duplicate it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rebroadcast_reply_publication(
+        room_id: &str,
+        user_id: &str,
+        display_name: &str,
+        responder_session: u64,
+        requester_session: u64,
+        is_guest: bool,
+        responder_is_active: bool,
+        requester_is_local: bool,
+    ) -> Option<(String, Vec<u8>)> {
+        if !responder_is_active || requester_is_local {
+            return None;
+        }
+        let subject = format!("room.{}.{}", room_id.replace(' ', "_"), requester_session);
+        let bytes = Self::build_peer_joined_packet(
+            room_id,
+            user_id,
+            responder_session,
+            display_name,
+            is_guest,
+        );
+        Some((subject, bytes))
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
@@ -358,6 +432,126 @@ mod tests {
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.target_user_id, to_user_id_bytes("alice"));
         assert_eq!(inner.session_id, 99);
+    }
+
+    #[tokio::test]
+    async fn test_build_participant_list_request() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // The requesting joiner's session is carried in `session_id` so peers
+        // can ignore their own request and address the reply back to it.
+        let requester_session = 4242u64;
+        let packet = SessionManager::build_participant_list_request("my-room", requester_session);
+
+        let wrapper = PacketWrapper::parse_from_bytes(&packet).unwrap();
+        // Must be a server-authoritative MEETING packet; `classify_packet`
+        // drops client-originated MEETING packets, so clients cannot forge it.
+        assert_eq!(wrapper.packet_type, PacketType::MEETING.into());
+        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_LIST_REQUEST.into()
+        );
+        assert_eq!(inner.room_id, "my-room");
+        assert_eq!(inner.session_id, requester_session);
+    }
+
+    #[tokio::test]
+    async fn test_participant_list_request_publication() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // Observer sessions never request a peer list.
+        assert!(
+            SessionManager::participant_list_request_publication(true, "my-room", 7).is_none(),
+            "observers must not publish a PARTICIPANT_LIST_REQUEST"
+        );
+
+        // Non-observers publish to the room system subject (with spaces in the
+        // room id sanitized to underscores) and carry their session as requester.
+        let (subject, bytes) =
+            SessionManager::participant_list_request_publication(false, "my room", 7)
+                .expect("non-observer must produce a publication");
+        assert_eq!(subject, "room.my_room.system");
+
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_LIST_REQUEST.into()
+        );
+        assert_eq!(inner.session_id, 7);
+    }
+
+    #[tokio::test]
+    async fn test_rebroadcast_reply_publication() {
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // Not-yet-Active responder → no reply (only elected connections announce).
+        assert!(
+            SessionManager::rebroadcast_reply_publication(
+                "my-room",
+                "alice@x.com",
+                "Alice",
+                10,
+                20,
+                false,
+                /*active*/ false,
+                /*requester_local*/ false,
+            )
+            .is_none(),
+            "a non-Active responder must not reply"
+        );
+
+        // Local requester → no reply (the in-memory replay already delivered it;
+        // a NATS reply would duplicate on the client). This is the short-circuit.
+        assert!(
+            SessionManager::rebroadcast_reply_publication(
+                "my-room",
+                "alice@x.com",
+                "Alice",
+                10,
+                20,
+                false,
+                /*active*/ true,
+                /*requester_local*/ true,
+            )
+            .is_none(),
+            "a local requester must be served by the in-memory replay, not a NATS reply"
+        );
+
+        // Active responder + remote requester → reply addressed to the
+        // requester's per-session subject, carrying the responder's
+        // PARTICIPANT_JOINED.
+        let (subject, bytes) = SessionManager::rebroadcast_reply_publication(
+            "my room",
+            "alice@x.com",
+            "Alice",
+            10,
+            20,
+            true,
+            /*active*/ true,
+            /*requester_local*/ false,
+        )
+        .expect("Active responder + remote requester must produce a reply");
+        // Subject targets the REQUESTER (20), not the responder (10), with the
+        // room id sanitized.
+        assert_eq!(subject, "room.my_room.20");
+
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_JOINED.into()
+        );
+        // The packet announces the RESPONDER's session (10) and identity.
+        assert_eq!(inner.session_id, 10);
+        assert_eq!(inner.target_user_id, to_user_id_bytes("alice@x.com"));
+        assert!(inner.is_guest, "is_guest must propagate into the reply");
     }
 
     /// Verify that build_peer_joined_packet and build_peer_left_packet are

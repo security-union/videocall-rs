@@ -2675,7 +2675,9 @@ select {
   position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
-  background: #000;
+  /* Theme-aware video letterbox — matches the in-meeting self-view
+     (.self-camera uses var(--bg)). */
+  background: var(--bg);
   border-radius: var(--radius-input, 12px);
   overflow: hidden;
   border: 1px solid var(--settings-card-border);
@@ -2697,7 +2699,7 @@ select {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  color: var(--text-tertiary, rgba(255, 255, 255, 0.6));
+  color: var(--text-tertiary);
 }
 
 .prejoin-video-placeholder-text {
@@ -2716,7 +2718,7 @@ select {
 .prejoin-permission-text {
   margin: 0;
   font-size: 0.85rem;
-  color: var(--text-secondary, rgba(255, 255, 255, 0.75));
+  color: var(--text-secondary);
 }
 
 .prejoin-controls-row {
@@ -2736,7 +2738,7 @@ select {
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
   background: var(--settings-card-bg);
-  color: var(--text-primary, #fff);
+  color: var(--text-primary);
   font-size: 0.85rem;
   cursor: pointer;
   transition: background 0.2s, border-color 0.2s, color 0.2s;
@@ -2747,19 +2749,19 @@ select {
 }
 
 /* ON: unmistakable green "active" treatment (independent of --accent, which is
-   Apple blue on this app). */
+   Apple blue on this app). Uses the semantic --success token. */
 .prejoin-toggle.on {
-  border-color: #34c759;
-  background: color-mix(in srgb, #34c759 18%, transparent);
-  color: #fff;
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--text-primary);
 }
 
 /* OFF: red-tinted danger treatment — joining muted/dark is the attention
-   state, so make it obvious rather than a faint border. */
+   state, so make it obvious rather than a faint border. Uses --error. */
 .prejoin-toggle.off.danger {
-  border-color: color-mix(in srgb, #ff453a 60%, var(--settings-card-border));
-  background: color-mix(in srgb, #ff453a 14%, transparent);
-  color: color-mix(in srgb, #ff453a 85%, #fff);
+  border-color: color-mix(in srgb, var(--error) 60%, var(--settings-card-border));
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  color: color-mix(in srgb, var(--error) 85%, var(--text-primary));
 }
 
 .prejoin-meter-row {
@@ -2778,7 +2780,7 @@ select {
   align-items: center;
   gap: 0.35rem;
   font-size: 0.72rem;
-  color: var(--text-tertiary, rgba(255, 255, 255, 0.6));
+  color: var(--text-tertiary);
 }
 
 .prejoin-meter-glyph {
@@ -2789,14 +2791,20 @@ select {
   width: 100%;
   height: 8px;
   border-radius: 4px;
-  background: var(--settings-card-border, rgba(255, 255, 255, 0.15));
+  background: var(--settings-card-border);
   overflow: hidden;
 }
 
 .prejoin-meter-fill {
   height: 100%;
-  /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping). */
-  background: linear-gradient(90deg, #34c759 0%, #ffd60a 65%, #ff453a 100%);
+  /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping), all
+     semantic tokens. */
+  background: linear-gradient(
+    90deg,
+    var(--success) 0%,
+    var(--warning) 65%,
+    var(--error) 100%
+  );
   border-radius: 4px;
   /* Light smoothing between the engine's per-frame width writes. */
   transition: width 0.06s linear;
@@ -2816,7 +2824,7 @@ select {
 
 .prejoin-select-group label {
   font-size: 0.75rem;
-  color: var(--text-tertiary, rgba(255, 255, 255, 0.6));
+  color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -2828,7 +2836,7 @@ select {
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
   background: var(--settings-card-bg);
-  color: var(--text-primary, #fff);
+  color: var(--text-primary);
   font-size: 0.85rem;
 }
 
@@ -2840,7 +2848,7 @@ select {
 .prejoin-select-note {
   margin: 0.15rem 0 0 0;
   font-size: 0.72rem;
-  color: var(--text-tertiary, rgba(255, 255, 255, 0.55));
+  color: var(--text-tertiary);
 }
 
 /* Focus-visible rings (WCAG 2.4.7) — keyboard only; mouse clicks stay clean. */
@@ -2848,7 +2856,7 @@ select {
 .prejoin-select:focus-visible,
 .prejoin-permission-allow:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px var(--accent, #007aff);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 .prejoin-toggle:focus:not(:focus-visible),
 .prejoin-select:focus:not(:focus-visible),

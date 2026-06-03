@@ -662,6 +662,12 @@ pub fn resolve_initial_enabled(
 /// Chromium-based browsers expose `setSinkId`, allowing programmatic audio
 /// output (speaker) selection. Firefox and Safari do not, so the speaker
 /// dropdown must be rendered read-only there with an explanatory note.
+///
+/// The only non-test caller is the wasm-gated [`html_media_set_sink_id_supported`],
+/// so on the native build (which `cargo clippy --all` compiles) this has no
+/// caller outside `#[cfg(test)]`. Suppress dead_code only there — on wasm it is
+/// genuinely used, and the host test still exercises it under `cargo test`.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 pub fn speaker_selection_supported(set_sink_id_present: bool) -> bool {
     set_sink_id_present
 }

@@ -329,6 +329,13 @@ pub struct FeedMeetingRow {
     pub admitted_can_admit: bool,
     pub last_active_at: DateTime<Utc>,
     pub ever_admitted: bool,
+    /// The requesting user's most recent admission to this meeting: the raw
+    /// `p.last_admit` = `MAX(admitted_at)` over their own
+    /// `meeting_participants` rows, WITHOUT the `last_active_at` COALESCE
+    /// fallbacks. Strictly user-scoped (`user_id = $1`). `NULL` when the user
+    /// has never been admitted (e.g. they own the meeting but never joined).
+    /// Surfaced as `MeetingFeedSummary::user_last_attended_at`.
+    pub last_admit: Option<DateTime<Utc>>,
     pub participant_count: i64,
     pub waiting_count: i64,
 }
@@ -382,6 +389,7 @@ pub async fn list_feed_for_user(
                m.admitted_can_admit,
                COALESCE(p.last_admit, m.started_at, m.created_at) AS last_active_at,
                (p.last_admit IS NOT NULL) AS ever_admitted,
+               p.last_admit AS last_admit,
                COALESCE(pc.admitted_count, 0) AS participant_count,
                COALESCE(wc.waiting_count, 0) AS waiting_count
         FROM meetings m

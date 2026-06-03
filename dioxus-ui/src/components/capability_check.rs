@@ -215,6 +215,12 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
 /// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
 /// and the flag defaults to 1 (feature off) — so a high-end device still emits a single
 /// layer until an operator raises the flag for a controlled test meeting.
+///
+/// The only non-test caller is the wasm32-gated `capability_max_simulcast_layers`
+/// below, so a native non-test build (e.g. `cargo clippy --all`) sees this as
+/// dead code; the `allow` keeps that build warning-free without hiding genuine
+/// dead code on wasm or in the host test build.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn max_simulcast_layers(verdict: &CapabilityVerdict, score: u32, older_intel: bool) -> u32 {
     const SCORE_FOR_2_LAYERS: u32 = 5000;
     const SCORE_FOR_3_LAYERS: u32 = 30000;

@@ -225,7 +225,7 @@ pub struct CameraEncoder {
     reelection_completed_signal: Rc<AtomicBool>,
     /// Maximum number of simulcast layers this publisher is allowed to emit
     /// (issue #989). Computed in the UI from device capability + the
-    /// `simulcastMaxLayers` runtime flag and passed into the constructor.
+    /// `experimentalSimulcastMaxLayers` runtime flag and passed into the constructor.
     /// Clamped to [`SIMULCAST_MAX_SUPPORTED_LAYERS`] by [`effective_layer_count`].
     ///
     /// **PR A always passes 1**, so [`effective_layer_count`] returns 1 and the
@@ -262,6 +262,26 @@ fn clamp_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
 
+/// Decide whether a just-encoded frame counts as "healthy" for the purpose of
+/// resetting the encoder restart counter.
+///
+/// Health is anchored to the **base layer** (`layer_id == 0`), not to "any
+/// layer encoded". Every receiver currently decodes only the base layer
+/// (receiver default `selected_video_layer = 0`) and the relay does not yet
+/// filter layers, so a frame in which the base layer failed — even if a higher
+/// simulcast layer succeeded — is broken video for every viewer and must NOT
+/// reset the restart counter (otherwise the encoder sits forever on a
+/// non-fatally-failing base layer with no restart path; issue #989 review).
+///
+/// For N==1 the sole layer IS the base layer, so `base_ok` equals the old
+/// "any layer ok" condition and this is a no-op vs. the pre-fix behavior.
+///
+/// Pure function so it can be unit-tested without a live camera / encoder.
+#[inline]
+fn frame_is_healthy(base_ok: bool) -> bool {
+    base_ok
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -275,7 +295,7 @@ impl CameraEncoder {
     ///
     /// * `max_layers` - the maximum number of simulcast layers to emit (issue
     ///   #989). The UI computes this from device capability and the
-    ///   `simulcastMaxLayers` runtime flag. Clamped to
+    ///   `experimentalSimulcastMaxLayers` runtime flag. Clamped to
     ///   [`SIMULCAST_MAX_SUPPORTED_LAYERS`]; `0` is treated as `1`. **PR A
     ///   always passes 1** (single layer, byte-identical to the legacy path).
     ///
@@ -1411,7 +1431,19 @@ impl CameraEncoder {
                             let frame_height = video_frame.display_height();
 
                             let mut fatal_encode = false;
-                            let mut any_ok = false;
+                            // Health is anchored to the BASE layer (layer_id == 0),
+                            // NOT "≥1 layer encoded". Every receiver currently decodes
+                            // only layer 0 (receiver default `selected_video_layer = 0`),
+                            // so a broken base layer means broken video for everyone —
+                            // even if a higher layer succeeds. Tracking `any_ok` here
+                            // would reset `restart_count` every frame and strand the
+                            // encoder forever on a non-fatally-failing base layer with
+                            // no restart path. (Fatal errors on ANY layer still force a
+                            // restart via `fatal_encode` below; this only governs the
+                            // non-fatal restart-counter reset.) For N==1 the sole layer
+                            // IS layer 0, so `base_ok` ≡ the old `any_ok` — no behavior
+                            // change in the PR-A single-layer path.
+                            let mut base_ok = false;
                             for layer in layers.iter_mut() {
                                 // Simulcast: skip inactive (shed) top layers — no
                                 // encode, no send, so a dropped layer costs zero
@@ -1483,9 +1515,18 @@ impl CameraEncoder {
                                     &video_encoder_encode_options,
                                 ) {
                                     Ok(_) => {
+                                        // Raw per-layer submission counter. NOTE: for
+                                        // N>1 this aggregates ALL layers, so it can
+                                        // overcount relative to delivered/usable frames
+                                        // (only the base layer is decoded today — see
+                                        // the `experimental_simulcast_max_layers` knob
+                                        // docs). Left as-is intentionally; it is a
+                                        // submission counter, not a health gate.
                                         CAMERA_ENCODER_FRAMES_SUBMITTED_OK
                                             .fetch_add(1, Ordering::Relaxed);
-                                        any_ok = true;
+                                        if layer.layer_id == 0 {
+                                            base_ok = true;
+                                        }
                                     }
                                     Err(e) => {
                                         let msg = format!("{e:?}");
@@ -1523,16 +1564,20 @@ impl CameraEncoder {
                             // fatal path below also reaches this single close.
                             video_frame.close();
 
-                            // First successful encode after a restart resets the
-                            // restart counter so transient errors don't accumulate
-                            // toward MAX_RESTARTS across long-lived sessions.
-                            if any_ok && !encoded_ok_this_cycle && restart_count > 0 {
+                            // First healthy frame after a restart resets the restart
+                            // counter so transient errors don't accumulate toward
+                            // MAX_RESTARTS across long-lived sessions. "Healthy" is
+                            // base-layer success (see `frame_is_healthy`): a frame in
+                            // which only a higher layer encoded is NOT healthy, because
+                            // receivers decode the base layer only.
+                            let frame_healthy = frame_is_healthy(base_ok);
+                            if frame_healthy && !encoded_ok_this_cycle && restart_count > 0 {
                                 log::info!(
-                                    "CameraEncoder: encode succeeded after restart, resetting restart counter"
+                                    "CameraEncoder: base-layer encode succeeded after restart, resetting restart counter"
                                 );
                                 restart_count = 0;
                             }
-                            if any_ok {
+                            if frame_healthy {
                                 encoded_ok_this_cycle = true;
                             }
 
@@ -1578,7 +1623,8 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_layer_count, is_fatal_encoder_error_message, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        clamp_layer_count, frame_is_healthy, is_fatal_encoder_error_message,
+        SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
 
     #[test]
@@ -1617,6 +1663,33 @@ mod tests {
     fn clamp_layer_count_caps_at_max_supported() {
         assert_eq!(clamp_layer_count(4), SIMULCAST_MAX_SUPPORTED_LAYERS);
         assert_eq!(clamp_layer_count(99), SIMULCAST_MAX_SUPPORTED_LAYERS);
+    }
+
+    #[test]
+    fn base_layer_failure_is_unhealthy_even_when_higher_layer_succeeds() {
+        // Models the per-frame health decision in the encode loop. `base_ok` is
+        // set true ONLY when the layer with `layer_id == 0` encodes Ok. A higher
+        // layer succeeding while the base layer fails must NOT mark the frame
+        // healthy — otherwise the restart counter resets every frame and the
+        // encoder is stranded on a broken base layer with no restart path (#989).
+
+        // Simulate "base layer failed, layer 1 succeeded": base_ok stays false.
+        let base_ok_when_only_higher_layer_ok = false;
+        assert!(
+            !frame_is_healthy(base_ok_when_only_higher_layer_ok),
+            "a frame where only a higher layer encoded must be UNHEALTHY"
+        );
+
+        // Simulate "base layer encoded Ok": healthy regardless of higher layers.
+        assert!(
+            frame_is_healthy(true),
+            "a frame where the base layer encoded must be HEALTHY"
+        );
+
+        // N==1 invariant: the sole layer IS layer 0, so its success == base_ok ==
+        // frame healthy — byte-identical to the pre-fix `any_ok` behavior.
+        let sole_layer_ok = true; // single-layer encode succeeded
+        assert_eq!(frame_is_healthy(sole_layer_ok), sole_layer_ok);
     }
 
     #[test]

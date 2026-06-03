@@ -113,31 +113,38 @@ pub struct RuntimeConfig {
     #[serde(rename = "mockPeersEnabled")]
     #[serde(default)]
     pub mock_peers_enabled: String,
-    /// Maximum simulcast layers a publisher may emit (issue #989), the runtime
-    /// half of the simulcast feature flag.
+    /// **EXPERIMENTAL, TEST-ONLY** maximum simulcast layers a publisher may emit
+    /// (issue #989), the runtime half of the simulcast feature flag.
     ///
     /// The effective layer count is `min(this, device-capability ceiling)`, so
     /// raising it never forces a weak device above what it can encode. Defaults
-    /// to **1 (feature OFF)** via [`default_simulcast_max_layers`].
+    /// to **1 (feature OFF)** via [`default_experimental_simulcast_max_layers`].
+    ///
+    /// WARNING: raising this above 1 provides **NO playback benefit yet** — the
+    /// layers are not tier-differentiated (that is PR B), receivers decode the
+    /// base layer only (`selected_video_layer = 0`), and the relay does not
+    /// filter layers. It purely multiplies encode CPU and uplink/relay egress.
+    /// **Keep at 1 in production**; raise only in controlled test meetings (and
+    /// for the load-test bot) until relay per-receiver layer-selection lands.
     ///
     /// CRITICAL (config.js bind-mount trap, see project memory): this is
     /// `#[serde(default = ...)]` so a stale bind-mounted `config.js` that
     /// predates this key still parses — a missing key yields 1, never a parse
     /// failure that would brick startup. Keep the committed `config.js` in sync,
     /// but never rely on it being present.
-    #[serde(rename = "simulcastMaxLayers")]
-    #[serde(default = "default_simulcast_max_layers")]
-    pub simulcast_max_layers: u32,
+    #[serde(rename = "experimentalSimulcastMaxLayers")]
+    #[serde(default = "default_experimental_simulcast_max_layers")]
+    pub experimental_simulcast_max_layers: u32,
 }
 
 fn default_vad_threshold() -> f32 {
     0.02
 }
 
-/// Default simulcast layer ceiling when `simulcastMaxLayers` is absent from
-/// `config.js` — 1 layer, i.e. the feature is OFF and the publisher behaves
-/// byte-identically to the pre-simulcast build (issue #989).
-fn default_simulcast_max_layers() -> u32 {
+/// Default simulcast layer ceiling when `experimentalSimulcastMaxLayers` is
+/// absent from `config.js` — 1 layer, i.e. the feature is OFF and the publisher
+/// behaves byte-identically to the pre-simulcast build (issue #989).
+fn default_experimental_simulcast_max_layers() -> u32 {
     1
 }
 
@@ -169,10 +176,14 @@ pub fn screen_bitrate_kbps() -> Result<u32, String> {
 pub fn vad_threshold() -> Result<f32, String> {
     app_config().map(|c| c.vad_threshold)
 }
-/// Runtime simulcast layer ceiling (issue #989). Defaults to 1 (feature off)
-/// when `config.js` lacks the key or the config can't be read.
-pub fn simulcast_max_layers() -> u32 {
-    app_config().map(|c| c.simulcast_max_layers).unwrap_or(1)
+/// **EXPERIMENTAL, TEST-ONLY** runtime simulcast layer ceiling (issue #989).
+/// Defaults to 1 (feature off) when `config.js` lacks the key or the config
+/// can't be read. Values > 1 cost encode CPU + egress with no playback benefit
+/// yet — see [`RuntimeConfig::experimental_simulcast_max_layers`].
+pub fn experimental_simulcast_max_layers() -> u32 {
+    app_config()
+        .map(|c| c.experimental_simulcast_max_layers)
+        .unwrap_or(1)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

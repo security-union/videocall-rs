@@ -212,8 +212,8 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
 ///   `score >= 30000`.
 ///
 /// Note this is only the *capability ceiling*. The effective layer count the
-/// encoder uses is `min(this, simulcastMaxLayers runtime flag)`, and the flag
-/// defaults to 1 (feature off) — so a high-end device still emits a single
+/// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
+/// and the flag defaults to 1 (feature off) — so a high-end device still emits a single
 /// layer until an operator raises the flag for a controlled test meeting.
 pub fn max_simulcast_layers(verdict: &CapabilityVerdict, score: u32, older_intel: bool) -> u32 {
     const SCORE_FOR_2_LAYERS: u32 = 5000;
@@ -307,7 +307,7 @@ pub fn assess_capability() -> CapabilityVerdict {
 /// globals are unreachable.
 ///
 /// This is only the capability ceiling; the encoder uses
-/// `min(this, simulcastMaxLayers runtime flag)`, and the flag defaults to 1.
+/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag defaults to 1.
 ///
 /// wasm32-only: it sniffs `web_sys` navigator and calls
 /// `videocall_client::capability::videocall_capability_score()`, which is

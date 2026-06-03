@@ -1878,11 +1878,28 @@ select {
   margin-top: 0.75rem;
   background: var(--surface-tint-3, rgba(255, 255, 255, 0.03)); /* @token-exempt: legacy var() fallback for very-faint glass */
   border-radius: var(--radius-card, 16px);
-  overflow: hidden;
+  /* NOTE: no `overflow: hidden` here — it was clipping the filter/sort
+     popovers. The inner `.meetings-list-content` owns the scroll region and
+     re-rounds the bottom corners to keep the card silhouette intact. */
+}
+
+/* Header row: collapsible title (left) + filter/sort controls (right).
+   Must NOT be positioned or clip its overflow — the popovers anchor to the
+   `.meetings-toolbar-group` wrappers inside it, so a clip/containing-block
+   here would re-clip or mis-anchor them. */
+.meetings-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  overflow: visible;
 }
 
 .meetings-list-toggle {
-  width: 100%;
+  /* Grow to fill the row so the controls sit flush right; the meeting-count's
+     `margin-left:auto` no longer needs full width to push right. */
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -1907,6 +1924,8 @@ select {
   border-top: 1px solid var(--glass-bg);
   max-height: 260px;
   overflow-y: auto;
+  border-bottom-left-radius: var(--radius-card, 16px);
+  border-bottom-right-radius: var(--radius-card, 16px);
 }
 
 .meetings-loading,
@@ -1971,6 +1990,264 @@ select {
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .retry-btn:hover { background: var(--glass-bg-hover); }
+
+/* ---- Meetings filter + sort toolbar (issue #1056) -------------------- */
+/* Sits on the right of the .meetings-list-header row (no longer its own row). */
+.meetings-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+  padding-right: 0.75rem;
+}
+
+.meetings-toolbar-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.meetings-icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-icon-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+.meetings-icon-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.meetings-icon-btn.is-active {
+  color: var(--text-primary);
+  border-color: var(--focus-ring);
+}
+
+/* "N active" count badge on the filter icon (replaces the easily-missed dot).
+   Hidden entirely when no filters are active. */
+.meetings-filter-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--focus-ring);
+  color: #fff /* @token-exempt: badge text on accent fill */;
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.meetings-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 32px;
+  padding: 0 0.625rem;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-sort-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+.meetings-sort-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.meetings-sort-label { white-space: nowrap; }
+
+.meetings-sort-dir-icon { transition: transform 0.2s ease; }
+.meetings-sort-dir-icon.is-desc { transform: rotate(0deg); }
+/* Ascending flips the down-arrow glyph to point up. */
+.meetings-sort-dir-icon:not(.is-desc) { transform: rotate(180deg); }
+
+/* Transparent click-catcher behind a popover for outside-click dismissal. */
+.meetings-popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9290;
+  background: transparent;
+}
+
+/* Pure-CSS absolute anchoring relative to the enclosing `.meetings-toolbar-group`
+   (which is `position: relative`). `position: absolute` is used instead of
+   `position: fixed` because an ancestor `.card-apple` / `.hero-content` applies
+   `backdrop-filter`, which makes it the containing block for fixed descendants —
+   so fixed coords resolved against the card, not the viewport, dumping the panel
+   in the corner. Absolute + `top: 100%; right: 0` drops the panel directly under
+   its trigger cluster, right-aligned, and the card no longer clips it
+   (`.meetings-list-container` overflow removed; header is overflow:visible). */
+.meetings-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: auto;
+  z-index: 9300;
+  min-width: 200px;
+  max-width: min(280px, calc(100vw - 24px));
+  max-height: min(360px, calc(100vh - 120px));
+  overflow-y: auto;
+  padding: 0.5rem;
+  background: var(--surface-elevated);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card, 12px);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  animation: meetings-popover-in 0.14s cubic-bezier(0.4, 0, 0.2, 1);
+}
+@keyframes meetings-popover-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) { .meetings-popover { animation: none; } }
+/* Per-popover min-widths are CSS-only now (no JS anchoring); tune freely. */
+.meetings-filter-popover { min-width: 220px; }
+
+.meetings-filter-group {
+  /* Reset the fieldset so legend + options form a tidy left-aligned column. */
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  gap: 0.25rem;
+}
+
+.meetings-filter-legend {
+  /* `display: block` + `float: none` avoids the browser's default legend
+     positioning so the group title is flush left like the options below it. */
+  display: block;
+  float: none;
+  width: 100%;
+  padding: 0;
+  margin-bottom: 0.125rem;
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-quaternary);
+}
+
+.meetings-filter-option {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.25rem;
+  text-align: left;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-button, 8px);
+}
+.meetings-filter-option:hover { background: var(--field-bg); color: var(--text-primary); }
+.meetings-filter-option input {
+  flex: 0 0 auto;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--focus-ring);
+}
+.meetings-filter-option span { flex: 1 1 auto; text-align: left; }
+
+.meetings-sort-popover { min-width: 180px; padding: 0.25rem; gap: 0; }
+.meetings-sort-option {
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.625rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-button, 8px);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.meetings-sort-option:hover { background: var(--field-bg); color: var(--text-primary); }
+.meetings-sort-option:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.meetings-sort-option.is-selected {
+  background: var(--field-bg);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Filtered-empty state: distinct from the generic "No meetings yet". */
+.meetings-empty-filtered {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.625rem;
+}
+.meetings-clear-filters-btn {
+  height: 32px;
+  padding: 0 0.875rem;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-clear-filters-btn:hover { background: var(--glass-bg-hover); }
+.meetings-clear-filters-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Touch targets: bump all interactive controls in the toolbar / popovers to
+   the 44px minimum on coarse pointers (phones, tablets). */
+@media (pointer: coarse) {
+  .meetings-icon-btn { width: 44px; height: 44px; }
+  .meetings-sort-btn,
+  .meetings-clear-filters-btn { min-height: 44px; }
+  .meetings-filter-option { min-height: 44px; padding: 0.5rem; }
+  .meetings-filter-option input { width: 20px; height: 20px; }
+  .meetings-sort-option { min-height: 44px; }
+}
+
+/* Honour the user's reduced-motion preference: drop the toolbar/popover
+   hover transitions and the sort-direction icon rotation animation. */
+@media (prefers-reduced-motion: reduce) {
+  .meetings-icon-btn,
+  .meetings-sort-btn,
+  .meetings-clear-filters-btn,
+  .meetings-sort-dir-icon {
+    transition: none;
+  }
+}
 
 .meetings-list { list-style: none; margin: 0; padding: 0; }
 
@@ -2660,6 +2937,209 @@ select {
 
 .settings-card-compact { padding: 1rem 1.5rem; }
 .settings-card-compact .settings-card-title { margin-bottom: 0.75rem; }
+
+/* ----------------------------------------------------------------
+   Pre-join device preview (issue #959)
+   ---------------------------------------------------------------- */
+.prejoin-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.prejoin-video-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  /* Theme-aware video letterbox — matches the in-meeting self-view
+     (.self-camera uses var(--bg)). */
+  background: var(--bg);
+  border-radius: var(--radius-input, 12px);
+  overflow: hidden;
+  border: 1px solid var(--settings-card-border);
+}
+
+.prejoin-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* No horizontal mirror: matches the in-meeting self-view (.self-camera),
+     which is not mirrored, so the preview is consistent with the call. */
+}
+
+.prejoin-video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-video-placeholder-text {
+  font-size: 0.85rem;
+}
+
+.prejoin-permission-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  text-align: center;
+  padding: 0.5rem 0;
+}
+
+.prejoin-permission-text {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.prejoin-controls-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.prejoin-toggle {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.prejoin-toggle-icon {
+  flex-shrink: 0;
+}
+
+/* ON: unmistakable green "active" treatment (independent of --accent, which is
+   Apple blue on this app). Uses the semantic --success token. */
+.prejoin-toggle.on {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--text-primary);
+}
+
+/* OFF: red-tinted danger treatment — joining muted/dark is the attention
+   state, so make it obvious rather than a faint border. Uses --error. */
+.prejoin-toggle.off.danger {
+  border-color: color-mix(in srgb, var(--error) 60%, var(--settings-card-border));
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  color: color-mix(in srgb, var(--error) 85%, var(--text-primary));
+}
+
+.prejoin-meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  transition: opacity 0.2s;
+}
+
+.prejoin-meter-row.muted {
+  opacity: 0.5;
+}
+
+.prejoin-meter-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-meter-glyph {
+  flex-shrink: 0;
+}
+
+.prejoin-meter {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--settings-card-border);
+  overflow: hidden;
+}
+
+.prejoin-meter-fill {
+  height: 100%;
+  /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping), all
+     semantic tokens. */
+  background: linear-gradient(
+    90deg,
+    var(--success) 0%,
+    var(--warning) 65%,
+    var(--error) 100%
+  );
+  border-radius: 4px;
+  /* Light smoothing between the engine's per-frame width writes. */
+  transition: width 0.06s linear;
+}
+
+.prejoin-selectors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.prejoin-select-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.prejoin-select-group label {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prejoin-select {
+  width: 100%;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.prejoin-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.prejoin-select-note {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+/* Focus-visible rings (WCAG 2.4.7) — keyboard only; mouse clicks stay clean. */
+.prejoin-toggle:focus-visible,
+.prejoin-select:focus-visible,
+.prejoin-permission-allow:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.prejoin-toggle:focus:not(:focus-visible),
+.prejoin-select:focus:not(:focus-visible),
+.prejoin-permission-allow:focus:not(:focus-visible) {
+  outline: none;
+}
 
 /* ----------------------------------------------------------------
    Join Meeting header (non-owner pre-join card)

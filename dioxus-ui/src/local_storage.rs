@@ -47,3 +47,37 @@ pub fn save_bool(key: &str, value: bool) {
         let _ = storage.set_item(key, if value { "true" } else { "false" });
     }
 }
+
+/// Load a JSON-serialised preference from `localStorage`, falling back to the
+/// supplied `default` on any failure path: storage unavailable, key missing, or
+/// a stored value that no longer parses (corrupt / written by an incompatible
+/// older release). Mirrors the resilience of [`load_bool`] for richer state
+/// shapes such as the meetings-list `FilterState` / `SortState`.
+///
+/// Chosen over the `FromStr`-based `load/save_transport_preference` pattern in
+/// `context.rs` because these states are multi-field structs/enums where a
+/// derived `serde_json` round-trip is far less error-prone than a hand-written
+/// string codec.
+pub fn load_json<T>(key: &str, default: T) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(key).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<T>(&raw).ok())
+        .unwrap_or(default)
+}
+
+/// Persist a value to `localStorage` as JSON. Silently ignores serialisation
+/// and storage failures (Safari private mode, quota, etc.).
+pub fn save_json<T>(key: &str, value: &T)
+where
+    T: serde::Serialize,
+{
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        if let Ok(json) = serde_json::to_string(value) {
+            let _ = storage.set_item(key, &json);
+        }
+    }
+}

@@ -28,6 +28,26 @@ use std::collections::BTreeMap;
 const MIN_PLAYOUT_DELAY_MS: f64 = 10.0;
 /// The maximum delay. Prevents the delay from growing indefinitely.
 const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
+/// The freshness deadline: an upper bound on how long the head-of-line frame may sit in the
+/// jitter buffer before we declare the backlog stale and skip to live.
+///
+/// `MAX_PLAYOUT_DELAY_MS` (500ms) only ever acts as a *lower-bound* clamp ceiling — it sets how
+/// long we are willing to wait before releasing a frame to absorb jitter. It is NOT a deadline:
+/// once a backlog accumulates during a network stall, frames are drained in order and painted as
+/// fast as the decoder will accept them, so video drifts permanently behind real time and desyncs
+/// from audio (issue #1020). This constant adds the missing upper bound.
+///
+/// Rationale for 1800ms:
+/// - It must sit comfortably *above* the largest legitimate playout delay so that normal jitter is
+///   never mistaken for staleness. The release gate caps the adaptive target at
+///   `MAX_PLAYOUT_DELAY_MS` = 500ms; 1800ms leaves ~1.3s of headroom (3.6x the max normal delay),
+///   so ordinary jitter, reordering, and a single late frame can never trip the skip path.
+/// - It is small enough that a real stall is corrected within roughly two seconds — short enough
+///   that a viewer perceives "it caught up to live" rather than "it played a slow-motion replay,"
+///   which is the failure mode #1020 describes.
+/// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
+///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
+const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -175,6 +195,20 @@ impl<T> JitterBuffer<T> {
         loop {
             let mut found_frame_to_move = false;
 
+            // Freshness-deadline check (issue #1020): before evaluating the normal release gate,
+            // discard any head-of-line backlog that has exceeded MAX_PLAYOUT_AGE_MS and skip to the
+            // freshest decodable (keyframe) point. If this advanced the buffer state, restart the
+            // loop so we re-derive the next decodable key from the post-skip state.
+            //
+            // Termination: `enforce_freshness_deadline` returns `true` ONLY when it actually removed
+            // at least one frame, so `buffered_frames` strictly shrinks on every `continue`. When a
+            // stale head can't be dropped (e.g. the chosen keyframe is already the head, or a stale
+            // keyframe-less backlog), it returns `false` and we fall through to the normal release
+            // gate instead of looping. This guarantees the loop terminates.
+            if self.enforce_freshness_deadline(current_time_ms) {
+                continue;
+            }
+
             let next_decodable_key: Option<u64> = if let Some(last_seq) =
                 self.last_decoded_sequence_number
             {
@@ -259,6 +293,134 @@ impl<T> JitterBuffer<T> {
 
         if frames_were_moved {
             // NOTE: No need to notify a condvar anymore. The decoder manages its own thread.
+        }
+    }
+
+    /// Freshness-deadline enforcement (issue #1020).
+    ///
+    /// Returns `true` if the head-of-line backlog is stale and the buffer state was advanced so
+    /// the caller should re-evaluate from the top of its release loop.
+    ///
+    /// "Stale" means the oldest frame the decoder is actually waiting on (the next frame it could
+    /// release — either the next continuous sequence number, or, across a gap, the next keyframe)
+    /// has been sitting in the buffer longer than `MAX_PLAYOUT_AGE_MS`. When that happens we are
+    /// no longer absorbing jitter; we are accumulating permanent lag. The fix is to discard the
+    /// stale backlog and resume from the freshest *self-contained* point.
+    ///
+    /// Critical correctness rule: we may only skip to a `KeyFrame`. Skipping to an arbitrary delta
+    /// would feed the WebCodecs decoder a frame whose reference is gone, producing
+    /// `DataError: A key frame is required` and bouncing the worker through `reset_pipeline()`
+    /// (a visible stall). So:
+    /// - If a buffered keyframe exists, drop everything before the *newest* such keyframe and let
+    ///   the normal release path pick it up — this is the skip-to-live.
+    /// - If NO keyframe is buffered, we must NOT drop to a delta. We evict the stale delta backlog
+    ///   so the buffer cannot keep growing, leave the last-good frame on screen, and rely on the
+    ///   existing PLI / keyframe-request recovery path (driven from the client when it observes the
+    ///   gap) to fetch a fresh keyframe. See TODO(#1020) below re: triggering a PLI from here.
+    fn enforce_freshness_deadline(&mut self, current_time_ms: u128) -> bool {
+        // Identify the frame the decoder is currently waiting to release.
+        let head_key = match self.last_decoded_sequence_number {
+            Some(last_seq) => {
+                let next_continuous_seq = last_seq + 1;
+                if self.buffered_frames.contains_key(&next_continuous_seq) {
+                    Some(next_continuous_seq)
+                } else {
+                    // Gap: the decoder is waiting on the next keyframe after the gap. The
+                    // head-of-line wait is measured from the oldest buffered frame, which is what
+                    // actually pins playout.
+                    self.buffered_frames.keys().next().copied()
+                }
+            }
+            // Never decoded yet: head of line is whatever is oldest in the buffer.
+            None => self.buffered_frames.keys().next().copied(),
+        };
+
+        let Some(head_key) = head_key else {
+            return false; // Empty buffer — nothing can be stale.
+        };
+
+        let head_age_ms = {
+            let frame = match self.buffered_frames.get(&head_key) {
+                Some(f) => f,
+                None => return false,
+            };
+            current_time_ms.saturating_sub(frame.arrival_time_ms) as f64
+        };
+
+        if head_age_ms < MAX_PLAYOUT_AGE_MS {
+            // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
+            return false;
+        }
+
+        // Backlog is stale. Find the NEWEST buffered keyframe to skip to so we land as close to
+        // live as possible while still resuming from a self-contained frame.
+        let newest_keyframe = self
+            .buffered_frames
+            .iter()
+            .rev()
+            .find(|(_, f)| f.is_keyframe())
+            .map(|(&s, _)| s);
+
+        match newest_keyframe {
+            Some(keyframe_seq) => {
+                // Drop the stale delta/keyframe backlog before the chosen keyframe. The keyframe
+                // itself is preserved and will be released by the normal gate on the next loop
+                // iteration. Because we resume from a keyframe, `find_and_move_continuous_frames`
+                // treats it as gap/restart recovery and decoding continues cleanly.
+                //
+                // CRITICAL termination guard: `drop_frames_before(seq)` only removes keys strictly
+                // `< seq`, so when the chosen keyframe is ALREADY the head of the buffer (nothing
+                // before it) it removes nothing. If we returned `true` unconditionally in that case,
+                // the caller would `continue`, re-enter with an unchanged buffer, and spin forever
+                // (the 10ms worker tick → tab freeze). This is reachable: e.g. background-tab
+                // throttling clamps/pauses `setInterval`, so on refocus the first tick's
+                // `Date::now()` delta is multi-second and a buffered post-gap keyframe is instantly
+                // ≥ MAX_PLAYOUT_AGE_MS old while sitting at the head. So we only report progress
+                // (return `true`) when we actually shrank the buffer. When 0 were dropped, return
+                // `false` and let the normal CASE-2 (gap) / CASE-3 (never-decoded) path select this
+                // head keyframe and release it through the normal gate — which advances
+                // `last_decoded_sequence_number` correctly.
+                let dropped_before = self.dropped_frames_count;
+                self.drop_frames_before(keyframe_seq);
+                let dropped_any = self.dropped_frames_count > dropped_before;
+                if dropped_any {
+                    println!(
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {} stale frame(s).",
+                        self.dropped_frames_count - dropped_before
+                    );
+                }
+                dropped_any
+            }
+            None => {
+                // No keyframe to skip to. We must NOT drop to a delta (that throws
+                // `DataError: A key frame is required` -> reset_pipeline stall). Evict the stale
+                // delta backlog so the buffer cannot keep growing while we wait, then hold the
+                // last-good frame on screen and rely on the existing keyframe-request recovery.
+                //
+                // We keep only frames newer than the (now-evicted) stale head so a subsequently
+                // arriving keyframe can still be matched, but we do not advance playout.
+                let stale_cutoff = head_key + 1;
+                let dropped_before = self.dropped_frames_count;
+                self.drop_frames_before(stale_cutoff);
+                if self.dropped_frames_count > dropped_before {
+                    println!(
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and awaiting keyframe recovery.",
+                        self.dropped_frames_count - dropped_before
+                    );
+                }
+                // TODO(#1020): trigger a PLI / keyframe request from here. The PLI mechanism lives
+                // in the client crate (videocall-client: peer_decode_manager::send_keyframe_request,
+                // gap detection in track_sequence), not in videocall-codecs, and the jitter buffer
+                // has no handle back to it. The client already issues keyframe requests on observed
+                // sequence gaps, which covers the common no-keyframe stall. A clean fix would thread
+                // a `request_keyframe` callback into JitterBuffer::new (mirroring how `decoder` is
+                // injected) so the codecs layer can proactively ask for a keyframe the instant it
+                // evicts a stale keyframe-less backlog, rather than waiting for the client's
+                // gap-driven request. Deferred to keep this change transport-agnostic and confined
+                // to the buffer; the eviction above guarantees the buffer cannot grow unbounded in
+                // the meantime.
+                false
+            }
         }
     }
 
@@ -777,5 +939,201 @@ mod tests {
         time += 100;
         jb.find_and_move_continuous_frames(time);
         assert!(decoded_frames.lock().unwrap().len() <= 2); // Should not have increased
+    }
+
+    // --- Freshness deadline (issue #1020) ---
+
+    /// A stale head-of-line frame whose age exceeds MAX_PLAYOUT_AGE_MS must NOT be released as-is;
+    /// playout must skip to the newest buffered keyframe (never drop to an arbitrary delta).
+    #[test]
+    fn stale_head_skips_to_keyframe_not_delta() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let start = 1000;
+
+        // Decode an initial keyframe so we are in a "continuous stream" state.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        // A network stall: the next continuous frame (2, delta) and a few more deltas arrive, then
+        // a FRESH keyframe (5) arrives much later. All the deltas are now ancient.
+        let stall_arrival = start + 200;
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall_arrival);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), stall_arrival);
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), stall_arrival);
+
+        // Newest buffered keyframe arrives recently.
+        let keyframe_arrival = stall_arrival + (MAX_PLAYOUT_AGE_MS as u128) + 100;
+        jb.insert_frame(create_test_frame(5, FrameType::KeyFrame), keyframe_arrival);
+
+        // Poll at a time where the head-of-line delta (seq 2) is older than MAX_PLAYOUT_AGE_MS but
+        // the keyframe (seq 5) is fresh.
+        let now = keyframe_arrival + 50;
+        jb.find_and_move_continuous_frames(now);
+
+        let queue = decoded_frames.lock().unwrap();
+        // We must have skipped straight to the keyframe; no stale delta released.
+        assert_eq!(queue.len(), 1, "only the fresh keyframe should be decoded");
+        assert_eq!(queue[0].sequence_number, 5);
+        // The stale deltas (2,3,4) must be gone.
+        assert!(!jb.buffered_frames.contains_key(&2));
+        assert!(!jb.buffered_frames.contains_key(&3));
+        assert!(!jb.buffered_frames.contains_key(&4));
+        assert_eq!(jb.last_decoded_sequence_number, Some(5));
+        assert_eq!(jb.get_dropped_frames_count(), 3);
+    }
+
+    /// Backlog with a newer buffered keyframe: drops the stale deltas before the keyframe and
+    /// resumes at the keyframe (skip-to-live).
+    #[test]
+    fn backlog_with_newer_keyframe_drops_deltas_and_resumes_at_keyframe() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let start = 5000;
+
+        // Never decoded yet. Stale deltas, then a newer keyframe, then a couple deltas after it.
+        let stale_arrival = start;
+        jb.insert_frame(create_test_frame(10, FrameType::DeltaFrame), stale_arrival);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), stale_arrival);
+
+        let keyframe_arrival = stale_arrival + (MAX_PLAYOUT_AGE_MS as u128) + 200;
+        jb.insert_frame(create_test_frame(12, FrameType::KeyFrame), keyframe_arrival);
+        jb.insert_frame(
+            create_test_frame(13, FrameType::DeltaFrame),
+            keyframe_arrival,
+        );
+
+        let now = keyframe_arrival + 100;
+        jb.find_and_move_continuous_frames(now);
+
+        let queue = decoded_frames.lock().unwrap();
+        // Keyframe 12 then continuous delta 13 should decode; stale 10,11 dropped.
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].sequence_number, 12);
+        assert_eq!(queue[1].sequence_number, 13);
+        assert!(!jb.buffered_frames.contains_key(&10));
+        assert!(!jb.buffered_frames.contains_key(&11));
+        assert_eq!(jb.last_decoded_sequence_number, Some(13));
+        assert_eq!(jb.get_dropped_frames_count(), 2);
+    }
+
+    /// Backlog with NO buffered keyframe must not drop to a delta and must not advance playout.
+    /// The stale delta backlog is evicted (so the buffer can't grow unbounded) and the last-good
+    /// frame is preserved; recovery is left to the keyframe-request path.
+    #[test]
+    fn stale_backlog_without_keyframe_does_not_drop_to_delta() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let start = 2000;
+
+        // Decode an initial keyframe (last good = seq 1).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        // A stall: only delta frames arrive, no keyframe. The next continuous frame (2) goes stale.
+        let stall_arrival = start + 200;
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall_arrival);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), stall_arrival);
+
+        let now = stall_arrival + (MAX_PLAYOUT_AGE_MS as u128) + 50;
+        jb.find_and_move_continuous_frames(now);
+
+        // No delta may be released (that would throw "key frame is required" in WebCodecs).
+        assert!(
+            decoded_frames.lock().unwrap().is_empty(),
+            "no delta should be decoded without a keyframe"
+        );
+        // Last-good playout position is preserved.
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        // The stale head delta must be evicted so the buffer can't grow unbounded while we wait.
+        assert!(
+            !jb.buffered_frames.contains_key(&2),
+            "stale head delta should be evicted"
+        );
+    }
+
+    /// Regression guard for the infinite-loop blocker: a stale post-gap keyframe that is ALREADY
+    /// the head of the buffer (nothing before it to drop) must NOT spin `find_and_move_continuous_frames`
+    /// forever. It must terminate and release the keyframe through the normal gate.
+    ///
+    /// Reachable trigger: background-tab throttling. `setInterval` is clamped/paused while the tab
+    /// is backgrounded, so on refocus the first tick's `Date::now()` delta is multi-second — a
+    /// buffered post-gap keyframe is instantly >= MAX_PLAYOUT_AGE_MS old while sitting at the head.
+    ///
+    /// Before the shrink-guard fix this test would hang (deadlock the worker tick); reaching the
+    /// assertions at all proves termination.
+    #[test]
+    fn stale_head_keyframe_terminates_and_releases() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let arrival = 1000u128;
+
+        // We are mid-stream (last decoded = 1), then a gap: only a single keyframe at seq 5 is
+        // buffered, and it is the head (nothing before it). Simulate this state directly.
+        jb.last_decoded_sequence_number = Some(1);
+        jb.insert_frame(create_test_frame(5, FrameType::KeyFrame), arrival);
+        // insert_frame already ran a poll; the keyframe is fresh at this point so nothing decoded.
+        decoded_frames.lock().unwrap().clear();
+        assert!(jb.buffered_frames.contains_key(&5));
+
+        // Poll at a time where the head keyframe (seq 5) is well past MAX_PLAYOUT_AGE_MS.
+        // Without the fix, drop_frames_before(5) removes nothing, enforce returns true, and the
+        // loop continues forever. With the fix it returns false and the normal gate releases 5.
+        let now = arrival + (MAX_PLAYOUT_AGE_MS as u128) + 100;
+        jb.find_and_move_continuous_frames(now);
+
+        // Reaching here at all proves the loop terminated.
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(
+            queue.len(),
+            1,
+            "head keyframe should be released, not spun on"
+        );
+        assert_eq!(queue[0].sequence_number, 5);
+        assert_eq!(jb.last_decoded_sequence_number, Some(5));
+        // Nothing was before the keyframe, so nothing was dropped by the deadline path.
+        assert_eq!(jb.get_dropped_frames_count(), 0);
+        assert!(jb.buffered_frames.is_empty());
+    }
+
+    /// Normal jitter within bounds is byte-for-byte unaffected: frames are released by the existing
+    /// lower-bound gate and nothing is dropped by the freshness deadline.
+    #[test]
+    fn normal_jitter_is_unaffected_by_freshness_deadline() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), time);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), time);
+
+        // Advance well past the playout delay but FAR below MAX_PLAYOUT_AGE_MS (1800ms).
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 2);
+        assert_eq!(queue[2].sequence_number, 3);
+        // Nothing dropped by the deadline.
+        assert_eq!(jb.get_dropped_frames_count(), 0);
+    }
+
+    /// A frame sitting just under the deadline is still released normally (boundary check).
+    #[test]
+    fn frame_just_under_deadline_is_released_normally() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let start = 1000;
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        // Poll at just under the deadline — should release normally, not skip/drop.
+        let now = start + (MAX_PLAYOUT_AGE_MS as u128) - 100;
+        jb.find_and_move_continuous_frames(now);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(jb.get_dropped_frames_count(), 0);
     }
 }

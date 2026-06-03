@@ -66,6 +66,7 @@ use crate::adaptive_quality_constants::{
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
+use videocall_aq::fit_within_preserving_aspect;
 
 // ── Screen encoder error observability counters (cumulative, since page load) ─
 // Mirrors the camera encoder pattern. See camera_encoder.rs for design rationale.
@@ -1393,8 +1394,21 @@ impl ScreenEncoder {
                     local_tier_max_width = new_tier_w;
                     local_tier_max_height = new_tier_h;
 
-                    let constrained_w = current_encoder_width.min(local_tier_max_width);
-                    let constrained_h = current_encoder_height.min(local_tier_max_height);
+                    // Constrain to the tier max while preserving the capture
+                    // source aspect ratio (issue #1037). `current_encoder_*` is
+                    // seeded from the screen track's native getSettings() dims
+                    // and only ever updated via this uniform fit or a raw
+                    // VideoFrame's native dims, so it always carries the source
+                    // aspect. getDisplayMedia requests 16:9 (ideal 1920x1080)
+                    // but the actual capture can be 16:10, ultrawide, portrait,
+                    // etc.; a per-axis `.min()` against the 16:9 tier ceiling
+                    // would stretch/squash those sources.
+                    let (constrained_w, constrained_h) = fit_within_preserving_aspect(
+                        current_encoder_width,
+                        current_encoder_height,
+                        local_tier_max_width,
+                        local_tier_max_height,
+                    );
 
                     log::info!(
                         "ScreenEncoder: tier dimension change -> {}x{} (was {}x{})",
@@ -1489,19 +1503,27 @@ impl ScreenEncoder {
                         }
 
                         let video_frame = value.unchecked_into::<VideoFrame>();
-                        let frame_width = video_frame.display_width();
-                        let frame_height = video_frame.display_height();
-                        // Constrain to tier max dimensions.
-                        let frame_width = if frame_width > 0 {
-                            (frame_width as u32).min(local_tier_max_width)
-                        } else {
-                            0
-                        };
-                        let frame_height = if frame_height > 0 {
-                            (frame_height as u32).min(local_tier_max_height)
-                        } else {
-                            0
-                        };
+                        let raw_frame_width = video_frame.display_width();
+                        let raw_frame_height = video_frame.display_height();
+                        // Constrain to tier max dimensions while preserving the
+                        // capture's native aspect ratio (issue #1037).
+                        // `display_width()` / `display_height()` are the raw
+                        // native VideoFrame dims (the true source aspect); a
+                        // per-axis `.min()` against the 16:9 tier ceiling would
+                        // stretch/squash non-16:9 captures (16:10, ultrawide,
+                        // portrait). 0 dims fall through as 0 so the
+                        // change-detection below skips reconfigure.
+                        let (frame_width, frame_height) =
+                            if raw_frame_width > 0 && raw_frame_height > 0 {
+                                fit_within_preserving_aspect(
+                                    raw_frame_width,
+                                    raw_frame_height,
+                                    local_tier_max_width,
+                                    local_tier_max_height,
+                                )
+                            } else {
+                                (0, 0)
+                            };
 
                         if frame_width > 0
                             && frame_height > 0

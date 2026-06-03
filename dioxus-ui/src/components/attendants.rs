@@ -19,6 +19,7 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
+use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
@@ -45,15 +46,19 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    load_appearance_settings_from_storage, load_decode_budget_override, load_density_mode,
-    load_dock_autohide, load_dock_position, resolve_transport_config,
+    html_media_set_sink_id_supported, load_appearance_settings_from_storage,
+    load_decode_budget_override, load_density_mode, load_dock_autohide, load_dock_position,
+    load_preferred_camera_on, load_preferred_device_ids, load_preferred_mic_on,
+    resolve_initial_enabled, resolve_transport_config, restore_device_id,
     save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
-    save_dock_autohide, save_dock_position, validate_display_name, AppearanceSettingsCtx,
-    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
-    DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
+    save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id, validate_display_name,
+    AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
+    DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx,
 };
+use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -65,6 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
+use videocall_client::MediaDeviceList;
 use videocall_client::{
     ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
     MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
@@ -422,109 +428,9 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
-/// Aspect ratio of a rendered tile in the participant grid.
-///
-/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
-/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
-/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
-/// than the tile and `place-self: center` will surface as visible internal
-/// padding around every tile.
-const TILE_AR: f64 = 3.0 / 2.0;
-
-/// Google Meet–style layout: try every column count, compute the maximum
-/// 3:2 tile size for each, and pick the variant with the largest tile area.
-/// Returns `(cols, rows, tile_width)`.
-fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
-    if n == 0 {
-        return (1, 1, w);
-    }
-    let mut best_cols = 1_usize;
-    let mut best_rows = 1_usize;
-    let mut best_area = 0.0_f64;
-    let mut best_tw = 0.0_f64;
-    let ar: f64 = TILE_AR;
-
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-
-        let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
-        let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
-
-        let mut tw = avail_w / cols as f64;
-        let mut th = tw / ar;
-
-        if th * rows as f64 > avail_h {
-            th = avail_h / rows as f64;
-            tw = th * ar;
-        }
-
-        let area = tw * th;
-        if area > best_area {
-            best_area = area;
-            best_cols = cols;
-            best_rows = rows;
-            best_tw = tw;
-        }
-    }
-
-    (best_cols, best_rows, best_tw)
-}
-
-/// Promote overflow speakers into the visible portion of a tile list.
-///
-/// When there are more tiles than fit on screen, tiles beyond `visible_count`
-/// are "overflow". If an overflow peer spoke within `active_ms` of `now_ms`,
-/// swap them with the least-recently-active visible peer that is NOT speaking.
-/// The loudest overflow speaker (most recent) gets priority.
-fn promote_speakers(
-    tiles: &mut [String],
-    visible_count: usize,
-    speech_map: &HashMap<String, f64>,
-    join_map: &HashMap<String, f64>,
-    now_ms: f64,
-    active_ms: f64,
-) {
-    if visible_count >= tiles.len() {
-        return;
-    }
-
-    // Effective timestamp: last speech time if exists, else join time.
-    let eff_ts = |peer: &str| -> f64 {
-        speech_map
-            .get(peer)
-            .copied()
-            .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
-    };
-
-    // Overflow tiles that are actively speaking (most recent first).
-    let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-    for (i, peer) in tiles.iter().enumerate().skip(visible_count) {
-        if let Some(&ts) = speech_map.get(peer) {
-            if now_ms - ts < active_ms {
-                overflow_speakers.push((i, ts));
-            }
-        }
-    }
-    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Visible non-speaking tiles as swap candidates (least recently active first).
-    let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
-        .filter(|&i| {
-            speech_map
-                .get(&tiles[i])
-                .is_none_or(|&ts| now_ms - ts >= active_ms)
-        })
-        .map(|i| (i, eff_ts(&tiles[i])))
-        .collect();
-    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Swap pairs — all indices are disjoint so order doesn't matter.
-    let num_swaps = overflow_speakers.len().min(swap_candidates.len());
-    for i in 0..num_swaps {
-        tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
-    }
-}
-
+use super::attendants_layout::{
+    compute_effective_density, compute_layout, promote_speakers, TILE_AR,
+};
 use super::density::{DensityMode, DENSITY_MODES};
 
 #[component]
@@ -845,6 +751,47 @@ pub fn AttendantsComponent(
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
+    // True only when the user explicitly clicked Join/Start (vs. granting
+    // permission just to preview devices). Gates the auto-connect in the
+    // MediaDeviceAccess callback so a preview-permission grant does NOT join
+    // the meeting. (issue #959)
+    let mut join_requested = use_signal(|| false);
+
+    // ── Pre-join device preview state (issue #959) ─────────────────────
+    // Device lists + selections for the pre-join screen. Populated once
+    // getUserMedia permission is granted (labels are empty before that).
+    let prejoin_cameras = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let prejoin_microphones = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let prejoin_speakers = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let mut prejoin_selected_camera = use_signal(|| None::<String>);
+    let mut prejoin_selected_mic = use_signal(|| None::<String>);
+    let mut prejoin_selected_speaker = use_signal(|| None::<String>);
+    // Restore the persisted on/off choices so they round-trip across visits.
+    let mut prejoin_camera_on = use_signal(load_preferred_camera_on);
+    let mut prejoin_mic_on = use_signal(load_preferred_mic_on);
+    // setSinkId support is fixed per-browser; probe once.
+    let speaker_supported = use_hook(html_media_set_sink_id_supported);
+
+    // The imperative preview engine owns the camera + mic preview hardware and
+    // drives the level meter. The meter is updated by DIRECT DOM writes (no
+    // Dioxus signal), so it never re-diffs the card per frame. One instance for
+    // the component's lifetime.
+    let preview_engine = use_hook(|| {
+        use crate::components::pre_join_settings_card::{
+            PREVIEW_MIC_METER_FILL_ID, PREVIEW_MIC_METER_ID, PREVIEW_VIDEO_ID,
+        };
+        PreviewEngine::new(
+            PREVIEW_VIDEO_ID,
+            PREVIEW_MIC_METER_ID,
+            PREVIEW_MIC_METER_FILL_ID,
+        )
+    });
+
+    // Pre-join device list (separate from the in-meeting Host's list). Loaded
+    // after permission is granted; restores persisted device-id selections.
+    let prejoin_devices: Rc<RefCell<MediaDeviceList>> =
+        use_hook(|| Rc::new(RefCell::new(MediaDeviceList::new())));
+
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
     let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
     let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
@@ -1621,9 +1568,20 @@ pub fn AttendantsComponent(
         });
     }
 
+    // Release any pre-join preview hardware (camera + mic) and close the
+    // AudioContext on unmount, covering the route-change / tab-close paths the
+    // join handler's explicit shutdown does not. Idempotent. (issue #959)
+    {
+        let preview_engine_for_drop = preview_engine.clone();
+        use_drop(move || {
+            preview_engine_for_drop.shutdown();
+        });
+    }
+
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
+        let preview_engine_for_mda = preview_engine.clone();
         mda.on_result = VcCallback::from(move |permit: MediaPermission| {
             let mut connection_error = connection_error;
             let mut media_access_granted = media_access_granted;
@@ -1637,6 +1595,7 @@ pub fn AttendantsComponent(
             let mut show_device_warning = show_device_warning;
             let mut reload_devices_counter = reload_devices_counter;
             let mut device_was_denied = device_was_denied;
+            let mut join_requested = join_requested;
 
             connection_error.set(None);
             mic_error.set(None);
@@ -1688,16 +1647,62 @@ pub fn AttendantsComponent(
                     video_enabled.set(false);
                     pending_video_enable.set(false);
                 }
+            } else if !join_requested() {
+                // Permission was requested just to PREVIEW devices (issue #959).
+                // Do NOT connect — the pre-join enumeration effect will pick up
+                // the granted permission and populate the device list. The user
+                // must click Join/Start to actually enter the meeting.
+                log::info!("Media permission granted for pre-join preview (not joining yet)");
             } else if mic_error.read().is_some() || video_error.read().is_some() {
                 show_device_warning.set(true);
                 meeting_joined.set(false);
+                join_requested.set(false);
             } else {
+                // Real join. Apply the pre-join camera/mic on-off choices.
+                //
+                // Each track is honored only if permission for it was granted
+                // AND a device exists, so we never try to enable capture we
+                // can't perform (`resolve_initial_enabled`).
+                //
+                // We set `mic_enabled`/`video_enabled` DIRECTLY rather than via
+                // `pending_*_enable`: the pending flags are consumed earlier in
+                // THIS same `on_result` invocation (the granted-pending check
+                // above), and `request()` fires `on_result` exactly once with
+                // nothing re-firing post-connect. Writing them here would be too
+                // late — the Host reads `mic_enabled`/`video_enabled` as props
+                // and acts on them when it mounts/renders, which is what drives
+                // `client.set_audio_enabled` / `set_video_enabled`. (issue #959)
+                let audio_ok = matches!(permit.audio, PermissionState::Granted);
+                let video_ok = matches!(permit.video, PermissionState::Granted);
+                let want_mic = resolve_initial_enabled(
+                    prejoin_mic_on(),
+                    audio_ok,
+                    !prejoin_microphones.read().is_empty(),
+                );
+                let want_cam = resolve_initial_enabled(
+                    prejoin_camera_on(),
+                    video_ok,
+                    !prejoin_cameras.read().is_empty(),
+                );
+
+                // Release the preview hardware BEFORE the real encoders start so
+                // there is no double-capture of the camera/mic. (issue #959)
+                preview_engine_for_mda.shutdown();
+
+                mic_enabled.set(want_mic);
+                video_enabled.set(want_cam);
+                // Clear any stale pending writes so a later focus re-check
+                // can't resurrect them.
+                pending_mic_enable.set(false);
+                pending_video_enable.set(false);
+
                 let mut connecting = connecting;
                 connecting.set(true);
                 if let Err(e) = client_cell.borrow_mut().connect() {
                     log::error!("Connection failed: {e:?}");
                 }
                 meeting_joined.set(true);
+                join_requested.set(false);
             }
 
             if device_was_denied() {
@@ -1707,6 +1712,127 @@ pub fn AttendantsComponent(
         });
         Rc::new(RefCell::new(mda))
     });
+
+    // ── Pre-join device enumeration + preview wiring (issue #959) ───────
+    //
+    // Once getUserMedia permission is granted (so device labels are populated)
+    // and we are still on the pre-join screen, enumerate devices, restore the
+    // persisted selections, and start the preview for any track the user chose
+    // to begin with ON. Re-runs when `reload_devices_counter` bumps (hot-plug /
+    // re-grant). The effect is a no-op after the meeting actually starts —
+    // teardown happens in the join handler and on unmount.
+    // Tracks the last (granted, reload_counter) key we ran `dev.load()` for, so
+    // the effect re-running for unrelated reasons does not re-enumerate and
+    // re-register the device-change listener every time. (code-review item 10)
+    let prejoin_loaded_key: Rc<Cell<Option<u32>>> = use_hook(|| Rc::new(Cell::new(None)));
+    {
+        let prejoin_devices = prejoin_devices.clone();
+        let preview_engine = preview_engine.clone();
+        let prejoin_loaded_key = prejoin_loaded_key.clone();
+        use_effect(move || {
+            // Subscribe to the reactive triggers.
+            let granted = media_access_granted();
+            let reload = reload_devices_counter();
+            if !granted || meeting_joined() {
+                return;
+            }
+            // Run `load()` once per grant, plus once per `reload_devices_counter`
+            // bump (hot-plug / re-grant). The counter is the load key.
+            if prejoin_loaded_key.get() == Some(reload) {
+                return;
+            }
+            prejoin_loaded_key.set(Some(reload));
+            let preview_engine = preview_engine.clone();
+            let mut dev = prejoin_devices.borrow_mut();
+
+            // Copy enumerated devices into signals and apply restored
+            // selections. Shared by the initial load and hot-plug changes.
+            let apply = {
+                let prejoin_devices = prejoin_devices.clone();
+                let preview_engine = preview_engine.clone();
+                move || {
+                    // Rebind Copy signals as local `mut` so this closure stays
+                    // `Fn` (required by VcCallback) — `.set()` mutates the local
+                    // handle, not a captured variable.
+                    let mut prejoin_cameras = prejoin_cameras;
+                    let mut prejoin_microphones = prejoin_microphones;
+                    let mut prejoin_speakers = prejoin_speakers;
+                    let mut prejoin_selected_camera = prejoin_selected_camera;
+                    let mut prejoin_selected_mic = prejoin_selected_mic;
+                    let mut prejoin_selected_speaker = prejoin_selected_speaker;
+                    let mut prejoin_camera_on = prejoin_camera_on;
+                    let mut prejoin_mic_on = prejoin_mic_on;
+
+                    let mut dev = prejoin_devices.borrow_mut();
+                    let cams = dev.video_inputs.devices();
+                    let mics = dev.audio_inputs.devices();
+                    let spks = dev.audio_outputs.devices();
+
+                    let (stored_cam, stored_mic, stored_spk) = load_preferred_device_ids();
+                    let cam_ids: Vec<String> = cams.iter().map(|d| d.device_id()).collect();
+                    let mic_ids: Vec<String> = mics.iter().map(|d| d.device_id()).collect();
+                    let spk_ids: Vec<String> = spks.iter().map(|d| d.device_id()).collect();
+
+                    let cam_sel = restore_device_id(stored_cam.as_deref(), &cam_ids);
+                    let mic_sel = restore_device_id(stored_mic.as_deref(), &mic_ids);
+                    let spk_sel = restore_device_id(stored_spk.as_deref(), &spk_ids);
+
+                    // Reflect the resolved selection back into the device list so
+                    // selected()/select() stay consistent with what we show.
+                    if let Some(id) = cam_sel.as_deref() {
+                        dev.video_inputs.select(id);
+                    }
+                    if let Some(id) = mic_sel.as_deref() {
+                        dev.audio_inputs.select(id);
+                    }
+                    if let Some(id) = spk_sel.as_deref() {
+                        dev.audio_outputs.select(id);
+                    }
+                    drop(dev);
+
+                    prejoin_cameras.set(cams);
+                    prejoin_microphones.set(mics);
+                    prejoin_speakers.set(spks);
+                    prejoin_selected_camera.set(cam_sel.clone());
+                    prejoin_selected_mic.set(mic_sel.clone());
+                    prejoin_selected_speaker.set(spk_sel);
+
+                    // Persist resolved selections (so a fallback after an
+                    // unplugged device becomes the new remembered choice).
+                    if let Some(id) = cam_sel.as_deref() {
+                        save_preferred_camera_id(id);
+                    }
+                    if let Some(id) = mic_sel.as_deref() {
+                        save_preferred_mic_id(id);
+                    }
+
+                    // Start preview for tracks the user wants ON, gated on a
+                    // device actually being present.
+                    if prejoin_camera_on() {
+                        if let Some(id) = cam_sel {
+                            preview_engine.start_camera(id);
+                        } else {
+                            prejoin_camera_on.set(false);
+                        }
+                    }
+                    if prejoin_mic_on() {
+                        if let Some(id) = mic_sel {
+                            preview_engine.start_mic_meter(id);
+                        } else {
+                            prejoin_mic_on.set(false);
+                        }
+                    }
+                }
+            };
+
+            dev.on_loaded = VcCallback::from({
+                let apply = apply.clone();
+                move |_| apply()
+            });
+            dev.on_devices_changed = VcCallback::from(move |_| apply());
+            dev.load();
+        });
+    }
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
     // Only fires for users already in-meeting who had a prior denial — on the
@@ -2409,6 +2535,9 @@ pub fn AttendantsComponent(
                     log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
                 }
                 _ => {
+                    // Direct-URL auto-join: a real join, so the permission
+                    // callback must proceed to connect (issue #959).
+                    join_requested.set(true);
                     mda.borrow().request();
                 }
             }
@@ -2625,54 +2754,17 @@ pub fn AttendantsComponent(
     };
 
     // --- Determine effective density mode ---
-    // If the user's chosen mode can't show all active speakers, auto-escalate
-    // to a denser mode so every speaker is always visible.
     let user_mode = density_mode();
-    let modes_by_density = [
-        DensityMode::Standard,
-        DensityMode::Auto,
-        DensityMode::Dense,
-        DensityMode::Maximum,
-    ];
-    let user_rank = modes_by_density
-        .iter()
-        .position(|&m| m == user_mode)
-        .unwrap_or(1);
-
-    let effective_mode = if active_speaker_count > 0 {
-        let mut chosen = user_mode;
-        for &mode in &modes_by_density[user_rank..] {
-            chosen = mode;
-            let mtw = mode.min_tile_width(vw);
-            // Find the max tile count where compute_layout yields tw >= mtw.
-            // Since tile_width is monotonically non-increasing as tile count
-            // grows, we can scan downward from total_tiles (fast in practice
-            // since the breakpoint is usually close to total_tiles).
-            let capacity = {
-                let mut t = total_tiles;
-                while t > 1 {
-                    let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
-                    if tw >= mtw {
-                        break;
-                    }
-                    t -= 1;
-                }
-                t
-            };
-            let vis = if total_tiles > capacity {
-                capacity.saturating_sub(1).max(1)
-            } else {
-                total_tiles
-            };
-            let vis_real = num_display_peers.min(vis);
-            if vis_real >= active_speaker_count {
-                break;
-            }
-        }
-        chosen
-    } else {
-        user_mode
-    };
+    let effective_mode = compute_effective_density(
+        user_mode,
+        total_tiles,
+        avail_w,
+        avail_h,
+        gap,
+        active_speaker_count,
+        num_display_peers,
+        vw,
+    );
 
     // --- Determine visible tile count ---
     let min_tw = effective_mode.min_tile_width(vw);
@@ -3160,6 +3252,77 @@ pub fn AttendantsComponent(
                                 saving,
                                 toggle_error,
                                 connection_error,
+                                media_access_granted: media_access_granted(),
+                                speaker_selection_supported: speaker_supported,
+                                cameras: prejoin_cameras(),
+                                microphones: prejoin_microphones(),
+                                speakers: prejoin_speakers(),
+                                selected_camera_id: prejoin_selected_camera(),
+                                selected_microphone_id: prejoin_selected_mic(),
+                                selected_speaker_id: prejoin_selected_speaker(),
+                                camera_on: prejoin_camera_on,
+                                mic_on: prejoin_mic_on,
+                                on_request_permission: {
+                                    let mda = mda.clone();
+                                    move |_| {
+                                        // Preview-only permission request: does NOT join
+                                        // (join_requested stays false).
+                                        mda.borrow().request();
+                                    }
+                                },
+                                on_camera_toggle: {
+                                    let preview_engine = preview_engine.clone();
+                                    move |on: bool| {
+                                        prejoin_camera_on.set(on);
+                                        save_preferred_camera_on(on);
+                                        if on {
+                                            let id = prejoin_selected_camera()
+                                                .unwrap_or_default();
+                                            preview_engine.start_camera(id);
+                                        } else {
+                                            preview_engine.stop_camera();
+                                        }
+                                    }
+                                },
+                                on_mic_toggle: {
+                                    let preview_engine = preview_engine.clone();
+                                    move |on: bool| {
+                                        prejoin_mic_on.set(on);
+                                        save_preferred_mic_on(on);
+                                        if on {
+                                            let id = prejoin_selected_mic().unwrap_or_default();
+                                            preview_engine.start_mic_meter(id);
+                                        } else {
+                                            preview_engine.stop_mic_meter();
+                                        }
+                                    }
+                                },
+                                on_camera_select: {
+                                    let preview_engine = preview_engine.clone();
+                                    move |info: DeviceInfo| {
+                                        prejoin_selected_camera.set(Some(info.device_id.clone()));
+                                        save_preferred_camera_id(&info.device_id);
+                                        // Re-acquire the preview with the new device
+                                        // (only while the camera is on).
+                                        if prejoin_camera_on() {
+                                            preview_engine.start_camera(info.device_id);
+                                        }
+                                    }
+                                },
+                                on_microphone_select: {
+                                    let preview_engine = preview_engine.clone();
+                                    move |info: DeviceInfo| {
+                                        prejoin_selected_mic.set(Some(info.device_id.clone()));
+                                        save_preferred_mic_id(&info.device_id);
+                                        if prejoin_mic_on() {
+                                            preview_engine.start_mic_meter(info.device_id);
+                                        }
+                                    }
+                                },
+                                on_speaker_select: move |info: DeviceInfo| {
+                                    prejoin_selected_speaker.set(Some(info.device_id.clone()));
+                                    save_preferred_speaker_id(&info.device_id);
+                                },
                                 on_join: {
                                     let mda = mda.clone();
                                     let has_strong_warn = strong_warn_msg.is_some();
@@ -3184,6 +3347,9 @@ pub fn AttendantsComponent(
                                             );
                                             return;
                                         }
+                                        // Mark this as a real join so the permission
+                                        // callback proceeds to connect (issue #959).
+                                        join_requested.set(true);
                                         mda.borrow().request();
                                     }
                                 },
@@ -3220,6 +3386,7 @@ pub fn AttendantsComponent(
                                                     "capability-check: user chose Audio-only"
                                                 );
                                                 capability_acknowledged.set(true);
+                                                join_requested.set(true);
                                                 mda_audio.borrow().request();
                                             },
                                             "Switch to audio-only"
@@ -3231,6 +3398,7 @@ pub fn AttendantsComponent(
                                                     "capability-check: user chose Continue anyway"
                                                 );
                                                 capability_acknowledged.set(true);
+                                                join_requested.set(true);
                                                 mda_continue.borrow().request();
                                             },
                                             "Continue anyway"
@@ -4213,11 +4381,14 @@ pub fn AttendantsComponent(
                                                             role: "option",
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
+                                                                let was_closed = !device_settings_open();
+                                                                device_settings_open.set(true);
+                                                                if was_closed {
+                                                                    device_settings_generation
+                                                                        .set(device_settings_generation() + 1);
+                                                                }
                                                                 device_settings_initial_section
                                                                     .set(Some("appearance".to_string()));
-                                                                device_settings_generation
-                                                                    .set(device_settings_generation() + 1);
-                                                                device_settings_open.set(true);
                                                                 dock_menu_open.set(false);
                                                             },
                                                             "Dock Settings\u{2026}"

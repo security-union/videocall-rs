@@ -462,9 +462,9 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::connection::task::StubSendKind;
     use crate::connection::webmedia::MediaStreamKey;
-    use super::*;
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;

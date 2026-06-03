@@ -21,6 +21,13 @@
 #                   session to the peer map from console logs. Useful for
 #                   identifying memory-pressured / slow clients (see
 #                   discussion #562, RELAY-2 pattern).
+#   --relay-ws=P    optional: path to a videocall-websocket relay pod log
+#                   file. When provided, emits a "WS Mailbox-Full Drops"
+#                   section joining "Dropping inbound message ... (mailbox
+#                   full)" drops per session to the peer map. This is the
+#                   actor-mailbox overflow that causes room-wide freezes
+#                   (issue #1057); often bursty fan-out storms, not slow
+#                   receivers.
 #   -h | --help     show full usage and exit
 #
 # Dependencies: jq, zcat, date (GNU coreutils)
@@ -68,6 +75,8 @@
 # | Phrase matched                              | Extracts                         | Emitter                                         |
 # |---------------------------------------------|----------------------------------|-------------------------------------------------|
 # | Outbound channel full for session <ID>      | drops_per_session (slow-drain)  | actix-api/src/actors/transports/wt_chat_session.rs |
+# RELAY-POD patterns (when --relay-ws=PATH is provided):
+# | Dropping inbound message for session <ID> ... (mailbox full) | mailbox_full drops_per_session (issue #1057) | actix-api/src/actors/chat_server.rs |
 # ===========================================================================
 
 set -e
@@ -75,7 +84,7 @@ set -e
 # -h / --help — print usage and exit 0
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<EOF
-Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]
+Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]
        $(basename "$0") -h | --help
 
 Produces a structured summary of a pulled console-log directory.
@@ -99,6 +108,13 @@ Modes:
                   counts joined to the peer map. Useful for spotting
                   memory-pressured / slow clients (RELAY-2 pattern,
                   see discussion #562).
+  --relay-ws=P    Optional path to a videocall-websocket relay pod log
+                  file. When provided, emits a "WS Mailbox-Full Drops"
+                  section showing per-session "Dropping inbound message
+                  ... (mailbox full)" drop counts joined to the peer
+                  map. This is the 16-slot actor-mailbox overflow that
+                  causes room-wide freezes (issue #1057) — usually
+                  bursty fan-out storms, not slow receivers.
   -h, --help      Show this help.
 
 Examples:
@@ -112,9 +128,10 @@ Examples:
   # Verify parser matches the current client's log format
   $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) --verify
 
-  # Cross-reference with relay pod backpressure
+  # Cross-reference with relay pod backpressure (both transports)
   $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) \\
-    --relay-wt=/tmp/relay-webtransport.log
+    --relay-wt=/tmp/relay-webtransport.log \\
+    --relay-ws=/tmp/relay-websocket.log
 
 See scripts/parse_meeting_console_logs.README.md for the full workflow
 (pulling logs from the pod, column reference, sample output).
@@ -125,6 +142,7 @@ fi
 LOG_DIR="${1:-}"
 OUTPUT_FORMAT="markdown"
 RELAY_WT=""
+RELAY_WS=""
 # Parse remaining args: $2..$N. --json / --verify set format; --relay-wt=PATH sets relay path.
 shift  # drop $1 (LOG_DIR)
 for arg in "$@"; do
@@ -140,20 +158,26 @@ for arg in "$@"; do
       fi
       OUTPUT_FORMAT="verify" ;;
     --relay-wt=*)    RELAY_WT="${arg#--relay-wt=}" ;;
+    --relay-ws=*)    RELAY_WS="${arg#--relay-ws=}" ;;
     "")              ;;  # skip empty
     *)               echo "Unknown option: $arg" >&2
-                     echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+                     echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]" >&2
                      exit 1 ;;
   esac
 done
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+  echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]" >&2
   exit 1
 fi
 
 if [[ -n "$RELAY_WT" && ! -f "$RELAY_WT" ]]; then
   echo "--relay-wt: file not found: $RELAY_WT" >&2
+  exit 1
+fi
+
+if [[ -n "$RELAY_WS" && ! -f "$RELAY_WS" ]]; then
+  echo "--relay-ws: file not found: $RELAY_WS" >&2
   exit 1
 fi
 
@@ -556,6 +580,40 @@ if [[ -n "$RELAY_WT" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 4d: Relay-WS log ingest (--relay-ws=PATH)
+# ---------------------------------------------------------------------------
+# Count "Dropping inbound message for session <id>: ... (mailbox full ...)"
+# drops per session. This is the WEBSOCKET-path equivalent of the WT
+# "Outbound channel full" slow-drain, but it fires at the 16-slot actix
+# ACTOR MAILBOX in front of the 128 outbound channel — see issue #1057 and
+# ~/work/notebook/.../2026-06-03-ws-mailbox-overflow-freeze.md. Unlike the WT
+# pattern this is NOT necessarily a slow receiver: drops are frequently BURSTY
+# fan-out storms (keyframe spike / join / screen-share start) that overflow the
+# tiny mailbox for ALL receivers at once, including fast ones. The matching
+# Prometheus signal is relay_packet_drops_total{drop_reason="mailbox_full"}.
+declare -A WS_MAILBOX_DROPS  # session_id → drop count
+WS_MAILBOX_DROPS_TOTAL=0
+if [[ -n "$RELAY_WS" ]]; then
+  declare -A IN_MEETING_SIDS_WS
+  for s in "${session_jsons[@]}"; do
+    sid=$(echo "$s" | jq -r '.session_id')
+    [[ -n "$sid" && "$sid" != "null" ]] && IN_MEETING_SIDS_WS["$sid"]=1
+  done
+  # Format: WARN ... Dropping inbound message for session 1057...: ... (mailbox full ...)
+  while read -r count sid; do
+    [[ -z "$sid" ]] && continue
+    if [[ -n "${IN_MEETING_SIDS_WS[$sid]:-}" ]]; then
+      WS_MAILBOX_DROPS["$sid"]="$count"
+      WS_MAILBOX_DROPS_TOTAL=$((WS_MAILBOX_DROPS_TOTAL + count))
+    fi
+  done < <(grep -oE 'Dropping inbound message for session [0-9]+' "$RELAY_WS" 2>/dev/null \
+           | grep -oE '[0-9]+$' \
+           | sort \
+           | uniq -c \
+           | $AWK '{print $1, $2}')
+fi
+
+# ---------------------------------------------------------------------------
 # Step 5: Output
 # ---------------------------------------------------------------------------
 
@@ -827,7 +885,9 @@ echo ""
 
 echo "### Capacity Warnings"
 echo ""
-echo "_Flagged by preamble network/battery fields. ⚠ on Net dl = downlink < 8 Mbps (marginal for 3+ peers at full HD). bat = on battery (potential WiFi/CPU throttling). Deduplicated per email._"
+echo "_Flagged by preamble network/battery fields. ⚠ on Net dl = downlink < 8 Mbps. bat = on battery (potential WiFi/CPU throttling). Deduplicated per email._"
+echo ""
+echo "_**CAVEAT — \`Net dl\` and the \`4g\` tag are UNRELIABLE.** They come from \`navigator.connection\` (\`downlink\`/\`effectiveType\`), which is a coarse Chrome ESTIMATE, **not a measurement**: \`downlink\` is capped ~10 Mbps and rounded for anti-fingerprinting; \`effectiveType=\"4g\"\` is the TOP bucket (≥~10 Mbps effective) and does NOT mean cellular — a 10GbE fiber link reports \`4g\`. A low \`Net dl\` may just reflect a tab that had pulled few bytes, or a SASE/proxy (e.g. Cato) shaping throughput. **Do NOT attribute freezes to a participant's bandwidth from this field alone** — corroborate with client-measured \`active_server_rtt\`, downstream packet-arrival gaps, and a real speed test before claiming a participant is bandwidth-constrained._"
 echo ""
 
 has_capacity_warn=0
@@ -845,7 +905,7 @@ for s in "${session_jsons[@]}"; do
   battery=$(echo "$s" | jq -r '.preamble.battery // "?"')
   cores=$(echo "$s" | jq -r '.preamble.cores // "?"')
   flags=""
-  [[ "$bw_flag" == "true" ]] && flags="${flags}bandwidth-constrained "
+  [[ "$bw_flag" == "true" ]] && flags="${flags}low-estimated-downlink(navigator.connection,unreliable) "
   [[ "$bat_flag" == "true" ]] && flags="${flags}on-battery "
   echo "- **${name}** (${email}): ${flags}-- network=${net}, battery=${battery}, cores=${cores}"
 done
@@ -918,6 +978,37 @@ if [[ -n "$RELAY_WT" ]]; then
   echo ""
 fi
 
+if [[ -n "$RELAY_WS" ]]; then
+  echo "### WS Mailbox-Full Drops (server-side, from \`${RELAY_WS}\`)"
+  echo ""
+  echo "_Count of \`Dropping inbound message for session X ... (mailbox full)\` drops per session — the WebSocket-path overflow at the 16-slot actix actor mailbox in front of the 128 outbound channel. See **issue #1057**. Prometheus equivalent: \`relay_packet_drops_total{drop_reason=\"mailbox_full\"}\`._"
+  echo ""
+  echo "_**NOT necessarily a slow receiver.** These are often BURSTY fan-out storms (keyframe spike / peer join / screen-share start) that overflow the tiny mailbox for ALL receivers at once — including fast, well-connected ones. To distinguish a genuine slow receiver from a burst storm: bucket the drop timestamps per second and count distinct sessions hit. Many sessions in one second = burst; one session sustained = slow drain._"
+  echo ""
+  if [[ $WS_MAILBOX_DROPS_TOTAL -eq 0 ]]; then
+    echo "_No mailbox-full drops recorded for any in-meeting session._"
+  else
+    echo "| Session ID | Drops | Email | Display Name |"
+    echo "|------------|------:|-------|--------------|"
+    declare -A SID_EMAIL_WS SID_NAME_WS
+    for s in "${session_jsons[@]}"; do
+      sid=$(echo "$s" | jq -r '.session_id')
+      [[ -z "$sid" || "$sid" == "null" ]] && continue
+      SID_EMAIL_WS[$sid]=$(echo "$s" | jq -r '.email')
+      SID_NAME_WS[$sid]=$(echo "$s" | jq -r '.display_name')
+    done
+    for sid in $(for k in "${!WS_MAILBOX_DROPS[@]}"; do echo "${WS_MAILBOX_DROPS[$k]} $k"; done | sort -rn | $AWK '{print $2}'); do
+      count="${WS_MAILBOX_DROPS[$sid]}"
+      email="${SID_EMAIL_WS[$sid]:-?}"
+      name="${SID_NAME_WS[$sid]:-?}"
+      echo "| \`${sid}\` | ${count} | ${email} | ${name} |"
+    done
+    echo ""
+    echo "**Total mailbox-full drops across in-meeting sessions:** ${WS_MAILBOX_DROPS_TOTAL}"
+  fi
+  echo ""
+fi
+
 echo "### Peer ID → Email Map (for Prometheus)"
 echo ""
 echo "| Session ID (uint64) | Email | Display Name |"
@@ -948,4 +1039,10 @@ echo "# Audio concealment:"
 echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=videocall_audio_concealment_pct{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=15s\""
+echo ""
+echo "# Relay mailbox-overflow drops (issue #1057) — room label is the meeting NAME:"
+echo "# Any nonzero increase here = the freeze-causing actor-mailbox overflow."
+echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  --data-urlencode \"query=increase(relay_packet_drops_total{room=\\\"<ROOM_NAME>\\\",drop_reason=\\\"mailbox_full\\\"}[1m])\" \\"
+echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
 echo "\`\`\`"

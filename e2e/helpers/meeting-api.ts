@@ -142,6 +142,42 @@ export async function endMeeting(
 }
 
 /**
+ * Fetch the authenticated user's home feed via `GET /api/v1/meetings/feed`
+ * and return the `state` ("idle" | "active" | "ended") of the meeting with the
+ * given `meetingId`, or `null` when that meeting is not present in the feed.
+ *
+ * The feed is the deterministic, server-side source of truth for meeting state
+ * (the same payload that backs the home-page meetings list). It is the
+ * canonical observation point for the presence-driven idle/active transitions:
+ * a created-but-unjoined or fully-drained meeting reports `idle`, a meeting
+ * with live presence reports `active`, and an ended meeting reports `ended`.
+ *
+ * Returns the raw `state` string (not an enum) so callers can `expect.poll`
+ * against it directly while the async NATS round-trip settles. `null` (meeting
+ * absent) is distinguished from a present-but-unexpected state so a poll can
+ * tell "not in my feed yet" apart from "wrong state".
+ */
+export async function fetchMeetingState(
+  email: string,
+  name: string,
+  meetingId: string,
+): Promise<string | null> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/feed?limit=200`, {
+    method: "GET",
+    headers: { Cookie: authCookie(email, name) },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`GET /api/v1/meetings/feed failed (${res.status}): ${txt}`);
+  }
+  const json = (await res.json()) as {
+    result: { meetings: Array<{ meeting_id: string; state: string }> };
+  };
+  const row = json.result.meetings.find((m) => m.meeting_id === meetingId);
+  return row ? row.state : null;
+}
+
+/**
  * Delete every meeting the authenticated user owns. Useful in `beforeEach`
  * hooks that need a clean baseline for assertions about list content. Does
  * NOT touch participant rows in meetings owned by other users — joined

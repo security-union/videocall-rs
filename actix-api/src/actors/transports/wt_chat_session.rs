@@ -560,19 +560,28 @@ impl Actor for WtChatSession {
         // CONGESTION feedback, so the offending sender never throttles —
         // the same room-wide-freeze failure mode described for WS.
         //
-        // We match the mailbox capacity to the **unistream** outbound
-        // channel capacity (`wt_outbound_channel_capacity()`), which is
-        // where the storm-prone traffic (video/screen + oversized
-        // audio/control) lands and where the priority-drop policy +
-        // CONGESTION feedback live. This does NOT add meaningful
-        // buffering — it relocates the overflow to the policy-aware
-        // channel, which sheds VIDEO/SCREEN first, protects AUDIO to ~95%,
-        // never preempts Critical lifecycle packets, and fires CONGESTION
-        // back to the sender via `on_outbound_drop`. The value is derived
-        // from the same resolver the channel is constructed with (see
-        // `webtransport::mod`), so the env-tunable
-        // `WT_OUTBOUND_CHANNEL_CAPACITY` keeps the two in lock-step.
-        ctx.set_mailbox_capacity(wt_outbound_channel_capacity());
+        // The WT actor fronts TWO independent policy-aware outbound
+        // channels — `unistream_tx` (cap `wt_outbound_channel_capacity()`,
+        // env-tunable, default 512) and `datagram_tx` (cap
+        // `WT_DATAGRAM_CHANNEL_CAPACITY`, fixed 512) — but a single shared
+        // mailbox. A `Message` only splits into unistream vs datagram
+        // *after* it leaves the mailbox (in `Handler<Message>` /
+        // `handle_outbound`), so the mailbox holds a MIX of both. To keep
+        // the mailbox from being the bottleneck in front of *either*
+        // channel — for any traffic mix and any value of the env-tunable
+        // unistream cap — size it to the SUM of both channel capacities.
+        // (`max()` is insufficient: with the unistream cap tuned up, a
+        // datagram-heavy burst could still fill and drop in the mailbox
+        // before the datagram channel's priority-drop ever runs — PR #1060
+        // review.) The value is derived from the same constants/resolver
+        // the channels are built with, so it stays in lock-step with both.
+        //
+        // This does NOT add meaningful buffering — it relocates overflow
+        // off the dumb 16-slot mailbox onto the policy-aware channels,
+        // which shed VIDEO/SCREEN first, protect AUDIO to ~95%, never
+        // preempt Critical lifecycle packets, and fire CONGESTION back to
+        // the sender via `on_outbound_drop`.
+        ctx.set_mailbox_capacity(wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY);
 
         // Track connection start
         self.logic.track_connection_start();
@@ -885,50 +894,66 @@ mod tests {
     };
 
     // -----------------------------------------------------------------------
-    // Issue #1057: mailbox capacity must match the (unistream) outbound
-    // channel.
+    // Issue #1057 (+ PR #1060 review): the shared actor mailbox must be able
+    // to hold a full backlog for BOTH outbound channels.
     //
-    // `WtChatSession::started` calls
-    // `ctx.set_mailbox_capacity(wt_outbound_channel_capacity())` so the actor
-    // mailbox stops being the (default 16-slot) overflow point in front of
-    // the policy-aware outbound channels. Constructing a live `WtChatSession`
-    // requires a populated `SessionLogic` (NATS, addresses, …), so rather
-    // than read the capacity back off a running context we guard the
-    // invariant the fix relies on at the value level:
-    //   * the mailbox capacity is derived from the SAME resolver the
-    //     unistream channel is built with (`wt_outbound_channel_capacity()` /
-    //     `resolve_wt_outbound_channel_capacity`), so the env-tunable
-    //     `WT_OUTBOUND_CHANNEL_CAPACITY` keeps them in lock-step with no
-    //     hardcoded duplicate, and
-    //   * the resolved default is strictly larger than actix's
-    //     `DEFAULT_CAPACITY` (16) so a future accidental revert to the tiny
-    //     default mailbox fails CI.
+    // `WtChatSession::started` calls `ctx.set_mailbox_capacity(
+    // wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY)`. The
+    // single actor mailbox fronts two independent policy-aware channels —
+    // unistream (env-tunable) and datagram (fixed) — and a `Message` only
+    // splits between them *after* leaving the mailbox, so the mailbox holds
+    // a mix of both. Sizing it to the SUM keeps it from being the overflow
+    // point in front of either channel for any traffic mix or env tuning
+    // (`max()` would let a datagram burst drop at the mailbox once the
+    // unistream cap is raised). Constructing a live `WtChatSession` requires
+    // a populated `SessionLogic` (NATS, addresses, …), so rather than read
+    // the capacity back off a running context we guard the invariant at the
+    // value level:
+    //   * the mailbox capacity is derived from the SAME constants/resolver
+    //     the channels are built with (`wt_outbound_channel_capacity()` /
+    //     `resolve_wt_outbound_channel_capacity` + `WT_DATAGRAM_CHANNEL_CAPACITY`),
+    //     so the env-tunable `WT_OUTBOUND_CHANNEL_CAPACITY` keeps them in
+    //     lock-step with no hardcoded duplicate, and
+    //   * it is >= each channel's capacity (and their sum) and strictly
+    //     larger than actix's `DEFAULT_CAPACITY` (16) so a future accidental
+    //     revert to the tiny default mailbox — or to sizing from only one
+    //     channel — fails CI.
     // -----------------------------------------------------------------------
 
     /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
     const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
 
+    /// The value `started()` feeds to `set_mailbox_capacity`, expressed via
+    /// the pure resolver so the test never races the memoised `OnceLock` or
+    /// the real process env. Must mirror the `started()` expression exactly.
+    fn wt_mailbox_capacity(env: Option<&str>) -> usize {
+        resolve_wt_outbound_channel_capacity(env) + WT_DATAGRAM_CHANNEL_CAPACITY
+    }
+
     #[test]
-    fn wt_mailbox_capacity_matches_unistream_outbound_channel() {
-        // `started()` feeds `wt_outbound_channel_capacity()` to
-        // `set_mailbox_capacity`; the unistream channel is built from the
-        // same resolver. Exercise the pure resolver so the test never races
-        // the memoised `OnceLock` or the real process env.
-        //
-        // Unset env → default; both must exceed actix's dumb 16-slot mailbox
-        // so overflow lands on the policy-aware channel.
+    fn wt_mailbox_capacity_covers_both_outbound_channels() {
+        // Default env: mailbox = unistream default + datagram cap, so it can
+        // hold a full backlog for either channel without dropping at the
+        // mailbox before the channel's priority-drop runs.
         assert_eq!(
-            resolve_wt_outbound_channel_capacity(None),
-            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+            wt_mailbox_capacity(None),
+            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT + WT_DATAGRAM_CHANNEL_CAPACITY,
         );
-        // Compile-time guard: issue #1057 requires the WT mailbox capacity
-        // to exceed actix's dumb default (16) so overflow lands on the
-        // policy-aware outbound channel, not the indiscriminate mailbox.
+        // The mailbox must be >= BOTH channels individually AND their sum —
+        // the PR #1060 review invariant (a `max()`-sized mailbox would still
+        // drop datagram traffic once the unistream cap is tuned up).
+        assert!(wt_mailbox_capacity(None) >= WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT);
+        assert!(wt_mailbox_capacity(None) >= WT_DATAGRAM_CHANNEL_CAPACITY);
+        // Compile-time guard: well clear of actix's dumb 16-slot default.
         const _: () =
             assert!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT > ACTIX_DEFAULT_MAILBOX_CAPACITY);
-        // A deploy-time override is honoured verbatim, keeping the mailbox in
-        // lock-step with the channel capacity it is built from.
-        assert_eq!(resolve_wt_outbound_channel_capacity(Some("1024")), 1024);
+        // A deploy-time override of the unistream cap is honoured verbatim
+        // and the datagram cap is still added on top, so the mailbox stays
+        // sized for both channels even when operators tune the env var up.
+        assert_eq!(
+            wt_mailbox_capacity(Some("1024")),
+            1024 + WT_DATAGRAM_CHANNEL_CAPACITY,
+        );
     }
 
     /// Helper: construct an `is_audio` test packet of the requested size.

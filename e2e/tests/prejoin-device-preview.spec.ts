@@ -172,7 +172,13 @@ test.describe("Pre-join device preview (#959)", () => {
     // whole flow on decode timing — the live-track guarantee is the load-bearer.
     // A MediaStream serializes to `{}` over the protocol, so toHaveJSProperty
     // can't match it — assert via evaluate that srcObject is a non-null stream.
-    expect(await video.evaluate((v) => (v as HTMLVideoElement).srcObject !== null)).toBe(true);
+    // Poll: getUserMedia resolves and attaches the stream a moment after the
+    // toggle click, so a one-shot read races the async acquire.
+    await expect
+      .poll(async () => video.evaluate((v) => (v as HTMLVideoElement).srcObject !== null), {
+        timeout: 10_000,
+      })
+      .toBe(true);
     await expect
       .poll(async () => (await videoState(page)).liveVideoTracks, { timeout: 15_000 })
       .toBeGreaterThan(0);
@@ -197,7 +203,13 @@ test.describe("Pre-join device preview (#959)", () => {
     await cameraToggle.click();
     await expect(cameraToggle).toHaveAttribute("aria-pressed", "false");
     await expect(cameraToggle).toHaveClass(/danger/);
-    await expect(video).toHaveJSProperty("srcObject", null);
+    // The stream detaches asynchronously after the toggle, so poll for the
+    // cleared srcObject rather than reading it one-shot.
+    await expect
+      .poll(async () => video.evaluate((v) => (v as HTMLVideoElement).srcObject === null), {
+        timeout: 10_000,
+      })
+      .toBe(true);
   });
 
   test("mic toggle drives the input-level meter aria state", async ({ page }) => {
@@ -275,12 +287,15 @@ test.describe("Pre-join device preview (#959)", () => {
       await expect
         .poll(async () => (await videoState(page)).liveVideoTracks, { timeout: 15_000 })
         .toBeGreaterThan(0);
-      // MediaStream serializes to {}, so assert non-null via evaluate.
-      expect(
-        await page
-          .locator(CAMERA_VIDEO)
-          .evaluate((v) => (v as HTMLVideoElement).srcObject !== null),
-      ).toBe(true);
+      // MediaStream serializes to {}, so assert non-null via evaluate. Poll:
+      // re-acquisition after selectOption is async, so a one-shot read races it.
+      await expect
+        .poll(
+          async () =>
+            page.locator(CAMERA_VIDEO).evaluate((v) => (v as HTMLVideoElement).srcObject !== null),
+          { timeout: 10_000 },
+        )
+        .toBe(true);
       // The chosen device id is persisted.
       const persisted = await page.evaluate((k) => localStorage.getItem(k), LS_CAMERA_ID);
       expect(persisted).toBe(uniqueValues[1]);

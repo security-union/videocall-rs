@@ -39,4 +39,5 @@ pub mod waiting_room;
 mod canvas_generator;
 mod peer_list;
 mod peer_tile;
+pub mod pre_join_preview;
 pub mod pre_join_settings_card;

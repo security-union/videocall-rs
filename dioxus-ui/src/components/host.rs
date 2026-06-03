@@ -19,7 +19,10 @@
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
-use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
+use crate::context::{
+    load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
+    save_preferred_speaker_id, TransportPreferenceCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use futures::channel::mpsc;
@@ -248,10 +251,60 @@ pub fn Host(
         let value = client.clone();
         use_effect(move || {
             let state_for_loaded = state.clone();
+            let client_for_loaded = value.clone();
             let mut s = state.borrow_mut();
             if !s.initialized {
                 s.media_devices.on_loaded = VcCallback::from(move |_| {
                     let mut s = state_for_loaded.borrow_mut();
+
+                    // Honor the pre-join device selection (issue #959): resolve
+                    // the persisted device ids against the live device lists,
+                    // falling back to the first device when a stored id no
+                    // longer exists. This is what makes the camera/mic/speaker
+                    // chosen on the pre-join screen the ones actually used when
+                    // capture starts.
+                    let (stored_cam, stored_mic, stored_spk) = load_preferred_device_ids();
+                    let cam_ids: Vec<String> = s
+                        .media_devices
+                        .video_inputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    let mic_ids: Vec<String> = s
+                        .media_devices
+                        .audio_inputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    let spk_ids: Vec<String> = s
+                        .media_devices
+                        .audio_outputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    if let Some(id) = restore_device_id(stored_cam.as_deref(), &cam_ids) {
+                        s.media_devices.video_inputs.select(&id);
+                        save_preferred_camera_id(&id);
+                    }
+                    if let Some(id) = restore_device_id(stored_mic.as_deref(), &mic_ids) {
+                        s.media_devices.audio_inputs.select(&id);
+                        save_preferred_mic_id(&id);
+                    }
+                    if let Some(id) = restore_device_id(stored_spk.as_deref(), &spk_ids) {
+                        s.media_devices.audio_outputs.select(&id);
+                        save_preferred_speaker_id(&id);
+                        // Apply the persisted speaker to the shared audio sink so
+                        // the pre-join speaker choice is honored in-meeting.
+                        // No-op where setSinkId is unsupported (handled inside
+                        // SharedAudioContext::update_speaker_device). (issue #959)
+                        if let Err(e) = client_for_loaded.update_speaker_device(Some(id.clone())) {
+                            log::warn!("Failed to apply pre-join speaker selection: {e:?}");
+                        }
+                    }
+
                     let video_id = s.media_devices.video_inputs.selected();
                     let audio_id = s.media_devices.audio_inputs.selected();
                     let num_cameras = s.media_devices.video_inputs.devices().len();
@@ -526,6 +579,8 @@ pub fn Host(
         Rc::new(move |audio: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_inputs.select(&audio.device_id);
+            // Persist so the next pre-join screen restores this mic. (issue #959)
+            save_preferred_mic_id(&audio.device_id);
             if s.microphone.select(audio.device_id.clone()) {
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
@@ -541,6 +596,8 @@ pub fn Host(
         Rc::new(move |video: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.video_inputs.select(&video.device_id);
+            // Persist so the next pre-join screen restores this camera. (issue #959)
+            save_preferred_camera_id(&video.device_id);
             if s.camera.select(video.device_id.clone()) {
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
@@ -557,6 +614,8 @@ pub fn Host(
         Rc::new(move |speaker: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_outputs.select(&speaker.device_id);
+            // Persist so the next pre-join screen restores this speaker. (issue #959)
+            save_preferred_speaker_id(&speaker.device_id);
             if let Err(e) = client.update_speaker_device(Some(speaker.device_id.clone())) {
                 log::error!("Failed to update speaker device: {e:?}");
             }

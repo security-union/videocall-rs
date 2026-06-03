@@ -689,6 +689,66 @@ lazy_static! {
     )
     .expect("Failed to create relay_viewport_updates_total metric");
 
+    /// Simulcast VIDEO packets INTENTIONALLY not forwarded because the
+    /// receiver's recorded layer preference (#989, Phase 1b) for the source
+    /// session selects a DIFFERENT simulcast layer than this packet carries.
+    ///
+    /// Like [`RELAY_VIEWPORT_FILTERED_TOTAL`] this is an expected,
+    /// bandwidth-saving drop — NOT a backpressure loss — so it is deliberately
+    /// kept off `relay_packet_drops_total`. It runs strictly AFTER the viewport
+    /// filter, so a packet counted here was already viewport-wanted.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time), same
+    /// caveats as the other room-labeled counters above.
+    pub static ref RELAY_LAYER_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_layer_filtered_total",
+        "Total simulcast VIDEO packets intentionally dropped by per-receiver layer selection (layer != receiver's recorded preference for the source) (#989)",
+        &["room"]
+    )
+    .expect("Failed to create relay_layer_filtered_total metric");
+
+    /// Simulcast VIDEO packets that PASSED the layer filter and were forwarded —
+    /// the denominator complement of `relay_layer_filtered_total` (#989). Counts
+    /// VIDEO packets that reached the layer filter (i.e. already passed the
+    /// viewport filter) and were forwarded, whether because no preference was
+    /// recorded (no-op / fail-open), the layer matched, or the layer id was 0
+    /// (base). The "% layer-filtered" panel is `filtered / (filtered + forwarded)`.
+    ///
+    /// CARDINALITY: `room` only. No per-source/session label (session IDs churn
+    /// on reconnect).
+    pub static ref RELAY_LAYER_FORWARDED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_layer_forwarded_total",
+        "Total simulcast VIDEO packets forwarded after passing per-receiver layer selection (matched, base layer 0, or fail-open). Denominator complement of relay_layer_filtered_total (#989)",
+        &["room"]
+    )
+    .expect("Failed to create relay_layer_forwarded_total metric");
+
+    /// LAYER_PREFERENCE control-packet update outcomes, per room (#989).
+    ///
+    /// Mirrors [`RELAY_VIEWPORT_UPDATES_TOTAL`]: makes the DoS guards in
+    /// `try_intercept_layer_preference` observable (the cap and the rate limit
+    /// would otherwise fire silently) and gives plain "LAYER_PREFERENCE
+    /// received" visibility via the `accepted` outcome.
+    ///
+    /// `outcome` is bounded — exactly 4 values:
+    /// - `accepted`:              update was applied to the receiver's map.
+    /// - `rate_limited`:          arrived within
+    ///   `LAYER_PREFERENCE_MIN_UPDATE_INTERVAL` of the last accepted update;
+    ///   consumed but ignored.
+    /// - `truncated`:             the entries list exceeded
+    ///   `LAYER_PREFERENCE_MAX_ENTRIES` and was capped (fail-open on the
+    ///   excess). Counted in ADDITION to `accepted` for the same packet.
+    /// - `ignored_other_subject`: arrived on a subject other than the receiver's
+    ///   own; expected for normal NATS fan-out and dropped without mutating state.
+    ///
+    /// CARDINALITY: bounded — `room` × 4 outcomes. No per-session label.
+    pub static ref RELAY_LAYER_PREFERENCE_UPDATES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_layer_preference_updates_total",
+        "LAYER_PREFERENCE control-packet update outcomes per room (accepted|rate_limited|truncated|ignored_other_subject) (#989)",
+        &["room", "outcome"]
+    )
+    .expect("Failed to create relay_layer_preference_updates_total metric");
+
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_depth",

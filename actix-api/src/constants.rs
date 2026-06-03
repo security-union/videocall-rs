@@ -279,6 +279,32 @@ pub const VIEWPORT_MAX_SESSION_IDS: usize = 64;
 /// human-driven scroll cadence.
 pub const VIEWPORT_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Maximum number of per-source layer-preference entries the relay will accept
+/// from a single LAYER_PREFERENCE control packet (#989, Phase 1b).
+///
+/// `LayerPreferencePacket.entries` is an unbounded `repeated`. As with
+/// [`VIEWPORT_MAX_SESSION_IDS`] the relay's NATS fan-out delivers every packet
+/// to every receiver, so an attacker spamming a huge entries list would impose
+/// O(list length) work per packet. This cap bounds that work. It is sized to
+/// match the viewport cap (one layer preference per visible tile), so a
+/// legitimate client rendering up to a 64-tile grid is never truncated.
+/// Packets exceeding the cap have their list truncated to the first
+/// [`LAYER_PREFERENCE_MAX_ENTRIES`] entries (fail-open on the excess rather
+/// than rejecting the whole update).
+pub const LAYER_PREFERENCE_MAX_ENTRIES: usize = VIEWPORT_MAX_SESSION_IDS;
+
+/// Minimum interval between accepted LAYER_PREFERENCE updates for a single
+/// session (#989, Phase 1b).
+///
+/// Mirrors [`VIEWPORT_MIN_UPDATE_INTERVAL`]: layer-preference packets are
+/// client-driven (a receiver switching the layer it wants for a tile) and
+/// should be infrequent. This throttle bounds how often a session can mutate
+/// its layer-preference map, blunting a client that spams updates to force
+/// repeated map rebuilds. Updates that arrive sooner than this after the last
+/// accepted one are dropped (the packet is still consumed and never
+/// re-broadcast).
+pub const LAYER_PREFERENCE_MIN_UPDATE_INTERVAL: Duration = VIEWPORT_MIN_UPDATE_INTERVAL;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2612,6 +2612,13 @@ impl Inner {
                 // filtering and never forwards it to peers. A client should
                 // never receive one; ignore it defensively if it ever appears.
             }
+            Ok(PacketType::LAYER_PREFERENCE) => {
+                // LAYER_PREFERENCE is a client -> relay ONLY control packet
+                // (#989, Phase 1b): the relay consumes it to drop unselected
+                // simulcast layers and never forwards it to peers. Like
+                // VIEWPORT, a client should never receive one; ignore it
+                // defensively if it ever appears.
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

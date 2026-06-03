@@ -15,7 +15,7 @@
 //! ## Filter semantics (see issue #1056)
 //!
 //! - **Within a group** the selected checkboxes are OR'd (union). Selecting
-//!   *both* options in a binary group (e.g. `I own` + `I don't own`) imposes no
+//!   *both* options in a binary group (e.g. `Owned` + `Not Owned`) imposes no
 //!   constraint. Selecting *neither* is also treated as "no constraint" — an
 //!   empty group never hides everything, which avoids the surprising
 //!   all-empty list when the user unticks the last box.
@@ -104,9 +104,9 @@ impl AttendedWithin {
 /// module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterState {
-    /// Ownership group — `I own`.
+    /// Ownership group — `Owned`.
     pub own_owned: bool,
-    /// Ownership group — `I don't own`.
+    /// Ownership group — `Not Owned`.
     pub own_not_owned: bool,
     /// Status group — `Active`.
     pub status_active: bool,
@@ -211,8 +211,8 @@ impl SortKey {
             SortKey::LastActive => "Last active",
             SortKey::LastAttended => "Last attended",
             SortKey::ActiveVsEnded => "Active vs ended",
-            SortKey::IOwn => "I own",
-            SortKey::MeetingId => "Meeting id",
+            SortKey::IOwn => "Owned",
+            SortKey::MeetingId => "Meeting ID",
         }
     }
 

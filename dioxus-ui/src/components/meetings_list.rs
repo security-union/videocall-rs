@@ -183,28 +183,61 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
     // a filter is active.
     let feed_empty = meetings().is_empty();
     let filtered_empty = !feed_empty && visible.is_empty();
+    // The filter/sort controls live on the header row (issue #1), so they must
+    // only render once the feed is expanded, loaded, authenticated, error-free,
+    // and actually has rows to refine — matching when the list body shows rows.
+    let show_controls =
+        expanded() && !loading() && !unauthenticated() && error().is_none() && !feed_empty;
 
     rsx! {
         div { class: "meetings-list-container",
-            button {
-                class: "meetings-list-toggle",
-                onclick: toggle_expanded,
-                r#type: "button",
-                svg {
-                    class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "20",
-                    height: "20",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    polyline { points: "6 9 12 15 18 9" }
+            // Header row: collapsible "Meetings" title on the left, the
+            // filter/sort controls on the right (space-between).
+            div { class: "meetings-list-header",
+                button {
+                    class: "meetings-list-toggle",
+                    onclick: toggle_expanded,
+                    r#type: "button",
+                    svg {
+                        class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "20",
+                        height: "20",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        polyline { points: "6 9 12 15 18 9" }
+                    }
+                    span { "Meetings" }
+                    span { class: "meeting-count", "({meetings().len()})" }
                 }
-                span { "Meetings" }
-                span { class: "meeting-count", "({meetings().len()})" }
+
+                if show_controls {
+                    MeetingsToolbar {
+                        filter: filter(),
+                        sort: sort(),
+                        active_filter_count,
+                        filter_open: filter_open(),
+                        sort_open: sort_open(),
+                        on_filter_change: set_filter,
+                        on_sort_change: set_sort,
+                        on_toggle_filter: move |_| {
+                            let open = !filter_open();
+                            filter_open.set(open);
+                            if open { sort_open.set(false); }
+                        },
+                        on_toggle_sort: move |_| {
+                            let open = !sort_open();
+                            sort_open.set(open);
+                            if open { filter_open.set(false); }
+                        },
+                        on_close_filter: move |_| filter_open.set(false),
+                        on_close_sort: move |_| sort_open.set(false),
+                    }
+                }
             }
 
             if expanded() {
@@ -227,30 +260,6 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
                     } else if feed_empty {
                         div { class: "meetings-empty", "No meetings yet" }
                     } else {
-                        // Filter + sort toolbar. Always shown when the feed has
-                        // rows so the user can refine even a long list.
-                        MeetingsToolbar {
-                            filter: filter(),
-                            sort: sort(),
-                            active_filter_count,
-                            filter_open: filter_open(),
-                            sort_open: sort_open(),
-                            on_filter_change: set_filter,
-                            on_sort_change: set_sort,
-                            on_toggle_filter: move |_| {
-                                let open = !filter_open();
-                                filter_open.set(open);
-                                if open { sort_open.set(false); }
-                            },
-                            on_toggle_sort: move |_| {
-                                let open = !sort_open();
-                                sort_open.set(open);
-                                if open { filter_open.set(false); }
-                            },
-                            on_close_filter: move |_| filter_open.set(false),
-                            on_close_sort: move |_| sort_open.set(false),
-                        }
-
                         if filtered_empty {
                             div { class: "meetings-empty meetings-empty-filtered",
                                 span { "No meetings match your filters" }
@@ -458,8 +467,9 @@ fn MeetingItem(
     }
 }
 
-/// Filter + sort toolbar shown above the meetings list whenever the feed has
-/// rows. Owns no business state — it renders the current `filter`/`sort` props
+/// Filter + sort toolbar rendered on the right of the "Meetings" header row
+/// (same line as the collapsible title) whenever the feed has rows. Owns no
+/// business state — it renders the current `filter`/`sort` props
 /// and bubbles every change up to `MeetingsList`, which persists it. Splitting
 /// it out keeps `MeetingsList`'s render tree small and lets the popover /
 /// dropdown manage their own open state via props.
@@ -493,28 +503,11 @@ fn MeetingsToolbar(
     };
     let filters_active = active_filter_count > 0;
 
-    // Stable ids on the trigger buttons so the fixed-position popovers can
-    // anchor to their bounding rects and focus can return to them on close.
+    // Stable ids on the trigger buttons so focus can return to them on close.
+    // Popover positioning is now pure CSS (absolute, anchored to the
+    // `.meetings-toolbar-group` wrapper) — no JS rect math.
     const FILTER_BTN_ID: &str = "meetings-filter-trigger";
     const SORT_BTN_ID: &str = "meetings-sort-trigger";
-    // Keep these in sync with `.meetings-filter-popover` / `.meetings-sort-popover`
-    // `min-width` in global.css — they drive the right-alignment math.
-    const FILTER_POPOVER_W: f64 = 220.0;
-    const SORT_POPOVER_W: f64 = 180.0;
-
-    // Anchor coordinates, recomputed whenever an open flag flips. The trigger
-    // buttons always render, so their rects are available before the popover
-    // mounts.
-    let filter_anchor = if filter_open {
-        anchor_below_trigger(FILTER_BTN_ID, FILTER_POPOVER_W)
-    } else {
-        AnchorPos::default()
-    };
-    let sort_anchor = if sort_open {
-        anchor_below_trigger(SORT_BTN_ID, SORT_POPOVER_W)
-    } else {
-        AnchorPos::default()
-    };
 
     rsx! {
         div { class: "meetings-toolbar",
@@ -560,9 +553,8 @@ fn MeetingsToolbar(
                         class: "meetings-popover meetings-filter-popover",
                         role: "dialog",
                         aria_label: "Filter meetings",
-                        // `position: fixed` (set in CSS) + JS-anchored coords so
-                        // the panel escapes the card's clipped scroll region.
-                        style: "left: {filter_anchor.left}px; top: {filter_anchor.top}px;",
+                        // Position is pure CSS (absolute, anchored to the
+                        // toolbar-group wrapper) — see `.meetings-popover`.
                         // Escape closes; stop propagation so a click inside the
                         // panel never reaches the backdrop.
                         onkeydown: move |e: KeyboardEvent| {
@@ -584,7 +576,7 @@ fn MeetingsToolbar(
                                         on_filter_change.call(FilterState { own_owned: e.checked(), ..filter });
                                     },
                                 }
-                                span { "I own" }
+                                span { "Owned" }
                             }
                             label { class: "meetings-filter-option",
                                 input {
@@ -594,7 +586,7 @@ fn MeetingsToolbar(
                                         on_filter_change.call(FilterState { own_not_owned: e.checked(), ..filter });
                                     },
                                 }
-                                span { "I don't own" }
+                                span { "Not Owned" }
                             }
                         }
 
@@ -707,7 +699,6 @@ fn MeetingsToolbar(
                     div {
                         class: "meetings-popover meetings-sort-popover",
                         aria_label: "Sort by",
-                        style: "left: {sort_anchor.left}px; top: {sort_anchor.top}px;",
                         onkeydown: move |e: KeyboardEvent| {
                             if e.key() == Key::Escape {
                                 e.stop_propagation();
@@ -983,54 +974,6 @@ fn hide_meeting_info_tooltip() {
         let html_el: web_sys::HtmlElement = el.unchecked_into();
         let _ = html_el.class_list().remove_1("is-visible");
     }
-}
-
-/// Viewport-anchored coordinates for a `position: fixed` popover.
-///
-/// `position: fixed` is used (rather than a body portal or `position:
-/// absolute`) so the popover escapes the meetings card's clipped scroll region
-/// — `.meetings-list-container { overflow: hidden }` and
-/// `.meetings-list-content { overflow-y: auto; max-height: 260px }` would
-/// otherwise crop an absolutely-positioned dropdown. Fixed elements are laid
-/// out relative to the viewport and are not clipped by ancestor `overflow`
-/// (the meetings card's ancestry establishes no transform/filter containing
-/// block), so the dropdown floats above the page.
-#[derive(Clone, Copy, PartialEq, Default)]
-pub(crate) struct AnchorPos {
-    pub left: f64,
-    pub top: f64,
-}
-
-/// Read a trigger button's bounding rect (by element id) and compute the
-/// top-left for a popover that drops below it and is right-aligned to its right
-/// edge. Falls back to `(0,0)` if the element isn't in the DOM yet. The final
-/// viewport clamp (so the panel never overflows narrow screens) is applied in
-/// CSS via `max-width`/`max-height` plus a JS left-edge guard here.
-fn anchor_below_trigger(trigger_id: &str, popover_min_width: f64) -> AnchorPos {
-    let doc = gloo_utils::document();
-    let Some(el) = doc.get_element_by_id(trigger_id) else {
-        return AnchorPos::default();
-    };
-    let rect = el.get_bounding_client_rect();
-    let win = gloo_utils::window();
-    let vw = win
-        .inner_width()
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let gap = 6.0;
-    let edge_margin = 8.0;
-    let top = rect.bottom() + gap;
-    // Right-align the popover to the trigger's right edge.
-    let mut left = rect.right() - popover_min_width;
-    // Clamp to the viewport on narrow screens so it never spills off-screen.
-    if left < edge_margin {
-        left = edge_margin;
-    }
-    if left + popover_min_width + edge_margin > vw {
-        left = (vw - popover_min_width - edge_margin).max(edge_margin);
-    }
-    AnchorPos { left, top }
 }
 
 /// Return keyboard focus to a trigger button by id. Called when a popover

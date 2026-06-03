@@ -115,7 +115,7 @@ async function openSortPopover(page: Page): Promise<void> {
 /**
  * Toggle a labelled checkbox inside the currently-open filter popover. The
  * checkboxes are wrapped in `<label>`s whose text is the visible option name
- * ("I own", "I don't own", "Active", "Ended"), so we target the input via the
+ * ("Owned", "Not Owned", "Active", "Ended"), so we target the input via the
  * label text using Playwright's accessible-name matching.
  */
 async function checkFilterOption(page: Page, label: string): Promise<void> {
@@ -161,7 +161,7 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await deleteAllOwnedMeetings(email, name);
   });
 
-  test("filter by ownership: 'I own' keeps owned rows and shows the count badge", async ({
+  test("filter by ownership: 'Owned' keeps owned rows and shows the count badge", async ({
     context,
     baseURL,
     page,
@@ -188,9 +188,9 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await page.waitForTimeout(1500);
     await waitForMeetingsRowCount(page, 2);
 
-    // Apply "I own".
+    // Apply "Owned".
     await openFilterPopover(page);
-    await checkFilterOption(page, "I own");
+    await checkFilterOption(page, "Owned");
 
     // Only the owned row survives.
     await waitForMeetingsRowCount(page, 1);
@@ -280,7 +280,7 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await deleteAllOwnedMeetings(email, name);
   });
 
-  test("sort: changing to 'Meeting id' and toggling direction flips the row order", async ({
+  test("sort: changing to 'Meeting ID' and toggling direction flips the row order", async ({
     context,
     baseURL,
     page,
@@ -312,17 +312,17 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     // SortState reproduces today's behaviour.
     expect(await renderedRowIds(page)).toEqual([idC, idB, idA]);
 
-    // Switch the sort key to "Meeting id". Default direction is DESC, so the
+    // Switch the sort key to "Meeting ID". Default direction is DESC, so the
     // lexicographic order is reversed → c, b, a (same as above by coincidence
     // of the timestamp ordering, so we don't assert here — we assert after the
     // direction toggle where the orders provably diverge).
     await openSortPopover(page);
-    await page.locator(SORT_OPTION, { hasText: "Meeting id" }).click();
+    await page.locator(SORT_OPTION, { hasText: "Meeting ID" }).click();
     // Selecting an option closes the popover.
     await expect(page.locator(SORT_POPOVER)).toHaveCount(0);
-    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting id");
+    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting ID");
 
-    // Meeting id DESC → c, b, a.
+    // Meeting ID DESC → c, b, a.
     expect(await renderedRowIds(page)).toEqual([idC, idB, idA]);
 
     // Toggle direction to ASC → the order flips to a, b, c.
@@ -388,7 +388,7 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     const name = "MfsPersistUser";
     await injectSessionCookie(context, { baseURL, email, name });
 
-    // Two meetings so the persisted "I own" filter has something to keep AND
+    // Two meetings so the persisted "Owned" filter has something to keep AND
     // something to drop after reload, proving the restored filter is applied,
     // not just stored.
     const ownerEmail = email;
@@ -410,14 +410,14 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     await page.waitForTimeout(1500);
     await waitForMeetingsRowCount(page, 2);
 
-    // Apply a non-default filter ("I own") and a non-default sort ("Meeting id").
+    // Apply a non-default filter ("Owned") and a non-default sort ("Meeting ID").
     await openFilterPopover(page);
-    await checkFilterOption(page, "I own");
+    await checkFilterOption(page, "Owned");
     await waitForMeetingsRowCount(page, 1);
 
     await openSortPopover(page);
-    await page.locator(SORT_OPTION, { hasText: "Meeting id" }).click();
-    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting id");
+    await page.locator(SORT_OPTION, { hasText: "Meeting ID" }).click();
+    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting ID");
 
     // The storage keys are written.
     const storedFilter = await page.evaluate((k) => localStorage.getItem(k), FILTER_STORAGE_KEY);
@@ -434,7 +434,7 @@ test.describe("Meetings list filter + sort toolbar (issue #1056)", () => {
     expect(await renderedRowIds(page)).toEqual([ownedId]);
 
     // The restored sort key is reflected on the trigger and the badge persists.
-    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting id");
+    await expect(page.locator(SORT_TRIGGER)).toContainText("Meeting ID");
     await expect(page.locator(FILTER_BADGE)).toHaveText("1");
 
     await deleteAllOwnedMeetings(ownerEmail, ownerName);

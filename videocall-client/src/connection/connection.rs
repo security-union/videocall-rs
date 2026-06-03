@@ -26,7 +26,7 @@ use super::webmedia::MediaStreamKey;
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
-use gloo::timers::callback::Interval;
+use gloo::timers::callback::{Interval, Timeout};
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -36,6 +36,26 @@ use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket, Tran
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
+
+/// Delay before re-sending a media-state heartbeat exactly once after a
+/// mute / camera-off transition.
+///
+/// A state-change heartbeat can be SUPPRESSED on the receiver by its
+/// per-stream media-freshness window: a mute fires immediately after a fresh
+/// audio/video frame, so the receiver keeps the stale `enabled = true` until
+/// that frame ages out of the window — and absent any retry it would only
+/// re-evaluate on the next 5s keepalive, producing the ~5s mute/camera-off
+/// lag. We therefore re-send the heartbeat once, just after the receiver's
+/// continuous-stream freshness window (`LIVE_STREAM_FRESH_WINDOW_MS = 500ms`
+/// in `decode::peer_decode_manager`) has elapsed; by the time this copy
+/// lands, no fresh frame remains and the `false` is applied.
+///
+/// MUST exceed `LIVE_STREAM_FRESH_WINDOW_MS`. 600ms = that 500ms window plus
+/// a 100ms margin for clock skew and network jitter. The resend reads LIVE
+/// state at fire time, so a mute-then-unmute within the delay re-sends the
+/// final (unmuted) state and causes no false-mute flicker. Delivery is
+/// reliable (Control stream), so a single resend suffices.
+const STATE_CHANGE_RESEND_DELAY_MS: u32 = 600;
 
 #[derive(Clone, Copy, Debug)]
 enum Status {
@@ -59,6 +79,11 @@ pub struct Connection {
     /// Not wrapped in `Rc` because it is only accessed via `&self` methods,
     /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
     userid: RefCell<Option<String>>,
+    /// Pending one-shot resend of a state-change heartbeat (see
+    /// `schedule_state_resend`). Held so it can be cancelled if the
+    /// connection tears down within `STATE_CHANGE_RESEND_DELAY_MS`; a new
+    /// state change replaces (and thereby cancels) any still-pending resend.
+    state_resend: RefCell<Option<Timeout>>,
     url: String,
     /// Transport announced to peers in our outgoing heartbeats. This is a
     /// passive label of the locally-chosen transport; it does not affect
@@ -148,6 +173,7 @@ impl Connection {
             is_speaking: Rc::new(AtomicBool::new(false)),
             session_id: Rc::new(RefCell::new(None)),
             userid: RefCell::new(None),
+            state_resend: RefCell::new(None),
             url,
             transport_type,
         };
@@ -199,6 +225,11 @@ impl Connection {
         if let Some(heartbeat_monitor) = self.heartbeat_monitor.take() {
             heartbeat_monitor.cancel();
         }
+        // Cancel any pending state-change resend so it can't fire on a
+        // torn-down task after the connection closes.
+        if let Some(resend) = self.state_resend.borrow_mut().take() {
+            resend.cancel();
+        }
     }
 
     /// Send a packet via the reliable stream selected by `stream_key`.
@@ -231,6 +262,10 @@ impl Connection {
         if prev != enabled {
             log::debug!("Video enabled changed: {prev} -> {enabled}");
             self.send_immediate_heartbeat();
+            // Camera-off is suppressed on the receiver while the last video
+            // frame is still within its freshness window; resend once after
+            // it expires so the change isn't stuck until the 5s keepalive.
+            self.schedule_state_resend();
         }
     }
 
@@ -241,6 +276,10 @@ impl Connection {
         if prev != enabled {
             log::debug!("Audio enabled changed: {prev} -> {enabled}");
             self.send_immediate_heartbeat();
+            // Mute is suppressed on the receiver while the last audio frame is
+            // still within its freshness window; resend once after it expires
+            // so the change isn't stuck until the 5s keepalive.
+            self.schedule_state_resend();
         }
     }
 
@@ -255,11 +294,19 @@ impl Connection {
     }
 
     /// Send a heartbeat packet immediately so peers learn about state changes
-    /// without waiting for the next keepalive heartbeat tick.
+    /// (mute/unmute, camera on/off, screen-share on/off) without waiting for
+    /// the next keepalive heartbeat tick.
     ///
-    /// Uses datagrams for consistency with the periodic heartbeat path.
-    /// Heartbeats are expendable — a missed immediate heartbeat is followed
-    /// by the next periodic one within HEARTBEAT_KEEPALIVE_INTERVAL_MS.
+    /// Unlike the PERIODIC keepalive — which is genuinely expendable and rides
+    /// an unreliable datagram (a dropped one is replaced by the next tick
+    /// within HEARTBEAT_KEEPALIVE_INTERVAL_MS) — an immediate heartbeat is
+    /// EDGE-TRIGGERED: it carries a one-shot state transition. If it is lost,
+    /// nothing re-sends that edge; remote peers keep showing the stale state
+    /// until the next keepalive up to HEARTBEAT_KEEPALIVE_INTERVAL_MS (5s)
+    /// later — and on a lossy WebTransport link that keepalive datagram can
+    /// drop too, compounding the lag. So these are sent on the reliable,
+    /// ordered `Control` QUIC stream to guarantee delivery. WebSocket already
+    /// routes datagrams over its reliable TCP stream, so this is a no-op there.
     fn send_immediate_heartbeat(&self) {
         let userid = match self.userid.borrow().as_ref() {
             Some(id) => id.clone(),
@@ -280,8 +327,57 @@ impl Connection {
             &self.session_id,
             self.transport_type,
         ) {
-            self.task.send_packet_datagram(packet_wrapper);
+            // Reliable, ordered delivery: a state-change edge must not be lost
+            // on an unreliable datagram (see this fn's doc comment).
+            self.task
+                .send_packet(packet_wrapper, MediaStreamKey::Control);
         }
+    }
+
+    /// Re-send the current media-state heartbeat exactly once after
+    /// `STATE_CHANGE_RESEND_DELAY_MS`, so a mute / camera-off lands on the
+    /// receiver AFTER its short media-freshness window expires instead of
+    /// waiting for the 5s keepalive. See `STATE_CHANGE_RESEND_DELAY_MS`.
+    ///
+    /// Captures shared state by `Rc` and reads it at FIRE time (not now), so
+    /// a mute-then-unmute within the delay re-sends the final state and never
+    /// produces a false mute. Only meaningful for audio/camera-video, whose
+    /// receiver window is short; screen uses a deliberately long window and
+    /// is intentionally not resent here.
+    fn schedule_state_resend(&self) {
+        // No heartbeat identity yet → nothing to resend.
+        let userid = match self.userid.borrow().as_ref() {
+            Some(id) => id.clone(),
+            None => return,
+        };
+        let task = Rc::clone(&self.task);
+        let status = Rc::clone(&self.status);
+        let aes = Rc::clone(&self.aes);
+        let video_enabled = Rc::clone(&self.video_enabled);
+        let audio_enabled = Rc::clone(&self.audio_enabled);
+        let screen_enabled = Rc::clone(&self.screen_enabled);
+        let is_speaking = Rc::clone(&self.is_speaking);
+        let session_id = Rc::clone(&self.session_id);
+        let transport_type = self.transport_type;
+
+        let timeout = Timeout::new(STATE_CHANGE_RESEND_DELAY_MS, move || {
+            if !matches!(status.get(), Status::Connected) {
+                return;
+            }
+            if let Some(packet_wrapper) = build_heartbeat_packet(
+                &userid,
+                &video_enabled,
+                &audio_enabled,
+                &screen_enabled,
+                &is_speaking,
+                &aes,
+                &session_id,
+                transport_type,
+            ) {
+                task.send_packet(packet_wrapper, MediaStreamKey::Control);
+            }
+        });
+        *self.state_resend.borrow_mut() = Some(timeout);
     }
 
     pub fn set_speaking(&self, speaking: bool) {

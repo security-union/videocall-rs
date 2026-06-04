@@ -8,12 +8,15 @@
  * does NOT modify the committed `dioxus-ui/scripts/config.js` nor the
  * developer's gitignored `config.local.js`).
  *
- * ## What runs in CI here, and what needs a netsim capability
+ * ## What runs in the default suite vs. the `@impair` project
  *
- * The Playwright harness in `e2e/` has NO per-client downlink-shaping
- * (no `tc`/`netem`, no CDP `Network.emulateNetworkConditions`, no `?netsim=`
- * — that machinery lives only in `e2e/bots-app/`, a separate orchestrator that
- * cannot inject congestion into a Playwright BrowserContext). Therefore:
+ * Most tests run in the default `dioxus` suite. The per-receiver congestion
+ * DIVERGENCE test (issue #1080) instead needs per-client downlink shaping, which
+ * the harness now provides for the WS path via the toxiproxy `impair` compose
+ * profile + `helpers/downlink-impair.ts`. That test is tagged `@impair` and is
+ * grep-inverted OUT of the default `dioxus`/bvt suites — it runs ONLY under
+ * `--project=impair` against a stack started with `make e2e-up-impair`, so the
+ * standard CI Playwright run is unaffected. Therefore:
  *
  *   - RUNS IN CI:
  *       1. Flag-on multi-layer SEND is active (proxy: a healthy receiver's
@@ -37,18 +40,28 @@
  *       path for #1082 (the ladder machinery went N-generic but default behavior
  *       must be unchanged).
  *
- *   - NEEDS NETSIM (documented, NOT faked here) — issue #1080:
- *       2. Per-receiver congestion DIVERGENCE — forcing one receiver onto a
- *          LOWER layer than a healthy peer requires injecting PACKET LOSS on that
- *          one receiver's downlink. The chooser steps down on loss/PLI, not raw
- *          bandwidth (see `layer_chooser.rs`), and CDP
- *          `Network.emulateNetworkConditions` shapes throughput/latency only — it
- *          cannot inject loss, and on the reliable+ordered WS path a throttle
- *          merely delays frames (no `loss_per_sec`). So NO slice (not even
- *          WS-only) is achievable with CDP; this needs a loss-injecting netsim
- *          (tc/netem or the bots-app orchestrator). Left as `test.fixme` below
- *          with the full feasibility analysis inline (never green on a
- *          non-exercised path).
+ *   - RUNS UNDER THE `@impair` PROJECT ONLY (issue #1080):
+ *       2. Per-receiver congestion DIVERGENCE (WS path) — one of two
+ *          co-receivers has its WS downlink bandwidth-clamped via toxiproxy,
+ *          which overflows the relay's bounded per-receiver outbound channel;
+ *          the relay sheds that receiver's video frames, the resulting sequence
+ *          gaps push its `loss_per_sec` over the chooser's step-down threshold,
+ *          and ONLY that receiver drops to a lower layer (sender + healthy peer
+ *          unaffected). See `helpers/downlink-impair.ts` for the full verified
+ *          mechanism — the relay-side overflow is what manufactures the loss a
+ *          raw bandwidth throttle alone could not. This test is TAGGED `@impair`
+ *          and is grep-inverted OUT of the default `dioxus` suite + bvt0/bvt1
+ *          (playwright.config.ts), so the standard CI run never touches it. It
+ *          runs ONLY under `--project=impair`, which needs the toxiproxy
+ *          `impair` compose profile up (`make e2e-up-impair`; run via
+ *          `make e2e-impair`). See `TODO(ci)` in that test for the dedicated
+ *          CI-job follow-up.
+ *
+ *   - STILL BLOCKED (documented `test.fixme`) — issue #1080, WT path:
+ *       The same divergence over WebTransport/QUIC cannot be produced: toxiproxy
+ *       is TCP-only and Playwright's proxy cannot carry QUIC/UDP, and per-client
+ *       UDP `netem` needs an isolated netns the shared Playwright harness does
+ *       not provide. Kept as `test.fixme` with the concrete blocker inline.
  *
  * ## Capability-ceiling caveat (see helpers/simulcast-config.ts)
  *
@@ -71,6 +84,12 @@
 import { test, expect, chromium, Browser, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { enableSimulcastFlag } from "../helpers/simulcast-config";
+import {
+  routeDownlinkThroughProxy,
+  impairDownlink,
+  healDownlink,
+  assertProxyUp,
+} from "../helpers/downlink-impair";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -614,27 +633,53 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2. Per-receiver congestion DIVERGENCE — NEEDS NETSIM (documented).
+  // 2. Per-receiver congestion DIVERGENCE over WebSocket (issue #1080).
   //
-  // Forcing one of two co-receivers onto a LOWER layer than a healthy peer
-  // requires shaping THAT receiver's downlink (high loss / low bandwidth). The
-  // Playwright `e2e/` harness has no per-client netsim hook (no tc/netem, no
-  // CDP Network.emulateNetworkConditions wired for QUIC/WebTransport, no
-  // `?netsim=` — that lives only in `e2e/bots-app/`). Without it the divergence
-  // cannot be deterministically produced, so this is left as `fixme` (skipped,
-  // not faked). The body documents the exact two-receiver shape + the assertion
-  // it would make once a per-client downlink-shaping capability exists.
+  //    Now EXERCISED via the per-client downlink-impairment infra
+  //    (`helpers/downlink-impair.ts` + the toxiproxy `impair` compose profile).
+  //    One of two co-receivers has its WS downlink bandwidth-clamped, which
+  //    overflows the relay's bounded per-receiver outbound channel; the relay
+  //    sheds that receiver's VIDEO frames, the gaps raise its `loss_per_sec`
+  //    above the chooser's step-down threshold, and ONLY that receiver drops to
+  //    a lower layer. The sender and the healthy receiver share neither the
+  //    proxy nor the relay channel, so they are unaffected. See the helper's
+  //    header for the full verified mechanism.
+  //
+  //    GATING: tagged `@impair` — EXCLUDED from the default `dioxus` suite
+  //    (grepInvert in playwright.config.ts) and from bvt0/bvt1. It runs ONLY
+  //    under `--project=impair`, which requires the toxiproxy proxy to be up
+  //    (`make e2e-up-impair`). On the default CI Playwright run this test does
+  //    not even appear. `assertProxyUp()` below fails fast with an actionable
+  //    message if someone runs the impair project without the proxy.
+  //
+  //    SCOPE: WebSocket only — `routeDownlinkThroughProxy` pins the degraded
+  //    context to WS because toxiproxy is TCP-only. The WT/QUIC equivalent
+  //    stays `test.fixme` immediately below with its concrete blocker.
+  //
+  //    TODO(ci): this `@impair` test is NOT yet wired into a CI job. The
+  //    existing CI workflows run `--project=dioxus` (full, e2e-hcl.yaml) and
+  //    `--project=bvt1` (smoke, pr-check-e2e-smoke-hcl.yaml), neither of which
+  //    starts the toxiproxy `impair` profile, so this test never runs in CI
+  //    today. To run it in CI, add a dedicated job mirroring
+  //    pr-check-e2e-smoke-hcl.yaml but: (a) bring the stack up with
+  //    `COMPOSE_PROFILES=impair ... up -d` (or `make e2e-up-impair`), (b) wait
+  //    for toxiproxy's control API on :8474, and (c) run
+  //    `npx playwright test --project=impair`. Locally: `make e2e-impair`.
   // -------------------------------------------------------------------------
-  test.fixme("congested receiver pulls a LOWER layer than the healthy peer (needs netsim)", async ({
+  test("congested receiver pulls a LOWER video layer than the healthy peer (WS) @impair", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_diverge_${Date.now()}`;
 
-    // 1 publisher + 2 receivers. Receiver A: healthy. Receiver B: would have
-    // its downlink shaped to high-loss/low-bandwidth via a per-client netsim
-    // capability (e.g. CDP emulateNetworkConditions on the QUIC path, or a
-    // sidecar tc/netem keyed on B's client port — NOT available today).
+    // Fail fast (before launching 3 browsers) if the impair profile is not up.
+    await assertProxyUp();
+    // Start from a clean toxic state so a prior run's leftover toxic cannot
+    // pre-degrade the "let layers climb" phase.
+    await healDownlink();
+
+    // 1 publisher + 2 receivers. Healthy receiver: normal downlink. Degraded
+    // receiver: WS downlink routed through toxiproxy so we can clamp it.
     const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
@@ -661,38 +706,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await enableSimulcastFlag(healthyCtx, 3);
       await enableSimulcastFlag(degradedCtx, 3);
 
-      // TODO(#1080 — netsim): apply low-downlink / high-loss shaping to
-      // degradedCtx ONLY, e.g.
-      //   `await applyDownlinkNetsim(degradedCtx, { kbps: 150, lossPct: 20 })`.
-      //
-      // FEASIBILITY (investigated 2026-06-04, kept `fixme`): NOT achievable with
-      // the tools available to this Playwright harness today — and the blocker
-      // is deeper than "CDP can't shape WebTransport":
-      //
-      //   1. The receiver layer chooser steps DOWN on PACKET LOSS / PLI, not on
-      //      raw bandwidth. See `videocall-client/src/decode/layer_chooser.rs`:
-      //      `is_congested()` triggers on `loss_per_sec >= LOSS_STEP_DOWN_PER_SEC`
-      //      (packets shifted off the reorder window unseen) or `kf_per_sec`
-      //      (PLI rate). A throttled-but-lossless downlink does NOT raise either.
-      //
-      //   2. CDP `Network.emulateNetworkConditions` shapes THROUGHPUT + LATENCY
-      //      only — it has no packet-loss / jitter knob. So even on the WS path
-      //      (where, unlike WebTransport/QUIC, CDP can throttle the renderer's
-      //      socket) it would make media frames arrive LATE, not LOST.
-      //
-      //   3. WS is reliable + ordered (RFC6455 over TCP — see
-      //      `videocall-transport/src/websocket.rs`). Throttling delays delivery;
-      //      the reorder window still sees every frame, so `loss_per_sec` stays
-      //      ~0 and the chooser never steps down. The only WS loss source is the
-      //      SENDER-side 1 MB send-buffer backpressure drop (an UPLINK signal a
-      //      receiver-side downlink shaper cannot trigger).
-      //
-      // CONCLUSION: no meaningful slice (not even WS-only) can be un-`fixme`d
-      // with CDP alone. Deterministically forcing per-receiver divergence needs
-      // a LOSS-injecting netsim on the degraded client's downlink — e.g. a
-      // sidecar `tc qdisc … netem loss 20%` keyed to that client's 5-tuple, or
-      // the `e2e/bots-app/` netsim orchestrator extended to drive a Playwright
-      // BrowserContext. Both are out of scope for the current `e2e/` harness.
+      // Route the degraded receiver's media WebSocket through toxiproxy and pin
+      // it to WS. MUST run before its first navigation (it patches /config.js).
+      await routeDownlinkThroughProxy(degradedCtx);
 
       const pubPage = await pubCtx.newPage();
       const healthyPage = await healthyCtx.newPage();
@@ -705,29 +721,115 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await openPerformancePanel(healthyPage);
       await openPerformancePanel(degradedPage);
 
-      // After the adaptation window, the degraded receiver's chosen layer
-      // must be strictly LOWER than the healthy receiver's. The SENDER keeps
-      // sending and the HEALTHY receiver stays high (unaffected).
+      // PHASE 1 — let both receivers climb above the base layer on a healthy
+      // (un-impaired) downlink. Capability ceiling can clamp to a single layer
+      // on a weak runner; in that case there is no headroom to diverge, so SKIP
+      // rather than assert a false negative (mirrors tests 1 & 6).
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
             const degraded = await readVideoLayer(degradedPage);
-            if (!healthy || !degraded) return false;
-            return degraded.layerIndex < healthy.layerIndex;
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
           },
-          { timeout: 60_000, intervals: [1000, 2000, 3000] },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped the publisher to a single layer; there is no " +
+          "ladder headroom to diverge on this runner (see helpers/simulcast-config.ts)",
+      );
+
+      // Let the degraded receiver actually reach a layer above base before we
+      // impair it — otherwise "stepped down" is unobservable (it is already at 0).
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // PHASE 2 — clamp ONLY the degraded receiver's downlink hard enough to
+      // overflow the relay's 128-slot outbound channel (sheds video → loss →
+      // step down). ~120 kbps is far below one HD layer's byte rate.
+      await impairDownlink({ rateKb: 15 });
+
+      // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
+      // the healthy receiver's. The sender and the healthy receiver share
+      // neither the proxy nor the relay channel, so the healthy peer stays high.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            // Degraded may briefly read "Not receiving" mid-step-down; treat
+            // that as the base layer (the lowest possible — still a divergence
+            // only if the healthy peer is above base).
+            const degradedIdx = degraded?.layerIndex ?? 0;
+            if (!healthy) return false;
+            return degradedIdx < healthy.layerIndex;
+          },
+          { timeout: 90_000, intervals: [2000, 3000, 5000] },
         )
         .toBe(true);
 
-      // Healthy receiver unaffected: still decoding (not pinned to base).
+      // Healthy receiver unaffected: still decoding and still ABOVE the base
+      // layer (its layer was not dragged down by the other receiver's congestion).
       const healthyFinal = await readVideoLayer(healthyPage);
-      expect(healthyFinal).not.toBeNull();
+      expect(healthyFinal, "healthy receiver must still be decoding").not.toBeNull();
+      expect(
+        healthyFinal!.layerIndex,
+        "healthy receiver must stay above the base layer (unaffected by peer congestion)",
+      ).toBeGreaterThan(0);
+
+      // PHASE 4 — heal the downlink and prove the degraded receiver climbs back
+      // up (recovery), confirming the divergence was the impairment, not a
+      // permanent failure. Climb-back is conservative (hysteresis), so allow a
+      // generous window; if the runner is too slow to re-climb within it this is
+      // a soft check (the core divergence above is the load-bearing assertion).
+      await healDownlink();
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
     } finally {
+      // Always remove the toxic so a failure does not leave the proxy degraded
+      // for a subsequent run.
+      await healDownlink();
       await pubBrowser.close();
       await healthyBrowser.close();
       await degradedBrowser.close();
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented).
+  //
+  // The same relay-side overflow → loss → step-down mechanism applies on the
+  // WebTransport path, but we cannot impair ONE WT client from this Playwright
+  // harness:
+  //   - WebTransport is QUIC over UDP. toxiproxy (used by the WS case above) is
+  //     TCP-only, and Playwright's `newContext({ proxy })` only carries the
+  //     browser's TCP/HTTP(S) traffic — neither can shape QUIC/UDP datagrams.
+  //   - Per-client UDP impairment needs `tc qdisc … netem` keyed to that
+  //     client's 5-tuple in an ISOLATED netns/veth. Playwright runs Chromium on
+  //     the host in a SHARED netns, so a netem qdisc there degrades EVERY
+  //     context (sender + both receivers), not just the degraded one.
+  // When the bots-app netsim orchestrator can drive a per-client veth, this can
+  // reuse the WS case's identical assertion against a UDP netem hook.
+  // -------------------------------------------------------------------------
+  test.fixme("congested receiver pulls a LOWER video layer than the healthy peer (WT) — needs per-client UDP netem", async () => {
+    // Intentionally empty: the assertion is identical to the WS case above;
+    // only the per-client WT/QUIC downlink-impairment hook is missing (see the
+    // block comment for the concrete blocker). Kept as `fixme` so the gap is
+    // visible in the test report rather than silently absent.
   });
 });
 

@@ -29,6 +29,39 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::{ClientBuilder, Session};
 
+/// Maximum length-prefixed frame payload the relay will accept on a uni stream.
+///
+/// Mirrors the relay's `MAX_FRAME_SIZE` (`actix-api/src/constants.rs`,
+/// `4_000_000` — 4 MB **decimal**, not 4 MiB) and the real client's
+/// `PERSISTENT_STREAM_MAX_FRAME_SIZE` (`videocall-transport`). Kept as a local
+/// copy because the bot is a native binary and cannot depend on the wasm-only
+/// `videocall-transport` crate; the value MUST stay in sync with the relay so
+/// the sender's self-check is exactly the relay's accept threshold (no over-cap
+/// window where the bot emits a frame the relay then rejects).
+const MAX_FRAME_SIZE: usize = 4_000_000;
+
+/// Encode `payload` as a single `[u32 BE length][payload]` frame — the wire
+/// format the relay's `read_length_prefixed_frame` and the bot's own
+/// [`WebTransportClient::read_length_prefixed_stream`] both expect.
+///
+/// Returns `Err` if the payload exceeds [`MAX_FRAME_SIZE`] (which would also
+/// overflow the `u32` header), so an over-sized frame is dropped before a
+/// stream is opened rather than written and immediately torn down by the relay.
+fn frame_packet(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if data.len() > MAX_FRAME_SIZE {
+        return Err(anyhow::anyhow!(
+            "packet too large to frame: {} bytes (max {})",
+            data.len(),
+            MAX_FRAME_SIZE
+        ));
+    }
+    let len = data.len() as u32;
+    let mut out = Vec::with_capacity(4 + data.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
 use crate::config::ClientConfig;
 use crate::inbound_stats::InboundStats;
 use crate::transport::InboundHook;
@@ -285,7 +318,7 @@ impl WebTransportClient {
                 break;
             }
             let payload_len = u32::from_be_bytes(len_buf) as usize;
-            if payload_len > 4 * 1024 * 1024 {
+            if payload_len > MAX_FRAME_SIZE {
                 warn!(
                     "Abnormal frame size {} for {}, closing stream",
                     payload_len, user_id
@@ -314,20 +347,13 @@ impl WebTransportClient {
         // framing. The framing migration (67d9c572, 2026-04-07) updated the
         // relay + WASM client but missed this bot sender, so unframed writes
         // were silently dropped as malformed — the bot never became visible and
-        // its session was reaped after CLIENT_TIMEOUT (30s). See read_length_-
-        // prefixed_stream above for the symmetric inbound decode.
-        // Guard against frames larger than the relay's 4 MiB cap (and any value
-        // that would overflow the u32 header); matches read_length_prefixed_stream.
-        if data.len() > 4 * 1024 * 1024 {
-            return Err(anyhow::anyhow!(
-                "packet too large to frame: {} bytes",
-                data.len()
-            ));
-        }
-        let len = data.len() as u32;
+        // its session was reaped after CLIENT_TIMEOUT (30s). See
+        // read_length_prefixed_stream below for the symmetric inbound decode.
+        // The size guard (== the relay's MAX_FRAME_SIZE) runs in frame_packet
+        // BEFORE open_uni() so an over-sized frame leaks no stream/flow slot.
+        let framed = frame_packet(&data)?;
         let mut stream = session.open_uni().await?;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&data).await?;
+        stream.write_all(&framed).await?;
         stream.finish()?;
         Ok(())
     }
@@ -356,5 +382,89 @@ impl WebTransportClient {
     pub fn stop(&self) {
         self.quit.store(true, Ordering::Relaxed);
         info!("Stopping WebTransport client for {}", self.config.user_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_packet, MAX_FRAME_SIZE};
+
+    /// Decode one `[u32 BE length][payload]` frame from a byte buffer, applying
+    /// the SAME length cap as the inbound reader
+    /// (`read_length_prefixed_stream`). Returns `(payload, rest)` or an error
+    /// describing why the frame is unreadable. This mirrors the relay's
+    /// `read_length_prefixed_frame` so the round-trip test exercises the real
+    /// wire contract, not a bespoke one.
+    fn decode_frame(buf: &[u8]) -> Result<(Vec<u8>, &[u8]), String> {
+        if buf.len() < 4 {
+            return Err(format!("short header: {} bytes", buf.len()));
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(format!("frame size {len} exceeds MAX_FRAME_SIZE"));
+        }
+        let body = &buf[4..];
+        if body.len() < len {
+            return Err(format!(
+                "truncated payload: have {}, need {len}",
+                body.len()
+            ));
+        }
+        Ok((body[..len].to_vec(), &body[len..]))
+    }
+
+    #[test]
+    fn frames_with_big_endian_length_prefix() {
+        let payload = vec![0x08, 0x04, 0x12, 0xAB, 0xCD]; // looks like a PacketWrapper head
+        let framed = frame_packet(&payload).expect("frame");
+        assert_eq!(&framed[..4], &(payload.len() as u32).to_be_bytes());
+        assert_eq!(&framed[4..], &payload[..]);
+    }
+
+    #[test]
+    fn round_trips_through_the_inbound_decode_logic() {
+        for payload in [
+            Vec::new(),
+            vec![0u8],
+            b"hello relay".to_vec(),
+            vec![0xC3u8; 64_000], // typical VP9 keyframe-ish size
+        ] {
+            let framed = frame_packet(&payload).expect("frame");
+            let (decoded, rest) = decode_frame(&framed).expect("decode");
+            assert_eq!(decoded, payload, "payload survives round-trip");
+            assert!(rest.is_empty(), "exactly one frame, no trailing bytes");
+        }
+    }
+
+    #[test]
+    fn two_frames_decode_independently_on_the_same_buffer() {
+        // Models the relay reading consecutive length-prefixed frames.
+        let a = b"first".to_vec();
+        let b = b"second packet".to_vec();
+        let mut buf = frame_packet(&a).expect("frame a");
+        buf.extend(frame_packet(&b).expect("frame b"));
+        let (d_a, rest) = decode_frame(&buf).expect("decode a");
+        let (d_b, rest) = decode_frame(rest).expect("decode b");
+        assert_eq!(d_a, a);
+        assert_eq!(d_b, b);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn payload_at_max_frame_size_is_accepted() {
+        let payload = vec![0u8; MAX_FRAME_SIZE];
+        let framed = frame_packet(&payload).expect("frame at cap should succeed");
+        assert_eq!(framed.len(), 4 + MAX_FRAME_SIZE);
+        let (decoded_len, _) = decode_frame(&framed).expect("decode at cap");
+        assert_eq!(decoded_len.len(), MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn payload_one_byte_over_max_is_rejected() {
+        let payload = vec![0u8; MAX_FRAME_SIZE + 1];
+        assert!(
+            frame_packet(&payload).is_err(),
+            "one byte over the relay cap must be rejected before a stream is opened"
+        );
     }
 }

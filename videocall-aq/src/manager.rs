@@ -433,8 +433,11 @@ impl AdaptiveQualityManager {
             // time AND a transition is permitted, raise the floor-saturated
             // signal so the controller's gradual layer shed can still fire here
             // (the simulcast layer axis is independent of the tier floor). We do
-            // NOT touch tier state, timers, or hysteresis — this is a read-only
-            // signal layered on top of the existing decision.
+            // not change the tier index, the transition timestamp, or the
+            // hysteresis thresholds — we only seed the existing degrade timer
+            // (`degrade_start_ms`) so the floor-saturated signal can latch (see
+            // the `else if !should_degrade` reset below, which deliberately
+            // keeps this timer running at the floor).
             let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
             let degrade_duration = now_ms - degrade_start;
             if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
@@ -1009,6 +1012,16 @@ impl AdaptiveQualityManager {
     /// do — so a deeper ladder (or a default tier near the floor) cannot leave
     /// the gradual path unable to shed. `false` outside the degrade-at-floor
     /// case and always `false` in single-stream mode (no layers to shed).
+    ///
+    /// THROTTLING (issue #1082 review): unlike the tier-coupled step-down (one
+    /// shed per `MIN_TIER_TRANSITION_INTERVAL_MS`), this signal is re-evaluated
+    /// every diagnostics tick (~1/sec), so the controller's floor shed it drives
+    /// can fire once per tick at the floor until `active_layer_count` reaches 1.
+    /// This is intentional and benign today: the shed is down-only, floors at 1,
+    /// and the current ladders need at most 2 sheds (the 3-layer screen ladder).
+    /// A future maintainer who DEEPENS the video ladder should revisit this and
+    /// reuse the min-interval throttle here (e.g. touch `last_transition_time_ms`
+    /// in the floor block) so a deep ladder cannot shed many layers in one burst.
     pub fn wanted_degrade_at_floor(&self) -> bool {
         self.degrade_floor_saturated
     }

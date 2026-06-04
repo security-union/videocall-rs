@@ -784,6 +784,15 @@ impl EncoderBitrateController {
         // the floor blocked (`wanted_degrade_at_floor`), decoupling the layer
         // axis from the tier floor exactly as the explicit `force_*` paths do.
         // No-op in single-stream mode (is_simulcast() == false).
+        //
+        // NOTE (issue #1082 review): the floor-saturated shed below is NOT
+        // min-interval-throttled (unlike the tier-coupled down-step, which is
+        // gated to one shed per MIN_TIER_TRANSITION_INTERVAL_MS). It can fire
+        // once per diagnostics tick (~1/sec) at the floor until
+        // `active_layer_count` hits 1. Intentional + benign today (down-only,
+        // floors at 1, ≤2 sheds for the current ladders) — see the throttling
+        // note on `AdaptiveQualityManager::wanted_degrade_at_floor` for what to
+        // revisit if the video ladder is ever deepened.
         if self.quality_manager.is_simulcast() {
             let tier_index_after = self.quality_manager.video_tier_index();
             // Down-step shed (tier moved down) OR floor-saturated degrade shed.

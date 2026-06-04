@@ -80,6 +80,7 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 /// atomics from the `CameraEncoder`. When provided, the microphone encoder
 /// reads the audio quality tier from the camera encoder's quality manager
 /// instead of creating its own `EncoderBitrateController`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_microphone_encoder(
     client: VideoCallClient,
     bitrate_kbps: u32,
@@ -88,6 +89,7 @@ pub fn create_microphone_encoder(
     vad_threshold: Option<f32>,
     shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
     shared_audio_tier_fec: Option<Rc<AtomicBool>>,
+    max_layers: u32,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
         client,
@@ -97,5 +99,6 @@ pub fn create_microphone_encoder(
         vad_threshold,
         shared_audio_tier_bitrate,
         shared_audio_tier_fec,
+        max_layers,
     ))
 }

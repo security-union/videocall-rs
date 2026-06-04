@@ -19,8 +19,9 @@
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::performance_settings::{
-    load_performance_preference, preference_to_encoder_bounds, save_performance_preference,
-    PerformancePreference, ScreenSnapshotReader, SnapshotReader,
+    load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
+    save_performance_preference, save_receive_preference, KindReceivePref, PerformancePreference,
+    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
 };
 use crate::constants::*;
 use crate::context::{
@@ -34,7 +35,8 @@ use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{
-    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+    initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
+    ScreenShareEvent,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -107,23 +109,45 @@ pub fn Host(
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
 
-        // Simulcast layer ceiling (issue #989): the lesser of the runtime flag
-        // (`experimentalSimulcastMaxLayers`, defaults to 1 = OFF) and what this
-        // device can actually encode without stalling. Defaults keep this at 1
-        // → single-layer, byte-identical to the pre-simulcast publisher.
+        // Simulcast layer ceiling (issue #989 / #1082): the lesser of the runtime
+        // flag (`experimentalSimulcastMaxLayers`, defaults to 3 = ON) and what
+        // this device can actually encode without stalling. A weak device's
+        // capability ceiling auto-gates this DOWN to 1–2 layers even with the
+        // flag at its default 3, so default-ON is safe.
         //
         // This `use_hook` closure runs once per Host component mount, so the
-        // WARN below fires once per session — never per frame.
-        let effective_max_layers = experimental_simulcast_max_layers()
+        // INFO below fires once per session — never per frame.
+        //
+        // VIDEO/SCREEN share the CPU-derived capability ceiling because each
+        // extra WebCodecs VIDEO encoder is ~N× main-thread encode cost (the
+        // 2-core Intel Mac stall mode, discussion #562/#890).
+        let flag_max_layers = experimental_simulcast_max_layers();
+        let effective_max_layers = flag_max_layers
             .min(crate::components::capability_check::capability_max_simulcast_layers());
         log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
+
+        // AUDIO is decoupled from the VIDEO capability ceiling (issue #1082):
+        // Opus encoders run on the AudioWorklet thread (off the main thread) and
+        // cost ~1-3% of call bandwidth, so a device that is correctly capped to
+        // 1 VIDEO layer can still run the full audio ladder. Audio's ceiling is
+        // the audio ladder size itself (`max_layers_for_kind(Audio)`), still
+        // gated by the SAME runtime flag — so setting the flag to 1 disables
+        // audio simulcast too (it now defaults to 3 = ON).
+        let audio_capability_ceiling = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+        let audio_effective_max_layers = flag_max_layers.min(audio_capability_ceiling);
+        log::info!(
+            "MicrophoneEncoder: effective audio simulcast layers = {audio_effective_max_layers} \
+             (flag={flag_max_layers}, audio_ceiling={audio_capability_ceiling})"
+        );
         if effective_max_layers > 1 {
-            log::warn!(
-                "SIMULCAST EXPERIMENTAL: publishing {effective_max_layers} video layers \
-                 — this multiplies encode CPU and uplink/relay egress and provides NO \
-                 playback benefit yet (receivers decode the base layer only; relay \
-                 layer-selection not implemented). For controlled testing only. Set \
-                 experimentalSimulcastMaxLayers=1 in production."
+            log::info!(
+                "SIMULCAST: publishing {effective_max_layers} video layers (default ON). \
+                 Receiver-driven per-peer layer selection is live — each receiver \
+                 automatically pulls the best layer its own downlink can sustain (and the \
+                 relay drops the layers it did not select per source+kind). This increases \
+                 this sender's encode CPU and uplink/relay egress; weak devices auto-gate \
+                 to fewer layers via the capability ceiling. To disable, set \
+                 experimentalSimulcastMaxLayers=1."
             );
         }
 
@@ -170,6 +194,12 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
+            // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
+            // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
+            // and is cheap), but still gated by the SAME runtime flag so it stays
+            // OFF by default (single audio layer, byte-identical to the
+            // pre-simulcast mic path).
+            audio_effective_max_layers,
         );
 
         let screen_settings_cell = screen_settings_handler.clone();
@@ -198,6 +228,10 @@ pub fn Host(
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
+            // Screen simulcast layer ceiling (issue #989, Phase 3b) — same
+            // flag + capability gating as the camera, so it's OFF by default
+            // (single layer, byte-identical to the pre-simulcast screen path).
+            effective_max_layers,
         );
 
         // Wire up congestion step-down, PLI keyframe, and re-election flags
@@ -722,6 +756,54 @@ pub fn Host(
         })
     };
 
+    // RECEIVE-side layer-bounds preference (simulcast P4/P5), restored from
+    // localStorage and surfaced to the settings modal. The signal is the UI's
+    // source of truth for the slider positions.
+    let receive_preference = use_signal(load_receive_preference);
+
+    // Apply the persisted receive bounds to the client once on mount, so the
+    // restored caps take effect immediately (each kind's effective bounds, with
+    // Auto → (None, None)). Re-applying is idempotent.
+    {
+        let client = client.clone();
+        use_hook(move || {
+            let pref = load_receive_preference();
+            for kind in [
+                PrefMediaKind::Video,
+                PrefMediaKind::Audio,
+                PrefMediaKind::Screen,
+            ] {
+                let (min, max) = pref.effective_bounds(kind);
+                client.set_receive_layer_bounds(kind, min, max);
+            }
+        });
+    }
+
+    // Apply a changed receive bound: persist it and push the effective bounds for
+    // the changed kind to the client (immediate downlink effect).
+    let on_receive_change: Rc<dyn Fn((PrefMediaKind, KindReceivePref))> = {
+        let client = client.clone();
+        Rc::new(move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+            let mut receive_preference = receive_preference;
+            let next = receive_preference().with_kind(kind, sub);
+            save_receive_preference(&next);
+            receive_preference.set(next);
+            let (min, max) = next.effective_bounds(kind);
+            client.set_receive_layer_bounds(kind, min, max);
+        })
+    };
+
+    // Per-kind received-layer snapshot reader for the P5 needles. Built once per
+    // mount (stable `Rc`) so the meter component doesn't see a "changed" prop.
+    let received_reader: ReceivedReader = {
+        let client = client.clone();
+        use_hook(move || {
+            ReceivedReader(Rc::new(move |kind: PrefMediaKind| {
+                client.received_layer_snapshot(kind)
+            }))
+        })
+    };
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -791,6 +873,8 @@ pub fn Host(
             let on_perf = on_performance_change.clone();
             let read_snap = read_quality_snapshot.clone();
             let read_screen_snap = read_screen_snapshot.clone();
+            let on_recv = on_receive_change.clone();
+            let recv_reader = received_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -811,6 +895,9 @@ pub fn Host(
                     on_performance_change: move |p: PerformancePreference| on_perf(p),
                     read_quality_snapshot: read_snap.clone(),
                     read_screen_snapshot: read_screen_snap.clone(),
+                    receive_preference: receive_preference(),
+                    on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
+                    received_reader: recv_reader.clone(),
                 }
             }
         }

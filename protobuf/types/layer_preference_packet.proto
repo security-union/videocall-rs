@@ -35,8 +35,25 @@ syntax = "proto3";
 // and is a separate frontend increment. AUDIO/SCREEN are NEVER filtered by
 // this signal. This packet is consumed by the relay and never re-broadcast.
 message LayerPreferencePacket {
-  // One desired-layer entry: for a given source session, the simulcast layer
-  // the receiver wants forwarded.
+  // The media kind an Entry applies to (issue #989, Phase 3). Mirrors
+  // `PacketWrapper.MediaKind` so camera VIDEO, AUDIO, and SCREEN of the SAME
+  // source session can be addressed INDEPENDENTLY: a receiver can request a
+  // low SCREEN layer while keeping full camera VIDEO, etc.
+  //
+  // BACK-COMPAT: the default (UNSPECIFIED = 0) MUST be treated by the relay as
+  // VIDEO. Pre-Phase-3 clients omit this field (proto3 default 0), and before
+  // Phase 3 the relay only ever filtered VIDEO — so an absent media_kind is
+  // exactly "this entry is about the source's camera video", preserving the
+  // existing wire contract with no flag-day.
+  enum EntryMediaKind {
+    ENTRY_MEDIA_KIND_UNSPECIFIED = 0; // treated as VIDEO by the relay
+    ENTRY_VIDEO = 1;
+    ENTRY_AUDIO = 2;
+    ENTRY_SCREEN = 3;
+  }
+
+  // One desired-layer entry: for a given source session AND media kind, the
+  // simulcast layer the receiver wants forwarded.
   message Entry {
     // The source session_id (publisher) this preference applies to. This is
     // the SUBJECT-derived publisher session the relay matches against on the
@@ -48,8 +65,17 @@ message LayerPreferencePacket {
     // preference" — to express "no preference / forward all", omit the entry
     // for this source entirely (see the message-level comment above).
     uint32 desired_layer = 2;
+    // Which media kind of `session_id` this entry constrains (issue #989,
+    // Phase 3). Additive field; default 0 (UNSPECIFIED) = VIDEO for back-compat
+    // (see EntryMediaKind). The relay keys its per-receiver preference map by
+    // (session_id, media_kind), and matches an entry against a forwarded
+    // packet's cleartext `PacketWrapper.media_kind`. AUDIO/SCREEN entries are
+    // ignored by pre-Phase-3 relays (which only filter VIDEO), so an old relay
+    // simply forwards those streams unfiltered — fail-open, never a wrong drop.
+    EntryMediaKind media_kind = 3;
   }
 
-  // Per-source desired-layer entries. Empty = no layer constraint (fail-open).
+  // Per-(source, media-kind) desired-layer entries. Empty = no layer
+  // constraint (fail-open).
   repeated Entry entries = 1;
 }

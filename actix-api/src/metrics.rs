@@ -441,6 +441,34 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_sent_total metric");
 
+    /// Cumulative transport re-election outcomes reported by the client
+    /// (dashboard audit Tier B #3; discussion #562).
+    ///
+    /// TYPE DECISION — GaugeVec, NOT CounterVec: the client reports a CUMULATIVE
+    /// total in every health packet (the same convention as DATAGRAM_DROPS /
+    /// WEBSOCKET_DROPS / KEYFRAME_REQUESTS_SENT_TOTAL above, all GaugeVecs). The
+    /// expander therefore `.set()`s this gauge to the client's reported
+    /// cumulative value once per packet. A CounterVec `.inc()`-ed per packet
+    /// would multiply-count (the same cumulative value arrives every second).
+    /// Because the client value is monotonic within a page session, Grafana
+    /// charts re-election RATE with `rate()`/`increase()` over this gauge
+    /// exactly as it does for the sibling `*_total` gauges. (A process restart /
+    /// reconnect that resets the client counter shows as a gauge drop, the same
+    /// minor caveat the sibling gauges already carry — acceptable for a
+    /// dashboard signal, and avoids the multiply-count bug.)
+    ///
+    /// CARDINALITY: `meeting_id` × `session_id` × `result` (exactly 4 bounded
+    /// result values: `proceeded|aborted|preserved|failed`). Per-session series
+    /// are GC'd by the metrics-server's existing stale-session cleanup
+    /// (`cleanup_stale_sessions` → `remove_session_metrics`), same as every
+    /// other `meeting_id,session_id`-keyed client series.
+    pub static ref CLIENT_REELECTION_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_client_reelection_total",
+        "Cumulative transport re-election outcomes reported by the client, by result (proceeded|aborted|preserved|failed). GaugeVec set() to the client's cumulative value; chart with rate()/increase()",
+        &["meeting_id", "session_id", "result"]
+    )
+    .expect("Failed to create videocall_client_reelection_total metric");
+
     // ===== ENCODER & SCREEN SHARE METRICS (sender-side, P0/P1) =====
 
     /// Encoder fps_ratio (received/target) driving tier decisions
@@ -752,7 +780,7 @@ lazy_static! {
     /// would otherwise fire silently) and gives plain "LAYER_PREFERENCE
     /// received" visibility via the `accepted` outcome.
     ///
-    /// `outcome` is bounded — exactly 4 values:
+    /// `outcome` is bounded — exactly 5 values:
     /// - `accepted`:              update was applied to the receiver's map.
     /// - `rate_limited`:          arrived within
     ///   `LAYER_PREFERENCE_MIN_UPDATE_INTERVAL` of the last accepted update;
@@ -760,13 +788,16 @@ lazy_static! {
     /// - `truncated`:             the entries list exceeded
     ///   `LAYER_PREFERENCE_MAX_ENTRIES` and was capped (fail-open on the
     ///   excess). Counted in ADDITION to `accepted` for the same packet.
+    /// - `layer_id_out_of_bound`: at least one entry's `desired_layer` exceeded
+    ///   `LAYER_PREFERENCE_MAX_LAYER_ID` and was skipped (fail-open per source,
+    ///   #1082). Counted in ADDITION to `accepted` for the same packet.
     /// - `ignored_other_subject`: arrived on a subject other than the receiver's
     ///   own; expected for normal NATS fan-out and dropped without mutating state.
     ///
-    /// CARDINALITY: bounded — `room` × 4 outcomes. No per-session label.
+    /// CARDINALITY: bounded — `room` × 5 outcomes. No per-session label.
     pub static ref RELAY_LAYER_PREFERENCE_UPDATES_TOTAL: CounterVec = register_counter_vec!(
         "relay_layer_preference_updates_total",
-        "LAYER_PREFERENCE control-packet update outcomes per room (accepted|rate_limited|truncated|ignored_other_subject) (#989)",
+        "LAYER_PREFERENCE control-packet update outcomes per room (accepted|rate_limited|truncated|layer_id_out_of_bound|ignored_other_subject) (#989, #1082)",
         &["room", "outcome"]
     )
     .expect("Failed to create relay_layer_preference_updates_total metric");
@@ -823,6 +854,88 @@ lazy_static! {
         &["reason"]
     )
     .expect("Failed to create videocall_auth_rejections_total metric");
+    //
+    // CARDINALITY DECISION (dashboard audit Tier B #3 / stale-JWT #562):
+    // We deliberately do NOT add a `room`/`meeting_id` label to this counter.
+    // The production connection flow is token-based (`GET /lobby?token=<JWT>`):
+    // the room is carried ONLY inside the JWT `claims.room`, which is extracted
+    // exclusively AFTER a successful `decode_room_token` (see
+    // `token_validator::decode_room_token_inner`). The dominant rejection
+    // reasons — `token_expired`, `invalid_signature`, `malformed` — fail BEFORE
+    // the claims are decoded (or with claims we must not trust), so the room is
+    // genuinely unknown at rejection time. There is no room in the URL path for
+    // the token flow (only the deprecated FF-off `/lobby/{user}/{room}` path has
+    // one). Adding a `room` label would therefore be empty/`""` for the majority
+    // of rejections — the "fabricated label that's empty half the time" the audit
+    // warned against — and would falsely imply per-meeting attribution the data
+    // cannot support. The stale-JWT killer (#562) stays a FLEET-WIDE rate here;
+    // per-meeting attribution must come from the meeting-api token-issuance side,
+    // not the relay reject path.
+
+    /// Per-session outbound-channel / slow-drain drops, attributable to a named
+    /// receiver session (dashboard audit Tier B #1).
+    ///
+    /// WHY A SEPARATE COUNTER (not a `session_id` label on
+    /// `videocall_outbound_channel_drops_total`): session IDs are per-connection
+    /// `u64`s that churn on every reconnect/re-election, so the label space is
+    /// unbounded over time and would explode storage if mixed into a
+    /// long-retained protocol-wide counter. Isolating it here lets us GC the
+    /// per-session series the instant the session ends, keeping the live series
+    /// count bounded to (active sessions × transport) at any moment — typically
+    /// a few hundred for our 10-15 meetings × 20 users scale target, never the
+    /// open-ended historical set.
+    ///
+    /// CARDINALITY BOUND: `room` × `transport` (2) × `session_id` (live only).
+    /// CLEANUP: `remove_label_values` is called for every series this session
+    /// touched in `SessionLogic::on_stopping` (the same per-session teardown hook
+    /// that decrements `relay_active_sessions_per_room`), so a disconnected
+    /// session leaves no residual series. Because cleanup must enumerate the
+    /// exact label tuples, the session actor records which `(transport, kind)`
+    /// pairs it incremented and replays them on teardown.
+    ///
+    /// This is the counter Grafana joins against to NAME the slow receiver in a
+    /// room ("session 12345 is shedding video") instead of only "a session in
+    /// this room is slow". `kind` mirrors the outbound-drop taxonomy
+    /// (`audio|video|screen|media|control|rtt|unknown|priority_drop_video|
+    /// priority_drop_audio|overflow_critical`).
+    pub static ref RELAY_SESSION_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_session_drops_total",
+        "Per-session outbound-channel drops attributable to a specific receiver session (GC'd on session close). Names the slow receiver for the meeting-investigation dashboard",
+        &["room", "transport", "session_id", "kind"]
+    )
+    .expect("Failed to create relay_session_drops_total metric");
+
+    /// Inbound actor-mailbox overflow drops (dashboard audit Tier B #2; #1057).
+    ///
+    /// This is the room-wide-freeze signature: when `ChatServer`'s NATS fan-out
+    /// does `session_recipient.try_send(Message)` and the receiving session
+    /// actor's mailbox is full, the packet is shed indiscriminately (audio,
+    /// video, control alike) with NO CONGESTION feedback to the sender — the
+    /// failure mode diagnosed in #1057. Pre-#1057 the mailbox was the actix
+    /// default (16 slots); post-#1057 it is sized to the outbound channel(s),
+    /// but this counter must still exist so a FUTURE mailbox overflow remains
+    /// visible the instant it recurs.
+    ///
+    /// DISTINCT FROM `relay_packet_drops_total{drop_reason="mailbox_full"}`:
+    /// that existing series is room-tagged (unbounded `room` label, good for
+    /// per-room forensics but noisy for fleet alerting). This counter is the
+    /// low-cardinality fleet-alerting sibling — `transport` only — so an SRE can
+    /// `rate(relay_inbound_mailbox_drops_total[5m])` to detect the freeze
+    /// signature without scraping the per-room series. BOTH are emitted at the
+    /// same `try_send`-to-mailbox failure sites; the room-tagged one is kept for
+    /// drill-down. `relay_packet_drops_total` keeps `transport="nats_delivery"`
+    /// on these (the publish-side identity); this counter uses the actual
+    /// receiver transport (`webtransport`|`websocket`) so the freeze can be
+    /// attributed to the transport whose mailbox overflowed.
+    ///
+    /// CARDINALITY BOUND: exactly 2 series (`webtransport`, `websocket`). Safe
+    /// for indefinite retention; no cleanup required.
+    pub static ref RELAY_INBOUND_MAILBOX_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_inbound_mailbox_drops_total",
+        "Inbound actor-mailbox overflow drops by receiver transport (room-wide-freeze signature, #1057). Low-cardinality fleet-alerting sibling of relay_packet_drops_total{drop_reason=mailbox_full}",
+        &["transport"]
+    )
+    .expect("Failed to create relay_inbound_mailbox_drops_total metric");
 
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///

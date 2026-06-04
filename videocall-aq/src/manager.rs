@@ -184,6 +184,35 @@ pub struct AdaptiveQualityManager {
     /// overall degradation history.
     step_down_count: u32,
 
+    // --- Simulcast active-layer state (issue #989, PR B) — ADDITIVE ---
+    /// Number of simulcast layers in this session's ladder (the ceiling for
+    /// `active_layer_count`). `1` means single-stream (simulcast off / weak
+    /// device), in which case all the layer methods are inert and the manager
+    /// behaves exactly as before. Set once at construction via
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers); defaults to 1 so
+    /// existing callers (and the bot) are unaffected.
+    simulcast_layer_count: usize,
+
+    /// Number of simulcast layers currently being encoded+sent (the *top*
+    /// `simulcast_layer_count - active_layer_count` layers are shed). Floor 1,
+    /// ceiling `simulcast_layer_count`. Driven by the SAME degrade/recover
+    /// decisions that move `video_tier_index` (see the controller), reusing the
+    /// incident-hardened hysteresis/crash-ceiling/yo-yo timers. Starts at the
+    /// ladder max (all layers active) — the AQ controller sheds the top layer
+    /// under sustained congestion. When `simulcast_layer_count == 1` this stays
+    /// pinned at 1 and the field is never consulted.
+    active_layer_count: usize,
+
+    /// Issue #1077: set by the most recent `update()` when a video step-DOWN was
+    /// fully warranted (degrade conditions sustained past the reaction time, and
+    /// a transition was permitted) but could NOT move the tier index because it
+    /// was already at the floor. The controller reads this via
+    /// [`wanted_degrade_at_floor`](Self::wanted_degrade_at_floor) so the gradual
+    /// `update()`-path simulcast layer shed can fire at the floor too, instead of
+    /// silently stopping once the tier index saturates. Reset to `false` at the
+    /// top of every `update()`. Meaningless in single-stream mode.
+    degrade_floor_saturated: bool,
+
     // --- Telemetry ---
     /// Counter: step-ups blocked because the crash ceiling prevented recovery.
     step_up_blocked_ceiling: u64,
@@ -269,6 +298,11 @@ impl AdaptiveQualityManager {
             reelection_completed_at_ms: None,
             congestion_hold_until_ms: None,
             step_down_count: 0,
+            // Simulcast active-layer state (issue #989) — additive, defaults to
+            // single-stream so existing callers behave exactly as before.
+            simulcast_layer_count: 1,
+            active_layer_count: 1,
+            degrade_floor_saturated: false,
             // Telemetry
             step_up_blocked_ceiling: 0,
             step_up_blocked_slowdown: 0,
@@ -364,6 +398,12 @@ impl AdaptiveQualityManager {
         now_ms: f64,
         effective_peer_count: usize,
     ) -> bool {
+        // Issue #1077: clear the floor-saturated degrade signal each tick; it is
+        // re-set below only if this tick warrants a step-down that the floor
+        // blocks. (Cleared before the warmup/guard early-returns so a stale
+        // signal can never leak across ticks.)
+        self.degrade_floor_saturated = false;
+
         // Warmup guard: during encoder startup, no frames have been produced yet
         // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
         // tier transitions until the encoder has had time to stabilize.
@@ -427,8 +467,36 @@ impl AdaptiveQualityManager {
             fps_ratio < degrade_fps_threshold || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
 
         // Step-DOWN cap: never exceed the user's `worst` bound (issue #961),
-        // composed with the hard array bound — the more restrictive wins.
+        // composed with the hard array bound — the more restrictive wins. This
+        // is the EFFECTIVE floor for the gradual step-down: once the tier index
+        // reaches it, no further tier step is possible (either because we hit
+        // the array bottom or because the user capped send quality there).
         let step_down_cap = self.video_step_down_cap(max_video_index);
+
+        if should_degrade && self.video_tier_index >= step_down_cap {
+            // Issue #1077 (composed with #961): degrade conditions persist but
+            // the tier index is already at the effective floor (the user's
+            // `worst` cap and/or the hard array bound), so no tier step is
+            // possible. Track the degrade duration the same way and, once it
+            // crosses the reaction time AND a transition is permitted, raise the
+            // floor-saturated signal so the controller's gradual simulcast layer
+            // shed can still fire here (the simulcast layer axis is independent
+            // of the tier floor). We do not change the tier index, the
+            // transition timestamp, or the hysteresis thresholds — we only seed
+            // the existing degrade timer (`degrade_start_ms`) so the
+            // floor-saturated signal can latch (see the `else if !should_degrade`
+            // reset below, which deliberately keeps this timer running at the
+            // floor). Driving this off `step_down_cap` (not the raw array bound)
+            // means a user who caps send quality at a higher tier still gets
+            // layer-shedding once that cap is reached.
+            let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
+            let degrade_duration = now_ms - degrade_start;
+            if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                self.degrade_floor_saturated = true;
+            }
+            // Fall through: no tier change at the floor, so `return false` below
+            // (via the step-up / no-op path) is unchanged.
+        }
 
         if should_degrade && self.video_tier_index < step_down_cap {
             // Start or continue tracking degradation duration.
@@ -471,8 +539,16 @@ impl AdaptiveQualityManager {
                 self.last_step_down_ms = Some(now_ms);
                 return true;
             }
-        } else {
+        } else if !should_degrade {
             // Conditions are not in the degradation zone; reset the timer.
+            //
+            // NOTE (issue #1077): this reset is gated on `!should_degrade`
+            // specifically (not just "the step-down branch wasn't taken") so
+            // that a sustained degrade AT THE FLOOR keeps accumulating
+            // `degrade_start_ms`, letting the floor-saturated block above cross
+            // the reaction time. Before #1077 this was a bare `else`, which was
+            // correct only because the floor case never set the timer; now that
+            // the floor case relies on the timer, the reset must exclude it.
             self.degrade_start_ms = None;
         }
 
@@ -868,6 +944,27 @@ impl AdaptiveQualityManager {
             .is_some_and(|until| now_ms < until)
     }
 
+    /// Whether the guards shared by the *forced* transition paths
+    /// ([`force_video_step_down`](Self::force_video_step_down) and
+    /// [`force_congestion_cut`](Self::force_congestion_cut)) are currently
+    /// clear — i.e. past the warmup window AND past the minimum transition
+    /// interval since the last transition.
+    ///
+    /// Additive read-only helper (issue #989, PR B). The simulcast layer axis
+    /// uses this to decide whether a forced congestion response should shed a
+    /// layer: a request blocked by these guards did not "happen" (no tier move,
+    /// no drain hold), so it must not shed a layer either. Unlike the forced
+    /// methods themselves, this is independent of the tier floor — letting the
+    /// layer axis respond to congestion even when `video_tier_index` is already
+    /// at its lowest tier. Does not mutate state and does not affect the
+    /// single-stream tier machinery.
+    pub fn forced_transition_guards_clear(&self, now_ms: f64) -> bool {
+        let past_warmup = now_ms - self.created_at_ms >= self.warmup_ms;
+        let past_min_interval =
+            now_ms - self.last_transition_time_ms >= MIN_TIER_TRANSITION_INTERVAL_MS as f64;
+        past_warmup && past_min_interval
+    }
+
     /// Set a quality ceiling that prevents step-up from going below (better
     /// quality than) the given index.
     ///
@@ -1072,6 +1169,128 @@ impl AdaptiveQualityManager {
     /// Drain and return all tier transition records since the last drain.
     pub fn drain_transitions(&mut self) -> Vec<TierTransitionRecord> {
         std::mem::take(&mut self.transition_buffer)
+    }
+
+    // -----------------------------------------------------------------
+    // Simulcast active-layer control (issue #989, PR B) — ADDITIVE
+    // -----------------------------------------------------------------
+    //
+    // These methods exist alongside the tier machinery and never touch
+    // `video_tier_index` or any existing field. When `simulcast_layer_count`
+    // is 1 (the default, and the value the bot always sees) they are inert:
+    // `active_layer_count()` returns 1, `drop_top_layer`/`add_top_layer` cannot
+    // move off the floor/ceiling of 1, and the manager behaves exactly as it
+    // did before this PR.
+    //
+    // Why additive rather than repurposing `video_tier_index`: the load-test
+    // bot reads `video_tier_index()` as a *resolution-tier index* to choose its
+    // encode resolution. Simulcast layers are a different axis (fixed-resolution
+    // streams that get shed top-down). Conflating them would silently change the
+    // bot's encode resolution. See CLAUDE.md "Change Impact Policy".
+
+    /// Configure how many simulcast layers this session's ladder has.
+    ///
+    /// Call once after construction with the effective layer count
+    /// (`min(max_layers, ladder_len)` from the client). `n` is clamped to
+    /// `[1, SIMULCAST_MAX_LAYERS]`. `active_layer_count` is (re)initialized to
+    /// `n` (all layers active); the controller then sheds the top layer under
+    /// sustained congestion. Passing `1` (the default) keeps the manager in
+    /// single-stream mode where the layer methods are inert.
+    pub fn set_simulcast_layers(&mut self, n: usize) {
+        let clamped = n.clamp(1, crate::constants::SIMULCAST_MAX_LAYERS);
+        self.simulcast_layer_count = clamped;
+        self.active_layer_count = clamped;
+    }
+
+    /// Number of simulcast layers in this session's ladder (the ceiling for
+    /// [`active_layer_count`](Self::active_layer_count)).
+    pub fn simulcast_layer_count(&self) -> usize {
+        self.simulcast_layer_count
+    }
+
+    /// Whether the most recent [`update`](Self::update) warranted a video
+    /// step-DOWN that the tier floor blocked (issue #1077).
+    ///
+    /// The gradual `update()`-path simulcast layer shed in the controller keys
+    /// off tier-index movement, which saturates at the floor. This signal lets
+    /// the controller shed the top layer at the floor too — decoupling the layer
+    /// axis from the tier floor exactly as the explicit `force_*` paths already
+    /// do — so a deeper ladder (or a default tier near the floor) cannot leave
+    /// the gradual path unable to shed. `false` outside the degrade-at-floor
+    /// case and always `false` in single-stream mode (no layers to shed).
+    ///
+    /// THROTTLING (issue #1082 review): unlike the tier-coupled step-down (one
+    /// shed per `MIN_TIER_TRANSITION_INTERVAL_MS`), this signal is re-evaluated
+    /// every diagnostics tick (~1/sec), so the controller's floor shed it drives
+    /// can fire once per tick at the floor until `active_layer_count` reaches 1.
+    /// This is intentional and benign today: the shed is down-only, floors at 1,
+    /// and the current ladders need at most 2 sheds (the 3-layer screen ladder).
+    /// A future maintainer who DEEPENS the video ladder should revisit this and
+    /// reuse the min-interval throttle here (e.g. touch `last_transition_time_ms`
+    /// in the floor block) so a deep ladder cannot shed many layers in one burst.
+    pub fn wanted_degrade_at_floor(&self) -> bool {
+        self.degrade_floor_saturated
+    }
+
+    /// Number of simulcast layers currently being encoded+sent.
+    ///
+    /// `1` in single-stream mode. In simulcast mode this ranges over
+    /// `[1, simulcast_layer_count]`; the top
+    /// `simulcast_layer_count - active_layer_count` layers are shed (saving both
+    /// egress bandwidth and sender encode CPU).
+    pub fn active_layer_count(&self) -> usize {
+        self.active_layer_count
+    }
+
+    /// Whether this manager is operating in simulcast mode (`> 1` layers).
+    pub fn is_simulcast(&self) -> bool {
+        self.simulcast_layer_count > 1
+    }
+
+    /// Shed the top active simulcast layer (decrement `active_layer_count`,
+    /// floored at 1).
+    ///
+    /// Called by the controller when a sustained-congestion *step-down* decision
+    /// fires in simulcast mode (the same decision that would step a tier down in
+    /// single-stream mode). Dropping the top layer cuts both egress and sender
+    /// encode CPU. Returns `true` if the active count actually decreased.
+    ///
+    /// No-op (returns `false`) in single-stream mode or when already at the
+    /// floor — exactly mirroring how `video_tier_index` step-down is a no-op at
+    /// the lowest tier.
+    pub fn drop_top_layer(&mut self) -> bool {
+        if self.active_layer_count <= 1 {
+            return false;
+        }
+        let from = self.active_layer_count;
+        self.active_layer_count -= 1;
+        log::info!(
+            "AdaptiveQuality: simulcast dropped TOP layer ({from} -> {} active of {})",
+            self.active_layer_count,
+            self.simulcast_layer_count,
+        );
+        true
+    }
+
+    /// Restore the next top simulcast layer (increment `active_layer_count`,
+    /// capped at `simulcast_layer_count`).
+    ///
+    /// Called by the controller when a sustained-recovery *step-up* decision
+    /// fires in simulcast mode. Returns `true` if the active count actually
+    /// increased. No-op (returns `false`) in single-stream mode or when already
+    /// at the ceiling.
+    pub fn add_top_layer(&mut self) -> bool {
+        if self.active_layer_count >= self.simulcast_layer_count {
+            return false;
+        }
+        let from = self.active_layer_count;
+        self.active_layer_count += 1;
+        log::info!(
+            "AdaptiveQuality: simulcast restored TOP layer ({from} -> {} active of {})",
+            self.active_layer_count,
+            self.simulcast_layer_count,
+        );
+        true
     }
 
     // -----------------------------------------------------------------
@@ -2712,6 +2931,98 @@ mod tests {
         assert!(
             mgr.crash_ceiling_info().is_none(),
             "Repeated congestion cuts must never arm the crash ceiling"
+        );
+    }
+
+    // =====================================================================
+    // Simulcast active-layer state tests (#989, PR B) — ADDITIVE
+    // =====================================================================
+
+    #[test]
+    fn test_simulcast_defaults_to_single_stream() {
+        let mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        assert_eq!(mgr.simulcast_layer_count(), 1);
+        assert_eq!(mgr.active_layer_count(), 1);
+        assert!(!mgr.is_simulcast());
+    }
+
+    #[test]
+    fn test_single_stream_layer_methods_are_inert() {
+        // In single-stream mode (the bot's mode), drop/add must be no-ops so the
+        // manager behaves exactly as before.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        assert!(!mgr.drop_top_layer(), "drop must be a no-op at 1 layer");
+        assert_eq!(mgr.active_layer_count(), 1);
+        assert!(
+            !mgr.add_top_layer(),
+            "add must be a no-op at the ceiling of 1"
+        );
+        assert_eq!(mgr.active_layer_count(), 1);
+    }
+
+    #[test]
+    fn test_set_simulcast_layers_clamps() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+
+        mgr.set_simulcast_layers(0);
+        assert_eq!(mgr.simulcast_layer_count(), 1, "0 clamps up to 1");
+        assert_eq!(mgr.active_layer_count(), 1);
+
+        mgr.set_simulcast_layers(3);
+        assert_eq!(mgr.simulcast_layer_count(), 3);
+        assert_eq!(mgr.active_layer_count(), 3, "starts with all layers active");
+        assert!(mgr.is_simulcast());
+
+        mgr.set_simulcast_layers(99);
+        assert_eq!(
+            mgr.simulcast_layer_count(),
+            crate::constants::SIMULCAST_MAX_LAYERS,
+            "over-large request clamps to ladder max"
+        );
+    }
+
+    #[test]
+    fn test_drop_and_add_top_layer_in_simulcast() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_layers(3);
+        assert_eq!(mgr.active_layer_count(), 3);
+
+        // Drop the top layer twice down to the floor.
+        assert!(mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 2);
+        assert!(mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 1);
+        // At the floor, further drops are no-ops (base layer always sent).
+        assert!(!mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 1);
+
+        // Restore layers back up to the ceiling.
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 2);
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 3);
+        // At the ceiling, further adds are no-ops.
+        assert!(!mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 3);
+    }
+
+    #[test]
+    fn test_simulcast_layer_state_does_not_touch_tier_index() {
+        // Dropping/adding layers must NOT move video_tier_index — the bot reads
+        // that field as a resolution-tier index and must be unaffected.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+        mgr.set_simulcast_layers(3);
+        let tier_before = mgr.video_tier_index();
+
+        mgr.drop_top_layer();
+        mgr.drop_top_layer();
+        mgr.add_top_layer();
+
+        assert_eq!(
+            mgr.video_tier_index(),
+            tier_before,
+            "layer add/drop must never move the resolution-tier index"
         );
     }
 

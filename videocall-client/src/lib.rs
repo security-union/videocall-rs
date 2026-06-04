@@ -148,6 +148,7 @@
 //!     None, // vad_threshold
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //! use std::sync::atomic::AtomicBool;
 //! use std::rc::Rc;
@@ -158,6 +159,7 @@
 //!     Callback::noop(),
 //!     Callback::noop(), // on_state_change callback for screen share events
 //!     screen_sharing_active,
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -243,7 +245,8 @@ pub use client::{
 };
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
-    create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
+    create_audio_peer_decoder, max_layers_for_kind, AudioPeerDecoderTrait, KindLayerBounds,
+    PeerDecodeManager, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,

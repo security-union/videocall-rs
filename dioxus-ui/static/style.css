@@ -6195,9 +6195,44 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 }
 
 /* ──────────────────────────────────────────────────────────────────
-   Performance settings panel + quality VU meters (issue #961)
-   All colors are design tokens (see global.css) — no literals.
+   Unified Performance settings panel — SEND quality bounds (#961) AND
+   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
+   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
+   VU needles, Auto toggle + "?" help. All colors are design tokens
+   (see global.css) — no literals.
    ────────────────────────────────────────────────────────────────── */
+
+/* One media kind's group: a title header, then a Receive row + a Send row.
+   The two rows are visually grouped under the kind so the user reads
+   "Video → Receive / Send" rather than six disconnected sliders. */
+.perf-kind-group {
+  margin: 20px 0;
+  padding: 4px 0 2px;
+  border-top: 1px solid var(--border);
+}
+
+.perf-kind-group:first-of-type {
+  border-top: none;
+}
+
+.perf-kind-header {
+  display: flex;
+  align-items: baseline;
+  margin: 6px 2px 2px;
+}
+
+.perf-kind-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* The Receive / Send rows reuse .perf-stream-group styling but sit tighter
+   together inside a kind group (less vertical margin so the panel fits
+   without excessive scroll — the #961 "fit" goal, now with 2 rows/kind). */
+.perf-kind-group .perf-stream-group {
+  margin: 8px 0;
+}
 
 .perf-stream-group {
   margin: 18px 0;
@@ -6205,6 +6240,16 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   background: var(--surface-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
+}
+
+/* Subtle left accent to distinguish the two directions at a glance (color is
+   not the sole cue — each row is labelled "Receive" / "Send"). */
+.perf-recv-row {
+  border-left: 3px solid var(--accent);
+}
+
+.perf-send-row {
+  border-left: 3px solid var(--success-border-vivid);
 }
 
 .perf-stream-header {
@@ -6293,7 +6338,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   border: 1px solid var(--border-emphasis);
 }
 
-/* "Auto" reset button, pinned to the right of the stream header. */
+/* "Auto" toggle, pinned to the right of the stream header. */
 .perf-auto-button {
   margin-left: auto;
   min-height: 32px;
@@ -6451,7 +6496,7 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   }
 }
 
-/* ── Per-section VU needle gauge (sits beside each slider) ── */
+/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
 
 .perf-vu-gauge {
   flex: 0 0 auto;

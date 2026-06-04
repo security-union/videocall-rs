@@ -3,44 +3,59 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Performance settings panel + real-time quality VU meter (issue #961).
+//! Unified Performance settings panel — SEND quality bounds (#961) AND RECEIVE
+//! layer bounds (#989 simulcast), with live "Sending" and "Receiving" needles.
 //!
-//! This module is the UI half of the user-configurable adaptive-quality (AQ)
-//! tier bounds feature. It lets the user pin a **max** (best allowed) and
-//! **min** (worst allowed) quality for both video and audio, or leave either
-//! end on **Auto**. It also renders two analog cassette-deck-style VU needles
-//! that track the encoder's *current* quality tier in real time.
+//! Now that the call supports per-receiver simulcast, the Performance panel
+//! exposes **two** controls per media kind (Video, Audio, Screen/content):
 //!
-//! # The tier-index inversion (the whole feature)
+//! - **Send** — bounds the quality/tiers this peer PUBLISHES (save MY uplink +
+//!   CPU). Wires to `CameraEncoder::set_quality_tier_bounds` /
+//!   `ScreenEncoder::set_quality_tier_bounds` via the parent. The send side is
+//!   the #961 feature.
+//! - **Receive** — bounds the simulcast layers this peer PULLS from others
+//!   (save MY downlink). Wires to `VideoCallClient::set_receive_layer_bounds`
+//!   via the parent. The receive side is the simulcast P4 feature.
 //!
-//! Quality is the **inverse** of the tier index used by the AQ crate:
-//! index `0` is the BEST tier (video 1080p / audio 50 kbps) and the highest
-//! index is the WORST. Therefore:
+//! # The two index conventions (cross-wiring these is a bug)
 //!
-//! - The user's **Max quality** selection = the *best* allowed tier = the
-//!   **lower** index = passed to the backend as `*_best` (a floor on the index;
-//!   adaptation never climbs to a smaller index / higher quality).
-//! - The user's **Min quality** selection = the *worst* allowed tier = the
-//!   **higher** index = passed to the backend as `*_worst` (a cap on the index;
-//!   adaptation never drops to a larger index / lower quality).
-//! - **Auto** on an end → `None` for that argument.
+//! - **SEND / AQ tiers:** index `0` is the BEST tier (1080p / 50 kbps), the
+//!   highest index is the WORST. The send "Max quality" selection = best allowed
+//!   = the *lower* index = backend `*_best`; "Min quality" = worst allowed = the
+//!   *higher* index = backend `*_worst`. All send logic lives at the top level of
+//!   this module (the `*` free functions, [`PerformancePreference`], etc.).
+//! - **RECEIVE layers:** index `0` is the LOWEST quality, higher index = HIGHER
+//!   quality (the natural left→right slider order). All receive logic lives in
+//!   the [`receive`] submodule ([`receive::ReceivePreference`] etc.) so its
+//!   `RangeSel`/`span_text`/`bounds_to_thumbs` cannot be confused with the
+//!   send-side ones.
 //!
-//! All of the label↔index mapping and the Max/Min→best/worst conversion lives
-//! in pure, host-testable free functions (see the `#[cfg(test)]` block) so the
-//! inversion logic is covered by `cargo test` with no browser APIs.
+//! Both conventions render with the SAME left→right = increasing-quality slider,
+//! so the visual is consistent; only the index→bound mapping differs, and it is
+//! kept strictly separate by the module boundary.
 //!
-//! # The VU meter
+//! # The needles
 //!
-//! Polling [`LiveQualitySnapshot`] on every render and re-rendering the whole
-//! modal at 4 Hz would be wasteful, so the meter follows the same pattern as the
-//! pre-join mic meter: a `requestAnimationFrame`-throttled loop writes the
-//! needle rotation directly to the DOM via `style.transform`, bypassing Dioxus's
-//! diff. The needle-angle math is a pure function ([`tier_to_needle_deg`]).
+//! Each kind shows a **Sending** needle (from [`SnapshotReader`], the live
+//! encoder snapshot) and a **Receiving** needle (from
+//! [`receive::ReceivedReader`], the live `received_layer_snapshot`). Two headless
+//! rAF drivers ([`QualityVuMeterDriver`] for send, [`receive::ReceivedQualityDriver`]
+//! for receive) poll at ~4 Hz and write each needle's rotation + readout straight
+//! to the DOM by id (bypassing the Dioxus diff). Send and receive needles use
+//! DISTINCT DOM ids so the two drivers never fight over the same node.
 
 use dioxus::prelude::*;
 use std::rc::Rc;
-use videocall_client::{LiveQualitySnapshot, ScreenQualitySnapshot};
+use videocall_client::{LiveQualitySnapshot, PrefMediaKind, ScreenQualitySnapshot};
 use wasm_bindgen::JsCast;
+
+// Re-export the receive-side public API so call sites can `use
+// performance_settings::{ReceivePreference, KindReceivePref, ReceivedReader, ...}`.
+// (`RECEIVE_PREF_KEY` stays available as `receive::RECEIVE_PREF_KEY`.)
+pub use receive::{
+    load_receive_preference, save_receive_preference, KindReceivePref, ReceivePreference,
+    ReceivedReader,
+};
 
 /// A cloneable, `PartialEq`-able handle around the live-snapshot reader closure.
 ///
@@ -92,13 +107,13 @@ impl PartialEq for ScreenSnapshotReader {
     }
 }
 
-// ── localStorage key + persisted shape ────────────────────────────
+// ── localStorage key + persisted shape (SEND) ─────────────────────
 
-/// `localStorage` key for the persisted performance preference. Follows the
+/// `localStorage` key for the persisted send-quality preference. Follows the
 /// `vc_`-prefixed convention used throughout `context.rs`.
 pub const PERFORMANCE_PREF_KEY: &str = "vc_performance_quality";
 
-/// Load the persisted performance preference, falling back to all-Auto on any
+/// Load the persisted send-quality preference, falling back to all-Auto on any
 /// failure (missing key, corrupt JSON, storage unavailable) and sanitizing any
 /// stale out-of-range index against the current tier ladders.
 pub fn load_performance_preference() -> PerformancePreference {
@@ -113,12 +128,12 @@ pub fn load_performance_preference() -> PerformancePreference {
     )
 }
 
-/// Persist the performance preference. Silently no-ops on storage failure.
+/// Persist the send-quality preference. Silently no-ops on storage failure.
 pub fn save_performance_preference(pref: &PerformancePreference) {
     crate::local_storage::save_json(PERFORMANCE_PREF_KEY, pref);
 }
 
-/// User-selected adaptive-quality tier bounds, persisted to `localStorage`.
+/// User-selected adaptive-quality (SEND) tier bounds, persisted to `localStorage`.
 ///
 /// Each field stores a **tier index** (not a label) so the serialized form is
 /// stable even if display labels change, and is robust to a stored index that no
@@ -188,7 +203,7 @@ impl Default for PerformancePreference {
     }
 }
 
-// ── tier ladders (label ↔ index) ──────────────────────────────────
+// ── tier ladders (label ↔ index, SEND) ─────────────────────────────
 //
 // The labels are a fixed product decision (8 video tiers, 4 audio tiers) and
 // intentionally hard-coded here rather than derived from the AQ tier tables:
@@ -209,7 +224,7 @@ pub const AUDIO_TIER_LABELS: [&str; 4] = ["50 kbps", "32 kbps", "24 kbps", "16 k
 /// Order MUST match `SCREEN_QUALITY_TIERS` (index 0 = best).
 pub const SCREEN_TIER_LABELS: [&str; 3] = ["1080p", "720p", "low"];
 
-// ── encoder bounds + inversion ─────────────────────────────────────
+// ── encoder bounds + inversion (SEND) ──────────────────────────────
 
 /// The four backend arguments for `CameraEncoder::set_quality_tier_bounds`,
 /// already inverted from the user-facing Max/Min selections.
@@ -257,7 +272,7 @@ pub fn preference_to_encoder_bounds(pref: &PerformancePreference) -> EncoderQual
     }
 }
 
-// ── dual-thumb range slider model ──────────────────────────────────
+// ── dual-thumb range slider model (SEND) ───────────────────────────
 //
 // The control is a dual-thumb slider where **left→right = increasing quality**.
 // A slider "position" is `0..=tier_count-1`:
@@ -501,7 +516,7 @@ pub fn span_text(sel: RangeSel, labels: &[&str]) -> String {
     }
 }
 
-// ── VU meter needle math ──────────────────────────────────────────
+// ── VU meter needle math (SEND) ────────────────────────────────────
 
 /// Sweep range of the analog needle, in degrees. The needle swings from
 /// `-MAX_NEEDLE_DEG` (worst / left) to `+MAX_NEEDLE_DEG` (best / right) across
@@ -563,7 +578,7 @@ pub const AUDIO_EMPTY_READOUT: &str = "Idle";
 /// Empty-state readout for the screen gauge (not sharing / no snapshot).
 pub const SCREEN_EMPTY_READOUT: &str = "Not sharing";
 
-/// All three gauges' render state: needle angle + readout text. Pure so the
+/// All three SEND gauges' render state: needle angle + readout text. Pure so the
 /// snapshot→gauge mapping (including the empty-state reset) is host-testable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GaugeState {
@@ -575,7 +590,7 @@ pub struct GaugeState {
     pub screen_text: String,
 }
 
-/// Map the optional live snapshots to all three gauges' render state.
+/// Map the optional live SEND snapshots to all three gauges' render state.
 ///
 /// `Some` → live needle angles + numeric readouts. `None` on an input (encoder
 /// unavailable — camera turned off, or screen not sharing) → that gauge's needle
@@ -631,7 +646,7 @@ fn focus_element_by_id_local(id: &str) {
     }
 }
 
-// ── DOM helpers for the throttled needle update ───────────────────
+// ── DOM helpers for the throttled needle update (shared) ───────────
 
 /// Write `style.transform = rotate(<deg>deg)` to the needle element by id.
 ///
@@ -661,18 +676,24 @@ fn write_readout_text(readout_id: &str, text: &str) {
 }
 
 // ── public testids (also referenced by e2e) ───────────────────────
+//
+// SEND controls keep the original #961 testids so the existing
+// performance-settings e2e selectors continue to resolve. RECEIVE controls use
+// the `perf-recv-*` namespace (defined in the `receive` submodule) so the two
+// sets never collide within one unified section.
 
-/// Dual-thumb range slider thumbs (the two overlaid `<input type="range">`).
+/// Dual-thumb SEND range slider thumbs (the two overlaid `<input type="range">`).
 pub const TESTID_VIDEO_RANGE_MIN: &str = "perf-video-range-min";
 pub const TESTID_VIDEO_RANGE_MAX: &str = "perf-video-range-max";
 pub const TESTID_AUDIO_RANGE_MIN: &str = "perf-audio-range-min";
 pub const TESTID_AUDIO_RANGE_MAX: &str = "perf-audio-range-max";
 pub const TESTID_SCREEN_RANGE_MIN: &str = "perf-screen-range-min";
 pub const TESTID_SCREEN_RANGE_MAX: &str = "perf-screen-range-max";
-/// Per-stream "Auto" reset buttons (slide both thumbs to the extremes).
+/// Per-stream SEND "Auto" toggle buttons.
 pub const TESTID_VIDEO_AUTO: &str = "perf-video-auto";
 pub const TESTID_AUDIO_AUTO: &str = "perf-audio-auto";
 pub const TESTID_SCREEN_AUTO: &str = "perf-screen-auto";
+/// SEND ("Sending") needle gauges.
 pub const TESTID_VU_VIDEO: &str = "perf-vu-video";
 pub const TESTID_VU_AUDIO: &str = "perf-vu-audio";
 pub const TESTID_VU_SCREEN: &str = "perf-vu-screen";
@@ -689,8 +710,9 @@ const SCREEN_READOUT_ID: &str = "perf-vu-screen-readout";
 /// A single analog VU needle gauge with a live numeric readout below it.
 ///
 /// The arc + ticks are static SVG; only the `<line>` needle and the readout
-/// text node are mutated at runtime (by [`QualityVuMeterDriver`]'s rAF loop) via
-/// direct DOM writes, so this component itself never re-renders per frame.
+/// text node are mutated at runtime (by the rAF drivers) via direct DOM writes,
+/// so this component itself never re-renders per frame. Shared by both the
+/// "Sending" and "Receiving" needles (distinct ids per instance).
 #[component]
 fn VuGauge(
     /// Stable testid / aria target for the gauge container.
@@ -699,7 +721,7 @@ fn VuGauge(
     needle_id: &'static str,
     /// Id of the readout text element.
     readout_id: &'static str,
-    /// Accessible label, e.g. "Video quality" / "Audio quality".
+    /// Accessible label, e.g. "Sending video" / "Receiving video".
     label: &'static str,
     /// Initial needle rotation (degrees) for first paint before the loop ticks.
     initial_deg: f32,
@@ -774,8 +796,8 @@ fn VuGauge(
     }
 }
 
-/// Headless driver for the three VU needles. Renders **nothing** — it only owns
-/// the single ~4 Hz `requestAnimationFrame` polling loop that reads
+/// Headless driver for the three SEND VU needles. Renders **nothing** — it only
+/// owns the single ~4 Hz `requestAnimationFrame` polling loop that reads
 /// `live_quality_snapshot()` / `live_screen_snapshot()` and writes the needle
 /// rotations + readouts straight to the DOM nodes **by id** (so the gauges can
 /// live anywhere in the tree, e.g. each inside its own threshold section).
@@ -857,7 +879,7 @@ fn position_label<'a>(position: usize, labels: &[&'a str]) -> &'a str {
     labels.get(idx).copied().unwrap_or("?")
 }
 
-/// A discrete dual-thumb quality range slider for one stream.
+/// A discrete dual-thumb SEND-quality range slider for one stream.
 ///
 /// Implemented as two overlaid native `<input type="range">` elements — this
 /// keeps full keyboard operability (arrow keys step by one tier) and native
@@ -865,10 +887,6 @@ fn position_label<'a>(position: usize, labels: &[&'a str]) -> &'a str {
 /// thumbs cannot cross: the left (min/worst) thumb is clamped to `<=` the right
 /// (max/best) thumb on every change. Left→right is increasing quality, so the
 /// rightmost stop is the best tier (index 0).
-///
-/// Each thumb carries its own `aria-label` and an `aria-valuetext` of the tier
-/// label it currently points at, so screen readers announce the quality (not a
-/// bare number).
 #[component]
 fn DualRangeSlider(
     /// Stable id prefix, e.g. "perf-video" / "perf-audio".
@@ -924,7 +942,7 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{min_value}",
-                    "aria-label": "Minimum {stream_noun} quality",
+                    "aria-label": "Minimum {stream_noun} send quality",
                     "aria-valuetext": "{min_valuetext}",
                     oninput: move |evt| {
                         if let Ok(p) = evt.value().parse::<usize>() {
@@ -941,7 +959,7 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{max_value}",
-                    "aria-label": "Maximum {stream_noun} quality",
+                    "aria-label": "Maximum {stream_noun} send quality",
                     "aria-valuetext": "{max_valuetext}",
                     oninput: move |evt| {
                         if let Ok(p) = evt.value().parse::<usize>() {
@@ -956,178 +974,212 @@ fn DualRangeSlider(
     }
 }
 
-/// One stream's threshold section: its live VU needle gauge alongside the
-/// dual-thumb range slider, with the header (Fixed badge + Auto toggle) and the
-/// live range text.
+/// A self-contained "?" help popover button (shared by send + receive rows).
 ///
-/// **Auto** is an explicit per-stream toggle (`aria-pressed`): when active
-/// (default), the slider stays **fully interactive** with both thumbs pinned at
-/// the extremes (full ladder span) and the encoder bounds are `None/None`. The
-/// only Auto-on cues are the green button + the thumbs at the ends — the slider
-/// is never disabled or dimmed. Clicking the button toggles Auto via
-/// `on_auto_toggle` (ON snaps thumbs back to the extremes); dragging a thumb
-/// inward reports the new range via `on_change`, which turns Auto OFF.
-#[allow(clippy::too_many_arguments)]
+/// `open_help` is the shared single-open signal keyed by `key_id`. Opening one
+/// closes any other (since they all share the signal).
 #[component]
-fn ThresholdGroup(
-    title: &'static str,
-    stream_noun: &'static str,
-    id_prefix: &'static str,
-    min_testid: &'static str,
-    max_testid: &'static str,
-    auto_testid: &'static str,
-    fixed_testid: &'static str,
-    /// "?" help button testid + its accessible label + the explanation copy.
+fn HelpPopover(
+    /// Unique key for this popover within the shared `open_help` signal.
+    key_id: &'static str,
     help_testid: &'static str,
     help_label: &'static str,
     help_body: &'static str,
-    /// VU gauge identifiers + first-paint values for this stream's needle.
-    vu_testid: &'static str,
-    vu_needle_id: &'static str,
-    vu_readout_id: &'static str,
-    vu_label: &'static str,
-    vu_initial_deg: f32,
-    vu_initial_readout: String,
-    labels: Vec<&'static str>,
-    /// Current bounds: (best index, worst index), `None` = extreme on that end.
-    best: Option<usize>,
-    worst: Option<usize>,
-    is_fixed: bool,
-    /// Whether this stream is currently on Auto.
-    is_auto: bool,
-    /// Which section's help popover is open (shared so opening one closes others).
-    /// Keyed by `id_prefix`.
     open_help: Signal<Option<&'static str>>,
-    on_change: EventHandler<RangeSel>,
-    /// Toggle the Auto flag; the arg is the new desired state.
-    on_auto_toggle: EventHandler<bool>,
 ) -> Element {
-    let sel = bounds_to_thumbs(best, worst, labels.len());
-    // The readout always describes the concrete slider span (full ladder while
-    // Auto, since both thumbs sit at the extremes), not the encoder semantics.
-    let range_str = span_text(sel, &labels);
-    let auto_button_class = if is_auto {
+    let mut open_help = open_help;
+    let help_open = open_help() == Some(key_id);
+    let help_popover_id = format!("{key_id}-help-popover");
+    let help_btn_id = format!("{key_id}-help-btn");
+
+    rsx! {
+        div { class: "perf-help",
+            button {
+                id: "{help_btn_id}",
+                r#type: "button",
+                class: "perf-help-button",
+                "data-testid": help_testid,
+                "aria-label": help_label,
+                "aria-haspopup": "dialog",
+                "aria-expanded": if help_open { "true" } else { "false" },
+                "aria-controls": "{help_popover_id}",
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    if help_open {
+                        open_help.set(None);
+                    } else {
+                        open_help.set(Some(key_id));
+                    }
+                },
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape && help_open {
+                        evt.stop_propagation();
+                        open_help.set(None);
+                    }
+                },
+                "?"
+            }
+            if help_open {
+                // Transparent full-viewport scrim: any click outside the popover
+                // closes it (touch-friendly outside-click).
+                div {
+                    class: "perf-help-scrim",
+                    "aria-hidden": "true",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        open_help.set(None);
+                    },
+                }
+                div {
+                    id: "{help_popover_id}",
+                    class: "perf-help-popover",
+                    role: "dialog",
+                    "aria-label": help_label,
+                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                    onkeydown: {
+                        let help_btn_id = help_btn_id.clone();
+                        move |evt: KeyboardEvent| {
+                            if evt.key() == Key::Escape {
+                                evt.stop_propagation();
+                                open_help.set(None);
+                                focus_element_by_id_local(&help_btn_id);
+                            }
+                        }
+                    },
+                    p { class: "perf-help-popover-text", "{help_body}" }
+                }
+            }
+        }
+    }
+}
+
+/// One stream kind's unified section: a header (kind title) plus a **Receive**
+/// row and a **Send** row, each with its own needle gauge, dual-thumb slider,
+/// Auto toggle, Fixed badge, "?" help popover and live range text.
+///
+/// Receive uses the natural index convention (0 = lowest) and bounds the layers
+/// pulled from peers; Send uses the inverted tier convention (0 = best) and
+/// bounds what this peer publishes. They are wired to independent callbacks and
+/// distinct testids / needle ids so they never cross.
+#[allow(clippy::too_many_arguments)]
+#[component]
+fn KindSection(
+    kind: PrefMediaKind,
+    title: &'static str,
+    stream_noun: &'static str,
+    /// Send id prefix, e.g. "perf-video".
+    send_id_prefix: &'static str,
+    send_min_testid: &'static str,
+    send_max_testid: &'static str,
+    send_auto_testid: &'static str,
+    send_fixed_testid: &'static str,
+    send_help_testid: &'static str,
+    send_vu_testid: &'static str,
+    send_vu_needle_id: &'static str,
+    send_vu_readout_id: &'static str,
+    send_vu_label: &'static str,
+    send_vu_initial_deg: f32,
+    send_vu_initial_readout: String,
+    send_labels: Vec<&'static str>,
+    send_best: Option<usize>,
+    send_worst: Option<usize>,
+    send_is_fixed: bool,
+    send_is_auto: bool,
+    /// Receive needle first-paint values + the kind's persisted receive sub-pref.
+    recv_vu_initial_deg: f32,
+    recv_vu_initial_readout: String,
+    recv_sub: KindReceivePref,
+    /// Shared single-open help signal (opening any popover closes the others).
+    open_help: Signal<Option<&'static str>>,
+    on_send_change: EventHandler<RangeSel>,
+    on_send_auto_toggle: EventHandler<bool>,
+    on_recv_change: EventHandler<KindReceivePref>,
+) -> Element {
+    let send_sel = bounds_to_thumbs(send_best, send_worst, send_labels.len());
+    let send_range_str = span_text(send_sel, &send_labels);
+    let send_auto_class = if send_is_auto {
         "perf-auto-button is-active"
     } else {
         "perf-auto-button"
     };
-    let mut open_help = open_help;
-    let help_open = open_help() == Some(id_prefix);
-    let help_popover_id = format!("{id_prefix}-help-popover");
-    let help_btn_id = format!("{id_prefix}-help-btn");
 
     rsx! {
-        div { class: "perf-stream-group",
-            div { class: "perf-stream-header",
-                span { class: "perf-stream-title", "{title}" }
-                // "?" help button + popover.
-                div { class: "perf-help",
-                    button {
-                        id: "{help_btn_id}",
-                        r#type: "button",
-                        class: "perf-help-button",
-                        "data-testid": help_testid,
-                        "aria-label": help_label,
-                        "aria-haspopup": "dialog",
-                        "aria-expanded": if help_open { "true" } else { "false" },
-                        "aria-controls": "{help_popover_id}",
-                        onclick: move |e: MouseEvent| {
-                            e.stop_propagation();
-                            if help_open {
-                                open_help.set(None);
-                            } else {
-                                open_help.set(Some(id_prefix));
-                            }
-                        },
-                        onkeydown: move |evt: KeyboardEvent| {
-                            if evt.key() == Key::Escape && help_open {
-                                evt.stop_propagation();
-                                open_help.set(None);
-                            }
-                        },
-                        "?"
-                    }
-                    if help_open {
-                        // Transparent full-viewport scrim: any click outside the
-                        // popover closes it (touch-friendly outside-click).
-                        div {
-                            class: "perf-help-scrim",
-                            "aria-hidden": "true",
-                            onclick: move |e: MouseEvent| {
-                                e.stop_propagation();
-                                open_help.set(None);
-                            },
-                        }
-                        div {
-                            id: "{help_popover_id}",
-                            class: "perf-help-popover",
-                            role: "dialog",
-                            "aria-label": help_label,
-                            // Keep clicks inside from reaching the scrim.
-                            onclick: move |e: MouseEvent| e.stop_propagation(),
-                            onkeydown: {
-                                let help_btn_id = help_btn_id.clone();
-                                move |evt: KeyboardEvent| {
-                                    if evt.key() == Key::Escape {
-                                        evt.stop_propagation();
-                                        open_help.set(None);
-                                        focus_element_by_id_local(&help_btn_id);
-                                    }
-                                }
-                            },
-                            p { class: "perf-help-popover-text", "{help_body}" }
-                        }
-                    }
-                }
-                if is_fixed {
-                    span {
-                        class: "perf-fixed-badge",
-                        "data-testid": fixed_testid,
-                        title: "Quality is pinned to a single tier — the call won't adapt this stream",
-                        "aria-label": "{stream_noun} quality pinned to a single tier — adaptation disabled for this stream",
-                        "Fixed"
-                    }
-                }
-                button {
-                    r#type: "button",
-                    class: auto_button_class,
-                    "data-testid": auto_testid,
-                    "aria-pressed": if is_auto { "true" } else { "false" },
-                    "aria-label": "Automatic {stream_noun} quality",
-                    title: if is_auto {
-                        "Automatic (full range) — click to set manual quality limits"
-                    } else {
-                        "Manual limits — click for fully automatic quality"
-                    },
-                    onclick: move |_| on_auto_toggle.call(!is_auto),
-                    "Auto"
-                }
+        div { class: "perf-kind-group",
+            div { class: "perf-kind-header",
+                span { class: "perf-kind-title", "{title}" }
             }
-            // Needle gauge (left) beside the slider + range text (right).
-            div { class: "perf-stream-body",
-                VuGauge {
-                    testid: vu_testid,
-                    needle_id: vu_needle_id,
-                    readout_id: vu_readout_id,
-                    label: vu_label,
-                    initial_deg: vu_initial_deg,
-                    initial_readout: vu_initial_readout,
-                }
-                div { class: "perf-stream-controls",
-                    DualRangeSlider {
-                        id_prefix,
-                        min_testid,
-                        max_testid,
-                        stream_noun,
-                        labels: labels.clone(),
-                        sel,
-                        on_change: move |s: RangeSel| on_change.call(s),
+
+            // ── RECEIVE row (save MY downlink) ──
+            receive::ReceiveRow {
+                kind,
+                stream_noun,
+                vu_initial_deg: recv_vu_initial_deg,
+                vu_initial_readout: recv_vu_initial_readout,
+                sub: recv_sub,
+                open_help,
+                on_change: move |sub: KindReceivePref| on_recv_change.call(sub),
+            }
+
+            // ── SEND row (save MY uplink / CPU) ──
+            div { class: "perf-stream-group perf-send-row",
+                div { class: "perf-stream-header",
+                    span { class: "perf-stream-title", "Send" }
+                    HelpPopover {
+                        key_id: send_id_prefix,
+                        help_testid: send_help_testid,
+                        help_label: send_vu_label,
+                        help_body: "Sets the best (right) and worst (left) quality this device PUBLISHES, to save your upload bandwidth and CPU. The app adapts within these limits based on your network. Auto uses the full range.",
+                        open_help,
                     }
-                    p {
-                        class: "perf-range-value",
-                        "data-testid": "{id_prefix}-range-value",
-                        "aria-live": "polite",
-                        "Range: {range_str}"
+                    if send_is_fixed {
+                        span {
+                            class: "perf-fixed-badge",
+                            "data-testid": send_fixed_testid,
+                            title: "Send quality is pinned to a single tier — this stream won't adapt",
+                            "aria-label": "{stream_noun} send quality pinned to a single tier — adaptation disabled",
+                            "Fixed"
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: send_auto_class,
+                        "data-testid": send_auto_testid,
+                        "aria-pressed": if send_is_auto { "true" } else { "false" },
+                        "aria-label": "Automatic {stream_noun} send quality",
+                        title: if send_is_auto {
+                            "Automatic (full range) — click to set manual send limits"
+                        } else {
+                            "Manual limits — click for fully automatic send quality"
+                        },
+                        onclick: move |_| on_send_auto_toggle.call(!send_is_auto),
+                        "Auto"
+                    }
+                }
+                div { class: "perf-stream-body",
+                    VuGauge {
+                        testid: send_vu_testid,
+                        needle_id: send_vu_needle_id,
+                        readout_id: send_vu_readout_id,
+                        label: send_vu_label,
+                        initial_deg: send_vu_initial_deg,
+                        initial_readout: send_vu_initial_readout,
+                    }
+                    div { class: "perf-stream-controls",
+                        DualRangeSlider {
+                            id_prefix: send_id_prefix,
+                            min_testid: send_min_testid,
+                            max_testid: send_max_testid,
+                            stream_noun,
+                            labels: send_labels.clone(),
+                            sel: send_sel,
+                            on_change: move |s: RangeSel| on_send_change.call(s),
+                        }
+                        p {
+                            class: "perf-range-value",
+                            "data-testid": "{send_id_prefix}-range-value",
+                            "aria-live": "polite",
+                            "Sending: {send_range_str}"
+                        }
                     }
                 }
             }
@@ -1135,140 +1187,1110 @@ fn ThresholdGroup(
     }
 }
 
-/// The Performance settings panel body: the live VU meters (top), then the
-/// per-stream dual-thumb quality-threshold sliders.
+/// The unified Performance settings panel body: per kind (Video, Audio,
+/// Screen/content) a Receive control + a Send control, each with its own live
+/// needle. Two headless rAF drivers update the "Sending" and "Receiving"
+/// needles independently.
 ///
-/// `pref` is the current persisted preference (controlled by the parent). When
-/// the user moves a thumb or presses Auto, the panel derives the new bounds and
-/// calls `on_change`; the parent persists it and pushes it to the encoder. The
-/// panel is otherwise stateless.
+/// `pref` (send) + `receive_pref` are the current persisted preferences
+/// (controlled by the parent). On any change the panel derives the new bounds
+/// and calls the matching callback; the parent persists it and pushes it to the
+/// encoder (send) or client (receive). The panel is otherwise stateless.
 #[component]
 pub fn PerformanceSettingsPanel(
+    // SEND side (#961).
     pref: PerformancePreference,
     on_change: EventHandler<PerformancePreference>,
     read_snapshot: SnapshotReader,
     read_screen_snapshot: ScreenSnapshotReader,
+    // RECEIVE side (#989 simulcast).
+    receive_pref: ReceivePreference,
+    on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
+    received_reader: ReceivedReader,
 ) -> Element {
     let video_fixed = pref.video_is_fixed();
     let audio_fixed = pref.audio_is_fixed();
     let screen_fixed = pref.screen_is_fixed();
 
-    // First-paint gauge values (before the rAF driver ticks). The same pure
+    // First-paint SEND gauge values (before the rAF driver ticks). The same pure
     // mapper drives the live loop, so first paint and live updates agree.
     let initial = read_snapshot.read();
     let initial_screen = read_screen_snapshot.read();
     let g = gauge_state_from_snapshot(initial.as_ref(), initial_screen.as_ref());
 
+    // First-paint RECEIVE gauge values.
+    let rgv = receive::gauge_state(received_reader.read(PrefMediaKind::Video).as_ref());
+    let rga = receive::gauge_state(received_reader.read(PrefMediaKind::Audio).as_ref());
+    let rgs = receive::gauge_state(received_reader.read(PrefMediaKind::Screen).as_ref());
+
     // Which popover (if any) is currently open. `None` = all closed. Shared
-    // across the three sections so opening one closes the others.
+    // across every section/row so opening one closes the others.
     let open_help: Signal<Option<&'static str>> = use_signal(|| None);
 
     rsx! {
         h3 { class: "settings-section-title", "Performance" }
         p { class: "settings-section-description",
-            "Each stream is on Auto (fully automatic) by default. Turn Auto off to "
-            "bound the range with the dual thumbs: the left thumb is the lowest it "
-            "may drop to, the right thumb the highest it may rise to."
+            "Per stream: limit what you RECEIVE from others (saves your download) and "
+            "what you SEND to others (saves your upload + CPU). Each control adapts "
+            "within its range; the needles show what's flowing right now."
         }
 
-        // Headless driver: owns the single ~4 Hz rAF loop that updates all three
-        // needles by id. Renders nothing; the gauges live in the sections below.
+        // Headless drivers: one ~4 Hz rAF loop each, updating the Sending and
+        // Receiving needles by id. They render nothing; gauges live in the
+        // sections below.
         QualityVuMeterDriver { read_snapshot, read_screen_snapshot }
+        receive::ReceivedQualityDriver { reader: received_reader }
 
-        // ── Video Thresholds ──
-        ThresholdGroup {
-            title: "Video Thresholds",
+        // ── Video ──
+        KindSection {
+            kind: PrefMediaKind::Video,
+            title: "Video",
             stream_noun: "video",
-            id_prefix: "perf-video",
-            min_testid: TESTID_VIDEO_RANGE_MIN,
-            max_testid: TESTID_VIDEO_RANGE_MAX,
-            auto_testid: TESTID_VIDEO_AUTO,
-            fixed_testid: "perf-video-fixed-badge",
-            help_testid: "perf-video-help",
-            help_label: "About video quality",
-            help_body: "Sets the best (right) and worst (left) video quality the call may use. The app automatically adapts resolution and frame rate between these limits based on your network. Auto uses the full range.",
-            vu_testid: TESTID_VU_VIDEO,
-            vu_needle_id: VIDEO_NEEDLE_ID,
-            vu_readout_id: VIDEO_READOUT_ID,
-            vu_label: "Video quality",
-            vu_initial_deg: g.video_deg,
-            vu_initial_readout: g.video_text.clone(),
-            labels: VIDEO_TIER_LABELS.to_vec(),
-            best: pref.video_max,
-            worst: pref.video_min,
-            is_fixed: video_fixed,
-            is_auto: pref.video_auto,
+            send_id_prefix: "perf-video",
+            send_min_testid: TESTID_VIDEO_RANGE_MIN,
+            send_max_testid: TESTID_VIDEO_RANGE_MAX,
+            send_auto_testid: TESTID_VIDEO_AUTO,
+            send_fixed_testid: "perf-video-fixed-badge",
+            send_help_testid: "perf-video-help",
+            send_vu_testid: TESTID_VU_VIDEO,
+            send_vu_needle_id: VIDEO_NEEDLE_ID,
+            send_vu_readout_id: VIDEO_READOUT_ID,
+            send_vu_label: "Sending video",
+            send_vu_initial_deg: g.video_deg,
+            send_vu_initial_readout: g.video_text.clone(),
+            send_labels: VIDEO_TIER_LABELS.to_vec(),
+            send_best: pref.video_max,
+            send_worst: pref.video_min,
+            send_is_fixed: video_fixed,
+            send_is_auto: pref.video_auto,
+            recv_vu_initial_deg: rgv.deg,
+            recv_vu_initial_readout: rgv.text.clone(),
+            recv_sub: receive_pref.video,
             open_help,
-            on_change: move |sel: RangeSel| {
-                on_change.call(pref.with_video_thumbs(sel));
-            },
-            on_auto_toggle: move |on: bool| {
-                on_change.call(pref.set_video_auto(on));
+            on_send_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
+            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
+            on_recv_change: move |sub: KindReceivePref| {
+                on_receive_change.call((PrefMediaKind::Video, sub));
             },
         }
 
-        // ── Audio Thresholds ──
-        ThresholdGroup {
-            title: "Audio Thresholds",
+        // ── Audio ──
+        KindSection {
+            kind: PrefMediaKind::Audio,
+            title: "Audio",
             stream_noun: "audio",
-            id_prefix: "perf-audio",
-            min_testid: TESTID_AUDIO_RANGE_MIN,
-            max_testid: TESTID_AUDIO_RANGE_MAX,
-            auto_testid: TESTID_AUDIO_AUTO,
-            fixed_testid: "perf-audio-fixed-badge",
-            help_testid: "perf-audio-help",
-            help_label: "About audio quality",
-            help_body: "Sets the best and worst audio quality (bitrate) the call may use. Audio only steps down once video is already at its lowest quality, so these limits mainly matter under heavy congestion.",
-            vu_testid: TESTID_VU_AUDIO,
-            vu_needle_id: AUDIO_NEEDLE_ID,
-            vu_readout_id: AUDIO_READOUT_ID,
-            vu_label: "Audio quality",
-            vu_initial_deg: g.audio_deg,
-            vu_initial_readout: g.audio_text.clone(),
-            labels: AUDIO_TIER_LABELS.to_vec(),
-            best: pref.audio_max,
-            worst: pref.audio_min,
-            is_fixed: audio_fixed,
-            is_auto: pref.audio_auto,
+            send_id_prefix: "perf-audio",
+            send_min_testid: TESTID_AUDIO_RANGE_MIN,
+            send_max_testid: TESTID_AUDIO_RANGE_MAX,
+            send_auto_testid: TESTID_AUDIO_AUTO,
+            send_fixed_testid: "perf-audio-fixed-badge",
+            send_help_testid: "perf-audio-help",
+            send_vu_testid: TESTID_VU_AUDIO,
+            send_vu_needle_id: AUDIO_NEEDLE_ID,
+            send_vu_readout_id: AUDIO_READOUT_ID,
+            send_vu_label: "Sending audio",
+            send_vu_initial_deg: g.audio_deg,
+            send_vu_initial_readout: g.audio_text.clone(),
+            send_labels: AUDIO_TIER_LABELS.to_vec(),
+            send_best: pref.audio_max,
+            send_worst: pref.audio_min,
+            send_is_fixed: audio_fixed,
+            send_is_auto: pref.audio_auto,
+            recv_vu_initial_deg: rga.deg,
+            recv_vu_initial_readout: rga.text.clone(),
+            recv_sub: receive_pref.audio,
             open_help,
-            on_change: move |sel: RangeSel| {
-                on_change.call(pref.with_audio_thumbs(sel));
-            },
-            on_auto_toggle: move |on: bool| {
-                on_change.call(pref.set_audio_auto(on));
+            on_send_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
+            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
+            on_recv_change: move |sub: KindReceivePref| {
+                on_receive_change.call((PrefMediaKind::Audio, sub));
             },
         }
 
-        // ── Screen Share Thresholds ──
-        ThresholdGroup {
-            title: "Screen Share Thresholds",
+        // ── Screen / shared content ──
+        KindSection {
+            kind: PrefMediaKind::Screen,
+            title: "Screen Share",
             stream_noun: "screen share",
-            id_prefix: "perf-screen",
-            min_testid: TESTID_SCREEN_RANGE_MIN,
-            max_testid: TESTID_SCREEN_RANGE_MAX,
-            auto_testid: TESTID_SCREEN_AUTO,
-            fixed_testid: "perf-screen-fixed-badge",
-            help_testid: "perf-screen-help",
-            help_label: "About shared-content quality",
-            help_body: "Sets the best and worst quality for screen / shared-content sharing. This is independent of your camera video — shared content adapts on its own between these limits.",
-            vu_testid: TESTID_VU_SCREEN,
-            vu_needle_id: SCREEN_NEEDLE_ID,
-            vu_readout_id: SCREEN_READOUT_ID,
-            vu_label: "Screen quality",
-            vu_initial_deg: g.screen_deg,
-            vu_initial_readout: g.screen_text.clone(),
-            labels: SCREEN_TIER_LABELS.to_vec(),
-            best: pref.screen_max,
-            worst: pref.screen_min,
-            is_fixed: screen_fixed,
-            is_auto: pref.screen_auto,
+            send_id_prefix: "perf-screen",
+            send_min_testid: TESTID_SCREEN_RANGE_MIN,
+            send_max_testid: TESTID_SCREEN_RANGE_MAX,
+            send_auto_testid: TESTID_SCREEN_AUTO,
+            send_fixed_testid: "perf-screen-fixed-badge",
+            send_help_testid: "perf-screen-help",
+            send_vu_testid: TESTID_VU_SCREEN,
+            send_vu_needle_id: SCREEN_NEEDLE_ID,
+            send_vu_readout_id: SCREEN_READOUT_ID,
+            send_vu_label: "Sending screen",
+            send_vu_initial_deg: g.screen_deg,
+            send_vu_initial_readout: g.screen_text.clone(),
+            send_labels: SCREEN_TIER_LABELS.to_vec(),
+            send_best: pref.screen_max,
+            send_worst: pref.screen_min,
+            send_is_fixed: screen_fixed,
+            send_is_auto: pref.screen_auto,
+            recv_vu_initial_deg: rgs.deg,
+            recv_vu_initial_readout: rgs.text.clone(),
+            recv_sub: receive_pref.screen,
             open_help,
-            on_change: move |sel: RangeSel| {
-                on_change.call(pref.with_screen_thumbs(sel));
+            on_send_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
+            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
+            on_recv_change: move |sub: KindReceivePref| {
+                on_receive_change.call((PrefMediaKind::Screen, sub));
             },
-            on_auto_toggle: move |on: bool| {
-                on_change.call(pref.set_screen_auto(on));
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// RECEIVE side (simulcast P4/P5). Layer-index convention is DIRECT: index 0 =
+// LOWEST quality, higher = HIGHER. Kept in its own module so its RangeSel /
+// span_text / bounds_to_thumbs cannot be confused with the inverted send-side
+// ones above.
+// ══════════════════════════════════════════════════════════════════════════
+pub mod receive {
+    use super::{write_needle_rotation, write_readout_text};
+    use dioxus::prelude::*;
+    use std::rc::Rc;
+    use videocall_client::{PrefMediaKind, ReceivedLayerSnapshot};
+    use wasm_bindgen::JsCast;
+
+    /// A cloneable, `PartialEq`-able handle around the per-kind received-snapshot
+    /// reader closure (see [`super::SnapshotReader`] for the pattern).
+    #[derive(Clone)]
+    pub struct ReceivedReader(pub Rc<dyn Fn(PrefMediaKind) -> Option<ReceivedLayerSnapshot>>);
+
+    impl ReceivedReader {
+        /// A reader that always yields `None` (nothing received / test default).
+        pub fn none() -> Self {
+            ReceivedReader(Rc::new(|_| None))
+        }
+
+        pub(super) fn read(&self, kind: PrefMediaKind) -> Option<ReceivedLayerSnapshot> {
+            (self.0)(kind)
+        }
+    }
+
+    impl PartialEq for ReceivedReader {
+        fn eq(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.0, &other.0)
+        }
+    }
+
+    // ── localStorage key + persisted shape ─────────────────────────
+
+    /// `localStorage` key for the persisted receive-bounds preference.
+    pub const RECEIVE_PREF_KEY: &str = "vc_perf_receive_bounds";
+
+    /// One stream's persisted receive bound: min/max layer index (`None` = that
+    /// end unbounded) plus an explicit Auto flag. When `auto` is set the encoder
+    /// bounds are forced to `(None, None)` regardless of the stored indices
+    /// (which are kept so toggling Auto off restores the last manual range).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KindReceivePref {
+        /// Inclusive minimum received layer index, or `None` for no lower bound.
+        #[serde(default)]
+        pub min: Option<u32>,
+        /// Inclusive maximum received layer index, or `None` for no upper bound.
+        #[serde(default)]
+        pub max: Option<u32>,
+        /// Whether this stream is on Auto (full range). Default `true`.
+        #[serde(default = "default_true")]
+        pub auto: bool,
+    }
+
+    impl Default for KindReceivePref {
+        fn default() -> Self {
+            KindReceivePref {
+                min: None,
+                max: None,
+                auto: true,
+            }
+        }
+    }
+
+    /// serde default for the `auto` flag (a fn because serde needs a path).
+    fn default_true() -> bool {
+        true
+    }
+
+    /// The full persisted receive-bounds preference: one [`KindReceivePref`] per
+    /// media kind. Default = all-Auto. `#[serde(default)]` per field gives
+    /// back-compat for prefs written by an older build that lacked a kind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+    pub struct ReceivePreference {
+        #[serde(default)]
+        pub video: KindReceivePref,
+        #[serde(default)]
+        pub audio: KindReceivePref,
+        #[serde(default)]
+        pub screen: KindReceivePref,
+    }
+
+    impl ReceivePreference {
+        /// The per-kind sub-preference.
+        pub fn for_kind(&self, kind: PrefMediaKind) -> KindReceivePref {
+            match kind {
+                PrefMediaKind::Video => self.video,
+                PrefMediaKind::Audio => self.audio,
+                PrefMediaKind::Screen => self.screen,
+            }
+        }
+
+        /// Return a copy with one kind's sub-preference replaced.
+        pub fn with_kind(mut self, kind: PrefMediaKind, sub: KindReceivePref) -> Self {
+            match kind {
+                PrefMediaKind::Video => self.video = sub,
+                PrefMediaKind::Audio => self.audio = sub,
+                PrefMediaKind::Screen => self.screen = sub,
+            }
+            self
+        }
+
+        /// The effective encoder `(min, max)` for a kind: `(None, None)` when on
+        /// Auto (full range), otherwise the stored indices. This is exactly what
+        /// gets pushed to `set_receive_layer_bounds`.
+        pub fn effective_bounds(&self, kind: PrefMediaKind) -> (Option<u32>, Option<u32>) {
+            let s = self.for_kind(kind);
+            if s.auto {
+                (None, None)
+            } else {
+                (s.min, s.max)
+            }
+        }
+
+        /// Clamp any stored index outside `[0, layer_count(kind)-1]` back to
+        /// `None`, defending against a pref written by a build with a different
+        /// ladder size.
+        pub fn sanitized(self) -> Self {
+            let fix = |kind: PrefMediaKind, sub: KindReceivePref| {
+                let top = top_index(kind);
+                KindReceivePref {
+                    min: sub.min.filter(|&i| i <= top),
+                    max: sub.max.filter(|&i| i <= top),
+                    auto: sub.auto,
+                }
+            };
+            ReceivePreference {
+                video: fix(PrefMediaKind::Video, self.video),
+                audio: fix(PrefMediaKind::Audio, self.audio),
+                screen: fix(PrefMediaKind::Screen, self.screen),
+            }
+        }
+    }
+
+    /// Load the persisted receive preference, falling back to all-Auto on any
+    /// failure and sanitizing any stale out-of-range index.
+    pub fn load_receive_preference() -> ReceivePreference {
+        crate::local_storage::load_json::<ReceivePreference>(
+            RECEIVE_PREF_KEY,
+            ReceivePreference::default(),
+        )
+        .sanitized()
+    }
+
+    /// Persist the receive preference. Silently no-ops on storage failure.
+    pub fn save_receive_preference(pref: &ReceivePreference) {
+        crate::local_storage::save_json(RECEIVE_PREF_KEY, pref);
+    }
+
+    // ── per-kind layer ladders (label ↔ index, receive convention) ─
+    //
+    // Order is LOWEST-first: index 0 = lowest quality (left thumb), top index =
+    // highest quality (right thumb).
+
+    /// Video receive layer labels, index 0 = lowest (360p) … 2 = highest (720p).
+    pub const VIDEO_LAYER_LABELS: [&str; 3] = ["360p", "540p", "720p"];
+
+    /// Screen receive layer labels, index 0 = lowest … 2 = highest.
+    pub const SCREEN_LAYER_LABELS: [&str; 3] = ["low", "medium", "high"];
+
+    /// Audio receive layer labels, index 0 = low (24k) … 2 = high (50k).
+    /// Three rungs to match the publisher's audio ladder (#1082).
+    pub const AUDIO_LAYER_LABELS: [&str; 3] = ["low (24k)", "mid (32k)", "high (50k)"];
+
+    /// The labels for a media kind.
+    pub fn labels_for(kind: PrefMediaKind) -> &'static [&'static str] {
+        match kind {
+            PrefMediaKind::Video => &VIDEO_LAYER_LABELS,
+            PrefMediaKind::Screen => &SCREEN_LAYER_LABELS,
+            PrefMediaKind::Audio => &AUDIO_LAYER_LABELS,
+        }
+    }
+
+    /// The number of layers in a kind's ladder.
+    pub fn layer_count(kind: PrefMediaKind) -> u32 {
+        labels_for(kind).len() as u32
+    }
+
+    /// The top (highest-quality) layer index for a kind: `layer_count - 1`.
+    pub fn top_index(kind: PrefMediaKind) -> u32 {
+        layer_count(kind).saturating_sub(1)
+    }
+
+    /// Map a layer index to its label for a kind, or `"?"` if out of range.
+    pub fn index_label(kind: PrefMediaKind, index: u32) -> &'static str {
+        labels_for(kind).get(index as usize).copied().unwrap_or("?")
+    }
+
+    // ── dual-thumb range slider model (receive: left=low index) ────
+
+    /// One stream's dual-thumb slider state, in layer-index space. `min_pos` is
+    /// the left thumb, `max_pos` the right thumb; `min_pos <= max_pos` always.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RangeSel {
+        pub min_pos: u32,
+        pub max_pos: u32,
+    }
+
+    /// Derive a kind's slider thumbs from its stored `(min, max)` bounds.
+    pub fn bounds_to_thumbs(kind: PrefMediaKind, min: Option<u32>, max: Option<u32>) -> RangeSel {
+        let top = top_index(kind);
+        let min_pos = min.unwrap_or(0).min(top);
+        let max_pos = max.unwrap_or(top).min(top);
+        if min_pos > max_pos {
+            RangeSel {
+                min_pos: max_pos,
+                max_pos,
+            }
+        } else {
+            RangeSel { min_pos, max_pos }
+        }
+    }
+
+    /// Derive a kind's `(min, max)` bounds from its slider thumbs. A thumb at its
+    /// extreme means "no bound" (`None`) on that end. Both extremes →
+    /// `(None, None)` (full range = Auto).
+    pub fn thumbs_to_bounds(kind: PrefMediaKind, sel: RangeSel) -> (Option<u32>, Option<u32>) {
+        let top = top_index(kind);
+        let min = if sel.min_pos == 0 {
+            None
+        } else {
+            Some(sel.min_pos.min(top))
+        };
+        let max = if sel.max_pos >= top {
+            None
+        } else {
+            Some(sel.max_pos)
+        };
+        (min, max)
+    }
+
+    /// Move the LEFT (min) thumb to `new_min_pos`, never past the right thumb.
+    pub fn set_min_thumb(sel: RangeSel, new_min_pos: u32) -> RangeSel {
+        RangeSel {
+            min_pos: new_min_pos.min(sel.max_pos),
+            max_pos: sel.max_pos,
+        }
+    }
+
+    /// Move the RIGHT (max) thumb to `new_max_pos`, never past the left thumb.
+    pub fn set_max_thumb(sel: RangeSel, new_max_pos: u32) -> RangeSel {
+        RangeSel {
+            min_pos: sel.min_pos,
+            max_pos: new_max_pos.max(sel.min_pos),
+        }
+    }
+
+    /// Concrete span text for the slider readout. Pure.
+    pub fn span_text(kind: PrefMediaKind, sel: RangeSel) -> String {
+        let low = index_label(kind, sel.min_pos);
+        let high = index_label(kind, sel.max_pos);
+        if sel.min_pos == sel.max_pos {
+            low.to_string()
+        } else {
+            format!("{low} – {high}")
+        }
+    }
+
+    // ── needle math + readout ──────────────────────────────────────
+
+    /// Sweep range of the analog needle, in degrees.
+    pub const MAX_NEEDLE_DEG: f32 = super::MAX_NEEDLE_DEG;
+
+    /// Empty-state needle angle: rested at the left peg (lowest end).
+    pub const EMPTY_NEEDLE_DEG: f32 = -MAX_NEEDLE_DEG;
+
+    /// Empty-state readout shown when nothing of a kind is being received.
+    pub const EMPTY_READOUT: &str = "Not receiving";
+
+    /// Convert a decoded `layer_index` within a `layer_count`-layer ladder into
+    /// the needle rotation angle. Layer 0 (lowest) → `-MAX` (left); top → `+MAX`
+    /// (right). Single-layer centers; out-of-range clamps. Pure.
+    pub fn needle_deg(layer_index: u32, layer_count: u32) -> f32 {
+        if layer_count <= 1 {
+            return 0.0;
+        }
+        let max_idx = layer_count - 1;
+        let clamped = layer_index.min(max_idx);
+        let frac = clamped as f32 / max_idx as f32;
+        -MAX_NEEDLE_DEG + frac * (2.0 * MAX_NEEDLE_DEG)
+    }
+
+    /// Format the readout line for a received snapshot. Video/screen show
+    /// `"L{i+1}/{n} · {w}x{h}"`; audio shows `"L{i+1}/{n} · {kbps} kbps"`. Pure.
+    pub fn format_readout(snap: &ReceivedLayerSnapshot) -> String {
+        let layer = snap.layer_index + 1;
+        match snap.kind {
+            PrefMediaKind::Audio => {
+                format!("L{layer}/{} · {} kbps", snap.layer_count, snap.kbps)
+            }
+            _ => format!(
+                "L{layer}/{} · {}x{}",
+                snap.layer_count, snap.width, snap.height
+            ),
+        }
+    }
+
+    /// One gauge's render state: needle angle + readout text. Pure.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct GaugeState {
+        pub deg: f32,
+        pub text: String,
+    }
+
+    /// Map an optional received snapshot to a gauge's render state. `Some` →
+    /// live; `None` → needle reset to the left peg + "Not receiving".
+    pub fn gauge_state(snap: Option<&ReceivedLayerSnapshot>) -> GaugeState {
+        match snap {
+            Some(s) => GaugeState {
+                deg: needle_deg(s.layer_index, s.layer_count),
+                text: format_readout(s),
             },
+            None => GaugeState {
+                deg: EMPTY_NEEDLE_DEG,
+                text: EMPTY_READOUT.to_string(),
+            },
+        }
+    }
+
+    // ── public testids (receive namespace — distinct from send) ────
+
+    pub const TESTID_VIDEO_RANGE_MIN: &str = "perf-recv-video-range-min";
+    pub const TESTID_VIDEO_RANGE_MAX: &str = "perf-recv-video-range-max";
+    pub const TESTID_AUDIO_RANGE_MIN: &str = "perf-recv-audio-range-min";
+    pub const TESTID_AUDIO_RANGE_MAX: &str = "perf-recv-audio-range-max";
+    pub const TESTID_SCREEN_RANGE_MIN: &str = "perf-recv-screen-range-min";
+    pub const TESTID_SCREEN_RANGE_MAX: &str = "perf-recv-screen-range-max";
+    pub const TESTID_VIDEO_AUTO: &str = "perf-recv-video-auto";
+    pub const TESTID_AUDIO_AUTO: &str = "perf-recv-audio-auto";
+    pub const TESTID_SCREEN_AUTO: &str = "perf-recv-screen-auto";
+    pub const TESTID_VIDEO_HELP: &str = "perf-recv-video-help";
+    pub const TESTID_AUDIO_HELP: &str = "perf-recv-audio-help";
+    pub const TESTID_SCREEN_HELP: &str = "perf-recv-screen-help";
+    pub const TESTID_VU_VIDEO: &str = "perf-vu-recv-video";
+    pub const TESTID_VU_AUDIO: &str = "perf-vu-recv-audio";
+    pub const TESTID_VU_SCREEN: &str = "perf-vu-recv-screen";
+
+    const VIDEO_NEEDLE_ID: &str = "perf-vu-recv-video-needle";
+    const AUDIO_NEEDLE_ID: &str = "perf-vu-recv-audio-needle";
+    const SCREEN_NEEDLE_ID: &str = "perf-vu-recv-screen-needle";
+    const VIDEO_READOUT_ID: &str = "perf-vu-recv-video-readout";
+    const AUDIO_READOUT_ID: &str = "perf-vu-recv-audio-readout";
+    const SCREEN_READOUT_ID: &str = "perf-vu-recv-screen-readout";
+
+    /// DOM ids for a kind's receive needle + readout.
+    fn needle_ids(kind: PrefMediaKind) -> (&'static str, &'static str) {
+        match kind {
+            PrefMediaKind::Video => (VIDEO_NEEDLE_ID, VIDEO_READOUT_ID),
+            PrefMediaKind::Audio => (AUDIO_NEEDLE_ID, AUDIO_READOUT_ID),
+            PrefMediaKind::Screen => (SCREEN_NEEDLE_ID, SCREEN_READOUT_ID),
+        }
+    }
+
+    /// Per-kind static metadata for the receive row (testids + labels).
+    struct RecvMeta {
+        min_testid: &'static str,
+        max_testid: &'static str,
+        auto_testid: &'static str,
+        fixed_testid: &'static str,
+        help_testid: &'static str,
+        vu_testid: &'static str,
+        vu_label: &'static str,
+        help_body: &'static str,
+        id_prefix: &'static str,
+    }
+
+    fn recv_meta(kind: PrefMediaKind) -> RecvMeta {
+        match kind {
+            PrefMediaKind::Video => RecvMeta {
+                min_testid: TESTID_VIDEO_RANGE_MIN,
+                max_testid: TESTID_VIDEO_RANGE_MAX,
+                auto_testid: TESTID_VIDEO_AUTO,
+                fixed_testid: "perf-recv-video-fixed-badge",
+                help_testid: TESTID_VIDEO_HELP,
+                vu_testid: TESTID_VU_VIDEO,
+                vu_label: "Receiving video",
+                help_body: "Limits the camera-video quality you pull from other participants, to save YOUR download bandwidth. The call picks a layer within this range based on your network. The needle shows what you're receiving now.",
+                id_prefix: "perf-recv-video",
+            },
+            PrefMediaKind::Audio => RecvMeta {
+                min_testid: TESTID_AUDIO_RANGE_MIN,
+                max_testid: TESTID_AUDIO_RANGE_MAX,
+                auto_testid: TESTID_AUDIO_AUTO,
+                fixed_testid: "perf-recv-audio-fixed-badge",
+                help_testid: TESTID_AUDIO_HELP,
+                vu_testid: TESTID_VU_AUDIO,
+                vu_label: "Receiving audio",
+                help_body: "Limits the audio quality you pull from other participants. The call adapts within this range. Audio is already low-bandwidth, so the download savings here are small.",
+                id_prefix: "perf-recv-audio",
+            },
+            PrefMediaKind::Screen => RecvMeta {
+                min_testid: TESTID_SCREEN_RANGE_MIN,
+                max_testid: TESTID_SCREEN_RANGE_MAX,
+                auto_testid: TESTID_SCREEN_AUTO,
+                fixed_testid: "perf-recv-screen-fixed-badge",
+                help_testid: TESTID_SCREEN_HELP,
+                vu_testid: TESTID_VU_SCREEN,
+                vu_label: "Receiving shared content",
+                help_body: "Limits the quality of screen / shared-content you pull from others, to save YOUR download bandwidth. Independent of camera video; adapts on its own within the range.",
+                id_prefix: "perf-recv-screen",
+            },
+        }
+    }
+
+    // ── components ─────────────────────────────────────────────────
+
+    /// Headless driver for the three received-quality needles. Renders nothing;
+    /// owns one ~4 Hz rAF loop reading `received_layer_snapshot(kind)` per kind
+    /// and writing the needle rotations + readouts straight to the DOM by id.
+    #[component]
+    pub fn ReceivedQualityDriver(reader: ReceivedReader) -> Element {
+        type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
+        let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+
+        {
+            let cb = cb.clone();
+            let reader = reader.clone();
+            use_hook(move || {
+                let cb_clone = cb.clone();
+                let last_ms = Rc::new(std::cell::Cell::new(0.0_f64));
+                let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                    let now = web_sys::window()
+                        .and_then(|w| w.performance())
+                        .map(|p| p.now())
+                        .unwrap_or(0.0);
+                    if now - last_ms.get() >= 250.0 {
+                        last_ms.set(now);
+                        for kind in [
+                            PrefMediaKind::Video,
+                            PrefMediaKind::Audio,
+                            PrefMediaKind::Screen,
+                        ] {
+                            let snap = reader.read(kind);
+                            let state = gauge_state(snap.as_ref());
+                            let (needle_id, readout_id) = needle_ids(kind);
+                            write_needle_rotation(needle_id, state.deg);
+                            write_readout_text(readout_id, &state.text);
+                        }
+                    }
+                    if let (Some(win), Some(c)) = (web_sys::window(), cb_clone.borrow().as_ref()) {
+                        let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
+                    }
+                })
+                    as Box<dyn FnMut()>);
+
+                *cb.borrow_mut() = Some(closure);
+                if let (Some(win), Some(c)) = (web_sys::window(), cb.borrow().as_ref()) {
+                    let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
+                }
+            });
+        }
+
+        {
+            let cb = cb.clone();
+            use_drop(move || {
+                *cb.borrow_mut() = None;
+            });
+        }
+
+        rsx! {}
+    }
+
+    /// A discrete dual-thumb received-quality range slider for one kind.
+    #[component]
+    fn DualRangeSlider(
+        kind: PrefMediaKind,
+        id_prefix: &'static str,
+        min_testid: &'static str,
+        max_testid: &'static str,
+        stream_noun: &'static str,
+        sel: RangeSel,
+        on_change: EventHandler<RangeSel>,
+    ) -> Element {
+        let top = top_index(kind);
+        let min_id = format!("{id_prefix}-range-min");
+        let max_id = format!("{id_prefix}-range-max");
+        let min_valuetext = index_label(kind, sel.min_pos).to_string();
+        let max_valuetext = index_label(kind, sel.max_pos).to_string();
+
+        let (fill_left, fill_right) = if top == 0 {
+            (0.0_f32, 100.0_f32)
+        } else {
+            (
+                sel.min_pos as f32 / top as f32 * 100.0,
+                sel.max_pos as f32 / top as f32 * 100.0,
+            )
+        };
+
+        rsx! {
+            div { class: "perf-range",
+                span { class: "perf-range-end-label", "{index_label(kind, 0)}" }
+                div { class: "perf-range-track-wrap",
+                    div { class: "perf-range-track",
+                        div {
+                            class: "perf-range-fill",
+                            style: "left: {fill_left}%; right: {100.0 - fill_right}%;",
+                        }
+                    }
+                    input {
+                        id: "{min_id}",
+                        class: "perf-range-input perf-range-input-min",
+                        "data-testid": min_testid,
+                        r#type: "range",
+                        min: "0",
+                        max: "{top}",
+                        step: "1",
+                        value: "{sel.min_pos}",
+                        "aria-label": "Minimum received {stream_noun} quality",
+                        "aria-valuetext": "{min_valuetext}",
+                        oninput: move |evt| {
+                            if let Ok(p) = evt.value().parse::<u32>() {
+                                on_change.call(set_min_thumb(sel, p));
+                            }
+                        },
+                    }
+                    input {
+                        id: "{max_id}",
+                        class: "perf-range-input perf-range-input-max",
+                        "data-testid": max_testid,
+                        r#type: "range",
+                        min: "0",
+                        max: "{top}",
+                        step: "1",
+                        value: "{sel.max_pos}",
+                        "aria-label": "Maximum received {stream_noun} quality",
+                        "aria-valuetext": "{max_valuetext}",
+                        oninput: move |evt| {
+                            if let Ok(p) = evt.value().parse::<u32>() {
+                                on_change.call(set_max_thumb(sel, p));
+                            }
+                        },
+                    }
+                }
+                span { class: "perf-range-end-label", "{index_label(kind, top)}" }
+            }
+        }
+    }
+
+    /// One kind's RECEIVE row: needle gauge + dual-thumb slider + Auto/help/Fixed
+    /// header + live range text. Used inside [`super::KindSection`].
+    #[component]
+    pub fn ReceiveRow(
+        kind: PrefMediaKind,
+        stream_noun: &'static str,
+        vu_initial_deg: f32,
+        vu_initial_readout: String,
+        sub: KindReceivePref,
+        open_help: Signal<Option<&'static str>>,
+        on_change: EventHandler<KindReceivePref>,
+    ) -> Element {
+        let meta = recv_meta(kind);
+        let sel = bounds_to_thumbs(kind, sub.min, sub.max);
+        let range_str = span_text(kind, sel);
+        // Fixed = manual (not Auto) AND both thumbs collapsed to one layer.
+        let is_fixed = !sub.auto && sel.min_pos == sel.max_pos;
+        let auto_button_class = if sub.auto {
+            "perf-auto-button is-active"
+        } else {
+            "perf-auto-button"
+        };
+        let (vu_needle_id, vu_readout_id) = needle_ids(kind);
+
+        rsx! {
+            div { class: "perf-stream-group perf-recv-row",
+                div { class: "perf-stream-header",
+                    span { class: "perf-stream-title", "Receive" }
+                    super::HelpPopover {
+                        key_id: meta.id_prefix,
+                        help_testid: meta.help_testid,
+                        help_label: meta.vu_label,
+                        help_body: meta.help_body,
+                        open_help,
+                    }
+                    if is_fixed {
+                        span {
+                            class: "perf-fixed-badge",
+                            "data-testid": meta.fixed_testid,
+                            title: "Pinned to a single layer — this stream won't adapt",
+                            "aria-label": "received {stream_noun} quality pinned to a single layer",
+                            "Fixed"
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: auto_button_class,
+                        "data-testid": meta.auto_testid,
+                        "aria-pressed": if sub.auto { "true" } else { "false" },
+                        "aria-label": "Automatic received {stream_noun} quality",
+                        title: if sub.auto {
+                            "Automatic (full range) — click to set manual receive limits"
+                        } else {
+                            "Manual limits — click for fully automatic receive quality"
+                        },
+                        onclick: move |_| {
+                            let next = if sub.auto {
+                                KindReceivePref { auto: false, ..sub }
+                            } else {
+                                KindReceivePref { min: None, max: None, auto: true }
+                            };
+                            on_change.call(next);
+                        },
+                        "Auto"
+                    }
+                }
+                div { class: "perf-stream-body",
+                    super::VuGauge {
+                        testid: meta.vu_testid,
+                        needle_id: vu_needle_id,
+                        readout_id: vu_readout_id,
+                        label: meta.vu_label,
+                        initial_deg: vu_initial_deg,
+                        initial_readout: vu_initial_readout,
+                    }
+                    div { class: "perf-stream-controls",
+                        DualRangeSlider {
+                            kind,
+                            id_prefix: meta.id_prefix,
+                            min_testid: meta.min_testid,
+                            max_testid: meta.max_testid,
+                            stream_noun,
+                            sel,
+                            on_change: move |s: RangeSel| {
+                                let (min, max) = thumbs_to_bounds(kind, s);
+                                on_change.call(KindReceivePref { min, max, auto: false });
+                            },
+                        }
+                        p {
+                            class: "perf-range-value",
+                            "data-testid": "{meta.id_prefix}-range-value",
+                            "aria-live": "polite",
+                            "Receiving up to: {range_str}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn layer_counts_and_top_index_per_kind() {
+            // Audio is now 3 rungs to match the publisher ladder (#1082).
+            assert_eq!(layer_count(PrefMediaKind::Video), 3);
+            assert_eq!(layer_count(PrefMediaKind::Screen), 3);
+            assert_eq!(layer_count(PrefMediaKind::Audio), 3);
+            assert_eq!(top_index(PrefMediaKind::Video), 2);
+            assert_eq!(top_index(PrefMediaKind::Audio), 2);
+        }
+
+        #[test]
+        fn index_label_receive_convention_not_inverted() {
+            // index 0 = LOWEST quality (left), top index = HIGHEST (right).
+            assert_eq!(index_label(PrefMediaKind::Video, 0), "360p");
+            assert_eq!(index_label(PrefMediaKind::Video, 2), "720p");
+            assert_eq!(index_label(PrefMediaKind::Screen, 0), "low");
+            assert_eq!(index_label(PrefMediaKind::Screen, 2), "high");
+            assert_eq!(index_label(PrefMediaKind::Audio, 0), "low (24k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 1), "mid (32k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 2), "high (50k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 5), "?");
+        }
+
+        #[test]
+        fn thumbs_both_extremes_is_none_none() {
+            let sel = RangeSel {
+                min_pos: 0,
+                max_pos: 2,
+            };
+            assert_eq!(thumbs_to_bounds(PrefMediaKind::Video, sel), (None, None));
+            let sel_a = RangeSel {
+                min_pos: 0,
+                max_pos: 2,
+            };
+            assert_eq!(thumbs_to_bounds(PrefMediaKind::Audio, sel_a), (None, None));
+        }
+
+        #[test]
+        fn thumbs_each_extreme_individually_is_none_on_that_end() {
+            let sel = RangeSel {
+                min_pos: 0,
+                max_pos: 1,
+            };
+            assert_eq!(thumbs_to_bounds(PrefMediaKind::Video, sel), (None, Some(1)));
+            let sel2 = RangeSel {
+                min_pos: 1,
+                max_pos: 2,
+            };
+            assert_eq!(
+                thumbs_to_bounds(PrefMediaKind::Video, sel2),
+                (Some(1), None)
+            );
+        }
+
+        #[test]
+        fn bounds_to_thumbs_round_trips() {
+            for &(min, max) in &[
+                (None, None),
+                (Some(1u32), None),
+                (None, Some(1u32)),
+                (Some(1u32), Some(1u32)),
+            ] {
+                let sel = bounds_to_thumbs(PrefMediaKind::Video, min, max);
+                assert!(sel.min_pos <= sel.max_pos);
+                assert_eq!(thumbs_to_bounds(PrefMediaKind::Video, sel), (min, max));
+            }
+        }
+
+        #[test]
+        fn bounds_to_thumbs_places_extremes_correctly() {
+            let sel = bounds_to_thumbs(PrefMediaKind::Video, None, None);
+            assert_eq!(
+                sel,
+                RangeSel {
+                    min_pos: 0,
+                    max_pos: 2
+                }
+            );
+            // Audio also 3 rungs now → 0..2.
+            let sel_a = bounds_to_thumbs(PrefMediaKind::Audio, None, None);
+            assert_eq!(
+                sel_a,
+                RangeSel {
+                    min_pos: 0,
+                    max_pos: 2
+                }
+            );
+        }
+
+        #[test]
+        fn thumbs_cannot_cross() {
+            let sel = RangeSel {
+                min_pos: 1,
+                max_pos: 2,
+            };
+            assert_eq!(
+                set_min_thumb(sel, 5),
+                RangeSel {
+                    min_pos: 2,
+                    max_pos: 2
+                }
+            );
+            assert_eq!(
+                set_max_thumb(sel, 0),
+                RangeSel {
+                    min_pos: 1,
+                    max_pos: 1
+                }
+            );
+        }
+
+        #[test]
+        fn span_text_renders_concrete_endpoints() {
+            assert_eq!(
+                span_text(
+                    PrefMediaKind::Video,
+                    RangeSel {
+                        min_pos: 0,
+                        max_pos: 2
+                    }
+                ),
+                "360p – 720p"
+            );
+            assert_eq!(
+                span_text(
+                    PrefMediaKind::Video,
+                    RangeSel {
+                        min_pos: 1,
+                        max_pos: 1
+                    }
+                ),
+                "540p"
+            );
+            assert_eq!(
+                span_text(
+                    PrefMediaKind::Audio,
+                    RangeSel {
+                        min_pos: 0,
+                        max_pos: 2
+                    }
+                ),
+                "low (24k) – high (50k)"
+            );
+        }
+
+        #[test]
+        fn default_preference_is_all_auto() {
+            let pref = ReceivePreference::default();
+            for kind in [
+                PrefMediaKind::Video,
+                PrefMediaKind::Audio,
+                PrefMediaKind::Screen,
+            ] {
+                let s = pref.for_kind(kind);
+                assert!(s.auto);
+                assert_eq!(s.min, None);
+                assert_eq!(s.max, None);
+                assert_eq!(pref.effective_bounds(kind), (None, None));
+            }
+        }
+
+        #[test]
+        fn auto_flag_forces_none_bounds_regardless_of_indices() {
+            let sub = KindReceivePref {
+                min: Some(1),
+                max: Some(1),
+                auto: true,
+            };
+            let pref = ReceivePreference::default().with_kind(PrefMediaKind::Video, sub);
+            assert_eq!(pref.effective_bounds(PrefMediaKind::Video), (None, None));
+        }
+
+        #[test]
+        fn auto_off_emits_stored_bounds() {
+            let sub = KindReceivePref {
+                min: None,
+                max: Some(1),
+                auto: false,
+            };
+            let pref = ReceivePreference::default().with_kind(PrefMediaKind::Screen, sub);
+            assert_eq!(
+                pref.effective_bounds(PrefMediaKind::Screen),
+                (None, Some(1))
+            );
+            assert_eq!(pref.effective_bounds(PrefMediaKind::Video), (None, None));
+        }
+
+        #[test]
+        fn sanitized_drops_out_of_range_indices_keeps_auto() {
+            let stale = ReceivePreference {
+                video: KindReceivePref {
+                    min: Some(9),
+                    max: Some(1),
+                    auto: false,
+                },
+                audio: KindReceivePref {
+                    min: Some(0),
+                    max: Some(7),
+                    auto: false,
+                },
+                screen: KindReceivePref::default(),
+            };
+            let clean = stale.sanitized();
+            assert_eq!(clean.video.min, None); // 9 > top(2) dropped
+            assert_eq!(clean.video.max, Some(1)); // kept
+            assert!(!clean.video.auto);
+            assert_eq!(clean.audio.min, Some(0)); // kept (0 <= top(2))
+            assert_eq!(clean.audio.max, None); // 7 > top(2) dropped
+        }
+
+        #[test]
+        fn needle_deg_lowest_pegs_left_highest_pegs_right() {
+            assert_eq!(needle_deg(0, 3), -MAX_NEEDLE_DEG);
+            assert_eq!(needle_deg(2, 3), MAX_NEEDLE_DEG);
+            assert!(needle_deg(1, 3).abs() < 0.001);
+            assert_eq!(needle_deg(0, 2), -MAX_NEEDLE_DEG);
+            assert_eq!(needle_deg(1, 2), MAX_NEEDLE_DEG);
+        }
+
+        #[test]
+        fn needle_deg_clamps_and_single_layer_centers() {
+            assert_eq!(needle_deg(99, 3), MAX_NEEDLE_DEG);
+            assert_eq!(needle_deg(0, 1), 0.0);
+            assert_eq!(needle_deg(0, 0), 0.0);
+        }
+
+        #[test]
+        fn format_readout_video_and_audio_shapes() {
+            let v = ReceivedLayerSnapshot {
+                kind: PrefMediaKind::Video,
+                layer_index: 1,
+                layer_count: 3,
+                width: 960,
+                height: 540,
+                kbps: 900,
+            };
+            assert_eq!(format_readout(&v), "L2/3 · 960x540");
+            let a = ReceivedLayerSnapshot {
+                kind: PrefMediaKind::Audio,
+                layer_index: 0,
+                layer_count: 3,
+                width: 0,
+                height: 0,
+                kbps: 24,
+            };
+            assert_eq!(format_readout(&a), "L1/3 · 24 kbps");
+            let s = ReceivedLayerSnapshot {
+                kind: PrefMediaKind::Screen,
+                layer_index: 2,
+                layer_count: 3,
+                width: 1920,
+                height: 1080,
+                kbps: 2500,
+            };
+            assert_eq!(format_readout(&s), "L3/3 · 1920x1080");
+        }
+
+        #[test]
+        fn gauge_state_live_and_none() {
+            let snap = ReceivedLayerSnapshot {
+                kind: PrefMediaKind::Video,
+                layer_index: 2,
+                layer_count: 3,
+                width: 1280,
+                height: 720,
+                kbps: 1500,
+            };
+            let st = gauge_state(Some(&snap));
+            assert_eq!(st.deg, MAX_NEEDLE_DEG);
+            assert_eq!(st.text, "L3/3 · 1280x720");
+            let empty = gauge_state(None);
+            assert_eq!(empty.deg, EMPTY_NEEDLE_DEG);
+            assert_eq!(empty.deg, -MAX_NEEDLE_DEG);
+            assert_eq!(empty.text, "Not receiving");
+        }
+
+        #[test]
+        fn preference_json_round_trips() {
+            let pref = ReceivePreference {
+                video: KindReceivePref {
+                    min: Some(1),
+                    max: None,
+                    auto: false,
+                },
+                audio: KindReceivePref::default(),
+                screen: KindReceivePref {
+                    min: None,
+                    max: Some(1),
+                    auto: false,
+                },
+            };
+            let json = serde_json::to_string(&pref).unwrap();
+            let back: ReceivePreference = serde_json::from_str(&json).unwrap();
+            assert_eq!(pref, back);
+        }
+
+        #[test]
+        fn json_without_auto_or_kinds_defaults_to_auto() {
+            let legacy = r#"{"video":{"min":1,"max":2}}"#;
+            let p: ReceivePreference = serde_json::from_str(legacy).unwrap();
+            assert!(p.video.auto);
+            assert_eq!(p.effective_bounds(PrefMediaKind::Video), (None, None));
+            assert!(p.audio.auto);
+            assert!(p.screen.auto);
         }
     }
 }
@@ -1360,7 +2382,6 @@ mod tests {
 
     #[test]
     fn toggling_auto_off_emits_thumb_derived_bounds() {
-        // Same indices, but auto OFF → the stored bounds flow through.
         let pref = manual((Some(1), Some(5)), (None, None), (Some(0), Some(2)));
         let b = preference_to_encoder_bounds(&pref);
         assert_eq!(b.video_best, Some(1));
@@ -1373,15 +2394,12 @@ mod tests {
 
     #[test]
     fn set_auto_helpers_toggle_and_reset_thumbs() {
-        // Turning Auto ON clears that stream's bounds; OFF leaves them.
         let manual_pref = manual((Some(1), Some(5)), (Some(0), Some(2)), (Some(0), Some(2)));
         let v_auto = manual_pref.set_video_auto(true);
         assert!(v_auto.video_auto);
         assert_eq!(v_auto.video_max, None);
         assert_eq!(v_auto.video_min, None);
-        // Audio/screen untouched by the video toggle.
         assert_eq!(v_auto.audio_max, Some(0));
-        // Turning Auto OFF flips the flag but keeps any stored bounds as-is.
         let s_manual = manual_pref.set_screen_auto(false);
         assert!(!s_manual.screen_auto);
         assert_eq!(s_manual.screen_max, Some(0));
@@ -1390,8 +2408,6 @@ mod tests {
 
     #[test]
     fn thumbs_both_extremes_is_auto() {
-        // Video: left thumb at 0 (far left) + right thumb at 7 (far right) =
-        // fully Auto = no bounds.
         let (best, worst) = thumbs_to_bounds(
             RangeSel {
                 min_pos: 0,
@@ -1401,7 +2417,6 @@ mod tests {
         );
         assert_eq!(best, None);
         assert_eq!(worst, None);
-        // And that is exactly the default-Auto preference.
         let pref = PerformancePreference::default().with_video_thumbs(auto_thumbs(8));
         assert_eq!(pref.video_max, None);
         assert_eq!(pref.video_min, None);
@@ -1409,8 +2424,6 @@ mod tests {
 
     #[test]
     fn thumbs_each_extreme_individually_is_none_on_that_end() {
-        // Right thumb at far right → best=None; left thumb pulled in to pos 2
-        // (tier index 5) → worst=Some(5).
         let (best, worst) = thumbs_to_bounds(
             RangeSel {
                 min_pos: 2,
@@ -1420,8 +2433,6 @@ mod tests {
         );
         assert_eq!(best, None);
         assert_eq!(worst, Some(5));
-        // Left thumb at far left → worst=None; right thumb pulled in to pos 5
-        // (tier index 2) → best=Some(2).
         let (best, worst) = thumbs_to_bounds(
             RangeSel {
                 min_pos: 0,
@@ -1435,7 +2446,6 @@ mod tests {
 
     #[test]
     fn thumbs_mid_range_pair_maps_to_both_bounds() {
-        // min_pos=2 (tier 5 / 360p), max_pos=6 (tier 1 / 900p).
         let (best, worst) = thumbs_to_bounds(
             RangeSel {
                 min_pos: 2,
@@ -1445,7 +2455,6 @@ mod tests {
         );
         assert_eq!(best, Some(1));
         assert_eq!(worst, Some(5));
-        // Audio mid-range: min_pos=1 (tier 2 / 24k), max_pos=2 (tier 1 / 32k).
         let (best, worst) = thumbs_to_bounds(
             RangeSel {
                 min_pos: 1,
@@ -1459,7 +2468,6 @@ mod tests {
 
     #[test]
     fn bounds_to_thumbs_round_trips_through_thumbs_to_bounds() {
-        // Canonical (non-extreme) bounds round-trip exactly.
         for &(best, worst) in &[
             (None, None),
             (Some(1), None),
@@ -1475,10 +2483,6 @@ mod tests {
 
     #[test]
     fn extreme_tier_bounds_canonicalize_to_auto() {
-        // Pinning best to the very top tier (index 0) is indistinguishable from
-        // "no cap" on a left→right slider — the right thumb is fully right either
-        // way — so it canonicalizes to None (Auto). Likewise worst = the lowest
-        // tier (index 7) canonicalizes to None.
         let sel = bounds_to_thumbs(Some(0), Some(7), 8);
         assert_eq!(
             sel,
@@ -1496,7 +2500,6 @@ mod tests {
             min_pos: 1,
             max_pos: 4,
         };
-        // Try to drag min past max → clamped to max.
         assert_eq!(
             set_min_thumb(sel, 6),
             RangeSel {
@@ -1504,7 +2507,6 @@ mod tests {
                 max_pos: 4
             }
         );
-        // Valid move.
         assert_eq!(
             set_min_thumb(sel, 3),
             RangeSel {
@@ -1520,7 +2522,6 @@ mod tests {
             min_pos: 3,
             max_pos: 6,
         };
-        // Try to drag max below min → clamped to min.
         assert_eq!(
             set_max_thumb(sel, 1),
             RangeSel {
@@ -1528,7 +2529,6 @@ mod tests {
                 max_pos: 3
             }
         );
-        // Valid move.
         assert_eq!(
             set_max_thumb(sel, 5),
             RangeSel {
@@ -1540,8 +2540,6 @@ mod tests {
 
     #[test]
     fn with_thumbs_writes_inverted_bounds_and_clears_auto() {
-        // Drag video to min_pos=2 / max_pos=6 → worst=Some(5), best=Some(1), and
-        // dragging implies manual mode (video_auto cleared).
         let p = PerformancePreference::default().with_video_thumbs(RangeSel {
             min_pos: 2,
             max_pos: 6,
@@ -1549,9 +2547,7 @@ mod tests {
         assert_eq!(p.video_max, Some(1)); // best
         assert_eq!(p.video_min, Some(5)); // worst
         assert!(!p.video_auto);
-        // Audio still on default Auto (untouched by the video drag).
         assert!(p.audio_auto);
-        // Dragging audio to extremes → both None, but auto cleared (manual).
         let p2 = p.with_audio_thumbs(auto_thumbs(4));
         assert_eq!(p2.audio_max, None);
         assert_eq!(p2.audio_min, None);
@@ -1561,7 +2557,6 @@ mod tests {
     #[test]
     fn span_text_renders_concrete_endpoints_including_full_ladder() {
         let v = &VIDEO_TIER_LABELS;
-        // Full ladder (both thumbs at extremes = Auto-on visual) → concrete span.
         assert_eq!(
             span_text(
                 RangeSel {
@@ -1572,7 +2567,6 @@ mod tests {
             ),
             "240p – 1080p"
         );
-        // Partial manual range.
         assert_eq!(
             span_text(
                 RangeSel {
@@ -1583,8 +2577,6 @@ mod tests {
             ),
             "360p – 900p"
         );
-        // Both thumbs together → single label (pinned). pos 3 → tier index
-        // 7-3=4 → "480p".
         assert_eq!(
             span_text(
                 RangeSel {
@@ -1595,7 +2587,6 @@ mod tests {
             ),
             "480p"
         );
-        // Audio full ladder.
         assert_eq!(
             span_text(
                 RangeSel {
@@ -1610,9 +2601,6 @@ mod tests {
 
     #[test]
     fn auto_on_preference_yields_full_span_thumbs() {
-        // An Auto-on stream's bounds are None/None, which derive to thumbs at the
-        // extremes (full ladder) — what the always-interactive slider shows while
-        // Auto is on. No "disabled" concept exists anymore.
         let pref = PerformancePreference::default(); // all auto
         assert!(pref.video_auto);
         let sel = bounds_to_thumbs(pref.video_max, pref.video_min, VIDEO_TIER_LABELS.len());
@@ -1635,7 +2623,6 @@ mod tests {
         assert_eq!(pref.audio_min, None);
         assert_eq!(pref.screen_max, None);
         assert_eq!(pref.screen_min, None);
-        // All three streams default to Auto = true.
         assert!(pref.video_auto);
         assert!(pref.audio_auto);
         assert!(pref.screen_auto);
@@ -1645,14 +2632,12 @@ mod tests {
 
     #[test]
     fn sanitized_drops_stale_indices_and_keeps_auto_flags() {
-        // A value stored by a hypothetical larger build, restored here: an index
-        // past the current ladder falls back to None; the auto flags pass through.
         let stale = PerformancePreference {
             video_max: Some(10),
             video_min: Some(3),
             audio_max: Some(9),
             audio_min: Some(2),
-            screen_max: Some(5), // out of range for 3 screen tiers
+            screen_max: Some(5),
             screen_min: Some(1),
             video_auto: false,
             audio_auto: false,
@@ -1663,13 +2648,12 @@ mod tests {
             AUDIO_TIER_LABELS.len(),
             SCREEN_TIER_LABELS.len(),
         );
-        assert_eq!(clean.video_max, None); // dropped
-        assert_eq!(clean.video_min, Some(3)); // kept
-        assert_eq!(clean.audio_max, None); // dropped
-        assert_eq!(clean.audio_min, Some(2)); // kept
-        assert_eq!(clean.screen_max, None); // dropped (>=3)
-        assert_eq!(clean.screen_min, Some(1)); // kept
-                                               // Flags preserved.
+        assert_eq!(clean.video_max, None);
+        assert_eq!(clean.video_min, Some(3));
+        assert_eq!(clean.audio_max, None);
+        assert_eq!(clean.audio_min, Some(2));
+        assert_eq!(clean.screen_max, None);
+        assert_eq!(clean.screen_min, Some(1));
         assert!(!clean.video_auto);
         assert!(!clean.audio_auto);
         assert!(!clean.screen_auto);
@@ -1677,12 +2661,10 @@ mod tests {
 
     #[test]
     fn fixed_detection() {
-        // Manual (auto off) + both ends equal → fixed.
         let fixed = manual((Some(2), Some(2)), (Some(1), Some(3)), (Some(1), Some(1)));
         assert!(fixed.video_is_fixed());
         assert!(!fixed.audio_is_fixed());
         assert!(fixed.screen_is_fixed());
-        // A stream on Auto is never "fixed" even with equal stored indices.
         let auto_equal = PerformancePreference {
             video_max: Some(2),
             video_min: Some(2),
@@ -1690,7 +2672,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!auto_equal.video_is_fixed());
-        // One end at extreme (None) is never "fixed".
         let partial = PerformancePreference {
             video_max: None,
             video_min: Some(2),
@@ -1702,19 +2683,15 @@ mod tests {
 
     #[test]
     fn needle_deg_best_pegs_right_worst_pegs_left() {
-        // 8 video tiers: index 0 (best) → +MAX, index 7 (worst) → -MAX.
         assert_eq!(tier_to_needle_deg(0, 8), MAX_NEEDLE_DEG);
         assert_eq!(tier_to_needle_deg(7, 8), -MAX_NEEDLE_DEG);
-        // Midpoint is ~0.
         let mid = tier_to_needle_deg(3, 7);
         assert!(mid.abs() < 0.001, "mid={mid}");
     }
 
     #[test]
     fn needle_deg_clamps_out_of_range_and_single_tier() {
-        // Out-of-range index clamps to the worst (no NaN / overshoot).
         assert_eq!(tier_to_needle_deg(99, 8), -MAX_NEEDLE_DEG);
-        // Single-tier ladder centers the needle.
         assert_eq!(tier_to_needle_deg(0, 1), 0.0);
         assert_eq!(tier_to_needle_deg(0, 0), 0.0);
     }
@@ -1738,17 +2715,17 @@ mod tests {
     #[test]
     fn gauge_state_live_snapshot_maps_to_needles_and_readouts() {
         let snap = LiveQualitySnapshot {
-            video_tier_index: 0, // best → +MAX
+            video_tier_index: 0,
             video_width: 1920,
             video_height: 1080,
             video_fps: 30,
             video_ideal_kbps: 2500,
-            audio_tier_index: 3, // worst → -MAX (4-tier ladder)
+            audio_tier_index: 3,
             audio_kbps: 16,
             target_bitrate_kbps: 2000.0,
         };
         let screen = ScreenQualitySnapshot {
-            tier_index: 1, // middle of 3 → ~0deg
+            tier_index: 1,
             width: 1280,
             height: 720,
             fps: 15,
@@ -1760,15 +2737,12 @@ mod tests {
         assert_eq!(st.audio_deg, -MAX_NEEDLE_DEG);
         assert_eq!(st.video_text, "1920x1080·30fps·2500kbps");
         assert_eq!(st.audio_text, "16 kbps");
-        // Screen middle tier (index 1 of 3) sits at the needle center.
         assert!(st.screen_deg.abs() < 0.001, "screen_deg={}", st.screen_deg);
         assert_eq!(st.screen_text, "1280x720·15fps·1200kbps");
     }
 
     #[test]
     fn gauge_state_none_resets_to_empty_state() {
-        // Camera off + not sharing: all needles peg left and readouts show their
-        // own placeholders — never a frozen / stale reading.
         let st = gauge_state_from_snapshot(None, None);
         assert_eq!(st.video_deg, EMPTY_NEEDLE_DEG);
         assert_eq!(st.audio_deg, EMPTY_NEEDLE_DEG);
@@ -1781,7 +2755,6 @@ mod tests {
 
     #[test]
     fn screen_gauge_none_shows_not_sharing_with_live_va() {
-        // Camera/mic live but screen not sharing: only the screen gauge resets.
         let va = LiveQualitySnapshot {
             video_tier_index: 2,
             video_width: 1280,
@@ -1800,7 +2773,6 @@ mod tests {
 
     #[test]
     fn screen_thumbs_map_over_three_tiers() {
-        // 3 screen tiers: both extremes → None/None (Auto).
         assert_eq!(
             thumbs_to_bounds(
                 RangeSel {
@@ -1811,7 +2783,6 @@ mod tests {
             ),
             (None, None)
         );
-        // Right thumb in to pos 1 (tier 1 / 720p) → best=Some(1), worst=None.
         assert_eq!(
             thumbs_to_bounds(
                 RangeSel {
@@ -1822,7 +2793,6 @@ mod tests {
             ),
             (Some(1), None)
         );
-        // Left thumb in to pos 1 (tier 1) → best=None, worst=Some(1).
         assert_eq!(
             thumbs_to_bounds(
                 RangeSel {
@@ -1833,7 +2803,6 @@ mod tests {
             ),
             (None, Some(1))
         );
-        // Mid pin both at pos 1 (tier 1 / 720p) → best=worst=Some(1).
         assert_eq!(
             thumbs_to_bounds(
                 RangeSel {
@@ -1844,7 +2813,6 @@ mod tests {
             ),
             (Some(1), Some(1))
         );
-        // with_screen_thumbs writes the inverted bounds + clears auto.
         let p = PerformancePreference::default().with_screen_thumbs(RangeSel {
             min_pos: 1,
             max_pos: 1,
@@ -1874,13 +2842,11 @@ mod tests {
 
     #[test]
     fn json_without_auto_fields_defaults_to_auto_true() {
-        // A pref persisted before the auto flags existed must load as fully Auto.
         let legacy = r#"{"video_max":2,"video_min":5}"#;
         let p: PerformancePreference = serde_json::from_str(legacy).unwrap();
         assert!(p.video_auto);
         assert!(p.audio_auto);
         assert!(p.screen_auto);
-        // And since auto is on, bounds resolve to None despite the stored indices.
         assert_eq!(
             preference_to_encoder_bounds(&p),
             EncoderQualityBounds::default()

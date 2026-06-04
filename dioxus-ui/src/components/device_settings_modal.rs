@@ -3,7 +3,8 @@
  * Licensed under MIT OR Apache-2.0
  */
 use crate::components::performance_settings::{
-    PerformancePreference, PerformanceSettingsPanel, ScreenSnapshotReader, SnapshotReader,
+    KindReceivePref, PerformancePreference, PerformanceSettingsPanel, ReceivePreference,
+    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
 };
 use crate::context::{
     clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
@@ -12,6 +13,7 @@ use crate::context::{
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use videocall_client::PrefMediaKind;
 use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
@@ -314,22 +316,36 @@ pub fn DeviceSettingsModal(
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
     #[props(default)] initial_section: Option<String>,
-    /// Current persisted performance (quality-bounds) preference. (#961)
+    // ── SEND side (#961): quality-bound preference, change callback, live needles.
+    /// Current persisted performance (send quality-bounds) preference. (#961)
     #[props(default)]
     performance_preference: PerformancePreference,
-    /// Called when the user changes any quality bound. The parent persists the
-    /// new preference and pushes it to the encoder via
-    /// `CameraEncoder::set_quality_tier_bounds`. (#961)
+    /// Called when the user changes any SEND quality bound. The parent persists
+    /// the new preference and pushes it to the encoders via
+    /// `CameraEncoder` / `ScreenEncoder::set_quality_tier_bounds`. (#961)
     #[props(default)]
     on_performance_change: EventHandler<PerformancePreference>,
-    /// Reads the encoder's live quality snapshot for the VU meters. Defaults to
-    /// a reader that always yields `None` (encoder unavailable / camera off). (#961)
+    /// Reads the encoder's live quality snapshot for the "Sending" needles.
+    /// Defaults to a reader that always yields `None` (encoder unavailable). (#961)
     #[props(default = SnapshotReader::none())]
     read_quality_snapshot: SnapshotReader,
-    /// Reads the screen encoder's live snapshot for the screen VU meter. Defaults
-    /// to a reader that always yields `None` (not sharing). (#961)
+    /// Reads the screen encoder's live snapshot for the screen "Sending" needle.
+    /// Defaults to `None` (not sharing). (#961)
     #[props(default = ScreenSnapshotReader::none())]
     read_screen_snapshot: ScreenSnapshotReader,
+    // ── RECEIVE side (#989 simulcast): layer-bound preference, change callback, needles.
+    /// Current persisted RECEIVE-side layer-bounds preference (simulcast P4). (#989)
+    #[props(default)]
+    receive_preference: ReceivePreference,
+    /// Called when the user changes a kind's receive bounds. The parent persists
+    /// the new preference and pushes it to the client via
+    /// `set_receive_layer_bounds`. (#989)
+    #[props(default)]
+    on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
+    /// Reads the client's per-kind received-layer snapshot for the "Receiving"
+    /// needles. Defaults to `None` (nothing received). (#989)
+    #[props(default = ReceivedReader::none())]
+    received_reader: ReceivedReader,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -550,12 +566,19 @@ pub fn DeviceSettingsModal(
                                     "aria-labelledby": SettingsSection::Performance.tab_id(),
 
                                     PerformanceSettingsPanel {
+                                        // SEND (#961).
                                         pref: performance_preference,
                                         on_change: move |p: PerformancePreference| {
                                             on_performance_change.call(p);
                                         },
                                         read_snapshot: read_quality_snapshot.clone(),
                                         read_screen_snapshot: read_screen_snapshot.clone(),
+                                        // RECEIVE (#989 simulcast).
+                                        receive_pref: receive_preference,
+                                        on_receive_change: move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+                                            on_receive_change.call((kind, sub));
+                                        },
+                                        received_reader: received_reader.clone(),
                                     }
                                 }
                             },

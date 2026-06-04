@@ -18,6 +18,9 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::performance_settings::{
+    load_receive_preference, save_receive_preference, KindReceivePref, ReceivedReader,
+};
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
@@ -30,7 +33,8 @@ use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{
-    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+    initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
+    ScreenShareEvent,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -651,6 +655,54 @@ pub fn Host(
         })
     };
 
+    // RECEIVE-side layer-bounds preference (simulcast P4/P5), restored from
+    // localStorage and surfaced to the settings modal. The signal is the UI's
+    // source of truth for the slider positions.
+    let receive_preference = use_signal(load_receive_preference);
+
+    // Apply the persisted receive bounds to the client once on mount, so the
+    // restored caps take effect immediately (each kind's effective bounds, with
+    // Auto → (None, None)). Re-applying is idempotent.
+    {
+        let client = client.clone();
+        use_hook(move || {
+            let pref = load_receive_preference();
+            for kind in [
+                PrefMediaKind::Video,
+                PrefMediaKind::Audio,
+                PrefMediaKind::Screen,
+            ] {
+                let (min, max) = pref.effective_bounds(kind);
+                client.set_receive_layer_bounds(kind, min, max);
+            }
+        });
+    }
+
+    // Apply a changed receive bound: persist it and push the effective bounds for
+    // the changed kind to the client (immediate downlink effect).
+    let on_receive_change: Rc<dyn Fn((PrefMediaKind, KindReceivePref))> = {
+        let client = client.clone();
+        Rc::new(move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+            let mut receive_preference = receive_preference;
+            let next = receive_preference().with_kind(kind, sub);
+            save_receive_preference(&next);
+            receive_preference.set(next);
+            let (min, max) = next.effective_bounds(kind);
+            client.set_receive_layer_bounds(kind, min, max);
+        })
+    };
+
+    // Per-kind received-layer snapshot reader for the P5 needles. Built once per
+    // mount (stable `Rc`) so the meter component doesn't see a "changed" prop.
+    let received_reader: ReceivedReader = {
+        let client = client.clone();
+        use_hook(move || {
+            ReceivedReader(Rc::new(move |kind: PrefMediaKind| {
+                client.received_layer_snapshot(kind)
+            }))
+        })
+    };
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -717,6 +769,8 @@ pub fn Host(
             let on_mic = on_mic_change.clone();
             let on_cam = on_cam_change.clone();
             let on_spk = on_speaker_change.clone();
+            let on_recv = on_receive_change.clone();
+            let recv_reader = received_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -733,6 +787,9 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
+                    receive_preference: receive_preference(),
+                    on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
+                    received_reader: recv_reader.clone(),
                 }
             }
         }

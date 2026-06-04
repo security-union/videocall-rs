@@ -2,6 +2,9 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
+use crate::components::performance_settings::{
+    KindReceivePref, PerformanceSettingsPanel, ReceivePreference, ReceivedReader,
+};
 use crate::context::{
     clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
     save_transport_preference_session, save_transport_sticky, TransportPreference,
@@ -9,6 +12,7 @@ use crate::context::{
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use videocall_client::PrefMediaKind;
 use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
@@ -219,6 +223,7 @@ fn SettingsGlassSelect(
 enum SettingsSection {
     Audio,
     Video,
+    Performance,
     Network,
     Appearance,
 }
@@ -228,6 +233,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "Audio",
             SettingsSection::Video => "Video",
+            SettingsSection::Performance => "Performance",
             SettingsSection::Network => "Network",
             SettingsSection::Appearance => "Appearance",
         }
@@ -237,6 +243,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-tab-audio",
             SettingsSection::Video => "settings-tab-video",
+            SettingsSection::Performance => "settings-tab-performance",
             SettingsSection::Network => "settings-tab-network",
             SettingsSection::Appearance => "settings-tab-appearance",
         }
@@ -246,6 +253,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-panel-audio",
             SettingsSection::Video => "settings-panel-video",
+            SettingsSection::Performance => "settings-panel-performance",
             SettingsSection::Network => "settings-panel-network",
             SettingsSection::Appearance => "settings-panel-appearance",
         }
@@ -255,15 +263,17 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-nav-audio",
             SettingsSection::Video => "settings-nav-video",
+            SettingsSection::Performance => "settings-nav-performance",
             SettingsSection::Network => "settings-nav-network",
             SettingsSection::Appearance => "settings-nav-appearance",
         }
     }
 
-    fn all() -> [SettingsSection; 4] {
+    fn all() -> [SettingsSection; 5] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
+            SettingsSection::Performance,
             SettingsSection::Network,
             SettingsSection::Appearance,
         ]
@@ -272,7 +282,8 @@ impl SettingsSection {
     fn next(self) -> Self {
         match self {
             SettingsSection::Audio => SettingsSection::Video,
-            SettingsSection::Video => SettingsSection::Network,
+            SettingsSection::Video => SettingsSection::Performance,
+            SettingsSection::Performance => SettingsSection::Network,
             SettingsSection::Network => SettingsSection::Appearance,
             SettingsSection::Appearance => SettingsSection::Audio,
         }
@@ -282,7 +293,8 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => SettingsSection::Appearance,
             SettingsSection::Video => SettingsSection::Audio,
-            SettingsSection::Network => SettingsSection::Video,
+            SettingsSection::Performance => SettingsSection::Video,
+            SettingsSection::Network => SettingsSection::Performance,
             SettingsSection::Appearance => SettingsSection::Network,
         }
     }
@@ -303,12 +315,25 @@ pub fn DeviceSettingsModal(
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
     #[props(default)] initial_section: Option<String>,
+    /// Current persisted RECEIVE-side layer-bounds preference (simulcast P4). (#989)
+    #[props(default)]
+    receive_preference: ReceivePreference,
+    /// Called when the user changes a kind's receive bounds. The parent persists
+    /// the new preference and pushes it to the client via
+    /// `set_receive_layer_bounds`. (#989)
+    #[props(default)]
+    on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
+    /// Reads the client's per-kind received-layer snapshot for the needles.
+    /// Defaults to a reader that always yields `None` (nothing received). (#989)
+    #[props(default = ReceivedReader::none())]
+    received_reader: ReceivedReader,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
     let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
         Some("network") => SettingsSection::Network,
+        Some("performance") => SettingsSection::Performance,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
     };
@@ -511,6 +536,22 @@ pub fn DeviceSettingsModal(
                                                 }
                                             },
                                         }
+                                    }
+                                }
+                            },
+                            SettingsSection::Performance => rsx! {
+                                div {
+                                    id: SettingsSection::Performance.panel_id(),
+                                    class: "settings-section",
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Performance.tab_id(),
+
+                                    PerformanceSettingsPanel {
+                                        pref: receive_preference,
+                                        on_change: move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+                                            on_receive_change.call((kind, sub));
+                                        },
+                                        reader: received_reader.clone(),
                                     }
                                 }
                             },
@@ -768,6 +809,24 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                 stroke_linejoin: "round",
                 rect { x: "3", y: "6", width: "13", height: "12", rx: "2" }
                 path { d: "M16 10l5-3v10l-5-3z" }
+            }
+        },
+        SettingsSection::Performance => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                // Gauge: arc + needle, echoing the VU meters.
+                path { d: "M4 16a8 8 0 0 1 16 0" }
+                path { d: "M12 16l4-4" }
+                circle { cx: "12", cy: "16", r: "1.2", fill: "currentColor", stroke: "none" }
             }
         },
         SettingsSection::Network => rsx! {

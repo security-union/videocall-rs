@@ -818,12 +818,19 @@ impl Peer {
     /// `[min, max]` at the manager level via
     /// [`crate::decode::layer_chooser::clamp_to_user_range`] before it is
     /// applied — a clean seam that does not touch this method.
-    pub fn tick_layer_chooser(&mut self, now_ms: u64) -> u32 {
+    pub fn tick_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
         let highest = self.video_layer_availability.highest_available(now_ms);
-        let desired = self
+        let raw = self
             .video_layer_chooser
             .choose(self.last_video_downlink, highest, now_ms);
-        // Apply to the decode guard so we decode exactly the layer we request.
+        // Phase 4: clamp the auto-chosen layer to the user's receive bounds, so
+        // the REQUESTED (and relay-forwarded) layer is bounded, and the local
+        // decode guard matches. Open bounds (default) = identity.
+        let desired = bounds.clamp(raw);
         self.selected_video_layer = desired;
         desired
     }
@@ -831,11 +838,16 @@ impl Peer {
     /// Run the SCREEN layer chooser one tick (issue #989, Phase 3) and apply the
     /// result to the screen decode guard. Independent of the camera VIDEO
     /// chooser: a peer's screen adapts to this receiver's downlink separately.
-    pub fn tick_screen_layer_chooser(&mut self, now_ms: u64) -> u32 {
+    pub fn tick_screen_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
         let highest = self.screen_layer_availability.highest_available(now_ms);
-        let desired = self
+        let raw = self
             .screen_layer_chooser
             .choose(self.last_screen_downlink, highest, now_ms);
+        let desired = bounds.clamp(raw);
         self.selected_screen_layer = desired;
         desired
     }
@@ -858,12 +870,17 @@ impl Peer {
     /// lose video it is the right moment to also shed the costlier audio layer.
     /// This keeps audio adaptation cheap and conservative (the documented
     /// cost-benefit: marginal savings, minimal added complexity).
-    pub fn tick_audio_layer_chooser(&mut self, now_ms: u64) -> u32 {
+    pub fn tick_audio_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
         let highest = self.audio_layer_availability.highest_available(now_ms);
         // Proxy audio downlink health with the video downlink window (see doc).
-        let desired = self
+        let raw = self
             .audio_layer_chooser
             .choose(self.last_video_downlink, highest, now_ms);
+        let desired = bounds.clamp(raw);
         self.selected_audio_layer = desired;
         desired
     }
@@ -1794,20 +1811,114 @@ impl PeerDecodeManager {
     pub fn tick_layer_choosers(
         &mut self,
         now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
     ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
         use crate::decode::layer_chooser::PrefMediaKind;
+        let video_bounds = bounds.for_kind(PrefMediaKind::Video);
+        let screen_bounds = bounds.for_kind(PrefMediaKind::Screen);
+        let audio_bounds = bounds.for_kind(PrefMediaKind::Audio);
         let mut desired = HashMap::new();
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-                let video = peer.tick_layer_chooser(now_ms);
-                let screen = peer.tick_screen_layer_chooser(now_ms);
-                let audio = peer.tick_audio_layer_chooser(now_ms);
+                // Phase 4: each per-(peer,kind) chooser output is clamped to the
+                // user's GLOBAL receive bounds for that kind before it becomes
+                // the requested + decoded layer.
+                let video = peer.tick_layer_chooser(now_ms, video_bounds);
+                let screen = peer.tick_screen_layer_chooser(now_ms, screen_bounds);
+                let audio = peer.tick_audio_layer_chooser(now_ms, audio_bounds);
                 desired.insert((session_id, PrefMediaKind::Video), video);
                 desired.insert((session_id, PrefMediaKind::Screen), screen);
                 desired.insert((session_id, PrefMediaKind::Audio), audio);
             }
         }
         desired
+    }
+
+    /// Aggregate received-layer snapshot for one media kind (issue #989, Phase 4),
+    /// for the P5 quality needles. Returns `None` when nothing of that kind is
+    /// being received.
+    ///
+    /// Receive is per-peer, so this collapses to ONE representative stream the UI
+    /// shows as a single needle per kind:
+    ///   * **Audio** — the active talker: the speaking, audio-enabled peer with
+    ///     the highest `audio_level`; fallback to any audio-enabled peer.
+    ///   * **Video** — the active speaker's camera: the speaking, video-enabled
+    ///     peer; fallback to the video-enabled peer currently receiving the
+    ///     HIGHEST layer (the most prominent stream).
+    ///   * **Screen** — the screen-enabled peer receiving the highest screen
+    ///     layer (screen-share is typically singular).
+    ///
+    /// The layer reported is the peer's POST-CLAMP `selected_*_layer` (what is
+    /// actually decoded), so the needle never exceeds the user's `max` bound.
+    /// `layer_count` is the empirically-learned ladder size (highest observed
+    /// available layer + 1), clamped by the resolver. `now_ms` lets availability
+    /// expiry use one consistent clock. Panic-safe; cheap to poll each render.
+    pub fn received_layer_snapshot(
+        &mut self,
+        kind: crate::decode::layer_chooser::PrefMediaKind,
+        now_ms: u64,
+    ) -> Option<crate::decode::layer_chooser::ReceivedLayerSnapshot> {
+        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+
+        // Pick the representative (session_id) for this kind, plus its decoded
+        // layer + learned ladder size. Two-pass: prefer the active talker /
+        // speaker, else the highest-layer eligible peer.
+        let keys = self.connected_peers.ordered_keys().clone();
+        let mut speaker: Option<(u64, f32)> = None;
+        let mut fallback: Option<(u64, u32)> = None; // (sid, layer) — highest layer
+
+        for sid in &keys {
+            let Some(peer) = self.connected_peers.get(sid) else {
+                continue;
+            };
+            let eligible = match kind {
+                PrefMediaKind::Video => peer.video_enabled,
+                PrefMediaKind::Screen => peer.screen_enabled,
+                PrefMediaKind::Audio => peer.audio_enabled,
+            };
+            if !eligible {
+                continue;
+            }
+            let layer = match kind {
+                PrefMediaKind::Video => peer.selected_video_layer,
+                PrefMediaKind::Screen => peer.selected_screen_layer,
+                PrefMediaKind::Audio => peer.selected_audio_layer,
+            };
+            // Active-talker / active-speaker preference (video + audio).
+            if matches!(kind, PrefMediaKind::Video | PrefMediaKind::Audio) && peer.is_speaking {
+                let better = speaker
+                    .map(|(_, lvl)| peer.audio_level > lvl)
+                    .unwrap_or(true);
+                if better {
+                    speaker = Some((*sid, peer.audio_level));
+                }
+            }
+            // Highest-layer fallback (all kinds).
+            let take = fallback.map(|(_, l)| layer > l).unwrap_or(true);
+            if take {
+                fallback = Some((*sid, layer));
+            }
+        }
+
+        let chosen = speaker
+            .map(|(sid, _)| sid)
+            .or(fallback.map(|(sid, _)| sid))?;
+        let peer = self.connected_peers.get_mut(&chosen)?;
+        let (layer, count) = match kind {
+            PrefMediaKind::Video => (
+                peer.selected_video_layer,
+                peer.video_layer_availability.highest_available(now_ms) + 1,
+            ),
+            PrefMediaKind::Screen => (
+                peer.selected_screen_layer,
+                peer.screen_layer_availability.highest_available(now_ms) + 1,
+            ),
+            PrefMediaKind::Audio => (
+                peer.selected_audio_layer,
+                peer.audio_layer_availability.highest_available(now_ms) + 1,
+            ),
+        };
+        Some(received_layer_snapshot(kind, layer, count))
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -4421,7 +4532,7 @@ mod tests {
             for layer in 0..3u32 {
                 peer.video_layer_availability.observe(layer, t);
             }
-            peer.tick_layer_chooser(t);
+            peer.tick_layer_chooser(t, crate::decode::layer_chooser::KindLayerBounds::default());
             t += 1100;
         }
         assert_eq!(
@@ -4449,7 +4560,10 @@ mod tests {
             let (peer, _muted) = make_test_peer(sid);
             manager.connected_peers.insert(sid, peer);
         }
-        let desired = manager.tick_layer_choosers(1000);
+        let desired = manager.tick_layer_choosers(
+            1000,
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+        );
         // 3 peers × 3 media kinds = 9 entries.
         assert_eq!(desired.len(), 9, "one entry per (peer, media-kind)");
         // Fresh peers (no availability learned) default to the base layer for
@@ -4467,6 +4581,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Phase 4 (#989): the user's receive-layer bounds clamp each peer's chosen
+    /// video layer, and lowering `max` steps the decode guard DOWN immediately on
+    /// the next tick (not after a delay).
+    #[wasm_bindgen_test]
+    fn receive_bounds_clamp_video_and_step_down_immediately() {
+        use crate::decode::layer_chooser::{KindLayerBounds, PrefMediaKind, ReceiveLayerBounds};
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(701);
+        manager.connected_peers.insert(701, peer);
+
+        // Learn 3 video layers + climb to the top under clean downlink, UNCLAMPED.
+        let open = ReceiveLayerBounds::default();
+        let mut t = 1000u64;
+        for _ in 0..20 {
+            if let Some(p) = manager.connected_peers.get_mut(&701) {
+                for layer in 0..3u32 {
+                    p.video_layer_availability.observe(layer, t);
+                }
+            }
+            manager.tick_layer_choosers(t, &open);
+            t += 1100;
+        }
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "unclamped: climbs to top"
+        );
+
+        // Now cap video at max layer 1 → next tick clamps the desired layer AND
+        // the decode guard down to 1 immediately.
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+        if let Some(p) = manager.connected_peers.get_mut(&701) {
+            for layer in 0..3u32 {
+                p.video_layer_availability.observe(layer, t);
+            }
+        }
+        let desired = manager.tick_layer_choosers(t, &capped);
+        assert_eq!(
+            desired.get(&(701, PrefMediaKind::Video)),
+            Some(&1),
+            "requested layer clamped to user max"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "decode guard steps down immediately to the clamped layer"
+        );
+        // Screen/audio are independent → still open (base).
+        let _ = KindLayerBounds::default();
+    }
+
+    /// Phase 4 (#989): received-layer snapshot aggregation. With one video-
+    /// enabled peer on a learned 3-layer ladder at the top layer, the snapshot
+    /// reports that layer + its hd resolution. None when nothing is received.
+    #[wasm_bindgen_test]
+    fn received_layer_snapshot_aggregates_representative_peer() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut manager = PeerDecodeManager::new();
+        // No peers → None.
+        assert!(manager
+            .received_layer_snapshot(PrefMediaKind::Video, 1000)
+            .is_none());
+
+        let (mut peer, _muted) = make_test_peer(801);
+        peer.video_enabled = true;
+        peer.set_selected_video_layer(2);
+        // Learn a 3-layer ladder.
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+        }
+        manager.connected_peers.insert(801, peer);
+
+        let snap = manager
+            .received_layer_snapshot(PrefMediaKind::Video, 1000)
+            .expect("a video-enabled peer is being received");
+        assert_eq!(snap.layer_index, 2);
+        assert_eq!(snap.layer_count, 3);
+        assert_eq!((snap.width, snap.height), (1280, 720));
+        // Audio not enabled on this peer → None for audio.
+        assert!(manager
+            .received_layer_snapshot(PrefMediaKind::Audio, 1000)
+            .is_none());
     }
 
     /// A MeetingPacket embedded in a PacketWrapper with MEETING type should

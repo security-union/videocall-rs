@@ -326,6 +326,166 @@ pub fn clamp_to_user_range(desired: u32, user_min: u32, user_max: u32) -> u32 {
     desired.clamp(user_min.min(user_max), user_max.max(user_min))
 }
 
+/// User-configured RECEIVE-side layer bounds for ONE media kind (issue #989,
+/// Phase 4).
+///
+/// ## Layer index convention (IMPORTANT for the UI author)
+/// Bounds are **simulcast LAYER indices**, where **0 = base = LOWEST quality**
+/// and a HIGHER index = HIGHER quality. This is the *opposite* of the 8-tier
+/// SEND index convention (where tier 0 is the *best*). Per kind:
+///   * video  — layers `0..=2` (low / standard / hd)
+///   * screen — layers `0..=2` (low / medium / high)
+///   * audio  — layers `0..=1` (low / high)
+///
+/// ## Semantics
+/// `min`/`max` are inclusive bounds applied to EVERY incoming peer of this kind
+/// ("never receive any peer's video below `min` or above `max`"). `None` means
+/// "no bound" (open end). The default `(None, None)` is the full range → pure
+/// auto-adaptation, no clamping. Out-of-order bounds (`min > max`) are normalized
+/// by [`clamp_to_user_range`] (defensive; the UI should never send them).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindLayerBounds {
+    /// Inclusive minimum layer index, or `None` for "no lower bound" (0).
+    pub min: Option<u32>,
+    /// Inclusive maximum layer index, or `None` for "no upper bound".
+    pub max: Option<u32>,
+}
+
+impl KindLayerBounds {
+    /// `true` when no bound is set on either end → the chooser runs unclamped.
+    pub fn is_open(&self) -> bool {
+        self.min.is_none() && self.max.is_none()
+    }
+
+    /// Clamp a chooser's desired layer into these bounds. An absent `min`
+    /// defaults to 0 (base); an absent `max` defaults to `u32::MAX` (open). When
+    /// both are absent this is the identity (pure auto).
+    pub fn clamp(&self, desired: u32) -> u32 {
+        if self.is_open() {
+            return desired;
+        }
+        clamp_to_user_range(desired, self.min.unwrap_or(0), self.max.unwrap_or(u32::MAX))
+    }
+}
+
+/// All three per-kind receive-layer bounds (issue #989, Phase 4). Default is
+/// fully open (no clamping on any kind). Stored on the client and applied to
+/// each per-(peer, kind) chooser's desired layer at the monitor-tick call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiveLayerBounds {
+    pub video: KindLayerBounds,
+    pub screen: KindLayerBounds,
+    pub audio: KindLayerBounds,
+}
+
+impl ReceiveLayerBounds {
+    /// The bounds for a given media kind.
+    pub fn for_kind(&self, kind: PrefMediaKind) -> KindLayerBounds {
+        match kind {
+            PrefMediaKind::Video => self.video,
+            PrefMediaKind::Screen => self.screen,
+            PrefMediaKind::Audio => self.audio,
+        }
+    }
+
+    /// Set (or clear) the bounds for a given media kind.
+    pub fn set_kind(&mut self, kind: PrefMediaKind, min: Option<u32>, max: Option<u32>) {
+        let b = KindLayerBounds { min, max };
+        match kind {
+            PrefMediaKind::Video => self.video = b,
+            PrefMediaKind::Screen => self.screen = b,
+            PrefMediaKind::Audio => self.audio = b,
+        }
+    }
+}
+
+/// A real-time snapshot of the simulcast layer this receiver is CURRENTLY
+/// decoding for one media kind, for the P5 quality needles (issue #989, Phase 4).
+///
+/// This reflects the **post-clamp** selected layer (what is actually decoded),
+/// so it can never exceed the user's `max` bound — matching the needle's stated
+/// expectation. `width`/`height` (and `kbps`) are resolved from the per-kind
+/// layer ladder via [`received_layer_snapshot`]. `fps` is left `None` here
+/// (the ladder's target fps is a publisher hint, not the received rate; the UI
+/// already has received-fps elsewhere). Cheap to construct and poll per render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedLayerSnapshot {
+    /// Which media kind this snapshot describes.
+    pub kind: PrefMediaKind,
+    /// The currently-decoded layer index (0 = base/lowest).
+    pub layer_index: u32,
+    /// Total layers available in this kind's ladder for `layer_count` layers
+    /// (e.g. how many distinct layers the source ladder defines). Lets the UI
+    /// render "layer 1 of 3".
+    pub layer_count: u32,
+    /// Resolution of the decoded layer in pixels (0 for audio).
+    pub width: u32,
+    pub height: u32,
+    /// Approximate bitrate of the decoded layer in kbps, from the ladder.
+    pub kbps: u32,
+}
+
+/// Audio simulcast bitrates (kbps) by layer, lowest-first (issue #989, Phase 3c
+/// / 4). Mirrors the publisher's 2-layer model (low 24 / high 50). Kept here so
+/// the snapshot resolver has no dependency on the encoder module.
+const AUDIO_LAYER_KBPS: &[u32] = &[24, 50];
+
+/// Resolve a [`ReceivedLayerSnapshot`] for `kind` at the given decoded
+/// `layer_index`, mapping the layer to its resolution/bitrate via the per-kind
+/// ladder (issue #989, Phase 4). `layer_count` is the number of layers the
+/// source ladder is producing (>= 1). Pure + panic-safe: `layer_index` and
+/// `layer_count` are clamped into range, so the 1-layer (flag-off) default
+/// always yields a valid layer-0 snapshot.
+pub fn received_layer_snapshot(
+    kind: PrefMediaKind,
+    layer_index: u32,
+    layer_count: u32,
+) -> ReceivedLayerSnapshot {
+    // Clamp the ladder size to the supported range for this kind, and the index
+    // into [0, count-1], so a degenerate input can never panic the resolver.
+    let (max_layers, audio) = match kind {
+        PrefMediaKind::Video | PrefMediaKind::Screen => (3u32, false),
+        PrefMediaKind::Audio => (2u32, true),
+    };
+    let count = layer_count.clamp(1, max_layers);
+    let idx = layer_index.min(count.saturating_sub(1));
+
+    if audio {
+        let kbps = AUDIO_LAYER_KBPS
+            .get(idx as usize)
+            .copied()
+            .unwrap_or(AUDIO_LAYER_KBPS[0]);
+        return ReceivedLayerSnapshot {
+            kind,
+            layer_index: idx,
+            layer_count: count,
+            width: 0,
+            height: 0,
+            kbps,
+        };
+    }
+
+    // Video / screen: resolve from the AQ ladder (lowest-first, index == layer).
+    let tiers = match kind {
+        PrefMediaKind::Screen => {
+            crate::adaptive_quality_constants::simulcast_screen_layers(count as usize)
+        }
+        _ => crate::adaptive_quality_constants::simulcast_layers(count as usize),
+    };
+    let tier = tiers
+        .get(idx as usize)
+        .or_else(|| tiers.first())
+        .expect("ladder is non-empty for count >= 1");
+    ReceivedLayerSnapshot {
+        kind,
+        layer_index: idx,
+        layer_count: count,
+        width: tier.max_width,
+        height: tier.max_height,
+        kbps: tier.ideal_bitrate_kbps,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +727,124 @@ mod tests {
         assert_eq!(clamp_to_user_range(0, 1, 2), 1, "clamped up to user min");
         // Defensive: inverted bounds are normalized, never panic.
         assert_eq!(clamp_to_user_range(5, 2, 1), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4: KindLayerBounds / ReceiveLayerBounds
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn kind_bounds_default_is_open_and_identity() {
+        let b = KindLayerBounds::default();
+        assert!(b.is_open(), "default bounds are fully open");
+        // Open bounds are the identity → pure auto, no clamping.
+        for d in 0..=2 {
+            assert_eq!(b.clamp(d), d);
+        }
+    }
+
+    #[test]
+    fn kind_bounds_max_clamps_down() {
+        let b = KindLayerBounds {
+            min: None,
+            max: Some(1),
+        };
+        assert!(!b.is_open());
+        assert_eq!(b.clamp(2), 1, "desired above max is clamped down");
+        assert_eq!(b.clamp(1), 1);
+        assert_eq!(b.clamp(0), 0, "below max is untouched");
+    }
+
+    #[test]
+    fn kind_bounds_min_clamps_up() {
+        let b = KindLayerBounds {
+            min: Some(1),
+            max: None,
+        };
+        assert_eq!(b.clamp(0), 1, "desired below min is clamped up");
+        assert_eq!(b.clamp(2), 2);
+    }
+
+    #[test]
+    fn kind_bounds_pin_to_single_layer() {
+        // min == max pins every peer to exactly that layer.
+        let b = KindLayerBounds {
+            min: Some(1),
+            max: Some(1),
+        };
+        assert_eq!(b.clamp(0), 1);
+        assert_eq!(b.clamp(2), 1);
+    }
+
+    #[test]
+    fn receive_bounds_per_kind_independent() {
+        let mut rb = ReceiveLayerBounds::default();
+        rb.set_kind(PrefMediaKind::Video, Some(0), Some(0)); // video pinned to base
+        rb.set_kind(PrefMediaKind::Screen, None, Some(2)); // screen open up to 2
+        assert_eq!(rb.for_kind(PrefMediaKind::Video).clamp(2), 0);
+        assert_eq!(rb.for_kind(PrefMediaKind::Screen).clamp(2), 2);
+        // Audio untouched → open.
+        assert!(rb.for_kind(PrefMediaKind::Audio).is_open());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4: received_layer_snapshot layer→resolution mapping
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn snapshot_video_maps_layer_to_ladder_resolution() {
+        // 3-layer video ladder, top layer (2) = 1280x720 hd.
+        let s = received_layer_snapshot(PrefMediaKind::Video, 2, 3);
+        assert_eq!(s.kind, PrefMediaKind::Video);
+        assert_eq!(s.layer_index, 2);
+        assert_eq!(s.layer_count, 3);
+        assert_eq!((s.width, s.height), (1280, 720));
+        assert!(s.kbps > 0);
+        // Base layer (0) = lowest resolution.
+        let base = received_layer_snapshot(PrefMediaKind::Video, 0, 3);
+        assert_eq!((base.width, base.height), (640, 360));
+        assert!(base.kbps < s.kbps, "base bitrate < top bitrate");
+    }
+
+    #[test]
+    fn snapshot_screen_top_layer_is_1080p() {
+        let s = received_layer_snapshot(PrefMediaKind::Screen, 2, 3);
+        assert_eq!((s.width, s.height), (1920, 1080));
+    }
+
+    #[test]
+    fn snapshot_audio_has_no_resolution_and_kbps_by_layer() {
+        let low = received_layer_snapshot(PrefMediaKind::Audio, 0, 2);
+        assert_eq!((low.width, low.height), (0, 0));
+        assert_eq!(low.kbps, 24);
+        let high = received_layer_snapshot(PrefMediaKind::Audio, 1, 2);
+        assert_eq!(high.kbps, 50);
+        assert_eq!(high.layer_count, 2);
+    }
+
+    #[test]
+    fn snapshot_is_panic_safe_on_out_of_range() {
+        // Degenerate inputs are clamped, never panic.
+        let s = received_layer_snapshot(PrefMediaKind::Video, 99, 99);
+        assert_eq!(s.layer_count, 3, "ladder size capped to 3 for video");
+        assert_eq!(s.layer_index, 2, "index clamped to count-1");
+        // Audio capped to 2.
+        let a = received_layer_snapshot(PrefMediaKind::Audio, 99, 99);
+        assert_eq!(a.layer_count, 2);
+        assert_eq!(a.layer_index, 1);
+    }
+
+    #[test]
+    fn snapshot_single_layer_default_is_base() {
+        // 1-layer (flag-off) default: layer 0 / base, valid for every kind.
+        for kind in [
+            PrefMediaKind::Video,
+            PrefMediaKind::Screen,
+            PrefMediaKind::Audio,
+        ] {
+            let s = received_layer_snapshot(kind, 0, 1);
+            assert_eq!(s.layer_index, 0);
+            assert_eq!(s.layer_count, 1);
+        }
     }
 }

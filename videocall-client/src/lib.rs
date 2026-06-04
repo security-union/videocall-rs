@@ -243,7 +243,8 @@ pub use client::{
 };
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
-    create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
+    create_audio_peer_decoder, AudioPeerDecoderTrait, KindLayerBounds, PeerDecodeManager,
+    PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,

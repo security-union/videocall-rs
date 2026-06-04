@@ -25,7 +25,7 @@ use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::decode::layer_chooser::PrefMediaKind;
+use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -374,6 +374,11 @@ struct Inner {
     /// receiver-driven chooser's per-peer desired layers actually change. See
     /// [`LayerPreferenceSender`].
     layer_preference_sender: LayerPreferenceSender,
+    /// User-configured RECEIVE-side simulcast layer bounds per kind (issue #989,
+    /// Phase 4). Default fully-open = pure auto. Applied to every per-(peer,kind)
+    /// chooser's desired layer at the monitor tick, so the requested + decoded
+    /// layer is bounded. Set via [`VideoCallClient::set_receive_layer_bounds`].
+    receive_layer_bounds: ReceiveLayerBounds,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
@@ -746,6 +751,7 @@ impl VideoCallClient {
                     diagnostics.clone(),
                 ),
                 layer_preference_sender: LayerPreferenceSender::new(),
+                receive_layer_bounds: ReceiveLayerBounds::default(),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
@@ -1007,7 +1013,14 @@ impl VideoCallClient {
                                 // — so this is a no-op on the wire (the empty /
                                 // all-zero map dedups after the first send).
                                 let now_ms = js_sys::Date::now() as u64;
-                                let desired = inner.peer_decode_manager.tick_layer_choosers(now_ms);
+                                // Phase 4: pass the user's receive-layer bounds so
+                                // the chooser output is clamped per kind. `Copy`,
+                                // so snapshot it to avoid an aliasing borrow with
+                                // `&mut peer_decode_manager`.
+                                let bounds = inner.receive_layer_bounds;
+                                let desired = inner
+                                    .peer_decode_manager
+                                    .tick_layer_choosers(now_ms, &bounds);
                                 if let Some(entries) = inner
                                     .layer_preference_sender
                                     .take_if_changed(&desired, now_ms)
@@ -1437,6 +1450,85 @@ impl VideoCallClient {
             return inner.peer_decode_manager.peer_audio_level(key);
         }
         0.0
+    }
+
+    /// Set (or clear) the user's RECEIVE-side simulcast layer bounds for one
+    /// media kind (issue #989, Phase 4).
+    ///
+    /// `kind` is `PrefMediaKind::{Video, Screen, Audio}`. `min`/`max` are
+    /// inclusive **LAYER indices**, where **0 = base = LOWEST quality** and a
+    /// HIGHER index = HIGHER quality (the OPPOSITE of the 8-tier SEND index
+    /// convention). Ladders: video/screen `0..=2`, audio `0..=1`. `None` =
+    /// "no bound" on that end; `(None, None)` (the default) = full range = pure
+    /// auto-adaptation.
+    ///
+    /// The bound is GLOBAL for the kind — it applies to EVERY incoming peer of
+    /// that kind ("never receive any peer's video below `min` or above `max`").
+    /// It clamps each per-(peer,kind) chooser's desired layer, so the client
+    /// never REQUESTS (and the relay never forwards) an out-of-bounds layer, and
+    /// the local decode selection is bounded to match.
+    ///
+    /// Applies IMMEDIATELY: this re-ticks the choosers and re-sends the
+    /// `LAYER_PREFERENCE` packet, so lowering `max` below the current selection
+    /// steps down at once rather than waiting for the next monitor tick.
+    pub fn set_receive_layer_bounds(
+        &self,
+        kind: PrefMediaKind,
+        min: Option<u32>,
+        max: Option<u32>,
+    ) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.receive_layer_bounds.set_kind(kind, min, max);
+            // Immediate enforcement: re-tick (clamps + updates decode guards) and
+            // re-send the (now-bounded) preference so the relay drops out-of-bounds
+            // layers without waiting ~1 monitor tick.
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            let desired = inner
+                .peer_decode_manager
+                .tick_layer_choosers(now_ms, &bounds);
+            if let Some(entries) = inner
+                .layer_preference_sender
+                .take_if_changed(&desired, now_ms)
+            {
+                let user_id = inner.options.user_id.clone();
+                let cc = inner.connection_controller.clone();
+                send_layer_preference_via(&cc, &user_id, entries);
+            }
+        } else {
+            warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
+        }
+    }
+
+    /// The user's current RECEIVE-side layer bounds (issue #989, Phase 4), for
+    /// the UI to render its current min/max selection. Default fully-open.
+    pub fn receive_layer_bounds(&self) -> ReceiveLayerBounds {
+        self.inner
+            .try_borrow()
+            .map(|inner| inner.receive_layer_bounds)
+            .unwrap_or_default()
+    }
+
+    /// Real-time snapshot of the simulcast layer this client is CURRENTLY
+    /// receiving for `kind`, for the P5 quality needles (issue #989, Phase 4).
+    ///
+    /// Returns `None` when nothing of that kind is being received. The reported
+    /// layer is POST-CLAMP (what is actually decoded), so it never exceeds the
+    /// user's `max` bound. Resolution/bitrate come from the per-kind layer
+    /// ladder. Per-kind aggregation (one needle per kind): active talker for
+    /// audio, active speaker for video, the screen-sharer for screen, each with
+    /// a highest-layer fallback — see
+    /// [`PeerDecodeManager::received_layer_snapshot`]. Panic-safe; cheap to poll
+    /// each render. The UI polls this like the other per-frame accessors.
+    ///
+    /// At the 1-layer default (flag off) this reports layer 0 / base — no error.
+    pub fn received_layer_snapshot(&self, kind: PrefMediaKind) -> Option<ReceivedLayerSnapshot> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner.try_borrow_mut().ok().and_then(|mut inner| {
+            inner
+                .peer_decode_manager
+                .received_layer_snapshot(kind, now_ms)
+        })
     }
 
     /// Returns a shared reference to the camera force-keyframe flag.

@@ -166,6 +166,10 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
+            // Audio simulcast layer ceiling (issue #989, Phase 3c) — same flag +
+            // capability gating as camera/screen, so OFF by default (single
+            // audio layer, byte-identical to the pre-simulcast mic path).
+            effective_max_layers,
         );
 
         let screen_settings_cell = screen_settings_handler.clone();

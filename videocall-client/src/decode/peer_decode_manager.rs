@@ -339,6 +339,38 @@ impl SequenceTracker {
     fn kf_per_sec(&self) -> f64 {
         self.kf_per_sec
     }
+
+    /// Re-anchor the tracker because the receiver switched to a DIFFERENT
+    /// simulcast layer (issue #989 / #1079 H1).
+    ///
+    /// Each simulcast layer is an independent encoder with its OWN per-layer
+    /// sequence space (camera/screen `sequence_numbers: vec![0; n_layers]`). When
+    /// the chooser switches `selected_*_layer`, the first packets of the new
+    /// layer arrive with sequence numbers from a DIFFERENT counter than the one
+    /// `high_seq` is tracking. Without this reset, `record_seq` would interpret
+    /// that cross-counter discontinuity as a huge window shift and manufacture
+    /// phantom loss — which is exactly the chooser's congestion signal, causing a
+    /// step-UP to immediately look like congestion and oscillate (UP→DOWN→UP).
+    ///
+    /// We clear the sequence-window state (`high_seq`, `seen_bits`, `lost_count`,
+    /// `loss_detected_at_ms`) so the next packet of the new layer establishes a
+    /// fresh baseline (the `high_seq == None` path in `record_seq` returns 0 loss
+    /// on the first packet), and clear the in-flight window accumulators
+    /// (`window_lost` / `window_kf_requests`) so the discontinuity does not leak
+    /// into the current rate window. We DELIBERATELY preserve the PLI backoff
+    /// history (`current_backoff_ms`, `unanswered_requests`,
+    /// `last_keyframe_request_ms`): that rate-limit state is connection-level, not
+    /// layer-level, and resetting it could let a PLI storm restart (issue #832).
+    /// The already-published `loss_per_sec` / `kf_per_sec` are left as-is; they
+    /// are recomputed on the next ~1s window rollover.
+    fn reanchor_for_layer_switch(&mut self) {
+        self.high_seq = None;
+        self.seen_bits = 0;
+        self.lost_count = 0;
+        self.loss_detected_at_ms = None;
+        self.window_lost = 0;
+        self.window_kf_requests = 0;
+    }
 }
 
 /// Result of `Peer::track_sequence`: a possible keyframe request plus, on
@@ -795,6 +827,15 @@ impl Peer {
     /// [`Self::tick_layer_chooser`]; it may also be set directly (tests / future
     /// viewport-driven overrides).
     pub fn set_selected_video_layer(&mut self, layer: u32) {
+        // Re-anchor the sequence tracker ONLY on an actual change (#1079 H1): the
+        // new layer has its own per-layer sequence counter, so the next packet
+        // must establish a fresh baseline rather than be diffed against the old
+        // layer's `high_seq` (which would manufacture phantom loss → chooser
+        // oscillation). A no-op switch (same layer) must not reset the tracker,
+        // or we would discard healthy loss/PLI history every tick.
+        if layer != self.selected_video_layer {
+            self.video_seq_tracker.reanchor_for_layer_switch();
+        }
         self.selected_video_layer = layer;
     }
 
@@ -831,6 +872,11 @@ impl Peer {
         // the REQUESTED (and relay-forwarded) layer is bounded, and the local
         // decode guard matches. Open bounds (default) = identity.
         let desired = bounds.clamp(raw);
+        // Re-anchor on an actual layer change (#1079 H1) — see
+        // `set_selected_video_layer` for the rationale. No-op when unchanged.
+        if desired != self.selected_video_layer {
+            self.video_seq_tracker.reanchor_for_layer_switch();
+        }
         self.selected_video_layer = desired;
         desired
     }
@@ -848,6 +894,11 @@ impl Peer {
             .screen_layer_chooser
             .choose(self.last_screen_downlink, highest, now_ms);
         let desired = bounds.clamp(raw);
+        // Re-anchor on an actual layer change (#1079 H1) — see
+        // `set_selected_video_layer` for the rationale. No-op when unchanged.
+        if desired != self.selected_screen_layer {
+            self.screen_seq_tracker.reanchor_for_layer_switch();
+        }
         self.selected_screen_layer = desired;
         desired
     }
@@ -4014,6 +4065,102 @@ mod tests {
         // Verify high_seq values are independent.
         assert_eq!(peer.video_seq_tracker.high_seq, Some(3));
         assert_eq!(peer.screen_seq_tracker.high_seq, Some(70));
+    }
+
+    /// Build a VIDEO MediaPacket wrapper carrying a cleartext `simulcast_layer_id`
+    /// and a per-layer `sequence`, ready for `Peer::decode`. Mirrors the real
+    /// wire shape the encoders produce (outer wrapper layer id + inner
+    /// VideoMetadata sequence).
+    fn video_layer_wrap(layer_id: u32, seq: u64, session_id: u64) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: b"test@test.com".to_vec(),
+            video_metadata: Some(VideoMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".to_string(),
+            ..Default::default()
+        };
+        let data = media.write_to_bytes().expect("serialize MediaPacket");
+        Arc::new(PacketWrapper {
+            data,
+            user_id: "test@test.com".into(),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            simulcast_layer_id: layer_id,
+            ..Default::default()
+        })
+    }
+
+    /// H1 (#1079) regression: a REAL simulcast layer switch driven through
+    /// `decode()` must NOT manufacture phantom loss / PLI.
+    ///
+    /// Each layer has its own per-layer sequence counter, so the new layer's
+    /// first packets carry sequence numbers from a different (lower) counter than
+    /// the old layer's `high_seq`. Without re-anchoring the tracker on switch,
+    /// `record_seq` reads the cross-counter discontinuity as a massive window
+    /// shift → phantom loss → the chooser's own congestion signal → oscillation.
+    /// This drives the real tracker path (decode → guard → track_sequence), not
+    /// synthetic DownlinkSamples, exactly as the reviewer required.
+    #[wasm_bindgen_test]
+    fn real_layer_switch_does_not_manufacture_phantom_loss() {
+        let (mut peer, _muted) = make_test_peer(909);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+
+        // Receiving layer 0 at a HIGH sequence (the old counter has advanced).
+        for seq in [100u64, 101, 102] {
+            let _ = peer.decode(&video_layer_wrap(0, seq, 909), "local@test.com");
+        }
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "no loss while steadily receiving layer 0"
+        );
+        assert_eq!(peer.video_seq_tracker.high_seq, Some(102));
+
+        // REAL switch to layer 1 (the production entry point the chooser uses).
+        // This must re-anchor the tracker so the new layer's low sequence numbers
+        // are not diffed against the old layer's high_seq.
+        peer.set_selected_video_layer(1);
+        assert!(
+            peer.video_seq_tracker.high_seq.is_none(),
+            "switch must re-anchor: tracker baseline cleared"
+        );
+
+        // Layer 1 starts from its OWN counter (low seq 0,1,2) — far below 102.
+        // Pre-fix, the first packet (seq 0 vs high_seq 102) would have looked like
+        // an enormous backwards jump / window shift; post-fix it is a clean
+        // fresh baseline.
+        for seq in [0u64, 1, 2] {
+            let _ = peer.decode(&video_layer_wrap(1, seq, 909), "local@test.com");
+        }
+
+        // The whole point: no phantom loss, no PLI, no loss-detected timestamp.
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "post-switch: a real layer switch must NOT manufacture phantom loss"
+        );
+        assert!(
+            peer.video_seq_tracker.loss_detected_at_ms.is_none(),
+            "post-switch: no loss should be flagged after re-anchor"
+        );
+        assert_eq!(
+            peer.video_seq_tracker.window_lost, 0,
+            "post-switch: the cross-counter discontinuity must not leak into the rate window"
+        );
+        // Baseline is the new layer's stream.
+        assert_eq!(peer.video_seq_tracker.high_seq, Some(2));
+
+        // A no-op "switch" to the SAME layer must NOT reset a healthy tracker.
+        peer.set_selected_video_layer(1);
+        assert_eq!(
+            peer.video_seq_tracker.high_seq,
+            Some(2),
+            "selecting the already-selected layer must be a no-op (no spurious reset)"
+        );
     }
 
     /// Different peers should have independent sequence tracking.

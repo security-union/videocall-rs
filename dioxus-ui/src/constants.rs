@@ -407,7 +407,7 @@ mod simulcast_default_tests {
         assert_eq!(
             default_experimental_simulcast_max_layers(),
             3,
-            "simulcast must default ON (3 layers) — see issue #1082"
+            "simulcast must default ON (3 layers) — see issue 1082"
         );
     }
 
@@ -424,7 +424,7 @@ mod simulcast_default_tests {
         assert_eq!(
             READ_FALLBACK,
             default_experimental_simulcast_max_layers(),
-            "the read-fn fallback must equal the serde default (lockstep, #1082)"
+            "the read-fn fallback must equal the serde default (lockstep, issue 1082)"
         );
     }
 }

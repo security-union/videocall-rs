@@ -45,7 +45,8 @@ pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]
 pub use connection_manager::ReconnectionPhase;
 pub use connection_manager::{
-    connection_handshake_failures, connection_session_drops, ConnectionManagerOptions,
-    ConnectionState,
+    connection_handshake_failures, connection_session_drops, reelection_aborted_total,
+    reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
+    ConnectionManagerOptions, ConnectionState,
 };
 pub use webmedia::{ConnectOptions, MediaStreamKey};

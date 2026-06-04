@@ -55,6 +55,14 @@ pub struct JoinRoom {
     pub is_host: bool,
     /// Whether the meeting should end when the host leaves.
     pub end_on_host_leave: bool,
+    /// Transport this session connected over (`"websocket"` | `"webtransport"`).
+    ///
+    /// Threaded through so the per-session NATS subscription loop's `handle_msg`
+    /// closure can attribute an inbound actor-mailbox overflow drop to the
+    /// receiver's transport — the `Recipient<Message>` stored in
+    /// `ChatServer::sessions` is transport-erased, so the transport is otherwise
+    /// unknown at the mailbox-drop site (dashboard audit Tier B #2 / #1057).
+    pub transport: String,
 }
 
 #[derive(ActixMessage)]

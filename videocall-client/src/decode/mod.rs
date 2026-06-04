@@ -19,6 +19,7 @@
 pub mod audio_decoder_wrapper;
 pub mod config;
 pub mod hash_map_with_ordered_keys;
+pub mod layer_chooser;
 pub mod media_decoder_trait;
 pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;

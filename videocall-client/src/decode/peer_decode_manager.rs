@@ -17,6 +17,7 @@
  */
 
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
+use super::layer_chooser::{DownlinkSample, LayerAvailability, LayerChooser};
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
@@ -399,6 +400,20 @@ pub struct Peer {
     /// selection (raising this to a higher layer for the focused tile) is
     /// deferred to a later PR.
     selected_video_layer: u32,
+    /// Receiver-driven per-peer simulcast layer chooser (issue #989, Phase 2).
+    /// Run on each monitor tick against this receiver's OWN downlink health for
+    /// this source; its output drives `selected_video_layer` (the decode guard)
+    /// and the `LAYER_PREFERENCE` packet sent to the relay. Independent per peer.
+    video_layer_chooser: LayerChooser,
+    /// Empirically-learned set of simulcast layers this source is producing,
+    /// observed from arriving `simulcast_layer_id`s (the relay does not
+    /// advertise availability). Caps how high the chooser may climb.
+    video_layer_availability: LayerAvailability,
+    /// Most recent windowed downlink sample for VIDEO (loss/sec + PLI/sec),
+    /// refreshed on each ~1s sequence-window rollover and consumed by the
+    /// chooser on the monitor tick. Starts clean so a fresh peer is not treated
+    /// as congested before any window has rolled.
+    last_video_downlink: DownlinkSample,
     /// Reorder-tolerant sequence tracker for video packets.
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
@@ -653,6 +668,15 @@ impl Peer {
             // Default to the lowest layer (0). Pre-simulcast publishers send 0,
             // so this is unchanged behaviour for them.
             selected_video_layer: 0,
+            // Phase 2: start the chooser at the base layer (bandwidth-safe for a
+            // freshly-joined peer whose available layers we have not learned),
+            // with empty availability and a clean initial downlink sample.
+            video_layer_chooser: LayerChooser::new(now_ms()),
+            video_layer_availability: LayerAvailability::new(),
+            last_video_downlink: DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             // HCL bug #1: 0 means "no media frame observed yet". The
@@ -736,11 +760,41 @@ impl Peer {
     /// Select which simulcast layer (issue #989) this receiver decodes for this
     /// peer. VIDEO packets tagged with a different `simulcast_layer_id` are
     /// dropped before sequence tracking and decode. Defaults to 0 (lowest
-    /// layer). Reserved for viewport/tile-size-driven selection in a later PR;
-    /// in PR A it always stays 0.
-    #[allow(dead_code)]
+    /// layer). In Phase 2 this is driven automatically by
+    /// [`Self::tick_layer_chooser`]; it may also be set directly (tests / future
+    /// viewport-driven overrides).
     pub fn set_selected_video_layer(&mut self, layer: u32) {
         self.selected_video_layer = layer;
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer.
+    pub fn selected_video_layer(&self) -> u32 {
+        self.selected_video_layer
+    }
+
+    /// Run the receiver-driven layer chooser one tick for this peer (issue #989,
+    /// Phase 2) and apply the result to the local decode guard.
+    ///
+    /// Folds the most recent windowed downlink sample
+    /// ([`Self::last_video_downlink`]) and the empirically-learned availability
+    /// cap into the per-peer [`LayerChooser`], updates `selected_video_layer` so
+    /// decode follows the chosen layer, and returns the desired layer so the
+    /// caller can build the aggregate `LAYER_PREFERENCE` packet.
+    ///
+    /// `now_ms` is threaded in (rather than read here) so the manager uses one
+    /// consistent clock per tick and so this stays testable. The chooser's raw
+    /// output is the value returned; P4 will clamp it to the user's
+    /// `[min, max]` at the manager level via
+    /// [`crate::decode::layer_chooser::clamp_to_user_range`] before it is
+    /// applied — a clean seam that does not touch this method.
+    pub fn tick_layer_chooser(&mut self, now_ms: u64) -> u32 {
+        let highest = self.video_layer_availability.highest_available(now_ms);
+        let desired = self
+            .video_layer_chooser
+            .choose(self.last_video_downlink, highest, now_ms);
+        // Apply to the decode guard so we decode exactly the layer we request.
+        self.selected_video_layer = desired;
+        desired
     }
 
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
@@ -904,6 +958,16 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Phase 2 (#989): learn which layers this source produces from
+                // EVERY arriving VIDEO packet — including ones we are about to
+                // drop below — so the chooser knows how high it may climb. This
+                // MUST run before the drop guard, otherwise we would only ever
+                // observe the layer we already selected and could never learn a
+                // higher layer exists. Observing a non-selected layer here costs
+                // a hashmap insert; the packet is still dropped below.
+                self.video_layer_availability
+                    .observe(incoming_video_layer, now_ms());
+
                 // Simulcast layer-select guard (issue #989). Drop any VIDEO
                 // packet that is not the layer this receiver is decoding for
                 // this peer — BEFORE sequence tracking and BEFORE decode.
@@ -924,6 +988,16 @@ impl Peer {
                 let seq = self.track_sequence(media_type, &packet);
                 if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
                     self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                    // Phase 2 (#989): cache this window's downlink health so the
+                    // monitor-tick chooser can fold it into the per-peer layer
+                    // decision. Only the SELECTED layer's sequence is tracked
+                    // (the guard above drops the rest), so this loss/PLI rate
+                    // measures exactly this receiver's ability to sustain the
+                    // layer it is currently pulling.
+                    self.last_video_downlink = DownlinkSample {
+                        loss_per_sec,
+                        kf_per_sec,
+                    };
                 }
                 let kf_request = seq.keyframe_request;
 
@@ -1578,6 +1652,35 @@ impl PeerDecodeManager {
             self.on_peers_removed_batch.emit(removed_ids.clone());
         }
         removed_ids
+    }
+
+    /// Run the receiver-driven simulcast layer chooser for every connected peer
+    /// (issue #989, Phase 2) and return the desired `session_id -> layer` map.
+    ///
+    /// Called on the monitor tick. For each peer this advances its per-peer
+    /// [`LayerChooser`] using that peer's own downlink health + learned layer
+    /// availability, applies the result to the peer's decode guard, and collects
+    /// the chosen layer into the returned map. The caller (`VideoCallClient`)
+    /// feeds that map to the `LayerPreferenceSender`, which emits a
+    /// `LAYER_PREFERENCE` packet only when the map actually changes and the
+    /// relay's rate-limit allows.
+    ///
+    /// Each peer is fully independent: a congested source's drop never affects a
+    /// healthy source. For a source publishing only the base layer (the default
+    /// until the P1 send flag is raised), availability is 0, so every peer's
+    /// chosen layer is 0 — the map is all-base and the resulting preference is a
+    /// no-op relative to the relay's fail-open (it forwards base regardless).
+    ///
+    /// `now_ms` is supplied by the caller so the whole tick shares one clock.
+    pub fn tick_layer_choosers(&mut self, now_ms: u64) -> HashMap<u64, u32> {
+        let mut desired = HashMap::new();
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                let layer = peer.tick_layer_chooser(now_ms);
+                desired.insert(session_id, layer);
+            }
+        }
+        desired
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -2329,6 +2432,12 @@ mod tests {
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -4148,6 +4257,67 @@ mod tests {
         );
     }
 
+    /// Phase 2 (#989): the local decode guard must follow the chooser. After
+    /// observing higher layers as available and feeding sustained clean downlink
+    /// windows through the chooser tick, `selected_video_layer` must climb — and
+    /// the guard then decodes exactly that layer.
+    #[wasm_bindgen_test]
+    fn decode_guard_follows_layer_chooser() {
+        let (mut peer, _muted) = make_test_peer(903);
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        assert_eq!(peer.selected_video_layer(), 0, "starts at base");
+
+        // Learn that layers 0,1,2 are available for this source by observing
+        // arriving packets of every layer (mirrors the decode path's observe()).
+        let mut t = 1000u64;
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, t);
+        }
+
+        // Feed sustained clean downlink windows (default sample is clean) with
+        // adequate spacing so dwell is satisfied; the chooser must climb toward
+        // the top available layer and the guard must follow.
+        for _ in 0..20 {
+            // Re-observe so availability does not expire across the long run.
+            for layer in 0..3u32 {
+                peer.video_layer_availability.observe(layer, t);
+            }
+            peer.tick_layer_chooser(t);
+            t += 1100;
+        }
+        assert_eq!(
+            peer.selected_video_layer(),
+            2,
+            "sustained clean downlink + availability must climb the decode guard to top"
+        );
+
+        // The guard now decodes layer 2 only.
+        let pkt2 = layered_video_packet(903, 2, 0);
+        let (_mt, _status, _kf) = peer.decode(&pkt2, "test@test.com").expect("decode ok");
+        let pkt0 = layered_video_packet(903, 0, 0);
+        let (_mt0, status0, _kf0) = peer.decode(&pkt0, "test@test.com").expect("decode ok");
+        assert!(!status0.rendered, "non-selected base layer must be dropped");
+    }
+
+    /// Phase 2 (#989): the manager's per-peer tick returns an independent
+    /// desired-layer entry for every connected peer.
+    #[wasm_bindgen_test]
+    fn manager_tick_layer_choosers_returns_per_peer_map() {
+        let mut manager = PeerDecodeManager::new();
+        for sid in [10u64, 20, 30] {
+            let (peer, _muted) = make_test_peer(sid);
+            manager.connected_peers.insert(sid, peer);
+        }
+        let desired = manager.tick_layer_choosers(1000);
+        assert_eq!(desired.len(), 3, "one entry per connected peer");
+        // Fresh peers (no availability learned) default to the base layer.
+        for sid in [10u64, 20, 30] {
+            assert_eq!(desired.get(&sid), Some(&0), "fresh peer defaults to base");
+        }
+    }
+
     /// A MeetingPacket embedded in a PacketWrapper with MEETING type should
     /// be extractable via parse_from_bytes on the wrapper's data field.
     #[wasm_bindgen_test]
@@ -4925,6 +5095,12 @@ mod tests {
                 transport_type: TransportType::TRANSPORT_UNKNOWN,
                 vad_threshold: None,
                 selected_video_layer: 0,
+                video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+                last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                    loss_per_sec: 0.0,
+                    kf_per_sec: 0.0,
+                },
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
                 last_screen_frame_ms: 0,
@@ -5014,6 +5190,12 @@ mod tests {
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -5074,6 +5256,12 @@ mod tests {
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,

@@ -559,6 +559,7 @@ impl EncoderBitrateController {
         // Clamp + configure the manager (single source of truth for the count).
         self.quality_manager.set_simulcast_layers(n);
         let effective = self.quality_manager.simulcast_layer_count();
+
         if effective <= 1 {
             // Single-stream mode: nothing to build, behave exactly as before.
             self.layer_pids.clear();
@@ -771,13 +772,29 @@ impl EncoderBitrateController {
         // top active layer; a step UP restores it. The single fps setpoint
         // (p75) that drove the tier decision drives this. No-op in single-stream
         // mode (is_simulcast() == false).
-        if self.quality_manager.is_simulcast() && tier_changed {
+        //
+        // FLOOR-INDEPENDENT SHED (issue #1077): a tier step DOWN sheds the top
+        // active layer; a step UP restores it. Previously this keyed ONLY off
+        // tier-index movement, so once the tier index reached the floor
+        // (`VIDEO_QUALITY_TIERS.len() - 1`) a further down-decision produced
+        // `tier_changed == false` and the gradual shed stopped — latent because
+        // the camera ladder happens to be deep enough today, but already real
+        // for the 3-layer SCREEN ladder (only 1 down-step from its default to
+        // its floor). We now ALSO shed when the manager reports a degrade that
+        // the floor blocked (`wanted_degrade_at_floor`), decoupling the layer
+        // axis from the tier floor exactly as the explicit `force_*` paths do.
+        // No-op in single-stream mode (is_simulcast() == false).
+        if self.quality_manager.is_simulcast() {
             let tier_index_after = self.quality_manager.video_tier_index();
-            if tier_index_after > tier_index_before {
+            // Down-step shed (tier moved down) OR floor-saturated degrade shed.
+            let degrade_down = (tier_changed && tier_index_after > tier_index_before)
+                || self.quality_manager.wanted_degrade_at_floor();
+            let recover_up = tier_changed && tier_index_after < tier_index_before;
+            if degrade_down {
                 if self.quality_manager.drop_top_layer() {
                     self.tier_changed = true;
                 }
-            } else if tier_index_after < tier_index_before && self.quality_manager.add_top_layer() {
+            } else if recover_up && self.quality_manager.add_top_layer() {
                 self.tier_changed = true;
             }
         }
@@ -1265,6 +1282,118 @@ mod tests {
     use crate::clock::default_clock;
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
+
+    /// Issue #1077 (manager level): a sustained video degrade while ALREADY at
+    /// the tier floor must raise `wanted_degrade_at_floor()` — the signal the
+    /// controller uses to keep shedding simulcast layers after the tier index
+    /// saturates. Driven directly on the manager for determinism (no slew/PID).
+    #[test]
+    fn test_manager_signals_degrade_at_floor() {
+        use crate::clock::TestClock;
+        use crate::constants::VIDEO_QUALITY_TIERS;
+        use crate::manager::AdaptiveQualityManager;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut mgr = AdaptiveQualityManager::with_clock(
+            VIDEO_QUALITY_TIERS,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+
+        // Drive the tier index to the floor with sustained bad fps. Use a clock
+        // well past warmup and step time forward generously each call so the
+        // reaction-time + min-transition-interval gates are satisfied.
+        let target_fps = 30.0;
+        let bad_fps = 1.0; // fps_ratio far below the degrade threshold
+        let ideal = VIDEO_QUALITY_TIERS[0].ideal_bitrate_kbps as f64;
+        let floor_index = VIDEO_QUALITY_TIERS.len() - 1;
+
+        let mut t = base_ms as f64 + 10_000.0;
+        for _ in 0..50 {
+            mgr.update(bad_fps, target_fps, 10.0, ideal, t, 3);
+            t += 6000.0; // > reaction time and > min transition interval
+            if mgr.video_tier_index() >= floor_index {
+                break;
+            }
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            floor_index,
+            "sustained bad fps must drive the tier to the floor"
+        );
+
+        // Now at the floor: the last real step-down reset `degrade_start_ms`, so
+        // degrade must re-accumulate past the reaction time before the signal
+        // fires. Feed a few more spaced bad ticks at the floor. (The combined
+        // `update()` return may still be true if the audio tier moves, so we
+        // assert on the video index, not the bool.)
+        let mut floor_signal = false;
+        for _ in 0..5 {
+            mgr.update(bad_fps, target_fps, 10.0, ideal, t, 3);
+            assert_eq!(
+                mgr.video_tier_index(),
+                floor_index,
+                "the video tier index must stay pinned at the floor"
+            );
+            if mgr.wanted_degrade_at_floor() {
+                floor_signal = true;
+                break;
+            }
+            t += 6000.0;
+        }
+        assert!(
+            floor_signal,
+            "a sustained degrade at the floor must raise the floor-saturated signal"
+        );
+
+        // A subsequent HEALTHY tick must clear the signal (no degrade wanted).
+        let healthy = mgr.update(target_fps, target_fps, ideal, ideal, t + 6000.0, 3);
+        let _ = healthy;
+        assert!(
+            !mgr.wanted_degrade_at_floor(),
+            "a healthy tick must clear the floor-saturated signal"
+        );
+    }
+
+    /// Issue #1077 (controller level): the gradual `update()`-path shed must fire
+    /// at the tier floor for the SCREEN ladder, which is only 1 down-step from
+    /// its default to its floor — the case that was already broken before the
+    /// floor-independent fix. Sustained bad conditions on a 3-layer screen
+    /// controller must shed BELOW what the tier-index-coupled path alone could.
+    #[test]
+    fn test_gradual_shed_fires_at_floor_for_screen_ladder() {
+        use crate::clock::TestClock;
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller = EncoderBitrateController::new_for_screen_with_clock(
+            target_fps,
+            SCREEN_QUALITY_TIERS,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        // Feed sustained bad fps over many spaced ticks. The screen default tier
+        // is 1 step from the floor, so the tier-index-coupled shed alone could
+        // drop at most ONE layer (3 -> 2). With the floor-independent shed,
+        // continued degrade at the floor must keep shedding down to the base.
+        let mut t = base_ms as f64 + 10_000.0;
+        for _ in 0..40 {
+            controller
+                .process_diagnostics_packet_with_time(create_test_packet("s", "peer1", 1.0, 50), t);
+            clock.set_ms(t as u64);
+            t += 6000.0;
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "sustained degrade must shed all the way to the base layer at the floor \
+             (floor-independent gradual shed, issue #1077)"
+        );
+    }
     use videocall_types::protos::diagnostics_packet::{
         AudioMetrics, DiagnosticsPacket, VideoMetrics,
     };

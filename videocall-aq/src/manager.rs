@@ -170,6 +170,16 @@ pub struct AdaptiveQualityManager {
     /// pinned at 1 and the field is never consulted.
     active_layer_count: usize,
 
+    /// Issue #1077: set by the most recent `update()` when a video step-DOWN was
+    /// fully warranted (degrade conditions sustained past the reaction time, and
+    /// a transition was permitted) but could NOT move the tier index because it
+    /// was already at the floor. The controller reads this via
+    /// [`wanted_degrade_at_floor`](Self::wanted_degrade_at_floor) so the gradual
+    /// `update()`-path simulcast layer shed can fire at the floor too, instead of
+    /// silently stopping once the tier index saturates. Reset to `false` at the
+    /// top of every `update()`. Meaningless in single-stream mode.
+    degrade_floor_saturated: bool,
+
     // --- Telemetry ---
     /// Counter: step-ups blocked because the crash ceiling prevented recovery.
     step_up_blocked_ceiling: u64,
@@ -252,6 +262,7 @@ impl AdaptiveQualityManager {
             // single-stream so existing callers behave exactly as before.
             simulcast_layer_count: 1,
             active_layer_count: 1,
+            degrade_floor_saturated: false,
             // Telemetry
             step_up_blocked_ceiling: 0,
             step_up_blocked_slowdown: 0,
@@ -347,6 +358,12 @@ impl AdaptiveQualityManager {
         now_ms: f64,
         effective_peer_count: usize,
     ) -> bool {
+        // Issue #1077: clear the floor-saturated degrade signal each tick; it is
+        // re-set below only if this tick warrants a step-down that the floor
+        // blocks. (Cleared before the warmup/guard early-returns so a stale
+        // signal can never leak across ticks.)
+        self.degrade_floor_saturated = false;
+
         // Warmup guard: during encoder startup, no frames have been produced yet
         // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
         // tier transitions until the encoder has had time to stabilize.
@@ -409,6 +426,24 @@ impl AdaptiveQualityManager {
         let should_degrade =
             fps_ratio < degrade_fps_threshold || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
 
+        if should_degrade && self.video_tier_index >= max_video_index {
+            // Issue #1077: degrade conditions persist but the tier index is
+            // already at the floor, so no tier step is possible. Track the
+            // degrade duration the same way and, once it crosses the reaction
+            // time AND a transition is permitted, raise the floor-saturated
+            // signal so the controller's gradual layer shed can still fire here
+            // (the simulcast layer axis is independent of the tier floor). We do
+            // NOT touch tier state, timers, or hysteresis — this is a read-only
+            // signal layered on top of the existing decision.
+            let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
+            let degrade_duration = now_ms - degrade_start;
+            if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                self.degrade_floor_saturated = true;
+            }
+            // Fall through: no tier change at the floor, so `return false` below
+            // (via the step-up / no-op path) is unchanged.
+        }
+
         if should_degrade && self.video_tier_index < max_video_index {
             // Start or continue tracking degradation duration.
             let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
@@ -450,8 +485,16 @@ impl AdaptiveQualityManager {
                 self.last_step_down_ms = Some(now_ms);
                 return true;
             }
-        } else {
+        } else if !should_degrade {
             // Conditions are not in the degradation zone; reset the timer.
+            //
+            // NOTE (issue #1077): this reset is gated on `!should_degrade`
+            // specifically (not just "the step-down branch wasn't taken") so
+            // that a sustained degrade AT THE FLOOR keeps accumulating
+            // `degrade_start_ms`, letting the floor-saturated block above cross
+            // the reaction time. Before #1077 this was a bare `else`, which was
+            // correct only because the floor case never set the timer; now that
+            // the floor case relies on the timer, the reset must exclude it.
             self.degrade_start_ms = None;
         }
 
@@ -954,6 +997,20 @@ impl AdaptiveQualityManager {
     /// [`active_layer_count`](Self::active_layer_count)).
     pub fn simulcast_layer_count(&self) -> usize {
         self.simulcast_layer_count
+    }
+
+    /// Whether the most recent [`update`](Self::update) warranted a video
+    /// step-DOWN that the tier floor blocked (issue #1077).
+    ///
+    /// The gradual `update()`-path simulcast layer shed in the controller keys
+    /// off tier-index movement, which saturates at the floor. This signal lets
+    /// the controller shed the top layer at the floor too — decoupling the layer
+    /// axis from the tier floor exactly as the explicit `force_*` paths already
+    /// do — so a deeper ladder (or a default tier near the floor) cannot leave
+    /// the gradual path unable to shed. `false` outside the degrade-at-floor
+    /// case and always `false` in single-stream mode (no layers to shed).
+    pub fn wanted_degrade_at_floor(&self) -> bool {
+        self.degrade_floor_saturated
     }
 
     /// Number of simulcast layers currently being encoded+sent.

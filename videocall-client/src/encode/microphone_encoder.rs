@@ -178,6 +178,16 @@ pub struct MicrophoneEncoder {
     /// `AudioContext`, fed the same captured audio, encoding at
     /// [`AUDIO_SIMULCAST_HIGH_KBPS`] and stamping `simulcast_layer_id = 1`.
     /// `Default` (empty) when single-layer.
+    ///
+    /// ROLLOUT NOTE (low-power devices): this is a SECOND, full Opus encode of
+    /// the same mic input, so audio encode CPU roughly DOUBLES while 2-layer
+    /// audio simulcast is active. Opus is cheap relative to video, so this is
+    /// acceptable — and it is flag-gated: it is only instantiated when the
+    /// effective audio layer count is > 1 (driven by
+    /// `experimentalSimulcastMaxLayers` × the device-capability ceiling), so a
+    /// weak device that gates audio to a single layer pays nothing. If a future
+    /// rollout sees audio-CPU pressure on low-power hardware, gate the high audio
+    /// layer behind a higher capability tier than video.
     codec_high: AudioWorkletCodec,
     /// Maximum audio simulcast layers (issue #989, Phase 3c). 1 = single layer
     /// (default, byte-identical). 2 = low base + high. Clamped in `start`.

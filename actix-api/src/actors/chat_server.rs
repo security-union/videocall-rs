@@ -18,8 +18,9 @@
 
 use crate::{
     constants::{
-        LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD,
-        VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MAX_LAYER_ID,
+        LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
+        VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -2532,27 +2533,52 @@ fn try_intercept_layer_preference(
         // than reject so an over-long list still applies its first N entries
         // (fail-open on the excess), matching the viewport interceptor.
         let raw_len = prefs.entries.len();
+        let mut bounded_any = false;
         // Key by (session_id, normalized media_kind) (issue #989, Phase 3). The
         // Entry's media_kind enum shares numbering with the wire MediaKind;
         // `normalize_pref_media_kind` maps UNSPECIFIED(0)→VIDEO(1) for
         // back-compat with pre-Phase-3 clients.
+        //
+        // DEFENSE-IN-DEPTH (#1082): clamp the VALUE RANGE of `desired_layer`.
+        // The relay is layer-count-agnostic (it never learns how many layers a
+        // source produces — see "AVAILABILITY NOT VALIDATED" on the forwarding
+        // path), so without this a forged/garbage entry could stuff an arbitrary
+        // `u32` into the per-source map. Such an id never matches a real packet,
+        // so the source's non-base layers all drop and the forger self-degrades
+        // to base — but the relay should not retain nonsense state. Entries
+        // exceeding `LAYER_PREFERENCE_MAX_LAYER_ID` are SKIPPED (`filter_map`),
+        // not clamped: skipping is fail-open per source (no recorded preference
+        // for that (source, kind) → the existing forwarding path forwards every
+        // layer = base-and-up), whereas clamping would invent a selection the
+        // receiver never asked for. This is O(1) per entry and adds no
+        // allocation. NOTE: this is NOT the real layer count — it is purely a
+        // forged-id bound (see the const doc).
         let next: HashMap<(u64, i32), u32> = prefs
             .entries
             .into_iter()
             .take(LAYER_PREFERENCE_MAX_ENTRIES)
-            .map(|e| {
-                (
+            .filter_map(|e| {
+                if e.desired_layer > LAYER_PREFERENCE_MAX_LAYER_ID {
+                    bounded_any = true;
+                    return None;
+                }
+                Some((
                     (
                         e.session_id,
                         normalize_pref_media_kind(e.media_kind.value()),
                     ),
                     e.desired_layer,
-                )
+                ))
             })
             .collect();
         if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
             RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
                 .with_label_values(&[room, "truncated"])
+                .inc();
+        }
+        if bounded_any {
+            RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                .with_label_values(&[room, "layer_id_out_of_bound"])
                 .inc();
         }
 
@@ -10079,6 +10105,137 @@ mod tests {
             prefs.state.read().unwrap().layers.len(),
             LAYER_PREFERENCE_MAX_ENTRIES,
             "accepted entries must be capped at LAYER_PREFERENCE_MAX_ENTRIES"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_bounds_desired_layer() {
+        // #1082 defense-in-depth: an entry whose `desired_layer` exceeds
+        // LAYER_PREFERENCE_MAX_LAYER_ID is SKIPPED (not recorded), while
+        // in-bound entries in the SAME packet are still recorded. Skipping is
+        // fail-open per source: the out-of-bound source has no recorded
+        // preference, so the forwarding path forwards all its layers (base-and-up)
+        // exactly as if no preference had been sent for it.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+
+        // Source 200: in-bound layer (1) → recorded.
+        // Source 300: at the exact bound → recorded (inclusive upper bound).
+        // Source 400: one past the bound → skipped.
+        // Source 500: wildly forged u32::MAX → skipped.
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 1 /* VIDEO */, 1),
+                    (300, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID),
+                    (400, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1),
+                    (500, 1 /* VIDEO */, u32::MAX),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r"
+        ));
+        let st = prefs.state.read().unwrap();
+        assert_eq!(
+            st.layers.get(&(200, 1)),
+            Some(&1),
+            "in-bound desired_layer must be recorded"
+        );
+        assert_eq!(
+            st.layers.get(&(300, 1)),
+            Some(&LAYER_PREFERENCE_MAX_LAYER_ID),
+            "desired_layer at the exact bound must be recorded (inclusive)"
+        );
+        assert!(
+            !st.layers.contains_key(&(400, 1)),
+            "desired_layer one past the bound must be SKIPPED (not recorded)"
+        );
+        assert!(
+            !st.layers.contains_key(&(500, 1)),
+            "forged u32::MAX desired_layer must be SKIPPED (not recorded)"
+        );
+        assert_eq!(
+            st.layers.len(),
+            2,
+            "exactly the two in-bound entries are recorded"
+        );
+        assert!(
+            prefs.has_any(),
+            "the non-empty hint must reflect the recorded in-bound entries"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_all_out_of_bound_records_nothing() {
+        // #1082: a packet whose every entry is out-of-bound records NOTHING and
+        // leaves the session in the empty / fail-open state (the non-empty hint
+        // stays false), so the forwarding path is byte-identical to no-preference.
+        // Subject ownership is still honored (the packet arrived on self_subject).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1),
+                    (300, 2 /* AUDIO */, u32::MAX),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r"
+        ));
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "an all-out-of-bound packet must record no entries (fail-open)"
+        );
+        assert!(
+            !prefs.has_any(),
+            "the non-empty hint must stay false when nothing is recorded"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_out_of_bound_other_subject_ignored() {
+        // #1082 + subject-authoritative: an out-of-bound (or any) entry arriving
+        // on a DIFFERENT subject than self_subject is dropped without mutating
+        // state — the bound check never even runs for non-owned packets.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let other_subject = self_subject_for("r", 999);
+        let msg = make_nats_message(
+            &other_subject,
+            make_layer_preference_packet_bytes_kinded(
+                999,
+                &[(200, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1)],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        // Consumed (true) but never recorded — ownership decided by subject.
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r"
+        ));
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "a LAYER_PREFERENCE on another subject must never mutate our map"
         );
     }
 

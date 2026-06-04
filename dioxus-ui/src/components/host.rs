@@ -107,13 +107,14 @@ pub fn Host(
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
 
-        // Simulcast layer ceiling (issue #989): the lesser of the runtime flag
-        // (`experimentalSimulcastMaxLayers`, defaults to 1 = OFF) and what this
-        // device can actually encode without stalling. Defaults keep this at 1
-        // → single-layer, byte-identical to the pre-simulcast publisher.
+        // Simulcast layer ceiling (issue #989 / #1082): the lesser of the runtime
+        // flag (`experimentalSimulcastMaxLayers`, defaults to 3 = ON) and what
+        // this device can actually encode without stalling. A weak device's
+        // capability ceiling auto-gates this DOWN to 1–2 layers even with the
+        // flag at its default 3, so default-ON is safe.
         //
         // This `use_hook` closure runs once per Host component mount, so the
-        // WARN below fires once per session — never per frame.
+        // INFO below fires once per session — never per frame.
         //
         // VIDEO/SCREEN share the CPU-derived capability ceiling because each
         // extra WebCodecs VIDEO encoder is ~N× main-thread encode cost (the
@@ -128,8 +129,8 @@ pub fn Host(
         // cost ~1-3% of call bandwidth, so a device that is correctly capped to
         // 1 VIDEO layer can still run the full audio ladder. Audio's ceiling is
         // the audio ladder size itself (`max_layers_for_kind(Audio)`), still
-        // gated by the SAME runtime flag — so audio stays single-layer (feature
-        // OFF) until an operator raises `experimentalSimulcastMaxLayers`.
+        // gated by the SAME runtime flag — so setting the flag to 1 disables
+        // audio simulcast too (it now defaults to 3 = ON).
         let audio_capability_ceiling = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
         let audio_effective_max_layers = flag_max_layers.min(audio_capability_ceiling);
         log::info!(
@@ -137,14 +138,14 @@ pub fn Host(
              (flag={flag_max_layers}, audio_ceiling={audio_capability_ceiling})"
         );
         if effective_max_layers > 1 {
-            log::warn!(
-                "SIMULCAST EXPERIMENTAL: publishing {effective_max_layers} video layers. \
-                 Receiver-driven per-peer layer selection IS live — each receiver \
+            log::info!(
+                "SIMULCAST: publishing {effective_max_layers} video layers (default ON). \
+                 Receiver-driven per-peer layer selection is live — each receiver \
                  automatically pulls the best layer its own downlink can sustain (and the \
-                 relay drops the layers it did not select per source+kind). Enabling this \
-                 increases this sender's encode CPU and uplink/relay egress. Still \
-                 EXPERIMENTAL: keep experimentalSimulcastMaxLayers=1 in production until \
-                 rollout."
+                 relay drops the layers it did not select per source+kind). This increases \
+                 this sender's encode CPU and uplink/relay egress; weak devices auto-gate \
+                 to fewer layers via the capability ceiling. To disable, set \
+                 experimentalSimulcastMaxLayers=1."
             );
         }
 

@@ -449,6 +449,63 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
     },
 ];
 
+/// Maximum number of SCREEN simulcast layers (issue #989, Phase 3).
+pub const SCREEN_SIMULCAST_MAX_LAYERS: usize = 3;
+
+/// Resolve the SCREEN simulcast layer tiers for an `n`-layer ladder
+/// (issue #989, Phase 3), **lowest layer first** (index == `layer_id`).
+///
+/// Derived from [`SCREEN_QUALITY_TIERS`] (which is ordered high→low):
+/// - `n == 1` → `[low]` (single base; screen single-stream path is unchanged
+///   and does not consult this).
+/// - `n == 2` → `[low, high]` (720p/500 base + 1080p/2500 top — well separated).
+/// - `n == 3` → `[low, medium, high]` (full ladder; low and medium share 720p
+///   but differ in fps/bitrate, so a receiver can still pull the cheaper rung).
+///
+/// # Panics
+/// Panics if `n` is not in `{1, 2, 3}`; callers must clamp first.
+pub fn simulcast_screen_layers(n: usize) -> &'static [VideoQualityTier] {
+    use std::sync::OnceLock;
+
+    // SCREEN_QUALITY_TIERS indices: 0=high, 1=medium, 2=low. Authored
+    // lowest-first per layer ladder below.
+    fn ladder(n: usize) -> Vec<VideoQualityTier> {
+        let indices: &[usize] = match n {
+            1 => &[2],       // [low]
+            2 => &[2, 0],    // [low, high]
+            3 => &[2, 1, 0], // [low, medium, high]
+            other => panic!("simulcast_screen_layers: n must be in {{1,2,3}}, got {other}"),
+        };
+        indices
+            .iter()
+            .map(|&i| {
+                let t = &SCREEN_QUALITY_TIERS[i];
+                VideoQualityTier {
+                    label: t.label,
+                    max_width: t.max_width,
+                    max_height: t.max_height,
+                    target_fps: t.target_fps,
+                    ideal_bitrate_kbps: t.ideal_bitrate_kbps,
+                    min_bitrate_kbps: t.min_bitrate_kbps,
+                    max_bitrate_kbps: t.max_bitrate_kbps,
+                    keyframe_interval_frames: t.keyframe_interval_frames,
+                }
+            })
+            .collect()
+    }
+
+    static SCREEN_LADDER_1: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+    static SCREEN_LADDER_2: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+    static SCREEN_LADDER_3: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+
+    match n {
+        1 => SCREEN_LADDER_1.get_or_init(|| ladder(1)).as_slice(),
+        2 => SCREEN_LADDER_2.get_or_init(|| ladder(2)).as_slice(),
+        3 => SCREEN_LADDER_3.get_or_init(|| ladder(3)).as_slice(),
+        other => panic!("simulcast_screen_layers: n must be in {{1,2,3}}, got {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Audio Quality Tiers
 // ---------------------------------------------------------------------------
@@ -1373,6 +1430,70 @@ mod tests {
         // Shed layers untouched.
         assert_eq!(targets[1], 9999.0);
         assert_eq!(targets[2], 8888.0);
+    }
+
+    // -----------------------------------------------------------------
+    // SCREEN simulcast ladder + budget (issue #989, Phase 3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_simulcast_screen_layers_labels_and_ordering() {
+        // n=1 → [low]; n=2 → [low, high]; n=3 → [low, medium, high].
+        let l1 = simulcast_screen_layers(1);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].label, "low");
+
+        let l2 = simulcast_screen_layers(2);
+        assert_eq!(l2.len(), 2);
+        assert_eq!(l2[0].label, "low");
+        assert_eq!(l2[1].label, "high");
+
+        let l3 = simulcast_screen_layers(3);
+        assert_eq!(l3.len(), 3);
+        assert_eq!(
+            [l3[0].label, l3[1].label, l3[2].label],
+            ["low", "medium", "high"]
+        );
+        // Bitrate ideals must be non-decreasing lowest→highest.
+        assert!(l3[0].ideal_bitrate_kbps <= l3[1].ideal_bitrate_kbps);
+        assert!(l3[1].ideal_bitrate_kbps <= l3[2].ideal_bitrate_kbps);
+    }
+
+    #[test]
+    #[should_panic(expected = "n must be in")]
+    fn test_simulcast_screen_layers_rejects_zero() {
+        let _ = simulcast_screen_layers(0);
+    }
+
+    #[test]
+    fn test_screen_budget_caps_active_sum() {
+        // The budget cap is ladder-agnostic; verify it works over the SCREEN
+        // ladder. 3-layer ideals: low 500 + medium 1200 + high 2500 = 4200.
+        let tiers = simulcast_screen_layers(3);
+        let budget = uplink_budget_kbps(tiers, 3);
+        assert_eq!(budget, 4200.0);
+        // Push each layer to its max → sum exceeds budget → scaled down.
+        let mut targets = [
+            tiers[0].max_bitrate_kbps as f64,
+            tiers[1].max_bitrate_kbps as f64,
+            tiers[2].max_bitrate_kbps as f64,
+        ];
+        cap_layers_to_budget(&mut targets, tiers, 3, budget);
+        let sum: f64 = targets.iter().sum();
+        assert!(
+            sum <= budget + 1e-6,
+            "screen active sum {sum} within {budget}"
+        );
+        for (i, &t) in targets.iter().enumerate() {
+            assert!(t >= tiers[i].min_bitrate_kbps as f64 - 1e-6, "floor held");
+        }
+    }
+
+    #[test]
+    fn test_screen_budget_shrinks_with_active_layers() {
+        let tiers = simulcast_screen_layers(3);
+        assert!(uplink_budget_kbps(tiers, 3) > uplink_budget_kbps(tiers, 2));
+        assert!(uplink_budget_kbps(tiers, 2) > uplink_budget_kbps(tiers, 1));
     }
 
     #[test]

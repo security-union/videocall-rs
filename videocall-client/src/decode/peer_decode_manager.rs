@@ -414,6 +414,26 @@ pub struct Peer {
     /// chooser on the monitor tick. Starts clean so a fresh peer is not treated
     /// as congested before any window has rolled.
     last_video_downlink: DownlinkSample,
+    /// Which simulcast layer (issue #989, Phase 3) this receiver decodes for
+    /// this peer's SCREEN stream. Independent of `selected_video_layer`: a peer
+    /// can publish camera AND screen simultaneously and the receiver chooses a
+    /// layer for each separately. Defaults to 0 (base / un-upgraded publisher).
+    selected_screen_layer: u32,
+    /// Per-peer SCREEN layer chooser, availability, and last downlink sample
+    /// (issue #989, Phase 3). Mirror of the VIDEO trio, driven by the SCREEN
+    /// stream's own loss/PLI windows so screen adapts independently of camera.
+    screen_layer_chooser: LayerChooser,
+    screen_layer_availability: LayerAvailability,
+    last_screen_downlink: DownlinkSample,
+    /// Which simulcast layer (issue #989, Phase 3) this receiver decodes for
+    /// this peer's AUDIO stream. Defaults to 0.
+    selected_audio_layer: u32,
+    /// Per-peer AUDIO layer chooser + availability (issue #989, Phase 3). Audio
+    /// carries no per-window loss tracker here (NetEq path), so the chooser is
+    /// fed the VIDEO downlink as a proxy for shared-connection health (see
+    /// `tick_audio_layer_chooser`) — hence no separate `last_audio_downlink`.
+    audio_layer_chooser: LayerChooser,
+    audio_layer_availability: LayerAvailability,
     /// Reorder-tolerant sequence tracker for video packets.
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
@@ -677,6 +697,17 @@ impl Peer {
                 loss_per_sec: 0.0,
                 kf_per_sec: 0.0,
             },
+            // Phase 3: per-peer SCREEN + AUDIO choosers, mirroring VIDEO.
+            selected_screen_layer: 0,
+            screen_layer_chooser: LayerChooser::new(now_ms()),
+            screen_layer_availability: LayerAvailability::new(),
+            last_screen_downlink: DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: LayerChooser::new(now_ms()),
+            audio_layer_availability: LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             // HCL bug #1: 0 means "no media frame observed yet". The
@@ -795,6 +826,52 @@ impl Peer {
         // Apply to the decode guard so we decode exactly the layer we request.
         self.selected_video_layer = desired;
         desired
+    }
+
+    /// Run the SCREEN layer chooser one tick (issue #989, Phase 3) and apply the
+    /// result to the screen decode guard. Independent of the camera VIDEO
+    /// chooser: a peer's screen adapts to this receiver's downlink separately.
+    pub fn tick_screen_layer_chooser(&mut self, now_ms: u64) -> u32 {
+        let highest = self.screen_layer_availability.highest_available(now_ms);
+        let desired = self
+            .screen_layer_chooser
+            .choose(self.last_screen_downlink, highest, now_ms);
+        self.selected_screen_layer = desired;
+        desired
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer's
+    /// screen stream.
+    pub fn selected_screen_layer(&self) -> u32 {
+        self.selected_screen_layer
+    }
+
+    /// Run the AUDIO layer chooser one tick (issue #989, Phase 3) and apply the
+    /// result to the audio decode guard.
+    ///
+    /// Audio carries no per-window sequence loss tracker here (audio decode goes
+    /// through NetEq, not `track_sequence`), and audio is only ~1-3% of call
+    /// bandwidth — so rather than build a dedicated audio loss pipeline, the
+    /// audio chooser is fed the receiver's VIDEO downlink as a proxy for overall
+    /// connection health (`last_video_downlink`): audio and video share the same
+    /// QUIC connection, so when the receiver's downlink is congested enough to
+    /// lose video it is the right moment to also shed the costlier audio layer.
+    /// This keeps audio adaptation cheap and conservative (the documented
+    /// cost-benefit: marginal savings, minimal added complexity).
+    pub fn tick_audio_layer_chooser(&mut self, now_ms: u64) -> u32 {
+        let highest = self.audio_layer_availability.highest_available(now_ms);
+        // Proxy audio downlink health with the video downlink window (see doc).
+        let desired = self
+            .audio_layer_chooser
+            .choose(self.last_video_downlink, highest, now_ms);
+        self.selected_audio_layer = desired;
+        desired
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer's audio
+    /// stream.
+    pub fn selected_audio_layer(&self) -> u32 {
+        self.selected_audio_layer
     }
 
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
@@ -1040,6 +1117,22 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
+                // Phase 3 (#989): learn AUDIO layer availability from arriving
+                // audio packets' layer ids. Audio simulcast is a small ladder
+                // (low/high); the chooser uses this to know whether a higher
+                // audio layer even exists before climbing. Single-layer audio
+                // publishers send 0, so availability stays {0} and the chooser
+                // never climbs — a no-op for them. Must run before any drop.
+                self.audio_layer_availability
+                    .observe(incoming_video_layer, now_ms());
+
+                // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop audio
+                // packets whose layer != the selected audio layer. Default
+                // selected_audio_layer is 0, matching single-layer publishers.
+                if incoming_video_layer != self.selected_audio_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // HCL bug #1: stamp audio freshness regardless of the
                 // straggler-drop path so the next heartbeat can detect
                 // recent audio frames and suppress a stale-muted heartbeat.
@@ -1066,11 +1159,33 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
+                // Phase 3 (#989): learn SCREEN layer availability from EVERY
+                // arriving screen packet (incl. ones about to be dropped) so the
+                // screen chooser knows how high it may climb — independent of the
+                // camera VIDEO availability. Must run before the drop guard.
+                self.screen_layer_availability
+                    .observe(incoming_video_layer, now_ms());
+
+                // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop any
+                // SCREEN packet that is not the layer this receiver selected for
+                // this peer's screen — BEFORE sequence tracking and decode, for
+                // the same phantom-loss reason as the VIDEO guard. Pre-simulcast
+                // / single-layer screen publishers send layer 0 and the default
+                // selected_screen_layer is 0, so nothing is dropped for them.
+                if incoming_video_layer != self.selected_screen_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // Track sequence numbers for gap detection (PLI) and windowed
                 // loss/keyframe-rate accounting (freeze observability #1013).
                 let seq = self.track_sequence(media_type, &packet);
                 if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
                     self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                    // Phase 3: cache the SCREEN downlink window for the chooser.
+                    self.last_screen_downlink = DownlinkSample {
+                        loss_per_sec,
+                        kf_per_sec,
+                    };
                 }
                 let kf_request = seq.keyframe_request;
 
@@ -1655,29 +1770,41 @@ impl PeerDecodeManager {
     }
 
     /// Run the receiver-driven simulcast layer chooser for every connected peer
-    /// (issue #989, Phase 2) and return the desired `session_id -> layer` map.
+    /// (issue #989, Phase 2/3) and return the desired
+    /// `(session_id, media_kind) -> layer` map.
     ///
-    /// Called on the monitor tick. For each peer this advances its per-peer
-    /// [`LayerChooser`] using that peer's own downlink health + learned layer
-    /// availability, applies the result to the peer's decode guard, and collects
-    /// the chosen layer into the returned map. The caller (`VideoCallClient`)
+    /// Called on the monitor tick. For each peer this advances ALL THREE per-peer
+    /// choosers — camera VIDEO, SCREEN, and AUDIO (Phase 3) — each using that
+    /// peer-stream's own downlink health + learned per-kind availability, applies
+    /// each result to the matching decode guard, and collects the chosen layers
+    /// keyed by `(session_id, PrefMediaKind)`. The caller (`VideoCallClient`)
     /// feeds that map to the `LayerPreferenceSender`, which emits a
     /// `LAYER_PREFERENCE` packet only when the map actually changes and the
     /// relay's rate-limit allows.
     ///
-    /// Each peer is fully independent: a congested source's drop never affects a
-    /// healthy source. For a source publishing only the base layer (the default
-    /// until the P1 send flag is raised), availability is 0, so every peer's
-    /// chosen layer is 0 — the map is all-base and the resulting preference is a
-    /// no-op relative to the relay's fail-open (it forwards base regardless).
+    /// Each (peer, kind) is fully independent: a congested screen never affects
+    /// the same peer's camera, and one peer never affects another. For a source
+    /// publishing only the base layer of a kind (the default until the P1/P3
+    /// send flags are raised), that kind's availability is 0, so its chosen layer
+    /// is 0 — a no-op relative to the relay's fail-open (base is always
+    /// forwarded). VIDEO is always emitted (every peer has a camera chooser);
+    /// SCREEN/AUDIO entries are emitted too, defaulting to base.
     ///
     /// `now_ms` is supplied by the caller so the whole tick shares one clock.
-    pub fn tick_layer_choosers(&mut self, now_ms: u64) -> HashMap<u64, u32> {
+    pub fn tick_layer_choosers(
+        &mut self,
+        now_ms: u64,
+    ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
+        use crate::decode::layer_chooser::PrefMediaKind;
         let mut desired = HashMap::new();
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-                let layer = peer.tick_layer_chooser(now_ms);
-                desired.insert(session_id, layer);
+                let video = peer.tick_layer_chooser(now_ms);
+                let screen = peer.tick_screen_layer_chooser(now_ms);
+                let audio = peer.tick_audio_layer_chooser(now_ms);
+                desired.insert((session_id, PrefMediaKind::Video), video);
+                desired.insert((session_id, PrefMediaKind::Screen), screen);
+                desired.insert((session_id, PrefMediaKind::Audio), audio);
             }
         }
         desired
@@ -2438,6 +2565,16 @@ mod tests {
                 loss_per_sec: 0.0,
                 kf_per_sec: 0.0,
             },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -4301,20 +4438,34 @@ mod tests {
         assert!(!status0.rendered, "non-selected base layer must be dropped");
     }
 
-    /// Phase 2 (#989): the manager's per-peer tick returns an independent
-    /// desired-layer entry for every connected peer.
+    /// Phase 2/3 (#989): the manager's per-peer tick returns an independent
+    /// desired-layer entry for every connected peer AND every media kind
+    /// (VIDEO/SCREEN/AUDIO), keyed by (session_id, PrefMediaKind).
     #[wasm_bindgen_test]
-    fn manager_tick_layer_choosers_returns_per_peer_map() {
+    fn manager_tick_layer_choosers_returns_per_peer_kind_map() {
+        use crate::decode::layer_chooser::PrefMediaKind;
         let mut manager = PeerDecodeManager::new();
         for sid in [10u64, 20, 30] {
             let (peer, _muted) = make_test_peer(sid);
             manager.connected_peers.insert(sid, peer);
         }
         let desired = manager.tick_layer_choosers(1000);
-        assert_eq!(desired.len(), 3, "one entry per connected peer");
-        // Fresh peers (no availability learned) default to the base layer.
+        // 3 peers × 3 media kinds = 9 entries.
+        assert_eq!(desired.len(), 9, "one entry per (peer, media-kind)");
+        // Fresh peers (no availability learned) default to the base layer for
+        // every kind.
         for sid in [10u64, 20, 30] {
-            assert_eq!(desired.get(&sid), Some(&0), "fresh peer defaults to base");
+            for kind in [
+                PrefMediaKind::Video,
+                PrefMediaKind::Screen,
+                PrefMediaKind::Audio,
+            ] {
+                assert_eq!(
+                    desired.get(&(sid, kind)),
+                    Some(&0),
+                    "fresh peer defaults to base for every kind"
+                );
+            }
         }
     }
 
@@ -5101,6 +5252,16 @@ mod tests {
                     loss_per_sec: 0.0,
                     kf_per_sec: 0.0,
                 },
+                selected_screen_layer: 0,
+                screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+                last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                    loss_per_sec: 0.0,
+                    kf_per_sec: 0.0,
+                },
+                selected_audio_layer: 0,
+                audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
                 last_screen_frame_ms: 0,
@@ -5196,6 +5357,16 @@ mod tests {
                 loss_per_sec: 0.0,
                 kf_per_sec: 0.0,
             },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -5262,6 +5433,16 @@ mod tests {
                 loss_per_sec: 0.0,
                 kf_per_sec: 0.0,
             },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,

@@ -319,12 +319,34 @@ type DesiredStreams = Arc<RwLock<ViewportState>>;
 /// recorded preference the forwarding path is byte-identical to today.
 #[derive(Default)]
 struct LayerPrefsState {
-    /// Map of source `session_id` → desired simulcast layer. Empty / absent
-    /// = fail-open (forward all layers).
-    layers: HashMap<u64, u32>,
+    /// Map of `(source session_id, media_kind)` → desired simulcast layer.
+    /// Empty / absent = fail-open (forward all layers). The `media_kind` is the
+    /// normalized wire discriminant (see [`normalize_pref_media_kind`]):
+    /// VIDEO(1) / AUDIO(2) / SCREEN(3). Keying by media kind (issue #989,
+    /// Phase 3) lets a receiver request, e.g., a low SCREEN layer while keeping
+    /// full camera VIDEO from the SAME source independently.
+    layers: HashMap<(u64, i32), u32>,
     /// Instant of the last accepted LAYER_PREFERENCE update, for rate-limiting.
     /// `None` until the first accepted update.
     last_update: Option<std::time::Instant>,
+}
+
+/// Normalize a `LayerPreferencePacket.Entry.media_kind` (or a wire
+/// `PacketWrapper.media_kind`) into the canonical layer-preference key
+/// discriminant (issue #989, Phase 3).
+///
+/// Both enums share the same numbering (`UNSPECIFIED=0, VIDEO=1, AUDIO=2,
+/// SCREEN=3`). BACK-COMPAT: `0` (UNSPECIFIED) maps to VIDEO(1) — pre-Phase-3
+/// clients omit the field, and before Phase 3 the relay only filtered VIDEO, so
+/// an absent media_kind is exactly "this preference is about camera video".
+/// Anything outside `{1,2,3}` also collapses to VIDEO(1) (defensive; the relay
+/// only ever filters those three kinds).
+fn normalize_pref_media_kind(raw: i32) -> i32 {
+    match raw {
+        2 => 2, // AUDIO
+        3 => 3, // SCREEN
+        _ => 1, // VIDEO (covers UNSPECIFIED=0, VIDEO=1, and any unknown)
+    }
 }
 
 /// Per-session layer-preference state, shared between the session's NATS
@@ -2510,11 +2532,23 @@ fn try_intercept_layer_preference(
         // than reject so an over-long list still applies its first N entries
         // (fail-open on the excess), matching the viewport interceptor.
         let raw_len = prefs.entries.len();
-        let next: HashMap<u64, u32> = prefs
+        // Key by (session_id, normalized media_kind) (issue #989, Phase 3). The
+        // Entry's media_kind enum shares numbering with the wire MediaKind;
+        // `normalize_pref_media_kind` maps UNSPECIFIED(0)→VIDEO(1) for
+        // back-compat with pre-Phase-3 clients.
+        let next: HashMap<(u64, i32), u32> = prefs
             .entries
             .into_iter()
             .take(LAYER_PREFERENCE_MAX_ENTRIES)
-            .map(|e| (e.session_id, e.desired_layer))
+            .map(|e| {
+                (
+                    (
+                        e.session_id,
+                        normalize_pref_media_kind(e.media_kind.value()),
+                    ),
+                    e.desired_layer,
+                )
+            })
             .collect();
         if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
             RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
@@ -2994,16 +3028,32 @@ fn handle_msg(
         // session. If it does not parse (shouldn't happen for normal media),
         // FAIL OPEN — never drop on an unparseable source.
         if let Some(pw) = parsed {
-            let is_video = pw.media_kind.enum_value()
-                == Ok(videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO);
-            if is_video {
-                let source = msg
-                    .subject
+            use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+            let wire_media_kind = pw.media_kind.enum_value();
+            let is_video = wire_media_kind == Ok(MediaKind::VIDEO);
+            // Layer filtering (issue #989, Phase 3) applies to VIDEO, SCREEN,
+            // AND AUDIO — each addressed independently via its media kind. The
+            // viewport filter remains VIDEO-only (it answers "is this sender's
+            // CAMERA wanted on screen"; screen/audio are never viewport-gated).
+            let is_layer_filterable = matches!(
+                wire_media_kind,
+                Ok(MediaKind::VIDEO) | Ok(MediaKind::SCREEN) | Ok(MediaKind::AUDIO)
+            );
+
+            // Resolve the SUBJECT-derived source ONCE, shared by both filters
+            // (source identity must come from the subject, never the forgeable
+            // payload session_id — see the block comment above).
+            let source = if is_video || is_layer_filterable {
+                msg.subject
                     .as_str()
                     .rsplit('.')
                     .next()
-                    .and_then(|tok| tok.parse::<u64>().ok());
+                    .and_then(|tok| tok.parse::<u64>().ok())
+            } else {
+                None
+            };
 
+            if is_video {
                 // ----- Viewport filter (#988): "is this SENDER wanted?" -----
                 //
                 // Read the viewport set ONCE: derive both the drop decision and
@@ -3048,82 +3098,86 @@ fn handle_msg(
                 RELAY_VIEWPORT_FORWARDED_TOTAL
                     .with_label_values(&[&room])
                     .inc();
+            }
 
-                // ----- Layer filter (#989): "which LAYER of a wanted sender?" -
-                //
-                // Runs strictly AFTER the viewport filter; a VIDEO packet only
-                // reaches here if the viewport forwarded it. The two are ordered
-                // and complementary.
-                //
-                // NO-OP-FIRST / fail-open. Drop iff ALL hold:
-                //   1. the cleartext `simulcast_layer_id` is non-zero, AND
-                //   2. this receiver has a recorded layer preference for the
-                //      (subject-derived) source session, AND
-                //   3. that preference selects a DIFFERENT layer.
-                // Everything else FORWARDS. In particular:
-                //   - No recorded preference for this source (or an empty map) →
-                //     FORWARD. This is the no-op gate: with no LAYER_PREFERENCE
-                //     recorded the path is byte-identical to pre-#989 behaviour.
-                //   - `simulcast_layer_id == 0` (base / un-upgraded publisher) →
-                //     always FORWARD.
-                //   - AUDIO / SCREEN are excluded by the `is_video` guard above.
-                //
-                // EMPTY-PREFS FAST PATH: `layer_prefs.has_any()` is a lock-free
-                // AtomicBool hint that is `false` until this receiver records
-                // its first LAYER_PREFERENCE. During the interim where
-                // publishers stamp layer ids but no receiver has expressed a
-                // preference yet, this short-circuits WITHOUT taking the read
-                // lock, keeping the no-preference path lock-free. A spurious
-                // `true` only costs a read lock that fails open (never a wrong
-                // drop) — see the `LayerPrefs` type doc.
-                //
-                // TRUST BOUNDARY (#993): both `simulcast_layer_id` (field 5) and
-                // the LAYER_PREFERENCE that populated `layer_prefs` live OUTSIDE
-                // the AEAD seal. A forged value only self-degrades the FORGER's
-                // OWN view: a bad `simulcast_layer_id` on a publisher's own
-                // stream, or a bad preference recorded under this receiver's own
-                // subject-authoritative map (see `try_intercept_layer_preference`),
-                // changes only what THIS receiver sees. It can never affect
-                // another receiver. Source identity comes from the NATS SUBJECT,
-                // never the forgeable payload `session_id`.
-                //
-                // AVAILABILITY NOT VALIDATED: the relay does NOT check that the
-                // requested layer is actually being produced by the source. A
-                // client requesting an absent layer will black-tile ITSELF. The
-                // mitigation is CLIENT-side (only request observed-arriving
-                // layers) and is a future frontend increment, out of scope here.
-                if pw.simulcast_layer_id != 0 && layer_prefs.has_any() {
-                    // Drop iff there is a recorded preference for this source AND
-                    // it selects a different layer. No entry → fail-open
-                    // (forward). A poisoned lock fails OPEN (forward). An
-                    // unparseable source (`None`) fails OPEN (forward).
-                    let drop_layer = match source {
-                        Some(src) => layer_prefs
-                            .state
-                            .read()
-                            .map(|st| {
-                                st.layers
-                                    .get(&src)
-                                    .is_some_and(|&want| want != pw.simulcast_layer_id)
-                            })
-                            .unwrap_or(false),
-                        None => false,
-                    };
+            // ----- Layer filter (#989): "which LAYER of a wanted sender?" -----
+            //
+            // Phase 3: applies to VIDEO, SCREEN, AND AUDIO, each addressed
+            // independently by its media kind. For VIDEO this runs strictly
+            // AFTER the viewport filter above (a VIDEO packet only reaches here
+            // if the viewport forwarded it). SCREEN/AUDIO skip the viewport
+            // filter entirely.
+            //
+            // NO-OP-FIRST / fail-open. Drop iff ALL hold:
+            //   1. the cleartext `simulcast_layer_id` is non-zero, AND
+            //   2. this receiver has a recorded layer preference for the
+            //      (subject-derived source session, this media kind), AND
+            //   3. that preference selects a DIFFERENT layer.
+            // Everything else FORWARDS. In particular:
+            //   - No recorded preference for this (source, kind) (or empty map)
+            //     → FORWARD. The no-op gate: with no LAYER_PREFERENCE recorded
+            //     the path is byte-identical to pre-#989 behaviour.
+            //   - `simulcast_layer_id == 0` (base / un-upgraded publisher) →
+            //     always FORWARD.
+            //   - Non-media kinds are excluded by `is_layer_filterable`.
+            //
+            // The (source, media_kind) key (Phase 3) is what lets a receiver
+            // request a low SCREEN layer while keeping full camera VIDEO from
+            // the SAME source: the camera packet keys (src, VIDEO) and the
+            // screen packet keys (src, SCREEN), matched against the receiver's
+            // per-kind recorded preference.
+            //
+            // EMPTY-PREFS FAST PATH: `layer_prefs.has_any()` is a lock-free
+            // AtomicBool hint that is `false` until this receiver records its
+            // first LAYER_PREFERENCE, short-circuiting WITHOUT the read lock. A
+            // spurious `true` only costs a read lock that fails open (never a
+            // wrong drop) — see the `LayerPrefs` type doc.
+            //
+            // TRUST BOUNDARY (#993): both `simulcast_layer_id` (field 5) and the
+            // LAYER_PREFERENCE that populated `layer_prefs` live OUTSIDE the AEAD
+            // seal. A forged value only self-degrades the FORGER's OWN view.
+            // Source identity comes from the NATS SUBJECT, never the forgeable
+            // payload `session_id`.
+            //
+            // AVAILABILITY NOT VALIDATED: the relay does NOT check that the
+            // requested layer is actually produced by the source; a client
+            // requesting an absent layer black-tiles ITSELF (client-side clamp
+            // is the mitigation, see the receiver chooser).
+            if is_layer_filterable && pw.simulcast_layer_id != 0 && layer_prefs.has_any() {
+                // The wire media kind, normalized to the preference-map key
+                // discriminant (UNSPECIFIED→VIDEO etc.).
+                let kind_key =
+                    normalize_pref_media_kind(wire_media_kind.map(|k| k as i32).unwrap_or(0));
+                // Drop iff there is a recorded preference for this
+                // (source, kind) AND it selects a different layer. No entry →
+                // fail-open (forward). A poisoned lock fails OPEN (forward). An
+                // unparseable source (`None`) fails OPEN (forward).
+                let drop_layer = match source {
+                    Some(src) => layer_prefs
+                        .state
+                        .read()
+                        .map(|st| {
+                            st.layers
+                                .get(&(src, kind_key))
+                                .is_some_and(|&want| want != pw.simulcast_layer_id)
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
 
-                    if drop_layer {
-                        RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[&room]).inc();
-                        debug!(
-                            "Layer drop: simulcast layer {} from subject-derived source {:?} not selected by receiver session {} in room {}",
-                            pw.simulcast_layer_id, source, session, room
-                        );
-                        return Ok(());
-                    }
-                    // Forwarded simulcast VIDEO — denominator complement of the
-                    // layer-filtered counter (#989).
-                    RELAY_LAYER_FORWARDED_TOTAL
-                        .with_label_values(&[&room])
-                        .inc();
+                if drop_layer {
+                    RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[&room]).inc();
+                    debug!(
+                        "Layer drop: simulcast layer {} (kind {}) from subject-derived source {:?} not selected by receiver session {} in room {}",
+                        pw.simulcast_layer_id, kind_key, source, session, room
+                    );
+                    return Ok(());
                 }
+                // Forwarded simulcast media — denominator complement of the
+                // layer-filtered counter (#989).
+                RELAY_LAYER_FORWARDED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
             }
         }
 
@@ -5450,10 +5504,23 @@ mod tests {
     }
 
     /// Build a `LayerPrefs` pre-populated with the given (source_session,
-    /// desired_layer) entries. Sets the lock-free `non_empty` hint to match the
-    /// map so the forwarding hot path's fast-path check is exercised faithfully.
+    /// desired_layer) entries, keyed as VIDEO (the pre-Phase-3 default). Sets
+    /// the lock-free `non_empty` hint to match the map so the forwarding hot
+    /// path's fast-path check is exercised faithfully.
     fn layer_prefs_with(entries: &[(u64, u32)]) -> LayerPrefs {
-        let layers: HashMap<u64, u32> = entries.iter().copied().collect();
+        let kinded: Vec<(u64, i32, u32)> = entries
+            .iter()
+            .map(|&(s, l)| (s, 1 /* VIDEO */, l))
+            .collect();
+        layer_prefs_with_kinds(&kinded)
+    }
+
+    /// Build a `LayerPrefs` keyed by (source_session, media_kind, desired_layer)
+    /// (issue #989, Phase 3). `media_kind` is the normalized wire discriminant
+    /// (VIDEO=1, AUDIO=2, SCREEN=3).
+    fn layer_prefs_with_kinds(entries: &[(u64, i32, u32)]) -> LayerPrefs {
+        let layers: HashMap<(u64, i32), u32> =
+            entries.iter().map(|&(s, k, l)| ((s, k), l)).collect();
         let non_empty = !layers.is_empty();
         LayerPrefs {
             state: Arc::new(RwLock::new(LayerPrefsState {
@@ -5495,6 +5562,36 @@ mod tests {
                 .map(|&(session_id, desired_layer)| Entry {
                     session_id,
                     desired_layer,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::LAYER_PREFERENCE.into();
+        pw.session_id = owner;
+        pw.data = inner
+            .write_to_bytes()
+            .expect("LayerPreferencePacket serialization should succeed");
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    /// Phase 3: build a LAYER_PREFERENCE carrying (source, EntryMediaKind, layer)
+    /// entries so tests can exercise per-(source,kind) recording.
+    fn make_layer_preference_packet_bytes_kinded(
+        owner: u64,
+        entries: &[(u64, i32, u32)],
+    ) -> Vec<u8> {
+        use videocall_types::protos::layer_preference_packet::layer_preference_packet::Entry;
+        use videocall_types::protos::layer_preference_packet::LayerPreferencePacket;
+        let inner = LayerPreferencePacket {
+            entries: entries
+                .iter()
+                .map(|&(session_id, kind, desired_layer)| Entry {
+                    session_id,
+                    desired_layer,
+                    media_kind: ::protobuf::EnumOrUnknown::from_i32(kind),
                     ..Default::default()
                 })
                 .collect(),
@@ -9567,9 +9664,12 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn test_handle_msg_audio_never_layer_filtered() {
-        // AUDIO is NEVER filtered by the layer selector, even with a mismatched
-        // layer and a recorded preference for the source.
+    async fn test_handle_msg_audio_not_filtered_by_video_preference() {
+        // Phase 3: layer prefs are keyed by (source, media_kind). An AUDIO
+        // packet is NOT filtered by a VIDEO-kind preference for the same source
+        // — the keys differ, so it fails open (forward). (Pre-Phase-3 this held
+        // because audio was excluded entirely; now it holds because of the
+        // per-kind key.)
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {
             count: count.clone(),
@@ -9583,11 +9683,10 @@ mod tests {
             false,
             "recv".to_string(),
             DesiredStreams::default(),
-            layer_prefs_with(&[(999, 1)]),
+            layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO)
         );
 
-        // AUDIO with a layer id that does NOT match the preference: must still
-        // forward (audio is never layer-filtered).
+        // AUDIO layer 2 with only a VIDEO preference for 999 → forward.
         let nats_msg = make_nats_message(
             "room.lp-room.999",
             make_media_packet_bytes_with_layer(MediaKind::AUDIO, 999, 2),
@@ -9599,7 +9698,157 @@ mod tests {
         assert_eq!(
             count.load(Ordering::Relaxed),
             1,
-            "AUDIO MUST never be layer-filtered"
+            "AUDIO must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_non_matching_screen_layer() {
+        // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen
+        // layer 0 from source 999; a screen layer-2 packet is dropped.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 0)]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "SCREEN whose layer != the recorded SCREEN preference MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_forwards_matching_screen_layer() {
+        // Phase 3: a SCREEN packet matching the recorded SCREEN preference is
+        // forwarded.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 1)]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 1),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "matching SCREEN forwarded"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_non_matching_audio_layer() {
+        // Phase 3: AUDIO is layer-filtered when an AUDIO-kind preference exists.
+        // Receiver wants audio layer 0 from 999; an audio layer-1 packet drops.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 2 /* AUDIO */, 0)]),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::AUDIO, 999, 1),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "AUDIO whose layer != the recorded AUDIO preference MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_per_kind_independence_same_source() {
+        // Phase 3 core: camera VIDEO and SCREEN of the SAME source are addressed
+        // independently. Receiver wants VIDEO layer 2 but SCREEN layer 0 from
+        // 999. A VIDEO layer-2 packet forwards; a SCREEN layer-2 packet drops.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 1 /* VIDEO */, 2), (999, 3 /* SCREEN */, 0)]),
+        );
+
+        // VIDEO layer 2 matches the VIDEO pref → forward.
+        let video_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let vparsed = parse_pw(&video_msg);
+        handler(video_msg, vparsed.as_ref()).expect("ok");
+
+        // SCREEN layer 2 does NOT match the SCREEN pref (wants 0) → drop.
+        let screen_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let sparsed = parse_pw(&screen_msg);
+        handler(screen_msg, sparsed.as_ref()).expect("ok");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "VIDEO forwarded + SCREEN dropped independently for the same source"
         );
     }
 
@@ -9663,8 +9912,50 @@ mod tests {
             "non_empty hint must be set after an accepted update"
         );
         let st = prefs.state.read().unwrap();
-        assert_eq!(st.layers.get(&200), Some(&1));
-        assert_eq!(st.layers.get(&300), Some(&2));
+        // Phase 3: entries without media_kind default to the VIDEO(1) key.
+        assert_eq!(st.layers.get(&(200, 1)), Some(&1));
+        assert_eq!(st.layers.get(&(300, 1)), Some(&2));
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_records_per_media_kind() {
+        // Phase 3: an Entry's media_kind is recorded as part of the key, so the
+        // SAME source can carry distinct preferences for VIDEO vs SCREEN vs
+        // AUDIO, and UNSPECIFIED(0) maps to the VIDEO key (back-compat).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 0 /* UNSPECIFIED → VIDEO */, 1),
+                    (200, 3 /* SCREEN */, 0),
+                    (200, 2 /* AUDIO */, 0),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r"
+        ));
+        let st = prefs.state.read().unwrap();
+        assert_eq!(
+            st.layers.get(&(200, 1)),
+            Some(&1),
+            "UNSPECIFIED keys as VIDEO"
+        );
+        assert_eq!(
+            st.layers.get(&(200, 3)),
+            Some(&0),
+            "SCREEN keyed distinctly"
+        );
+        assert_eq!(st.layers.get(&(200, 2)), Some(&0), "AUDIO keyed distinctly");
+        assert_eq!(st.layers.len(), 3, "three independent (source,kind) keys");
     }
 
     #[test]
@@ -9738,12 +10029,12 @@ mod tests {
         assert!(intercepted, "LAYER_PREFERENCE must still be consumed");
         let st = prefs.state.read().unwrap();
         assert_eq!(
-            st.layers.get(&200),
+            st.layers.get(&(200, 1)),
             Some(&1),
             "another session's LAYER_PREFERENCE MUST NOT overwrite our map"
         );
         assert!(
-            !st.layers.contains_key(&999),
+            !st.layers.contains_key(&(999, 1)),
             "another session's LAYER_PREFERENCE MUST NOT add entries to our map"
         );
     }
@@ -9810,7 +10101,7 @@ mod tests {
             &prefs,
             "r"
         ));
-        assert_eq!(prefs.state.read().unwrap().layers.get(&200), Some(&1));
+        assert_eq!(prefs.state.read().unwrap().layers.get(&(200, 1)), Some(&1));
 
         // Immediate second update (well within the rate-limit window).
         let msg2 = make_nats_message(
@@ -9826,7 +10117,7 @@ mod tests {
             "r"
         ));
         assert_eq!(
-            prefs.state.read().unwrap().layers.get(&200),
+            prefs.state.read().unwrap().layers.get(&(200, 1)),
             Some(&1),
             "rate-limited update must NOT mutate the map"
         );

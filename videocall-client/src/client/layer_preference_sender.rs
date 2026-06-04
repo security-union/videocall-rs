@@ -70,7 +70,13 @@
 //! (and is unit-tested); the wasm-only transport plumbing lives in
 //! `video_call_client.rs`, which drives this state machine.
 
+use crate::decode::layer_chooser::PrefMediaKind;
 use std::collections::BTreeMap;
+
+/// Key for one desired-layer entry: a specific media kind of a specific source
+/// session (issue #989, Phase 3). Ordered so the canonical map / on-wire entry
+/// order is deterministic.
+pub(crate) type PrefKey = (u64, PrefMediaKind);
 
 /// Client-side minimum interval (ms) between accepted layer-preference sends.
 ///
@@ -97,7 +103,7 @@ pub(crate) struct LayerPreferenceSender {
     /// Canonical form of the map last written to the wire. `None` means nothing
     /// sent yet on the current connection — the next change sends
     /// unconditionally. Reset to `None` on reconnect (fail-open recovery).
-    last_sent: Option<BTreeMap<u64, u32>>,
+    last_sent: Option<BTreeMap<PrefKey, u32>>,
     /// Timestamp (ms) of the last accepted send, for the rate limiter. `None`
     /// until the first send.
     last_sent_ms: Option<u64>,
@@ -108,15 +114,13 @@ impl LayerPreferenceSender {
         Self::default()
     }
 
-    /// Canonicalize a desired-layer map: sort by session_id (BTreeMap) and cap
-    /// to [`LAYER_PREFERENCE_MAX_ENTRIES`]. When over the cap we keep the
-    /// lowest session_ids deterministically (stable, not bandwidth-meaningful —
-    /// the relay would otherwise truncate arbitrarily).
-    fn canonicalize(map: &std::collections::HashMap<u64, u32>) -> BTreeMap<u64, u32> {
-        let mut sorted: BTreeMap<u64, u32> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    /// Canonicalize a desired-layer map: sort by (session_id, media_kind)
+    /// (BTreeMap) and cap to [`LAYER_PREFERENCE_MAX_ENTRIES`]. When over the cap
+    /// we drop the highest keys deterministically (stable, not
+    /// bandwidth-meaningful — the relay would otherwise truncate arbitrarily).
+    fn canonicalize(map: &std::collections::HashMap<PrefKey, u32>) -> BTreeMap<PrefKey, u32> {
+        let mut sorted: BTreeMap<PrefKey, u32> = map.iter().map(|(&k, &v)| (k, v)).collect();
         while sorted.len() > LAYER_PREFERENCE_MAX_ENTRIES {
-            // Remove the highest session_id until within the cap. `last_key_value`
-            // avoids collecting; stable + deterministic.
             if let Some((&k, _)) = sorted.iter().next_back() {
                 sorted.remove(&k);
             } else {
@@ -128,20 +132,20 @@ impl LayerPreferenceSender {
 
     /// Decide whether to emit a `LAYER_PREFERENCE` packet for `desired`.
     ///
-    /// Returns `Some(entries)` (canonical, capped `(session_id, desired_layer)`
-    /// pairs) to put on the wire, or `None` when there is nothing to send
-    /// because either:
+    /// Returns `Some(entries)` (canonical, capped `(session_id, media_kind,
+    /// desired_layer)` tuples) to put on the wire, or `None` when there is
+    /// nothing to send because either:
     ///   * the desired map is identical to what was last sent (change
-    ///     detection — no spam when the chooser is stable), or
+    ///     detection — no spam when the choosers are stable), or
     ///   * fewer than [`LAYER_PREFERENCE_MIN_UPDATE_MS`] have elapsed since the
     ///     last accepted send (rate limit).
     ///
     /// On success the new map is promoted to `last_sent` and `now_ms` recorded.
     pub(crate) fn take_if_changed(
         &mut self,
-        desired: &std::collections::HashMap<u64, u32>,
+        desired: &std::collections::HashMap<PrefKey, u32>,
         now_ms: u64,
-    ) -> Option<Vec<(u64, u32)>> {
+    ) -> Option<Vec<(u64, PrefMediaKind, u32)>> {
         let canonical = Self::canonicalize(desired);
 
         // Change detection: identical map → nothing to do (the common case).
@@ -150,15 +154,18 @@ impl LayerPreferenceSender {
         }
 
         // Rate limit: respect the relay's minimum interval. A pending change
-        // that arrives too soon is simply deferred to a later tick (the chooser
-        // re-presents the desired map every tick, so no change is lost).
+        // that arrives too soon is simply deferred to a later tick (the choosers
+        // re-present the desired map every tick, so no change is lost).
         if let Some(last) = self.last_sent_ms {
             if now_ms.saturating_sub(last) < LAYER_PREFERENCE_MIN_UPDATE_MS {
                 return None;
             }
         }
 
-        let entries: Vec<(u64, u32)> = canonical.iter().map(|(&k, &v)| (k, v)).collect();
+        let entries: Vec<(u64, PrefMediaKind, u32)> = canonical
+            .iter()
+            .map(|(&(sid, kind), &layer)| (sid, kind, layer))
+            .collect();
         self.last_sent = Some(canonical);
         self.last_sent_ms = Some(now_ms);
         Some(entries)
@@ -179,15 +186,30 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn map(pairs: &[(u64, u32)]) -> HashMap<u64, u32> {
-        pairs.iter().copied().collect()
+    const V: PrefMediaKind = PrefMediaKind::Video;
+    const S: PrefMediaKind = PrefMediaKind::Screen;
+    const A: PrefMediaKind = PrefMediaKind::Audio;
+
+    /// Build a desired map of VIDEO-kind entries (the common case; per-kind
+    /// behavior has its own test).
+    fn map(pairs: &[(u64, u32)]) -> HashMap<PrefKey, u32> {
+        pairs.iter().map(|&(s, l)| ((s, V), l)).collect()
+    }
+
+    /// Build a desired map of explicit (session, kind, layer) entries.
+    fn kmap(pairs: &[(u64, PrefMediaKind, u32)]) -> HashMap<PrefKey, u32> {
+        pairs.iter().map(|&(s, k, l)| ((s, k), l)).collect()
     }
 
     #[test]
     fn first_send_emits_entries() {
         let mut s = LayerPreferenceSender::new();
         let out = s.take_if_changed(&map(&[(10, 0), (20, 2)]), 1000);
-        assert_eq!(out, Some(vec![(10, 0), (20, 2)]), "sorted by session_id");
+        assert_eq!(
+            out,
+            Some(vec![(10, V, 0), (20, V, 2)]),
+            "sorted by session_id"
+        );
     }
 
     #[test]
@@ -211,7 +233,28 @@ mod tests {
         let mut s = LayerPreferenceSender::new();
         assert!(s.take_if_changed(&map(&[(7, 0)]), 1000).is_some());
         // Same source, different desired layer → a real change.
-        assert_eq!(s.take_if_changed(&map(&[(7, 2)]), 5000), Some(vec![(7, 2)]));
+        assert_eq!(
+            s.take_if_changed(&map(&[(7, 2)]), 5000),
+            Some(vec![(7, V, 2)])
+        );
+    }
+
+    #[test]
+    fn per_media_kind_entries_are_addressed_independently() {
+        // Phase 3: camera VIDEO and SCREEN of the SAME source are distinct
+        // entries; changing one is a change, and both ride the same packet.
+        let mut s = LayerPreferenceSender::new();
+        let out = s
+            .take_if_changed(&kmap(&[(9, V, 2), (9, S, 0), (9, A, 1)]), 1000)
+            .expect("first send");
+        // Sorted by (session, kind): Video(1) < Audio(2) < Screen(3).
+        assert_eq!(out, vec![(9, V, 2), (9, A, 1), (9, S, 0)]);
+        // Changing ONLY the screen layer is a change; video/audio unchanged.
+        assert_eq!(
+            s.take_if_changed(&kmap(&[(9, V, 2), (9, S, 1), (9, A, 1)]), 5000),
+            Some(vec![(9, V, 2), (9, A, 1), (9, S, 1)]),
+            "a screen-only change must re-send with video/audio intact"
+        );
     }
 
     #[test]
@@ -225,15 +268,18 @@ mod tests {
             "must respect the relay's min update interval"
         );
         // Same change at +200ms → now allowed.
-        assert_eq!(s.take_if_changed(&map(&[(1, 1)]), 1200), Some(vec![(1, 1)]));
+        assert_eq!(
+            s.take_if_changed(&map(&[(1, 1)]), 1200),
+            Some(vec![(1, V, 1)])
+        );
     }
 
     #[test]
     fn entry_cap_truncates_to_max() {
         let mut s = LayerPreferenceSender::new();
-        let mut big: HashMap<u64, u32> = HashMap::new();
+        let mut big: HashMap<PrefKey, u32> = HashMap::new();
         for i in 0..(LAYER_PREFERENCE_MAX_ENTRIES as u64 + 10) {
-            big.insert(i, 1);
+            big.insert((i, V), 1);
         }
         let out = s.take_if_changed(&big, 1000).expect("first send");
         assert_eq!(
@@ -257,7 +303,7 @@ mod tests {
         let out = s.take_if_changed(&map(&[(42, 0)]), 1000);
         assert_eq!(
             out,
-            Some(vec![(42, 0)]),
+            Some(vec![(42, V, 0)]),
             "layer 0 is base-only, an explicit entry"
         );
     }
@@ -270,7 +316,10 @@ mod tests {
         let out = s.take_if_changed(&HashMap::new(), 1000);
         assert_eq!(out, Some(vec![]), "empty desired map sends empty entries");
         // Then a real map is a change.
-        assert_eq!(s.take_if_changed(&map(&[(1, 1)]), 5000), Some(vec![(1, 1)]));
+        assert_eq!(
+            s.take_if_changed(&map(&[(1, 1)]), 5000),
+            Some(vec![(1, V, 1)])
+        );
     }
 
     #[test]
@@ -284,7 +333,7 @@ mod tests {
         s.reset_for_reconnect();
         assert_eq!(
             s.take_if_changed(&map(&[(5, 2)]), 5001),
-            Some(vec![(5, 2)]),
+            Some(vec![(5, V, 2)]),
             "reconnect must re-send the current map to resume filtering"
         );
     }

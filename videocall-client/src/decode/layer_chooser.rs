@@ -72,7 +72,34 @@
 //!
 //! [`LayerChooser::choose`] returns the *raw* desired layer the downlink can
 //! sustain. P4 will clamp that into `[user_min, user_max]` at the call site
-//! (see [`clamp_to_user_range`]) without changing this module's logic.
+//! (see [`clamp_to_user_range`]) without changing this module's logic. The clamp
+//! is per-(peer, [`PrefMediaKind`]), so a user can cap screen and camera
+//! independently.
+
+/// Media kind a layer preference / chooser applies to (issue #989, Phase 3).
+///
+/// Camera VIDEO, SCREEN-share, and AUDIO of the same peer are independent
+/// streams, each with its own availability, downlink health, and chosen layer.
+/// This enum keys the per-(peer, kind) chooser state on the receiver and the
+/// per-(peer, kind) entry in the `LAYER_PREFERENCE` packet. The discriminants
+/// match the wire `PacketWrapper.MediaKind` / proto `EntryMediaKind`
+/// (VIDEO=1, AUDIO=2, SCREEN=3) so mapping to the wire is a trivial cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PrefMediaKind {
+    /// Camera video (`MediaKind::VIDEO` == 1).
+    Video = 1,
+    /// Microphone audio (`MediaKind::AUDIO` == 2).
+    Audio = 2,
+    /// Screen share (`MediaKind::SCREEN` == 3).
+    Screen = 3,
+}
+
+impl PrefMediaKind {
+    /// The wire discriminant for the proto `EntryMediaKind` / `MediaKind`.
+    pub fn wire_value(self) -> i32 {
+        self as i32
+    }
+}
 
 /// Consecutive clean (sub-threshold) windows required before a step UP.
 ///

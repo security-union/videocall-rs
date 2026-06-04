@@ -25,6 +25,7 @@ use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::decode::layer_chooser::PrefMediaKind;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -549,7 +550,7 @@ fn send_viewport_via(
 fn send_layer_preference_via(
     connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
     user_id: &str,
-    entries: Vec<(u64, u32)>,
+    entries: Vec<(u64, PrefMediaKind, u32)>,
 ) {
     const LAYER_PREF_LOG_SAMPLE: usize = 8;
     debug!(
@@ -561,9 +562,13 @@ fn send_layer_preference_via(
     let packet = LayerPreferencePacket {
         entries: entries
             .into_iter()
-            .map(|(session_id, desired_layer)| LayerPreferenceEntry {
+            .map(|(session_id, kind, desired_layer)| LayerPreferenceEntry {
                 session_id,
                 desired_layer,
+                // Map the chooser's PrefMediaKind to the proto EntryMediaKind.
+                // Both share the wire discriminant (VIDEO=1/AUDIO=2/SCREEN=3),
+                // so a from_i32 of `wire_value()` is exact and back-compatible.
+                media_kind: ::protobuf::EnumOrUnknown::from_i32(kind.wire_value()),
                 ..Default::default()
             })
             .collect(),

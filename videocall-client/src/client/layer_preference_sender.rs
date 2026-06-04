@@ -148,6 +148,24 @@ impl LayerPreferenceSender {
     ) -> Option<Vec<(u64, PrefMediaKind, u32)>> {
         let canonical = Self::canonicalize(desired);
 
+        // M1 (#1079): suppress an EMPTY preference unless we have a non-empty
+        // preference at the relay to clear. With simulcast effectively off (or a
+        // healthy receiver that constrains nothing), every chooser yields "no
+        // preference" so `canonical` is empty; sending an empty LAYER_PREFERENCE
+        // on every connect/reconnect is pure control-stream fan-out the relay's
+        // fail-open already covers. We still allow exactly ONE empty send when
+        // `last_sent` was a non-empty map — that empty packet is the signal to
+        // the relay to STOP filtering (go back to forwarding all). `last_sent ==
+        // Some(empty)` is treated as "nothing to clear" too.
+        let prev_was_nonempty = matches!(self.last_sent.as_ref(), Some(m) if !m.is_empty());
+        if canonical.is_empty() && !prev_was_nonempty {
+            // Record that our effective state is "no preference" so a subsequent
+            // identical empty tick stays suppressed and the rate-limit clock is
+            // not advanced by a packet we never send.
+            self.last_sent = Some(canonical);
+            return None;
+        }
+
         // Change detection: identical map → nothing to do (the common case).
         if self.last_sent.as_ref() == Some(&canonical) {
             return None;
@@ -309,17 +327,41 @@ mod tests {
     }
 
     #[test]
-    fn empty_map_means_no_entries() {
-        // No peers chosen yet → empty entries (relay treats as no constraint =
-        // forward all, fail-open). Distinct from a populated map.
+    fn empty_map_with_no_prior_preference_is_suppressed() {
+        // M1 (#1079): nothing to constrain (no chooser wants a preference) and
+        // nothing previously filtered at the relay → emit NOTHING. The relay's
+        // fail-open already forwards all layers, so an empty packet would be pure
+        // control-stream fan-out (the bug: one such packet per connect/reconnect).
         let mut s = LayerPreferenceSender::new();
-        let out = s.take_if_changed(&HashMap::new(), 1000);
-        assert_eq!(out, Some(vec![]), "empty desired map sends empty entries");
-        // Then a real map is a change.
+        assert_eq!(
+            s.take_if_changed(&HashMap::new(), 1000),
+            None,
+            "empty desired with no prior preference must not emit a packet"
+        );
+        // A second empty tick stays suppressed (no spam, rate-limit clock unused).
+        assert_eq!(s.take_if_changed(&HashMap::new(), 1100), None);
+        // Then a real constraining map IS a change and sends.
         assert_eq!(
             s.take_if_changed(&map(&[(1, 1)]), 5000),
             Some(vec![(1, V, 1)])
         );
+    }
+
+    #[test]
+    fn empty_map_after_nonempty_sends_one_clear_then_suppresses() {
+        // M1 (#1079): an empty map IS sent exactly once when it clears a prior
+        // non-empty preference — that empty packet tells the relay to stop
+        // filtering (forward all again). Subsequent empty ticks are suppressed.
+        let mut s = LayerPreferenceSender::new();
+        assert!(s.take_if_changed(&map(&[(7, 0)]), 1000).is_some());
+        // Now the constraint lifts (chooser climbed back to top) → one clear send.
+        assert_eq!(
+            s.take_if_changed(&HashMap::new(), 5000),
+            Some(vec![]),
+            "empty after a non-empty preference must send one clearing packet"
+        );
+        // Further empty ticks are no-ops.
+        assert_eq!(s.take_if_changed(&HashMap::new(), 9000), None);
     }
 
     #[test]

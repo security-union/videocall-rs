@@ -197,6 +197,16 @@ pub struct MicrophoneEncoder {
     /// Sized to the effective layer count in [`MicrophoneEncoder::start`]; holds
     /// a single default (empty) codec until then so `set_enabled`/`stop` are
     /// safe before `start`.
+    ///
+    /// ROLLOUT NOTE (low-power devices): each higher layer (`1..N`) is a SECOND+
+    /// full Opus encode of the same mic input, so audio encode CPU scales roughly
+    /// linearly with the active layer count. Opus is cheap relative to video, so
+    /// this is acceptable — and it is flag-gated: higher layers are only
+    /// instantiated when the effective audio layer count is > 1 (driven by
+    /// `experimentalSimulcastMaxLayers` × the device-capability ceiling), so a
+    /// weak device that gates audio to a single layer pays nothing. If a future
+    /// rollout sees audio-CPU pressure on low-power hardware, gate the higher
+    /// audio layers behind a higher capability tier than video.
     codecs: Vec<AudioWorkletCodec>,
     /// Maximum audio simulcast layers (issue #989, Phase 3c → up to 3 in #1082).
     /// 1 = single layer (default, byte-identical). Clamped in `start` to

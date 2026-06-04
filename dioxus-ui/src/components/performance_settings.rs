@@ -1629,6 +1629,11 @@ pub mod receive {
     // highest quality (right thumb).
 
     /// Video receive layer labels, index 0 = lowest (360p) … 2 = highest (720p).
+    ///
+    /// These mirror `videocall_aq::simulcast_layers(3)` = `[low, standard, hd]`,
+    /// lowest-first: low = 640×360 (360p), standard = 960×540 (540p), hd =
+    /// 1280×720 (720p). The middle "540p" is correct — `simulcast_layers(3)[1]`
+    /// is the "standard" tier at 960×540 (#1079 reviewer confirmation).
     pub const VIDEO_LAYER_LABELS: [&str; 3] = ["360p", "540p", "720p"];
 
     /// Screen receive layer labels, index 0 = lowest … 2 = highest.

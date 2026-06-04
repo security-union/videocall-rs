@@ -430,6 +430,28 @@ pub struct ReceivedLayerSnapshot {
 /// the snapshot resolver has no dependency on the encoder module.
 const AUDIO_LAYER_KBPS: &[u32] = &[24, 50];
 
+/// Number of simulcast layers the ladder defines for a media kind (issue #989):
+/// video/screen = 3, audio = 2. Single source of truth for the per-kind ladder
+/// size used by the snapshot resolver and the availability-id clamp.
+pub fn max_layers_for_kind(kind: PrefMediaKind) -> u32 {
+    match kind {
+        PrefMediaKind::Video | PrefMediaKind::Screen => 3,
+        PrefMediaKind::Audio => 2,
+    }
+}
+
+/// Clamp a raw incoming `simulcast_layer_id` to the highest valid layer index
+/// for `kind` (issue #989, security follow-up). The layer id rides OUTSIDE the
+/// AEAD seal, so a malicious publisher could cycle arbitrary/unbounded ids; if
+/// fed straight into [`LayerAvailability::observe`] each unique id would add a
+/// distinct map entry, inflating availability cardinality between prunes.
+/// Clamping to `[0, max_layers_for_kind - 1]` bounds the map to the ladder size
+/// regardless of what arrives on the wire, with no effect on honest publishers
+/// (whose ids are already in range).
+pub fn clamp_observed_layer_id(kind: PrefMediaKind, raw_layer_id: u32) -> u32 {
+    raw_layer_id.min(max_layers_for_kind(kind).saturating_sub(1))
+}
+
 /// Resolve a [`ReceivedLayerSnapshot`] for `kind` at the given decoded
 /// `layer_index`, mapping the layer to its resolution/bitrate via the per-kind
 /// ladder (issue #989, Phase 4). `layer_count` is the number of layers the
@@ -443,10 +465,8 @@ pub fn received_layer_snapshot(
 ) -> ReceivedLayerSnapshot {
     // Clamp the ladder size to the supported range for this kind, and the index
     // into [0, count-1], so a degenerate input can never panic the resolver.
-    let (max_layers, audio) = match kind {
-        PrefMediaKind::Video | PrefMediaKind::Screen => (3u32, false),
-        PrefMediaKind::Audio => (2u32, true),
-    };
+    let max_layers = max_layers_for_kind(kind);
+    let audio = matches!(kind, PrefMediaKind::Audio);
     let count = layer_count.clamp(1, max_layers);
     let idx = layer_index.min(count.saturating_sub(1));
 
@@ -846,5 +866,48 @@ mod tests {
             assert_eq!(s.layer_index, 0);
             assert_eq!(s.layer_count, 1);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Security follow-up: clamp_observed_layer_id bounds availability cardinality
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn max_layers_for_kind_matches_ladders() {
+        assert_eq!(max_layers_for_kind(PrefMediaKind::Video), 3);
+        assert_eq!(max_layers_for_kind(PrefMediaKind::Screen), 3);
+        assert_eq!(max_layers_for_kind(PrefMediaKind::Audio), 2);
+    }
+
+    #[test]
+    fn clamp_observed_layer_id_caps_to_ladder() {
+        // In-range ids pass through; out-of-range ids clamp to the top index.
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 0), 0);
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 2), 2);
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 3), 2);
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, u32::MAX), 2);
+        // Audio caps at index 1.
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 5), 1);
+    }
+
+    #[test]
+    fn clamped_observe_bounds_availability_cardinality() {
+        // Simulate an attacker cycling many UNIQUE out-of-range layer ids: with
+        // the clamp, availability can never hold more than the ladder size, and
+        // highest_available never exceeds the top index — no inflation between
+        // prunes. (Without the clamp this map would grow to ~1000 entries.)
+        let mut avail = LayerAvailability::new();
+        let now = 1_000u64;
+        for raw in 0u32..1000 {
+            let clamped = clamp_observed_layer_id(PrefMediaKind::Video, raw);
+            avail.observe(clamped, now);
+        }
+        // highest_available also prunes; with all observations at `now` it is the
+        // top ladder index, not some giant attacker value.
+        assert_eq!(
+            avail.highest_available(now),
+            2,
+            "clamped observe keeps availability within the 3-layer video ladder"
+        );
     }
 }

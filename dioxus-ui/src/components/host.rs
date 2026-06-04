@@ -119,11 +119,13 @@ pub fn Host(
         log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
         if effective_max_layers > 1 {
             log::warn!(
-                "SIMULCAST EXPERIMENTAL: publishing {effective_max_layers} video layers \
-                 — this multiplies encode CPU and uplink/relay egress and provides NO \
-                 playback benefit yet (receivers decode the base layer only; relay \
-                 layer-selection not implemented). For controlled testing only. Set \
-                 experimentalSimulcastMaxLayers=1 in production."
+                "SIMULCAST EXPERIMENTAL: publishing {effective_max_layers} video layers. \
+                 Receiver-driven per-peer layer selection IS live — each receiver \
+                 automatically pulls the best layer its own downlink can sustain (and the \
+                 relay drops the layers it did not select per source+kind). Enabling this \
+                 increases this sender's encode CPU and uplink/relay egress. Still \
+                 EXPERIMENTAL: keep experimentalSimulcastMaxLayers=1 in production until \
+                 rollout."
             );
         }
 

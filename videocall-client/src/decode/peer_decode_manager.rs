@@ -1036,6 +1036,13 @@ impl Peer {
         // before any sequence tracking / decode.
         let incoming_video_layer = packet.simulcast_layer_id;
 
+        // Compute the monotonic clock ONCE for this packet (perf follow-up):
+        // `now_ms()` crosses the JS boundary (`performance.now()`), and the decode
+        // path needs it for the media-freshness stamp AND the per-kind simulcast
+        // availability `observe`. Reusing one value avoids the extra per-packet
+        // boundary call (which ran even with simulcast off).
+        let now = now_ms();
+
         let packet = match self.aes {
             Some(aes) => {
                 let data = aes
@@ -1059,8 +1066,18 @@ impl Peer {
                 // observe the layer we already selected and could never learn a
                 // higher layer exists. Observing a non-selected layer here costs
                 // a hashmap insert; the packet is still dropped below.
-                self.video_layer_availability
-                    .observe(incoming_video_layer, now_ms());
+                //
+                // Security (#989): clamp the raw, attacker-controllable
+                // (un-sealed) layer id to the ladder range BEFORE observing, so a
+                // malicious publisher cycling unbounded unique ids cannot inflate
+                // availability cardinality between prunes.
+                self.video_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Video,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
 
                 // Simulcast layer-select guard (issue #989). Drop any VIDEO
                 // packet that is not the layer this receiver is decoding for
@@ -1100,7 +1117,7 @@ impl Peer {
                 // "no heartbeat yet" and "heartbeat says off, drop frame"
                 // paths. The next heartbeat consults this to decide whether
                 // to trust its own metadata or the live frame stream.
-                self.last_video_frame_ms = now_ms();
+                self.last_video_frame_ms = now;
 
                 if !self.video_enabled {
                     if !self.has_received_heartbeat {
@@ -1140,8 +1157,16 @@ impl Peer {
                 // audio layer even exists before climbing. Single-layer audio
                 // publishers send 0, so availability stays {0} and the chooser
                 // never climbs — a no-op for them. Must run before any drop.
-                self.audio_layer_availability
-                    .observe(incoming_video_layer, now_ms());
+                //
+                // Security (#989): clamp the raw (un-sealed) layer id to the
+                // audio ladder range before observing (see the VIDEO arm).
+                self.audio_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Audio,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
 
                 // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop audio
                 // packets whose layer != the selected audio layer. Default
@@ -1153,7 +1178,7 @@ impl Peer {
                 // HCL bug #1: stamp audio freshness regardless of the
                 // straggler-drop path so the next heartbeat can detect
                 // recent audio frames and suppress a stale-muted heartbeat.
-                self.last_audio_frame_ms = now_ms();
+                self.last_audio_frame_ms = now;
 
                 if !self.audio_enabled {
                     if !self.has_received_heartbeat {
@@ -1180,8 +1205,16 @@ impl Peer {
                 // arriving screen packet (incl. ones about to be dropped) so the
                 // screen chooser knows how high it may climb — independent of the
                 // camera VIDEO availability. Must run before the drop guard.
-                self.screen_layer_availability
-                    .observe(incoming_video_layer, now_ms());
+                //
+                // Security (#989): clamp the raw (un-sealed) layer id to the
+                // screen ladder range before observing (see the VIDEO arm).
+                self.screen_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Screen,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
 
                 // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop any
                 // SCREEN packet that is not the layer this receiver selected for
@@ -1217,7 +1250,7 @@ impl Peer {
                 // observe `has_screen_share = false`, and the split-screen
                 // layout would collapse — exactly the WT-only symptom from
                 // the user report.
-                self.last_screen_frame_ms = now_ms();
+                self.last_screen_frame_ms = now;
 
                 if !self.screen_enabled {
                     // A SCREEN frame arrived while screen_enabled is false.
@@ -1252,7 +1285,10 @@ impl Peer {
                 let effective_kf_request = if kf_request.is_some() {
                     kf_request
                 } else if self.screen.is_waiting_for_keyframe() {
-                    let now = now_ms();
+                    // Reuse the hoisted per-packet `now` (computed at the top of
+                    // decode) — within one synchronous decode call it is the same
+                    // instant for rate-limiting purposes, and avoids another
+                    // JS-boundary `now_ms()` call.
                     let elapsed =
                         now.saturating_sub(self.screen_seq_tracker.last_keyframe_request_ms);
                     if elapsed >= KEYFRAME_REQUEST_MIN_INTERVAL_MS {

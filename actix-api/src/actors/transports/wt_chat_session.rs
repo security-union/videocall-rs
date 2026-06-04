@@ -407,6 +407,8 @@ impl WtChatSession {
             OUTBOUND_CHANNEL_DROPS_TOTAL
                 .with_label_values(&["webtransport", reason])
                 .inc();
+            // Per-session attribution (Tier B #1): name the slow receiver.
+            self.logic.record_session_drop(reason);
             trace!(
                 "Priority-drop {reason} on WT session {}: free={free_capacity}/{target_total_capacity}",
                 self.logic.id,
@@ -472,6 +474,8 @@ impl WtChatSession {
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["webtransport", kind])
                     .inc();
+                // Per-session attribution (Tier B #1): name the slow receiver.
+                self.logic.record_session_drop(kind);
                 error!(
                     "Outbound channel full for session {}, dropping message (kind={kind})",
                     self.logic.id

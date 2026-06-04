@@ -45,9 +45,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::metrics::{
-    RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
-    RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
-    RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
+    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
+    RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
@@ -1860,6 +1861,7 @@ impl Handler<JoinRoom> for ChatServer {
             instance_id,
             is_host,
             end_on_host_leave,
+            transport,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -2084,6 +2086,10 @@ impl Handler<JoinRoom> for ChatServer {
         let desired_streams_for_loop = desired_streams.clone();
         // Shared layer-preference map for this session's NATS loop (#989).
         let layer_prefs_for_loop = layer_prefs.clone();
+        // Receiver transport for the per-session NATS loop's `handle_msg`, so an
+        // inbound actor-mailbox overflow can be attributed to the right
+        // transport on `relay_inbound_mailbox_drops_total` (Tier B #2 / #1057).
+        let transport_for_loop = transport.clone();
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -2181,6 +2187,7 @@ impl Handler<JoinRoom> for ChatServer {
                         user_id_clone.clone(),
                         desired_streams_for_loop.clone(),
                         layer_prefs_for_loop.clone(),
+                        transport_for_loop.clone(),
                     );
                     let self_subject =
                         format!("room.{room_clone}.{session_clone}").replace(' ', "_");
@@ -2223,6 +2230,7 @@ impl Handler<JoinRoom> for ChatServer {
                             session_clone,
                             &session_recipient,
                             &server_addr,
+                            &transport_for_loop,
                         ) {
                             continue;
                         }
@@ -2674,6 +2682,7 @@ fn try_intercept_display_name_change(
     session: SessionId,
     recipient: &Recipient<Message>,
     server: &Addr<ChatServer>,
+    transport: &str,
 ) -> bool {
     if !msg.subject.ends_with(".system") {
         return false;
@@ -2785,6 +2794,11 @@ fn try_intercept_display_name_change(
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
                     .inc();
+                // Same inbound-mailbox overflow signature as the main fan-out
+                // site, attributed to the receiver's transport (Tier B #2 / #1057).
+                RELAY_INBOUND_MAILBOX_DROPS_TOTAL
+                    .with_label_values(&[transport])
+                    .inc();
                 warn!(
                     "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
                     session, e
@@ -2822,6 +2836,11 @@ fn try_intercept_display_name_change(
 ///
 /// A modified client cannot bypass isolation because the server never sends
 /// MEDIA packets to observer sessions in the first place.
+// The per-session forwarding closure legitimately needs all of these inputs
+// (recipient, room, session id, observer flag, user id, viewport set, layer
+// prefs, and now the receiver transport for mailbox-drop attribution). Grouping
+// them into a struct would not improve clarity for a single internal builder.
+#[allow(clippy::too_many_arguments)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -2830,6 +2849,7 @@ fn handle_msg(
     receiver_user_id: String,
     desired_streams: DesiredStreams,
     layer_prefs: LayerPrefs,
+    transport: String,
 ) -> impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error> {
     // `parsed` is the PacketWrapper decoded ONCE per packet by the NATS loop
     // and shared with every consumer (display-name interceptor, viewport
@@ -3187,8 +3207,18 @@ fn handle_msg(
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            // Room-tagged forensic series (kept for per-room drill-down). The
+            // `transport="nats_delivery"` here is the publish-side identity, not
+            // the receiver's transport.
             RELAY_PACKET_DROPS_TOTAL
                 .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .inc();
+            // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
+            // room-wide-freeze signature, labeled by the RECEIVER's transport so
+            // an SRE can rate() it without scraping per-room series and can tell
+            // which transport's mailbox is overflowing.
+            RELAY_INBOUND_MAILBOX_DROPS_TOTAL
+                .with_label_values(&[&transport])
                 .inc();
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
@@ -3272,6 +3302,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3335,6 +3366,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3370,6 +3402,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3433,6 +3466,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3452,6 +3486,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3833,6 +3868,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3945,6 +3981,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4043,6 +4080,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4147,6 +4185,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4215,6 +4254,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4328,6 +4368,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4442,6 +4483,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4569,6 +4611,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4590,6 +4633,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4700,6 +4744,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4733,6 +4778,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4766,6 +4812,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4799,6 +4846,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4832,6 +4880,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -4866,6 +4915,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4899,6 +4949,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4932,6 +4983,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4979,6 +5031,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5017,6 +5070,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Subject points at a DIFFERENT session id; payload session_id is
@@ -5056,6 +5110,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5094,6 +5149,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5131,6 +5187,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5170,6 +5227,7 @@ mod tests {
             "recv-user".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5223,6 +5281,7 @@ mod tests {
             "alice".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5256,6 +5315,7 @@ mod tests {
             "bob".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5289,6 +5349,7 @@ mod tests {
             "alice".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5322,6 +5383,7 @@ mod tests {
             "alice".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let mut pw = PacketWrapper::new();
@@ -5375,6 +5437,7 @@ mod tests {
             "requester".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5411,6 +5474,7 @@ mod tests {
             "bystander".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Reply addressed to session 9999, not us (7001).
@@ -5448,6 +5512,7 @@ mod tests {
             "peer".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5649,6 +5714,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5690,6 +5756,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Forged payload session_id = 200 (visible), but arrives on 999's subject.
@@ -5729,6 +5796,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5762,6 +5830,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Subject-derived source = 200 (in the viewport set).
@@ -5797,6 +5866,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5832,6 +5902,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5866,6 +5937,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5901,6 +5973,7 @@ mod tests {
             "recv".to_string(),
             desired_streams_with(&[200]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5939,6 +6012,7 @@ mod tests {
             // observer receive MEDIA.
             desired_streams_with(&[999]),
             empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -6292,6 +6366,7 @@ mod tests {
                 instance_id,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6846,6 +6921,7 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6946,6 +7022,7 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -7039,6 +7116,7 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -7132,6 +7210,7 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -7335,6 +7414,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7428,6 +7508,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7516,6 +7597,7 @@ mod tests {
                     instance_id: None,
                     is_host: false,
                     end_on_host_leave: false,
+                    transport: "websocket".to_string(),
                 })
                 .await
                 .expect("Message delivery should succeed")
@@ -7624,6 +7706,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7710,6 +7793,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7832,6 +7916,7 @@ mod tests {
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7881,6 +7966,7 @@ mod tests {
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7951,6 +8037,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7979,6 +8066,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8156,6 +8244,7 @@ mod tests {
                 instance_id: Some("inst-A".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8187,6 +8276,7 @@ mod tests {
                 instance_id: Some("inst-B".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8313,6 +8403,7 @@ mod tests {
                 instance_id: Some("inst-laptop".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8337,6 +8428,7 @@ mod tests {
                 instance_id: Some("inst-phone".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8380,6 +8472,7 @@ mod tests {
                 instance_id: Some("inst-carol".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8447,6 +8540,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8472,6 +8566,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8540,6 +8635,7 @@ mod tests {
                 instance_id: Some(iid.clone()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8572,6 +8668,7 @@ mod tests {
                 instance_id: Some(iid),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8664,6 +8761,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8712,6 +8810,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -8831,6 +8930,7 @@ mod tests {
                 instance_id: Some("iid-laptop".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery A")
@@ -8858,6 +8958,7 @@ mod tests {
                 instance_id: Some("iid-phone".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery B")
@@ -8960,6 +9061,7 @@ mod tests {
                     instance_id: Some(iid.to_string()),
                     is_host: false,
                     end_on_host_leave: true,
+                    transport: "websocket".to_string(),
                 })
                 .await
                 .expect("Delivery")
@@ -9047,6 +9149,7 @@ mod tests {
                     instance_id: Some(iid.to_string()),
                     is_host: false,
                     end_on_host_leave: true,
+                    transport: "websocket".to_string(),
                 })
                 .await
                 .expect("Delivery")
@@ -9155,6 +9258,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery A")
@@ -9198,6 +9302,7 @@ mod tests {
                 instance_id: Some("iid-B-fresh".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery B")
@@ -9541,6 +9646,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(), // empty viewport = fail-open (forward all senders)
             empty_layer_prefs(),       // empty prefs = no-op (forward all layers)
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9576,6 +9682,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9610,6 +9717,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9646,6 +9754,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9684,6 +9793,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO)
+            "websocket".to_string(),
         );
 
         // AUDIO layer 2 with only a VIDEO preference for 999 → forward.
@@ -9720,6 +9830,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 0)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9755,6 +9866,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 1)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9790,6 +9902,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 2 /* AUDIO */, 0)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9826,6 +9939,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 1 /* VIDEO */, 2), (999, 3 /* SCREEN */, 0)]),
+            "websocket".to_string(),
         );
 
         // VIDEO layer 2 matches the VIDEO pref → forward.
@@ -9871,6 +9985,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -9992,6 +10107,7 @@ mod tests {
             "recv".to_string(),
             DesiredStreams::default(),
             prefs,
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(

@@ -142,13 +142,25 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open Settings → Performance and return the visible perf tabpanel locator. */
+/**
+ * Open Settings → Performance and return the visible perf tabpanel locator.
+ *
+ * The unified panel (#1078) has a `Receive | Send` direction toggle and renders
+ * ONLY the active direction's three rows. Receive is the default, but this whole
+ * spec reads RECEIVE needles/controls, so we click the Receive segment defensively
+ * to guarantee the receive rows are mounted (the `@impair` divergence test reads
+ * the receive needle and must be on this direction).
+ */
 async function openPerformancePanel(page: Page) {
   await page.locator('[data-testid="open-settings"]').click();
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("tab", { name: "Performance" }).click();
   const panel = page.locator("#settings-panel-performance");
   await expect(panel).toBeVisible({ timeout: 10_000 });
+  // Ensure the RECEIVE direction is active (default, but assert for isolation).
+  const recvSeg = page.locator('[data-testid="perf-direction-receive"]');
+  await recvSeg.click();
+  await expect(recvSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
   return panel;
 }
 

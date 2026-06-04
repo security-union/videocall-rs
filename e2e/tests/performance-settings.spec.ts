@@ -158,6 +158,31 @@ async function openPerformanceTab(page: Page): Promise<void> {
   await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
 }
 
+/**
+ * Select the SEND direction in the panel's `Receive | Send` segmented toggle
+ * (#1078). The panel renders ONLY the active direction's three rows, so the
+ * send-side controls (`perf-{kind}-*`, `perf-vu-{kind}`) are NOT in the DOM
+ * until this runs. The default direction is Receive, so every send-side test
+ * must call this after `openPerformanceTab`. Idempotent: confirms the Send
+ * segment ends up `aria-checked="true"`.
+ */
+async function selectSendDirection(page: Page): Promise<void> {
+  const sendSeg = page.locator('[data-testid="perf-direction-send"]');
+  await sendSeg.click();
+  await expect(sendSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+}
+
+/**
+ * Select (or re-assert) the RECEIVE direction — the panel default. Receive-side
+ * tests do not strictly need this on a fresh page, but calling it is a cheap
+ * isolation guard in case the panel was left on Send. Idempotent.
+ */
+async function selectReceiveDirection(page: Page): Promise<void> {
+  const recvSeg = page.locator('[data-testid="perf-direction-receive"]');
+  await recvSeg.click();
+  await expect(recvSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+}
+
 /** Read and parse localStorage["vc_performance_quality"], or null if unset. */
 async function readPerfPref(page: Page): Promise<PerformancePreference | null> {
   const raw = await page.evaluate((key) => localStorage.getItem(key), PERF_PREF_KEY);
@@ -197,6 +222,8 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "render");
     await openPerformanceTab(page);
+    // Default direction is Receive; reveal the SEND rows before asserting them.
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -237,6 +264,7 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "auto_toggle");
     await openPerformanceTab(page);
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
     const autoBtn = panel.locator('[data-testid="perf-video-auto"]');
@@ -276,6 +304,7 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "help_popover");
     await openPerformanceTab(page);
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
     const helpBtn = panel.locator('[data-testid="perf-video-help"]');
@@ -309,6 +338,7 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "persist");
     await openPerformanceTab(page);
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -371,6 +401,9 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(grid).toBeVisible({ timeout: 15_000 });
 
     await openPerformanceTab(page);
+    // The panel reopens on the default Receive direction after reload; switch
+    // back to Send to re-read the persisted send-side video preference.
+    await selectSendDirection(page);
     const panelAfter = page.locator("#settings-panel-performance");
 
     // Auto still off after restore.
@@ -395,6 +428,8 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "vu_live");
     await openPerformanceTab(page);
+    // The live SEND needles (encoder snapshot) only mount on the Send direction.
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -419,6 +454,7 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "fixed_badge");
     await openPerformanceTab(page);
+    await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -464,11 +500,50 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     await injectSessionCookie(context, { baseURL });
   });
 
+  test("direction toggle: defaults to Receive, and Send|Receive swap which rows render", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "direction_toggle");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    const recvSeg = panel.locator('[data-testid="perf-direction-receive"]');
+    const sendSeg = panel.locator('[data-testid="perf-direction-send"]');
+
+    // ── Default = Receive: receive segment checked, RECEIVE rows mounted, SEND
+    //    rows ABSENT (the panel renders only the active direction's 3 rows). ──
+    await expect(recvSeg).toHaveAttribute("aria-checked", "true");
+    await expect(sendSeg).toHaveAttribute("aria-checked", "false");
+    await expect(panel.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="perf-recv-video-range-min"]')).toBeVisible();
+    // Send-side controls are not in the DOM while Receive is active.
+    await expect(panel.locator('[data-testid="perf-vu-video"]')).toHaveCount(0);
+    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toHaveCount(0);
+
+    // ── Click Send: send segment checked, SEND rows mounted, RECEIVE rows gone. ──
+    await sendSeg.click();
+    await expect(sendSeg).toHaveAttribute("aria-checked", "true");
+    await expect(recvSeg).toHaveAttribute("aria-checked", "false");
+    await expect(panel.locator('[data-testid="perf-vu-video"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="perf-vu-recv-video"]')).toHaveCount(0);
+    await expect(panel.locator('[data-testid="perf-recv-video-range-min"]')).toHaveCount(0);
+
+    // ── Click Receive again: back to the receive rows (round-trip). ──
+    await recvSeg.click();
+    await expect(recvSeg).toHaveAttribute("aria-checked", "true");
+    await expect(sendSeg).toHaveAttribute("aria-checked", "false");
+    await expect(panel.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="perf-vu-video"]')).toHaveCount(0);
+  });
+
   test("receive row renders a range slider, Auto toggle, and needle for each kind", async ({
     page,
   }) => {
     await joinMeeting(page, "recv_render");
     await openPerformanceTab(page);
+    // Receive is the default direction; assert it explicitly for isolation.
+    await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -501,6 +576,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
   test("receive row defaults to Auto with both thumbs at the extremes", async ({ page }) => {
     await joinMeeting(page, "recv_auto_default");
     await openPerformanceTab(page);
+    await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -528,6 +604,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
   }) => {
     await joinMeeting(page, "recv_auto_toggle");
     await openPerformanceTab(page);
+    await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
     const autoBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
@@ -546,6 +623,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
   }) => {
     await joinMeeting(page, "recv_needle");
     await openPerformanceTab(page);
+    await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
@@ -579,6 +657,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
   }) => {
     await joinMeeting(page, "recv_fixed_badge");
     await openPerformanceTab(page);
+    await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 

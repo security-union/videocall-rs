@@ -51,19 +51,20 @@ use sec_api::metrics::{
     AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
     CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
     CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_RENDER_FPS,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
-    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
-    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
-    ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS,
-    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
+    CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
+    CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP,
+    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
+    DECODE_BUDGET_PRESSURED, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
+    ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -274,6 +275,18 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     ];
     let _ = CLIENT_LONGTASK_DURATION_MS.remove_label_values(&telem_labels);
     let _ = CLIENT_RENDER_FPS.remove_label_values(&telem_labels);
+
+    // Tier B #3: re-election outcome series (meeting_id, session_id, result).
+    // Remove all four bounded result buckets for this session so the
+    // (unbounded-over-time) session_id label leaves no residual series on
+    // disconnect — same lifecycle GC the other per-session client series use.
+    for result in ["proceeded", "aborted", "preserved", "failed"] {
+        let _ = CLIENT_REELECTION_TOTAL.remove_label_values(&[
+            &session_info.meeting_id,
+            &session_info.session_id,
+            result,
+        ]);
+    }
     // TELEM-7: remove CLIENT_INFO using stored label values
     if let Some(ref info_labels) = session_info.client_info_labels {
         let _ = CLIENT_INFO.remove_label_values(&[
@@ -648,6 +661,27 @@ fn process_health_packet_to_metrics_pb(
                     reporter_display_name.as_str(),
                 ])
                 .set(agent_mem as f64);
+        }
+
+        // Tier B #3 / #562: transport re-election outcomes. The client reports a
+        // CUMULATIVE total per result in every packet; we `.set()` the gauge to
+        // that value (NOT `.inc()`, which would multiply-count the same total
+        // each second — see the type-decision note on CLIENT_REELECTION_TOTAL).
+        // `result` is bounded to exactly these four values; the per-(meeting,
+        // session) series are GC'd by the stale-session cleanup below. Each
+        // field is absent until the client has seen at least one such outcome,
+        // so the series only appears once a re-election has actually happened.
+        for (result, value) in [
+            ("proceeded", health_packet.reelection_proceeded_total),
+            ("aborted", health_packet.reelection_aborted_total),
+            ("preserved", health_packet.reelection_preserved_total),
+            ("failed", health_packet.reelection_failed_total),
+        ] {
+            if let Some(total) = value {
+                CLIENT_REELECTION_TOTAL
+                    .with_label_values(&[meeting_id, session_id, result])
+                    .set(total as f64);
+            }
         }
 
         // Communication and browser state metrics

@@ -236,6 +236,15 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
+    /// Set of `kind` label values this session has incremented on
+    /// `relay_session_drops_total` (dashboard audit Tier B #1). Tracked so the
+    /// exact `(room, transport, session_id, kind)` series can be GC'd via
+    /// `remove_label_values` in [`on_stopping`], keeping that high-cardinality
+    /// counter bounded to live sessions. `RefCell` because `record_session_drop`
+    /// is reached from `&mut self` handlers while cleanup runs from `&self`
+    /// `on_stopping`; the per-actor event loop is single-threaded so there is no
+    /// cross-thread contention.
+    session_drop_kinds: std::cell::RefCell<std::collections::HashSet<&'static str>>,
 }
 
 impl SessionLogic {
@@ -279,7 +288,27 @@ impl SessionLogic {
             end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
+            session_drop_kinds: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Record a per-session outbound drop on `relay_session_drops_total`
+    /// (dashboard audit Tier B #1) and remember the `kind` so the series can be
+    /// removed on session teardown.
+    ///
+    /// Called from both transport actors' drop sites (priority-preempt and
+    /// real channel-full) with the same `kind` label they pass to the
+    /// protocol-wide `videocall_outbound_channel_drops_total` counter, so the
+    /// two stay in lock-step. `kind` MUST be a `'static` string from the bounded
+    /// drop-kind taxonomy (the actors only ever pass string literals / the
+    /// `priority_drop.rs` reason labels), which keeps the tracked set — and the
+    /// number of series GC'd on close — bounded to that small fixed taxonomy.
+    pub fn record_session_drop(&self, kind: &'static str) {
+        let session_id = self.id.to_string();
+        crate::metrics::RELAY_SESSION_DROPS_TOTAL
+            .with_label_values(&[&self.room, &self.transport, &session_id, kind])
+            .inc();
+        self.session_drop_kinds.borrow_mut().insert(kind);
     }
 
     // =========================================================================
@@ -338,6 +367,7 @@ impl SessionLogic {
             instance_id: self.instance_id.clone(),
             is_host: self.is_host,
             end_on_host_leave: self.end_on_host_leave,
+            transport: self.transport.clone(),
         }
     }
 
@@ -381,6 +411,22 @@ impl SessionLogic {
         RELAY_ACTIVE_SESSIONS_PER_ROOM
             .with_label_values(&[&self.room, &self.transport])
             .dec();
+
+        // GC the per-session drop series (Tier B #1). `relay_session_drops_total`
+        // carries an unbounded-over-time `session_id` label; removing every
+        // `(room, transport, session_id, kind)` tuple this session touched the
+        // moment it disconnects keeps the live series count bounded to active
+        // sessions. Mirrors the metrics-server `remove_label_values` cleanup
+        // pattern. No-op for sessions that never dropped (empty set).
+        let session_id = self.id.to_string();
+        for kind in self.session_drop_kinds.borrow().iter() {
+            let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+                &self.room,
+                &self.transport,
+                &session_id,
+                kind,
+            ]);
+        }
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,

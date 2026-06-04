@@ -308,7 +308,25 @@ impl WebTransportClient {
     }
 
     async fn send_via_session(session: &Session, data: Vec<u8>) -> anyhow::Result<()> {
+        // Length-prefix every upstream packet with a 4-byte big-endian header,
+        // matching the relay's framed reader (actix-api webtransport/bridge.rs
+        // read_length_prefixed_frame) and the real client's persistent-stream
+        // framing. The framing migration (67d9c572, 2026-04-07) updated the
+        // relay + WASM client but missed this bot sender, so unframed writes
+        // were silently dropped as malformed — the bot never became visible and
+        // its session was reaped after CLIENT_TIMEOUT (30s). See read_length_-
+        // prefixed_stream above for the symmetric inbound decode.
+        // Guard against frames larger than the relay's 4 MiB cap (and any value
+        // that would overflow the u32 header); matches read_length_prefixed_stream.
+        if data.len() > 4 * 1024 * 1024 {
+            return Err(anyhow::anyhow!(
+                "packet too large to frame: {} bytes",
+                data.len()
+            ));
+        }
+        let len = data.len() as u32;
         let mut stream = session.open_uni().await?;
+        stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(&data).await?;
         stream.finish()?;
         Ok(())

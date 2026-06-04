@@ -1908,14 +1908,37 @@ impl PeerDecodeManager {
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
                 // Phase 4: each per-(peer,kind) chooser output is clamped to the
-                // user's GLOBAL receive bounds for that kind before it becomes
-                // the requested + decoded layer.
+                // user's GLOBAL receive bounds for that kind. The tick updates the
+                // peer's DECODE guard (`selected_*_layer`) as a side effect and
+                // returns the (clamped) decode layer.
                 let video = peer.tick_layer_chooser(now_ms, video_bounds);
                 let screen = peer.tick_screen_layer_chooser(now_ms, screen_bounds);
                 let audio = peer.tick_audio_layer_chooser(now_ms, audio_bounds);
-                desired.insert((session_id, PrefMediaKind::Video), video);
-                desired.insert((session_id, PrefMediaKind::Screen), screen);
-                desired.insert((session_id, PrefMediaKind::Audio), audio);
+
+                // Issue #1079 M1/M2: only ADVERTISE a preference for a kind when
+                // the final (clamped) decode layer actually constrains BELOW the
+                // highest available layer for that kind. This single rule captures
+                // BOTH sources of a real constraint:
+                //   * the chooser dropped below the top under congestion, and
+                //   * the user's receive `max` bound capped it below the top.
+                // On cold start / a healthy unclamped receiver, the chooser tracks
+                // the top (M2: it no longer ramps from base), so layer == highest
+                // and the entry is OMITTED → relay fail-open forwards all layers
+                // (no base-pin HD dip after reconnect). An all-omitted map yields
+                // no entries, so no LAYER_PREFERENCE packet goes out when there is
+                // nothing to constrain (M1).
+                let vh = peer.video_layer_availability.highest_available(now_ms);
+                if video < vh {
+                    desired.insert((session_id, PrefMediaKind::Video), video);
+                }
+                let sh = peer.screen_layer_availability.highest_available(now_ms);
+                if screen < sh {
+                    desired.insert((session_id, PrefMediaKind::Screen), screen);
+                }
+                let ah = peer.audio_layer_availability.highest_available(now_ms);
+                if audio < ah {
+                    desired.insert((session_id, PrefMediaKind::Audio), audio);
+                }
             }
         }
         desired
@@ -4747,23 +4770,15 @@ mod tests {
             1000,
             &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
         );
-        // 3 peers × 3 media kinds = 9 entries.
-        assert_eq!(desired.len(), 9, "one entry per (peer, media-kind)");
-        // Fresh peers (no availability learned) default to the base layer for
-        // every kind.
-        for sid in [10u64, 20, 30] {
-            for kind in [
-                PrefMediaKind::Video,
-                PrefMediaKind::Screen,
-                PrefMediaKind::Audio,
-            ] {
-                assert_eq!(
-                    desired.get(&(sid, kind)),
-                    Some(&0),
-                    "fresh peer defaults to base for every kind"
-                );
-            }
-        }
+        // M2 (#1079): fresh peers (no availability learned, no congestion) advertise
+        // NO preference for any kind — the map is EMPTY, not 9 base entries. A
+        // base-pin on cold start would drop upgraded layers and cause an HD dip
+        // after every (re)connect. Absence = no constraint = relay forwards all.
+        assert!(
+            desired.is_empty(),
+            "fresh peers must advertise no preference (cold start = forward all): {desired:?}"
+        );
+        let _ = PrefMediaKind::Video; // keep the import used regardless of asserts
     }
 
     /// Phase 4 (#989): the user's receive-layer bounds clamp each peer's chosen

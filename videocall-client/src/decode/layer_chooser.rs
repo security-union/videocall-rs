@@ -226,9 +226,25 @@ impl Default for LayerAvailability {
 /// affect a healthy one.
 #[derive(Debug, Clone)]
 pub struct LayerChooser {
-    /// Currently selected layer for this source (== the decode guard value and
-    /// the layer requested from the relay).
+    /// Currently selected layer for this source (== the decode guard value).
+    ///
+    /// NOTE this is the DECODE layer, not necessarily the advertised preference.
+    /// While `constrained == false` the chooser tracks `highest_available` (decode
+    /// the best available) and advertises NOTHING — see
+    /// [`Self::desired_preference`].
     current: u32,
+    /// Whether the chooser is ACTIVELY holding `current` BELOW the highest
+    /// available layer because of observed congestion (issue #1079 M2).
+    ///
+    /// - `false` (the cold-start / healthy default): follow `highest_available`
+    ///   (decode the best available) and advertise NO preference, so the relay
+    ///   fail-open forwards every layer and a fresh/just-reconnected receiver
+    ///   keeps full quality instead of being pinned to base while the old
+    ///   conservative-up ramp climbed.
+    /// - `true`: a congested window dropped us below the top; we hold `current`
+    ///   and advertise it as a concrete `desired_layer` until sustained clean
+    ///   windows climb us back to the top, at which point we clear this flag.
+    constrained: bool,
     /// Consecutive clean windows accumulated toward a step up.
     clean_windows: u32,
     /// Timestamp (ms) of the last layer change, for the step-up dwell guard.
@@ -236,45 +252,94 @@ pub struct LayerChooser {
 }
 
 impl LayerChooser {
-    /// Construct a chooser starting at the **base layer (0)** — the
-    /// bandwidth-safe default. A freshly-joined peer whose layers we have not
-    /// yet learned therefore requests only the base layer, and climbs as the
-    /// downlink proves capacity AND higher layers are observed available.
+    /// Construct a chooser in the **unconstrained** state (issue #1079 M2): it
+    /// decodes the highest available layer and advertises no preference until a
+    /// congested window forces it to constrain down. This means a freshly-joined
+    /// or just-reconnected receiver keeps full quality (relay forwards all
+    /// layers) instead of pinning peers to base while a conservative-up ramp
+    /// climbs — which caused a visible HD dip after every (re)connect.
     pub fn new(now_ms: u64) -> Self {
         Self {
             current: 0,
+            constrained: false,
             clean_windows: 0,
             last_change_ms: now_ms,
         }
     }
 
-    /// The currently-selected layer (decode-guard value + relay request).
+    /// The currently-selected DECODE layer (the decode-guard value).
     pub fn current(&self) -> u32 {
         self.current
     }
 
+    /// The layer to advertise to the relay as a `LAYER_PREFERENCE`, or `None`
+    /// when the chooser has no preference (issue #1079 M1/M2).
+    ///
+    /// Returns `Some(current)` ONLY while `constrained` — i.e. the chooser has
+    /// actively decided to hold below the highest available layer because of
+    /// congestion. Otherwise `None` ("no preference"): the caller omits the entry
+    /// so the relay forwards ALL layers (fail-open) and the receiver decodes the
+    /// best available. This is what prevents (a) cold-start pinning to base (M2)
+    /// and (b) emitting a preference packet when there is nothing to constrain
+    /// (M1 — an all-`None` map produces no entries).
+    pub fn desired_preference(&self) -> Option<u32> {
+        if self.constrained {
+            Some(self.current)
+        } else {
+            None
+        }
+    }
+
     /// Fold one downlink window sample into the decision and return the new
-    /// desired layer for this source.
+    /// DECODE layer for this source.
     ///
     /// `highest_available` is the cap learned empirically by
-    /// [`LayerAvailability`]; the chooser never targets above it (and clamps a
-    /// previously-higher selection down when a top layer disappears).
+    /// [`LayerAvailability`]; the chooser never targets above it.
     ///
     /// Behavior:
+    ///   * **Unconstrained (default):** track `highest_available` (decode best),
+    ///     advertise nothing. A congested window flips to constrained and steps
+    ///     down from the top.
     ///   * **Down (fast):** a single congested window steps down one layer and
-    ///     resets the clean-window counter (floored at base 0).
+    ///     resets the clean-window counter (floored at base 0), and marks the
+    ///     chooser constrained so it advertises the held layer.
     ///   * **Up (conservative):** requires [`STEP_UP_CLEAN_WINDOWS`] consecutive
     ///     clean windows AND [`LAYER_STEP_UP_DWELL_MS`] dwell since the last
-    ///     change, then climbs one layer toward `highest_available`.
+    ///     change, then climbs one layer toward `highest_available`; reaching the
+    ///     top clears `constrained` (back to no-preference / decode-best).
     ///   * **Neutral band:** a window that is neither congested nor clean holds
-    ///     the layer and resets the clean streak (no progress toward climbing,
-    ///     but no drop either).
+    ///     the layer and resets the clean streak.
     pub fn choose(&mut self, sample: DownlinkSample, highest_available: u32, now_ms: u64) -> u32 {
+        // Unconstrained: simply track the highest available layer (decode best,
+        // advertise nothing) until a congested window forces us to constrain.
+        if !self.constrained {
+            // A congested window drops us into the constrained state, stepping
+            // down ONE layer from the current top.
+            if sample.is_congested() {
+                self.constrained = true;
+                let from = self.current.min(highest_available);
+                let dropped = from.saturating_sub(1);
+                self.set_layer(dropped, now_ms);
+                self.clean_windows = 0;
+                return self.current;
+            }
+            // Otherwise follow the top (no constraint, full quality).
+            self.set_layer(highest_available, now_ms);
+            return self.current;
+        }
+
+        // --- Constrained state: the existing fast-down / conservative-up loop. ---
+
         // Availability can only shrink our target: if the top layer we were on
         // is no longer being produced, drop to the highest still-available one
         // immediately (it is no longer decodable anyway).
         if self.current > highest_available {
             self.set_layer(highest_available, now_ms);
+            // If the ceiling itself collapsed to where we sit, we are no longer
+            // constraining below it — clear so we resume decode-best/no-pref.
+            if self.current >= highest_available {
+                self.constrained = false;
+            }
             return self.current;
         }
 
@@ -296,6 +361,11 @@ impl LayerChooser {
                 // Require a fresh streak before the NEXT climb so we ascend one
                 // rung per sustained-headroom period, not all at once.
                 self.clean_windows = 0;
+            }
+            // Climbed (or already) back to the top → no longer constraining:
+            // clear the flag so we advertise nothing and decode best again.
+            if self.current >= highest_available {
+                self.constrained = false;
             }
             return self.current;
         }
@@ -547,8 +617,76 @@ mod tests {
 
     #[test]
     fn starts_at_base_layer() {
+        // The raw `current` field initializes to 0 before any sample is folded.
         let c = LayerChooser::new(0);
         assert_eq!(c.current(), 0);
+    }
+
+    #[test]
+    fn cold_start_is_unconstrained_no_preference_and_decodes_top() {
+        // M2 (#1079): a fresh chooser must NOT pin to base. With no preference
+        // advertised (so the relay forwards all layers) the receiver decodes the
+        // highest available layer immediately — no HD dip after (re)connect.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        // Before any sample: no preference.
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "cold start advertises no preference"
+        );
+        // First (even clean) window: decode the top, still no preference.
+        let l = c.choose(clean(), avail, 1000);
+        assert_eq!(l, 2, "unconstrained chooser decodes the highest available");
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "healthy receiver at the top advertises no preference"
+        );
+    }
+
+    #[test]
+    fn cold_start_with_layers_unobserved_advertises_nothing() {
+        // M2: even before any higher layer is observed (avail still 0), the
+        // chooser advertises no preference (not a concrete `0` = base-only).
+        let mut c = LayerChooser::new(0);
+        c.choose(clean(), 0, 1000);
+        assert_eq!(c.current(), 0, "only base available → decode base");
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "must NOT advertise 0; absence = no constraint = forward all"
+        );
+    }
+
+    #[test]
+    fn constrains_only_after_congestion_then_clears_on_climb_back() {
+        // M2: a preference is advertised ONLY while actively constrained, and is
+        // cleared once the chooser climbs back to the top.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 1000); // top, no pref
+        assert_eq!(c.desired_preference(), None);
+        // Congestion → constrained, drops to 1, advertises Some(1).
+        c.choose(congested(), avail, 2000);
+        assert_eq!(c.current(), 1);
+        assert_eq!(
+            c.desired_preference(),
+            Some(1),
+            "constrained chooser advertises its held layer"
+        );
+        // Sustained clean re-climbs to the top → preference clears.
+        let mut t = 3000u64;
+        for _ in 0..20 {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert_eq!(c.current(), 2, "re-climbs to top");
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "back at the top → no preference again (clears the relay filter)"
+        );
     }
 
     #[test]
@@ -586,13 +724,17 @@ mod tests {
 
     #[test]
     fn hysteresis_prevents_flap_on_neutral_windows() {
-        // From base, climb to 1, then alternate neutral windows: neutral never
-        // climbs (streak resets) and never drops, so the layer is stable.
+        // After a congestion drop into the constrained state, neutral windows
+        // must neither climb (streak resets) nor drop — the layer is stable.
         let mut c = LayerChooser::new(0);
         let avail = 2;
-        let t = feed_clean(&mut c, avail, 1000, 4, 1100);
-        assert_eq!(c.current(), 1, "should have climbed exactly one rung");
-        let mut t = t;
+        // Unconstrained start tracks the top; one congested window drops to 1 and
+        // enters the constrained state.
+        c.choose(clean(), avail, 1000); // decode top (2), no preference
+        assert_eq!(c.current(), 2);
+        c.choose(congested(), avail, 2000);
+        assert_eq!(c.current(), 1, "congestion drops one rung into constrained");
+        let mut t = 3000u64;
         for _ in 0..10 {
             let l = c.choose(neutral(), avail, t);
             assert_eq!(l, 1, "neutral windows must hold the current layer");
@@ -615,10 +757,17 @@ mod tests {
 
     #[test]
     fn step_up_requires_sustained_headroom() {
-        // Fewer than STEP_UP_CLEAN_WINDOWS clean windows must NOT climb.
+        // Re-climb after a congestion drop is conservative: fewer than
+        // STEP_UP_CLEAN_WINDOWS clean windows must NOT climb back up.
         let mut c = LayerChooser::new(0);
         let avail = 2;
-        let mut t = 1000u64;
+        // Drop to the floor (0) via repeated congestion → constrained.
+        c.choose(clean(), avail, 500); // top
+        c.choose(congested(), avail, 1000); // -> 1
+        c.choose(congested(), avail, 1500); // -> 0
+        assert_eq!(c.current(), 0);
+        // A few clean windows, but fewer than the streak → no re-climb.
+        let mut t = 2000u64;
         for _ in 0..(STEP_UP_CLEAN_WINDOWS - 1) {
             c.choose(clean(), avail, t);
             t += 1100;
@@ -626,19 +775,23 @@ mod tests {
         assert_eq!(
             c.current(),
             0,
-            "must not climb before the clean-window streak is met"
+            "must not re-climb before the clean-window streak is met"
         );
     }
 
     #[test]
     fn step_up_requires_dwell_even_with_streak() {
-        // Enough clean windows but bunched within the dwell period (small dt):
-        // the dwell guard must still block the climb.
+        // Re-climb after a drop also needs dwell: enough clean windows but bunched
+        // within the dwell period (small dt) → the dwell guard blocks the climb.
         let mut c = LayerChooser::new(1000);
         let avail = 2;
-        // 5 clean windows only 100ms apart → streak satisfied but only 400ms
-        // dwell elapsed, under LAYER_STEP_UP_DWELL_MS.
-        let mut t = 1000u64;
+        // Drop to 0 first (constrained).
+        c.choose(clean(), avail, 500); // top
+        c.choose(congested(), avail, 1000); // -> 1
+        c.choose(congested(), avail, 1500); // -> 0
+        assert_eq!(c.current(), 0);
+        // 5 clean windows only 100ms apart → streak satisfied but dwell not met.
+        let mut t = 2000u64;
         for _ in 0..5 {
             c.choose(clean(), avail, t);
             t += 100;
@@ -646,7 +799,7 @@ mod tests {
         assert_eq!(
             c.current(),
             0,
-            "dwell guard must block a climb even with a clean streak"
+            "dwell guard must block a re-climb even with a clean streak"
         );
     }
 

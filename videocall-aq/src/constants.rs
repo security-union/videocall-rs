@@ -218,7 +218,9 @@ pub const SIMULCAST_MAX_LAYERS: usize = 3;
 /// the client's `clamp_layer_count`; an out-of-range request is degraded, not a
 /// crash). Returns positions into the ladder slice, lowest layer first.
 fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
-    debug_assert!(len >= 1, "ladder must be non-empty");
+    // `max(1)` is the real guard (a 0-length ladder is a caller bug, but we
+    // degrade rather than panic): it prevents both the `n == 1` divide-by-zero
+    // below and out-of-range indexing in release builds.
     let len = len.max(1);
     let n = n.clamp(1, len);
     if n == 1 {

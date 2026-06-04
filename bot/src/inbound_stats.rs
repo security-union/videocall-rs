@@ -30,6 +30,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::aq_controller::BotAq;
 use crate::keyframe_requester::KeyframeRequester;
+use crate::layer_preference_sender::LayerPreferenceSender;
 use crate::rtt_probe::RttProbeState;
 use crate::viewport_sender::ViewportSender;
 
@@ -94,6 +95,11 @@ pub struct InboundStats {
     /// inbound media packet is fed here so the bot can emit VIEWPORT control
     /// packets like a real client (HCL issue #988).
     viewport_sender: Option<ViewportSender>,
+    /// Optional layer-preference sender. When set, the source session_id of
+    /// every inbound media packet is fed here so the bot can emit
+    /// LAYER_PREFERENCE control packets pinning each source to a fixed simulcast
+    /// layer, like a real client that selected a quality tier (#1083-A2).
+    layer_preference_sender: Option<LayerPreferenceSender>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -134,6 +140,14 @@ impl InboundStats {
     /// control packets mimicking a real client's on-screen tile set (#988).
     pub fn set_viewport_sender(&mut self, sender: ViewportSender) {
         self.viewport_sender = Some(sender);
+    }
+
+    /// Attach a layer-preference sender. When set, the relay-stamped source
+    /// session_id of every inbound media packet is fed to it so the bot emits
+    /// LAYER_PREFERENCE control packets pinning each source to a fixed simulcast
+    /// layer, mimicking a real client that selected a quality tier (#1083-A2).
+    pub fn set_layer_preference_sender(&mut self, sender: LayerPreferenceSender) {
+        self.layer_preference_sender = Some(sender);
     }
 
     /// Install (or replace) the Prometheus metrics handle. Calls made before
@@ -275,6 +289,14 @@ impl InboundStats {
             vs.on_source_seen(wrapper.session_id);
         }
 
+        // Feed the same relay-stamped source session_id to the layer-preference
+        // sender so a "pin to layer N" bot emits a LAYER_PREFERENCE for each
+        // discovered source (#1083-A2). Same fail-open/unstamped-sentinel
+        // handling as the viewport sender above.
+        if let Some(ref mut lps) = self.layer_preference_sender {
+            lps.on_source_seen(wrapper.session_id);
+        }
+
         match media.media_type.enum_value() {
             Ok(MediaType::AUDIO) => {
                 #[cfg(feature = "metrics")]
@@ -405,6 +427,7 @@ impl InboundStats {
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
         let viewport_sender = self.viewport_sender.take();
+        let layer_preference_sender = self.layer_preference_sender.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         *self = Self::default();
@@ -419,6 +442,7 @@ impl InboundStats {
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
         self.viewport_sender = viewport_sender;
+        self.layer_preference_sender = layer_preference_sender;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;
@@ -444,6 +468,15 @@ impl InboundStats {
         // connection re-asserts a tiny control packet at most once per window.
         if let Some(ref mut vs) = self.viewport_sender {
             vs.resend_on_reconnect();
+        }
+
+        // Same re-assert for the layer-preference signal (#1083-A2): the relay
+        // drops a receiver's recorded layer preference on disconnect, and a
+        // reconnect leaves it empty (fail-open → the bot silently receives the
+        // full ladder again). `resend_on_reconnect` is idempotent, guarded on
+        // `has_sent`, and rate-limited, exactly like the viewport re-assert.
+        if let Some(ref mut lps) = self.layer_preference_sender {
+            lps.resend_on_reconnect();
         }
     }
 

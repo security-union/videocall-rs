@@ -485,18 +485,19 @@ impl PerformancePreference {
     }
 }
 
-/// Human-readable range text for a stream, e.g. `"360p – 1080p"`, or
-/// `"Auto – 1080p"` when the worst end is unbounded, or `"Auto"` when both ends
-/// are unbounded (fully automatic). `best`/`worst` are tier indices (or `None`).
-/// Pure so the readout is host-tested.
-pub fn range_text(best: Option<usize>, worst: Option<usize>, labels: &[&str]) -> String {
-    let label_of = |idx: usize| labels.get(idx).copied().unwrap_or("?");
-    match (worst, best) {
-        (None, None) => "Auto".to_string(),
-        (Some(w), None) => format!("{} – Auto", label_of(w)),
-        (None, Some(b)) => format!("Auto – {}", label_of(b)),
-        (Some(w), Some(b)) if w == b => label_of(w).to_string(),
-        (Some(w), Some(b)) => format!("{} – {}", label_of(w), label_of(b)),
+/// Concrete span text for the slider readout: always renders both thumb
+/// positions as tier labels (e.g. `"240p – 1080p"` for the full ladder),
+/// regardless of Auto state — it describes what the slider visibly shows, not
+/// the encoder bound semantics. When both thumbs sit on the same tier it
+/// collapses to a single label. Pure so it is host-tested.
+pub fn span_text(sel: RangeSel, labels: &[&str]) -> String {
+    let label_at = |pos: usize| position_label(pos, labels);
+    let worst = label_at(sel.min_pos); // left thumb = worst end
+    let best = label_at(sel.max_pos); // right thumb = best end
+    if sel.min_pos == sel.max_pos {
+        worst.to_string()
+    } else {
+        format!("{worst} – {best}")
     }
 }
 
@@ -618,6 +619,18 @@ pub fn gauge_state_from_snapshot(
     }
 }
 
+/// Move keyboard focus to the element with `id`, if present. Used to return
+/// focus to the "?" button after its popover closes via Escape.
+fn focus_element_by_id_local(id: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = el.focus();
+    }
+}
+
 // ── DOM helpers for the throttled needle update ───────────────────
 
 /// Write `style.transform = rotate(<deg>deg)` to the needle element by id.
@@ -676,7 +689,7 @@ const SCREEN_READOUT_ID: &str = "perf-vu-screen-readout";
 /// A single analog VU needle gauge with a live numeric readout below it.
 ///
 /// The arc + ticks are static SVG; only the `<line>` needle and the readout
-/// text node are mutated at runtime (by [`QualityVuMeters`]'s rAF loop) via
+/// text node are mutated at runtime (by [`QualityVuMeterDriver`]'s rAF loop) via
 /// direct DOM writes, so this component itself never re-renders per frame.
 #[component]
 fn VuGauge(
@@ -761,38 +774,25 @@ fn VuGauge(
     }
 }
 
-/// The three VU meters (video + audio + screen) plus the rAF polling loop that
-/// drives them from `live_quality_snapshot()` / `live_screen_snapshot()`.
+/// Headless driver for the three VU needles. Renders **nothing** — it only owns
+/// the single ~4 Hz `requestAnimationFrame` polling loop that reads
+/// `live_quality_snapshot()` / `live_screen_snapshot()` and writes the needle
+/// rotations + readouts straight to the DOM nodes **by id** (so the gauges can
+/// live anywhere in the tree, e.g. each inside its own threshold section).
 ///
-/// Both readers are cheap closures over the encoders' live atomics; they are
-/// invoked on a throttled cadence (~4 Hz) inside a `requestAnimationFrame` loop
-/// and the result is written straight to the needle/readout DOM nodes — no
-/// signal write, no modal re-render. The loop self-cancels when the component
-/// unmounts (the `use_drop` clears the closure cell).
+/// Direct DOM writes mean no per-frame re-render. The loop self-cancels when the
+/// driver unmounts (the `use_drop` clears the closure cell).
 #[component]
-pub fn QualityVuMeters(
-    /// Reads the current video/audio live snapshot. `None` while the encoder is
-    /// unavailable (e.g. camera off); those gauges then show placeholders.
+fn QualityVuMeterDriver(
+    /// Reads the current video/audio live snapshot. `None` → those gauges reset
+    /// to the empty state ("Camera off" / "Idle").
     read_snapshot: SnapshotReader,
-    /// Reads the current screen-share live snapshot. Already `Option` (`None`
-    /// while not sharing); the screen gauge shows "Not sharing" placeholder.
+    /// Reads the current screen-share live snapshot. `None` (not sharing) → the
+    /// screen gauge shows "Not sharing".
     read_screen_snapshot: ScreenSnapshotReader,
 ) -> Element {
-    // Initial paint values (before the loop ticks). Uses the same pure mapper as
-    // the rAF loop so first paint and live updates share one empty-state.
-    let initial = read_snapshot.read();
-    let initial_screen = read_screen_snapshot.read();
-    let initial_state = gauge_state_from_snapshot(initial.as_ref(), initial_screen.as_ref());
-    let v_deg = initial_state.video_deg;
-    let a_deg = initial_state.audio_deg;
-    let s_deg = initial_state.screen_deg;
-    let v_text = initial_state.video_text.clone();
-    let a_text = initial_state.audio_text.clone();
-    let s_text = initial_state.screen_text.clone();
-
     // Shared cell holds the rAF closure so it can reschedule itself, and so the
-    // component's `use_drop` can drop it on unmount (stopping the loop). Created
-    // once per mount via `use_hook`.
+    // component's `use_drop` can drop it on unmount (stopping the loop).
     type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
     let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
 
@@ -840,7 +840,7 @@ pub fn QualityVuMeters(
         });
     }
 
-    // Stop the loop and drop the closure when the meter unmounts.
+    // Stop the loop and drop the closure when the driver unmounts.
     {
         let cb = cb.clone();
         use_drop(move || {
@@ -848,34 +848,7 @@ pub fn QualityVuMeters(
         });
     }
 
-    rsx! {
-        div { class: "perf-vu-row",
-            VuGauge {
-                testid: TESTID_VU_VIDEO,
-                needle_id: VIDEO_NEEDLE_ID,
-                readout_id: VIDEO_READOUT_ID,
-                label: "Video quality",
-                initial_deg: v_deg,
-                initial_readout: v_text,
-            }
-            VuGauge {
-                testid: TESTID_VU_AUDIO,
-                needle_id: AUDIO_NEEDLE_ID,
-                readout_id: AUDIO_READOUT_ID,
-                label: "Audio quality",
-                initial_deg: a_deg,
-                initial_readout: a_text,
-            }
-            VuGauge {
-                testid: TESTID_VU_SCREEN,
-                needle_id: SCREEN_NEEDLE_ID,
-                readout_id: SCREEN_READOUT_ID,
-                label: "Screen quality",
-                initial_deg: s_deg,
-                initial_readout: s_text,
-            }
-        }
-    }
+    rsx! {}
 }
 
 /// Tier-index → aria-valuetext label for a slider thumb at `position`.
@@ -910,9 +883,6 @@ fn DualRangeSlider(
     labels: Vec<&'static str>,
     /// Current thumbs in slider-position space.
     sel: RangeSel,
-    /// When `true` (stream on Auto), the inputs are `disabled` (skipped in tab
-    /// order) and the whole control is dimmed via the `is-auto` class.
-    disabled: bool,
     /// Called with the corrected [`RangeSel`] whenever a thumb moves.
     on_change: EventHandler<RangeSel>,
 ) -> Element {
@@ -923,11 +893,6 @@ fn DualRangeSlider(
     let max_id = format!("{id_prefix}-range-max");
     let min_valuetext = position_label(sel.min_pos, &labels).to_string();
     let max_valuetext = position_label(sel.max_pos, &labels).to_string();
-    let root_class = if disabled {
-        "perf-range is-auto"
-    } else {
-        "perf-range"
-    };
 
     // Fill highlight between the thumbs (percent of track).
     let (fill_left, fill_right) = if max_pos == 0 {
@@ -940,7 +905,7 @@ fn DualRangeSlider(
     };
 
     rsx! {
-        div { class: root_class,
+        div { class: "perf-range",
             // Worst-end (left) tier label.
             span { class: "perf-range-end-label", "{labels.last().copied().unwrap_or(\"\")}" }
             div { class: "perf-range-track-wrap",
@@ -959,7 +924,6 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{min_value}",
-                    disabled,
                     "aria-label": "Minimum {stream_noun} quality",
                     "aria-valuetext": "{min_valuetext}",
                     oninput: move |evt| {
@@ -977,7 +941,6 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{max_value}",
-                    disabled,
                     "aria-label": "Maximum {stream_noun} quality",
                     "aria-valuetext": "{max_valuetext}",
                     oninput: move |evt| {
@@ -993,14 +956,17 @@ fn DualRangeSlider(
     }
 }
 
-/// One stream's threshold group: header (Fixed badge + Auto toggle), the
-/// dual-thumb range slider (disabled while Auto), and the live range text.
+/// One stream's threshold section: its live VU needle gauge alongside the
+/// dual-thumb range slider, with the header (Fixed badge + Auto toggle) and the
+/// live range text.
 ///
-/// **Auto** is an explicit per-stream toggle (`aria-pressed`): active (default)
-/// = fully automatic, the slider is disabled + dimmed and bounds are `None/None`;
-/// inactive = the slider is interactive and the thumbs set the bounds. Clicking
-/// the button toggles it via `on_auto_toggle`; dragging a thumb (only possible
-/// when inactive) reports the new range via `on_change`.
+/// **Auto** is an explicit per-stream toggle (`aria-pressed`): when active
+/// (default), the slider stays **fully interactive** with both thumbs pinned at
+/// the extremes (full ladder span) and the encoder bounds are `None/None`. The
+/// only Auto-on cues are the green button + the thumbs at the ends — the slider
+/// is never disabled or dimmed. Clicking the button toggles Auto via
+/// `on_auto_toggle` (ON snaps thumbs back to the extremes); dragging a thumb
+/// inward reports the new range via `on_change`, which turns Auto OFF.
 #[allow(clippy::too_many_arguments)]
 #[component]
 fn ThresholdGroup(
@@ -1011,34 +977,108 @@ fn ThresholdGroup(
     max_testid: &'static str,
     auto_testid: &'static str,
     fixed_testid: &'static str,
+    /// "?" help button testid + its accessible label + the explanation copy.
+    help_testid: &'static str,
+    help_label: &'static str,
+    help_body: &'static str,
+    /// VU gauge identifiers + first-paint values for this stream's needle.
+    vu_testid: &'static str,
+    vu_needle_id: &'static str,
+    vu_readout_id: &'static str,
+    vu_label: &'static str,
+    vu_initial_deg: f32,
+    vu_initial_readout: String,
     labels: Vec<&'static str>,
     /// Current bounds: (best index, worst index), `None` = extreme on that end.
     best: Option<usize>,
     worst: Option<usize>,
     is_fixed: bool,
-    /// Whether this stream is currently on Auto (slider disabled).
+    /// Whether this stream is currently on Auto.
     is_auto: bool,
+    /// Which section's help popover is open (shared so opening one closes others).
+    /// Keyed by `id_prefix`.
+    open_help: Signal<Option<&'static str>>,
     on_change: EventHandler<RangeSel>,
     /// Toggle the Auto flag; the arg is the new desired state.
     on_auto_toggle: EventHandler<bool>,
 ) -> Element {
     let sel = bounds_to_thumbs(best, worst, labels.len());
-    // While Auto, the displayed range is always the full "Auto".
-    let range_str = if is_auto {
-        "Auto".to_string()
-    } else {
-        range_text(best, worst, &labels)
-    };
+    // The readout always describes the concrete slider span (full ladder while
+    // Auto, since both thumbs sit at the extremes), not the encoder semantics.
+    let range_str = span_text(sel, &labels);
     let auto_button_class = if is_auto {
         "perf-auto-button is-active"
     } else {
         "perf-auto-button"
     };
+    let mut open_help = open_help;
+    let help_open = open_help() == Some(id_prefix);
+    let help_popover_id = format!("{id_prefix}-help-popover");
+    let help_btn_id = format!("{id_prefix}-help-btn");
 
     rsx! {
         div { class: "perf-stream-group",
             div { class: "perf-stream-header",
                 span { class: "perf-stream-title", "{title}" }
+                // "?" help button + popover.
+                div { class: "perf-help",
+                    button {
+                        id: "{help_btn_id}",
+                        r#type: "button",
+                        class: "perf-help-button",
+                        "data-testid": help_testid,
+                        "aria-label": help_label,
+                        "aria-haspopup": "dialog",
+                        "aria-expanded": if help_open { "true" } else { "false" },
+                        "aria-controls": "{help_popover_id}",
+                        onclick: move |e: MouseEvent| {
+                            e.stop_propagation();
+                            if help_open {
+                                open_help.set(None);
+                            } else {
+                                open_help.set(Some(id_prefix));
+                            }
+                        },
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if evt.key() == Key::Escape && help_open {
+                                evt.stop_propagation();
+                                open_help.set(None);
+                            }
+                        },
+                        "?"
+                    }
+                    if help_open {
+                        // Transparent full-viewport scrim: any click outside the
+                        // popover closes it (touch-friendly outside-click).
+                        div {
+                            class: "perf-help-scrim",
+                            "aria-hidden": "true",
+                            onclick: move |e: MouseEvent| {
+                                e.stop_propagation();
+                                open_help.set(None);
+                            },
+                        }
+                        div {
+                            id: "{help_popover_id}",
+                            class: "perf-help-popover",
+                            role: "dialog",
+                            "aria-label": help_label,
+                            // Keep clicks inside from reaching the scrim.
+                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                            onkeydown: {
+                                let help_btn_id = help_btn_id.clone();
+                                move |evt: KeyboardEvent| {
+                                    if evt.key() == Key::Escape {
+                                        evt.stop_propagation();
+                                        open_help.set(None);
+                                        focus_element_by_id_local(&help_btn_id);
+                                    }
+                                }
+                            },
+                            p { class: "perf-help-popover-text", "{help_body}" }
+                        }
+                    }
+                }
                 if is_fixed {
                     span {
                         class: "perf-fixed-badge",
@@ -1055,7 +1095,7 @@ fn ThresholdGroup(
                     "aria-pressed": if is_auto { "true" } else { "false" },
                     "aria-label": "Automatic {stream_noun} quality",
                     title: if is_auto {
-                        "Automatic — click to set manual quality limits"
+                        "Automatic (full range) — click to set manual quality limits"
                     } else {
                         "Manual limits — click for fully automatic quality"
                     },
@@ -1063,21 +1103,33 @@ fn ThresholdGroup(
                     "Auto"
                 }
             }
-            DualRangeSlider {
-                id_prefix,
-                min_testid,
-                max_testid,
-                stream_noun,
-                labels: labels.clone(),
-                sel,
-                disabled: is_auto,
-                on_change: move |s: RangeSel| on_change.call(s),
-            }
-            p {
-                class: "perf-range-value",
-                "data-testid": "{id_prefix}-range-value",
-                "aria-live": "polite",
-                "Range: {range_str}"
+            // Needle gauge (left) beside the slider + range text (right).
+            div { class: "perf-stream-body",
+                VuGauge {
+                    testid: vu_testid,
+                    needle_id: vu_needle_id,
+                    readout_id: vu_readout_id,
+                    label: vu_label,
+                    initial_deg: vu_initial_deg,
+                    initial_readout: vu_initial_readout,
+                }
+                div { class: "perf-stream-controls",
+                    DualRangeSlider {
+                        id_prefix,
+                        min_testid,
+                        max_testid,
+                        stream_noun,
+                        labels: labels.clone(),
+                        sel,
+                        on_change: move |s: RangeSel| on_change.call(s),
+                    }
+                    p {
+                        class: "perf-range-value",
+                        "data-testid": "{id_prefix}-range-value",
+                        "aria-live": "polite",
+                        "Range: {range_str}"
+                    }
+                }
             }
         }
     }
@@ -1101,6 +1153,16 @@ pub fn PerformanceSettingsPanel(
     let audio_fixed = pref.audio_is_fixed();
     let screen_fixed = pref.screen_is_fixed();
 
+    // First-paint gauge values (before the rAF driver ticks). The same pure
+    // mapper drives the live loop, so first paint and live updates agree.
+    let initial = read_snapshot.read();
+    let initial_screen = read_screen_snapshot.read();
+    let g = gauge_state_from_snapshot(initial.as_ref(), initial_screen.as_ref());
+
+    // Which popover (if any) is currently open. `None` = all closed. Shared
+    // across the three sections so opening one closes the others.
+    let open_help: Signal<Option<&'static str>> = use_signal(|| None);
+
     rsx! {
         h3 { class: "settings-section-title", "Performance" }
         p { class: "settings-section-description",
@@ -1109,11 +1171,9 @@ pub fn PerformanceSettingsPanel(
             "may drop to, the right thumb the highest it may rise to."
         }
 
-        // ── Live VU meters (top) ──
-        div { class: "perf-vu-section",
-            span { class: "perf-vu-section-title", "Current quality" }
-            QualityVuMeters { read_snapshot, read_screen_snapshot }
-        }
+        // Headless driver: owns the single ~4 Hz rAF loop that updates all three
+        // needles by id. Renders nothing; the gauges live in the sections below.
+        QualityVuMeterDriver { read_snapshot, read_screen_snapshot }
 
         // ── Video Thresholds ──
         ThresholdGroup {
@@ -1124,11 +1184,21 @@ pub fn PerformanceSettingsPanel(
             max_testid: TESTID_VIDEO_RANGE_MAX,
             auto_testid: TESTID_VIDEO_AUTO,
             fixed_testid: "perf-video-fixed-badge",
+            help_testid: "perf-video-help",
+            help_label: "About video quality",
+            help_body: "Sets the best (right) and worst (left) video quality the call may use. The app automatically adapts resolution and frame rate between these limits based on your network. Auto uses the full range.",
+            vu_testid: TESTID_VU_VIDEO,
+            vu_needle_id: VIDEO_NEEDLE_ID,
+            vu_readout_id: VIDEO_READOUT_ID,
+            vu_label: "Video quality",
+            vu_initial_deg: g.video_deg,
+            vu_initial_readout: g.video_text.clone(),
             labels: VIDEO_TIER_LABELS.to_vec(),
             best: pref.video_max,
             worst: pref.video_min,
             is_fixed: video_fixed,
             is_auto: pref.video_auto,
+            open_help,
             on_change: move |sel: RangeSel| {
                 on_change.call(pref.with_video_thumbs(sel));
             },
@@ -1146,60 +1216,27 @@ pub fn PerformanceSettingsPanel(
             max_testid: TESTID_AUDIO_RANGE_MAX,
             auto_testid: TESTID_AUDIO_AUTO,
             fixed_testid: "perf-audio-fixed-badge",
+            help_testid: "perf-audio-help",
+            help_label: "About audio quality",
+            help_body: "Sets the best and worst audio quality (bitrate) the call may use. Audio only steps down once video is already at its lowest quality, so these limits mainly matter under heavy congestion.",
+            vu_testid: TESTID_VU_AUDIO,
+            vu_needle_id: AUDIO_NEEDLE_ID,
+            vu_readout_id: AUDIO_READOUT_ID,
+            vu_label: "Audio quality",
+            vu_initial_deg: g.audio_deg,
+            vu_initial_readout: g.audio_text.clone(),
             labels: AUDIO_TIER_LABELS.to_vec(),
             best: pref.audio_max,
             worst: pref.audio_min,
             is_fixed: audio_fixed,
             is_auto: pref.audio_auto,
+            open_help,
             on_change: move |sel: RangeSel| {
                 on_change.call(pref.with_audio_thumbs(sel));
             },
             on_auto_toggle: move |on: bool| {
                 on_change.call(pref.set_audio_auto(on));
             },
-        }
-
-        // Audio caveat surfaced with the same info-panel treatment the Network
-        // tab uses for its "Protocol pinned" advisory. Placed under the audio
-        // thresholds so it sits with the controls it qualifies.
-        div {
-            class: "settings-info-panel perf-audio-info",
-            role: "note",
-            div { class: "settings-info-panel-icon",
-                svg {
-                    view_box: "0 0 24 24",
-                    width: "16",
-                    height: "16",
-                    "aria-hidden": "true",
-                    circle {
-                        cx: "12",
-                        cy: "12",
-                        r: "10",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "1.5",
-                    }
-                    path {
-                        d: "M12 8v5",
-                        stroke: "currentColor",
-                        stroke_width: "1.5",
-                        stroke_linecap: "round",
-                    }
-                    circle {
-                        cx: "12",
-                        cy: "16",
-                        r: "0.9",
-                        fill: "currentColor",
-                    }
-                }
-            }
-            div { class: "settings-info-panel-body",
-                p { class: "settings-info-panel-title", "Audio adapts after video" }
-                p { class: "settings-info-panel-text",
-                    "Audio only adapts once video has reached its lowest tier, so "
-                    "audio limits may have no visible effect until then."
-                }
-            }
         }
 
         // ── Screen Share Thresholds ──
@@ -1211,11 +1248,21 @@ pub fn PerformanceSettingsPanel(
             max_testid: TESTID_SCREEN_RANGE_MAX,
             auto_testid: TESTID_SCREEN_AUTO,
             fixed_testid: "perf-screen-fixed-badge",
+            help_testid: "perf-screen-help",
+            help_label: "About shared-content quality",
+            help_body: "Sets the best and worst quality for screen / shared-content sharing. This is independent of your camera video — shared content adapts on its own between these limits.",
+            vu_testid: TESTID_VU_SCREEN,
+            vu_needle_id: SCREEN_NEEDLE_ID,
+            vu_readout_id: SCREEN_READOUT_ID,
+            vu_label: "Screen quality",
+            vu_initial_deg: g.screen_deg,
+            vu_initial_readout: g.screen_text.clone(),
             labels: SCREEN_TIER_LABELS.to_vec(),
             best: pref.screen_max,
             worst: pref.screen_min,
             is_fixed: screen_fixed,
             is_auto: pref.screen_auto,
+            open_help,
             on_change: move |sel: RangeSel| {
                 on_change.call(pref.with_screen_thumbs(sel));
             },
@@ -1512,13 +1559,71 @@ mod tests {
     }
 
     #[test]
-    fn range_text_renders_auto_and_pairs() {
+    fn span_text_renders_concrete_endpoints_including_full_ladder() {
         let v = &VIDEO_TIER_LABELS;
-        assert_eq!(range_text(None, None, v), "Auto");
-        assert_eq!(range_text(Some(0), None, v), "Auto – 1080p");
-        assert_eq!(range_text(None, Some(7), v), "240p – Auto");
-        assert_eq!(range_text(Some(1), Some(5), v), "360p – 900p");
-        assert_eq!(range_text(Some(3), Some(3), v), "540p");
+        // Full ladder (both thumbs at extremes = Auto-on visual) → concrete span.
+        assert_eq!(
+            span_text(
+                RangeSel {
+                    min_pos: 0,
+                    max_pos: 7
+                },
+                v
+            ),
+            "240p – 1080p"
+        );
+        // Partial manual range.
+        assert_eq!(
+            span_text(
+                RangeSel {
+                    min_pos: 2,
+                    max_pos: 6
+                },
+                v
+            ),
+            "360p – 900p"
+        );
+        // Both thumbs together → single label (pinned). pos 3 → tier index
+        // 7-3=4 → "480p".
+        assert_eq!(
+            span_text(
+                RangeSel {
+                    min_pos: 3,
+                    max_pos: 3
+                },
+                v
+            ),
+            "480p"
+        );
+        // Audio full ladder.
+        assert_eq!(
+            span_text(
+                RangeSel {
+                    min_pos: 0,
+                    max_pos: 3
+                },
+                &AUDIO_TIER_LABELS
+            ),
+            "16 kbps – 50 kbps"
+        );
+    }
+
+    #[test]
+    fn auto_on_preference_yields_full_span_thumbs() {
+        // An Auto-on stream's bounds are None/None, which derive to thumbs at the
+        // extremes (full ladder) — what the always-interactive slider shows while
+        // Auto is on. No "disabled" concept exists anymore.
+        let pref = PerformancePreference::default(); // all auto
+        assert!(pref.video_auto);
+        let sel = bounds_to_thumbs(pref.video_max, pref.video_min, VIDEO_TIER_LABELS.len());
+        assert_eq!(
+            sel,
+            RangeSel {
+                min_pos: 0,
+                max_pos: VIDEO_TIER_LABELS.len() - 1
+            }
+        );
+        assert_eq!(span_text(sel, &VIDEO_TIER_LABELS), "240p – 1080p");
     }
 
     #[test]

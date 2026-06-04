@@ -7,22 +7,23 @@ import { waitForServices } from "../helpers/wait-for-services";
  * branch `feat/961-performance-quality-thresholds`).
  *
  * ─── Feature under test ──────────────────────────────────────────────────────
- * A new "Performance" tab inside the in-meeting device-settings modal. Top to
- * bottom it renders:
- *   1. Three live VU-meter needle gauges — Video / Audio / Screen — each with a
- *      live numeric readout (`perf-vu-{stream}-readout`). Readouts show
- *      `{w}x{h}·{fps}fps·{kbps}kbps` for video/screen, `{kbps} kbps` for audio,
- *      and the screen gauge shows the literal placeholder "Not sharing" while no
- *      screen share is active.
- *   2. Three "Thresholds" groups (Video / Audio / Screen Share). Each is a
- *      dual-thumb range slider (two overlaid native `<input type="range">`:
+ * A new "Performance" tab inside the in-meeting device-settings modal. It renders
+ * three per-stream "Thresholds" sections (Video / Audio / Screen Share), each of
+ * which contains, side by side:
+ *   1. That stream's live VU-meter needle gauge with a live numeric readout
+ *      (`perf-vu-{stream}-readout`). Readouts show `{w}x{h}·{fps}fps·{kbps}kbps`
+ *      for video/screen, `{kbps} kbps` for audio, and the screen gauge shows the
+ *      literal placeholder "Not sharing" while no screen share is active.
+ *   2. A dual-thumb range slider (two overlaid native `<input type="range">`:
  *      min/left = worst quality, max/right = best quality) plus a per-stream
- *      "Auto" toggle button (`aria-pressed`).
+ *      "?" help button and an "Auto" toggle button (`aria-pressed`).
  *
- * Auto is the default for all three streams: the toggle is `aria-pressed="true"`
- * (green `is-active`) and the slider's range inputs carry `disabled`. Turning
- * Auto off flips it to `aria-pressed="false"` and enables (removes `disabled`
- * from) that stream's two range inputs.
+ * Auto is the default for all three streams. While Auto is ON the toggle is
+ * `aria-pressed="true"` (green `is-active`) AND the slider is **fully
+ * interactive** (NOT disabled) with both thumbs pinned at the extremes (min at
+ * position 0, max at the top position) so it visibly shows the full ladder span.
+ * Turning Auto off flips the toggle to `aria-pressed="false"`; dragging a thumb
+ * inward also turns Auto off. There is no `disabled` state on the inputs.
  *
  * Choices persist to `localStorage["vc_performance_quality"]` as a
  * `PerformancePreference` JSON object:
@@ -33,11 +34,12 @@ import { waitForServices } from "../helpers/wait-for-services";
  * ─── Stable testids (from the Rust implementation) ───────────────────────────
  *   Tab/nav/panel:  settings-tab-performance (id) · settings-nav-performance
  *                   (data-testid, role="tab") · settings-panel-performance (id)
- *   VU gauges:      perf-vu-video / -audio / -screen
+ *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
  *                   readouts: perf-vu-{video,audio,screen}-readout (by id)
  *   Range inputs:   perf-{video,audio,screen}-range-min / -range-max
- *                   (native <input type=range>; carry `disabled` while Auto on)
+ *                   (native <input type=range>; always enabled)
  *   Auto toggles:   perf-{video,audio,screen}-auto (have aria-pressed)
+ *   Help buttons:   perf-{video,audio,screen}-help (aria-expanded popover)
  *   Range value:    perf-{video,audio,screen}-range-value
  *   Fixed badge:    perf-{video,audio,screen}-fixed-badge
  *
@@ -171,7 +173,7 @@ test.describe("Performance settings panel (#961)", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  test("panel renders: 3 VU gauges, 3 threshold groups, all Auto by default (disabled sliders)", async ({
+  test("panel renders: 3 VU gauges, 3 threshold groups, all Auto by default (enabled sliders, thumbs at extremes)", async ({
     page,
   }) => {
     await joinMeeting(page, "render");
@@ -179,30 +181,39 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // ── Three live VU gauges visible ──
+    // ── Three live VU gauges visible (one per stream section) ──
     await expect(panel.locator('[data-testid="perf-vu-video"]')).toBeVisible();
     await expect(panel.locator('[data-testid="perf-vu-audio"]')).toBeVisible();
     await expect(panel.locator('[data-testid="perf-vu-screen"]')).toBeVisible();
 
-    // ── Three threshold groups: assert each stream's slider pair + Auto toggle ──
+    // ── Three threshold groups: assert each stream's slider pair + Auto + help ──
     for (const stream of ["video", "audio", "screen"] as const) {
       await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeVisible();
       await expect(panel.locator(`[data-testid="perf-${stream}-range-max"]`)).toBeVisible();
       await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toBeVisible();
+      await expect(panel.locator(`[data-testid="perf-${stream}-help"]`)).toBeVisible();
     }
 
-    // ── Default = all-Auto: every toggle pressed, every range input disabled ──
+    // ── Default = all-Auto: every toggle pressed, but sliders stay ENABLED with
+    //    both thumbs pinned at the extremes (min at 0, max at the top position).
+    const topPos = { video: 7, audio: 3, screen: 2 } as const;
     for (const stream of ["video", "audio", "screen"] as const) {
       await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveAttribute(
         "aria-pressed",
         "true",
       );
-      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeDisabled();
-      await expect(panel.locator(`[data-testid="perf-${stream}-range-max"]`)).toBeDisabled();
+      const minInput = panel.locator(`[data-testid="perf-${stream}-range-min"]`);
+      const maxInput = panel.locator(`[data-testid="perf-${stream}-range-max"]`);
+      // Sliders are interactive while Auto (the refinement: never disabled).
+      await expect(minInput).toBeEnabled();
+      await expect(maxInput).toBeEnabled();
+      // Thumbs span the full ladder: min at position 0, max at the top position.
+      await expect(minInput).toHaveValue("0");
+      await expect(maxInput).toHaveValue(String(topPos[stream]));
     }
   });
 
-  test("Auto toggle: clicking flips aria-pressed and enables/disables the video range inputs", async ({
+  test("Auto toggle: flips aria-pressed and snaps thumbs to extremes; slider stays enabled throughout", async ({
     page,
   }) => {
     await joinMeeting(page, "auto_toggle");
@@ -213,22 +224,65 @@ test.describe("Performance settings panel (#961)", () => {
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-video-range-max"]');
 
-    // Default: Auto on → pressed + inputs disabled.
+    // Default: Auto on → pressed, inputs ENABLED, thumbs at extremes (0 and 7).
     await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
-    await expect(minInput).toBeDisabled();
-    await expect(maxInput).toBeDisabled();
+    await expect(minInput).toBeEnabled();
+    await expect(maxInput).toBeEnabled();
+    await expect(minInput).toHaveValue("0");
+    await expect(maxInput).toHaveValue("7");
 
-    // Turn Auto off → pressed flips false + inputs become enabled.
+    // Turn Auto OFF via the button → pressed flips false; inputs stay enabled.
     await autoBtn.click();
     await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
     await expect(minInput).toBeEnabled();
     await expect(maxInput).toBeEnabled();
 
-    // Turn Auto back on → pressed true + inputs disabled again.
+    // Drag a thumb inward → range narrows and Auto remains off.
+    await setRangeValue(page, "perf-video-range-max", 5);
+    await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(maxInput).toHaveValue("5");
+
+    // Turn Auto back ON → pressed true, thumbs snap back to the extremes, and the
+    // inputs are STILL enabled (never disabled by Auto).
     await autoBtn.click();
     await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
-    await expect(minInput).toBeDisabled();
-    await expect(maxInput).toBeDisabled();
+    await expect(minInput).toBeEnabled();
+    await expect(maxInput).toBeEnabled();
+    await expect(minInput).toHaveValue("0");
+    await expect(maxInput).toHaveValue("7");
+  });
+
+  test("help popover: '?' opens an explanation, Escape and outside-click dismiss it", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "help_popover");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    const helpBtn = panel.locator('[data-testid="perf-video-help"]');
+    const popover = page.locator("#perf-video-help-popover");
+
+    // Closed by default.
+    await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(popover).toHaveCount(0);
+
+    // Click "?" → popover opens with the explanation copy.
+    await helpBtn.click();
+    await expect(helpBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(popover).toBeVisible();
+    await expect(popover).toContainText(/best.*worst.*video quality/i);
+
+    // Escape closes it.
+    await page.keyboard.press("Escape");
+    await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(popover).toHaveCount(0);
+
+    // Re-open, then outside-click dismisses.
+    await helpBtn.click();
+    await expect(popover).toBeVisible();
+    await panel.locator('[data-testid="perf-video-range-value"]').click();
+    await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(popover).toHaveCount(0);
   });
 
   test("setting a video threshold persists to localStorage and restores after reload", async ({
@@ -239,7 +293,7 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Turn video Auto off so the slider is interactive.
+    // Turn video Auto off so the stream is in manual mode (bounds persist).
     await panel.locator('[data-testid="perf-video-auto"]').click();
     await expect(panel.locator('[data-testid="perf-video-auto"]')).toHaveAttribute(
       "aria-pressed",
@@ -349,7 +403,7 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Turn video Auto off so the slider is interactive.
+    // Turn video Auto off so the stream is in manual mode (bounds persist).
     await panel.locator('[data-testid="perf-video-auto"]').click();
     await expect(panel.locator('[data-testid="perf-video-auto"]')).toHaveAttribute(
       "aria-pressed",

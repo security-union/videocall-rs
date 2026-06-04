@@ -6220,6 +6220,67 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   color: var(--text-primary);
 }
 
+/* "?" help button + its popover, anchored next to the section title. */
+.perf-help {
+  position: relative;
+  display: inline-flex;
+}
+
+.perf-help-button {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-help-button:hover {
+  background: var(--field-bg-hover);
+  color: var(--text-primary);
+}
+
+.perf-help-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Transparent outside-click catcher behind the popover. */
+.perf-help-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: transparent;
+}
+
+.perf-help-popover {
+  position: absolute;
+  z-index: 1001;
+  top: calc(100% + 8px);
+  left: 0;
+  width: 260px;
+  max-width: 80vw;
+  padding: 12px 14px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.perf-help-popover-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
 .perf-fixed-badge {
   font-size: 11px;
   font-weight: 600;
@@ -6267,20 +6328,24 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   background: var(--success-bg-soft-hover);
 }
 
+/* Per-section body: the VU needle gauge beside the slider + range text. */
+.perf-stream-body {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.perf-stream-controls {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 /* ── Dual-thumb range slider ── */
 
 .perf-range {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-/* Auto ACTIVE: the slider is disabled + dimmed and ignores pointer input.
-   (The inputs also carry the `disabled` attribute, so they are removed from the
-   tab order — this is the visual half.) */
-.perf-range.is-auto {
-  opacity: 0.45;
-  pointer-events: none;
 }
 
 .perf-range-end-label {
@@ -6380,47 +6445,24 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   color: var(--text-secondary);
 }
 
-/* Space the audio caveat info-panel away from the slider above it. */
-.perf-audio-info {
-  margin-top: 14px;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .perf-range-fill {
     transition: none;
   }
 }
 
-/* ── VU meters ── */
-
-.perf-vu-section {
-  margin: 22px 0 8px;
-}
-
-.perf-vu-section-title {
-  display: block;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
-}
-
-.perf-vu-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-}
+/* ── Per-section VU needle gauge (sits beside each slider) ── */
 
 .perf-vu-gauge {
-  flex: 1 1 160px;
-  min-width: 150px;
+  flex: 0 0 auto;
+  width: 150px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 14px 12px 12px;
-  background: var(--surface-elevated);
+  padding: 12px 10px 10px;
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
 }
 
@@ -6465,5 +6507,17 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 @media (prefers-reduced-motion: reduce) {
   .perf-vu-needle {
     transition: none;
+  }
+}
+
+/* On narrow widths stack the needle above the slider instead of beside it. */
+@media (max-width: 540px) {
+  .perf-stream-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .perf-vu-gauge {
+    width: 100%;
   }
 }

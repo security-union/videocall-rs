@@ -73,15 +73,20 @@
  * flag = 3, in which case the publisher emits a single layer. Test 1 detects
  * this (`layer_count <= 1`) and SKIPS rather than asserts a false negative.
  *
- * Selectors used (all stable, defined in dioxus-ui source):
- *   - `[data-testid="open-settings"]`           toolbar gear (settings modal)
- *   - `.device-settings-modal`                  the settings modal root
- *   - `role="tab" name="Performance"`           Performance nav tab
- *   - `#settings-panel-performance`             the perf tabpanel
- *   - `#perf-vu-video-readout`                  video received-quality readout
+ * Selectors used (all stable, defined in dioxus-ui source). This spec targets
+ * the RECEIVE side only; since the unified send+receive panel landed (#1078) the
+ * receive controls/needles live under the `perf-recv-*` / `perf-vu-recv-*`
+ * namespace (the bare `perf-*` / `perf-vu-*` ids are now the SEND side):
+ *   - `[data-testid="open-settings"]`               toolbar gear (settings modal)
+ *   - `.device-settings-modal`                      the settings modal root
+ *   - `role="tab" name="Performance"`               Performance nav tab
+ *   - `#settings-panel-performance`                 the perf tabpanel
+ *   - `#perf-vu-recv-video-readout`                 video received-quality readout
  *       text format: `L{idx+1}/{count} · {w}x{h}` or "Not receiving"
- *   - `[data-testid="perf-video-range-max"]`    video max-layer range thumb
- *   - `[data-testid="perf-video-auto"]`         video Auto toggle (aria-pressed)
+ *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
+ *       text format: `L{idx+1}/{count} · {kbps} kbps` or "Not receiving"
+ *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
+ *   - `[data-testid="perf-recv-video-auto"]`        video Auto toggle (aria-pressed)
  */
 
 import { test, expect, chromium, Browser, Page } from "@playwright/test";
@@ -148,21 +153,21 @@ async function openPerformancePanel(page: Page) {
 }
 
 /**
- * Parse the video received-quality readout `#perf-vu-video-readout`.
+ * Parse the video received-quality readout `#perf-vu-recv-video-readout`.
  * Returns null while the readout reads "Not receiving" (nothing decoded yet),
  * otherwise `{ layerIndex, layerCount }` (1-based "L{idx+1}/{count}" → 0-based).
  */
 async function readVideoLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number } | null> {
-  const text = (await page.locator("#perf-vu-video-readout").textContent())?.trim() ?? "";
+  const text = (await page.locator("#perf-vu-recv-video-readout").textContent())?.trim() ?? "";
   const m = text.match(/^L(\d+)\/(\d+)/);
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
 }
 
 /**
- * Parse the AUDIO received-quality readout `#perf-vu-audio-readout`.
+ * Parse the AUDIO received-quality readout `#perf-vu-recv-audio-readout`.
  *
  * The audio readout format (see `format_readout` in
  * `dioxus-ui/src/components/performance_settings.rs`) is
@@ -182,7 +187,7 @@ async function readVideoLayer(
 async function readAudioLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number; kbps: number } | null> {
-  const text = (await page.locator("#perf-vu-audio-readout").textContent())?.trim() ?? "";
+  const text = (await page.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "";
   const m = text.match(/^L(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
   if (!m) return null;
   return {
@@ -347,14 +352,14 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // Turn Auto OFF (so the manual range applies) then drag the max thumb to
       // the lowest layer (index 0 = "360p"). The slider is an <input type=range>
       // with min=0 / max=top; setting value to 0 pins max → layer 0.
-      const autoToggle = rxPage.locator('[data-testid="perf-video-auto"]');
+      const autoToggle = rxPage.locator('[data-testid="perf-recv-video-auto"]');
       // The toggle reports state via aria-pressed; only click it off if on.
       const autoPressed = await autoToggle.getAttribute("aria-pressed");
       if (autoPressed === "true") {
         await autoToggle.click();
       }
 
-      const maxThumb = rxPage.locator('[data-testid="perf-video-range-max"]');
+      const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
       await expect(maxThumb).toBeVisible({ timeout: 10_000 });
       // Set the range input to its lowest position and fire input so Dioxus's
       // oninput handler persists the new bound.
@@ -435,11 +440,11 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       // Default state: video Auto is ON (aria-pressed="true"), and both thumbs
       // sit at the extremes (min=0, max=top) = full range = Auto.
-      const autoToggle = rxPage.locator('[data-testid="perf-video-auto"]');
+      const autoToggle = rxPage.locator('[data-testid="perf-recv-video-auto"]');
       await expect(autoToggle).toHaveAttribute("aria-pressed", "true");
 
-      const minThumb = rxPage.locator('[data-testid="perf-video-range-min"]');
-      const maxThumb = rxPage.locator('[data-testid="perf-video-range-max"]');
+      const minThumb = rxPage.locator('[data-testid="perf-recv-video-range-min"]');
+      const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
       await expect(minThumb).toHaveValue("0");
       // The max thumb sits at the top index (full range). The exact top value is
       // the ladder size minus one; assert it is non-zero (range spans up).
@@ -449,12 +454,15 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // The needle gauge is present and the readout reflects auto-selection
       // (either actively decoding "L../.." or "Not receiving" before first
       // frame). It must NOT be artificially clamped — full range is in effect.
-      await expect(panel.locator("#perf-vu-video-readout")).toBeVisible();
+      await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
       await expect
-        .poll(async () => (await rxPage.locator("#perf-vu-video-readout").textContent())?.trim(), {
-          timeout: 45_000,
-          intervals: [500, 1000, 2000],
-        })
+        .poll(
+          async () => (await rxPage.locator("#perf-vu-recv-video-readout").textContent())?.trim(),
+          {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+          },
+        )
         .toMatch(/^(L\d+\/\d+|Not receiving)/);
     } finally {
       await pubBrowser.close();
@@ -507,25 +515,27 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       const panel = await openPerformancePanel(rxPage);
 
-      // Every kind must expose its full control set: needle gauge, Auto toggle,
-      // and dual-thumb range (min + max). Content === Screen kind (testid prefix
-      // `perf-screen`, labelled "Shared content" in the UI).
+      // Every kind must expose its full RECEIVE control set: needle gauge, Auto
+      // toggle, and dual-thumb range (min + max). The unified panel (#1078) puts
+      // the receive controls under the `perf-recv-*` / `perf-vu-recv-*`
+      // namespace. Content === Screen kind (testid prefix `perf-recv-screen`,
+      // labelled "Shared content" in the UI).
       for (const kind of ["video", "audio", "screen"] as const) {
         await expect(
-          panel.locator(`[data-testid="perf-vu-${kind}"]`),
-          `${kind} needle gauge present`,
+          panel.locator(`[data-testid="perf-vu-recv-${kind}"]`),
+          `${kind} receive needle gauge present`,
         ).toBeVisible();
         await expect(
-          panel.locator(`[data-testid="perf-${kind}-auto"]`),
-          `${kind} Auto toggle present`,
+          panel.locator(`[data-testid="perf-recv-${kind}-auto"]`),
+          `${kind} receive Auto toggle present`,
         ).toBeVisible();
         await expect(
-          panel.locator(`[data-testid="perf-${kind}-range-min"]`),
-          `${kind} min thumb present`,
+          panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`),
+          `${kind} receive min thumb present`,
         ).toBeAttached();
         await expect(
-          panel.locator(`[data-testid="perf-${kind}-range-max"]`),
-          `${kind} max thumb present`,
+          panel.locator(`[data-testid="perf-recv-${kind}-range-max"]`),
+          `${kind} receive max thumb present`,
         ).toBeAttached();
       }
 
@@ -533,12 +543,15 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // actively decoding ("L../.. kbps") or the "Not receiving" placeholder
       // before the first audio frame. (Layer-count content is asserted in the
       // dedicated audio-layering test below.)
-      await expect(panel.locator("#perf-vu-audio-readout")).toBeVisible();
+      await expect(panel.locator("#perf-vu-recv-audio-readout")).toBeVisible();
       await expect
-        .poll(async () => (await rxPage.locator("#perf-vu-audio-readout").textContent())?.trim(), {
-          timeout: 45_000,
-          intervals: [500, 1000, 2000],
-        })
+        .poll(
+          async () => (await rxPage.locator("#perf-vu-recv-audio-readout").textContent())?.trim(),
+          {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+          },
+        )
         .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)/);
     } finally {
       await pubBrowser.close();

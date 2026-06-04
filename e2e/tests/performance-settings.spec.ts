@@ -32,8 +32,15 @@ import { waitForServices } from "../helpers/wait-for-services";
  * Default = all-Auto (every `*_auto` true, every bound null).
  *
  * ─── Stable testids (from the Rust implementation) ───────────────────────────
+ *
+ * The panel unified into ONE component (PR #1078) with, per kind, a **Send** row
+ * AND a **Receive** row. SEND-side testids are UNCHANGED (below); RECEIVE-side
+ * uses the `perf-recv-*` / `perf-vu-recv-*` namespace (further down).
+ *
  *   Tab/nav/panel:  settings-tab-performance (id) · settings-nav-performance
  *                   (data-testid, role="tab") · settings-panel-performance (id)
+ *
+ *   SEND row (this spec's primary coverage; testids unchanged by #1078):
  *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
  *                   readouts: perf-vu-{video,audio,screen}-readout (by id)
  *   Range inputs:   perf-{video,audio,screen}-range-min / -range-max
@@ -42,6 +49,18 @@ import { waitForServices } from "../helpers/wait-for-services";
  *   Help buttons:   perf-{video,audio,screen}-help (aria-expanded popover)
  *   Range value:    perf-{video,audio,screen}-range-value
  *   Fixed badge:    perf-{video,audio,screen}-fixed-badge
+ *
+ *   RECEIVE row (#1078; covered by the "Receive-side controls" describe block):
+ *   VU gauges:      perf-vu-recv-video / -audio / -screen
+ *                   readouts: perf-vu-recv-{video,audio,screen}-readout (by id)
+ *                   format: `L{i}/{N} · {w}x{h}` (video/screen),
+ *                           `L{i}/{N} · {kbps} kbps` (audio),
+ *                           "Not receiving" placeholder when nothing decoded.
+ *   Range inputs:   perf-recv-{video,audio,screen}-range-min / -range-max
+ *   Auto toggles:   perf-recv-{video,audio,screen}-auto (have aria-pressed)
+ *   Help buttons:   perf-recv-{video,audio,screen}-help
+ *   Range value:    perf-recv-{video,audio,screen}-range-value
+ *   Fixed badge:    perf-recv-{video,audio,screen}-fixed-badge
  *
  * ─── How the panel is reached ────────────────────────────────────────────────
  * The Performance tab lives inside the in-meeting device-settings modal, so each
@@ -420,6 +439,161 @@ test.describe("Performance settings panel (#961)", () => {
     // The "Fixed" badge for the video stream becomes visible once both bounds
     // resolve to the same tier.
     await expect(panel.locator('[data-testid="perf-video-fixed-badge"]')).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RECEIVE-side controls (#1078 — unified send+receive panel).
+//
+// The unified panel renders a Receive row PER KIND alongside the Send row, each
+// with its own dual-thumb range slider, Auto toggle, "?" help, Fixed badge, and
+// a live "Receiving" needle. These use the `perf-recv-*` / `perf-vu-recv-*`
+// namespace (distinct from the send-side ids the block above covers). This block
+// asserts the receive row renders and behaves; it is single-page (no peer), so
+// the receive needle shows the "Not receiving" placeholder (the cross-peer
+// received-layer assertions live in simulcast-per-receiver.spec.ts).
+// ---------------------------------------------------------------------------
+test.describe("Performance settings panel — Receive-side controls (#1078)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test.beforeEach(async ({ context, baseURL }) => {
+    await injectSessionCookie(context, { baseURL });
+  });
+
+  test("receive row renders a range slider, Auto toggle, and needle for each kind", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "recv_render");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    // Per kind, the RECEIVE row exposes its full control set in the perf-recv-*
+    // namespace: needle gauge, dual-thumb range (min + max), Auto toggle, help.
+    for (const kind of ["video", "audio", "screen"] as const) {
+      await expect(
+        panel.locator(`[data-testid="perf-vu-recv-${kind}"]`),
+        `${kind} receive needle gauge present`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`),
+        `${kind} receive min thumb present`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-range-max"]`),
+        `${kind} receive max thumb present`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-auto"]`),
+        `${kind} receive Auto toggle present`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-help"]`),
+        `${kind} receive help button present`,
+      ).toBeVisible();
+    }
+  });
+
+  test("receive row defaults to Auto with both thumbs at the extremes", async ({ page }) => {
+    await joinMeeting(page, "recv_auto_default");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    for (const kind of ["video", "audio", "screen"] as const) {
+      // Default = Auto ON (aria-pressed="true"), slider fully interactive with
+      // thumbs pinned to the extremes (min at 0, max at the ladder top).
+      await expect(panel.locator(`[data-testid="perf-recv-${kind}-auto"]`)).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+
+      const minInput = panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`);
+      const maxInput = panel.locator(`[data-testid="perf-recv-${kind}-range-max"]`);
+      await expect(minInput).toBeEnabled();
+      await expect(maxInput).toBeEnabled();
+      await expect(minInput).toHaveValue("0");
+      // Max sits at the ladder top (its own `max` attribute).
+      const top = await maxInput.getAttribute("max");
+      await expect(maxInput).toHaveValue(String(top));
+    }
+  });
+
+  test("receive Auto toggle flips aria-pressed and keeps the slider interactive", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "recv_auto_toggle");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    const autoBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
+    const minInput = panel.locator('[data-testid="perf-recv-video-range-min"]');
+
+    await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
+    await autoBtn.click();
+    await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
+    // The slider is never disabled (Auto is conveyed by the toggle + thumb
+    // positions, not a disabled state) — mirrors the send-side behavior.
+    await expect(minInput).toBeEnabled();
+  });
+
+  test("receive needle readout shows a valid received-layer line or the placeholder", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "recv_needle");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    // Single-page: no peer is sending, so the receive video needle must read the
+    // "Not receiving" placeholder. If a stream WERE being decoded it would show
+    // the `L{i}/{N} · {w}x{h}` shape; assert the union so the test is correct in
+    // both states (mirrors how the send-side test asserts its needle readout).
+    await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
+    await expect
+      .poll(
+        async () => (await panel.locator("#perf-vu-recv-video-readout").textContent())?.trim(),
+        {
+          timeout: 15_000,
+        },
+      )
+      .toMatch(/^(L\d+\/\d+ · \d+x\d+|Not receiving)$/);
+
+    // Audio receive readout: `L{i}/{N} · {kbps} kbps` or the placeholder.
+    await expect
+      .poll(
+        async () => (await panel.locator("#perf-vu-recv-audio-readout").textContent())?.trim(),
+        {
+          timeout: 15_000,
+        },
+      )
+      .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)$/);
+  });
+
+  test("receive fixed badge appears when a kind's two thumbs collapse to one layer", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "recv_fixed_badge");
+    await openPerformanceTab(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    // Turn the video RECEIVE Auto off (manual mode), then pin both thumbs to the
+    // same interior layer so min == max → the receive Fixed badge appears.
+    await panel.locator('[data-testid="perf-recv-video-auto"]').click();
+    await expect(panel.locator('[data-testid="perf-recv-video-auto"]')).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    await setRangeValue(page, "perf-recv-video-range-min", 1);
+    await setRangeValue(page, "perf-recv-video-range-max", 1);
+
+    await expect(panel.locator('[data-testid="perf-recv-video-fixed-badge"]')).toBeVisible({
       timeout: 10_000,
     });
   });

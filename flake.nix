@@ -62,6 +62,7 @@
           pkgs.trunk
           pkgs.wasm-bindgen-cli_0_2_108
           pkgs.tailwindcss
+          pkgs.miniserve
         ] ++ coreInputs;
 
         leptosEnv = {

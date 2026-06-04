@@ -1,6 +1,14 @@
 const DIOXUS_UI_URL = process.env.DIOXUS_UI_URL || "http://localhost:3001";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 const WS_URL = process.env.WS_CHECK_URL || "http://localhost:8080";
+// WebTransport health endpoint (TCP) — bound by the `webtransport_server`
+// binary from `HEALTH_LISTEN_URL` (see
+// `actix-api/src/bin/webtransport_server.rs`). The Playwright stack publishes
+// 5321 on the host so we can probe readiness here; the actual WT traffic
+// runs on UDP 4433 which has no portable readiness check. If the health
+// listener is up, the QUIC listener is up — both are spawned in the same
+// process.
+const WT_HEALTH_URL = process.env.WT_HEALTH_URL || "http://localhost:5321/healthz";
 
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 2_000;
@@ -20,6 +28,13 @@ export async function waitForServices(): Promise<void> {
     { name: "Dioxus UI", url: DIOXUS_UI_URL },
     { name: "Meeting API", url: `${API_URL}/session` },
     { name: "WebSocket API", url: WS_URL },
+    // WebTransport readiness — keep this last because it is the slowest to
+    // come up (debug build of `webtransport_server` + QUIC bind). Specs that
+    // force `vc_transport_preference=webtransport` rely on this being ready
+    // before they navigate; without it the WT handshake silently fails and
+    // every `canvas-container` assertion times out (see RCA in
+    // `e2e/tests/wt-persistent-streams-freeze-regression.spec.ts`).
+    { name: "WebTransport API", url: WT_HEALTH_URL },
   ];
 
   const deadline = Date.now() + MAX_WAIT_MS;

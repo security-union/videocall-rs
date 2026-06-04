@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod about_modal;
 pub mod appearance_settings_panel;
 pub mod attendants;
 pub mod browser_compatibility;
 pub mod call_timer;
+pub mod capability_check;
+pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
-mod density;
+pub mod decode_budget;
+pub mod decode_budget_inject;
+pub mod density;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;
@@ -16,6 +21,7 @@ pub mod host_controls;
 pub mod icons;
 pub mod login;
 pub mod meeting_ended_overlay;
+pub mod meeting_format;
 pub mod meeting_info;
 pub mod meetings_list;
 pub mod neteq_chart;

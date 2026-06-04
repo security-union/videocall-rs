@@ -121,6 +121,17 @@ pub enum Operation {
     Undefined,
 }
 
+impl Operation {
+    /// Total number of variants, derived from the last discriminant.
+    ///
+    /// This relies on `Undefined` being the final variant with default
+    /// (sequential) discriminant numbering starting at 0.  Adding a variant
+    /// after `Undefined` or reordering will cause the compile-time assertion
+    /// in `statistics.rs` to fire, signalling that this constant (or the
+    /// assertion) needs updating.
+    pub const VARIANT_COUNT: usize = Self::Undefined as usize + 1;
+}
+
 /// NetEQ statistics summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetEqStats {

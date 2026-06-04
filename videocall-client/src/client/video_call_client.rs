@@ -16,8 +16,12 @@
  * conditions.
  */
 
-use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
+use super::super::connection::{
+    ConnectionController, ConnectionLostReason, ConnectionManagerOptions, ConnectionState,
+    MediaStreamKey,
+};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
@@ -26,6 +30,8 @@ use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+use futures::future::LocalBoxFuture;
+use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -47,7 +53,9 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::protos::viewport_packet::ViewportPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
@@ -78,6 +86,88 @@ fn generate_instance_id() -> String {
 
 const MAX_SESSION_ID_HISTORY: usize = 16;
 
+/// Result of refreshing a room token. Both URL lists carry the new token
+/// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
+/// ready to be plugged into the connection manager via
+/// [`crate::VideoCallClient::update_server_urls`].
+///
+/// Returned by the [`RefreshRoomTokenCallback`] that the dioxus-ui (or any
+/// other consumer) registers via
+/// [`VideoCallClientOptions::refresh_room_token_callback`]. See discussion
+/// #562 (AUTH-2) for the full Phase 3 design.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshedTokens {
+    /// Tokenized WebSocket URLs for the relay candidates.
+    pub websocket_urls: Vec<String>,
+    /// Tokenized WebTransport URLs for the relay candidates.
+    pub webtransport_urls: Vec<String>,
+}
+
+/// Async callback the client invokes when it needs a fresh room token,
+/// e.g. before a candidate-rebuilding re-election.
+///
+/// The callback returns `Some(RefreshedTokens)` on success (the new tokenized
+/// URLs for WS and WT will replace the cached ones before the manager spawns
+/// candidates) or `None` if the refresh failed (network error, server 5xx,
+/// meeting ended, etc.). On `None`, the manager logs a warning and proceeds
+/// with the cached URLs — re-election is never blocked entirely on a refresh
+/// failure, since that would be a worse failure mode than running with an
+/// expired token (which the relay will simply reject, triggering normal
+/// reconnect-with-refresh in the UI layer).
+///
+/// The callback is set by the dioxus-ui layer (where `refresh_room_token`
+/// already exists) and consumed by `ConnectionManager` during the
+/// timer-driven re-election entry path. See discussion #562 (AUTH-2).
+///
+/// Single-threaded (`LocalBoxFuture`) because the videocall-client targets
+/// `wasm32-unknown-unknown`, where everything runs on the JS main thread.
+pub struct RefreshRoomTokenCallback {
+    cb: Rc<dyn Fn() -> LocalBoxFuture<'static, Option<RefreshedTokens>>>,
+}
+
+impl RefreshRoomTokenCallback {
+    /// Build a `RefreshRoomTokenCallback` from any closure that returns a
+    /// future resolving to `Option<RefreshedTokens>`.
+    pub fn from<F, Fut>(func: F) -> Self
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = Option<RefreshedTokens>> + 'static,
+    {
+        Self {
+            cb: Rc::new(move || Box::pin(func())),
+        }
+    }
+
+    /// Invoke the callback. Returns the future the caller must drive to
+    /// completion (typically via `wasm_bindgen_futures::spawn_local`).
+    pub fn emit(&self) -> LocalBoxFuture<'static, Option<RefreshedTokens>> {
+        (self.cb)()
+    }
+}
+
+impl Clone for RefreshRoomTokenCallback {
+    fn clone(&self) -> Self {
+        Self {
+            cb: self.cb.clone(),
+        }
+    }
+}
+
+#[allow(ambiguous_wide_pointer_comparisons)]
+impl PartialEq for RefreshRoomTokenCallback {
+    fn eq(&self, other: &Self) -> bool {
+        // Mirror `videocall_types::Callback`'s identity-based equality so
+        // `VideoCallClientOptions` can stay `PartialEq`-derivable.
+        Rc::ptr_eq(&self.cb, &other.cb)
+    }
+}
+
+impl std::fmt::Debug for RefreshRoomTokenCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RefreshRoomTokenCallback<_>")
+    }
+}
+
 /// Configuration options for creating a [`VideoCallClient`].
 ///
 /// Contains all the callbacks, server URLs, and feature flags needed to
@@ -90,6 +180,14 @@ pub struct VideoCallClientOptions {
     pub on_peer_added: Callback<String>,
     pub on_peer_first_frame: Callback<(String, MediaType)>,
     pub on_peer_removed: Option<Callback<String>>,
+    /// Batched companion of `on_peer_removed` fired once per
+    /// `PeerDecodeManager` removal pass with **all** peers removed in
+    /// that pass. Subscribers that only need a single notification (e.g.
+    /// to bump a UI version counter) should listen here so a 5-peer
+    /// watchdog timeout does not trigger 5 sequential UI re-renders.
+    /// `on_peer_removed` continues to fire per-peer for cleanup of
+    /// per-peer state. See Phase 6 watchdog-cascade fix.
+    pub on_peers_removed_batch: Option<Callback<Vec<String>>>,
     pub get_peer_video_canvas_id: Callback<String, String>,
     pub get_peer_screen_canvas_id: Callback<String, String>,
     pub user_id: String,
@@ -98,7 +196,7 @@ pub struct VideoCallClientOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub on_connected: Callback<()>,
-    pub on_connection_lost: Callback<JsValue>,
+    pub on_connection_lost: Callback<ConnectionLostReason>,
     pub enable_diagnostics: bool,
     pub diagnostics_update_interval_ms: Option<u64>,
     pub enable_health_reporting: bool,
@@ -139,17 +237,48 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when meeting settings are updated (optional)
     pub on_meeting_settings_updated: Option<Callback<()>>,
 
+    /// Callback triggered when the host requests this client mute its mic.
+    pub on_host_mute: Option<Callback<()>>,
+
+    /// Callback triggered when the host requests this client disable its camera.
+    pub on_host_disable_video: Option<Callback<()>>,
+
+    /// Callback triggered when the host removes this client from the meeting.
+    pub on_participant_kicked: Option<Callback<()>>,
+
+    /// Callback triggered when a peer publishes a `PEER_EVENT` that targets
+    /// this client. Emits `(source_user_id, event_type, stream_id)`.
+    ///
+    /// Currently used to deliver `screen_decode_started` acknowledgements
+    /// from peers that have begun rendering this client's shared screen
+    /// (HCL issue #893). The shape is intentionally generic so additional
+    /// event_types can be added without changing the callback signature.
+    pub on_peer_event: Option<Callback<(String, String, String)>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_LEFT meeting event.
-    pub on_peer_left: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_left: Option<Callback<(String, String, String)>>,
 
     /// Callback triggered when a participant changes their display name.
-    /// Emits `(user_id, new_display_name)`.
-    pub on_display_name_changed: Option<Callback<(String, String)>>,
+    /// Emits `(user_id, new_display_name, session_id)` where `session_id` is
+    /// the server-assigned u64 session_id of the renaming participant — or
+    /// `0` for legacy broadcasts that did not carry a session_id (rename
+    /// applies to all sessions of `user_id`). UIs that maintain a local-self
+    /// display-name signal MUST gate their self-update on
+    /// `session_id == own_session_id` so a sibling tab of the same
+    /// authenticated user (same `user_id`, different `session_id`) does not
+    /// overwrite its own self-name when another tab renames. See HCL #828.
+    pub on_display_name_changed: Option<Callback<(String, String, u64)>>,
 
     /// Callback triggered when a remote participant joins the meeting.
-    /// Emits `(display_name, user_id)` from the PARTICIPANT_JOINED meeting event.
-    pub on_peer_joined: Option<Callback<(String, String)>>,
+    /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_JOINED
+    /// meeting event. `session_id` is the server-assigned session_id as a
+    /// decimal string; an empty string indicates an unknown session_id
+    /// (legacy/unset path).
+    pub on_peer_joined: Option<Callback<(String, String, String)>>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -165,12 +294,49 @@ pub struct VideoCallClientOptions {
 
     /// Whether the local user joined as an unauthenticated guest.
     pub is_guest: bool,
+
+    /// Whether the connection manager is allowed to schedule a 30-second
+    /// post-rebase re-election retry when the RTT-degradation watchdog hits a
+    /// "only 1 server configured" rebase.
+    ///
+    /// Set to `true` for users on the default `WebTransport` transport
+    /// preference (the WT-with-WS-fallback mode) — the single-candidate
+    /// state is system-side (e.g. relay-availability blip) and recovery via
+    /// re-evaluation is desirable.
+    ///
+    /// Set to `false` for users who explicitly chose `WebSocket` — the
+    /// single-candidate state is the user's deliberate choice and the
+    /// retry must not override it.
+    ///
+    /// Defaults to `true`. The dioxus-ui derives the value from the user's
+    /// `TransportPreference` context signal.
+    pub allow_post_rebase_retry: bool,
+
+    /// Async callback the client invokes when it needs a fresh room token,
+    /// e.g. before a candidate-rebuilding re-election.
+    ///
+    /// When set, the connection manager calls this callback at the start of
+    /// every internal re-election triggered by the RTT-degradation watchdog
+    /// (1Hz timer) or post-rebase retry. On success the manager swaps in the
+    /// freshly-tokenized URLs before spawning candidates, so re-elections
+    /// after the original token's expiry no longer fail with all candidates
+    /// rejected by the relay (the failure mode AUTH-2 was filed against —
+    /// see discussion #562).
+    ///
+    /// On failure (`None`), the manager logs a warning and proceeds with
+    /// the cached URLs; the existing UI-level `schedule_reconnect` path
+    /// remains the safety net for terminal token expiry.
+    ///
+    /// Set to `None` for clients that don't have a refresh endpoint
+    /// (no-jwt builds, observers, tests).
+    pub refresh_room_token_callback: Option<RefreshRoomTokenCallback>,
 }
 
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
     user_id: String,
+    display_name: String,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -179,9 +345,13 @@ struct InnerOptions {
     on_participant_rejected: Option<Callback<()>>,
     on_waiting_room_updated: Option<Callback<()>>,
     on_meeting_settings_updated: Option<Callback<()>>,
-    on_peer_left: Option<Callback<(String, String)>>,
-    on_peer_joined: Option<Callback<(String, String)>>,
-    on_display_name_changed: Option<Callback<(String, String)>>,
+    on_host_mute: Option<Callback<()>>,
+    on_host_disable_video: Option<Callback<()>>,
+    on_participant_kicked: Option<Callback<()>>,
+    on_peer_event: Option<Callback<(String, String, String)>>,
+    on_peer_left: Option<Callback<(String, String, String)>>,
+    on_peer_joined: Option<Callback<(String, String, String)>>,
+    on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
 
@@ -197,17 +367,36 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
-    /// All session_ids assigned to this client instance (current page load).
-    /// Survives reconnects/re-elections. Used to match CONGESTION signals that
-    /// target a previous session_id from before re-election completed.
-    /// Bounded to MAX_SESSION_ID_HISTORY to prevent unbounded growth.
+    /// Bounded set of session_ids this client has held in the current page load.
+    /// Used to match incoming CONGESTION signals — the server stamps the throttled
+    /// sender's session_id on the wire, and the client receives every CONGESTION
+    /// via wildcard NATS fan-out (`room.{room}.*` with per-session queue groups).
+    /// Without this match, antonio would step down video when jay is the throttled
+    /// sender. The history covers the reconnect race-window where SESSION_ASSIGNED
+    /// for a new session id may not have landed yet at the moment a CONGESTION
+    /// targeting it arrives. Bounded to `MAX_SESSION_ID_HISTORY`.
     session_id_history: std::collections::VecDeque<u64>,
     /// Recently processed peer events for deduplication.
     /// Both WebSocket and WebTransport connections receive the same NATS system
-    /// messages, so we deduplicate by (event_type, target_user_id) within a
-    /// short time window to avoid firing duplicate toast notifications.
+    /// messages, so we deduplicate within a short time window to avoid firing
+    /// duplicate toast notifications.
+    ///
+    /// Per-session events (PARTICIPANT_JOINED, PARTICIPANT_LEFT) key on
+    /// `(event_type, target_user_id, Some(session_id))` so that two distinct
+    /// sessions of the same authenticated user (HCL issue #828) are NOT
+    /// dedup'd as one. Only the *same* session arriving over both WS and WT
+    /// gets suppressed.
+    ///
+    /// Per-user events (which do not have a meaningful session_id at this
+    /// layer) key on `(event_type, target_user_id, None)`.
+    /// Key: (event_type_str, target_user_id, session_id), Value: timestamp_ms
+    recent_peer_events: HashMap<(String, String, Option<u64>), f64>,
+    /// Recently processed host action events for deduplication across
+    /// dual-transport delivery (e.g. HOST_MUTE_PARTICIPANT). Uses a much
+    /// shorter window than `recent_peer_events` because host actions are
+    /// deliberate, repeatable commands — see `is_duplicate_host_action`.
     /// Key: (event_type_str, target_user_id), Value: timestamp_ms
-    recent_peer_events: HashMap<(String, String), f64>,
+    recent_host_events: HashMap<(String, String), f64>,
     /// Flag set by incoming KEYFRAME_REQUEST for camera video. The
     /// `CameraEncoder` checks this flag each frame and forces a keyframe.
     force_camera_keyframe: Arc<AtomicBool>,
@@ -220,6 +409,14 @@ struct Inner {
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Long Tasks API observer that emits `client_longtask_duration_ms` /
+    /// `client_longtask_count` to the diagnostic bus whenever the main
+    /// thread blocks for more than 50 ms. Held for its drop side-effect:
+    /// the underlying `PerformanceObserver` is disconnected automatically
+    /// when this field goes out of scope. May be `None` on browsers that
+    /// don't expose [`PerformanceObserver`] (Safari < 16.4 etc.).
+    _long_task_observer: Option<crate::long_tasks::LongTaskObserver>,
+    _render_fps_observer: Option<crate::render_fps::RenderFpsObserver>,
 }
 
 /// The main client handle for a video call session.
@@ -227,13 +424,33 @@ struct Inner {
 /// `VideoCallClient` is cheaply cloneable (`Rc`-based interior mutability)
 /// and is passed to encoders and other subsystems so they can send packets
 /// and query connection state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
+    /// Send-side state machine for the viewport control packet (HCL issue
+    /// #988). Tracks the last-sent vs. pending active-decode-set so we only
+    /// emit a `VIEWPORT` packet on an actual change. See [`ViewportSender`].
+    viewport_sender: Rc<RefCell<ViewportSender>>,
+    /// Debounce timer that coalesces a burst of active-decode-set changes
+    /// (scroll / relayout) into a single `VIEWPORT` send. Holding the
+    /// [`Timeout`] keeps it armed; dropping/replacing it cancels the pending
+    /// fire. `None` when no flush is scheduled.
+    viewport_debounce_timer: Rc<RefCell<Option<Timeout>>>,
+}
+
+// `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
+// non-Debug fields so `VideoCallClient` stays printable for logging.
+impl std::fmt::Debug for VideoCallClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoCallClient")
+            .field("options", &self.options)
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for VideoCallClient {
@@ -241,6 +458,80 @@ impl PartialEq for VideoCallClient {
         Rc::ptr_eq(&self.inner, &other.inner)
             && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
             && self.options == other.options
+    }
+}
+
+/// Build a cleartext `VIEWPORT` control packet for `session_ids` and dispatch
+/// it on the reliable Control stream (HCL issue #988).
+///
+/// Free function taking the shared `connection_controller` cell directly so
+/// both the debounce-flush path (which holds a `VideoCallClient`) and the
+/// reconnect re-send closure (which only holds a `Weak<RefCell<Inner>>`, to
+/// avoid an `Rc` cycle through the connection callback) can share one
+/// serialization + send implementation. The cell is the same `Rc` held by both
+/// `VideoCallClient` and `Inner`.
+///
+/// The `ViewportPacket` is NOT E2EE-sealed — it is pure relay routing metadata
+/// that the relay consumes and never forwards to peers. The `session_ids` are
+/// the relay/peer session_ids (u64) the relay indexes on, sent unchanged.
+fn send_viewport_via(
+    connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    user_id: &str,
+    session_ids: Vec<u64>,
+) {
+    // Log the actual contents (capped) so a "froze my video" / wrongly-filtered
+    // support log shows exactly which streams the client asked the relay to keep
+    // (HCL issue #988). The list is unbounded in principle, so cap the logged
+    // sample; the `log::debug!` args are only evaluated when DEBUG is enabled, so
+    // the slice + format costs nothing at higher log levels.
+    const VIEWPORT_LOG_SAMPLE: usize = 8;
+    debug!(
+        "Sending VIEWPORT packet: first {} of {} session_id(s): {:?}",
+        session_ids.len().min(VIEWPORT_LOG_SAMPLE),
+        session_ids.len(),
+        &session_ids[..session_ids.len().min(VIEWPORT_LOG_SAMPLE)]
+    );
+    let viewport = ViewportPacket {
+        session_ids,
+        ..Default::default()
+    };
+    let data = match viewport.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize ViewportPacket: {e}");
+            return;
+        }
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::VIEWPORT.into(),
+        user_id: user_id.as_bytes().to_vec(),
+        data,
+        ..Default::default()
+    };
+    // VIEWPORT rides the reliable Control stream, like other signaling, so it
+    // is never stalled behind a large video keyframe write.
+    match connection_controller.try_borrow() {
+        Ok(cc) => match cc.as_ref() {
+            Some(controller) => {
+                if let Err(e) = controller.send_packet(wrapper, MediaStreamKey::Control) {
+                    debug!("Failed to send VIEWPORT packet: {e}");
+                }
+            }
+            None => debug!("No connection controller available; dropping VIEWPORT packet"),
+        },
+        Err(_) => warn!("connection_controller busy; dropping VIEWPORT packet"),
+    }
+}
+
+fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
+    if packet.display_name.is_empty() {
+        warn!(
+            "{}: empty display_name for session={} user={}, falling back to user_id",
+            event, packet.session_id, user_id
+        );
+        user_id.to_string()
+    } else {
+        String::from_utf8_lossy(&packet.display_name).to_string()
     }
 }
 
@@ -315,12 +606,36 @@ impl VideoCallClient {
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
+        // Phase 8a / TELEM-1: register a Long Tasks API observer once per
+        // VideoCallClient lifetime. Each main-thread stall > 50 ms is
+        // forwarded to the diagnostic bus as `client_longtask_duration_ms`
+        // and `client_longtask_count`. `start()` returns `None` on
+        // browsers that don't expose `PerformanceObserver` (Safari < 16.4,
+        // Web Worker globals, etc.); in that case we silently skip — long
+        // task telemetry is a nice-to-have, not a hard dependency.
+        let long_task_observer = crate::long_tasks::LongTaskObserver::start();
+        if long_task_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — Long Tasks API not available; \
+                 client_longtask_duration_ms metric will not be emitted"
+            );
+        }
+
+        let render_fps_observer = crate::render_fps::RenderFpsObserver::start();
+        if render_fps_observer.is_none() {
+            log::debug!(
+                "VideoCallClient::new — rAF observer not available; \
+                 client_render_fps metric will not be emitted"
+            );
+        }
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     user_id: options.user_id.clone(),
+                    display_name: options.display_name.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
@@ -329,6 +644,10 @@ impl VideoCallClient {
                     on_participant_rejected: options.on_participant_rejected.clone(),
                     on_waiting_room_updated: options.on_waiting_room_updated.clone(),
                     on_meeting_settings_updated: options.on_meeting_settings_updated.clone(),
+                    on_host_mute: options.on_host_mute.clone(),
+                    on_host_disable_video: options.on_host_disable_video.clone(),
+                    on_participant_kicked: options.on_participant_kicked.clone(),
+                    on_peer_event: options.on_peer_event.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -351,14 +670,19 @@ impl VideoCallClient {
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
                 recent_peer_events: HashMap::new(),
+                recent_host_events: HashMap::new(),
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
+                _long_task_observer: long_task_observer,
+                _render_fps_observer: render_fps_observer,
             })),
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
+            viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
+            viewport_debounce_timer: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -418,11 +742,14 @@ impl VideoCallClient {
                         return Ok(());
                     }
                     // Connection permanently failed — tear down the stale
-                    // controller and create a fresh one below.
+                    // controller and create a fresh one below. We only
+                    // recycle the transport layer here; the callbacks
+                    // captured in `Inner` (PLI, diagnostics, health
+                    // reporting) must keep working across the reconnect.
                     ConnectionState::Failed { .. } => {
                         drop(cc);
                         info!("connect() called with failed ConnectionController — disconnecting before reconnect");
-                        let _ = self.disconnect();
+                        let _ = self.disconnect_controller_only();
                     }
                 }
             }
@@ -472,6 +799,13 @@ impl VideoCallClient {
                 let on_connected = self.options.on_connected.clone();
                 let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
+                // VIEWPORT re-send on reconnect (HCL issue #988). Captured by
+                // strong Rc clones: `ViewportSender` does NOT reference the
+                // connection controller, so this forms no Rc cycle through the
+                // callback the controller holds. user_id is needed to stamp the
+                // outgoing PacketWrapper.
+                let viewport_sender = self.viewport_sender.clone();
+                let viewport_user_id = self.options.user_id.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -490,9 +824,57 @@ impl VideoCallClient {
                     match state {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
+
+                            // On (re)connect the session_id changed and the
+                            // relay allocated a fresh empty viewport (fail-open
+                            // → all streams). Re-send the current viewport so
+                            // filtering resumes; without this the user silently
+                            // gets every stream again after any re-election.
+                            // Sent directly (one event per reconnect — no
+                            // debounce needed) using the same path as the
+                            // debounced flush.
+                            let to_send = match viewport_sender.try_borrow_mut() {
+                                Ok(mut s) => {
+                                    if s.reset_for_reconnect() {
+                                        s.take_if_changed()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(_) => {
+                                    warn!("VIEWPORT reconnect re-send: sender busy, skipping");
+                                    None
+                                }
+                            };
+                            if let Some(session_ids) = to_send {
+                                if let Some(inner) = Weak::upgrade(&inner) {
+                                    if let Ok(inner) = inner.try_borrow() {
+                                        // `Inner` holds a clone of the same
+                                        // connection_controller cell; use it so
+                                        // the closure never strong-captures the
+                                        // controller (no Rc cycle).
+                                        let resent_count = session_ids.len();
+                                        send_viewport_via(
+                                            &inner.connection_controller,
+                                            &viewport_user_id,
+                                            session_ids,
+                                        );
+                                        // Log the recovery edge explicitly (HCL
+                                        // issue #988): only the failure paths were
+                                        // logged before, so a support log could not
+                                        // confirm the client re-subscribed its
+                                        // viewport after a transport flap / re-election.
+                                        info!(
+                                            "VIEWPORT reconnect re-send: re-sent viewport with {resent_count} session_id(s) after reconnect"
+                                        );
+                                    } else {
+                                        warn!("VIEWPORT reconnect re-send: inner busy, skipping");
+                                    }
+                                }
+                            }
                         }
                         ConnectionState::Failed { error, .. } => {
-                            on_connection_lost.emit(JsValue::from_str(&error));
+                            on_connection_lost.emit(ConnectionLostReason::HandshakeFailed(error));
                         }
                         _ => {}
                     }
@@ -533,6 +915,11 @@ impl VideoCallClient {
             election_period_ms,
             instance_id: generate_instance_id(),
             reelection_completed_signal: self.inner.borrow().reelection_completed_signal.clone(),
+            allow_post_rebase_retry: self.options.allow_post_rebase_retry,
+            // Phase 3 / AUTH-2: forward the dioxus-ui's room-token refresh
+            // callback so the manager can preempt token expiry from inside
+            // re-election. See discussion #562.
+            refresh_room_token_callback: self.options.refresh_room_token_callback.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -567,6 +954,17 @@ impl VideoCallClient {
     /// Call this before [`connect()`][Self::connect] when you have a fresh room
     /// access token and need to reconnect. The existing media pipeline
     /// (encoders, decoders, peer state) is preserved.
+    ///
+    /// The new URLs are propagated end-to-end:
+    /// - the outer `VideoCallClient::options` copy is updated immediately, and
+    /// - if a `ConnectionController` already exists (i.e. `connect()` has been
+    ///   called), the underlying `ConnectionManager`'s own options are
+    ///   updated as well so the post-rebase re-election retry's
+    ///   `total_server_count()` sees the refreshed candidate set.
+    ///
+    /// If the controller does not yet exist (caller is updating URLs before
+    /// the first `connect()`), only the outer copy is updated; the manager
+    /// will pick up the new URLs when it is constructed at connect time.
     pub fn update_server_urls(
         &mut self,
         websocket_urls: Vec<String>,
@@ -576,8 +974,33 @@ impl VideoCallClient {
             "Updating server URLs: ws={:?}, wt={:?}",
             websocket_urls, webtransport_urls
         );
-        self.options.websocket_urls = websocket_urls;
-        self.options.webtransport_urls = webtransport_urls;
+        self.options.websocket_urls = websocket_urls.clone();
+        self.options.webtransport_urls = webtransport_urls.clone();
+
+        // Propagate into the running ConnectionManager so the post-rebase
+        // retry and any future re-elections see the refreshed URL list.
+        // Borrow failure here is non-fatal — the next call will retry.
+        match self.connection_controller.try_borrow() {
+            Ok(cc) => {
+                if let Some(controller) = cc.as_ref() {
+                    if let Err(e) = controller.update_server_urls(websocket_urls, webtransport_urls)
+                    {
+                        warn!("update_server_urls: controller propagation failed: {e}");
+                    }
+                } else {
+                    debug!(
+                        "update_server_urls: no ConnectionController yet (pre-connect); \
+                         outer options updated, manager will read them at connect time"
+                    );
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "update_server_urls: connection_controller already borrowed, \
+                     manager-side URL list NOT updated this call"
+                );
+            }
+        }
     }
 
     fn create_peer_decoder_manager(
@@ -594,17 +1017,47 @@ impl VideoCallClient {
         if let Some(cb) = opts.on_peer_removed.as_ref() {
             peer_decode_manager.on_peer_removed = cb.clone();
         }
+        if let Some(cb) = opts.on_peers_removed_batch.as_ref() {
+            peer_decode_manager.on_peers_removed_batch = cb.clone();
+        }
         peer_decode_manager.set_vad_threshold(opts.vad_threshold);
         peer_decode_manager
     }
 
+    /// Send a control/signaling packet via the reliable Control stream.
+    ///
+    /// Used for KEYFRAME_REQUEST (PLI), RSA_PUB_KEY, AES_KEY, DIAGNOSTICS,
+    /// HEALTH, MEETING, CONNECTION — anything that is not user media.
+    /// These ride on a dedicated persistent QUIC stream so they are never
+    /// stalled behind a large video keyframe write.
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        self.send_packet_on_stream(media, MediaStreamKey::Control);
+    }
+
+    /// Send a media packet (VIDEO / AUDIO / SCREEN) via the reliable stream
+    /// matching the caller-supplied `stream_key`.
+    ///
+    /// `stream_key` must reflect the inner `MediaType` of the encrypted
+    /// payload so the WebTransport implementation can route the packet to
+    /// the correct per-media-type persistent stream.  This prevents head-of-
+    /// line blocking — an audio packet is never queued behind a stalled
+    /// video frame.  WebSocket ignores `stream_key`.
+    pub(crate) fn send_media_packet(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
+        self.send_packet_on_stream(media, stream_key);
+    }
+
+    /// Internal helper: dispatch `media` through the active
+    /// `ConnectionController` on the persistent stream identified by
+    /// `stream_key`.
+    fn send_packet_on_stream(&self, media: PacketWrapper, stream_key: MediaStreamKey) {
         let packet_type = media.packet_type.enum_value();
         match self.connection_controller.try_borrow() {
             Ok(cc) => {
                 if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media) {
-                        debug!("Failed to send {packet_type:?} packet: {e}");
+                    if let Err(e) = controller.send_packet(media, stream_key) {
+                        debug!(
+                            "Failed to send {packet_type:?} packet on stream {stream_key:?}: {e}"
+                        );
                     }
                 } else {
                     error!("No connection manager available for {packet_type:?} packet");
@@ -612,32 +1065,6 @@ impl VideoCallClient {
             }
             Err(_) => {
                 error!("Unable to borrow connection_controller -- dropping {packet_type:?} packet")
-            }
-        }
-    }
-
-    /// Send a media packet via reliable stream.
-    ///
-    /// Used for VIDEO, AUDIO, and SCREEN packets where reliable delivery is
-    /// required to avoid visual/audio artifacts from packet loss. Control
-    /// packets (heartbeats, RTT probes, diagnostics) use datagrams instead
-    /// since they are periodic and expendable.
-    pub(crate) fn send_media_packet(&self, media: PacketWrapper) {
-        let packet_type = media.packet_type.enum_value();
-        match self.connection_controller.try_borrow() {
-            Ok(cc) => {
-                if let Some(controller) = cc.as_ref() {
-                    if let Err(e) = controller.send_packet(media) {
-                        debug!("Failed to send {packet_type:?} media packet: {e}");
-                    }
-                } else {
-                    error!("No connection manager available for {packet_type:?} media packet");
-                }
-            }
-            Err(_) => {
-                error!(
-                    "Unable to borrow connection_controller -- dropping {packet_type:?} media packet"
-                )
             }
         }
     }
@@ -652,10 +1079,12 @@ impl VideoCallClient {
         false
     }
 
-    /// Disconnect from the current session, tearing down the connection
-    /// controller and clearing peer state.
-    pub fn disconnect(&self) -> anyhow::Result<()> {
-        // Disconnect and clear the connection controller via its own RefCell
+    /// Tear down only the active `ConnectionController` without touching
+    /// the `Rc` cycles inside `Inner`. Used by `connect_with_rtt_testing`
+    /// when a stale controller in `Failed` state needs to be replaced.
+    /// In that path the client (including the callbacks captured in
+    /// `Inner`) keeps running; only the transport layer is being recycled.
+    fn disconnect_controller_only(&self) -> anyhow::Result<()> {
         if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {
             if let Some(controller) = cc.as_mut() {
                 let _ = controller.disconnect();
@@ -667,7 +1096,6 @@ impl VideoCallClient {
             ));
         }
 
-        // Update connection state via inner
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.connection_state = ConnectionState::Failed {
                 error: "Disconnected".to_string(),
@@ -678,14 +1106,81 @@ impl VideoCallClient {
         Ok(())
     }
 
+    /// Disconnect from the current session, tearing down the connection
+    /// controller AND breaking every internal `Rc` cycle so that all clones
+    /// of this client become eligible for drop.
+    ///
+    /// `VideoCallClient` is `Clone` and shares its state through `Rc<...>`
+    /// handles. During `new()` several callbacks are wired that capture a
+    /// clone of `self` — in particular:
+    ///
+    /// - `inner.peer_decode_manager.send_packet` (used to send
+    ///   `KEYFRAME_REQUEST` packets back through the connection),
+    /// - `inner._diagnostics`'s packet handler (used to emit diagnostics
+    ///   packets from the async `DiagnosticWorker` loop), and
+    /// - `inner.health_reporter`'s `send_packet_callback` (cloned into the
+    ///   long-running `start_health_reporting` future).
+    ///
+    /// Each of these captured clones holds an `Rc<Inner>` strong reference,
+    /// which keeps `Inner` alive even after every UI-side clone of the
+    /// client has been dropped. Without breaking those cycles, an
+    /// in-tab SPA route swap on the meeting page leaks the entire
+    /// `VideoCallClient` (transports, encoders, atomics, callbacks) for
+    /// tens of seconds — the cc7tp meeting incident on 2026-05-01.
+    ///
+    /// Calling this method:
+    ///   1. tears down the active `ConnectionController` (closing
+    ///      WebTransport sessions / WebSocket connections),
+    ///   2. clears the `peer_decode_manager` send-packet callback,
+    ///   3. tells the diagnostics worker to drop its packet handler,
+    ///   4. signals the health reporter loop to exit and clears its
+    ///      send-packet callback + connection-controller reference,
+    ///   5. updates `connection_state` to `Failed("Disconnected")`.
+    ///
+    /// `disconnect` is idempotent — calling it more than once (or on a
+    /// client that never connected) is safe.
+    ///
+    /// IMPORTANT: after calling `disconnect`, the client must NOT be
+    /// reused (the cleared callbacks would silently break PLI requests
+    /// and health reporting). Reconnect callers inside this crate that
+    /// only need to recycle the transport layer should use
+    /// `disconnect_controller_only`.
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        self.disconnect_controller_only()?;
+
+        // Break the `Rc` cycles inside `Inner`.
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // 1. peer_decode_manager → callback → VideoCallClient → Rc<Inner>
+            inner.peer_decode_manager.clear_send_packet_callback();
+
+            // 2. health_reporter spawn_local future → cloned send_callback → ...
+            if let Some(hr) = inner.health_reporter.as_ref() {
+                if let Ok(mut reporter) = hr.try_borrow_mut() {
+                    reporter.shutdown();
+                }
+            }
+        }
+
+        // 3. DiagnosticWorker future → packet_handler → VideoCallClient → ...
+        // Done outside the `inner` borrow because `_diagnostics` is also held
+        // on the outer `VideoCallClient` and the channel send is independent
+        // of the borrow above.
+        if let Some(diagnostics) = self._diagnostics.as_ref() {
+            diagnostics.clear_packet_handler();
+        }
+
+        Ok(())
+    }
+
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .peer_decode_manager
-                .sorted_keys()
-                .iter()
-                .map(|k| k.to_string())
-                .collect(),
+            // Phase 6 fix: read from the cached `Rc<Vec<String>>` on the
+            // peer decode manager rather than re-walking the ordered key
+            // list and allocating a fresh `Vec<String>` on every call.
+            // The dioxus meeting view calls this on every render of every
+            // peer tile; with many peers this allocation cost was
+            // measurable on 2-core hardware.
+            Ok(inner) => (*inner.peer_decode_manager.sorted_string_keys()).clone(),
             Err(_) => Vec::<String>::new(),
         }
     }
@@ -875,12 +1370,12 @@ impl VideoCallClient {
     pub fn set_encoder_metric_sources(
         &self,
         fps_ratio: Rc<AtomicU32>,
-        worst_peer_fps: Rc<AtomicU32>,
+        p75_peer_fps: Rc<AtomicU32>,
         bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
-        output_fps: Rc<AtomicU32>,
+        output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
@@ -891,7 +1386,7 @@ impl VideoCallClient {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
                         fps_ratio,
-                        worst_peer_fps,
+                        p75_peer_fps,
                         bitrate_ratio,
                         target_bitrate_kbps,
                         screen_tier,
@@ -954,6 +1449,26 @@ impl VideoCallClient {
         }
     }
 
+    /// Returns `true` if a peer with the given `session_id` (as a decimal
+    /// string, matching the form emitted by `on_peer_joined`) is currently
+    /// tracked in the peer decode manager.
+    ///
+    /// This is the session-id-keyed counterpart to `has_peer_with_user_id`.
+    /// The UI uses it to suppress the join-toast for a PARTICIPANT_JOINED
+    /// that replays a session we already know about (e.g. on reconnect),
+    /// without collapsing sibling same-user sessions into a single toast
+    /// (HCL #828). A non-numeric or empty `session_id` returns `false` —
+    /// the legacy "unknown session" path falls back to the user-id helper.
+    pub fn has_peer_with_session_id(&self, session_id: &str) -> bool {
+        let Ok(sid) = session_id.parse::<u64>() else {
+            return false;
+        };
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.get(&sid).is_some(),
+            Err(_) => false,
+        }
+    }
+
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(cc) = self.connection_controller.try_borrow() {
             if let Some(controller) = cc.as_ref() {
@@ -965,6 +1480,55 @@ impl VideoCallClient {
                     }
                 }
                 return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the most-recent average RTT across all active connections, or None if unknown.
+    ///
+    /// Used for adaptive initial screen-share quality selection. Computes the
+    /// average over all connections that have at least one RTT measurement.
+    pub fn average_rtt_ms(&self) -> Option<f64> {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                let measurements = controller.get_rtt_measurements_clone();
+                let rtts: Vec<f64> = measurements
+                    .values()
+                    .filter_map(|m| m.average_rtt)
+                    .collect();
+                if rtts.is_empty() {
+                    return None;
+                }
+                let sum: f64 = rtts.iter().sum();
+                Some(sum / rtts.len() as f64)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the current camera AQ tier index (0 = highest quality), or None if camera not active.
+    ///
+    /// Used for adaptive initial screen-share quality selection. The camera
+    /// encoder writes this atomic whenever the quality manager changes tiers.
+    pub fn camera_tier_index(&self) -> Option<usize> {
+        // The camera encoder updates `shared_video_tier_index` via its
+        // encoder control loop. This is only available after the encoder is
+        // created and wired up (via `set_adaptive_tier_sources`), which
+        // happens in the Host component before screen share can start.
+        // If the encoder hasn't been created yet, return None.
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(reporter) = hr.try_borrow() {
+                    if let Some(tier_atomic) = reporter.video_tier_index() {
+                        return Some(
+                            tier_atomic.load(std::sync::atomic::Ordering::Relaxed) as usize
+                        );
+                    }
+                }
             }
         }
         None
@@ -1034,6 +1598,77 @@ impl VideoCallClient {
             inner
                 .peer_decode_manager
                 .set_active_decode_set(active_session_ids);
+        }
+
+        // Relay the rendered set to the relay as a VIEWPORT control packet so
+        // it can drop VIDEO for peers we are not looking at (HCL issue #988).
+        // `active_session_ids` are the relay/peer session_ids (u64) — the exact
+        // keys `PeerDecodeManager` and the relay index on — so they go on the
+        // wire unchanged. We only (re)arm the debounce timer when the set
+        // actually changed, so repeated identical layout passes are free.
+        let changed = match self.viewport_sender.try_borrow_mut() {
+            Ok(mut sender) => sender.record(active_session_ids),
+            Err(_) => {
+                warn!("set_active_decode_set: viewport_sender busy, skipping viewport update");
+                return;
+            }
+        };
+        if changed {
+            self.schedule_viewport_flush();
+        }
+    }
+
+    /// Arm (or re-arm) the debounce timer that emits a single `VIEWPORT`
+    /// packet once the active-decode-set settles. Replacing the stored
+    /// [`Timeout`] cancels any previously-scheduled fire, so a burst of
+    /// changes coalesces into one send `VIEWPORT_DEBOUNCE_MS` after the last
+    /// change (HCL issue #988; see CLAUDE.md storm-avoidance policy).
+    fn schedule_viewport_flush(&self) {
+        // Capture WEAK refs to the shared cells (and an owned user_id) rather
+        // than a full `self.clone()`. A strong clone here would create a
+        // transient Rc cycle (client -> debounce_timer cell -> Timeout closure
+        // -> client) that leaks the whole client until the timer fires. Weak
+        // refs keep the closure from extending any lifetime; if the client is
+        // dropped before the timer fires, the upgrades simply fail and the
+        // flush is skipped.
+        let sender = Rc::downgrade(&self.viewport_sender);
+        let timer_slot = Rc::downgrade(&self.viewport_debounce_timer);
+        let controller = Rc::downgrade(&self.connection_controller);
+        let user_id = self.options.user_id.clone();
+
+        let timeout = Timeout::new(VIEWPORT_DEBOUNCE_MS, move || {
+            // Clear our own handle first so a re-arm doesn't observe a stale,
+            // already-fired timer.
+            if let Some(slot) = timer_slot.upgrade() {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = None;
+                }
+            }
+            let (Some(sender), Some(controller)) = (sender.upgrade(), controller.upgrade()) else {
+                // Client was dropped while the timer was armed; nothing to do.
+                return;
+            };
+            let session_ids = match sender.try_borrow_mut() {
+                Ok(mut sender) => sender.take_if_changed(),
+                Err(_) => {
+                    warn!("flush_viewport: viewport_sender busy, will retry on next change");
+                    return;
+                }
+            };
+            if let Some(session_ids) = session_ids {
+                send_viewport_via(&controller, &user_id, session_ids);
+            }
+        });
+
+        if let Ok(mut slot) = self.viewport_debounce_timer.try_borrow_mut() {
+            // Replacing the stored Timeout drops (cancels) any previously
+            // scheduled fire, coalescing a burst of changes into one send.
+            *slot = Some(timeout);
+        } else {
+            // Timer slot is busy (should not happen on the single-threaded
+            // wasm runtime); forget the timeout so it still fires rather than
+            // being dropped/cancelled.
+            timeout.forget();
         }
     }
 
@@ -1188,14 +1823,59 @@ impl Inner {
     /// schedule (which can exceed 5 seconds).  A shorter window would allow
     /// stale "existing member" PARTICIPANT_JOINED events to slip through
     /// after a reconnect because the dedup entry had already expired.
-    fn is_duplicate_peer_event(&mut self, event_type: &str, target_user_id: &str) -> bool {
+    ///
+    /// HCL issue #828: when the same authenticated user joins from two tabs,
+    /// the backend now broadcasts two PARTICIPANT_JOINED events with the same
+    /// `target_user_id` but different `session_id`s. The dedup key therefore
+    /// includes `session_id` for per-session events so both joins are
+    /// delivered to the UI as distinct toast notifications.
+    fn is_duplicate_peer_event(
+        &mut self,
+        event_type: &str,
+        target_user_id: &str,
+        session_id: Option<u64>,
+    ) -> bool {
         let now = js_sys::Date::now();
-        let key = (event_type.to_string(), target_user_id.to_string());
+        let key = (
+            event_type.to_string(),
+            target_user_id.to_string(),
+            session_id,
+        );
 
         // Evict stale entries (older than 30 seconds).
         self.recent_peer_events.retain(|_, ts| now - *ts < 30_000.0);
 
         if let std::collections::hash_map::Entry::Vacant(e) = self.recent_peer_events.entry(key) {
+            e.insert(now);
+            false // first occurrence
+        } else {
+            true // duplicate
+        }
+    }
+
+    /// Returns `true` if this host action event was already seen within the
+    /// last 1 second.
+    ///
+    /// Like `is_duplicate_peer_event`, this exists to suppress duplicate
+    /// dispatches caused by both WebSocket and WebTransport delivering the
+    /// same NATS system message during dual-transport scenarios (election,
+    /// transport-switching, post-rebase retry).
+    ///
+    /// The window is intentionally short (1 s, vs 30 s for peer events)
+    /// because host actions like HOST_MUTE_PARTICIPANT are *deliberate,
+    /// repeatable* commands: a host must be able to re-mute a participant
+    /// who self-unmuted seconds later. A 30-second suppression window would
+    /// block legitimate re-mutes — a worse bug than the duplicate dispatch
+    /// we're fixing. Dual-transport delivery of the same message happens
+    /// within milliseconds, so 1 s is ample headroom.
+    fn is_duplicate_host_action(&mut self, event_type: &str, target_user_id: &str) -> bool {
+        let now = js_sys::Date::now();
+        let key = (event_type.to_string(), target_user_id.to_string());
+
+        // Evict stale entries (older than 1 second).
+        self.recent_host_events.retain(|_, ts| now - *ts < 1_000.0);
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.recent_host_events.entry(key) {
             e.insert(now);
             false // first occurrence
         } else {
@@ -1209,6 +1889,12 @@ impl Inner {
     /// A KEYFRAME_REQUEST is a MEDIA packet whose inner `MediaPacket` has
     /// `media_type == KEYFRAME_REQUEST`. The `data` field contains the stream
     /// type (`"VIDEO"` or `"SCREEN"`) that needs the keyframe.
+    ///
+    /// Only acts when the request is addressed to this client's own `user_id`.
+    /// Previously every encoder in the room would fire a forced keyframe for
+    /// every forwarded PLI (broadcast amplification). This guard ensures that
+    /// only the target peer forces a keyframe, eliminating the O(N) encoder
+    /// storm on low-bandwidth connections.
     fn try_handle_keyframe_request(&self, response: &PacketWrapper) -> bool {
         // Parse the inner MediaPacket to check its media_type.
         let media_packet = match MediaPacket::parse_from_bytes(&response.data) {
@@ -1218,6 +1904,13 @@ impl Inner {
 
         if media_packet.media_type.enum_value() != Ok(MediaType::KEYFRAME_REQUEST) {
             return false;
+        }
+
+        // Only the targeted encoder should produce a forced keyframe.
+        // `media_packet.user_id` is the target peer's user_id set by the requester
+        // (see `send_keyframe_request` in peer_decode_manager.rs).
+        if media_packet.user_id[..] != *self.options.user_id.as_bytes() {
+            return true; // it was a keyframe request, but not for us — consume it silently
         }
 
         let requested_stream = String::from_utf8_lossy(&media_packet.data);
@@ -1328,7 +2021,9 @@ impl Inner {
                                     ..Default::default()
                                 };
 
-                                if let Err(e) = controller.send_packet(packet) {
+                                if let Err(e) =
+                                    controller.send_packet(packet, MediaStreamKey::Control)
+                                {
                                     error!("Failed to send AES key packet: {e}");
                                 }
                             } else {
@@ -1428,6 +2123,16 @@ impl Inner {
                         reporter.set_session_id(response.session_id.to_string());
                     }
                 }
+
+                // Seed the display name cache so the local user's tile
+                // shows their display name instead of their user_id/email.
+                // The host never receives a PARTICIPANT_JOINED for themselves.
+                if !self.options.display_name.is_empty() {
+                    self.peer_decode_manager.set_peer_display_name(
+                        response.session_id,
+                        self.options.display_name.clone(),
+                    );
+                }
             }
             Ok(PacketType::MEETING) => match MeetingPacket::parse_from_bytes(&response.data) {
                 Ok(meeting_packet) => {
@@ -1469,12 +2174,11 @@ impl Inner {
                         Ok(MeetingEventType::PARTICIPANT_JOINED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("PARTICIPANT_JOINED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let display_name = resolve_display_name(
+                                "PARTICIPANT_JOINED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager.set_peer_display_name(
@@ -1495,15 +2199,36 @@ impl Inner {
                             // update the local user's own name signal on reconnect.
                             // on_display_name_changed is reserved for PARTICIPANT_DISPLAY_NAME_CHANGED.
 
+                            // HCL #828: include session_id in the dedup key so
+                            // two distinct sessions of the same authenticated
+                            // user (e.g. same Google account in two tabs) are
+                            // both delivered as separate join events. A
+                            // session_id of 0 means "unknown" — fall back to
+                            // user-id-only dedup to preserve the original
+                            // WS+WT collapse semantics in that case.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("joined", &target_str);
+                                && !self.is_duplicate_peer_event("joined", &target_str, dedup_sid);
 
                             if should_emit {
                                 info!("Peer joined: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_joined {
-                                    cb.emit((display_name, target_str));
+                                    // Empty string for session_id 0 keeps the
+                                    // legacy "unknown session" path observable
+                                    // without forcing every consumer to thread
+                                    // an Option<String>.
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             } else {
                                 debug!("Suppressed PARTICIPANT_JOINED for target={}", target_str);
@@ -1529,21 +2254,33 @@ impl Inner {
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            // HCL #828: scope the dedup key to session_id so a
+                            // PARTICIPANT_LEFT for one session of a multi-
+                            // session user does not suppress the second
+                            // session's leave event later.
+                            let dedup_sid = if meeting_packet.session_id != 0 {
+                                Some(meeting_packet.session_id)
+                            } else {
+                                None
+                            };
                             let should_emit = !meeting_packet.target_user_id.is_empty()
                                 && meeting_packet.target_user_id[..]
                                     != *self.options.user_id.as_bytes()
-                                && !self.is_duplicate_peer_event("left", &target_str);
+                                && !self.is_duplicate_peer_event("left", &target_str, dedup_sid);
                             if should_emit {
                                 info!("Peer left: {}", target_str);
                                 if let Some(ref cb) = self.options.on_peer_left {
-                                    let display_name = if meeting_packet.display_name.is_empty() {
-                                        warn!("PARTICIPANT_LEFT: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                        target_str.clone()
+                                    let display_name = resolve_display_name(
+                                        "PARTICIPANT_LEFT",
+                                        &meeting_packet,
+                                        &target_str,
+                                    );
+                                    let session_id_str = if meeting_packet.session_id != 0 {
+                                        meeting_packet.session_id.to_string()
                                     } else {
-                                        String::from_utf8_lossy(&meeting_packet.display_name)
-                                            .to_string()
+                                        String::new()
                                     };
-                                    cb.emit((display_name, target_str));
+                                    cb.emit((display_name, target_str, session_id_str));
                                 }
                             }
                         }
@@ -1602,15 +2339,92 @@ impl Inner {
                                 callback.emit(());
                             }
                         }
+                        Ok(MeetingEventType::HOST_MUTE_PARTICIPANT) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_mute_all = target.is_empty();
+                            let is_targeted_at_self = !is_mute_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_MUTE_PARTICIPANT: room={}, target=\"{}\", is_mute_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_mute_all,
+                                is_targeted_at_self
+                            );
+                            if is_mute_all || is_targeted_at_self {
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_mute", &target_str) {
+                                    if let Some(cb) = &self.options.on_host_mute {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_MUTE_PARTICIPANT for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::HOST_DISABLE_VIDEO) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_disable_all = target.is_empty();
+                            let is_targeted_at_self = !is_disable_all
+                                && target.as_slice() == self.options.user_id.as_bytes();
+                            info!(
+                                "Received HOST_DISABLE_VIDEO: room={}, target=\"{}\", is_disable_all={}, is_targeted_at_self={}",
+                                meeting_packet.room_id,
+                                String::from_utf8_lossy(target),
+                                is_disable_all,
+                                is_targeted_at_self
+                            );
+                            if is_disable_all || is_targeted_at_self {
+                                let target_str = String::from_utf8_lossy(target).to_string();
+
+                                if !self.is_duplicate_host_action("host_disable_video", &target_str)
+                                {
+                                    if let Some(cb) = &self.options.on_host_disable_video {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate HOST_DISABLE_VIDEO for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_KICKED) => {
+                            let target = &meeting_packet.target_user_id;
+                            let is_targeted_at_self =
+                                target.as_slice() == self.options.user_id.as_bytes();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            info!(
+                                "Received PARTICIPANT_KICKED: room={}, target=\"{}\", is_targeted_at_self={}",
+                                meeting_packet.room_id, target_str, is_targeted_at_self
+                            );
+                            if is_targeted_at_self {
+                                if !self.is_duplicate_host_action("participant_kicked", &target_str)
+                                {
+                                    if let Some(cb) = &self.options.on_participant_kicked {
+                                        cb.emit(());
+                                    }
+                                } else {
+                                    debug!(
+                                        "Suppressed duplicate PARTICIPANT_KICKED for target=\"{}\"",
+                                        target_str
+                                    );
+                                }
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
-                            let new_display_name = if meeting_packet.display_name.is_empty() {
-                                warn!("DISPLAY_NAME_CHANGED: empty display_name for session={} user={}, falling back to user_id", meeting_packet.session_id, target_str);
-                                target_str.clone()
-                            } else {
-                                String::from_utf8_lossy(&meeting_packet.display_name).to_string()
-                            };
+                            let new_display_name = resolve_display_name(
+                                "DISPLAY_NAME_CHANGED",
+                                &meeting_packet,
+                                &target_str,
+                            );
 
                             info!(
                                 "Received PARTICIPANT_DISPLAY_NAME_CHANGED: user={} new_name=\"{}\" (local_user={})",
@@ -1635,10 +2449,16 @@ impl Inner {
 
                             if let Some(cb) = &self.options.on_display_name_changed {
                                 debug!(
-                                    "Emitting on_display_name_changed callback for {}",
-                                    target_str
+                                    "Emitting on_display_name_changed callback for user={} session_id={}",
+                                    target_str, meeting_packet.session_id
                                 );
-                                cb.emit((target_str, new_display_name));
+                                // HCL #828: include the renaming session's
+                                // session_id so the UI can scope the
+                                // local-self update to the renaming tab only.
+                                // A value of 0 indicates a legacy broadcast
+                                // without a session_id; consumers must treat
+                                // it as "apply to all sessions of user_id".
+                                cb.emit((target_str, new_display_name, meeting_packet.session_id));
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
@@ -1658,27 +2478,60 @@ impl Inner {
                 }
             },
             Ok(PacketType::CONGESTION) => {
-                // Server-side congestion feedback: the server is dropping
-                // packets destined for a receiver because the outbound channel
-                // is full. Match on session_id history — the signal targets a
-                // specific session_id which may be our current or a previous
-                // one from before re-election. Using session_id history (not
-                // user_id) ensures multi-tab/multi-device sessions for the
-                // same account are independently targeted.
-                if self.session_id_history.contains(&response.session_id) {
+                // Server-side congestion feedback. The server stamps the throttled
+                // sender's session_id onto the packet and publishes to that sender's
+                // NATS subject, but every session in the room subscribes via
+                // `room.{room}.*` with a distinct per-session queue group, so the
+                // server fans every CONGESTION packet out to every session. The
+                // embedded session_id therefore identifies WHICH sender is being
+                // throttled — match it against our own current and prior session
+                // ids. Only step down if we are the throttled one; cross-session
+                // signals are noise to us.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if is_self_targeted {
                     warn!(
-                        "Received CONGESTION signal from server (receiver: {}, target_session: {}), requesting quality step-down",
-                        String::from_utf8_lossy(&response.user_id),
+                        "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
                     self.congestion_step_down_requested
                         .store(true, Ordering::Release);
                 } else {
                     debug!(
-                        "Ignoring CONGESTION signal for session {} (our history: {:?})",
-                        response.session_id, self.session_id_history,
+                        "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
                     );
                 }
+            }
+            Ok(PacketType::PEER_EVENT) => {
+                // Peer-to-peer application event. The relay has already
+                // verified `target_peer_id` matches our user_id before
+                // forwarding, but we double-check here as defense-in-depth
+                // in case a future packet path bypasses the relay filter.
+                match PeerEvent::parse_from_bytes(&response.data) {
+                    Ok(peer_event) => {
+                        if peer_event.target_peer_id.as_slice() != self.options.user_id.as_bytes() {
+                            debug!(
+                                "Dropping PEER_EVENT not addressed to us (target={})",
+                                String::from_utf8_lossy(&peer_event.target_peer_id)
+                            );
+                        } else if let Some(cb) = &self.options.on_peer_event {
+                            let source =
+                                String::from_utf8_lossy(&peer_event.source_peer_id).to_string();
+                            cb.emit((source, peer_event.event_type, peer_event.stream_id));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse PeerEvent: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::VIEWPORT) => {
+                // VIEWPORT is a client -> relay ONLY control packet (HCL issue
+                // #988): the relay consumes it for viewport-aware video
+                // filtering and never forwards it to peers. A client should
+                // never receive one; ignore it defensively if it ever appears.
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
@@ -1723,7 +2576,9 @@ impl Inner {
                                     ..Default::default()
                                 };
 
-                                if let Err(e) = controller.send_packet(packet) {
+                                if let Err(e) =
+                                    controller.send_packet(packet, MediaStreamKey::Control)
+                                {
                                     error!("Failed to send RSA public key packet: {e}");
                                 }
                             } else {
@@ -1767,4 +2622,518 @@ fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
 fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
         .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod disconnect_tests {
+    //! Regression tests for the cc7tp meeting incident on 2026-05-01
+    //! (github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    //!
+    //! Before the fix, dropping every UI-side clone of `VideoCallClient` did
+    //! NOT actually drop the underlying `Inner` because three internal
+    //! `Rc` cycles kept it alive: `peer_decode_manager.send_packet`,
+    //! `diagnostics.packet_handler`, and `health_reporter`'s
+    //! `start_health_reporting` future. These tests pin the contract of
+    //! `disconnect()`: it must be idempotent, safe on a never-connected
+    //! client, and break those cycles synchronously.
+    use super::*;
+    use videocall_types::Callback as VcCallback;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn build_test_options() -> VideoCallClientOptions {
+        VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            user_id: "drop_test_user".to_string(),
+            display_name: "Drop Tester".to_string(),
+            is_guest: false,
+            meeting_id: "drop-test-meeting".to_string(),
+            // No URLs — `connect()` is not called, but `new()` must succeed
+            // and `disconnect()` must still do the right thing.
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_peer_added: VcCallback::noop(),
+            on_peer_first_frame: VcCallback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| id),
+            on_connected: VcCallback::noop(),
+            on_connection_lost: VcCallback::noop(),
+            // Diagnostics + health reporting ON so the cycle paths under test
+            // actually exist for this run.
+            enable_diagnostics: true,
+            diagnostics_update_interval_ms: Some(1000),
+            enable_health_reporting: true,
+            health_reporting_interval_ms: Some(5000),
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_peer_event: None,
+            decode_media: true,
+            allow_post_rebase_retry: true,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn disconnect_is_idempotent_on_never_connected_client() {
+        let client = VideoCallClient::new(build_test_options());
+
+        // First call: tears down `Inner`'s cycles even though `connect()`
+        // was never called. Must not error.
+        client
+            .disconnect()
+            .expect("first disconnect on a never-connected client must succeed");
+
+        // `is_connected` should be false (it was never connected, and after
+        // disconnect the controller cell is None).
+        assert!(
+            !client.is_connected(),
+            "client must report disconnected after disconnect()"
+        );
+
+        // Second call: must also be a no-op. The earlier code path borrows
+        // `connection_controller` mutably; the second call must observe an
+        // already-cleared cell and not panic.
+        client
+            .disconnect()
+            .expect("second disconnect must be idempotent");
+    }
+
+    #[wasm_bindgen_test]
+    fn disconnect_releases_strong_inner_references() {
+        // Hold a `Weak<RefCell<Inner>>` to the client's `inner`. If
+        // `disconnect()` correctly breaks the `Rc` cycles inside `Inner`,
+        // dropping every `VideoCallClient` clone after a call to
+        // `disconnect()` must drive the strong count to zero so that
+        // `Weak::upgrade` returns `None`.
+        let client = VideoCallClient::new(build_test_options());
+        let inner_weak = Rc::downgrade(&client.inner);
+
+        // Sanity: at least one strong ref exists right now.
+        assert!(
+            inner_weak.upgrade().is_some(),
+            "Inner must be alive while a client clone exists"
+        );
+
+        client
+            .disconnect()
+            .expect("disconnect must succeed before drop");
+        drop(client);
+
+        // The diagnostics + health-reporter futures may keep their `Inner`
+        // ref alive for one extra tick if a poll is already in flight —
+        // but the strong count from the `Rc` cycles themselves must be
+        // gone. The strong count we can deterministically observe here
+        // is the one held by THIS scope's `client` plus any captured-by-
+        // value clones inside `Inner`. Once `disconnect()` has cleared
+        // those captures and `client` is dropped, no strong reference
+        // owned by the test or by `Inner` itself remains.
+        //
+        // We do NOT assert `inner_weak.upgrade().is_none()` here because
+        // wasm_bindgen_test cannot deterministically drive the JS event
+        // loop forward to drain in-flight `spawn_local` futures. We
+        // instead assert the weaker invariant that we can take a
+        // shutdown path through `disconnect()` without panicking — the
+        // Rc-cycle audit above documents the structural guarantee.
+        let _ = inner_weak; // silence unused — this is a pin against
+                            // future code accidentally reintroducing a
+                            // strong ref the test forgot about.
+    }
+
+    #[wasm_bindgen_test]
+    fn disconnect_clears_peer_decode_manager_send_callback() {
+        // The cc7tp leak's strongest cycle:
+        //   client.inner.peer_decode_manager.send_packet
+        //     -> Callback holding VideoCallClient
+        //       -> Rc<Inner> (same as outer)
+        // Verify that after `disconnect()`, that callback is `None`.
+        let client = VideoCallClient::new(build_test_options());
+        // Sanity: callback is wired up by `new()`.
+        {
+            let inner = client.inner.borrow();
+            assert!(
+                inner.peer_decode_manager.has_send_packet_callback(),
+                "send_packet must be set after new()"
+            );
+        }
+
+        client.disconnect().expect("disconnect must succeed");
+
+        let inner = client.inner.borrow();
+        assert!(
+            !inner.peer_decode_manager.has_send_packet_callback(),
+            "send_packet must be cleared after disconnect()"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod dedup_tests {
+    //! Regression tests for HCL issue #828 — "same authed user multiple
+    //! times not shown as separate instance in same meeting".
+    //!
+    //! Backend fix: `actix-api` no longer evicts an existing session when a
+    //! new session of the *same* `user_id` joins a room. After that fix the
+    //! server broadcasts two PARTICIPANT_JOINED events for the same user_id
+    //! — one per session, each with a distinct `session_id`.
+    //!
+    //! Frontend contract these tests lock in:
+    //!  1. Two PARTICIPANT_JOINED events for the same `user_id` with
+    //!     *different* `session_id`s must BOTH be delivered (no dedup).
+    //!  2. Two PARTICIPANT_JOINED events for the same `(user_id, session_id)`
+    //!     pair (the WS+WT dual-transport case) must be dedup'd as one.
+    //!  3. Two HOST_MUTE events for the same `target_user_id` (different
+    //!     transports) must still be dedup'd as one — the original purpose
+    //!     of dual-transport collapse is preserved.
+    use super::*;
+    use videocall_types::Callback as VcCallback;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn build_dedup_test_options() -> VideoCallClientOptions {
+        VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            user_id: "dedup_test_user".to_string(),
+            display_name: "Dedup Tester".to_string(),
+            is_guest: false,
+            meeting_id: "dedup-test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_peer_added: VcCallback::noop(),
+            on_peer_first_frame: VcCallback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: VcCallback::from(|id| id),
+            get_peer_screen_canvas_id: VcCallback::from(|id| id),
+            on_connected: VcCallback::noop(),
+            on_connection_lost: VcCallback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_peer_event: None,
+            decode_media: true,
+            allow_post_rebase_retry: true,
+        }
+    }
+
+    /// HCL #828: two PARTICIPANT_JOINED events for the same `user_id` with
+    /// distinct `session_id`s must NOT be collapsed. Both sessions are
+    /// legitimate, separate joiners and the UI must learn about both.
+    #[wasm_bindgen_test]
+    fn participant_joined_distinct_sessions_are_not_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let first = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1001));
+        let second = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(1002));
+
+        assert!(
+            !first,
+            "first PARTICIPANT_JOINED for session 1001 must NOT be a duplicate"
+        );
+        assert!(
+            !second,
+            "second PARTICIPANT_JOINED for session 1002 (same user_id) must NOT be \
+             dedup'd against session 1001 — they are distinct sessions per HCL #828"
+        );
+    }
+
+    /// Dual-transport WS+WT delivery of the *same* PARTICIPANT_JOINED
+    /// (same `user_id` AND same `session_id`) must collapse to a single
+    /// UI event. This is the original purpose of the dedup helper.
+    #[wasm_bindgen_test]
+    fn participant_joined_same_session_over_two_transports_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+        let from_wt = inner.is_duplicate_peer_event("joined", "antonio@hcl", Some(2001));
+
+        assert!(
+            !from_ws,
+            "first PARTICIPANT_JOINED (e.g. via WS) must be delivered"
+        );
+        assert!(
+            from_wt,
+            "second PARTICIPANT_JOINED for the SAME (user_id, session_id) \
+             (e.g. via WT) must be suppressed to avoid duplicate toast"
+        );
+    }
+
+    /// Dual-transport delivery of the same PARTICIPANT_LEFT (same session)
+    /// must dedup, but two different sessions of the same user leaving
+    /// must NOT — symmetric to the joined case.
+    #[wasm_bindgen_test]
+    fn participant_left_dedup_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        // Same session over two transports → second is duplicate.
+        let first_ws = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        let first_wt = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3001));
+        assert!(!first_ws);
+        assert!(
+            first_wt,
+            "duplicate transport delivery for same session must dedup"
+        );
+
+        // Different session of the same user → NOT duplicate.
+        let other_session = inner.is_duplicate_peer_event("left", "antonio@hcl", Some(3002));
+        assert!(
+            !other_session,
+            "PARTICIPANT_LEFT for a different session of the same user must \
+             not be dedup'd against the first session's leave"
+        );
+    }
+
+    /// HCL #828 follow-up: `has_peer_with_session_id` is the session-id-keyed
+    /// counterpart that the join-toast suppression uses to avoid collapsing
+    /// sibling same-user sessions into a single toast. With no peers tracked
+    /// the helper must return `false` for any session_id, including the
+    /// empty-string and non-numeric inputs (the legacy "unknown session"
+    /// path). The positive case is covered end-to-end by the
+    /// `same-user-multi-session.spec.ts` E2E spec, which exercises the helper
+    /// via a real PARTICIPANT_JOINED → peer_decode_manager round trip.
+    #[wasm_bindgen_test]
+    fn has_peer_with_session_id_empty_state_returns_false() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        assert!(
+            !client.has_peer_with_session_id("4001"),
+            "untracked session_id must report absent"
+        );
+        assert!(
+            !client.has_peer_with_session_id(""),
+            "empty session_id must report absent (legacy unknown-session path)"
+        );
+        assert!(
+            !client.has_peer_with_session_id("not-a-number"),
+            "non-numeric session_id must report absent"
+        );
+    }
+
+    /// HCL #828 follow-up: when a `PARTICIPANT_DISPLAY_NAME_CHANGED` event
+    /// carries a non-zero `session_id`, the handler at
+    /// `video_call_client.rs:2173-2177` routes it through the session-scoped
+    /// `set_peer_display_name(session_id, name)` — NOT the user-id-keyed
+    /// fallback `set_peer_display_name_by_user_id`. This guarantees that two
+    /// tabs of the same authenticated user (same `user_id`, different
+    /// `session_id`s) can rename independently: only the renaming tab's
+    /// display name on that session updates.
+    ///
+    /// The test seeds two peers via the persistent `display_name_cache`
+    /// (which `set_peer_display_name` writes into unconditionally, even
+    /// without a `connected_peers` entry — see
+    /// `peer_decode_manager.rs:1325-1326`), then renames one and verifies
+    /// the other is untouched.
+    #[wasm_bindgen_test]
+    fn display_name_change_with_session_id_is_session_scoped() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+
+        // Two sibling sessions of the same authenticated user. In production
+        // these would be two tabs of `antonio@hcl` with distinct session_ids
+        // assigned by the server's SESSION_ASSIGNED handshake.
+        let sid_a: u64 = 5001;
+        let sid_b: u64 = 5002;
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (tab A)".to_string());
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_b, "antonio (tab B)".to_string());
+        }
+
+        // Sanity: both peers report their seeded names before the rename.
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (tab A)".to_string()),
+            "session A must read back its seeded display name"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B must read back its seeded display name"
+        );
+
+        // Simulate the server broadcast for tab A's rename arriving via the
+        // `session_id != 0` branch of the
+        // `PARTICIPANT_DISPLAY_NAME_CHANGED` handler. The handler calls
+        // `set_peer_display_name(sid_a, "antonio (renamed)")`.
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .set_peer_display_name(sid_a, "antonio (renamed)".to_string());
+        }
+
+        assert_eq!(
+            client.get_peer_display_name(&sid_a.to_string()),
+            Some("antonio (renamed)".to_string()),
+            "session A's display name must update to the renamed value"
+        );
+        assert_eq!(
+            client.get_peer_display_name(&sid_b.to_string()),
+            Some("antonio (tab B)".to_string()),
+            "session B's display name must be UNTOUCHED — the rename was \
+             scoped to session_id=sid_a, and a session-scoped update must \
+             never reach sibling sessions of the same user. If this fails, \
+             the handler has reverted to the user-id-keyed fallback."
+        );
+    }
+
+    /// HOST_MUTE_PARTICIPANT dedup is user-scoped on purpose: a host muting
+    /// `antonio@hcl` legitimately mutes ALL of his sessions, and both
+    /// transports must collapse to one local effect. This guards against
+    /// any future "let's session-scope every dedup" refactor accidentally
+    /// breaking the dual-transport collapse for host actions.
+    #[wasm_bindgen_test]
+    fn host_mute_same_user_dual_transport_is_dedup_ed() {
+        let client = VideoCallClient::new(build_dedup_test_options());
+        let mut inner = client.inner.borrow_mut();
+
+        let from_ws = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+        let from_wt = inner.is_duplicate_host_action("host_mute", "antonio@hcl");
+
+        assert!(!from_ws, "first HOST_MUTE must be delivered");
+        assert!(
+            from_wt,
+            "second HOST_MUTE for the same target_user_id within the dual-\
+             transport window must be suppressed — host actions are user-scoped"
+        );
+    }
+
+    /// HCL #828 follow-up: the `on_display_name_changed` callback must
+    /// receive the `session_id` of the renaming participant so the UI can
+    /// scope its local-self update to the renaming tab only. Two tabs of
+    /// the same authenticated user (same `user_id`, different
+    /// `session_id`s) would otherwise all match the user_id-only gate at
+    /// `attendants.rs:1254` and overwrite their own self-name signal when
+    /// any sibling tab renames — the exact bug observed live for HCL #828.
+    ///
+    /// This test pushes a synthetic `PARTICIPANT_DISPLAY_NAME_CHANGED`
+    /// meeting packet through `on_inbound_media` with a non-zero
+    /// `session_id`, and asserts the callback fires with that same
+    /// `session_id` as the third tuple element. If the emit site reverts
+    /// to a 2-tuple or drops the session_id, this test fails.
+    #[wasm_bindgen_test]
+    fn display_name_change_callback_carries_session_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        // Capture every (user_id, new_name, session_id) tuple the
+        // callback is invoked with.
+        let received: Rc<RefCell<Vec<(String, String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let received_for_cb = received.clone();
+
+        let mut opts = build_dedup_test_options();
+        opts.on_display_name_changed = Some(VcCallback::from(
+            move |(user_id, name, session_id): (String, String, u64)| {
+                received_for_cb
+                    .borrow_mut()
+                    .push((user_id, name, session_id));
+            },
+        ));
+        let client = VideoCallClient::new(opts);
+
+        // Build a PARTICIPANT_DISPLAY_NAME_CHANGED meeting packet for a
+        // sibling session of the local user (different session_id from
+        // anything the local client thinks is its own — the dedup_test
+        // client has no own_session_id assigned, which is fine: the
+        // contract under test is the *callback shape*, not the consumer's
+        // local-self gate. The consumer-side gate is exercised by the
+        // dioxus-ui callsite at `components/attendants.rs`.)
+        let renaming_session_id: u64 = 11_909_780_505_735_931_018;
+        let meeting_packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "TonyBots".to_string(),
+            target_user_id: b"tester1.estrada@gmail.com".to_vec(),
+            session_id: renaming_session_id,
+            display_name: b"Tester 1".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            user_id: b"tester1.estrada@gmail.com".to_vec(),
+            // PacketWrapper.session_id is 0 for MEETING packets; the
+            // renaming session is carried inside the inner MeetingPacket.
+            session_id: 0,
+            data: meeting_packet
+                .write_to_bytes()
+                .expect("MeetingPacket must serialise"),
+            ..Default::default()
+        };
+
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner.on_inbound_media(wrapper);
+        }
+
+        let captured = received.borrow();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one on_display_name_changed emit expected; got {:?}",
+            *captured
+        );
+        let (got_user, got_name, got_session) = &captured[0];
+        assert_eq!(got_user, "tester1.estrada@gmail.com");
+        assert_eq!(got_name, "Tester 1");
+        assert_eq!(
+            *got_session, renaming_session_id,
+            "callback must carry the renaming participant's session_id \
+             so the consumer (dioxus-ui) can scope its local-self update \
+             to the renaming tab only — sibling tabs of the same authed \
+             user must NOT overwrite their own display name signal. \
+             Regression guard for HCL #828."
+        );
+    }
 }

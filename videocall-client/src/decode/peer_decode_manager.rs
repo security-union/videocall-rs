@@ -17,7 +17,7 @@
  */
 
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
+use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
     KEYFRAME_BACKOFF_DECAY_MS, KEYFRAME_REQUEST_MAX_BACKOFF_MS, KEYFRAME_REQUEST_MAX_UNANSWERED,
@@ -27,18 +27,21 @@ use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
+use js_sys::Date;
 use log::debug;
 use protobuf::Message;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::Callback;
+use videocall_types::protos::peer_event::PeerEvent;
+use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
@@ -120,6 +123,28 @@ struct SequenceTracker {
     unanswered_requests: u32,
     /// Current backoff interval for keyframe requests (ms). Doubles after each request.
     current_backoff_ms: u64,
+
+    // ── Windowed rate accounting (freeze observability, issue #1013) ──────
+    // During a freeze, decode CALLS keep firing (fps_received reads ~30) but
+    // packets are being lost and the stream is stuck requesting keyframes.
+    // We surface two per-stream signals — windowed packet-loss rate and
+    // windowed keyframe-request rate — so the health reporter can fold them
+    // into video_quality_score. Both use a ~1s rolling window and are
+    // recomputed only on window rollover (never per packet) to keep the
+    // real-time decode path allocation- and bus-spam-free.
+    /// Start of the current rate window (ms). 0 = not yet started.
+    window_start_ms: u64,
+    /// Lost packets accumulated in the current window.
+    window_lost: u32,
+    /// Keyframe requests (PLI) we decided to send for this stream in the
+    /// current window.
+    window_kf_requests: u32,
+    /// Most recently computed loss rate (lost packets/sec). Stable between
+    /// window rollovers.
+    loss_per_sec: f64,
+    /// Most recently computed keyframe-request rate (PLI/sec). Stable between
+    /// window rollovers.
+    kf_per_sec: f64,
 }
 
 impl SequenceTracker {
@@ -132,6 +157,11 @@ impl SequenceTracker {
             last_keyframe_request_ms: 0,
             unanswered_requests: 0,
             current_backoff_ms: KEYFRAME_REQUEST_MIN_INTERVAL_MS,
+            window_start_ms: 0,
+            window_lost: 0,
+            window_kf_requests: 0,
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
         }
     }
 
@@ -263,6 +293,63 @@ impl SequenceTracker {
         self.unanswered_requests = self.unanswered_requests.saturating_sub(1);
         // current_backoff_ms is intentionally NOT reset -- see doc comment.
     }
+
+    /// Feed this window's per-packet observations and roll the ~1s rate
+    /// window when it expires. Returns `true` exactly when a rollover occurred
+    /// (i.e. fresh `loss_per_sec` / `kf_per_sec` values are available), so the
+    /// caller can throttle bus emission to ~1Hz per stream rather than per
+    /// packet.
+    ///
+    /// `new_lost`     — newly lost packets detected this call (from `record_seq`).
+    /// `kf_requested` — whether a keyframe request (PLI) will be sent for this
+    ///                  stream as a result of this packet.
+    fn observe_window(&mut self, now: u64, new_lost: u32, kf_requested: bool) -> bool {
+        if self.window_start_ms == 0 {
+            self.window_start_ms = now;
+        }
+        self.window_lost = self.window_lost.saturating_add(new_lost);
+        if kf_requested {
+            self.window_kf_requests = self.window_kf_requests.saturating_add(1);
+        }
+
+        let elapsed = now.saturating_sub(self.window_start_ms);
+        if elapsed >= 1000 {
+            // Normalize by the ACTUAL elapsed window (not a fixed 1000ms) so a
+            // window that ran long — sparse packet arrival, a stalled tab —
+            // still yields a correct per-second rate. The `elapsed >= 1000`
+            // gate guarantees `denom` is never zero, so the division is safe.
+            let denom = elapsed as f64;
+            self.loss_per_sec = self.window_lost as f64 * 1000.0 / denom;
+            self.kf_per_sec = self.window_kf_requests as f64 * 1000.0 / denom;
+            self.window_lost = 0;
+            self.window_kf_requests = 0;
+            self.window_start_ms = now;
+            return true;
+        }
+        false
+    }
+
+    /// Most recently computed windowed packet-loss rate (lost packets/sec).
+    fn loss_per_sec(&self) -> f64 {
+        self.loss_per_sec
+    }
+
+    /// Most recently computed windowed keyframe-request rate (PLI/sec).
+    fn kf_per_sec(&self) -> f64 {
+        self.kf_per_sec
+    }
+}
+
+/// Result of `Peer::track_sequence`: a possible keyframe request plus, on
+/// ~1Hz window rollover, the freshly-computed per-stream loss / keyframe rates
+/// to publish on the diagnostics bus. `rates` is `Some` only on rollover so the
+/// manager throttles bus emission to ~1Hz per peer-stream (no per-packet spam).
+struct SeqTrackResult {
+    /// `Some(media_type)` when a KEYFRAME_REQUEST (PLI) should be sent.
+    keyframe_request: Option<MediaType>,
+    /// `Some((loss_per_sec, kf_per_sec))` only when the rate window just rolled
+    /// over and a fresh sample is ready to emit.
+    rates: Option<(f64, f64)>,
 }
 
 pub struct Peer {
@@ -283,6 +370,11 @@ pub struct Peer {
     pub screen_enabled: bool,
     pub is_speaking: bool,
     pub audio_level: f32,
+    /// Most recently observed transport this peer is connected over
+    /// (announced via HeartbeatMetadata). Defaults to UNKNOWN until the
+    /// first heartbeat arrives or if the peer is on an older client that
+    /// does not populate the field.
+    pub transport_type: TransportType,
     pub display_name: Option<String>,
     /// Server-vouched guest indicator, sourced from the authenticated JWT
     /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
@@ -300,6 +392,97 @@ pub struct Peer {
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
     screen_seq_tracker: SequenceTracker,
+    /// HCL bug #1: monotonic timestamp (ms since epoch) of the most recent
+    /// SCREEN media frame this receiver actually decoded. A non-zero value
+    /// means we have hard evidence the publisher is currently sharing
+    /// (the SCREEN stream is live), regardless of what an older heartbeat
+    /// metadata payload claims. Used by the HEARTBEAT branch to suppress
+    /// stale-heartbeat clobbering — when WT delivers a SCREEN keyframe on
+    /// the Screen persistent stream before an older heartbeat (carrying
+    /// `screen_enabled = false`) catches up on the Control stream, we
+    /// must NOT let the heartbeat reset `screen_enabled` back to false.
+    /// On WS (strict FIFO over one TCP socket) the heartbeat almost
+    /// always wins the race so the symptom is rare; on WT (multi-stream,
+    /// no global ordering) the race surfaces reliably and the screen
+    /// tile collapses out of the split layout.
+    last_screen_frame_ms: u64,
+    /// HCL bug #1: same idea for the camera-video stream. Without this
+    /// guard a stale heartbeat with `video_enabled = false` would mute
+    /// an actively-streaming camera on WT for one heartbeat period.
+    last_video_frame_ms: u64,
+    /// HCL bug #1: same idea for the audio stream.
+    last_audio_frame_ms: u64,
+}
+
+/// HCL bug #1: window during which a recent media frame suppresses a stale
+/// negative heartbeat. Set to match the publisher's heartbeat cadence
+/// (`HEARTBEAT_KEEPALIVE_INTERVAL_MS = 5000ms`, see
+/// `videocall-aq/src/constants.rs`).
+///
+/// Heartbeats are sent over lossy datagrams (see
+/// `videocall-client/src/connection/connection.rs`) and can arrive up to
+/// one full cadence late on bad links (mobile, 3G, congested WT). A
+/// heartbeat carrying `screen_enabled = false` sent at t=0 might land at
+/// t=4.5s — well after the first SCREEN frame of a freshly-started share
+/// has already set the local flag to true. If the freshness window were
+/// shorter than the cadence, the stale heartbeat would clobber the live
+/// flag back to false, collapse the split layout, and re-introduce the
+/// "shared content shown in a small tile only" symptom this fix exists
+/// to prevent.
+///
+/// 5000ms is the minimum value that covers the worst case while still
+/// honouring genuine "publisher stopped sharing" transitions on the
+/// NEXT heartbeat after the window expires.
+const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
+
+/// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
+/// arrives, given:
+///   * `current` — our locally tracked flag for this peer
+///   * `heartbeat_value` — what `HeartbeatMetadata.X_enabled` says
+///   * `last_frame_ms` — timestamp of the most recent live X frame we
+///     decoded (0 = none ever)
+///   * `now_ms` — current monotonic clock
+///
+/// Returns the value to install on `self.X_enabled`.
+///
+/// Decision matrix:
+///
+///   heartbeat=true   → trust the heartbeat (publisher announces it's on;
+///                      any contradicting "no frames seen" condition is
+///                      a network problem, not a state problem).
+///
+///   heartbeat=false  → if we saw an X frame within
+///                      `MEDIA_FRESH_WINDOW_MS`, KEEP `current`. The
+///                      heartbeat is stale relative to the live stream
+///                      (classic out-of-order-arrival window on WT, where
+///                      heartbeats and SCREEN frames live on different
+///                      QUIC streams with no global FIFO ordering). If
+///                      no recent frame, trust the heartbeat — the
+///                      publisher really did stop the X stream.
+///
+/// Pure function so it can be unit-tested without a real `Peer`.
+pub(crate) fn apply_heartbeat_enabled_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    if heartbeat_value {
+        // Affirmative heartbeats always win — publisher is announcing
+        // the stream is live, and we can't out-vote the source of truth
+        // with stale local state.
+        return true;
+    }
+    // heartbeat says off — only override the heartbeat when we have
+    // live media evidence within the freshness window. `saturating_sub`
+    // guards the (unlikely) case where `now_ms < last_frame_ms` due to
+    // a clock skew or test fixture setting future timestamps; we treat
+    // that as "frame is fresh" rather than panic / wrap.
+    if last_frame_ms > 0 && now_ms.saturating_sub(last_frame_ms) < MEDIA_FRESH_WINDOW_MS {
+        current
+    } else {
+        false
+    }
 }
 
 use std::fmt::Debug;
@@ -348,6 +531,7 @@ impl Peer {
             screen_enabled: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             display_name: None,
             is_guest,
             visible: false,
@@ -356,6 +540,14 @@ impl Peer {
             has_received_heartbeat: false,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            // HCL bug #1: 0 means "no media frame observed yet". The
+            // freshness check (`apply_heartbeat_enabled_flag`) treats 0
+            // as "not fresh," so a heartbeat at session start carries
+            // unchallenged authority — correct behaviour because we have
+            // no media yet.
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         })
     }
 
@@ -374,8 +566,8 @@ impl Peer {
     > {
         // Create decoders without canvas (will be set later via set_canvas)
         // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None)?;
-        let screen_decoder = VideoPeerDecoder::new(None)?;
+        let video_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_CAMERA)?;
+        let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN)?;
 
         // Attempt to set canvas immediately if available in DOM
         if let Some(window) = web_sys::window() {
@@ -429,6 +621,11 @@ impl Peer {
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
+        let transport_str = match self.transport_type {
+            TransportType::TRANSPORT_WEBTRANSPORT => "webtransport",
+            TransportType::TRANSPORT_WEBSOCKET => "websocket",
+            TransportType::TRANSPORT_UNKNOWN => "unknown",
+        };
         let evt = DiagEvent {
             subsystem: "peer_status",
             stream_id: None,
@@ -449,6 +646,41 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
+                metric!("peer_transport", transport_str.to_string()),
+            ],
+        };
+        let _ = global_sender().try_broadcast(evt);
+    }
+
+    /// Emit windowed per-stream packet-loss and keyframe-request rates on the
+    /// diagnostics bus (freeze observability, issue #1013).
+    ///
+    /// Shaped like the `"video"` subsystem events emitted by
+    /// `DiagnosticWorker::send_diagnostic_packets` so the existing
+    /// health_reporter `"video"` handler routes these metrics into the same
+    /// per-peer camera/screen bucket (disambiguated by `media_type`). Called
+    /// at most ~1Hz per peer-stream (only on rate-window rollover), so this
+    /// stays off the per-packet hot path.
+    ///
+    /// `local_user_id` is the reporting (local) client — the `from_peer` of the
+    /// event; `self.sid_str` is the observed remote peer — the `to_peer`.
+    fn emit_loss_metrics(
+        &self,
+        local_user_id: &str,
+        media_type: MediaType,
+        loss_per_sec: f64,
+        kf_per_sec: f64,
+    ) {
+        let evt = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("media_type", format!("{media_type:?}")),
+                metric!("from_peer", local_user_id.to_string()),
+                metric!("to_peer", self.sid_str.clone()),
+                metric!("video_seq_loss_per_sec", loss_per_sec),
+                metric!("keyframe_requests_per_sec", kf_per_sec),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -463,6 +695,7 @@ impl Peer {
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
+        local_user_id: &str,
     ) -> Result<(MediaType, DecodeStatus, Option<MediaType>), PeerDecodeError> {
         if packet
             .packet_type
@@ -489,8 +722,20 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
-                // Track sequence numbers for gap detection (PLI).
-                let kf_request = self.track_sequence(media_type, &packet);
+                // Track sequence numbers for gap detection (PLI) and windowed
+                // loss/keyframe-rate accounting (freeze observability #1013).
+                let seq = self.track_sequence(media_type, &packet);
+                if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
+                    self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                }
+                let kf_request = seq.keyframe_request;
+
+                // HCL bug #1: stamp the freshness timestamp BEFORE the
+                // `has_received_heartbeat` branch so it works on both the
+                // "no heartbeat yet" and "heartbeat says off, drop frame"
+                // paths. The next heartbeat consults this to decide whether
+                // to trust its own metadata or the live frame stream.
+                self.last_video_frame_ms = now_ms();
 
                 if !self.video_enabled {
                     if !self.has_received_heartbeat {
@@ -524,6 +769,11 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
+                // HCL bug #1: stamp audio freshness regardless of the
+                // straggler-drop path so the next heartbeat can detect
+                // recent audio frames and suppress a stale-muted heartbeat.
+                self.last_audio_frame_ms = now_ms();
+
                 if !self.audio_enabled {
                     if !self.has_received_heartbeat {
                         // No heartbeat yet — infer audio_enabled from the actual frame.
@@ -545,8 +795,26 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
-                // Track sequence numbers for gap detection (PLI).
-                let kf_request = self.track_sequence(media_type, &packet);
+                // Track sequence numbers for gap detection (PLI) and windowed
+                // loss/keyframe-rate accounting (freeze observability #1013).
+                let seq = self.track_sequence(media_type, &packet);
+                if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
+                    self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                }
+                let kf_request = seq.keyframe_request;
+
+                // HCL bug #1: stamp the screen-freshness timestamp on every
+                // observed SCREEN frame. The next heartbeat (which may carry
+                // a stale `metadata.screen_enabled = false` on WebTransport
+                // because heartbeats and SCREEN frames race across separate
+                // QUIC streams) consults this to decide whether to honour
+                // its own metadata or trust the live screen stream.
+                // Without this stamp, the heartbeat at line ~691 below would
+                // overwrite `screen_enabled` back to false, the UI would
+                // observe `has_screen_share = false`, and the split-screen
+                // layout would collapse — exactly the WT-only symptom from
+                // the user report.
+                self.last_screen_frame_ms = now_ms();
 
                 if !self.screen_enabled {
                     // A SCREEN frame arrived while screen_enabled is false.
@@ -607,31 +875,68 @@ impl Peer {
                 self.has_received_heartbeat = true;
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    let now = now_ms();
+                    // HCL bug #1: resolve each media-enabled flag against
+                    // recently observed frames. The heartbeat stream and the
+                    // media streams race on WebTransport — a stale heartbeat
+                    // carrying `metadata.X_enabled = false` can arrive after
+                    // we've already started decoding live X frames. Trusting
+                    // the heartbeat blindly would erase `screen_enabled = true`
+                    // and collapse the split-screen-share layout for one full
+                    // heartbeat period. The freshness check trusts the live
+                    // media when we saw an X frame within the last
+                    // `MEDIA_FRESH_WINDOW_MS`; otherwise the heartbeat wins.
+                    let resolved_video = apply_heartbeat_enabled_flag(
+                        self.video_enabled,
+                        metadata.video_enabled,
+                        self.last_video_frame_ms,
+                        now,
+                    );
+                    let resolved_audio = apply_heartbeat_enabled_flag(
+                        self.audio_enabled,
+                        metadata.audio_enabled,
+                        self.last_audio_frame_ms,
+                        now,
+                    );
+                    let resolved_screen = apply_heartbeat_enabled_flag(
+                        self.screen_enabled,
+                        metadata.screen_enabled,
+                        self.last_screen_frame_ms,
+                        now,
+                    );
+
                     // Check if video is being turned off (on -> off transition)
-                    let video_turned_off = self.video_enabled && !metadata.video_enabled;
+                    let video_turned_off = self.video_enabled && !resolved_video;
                     // Check if screen is being turned off (on -> off transition)
-                    let screen_turned_off = self.screen_enabled && !metadata.screen_enabled;
+                    let screen_turned_off = self.screen_enabled && !resolved_screen;
                     // Check if audio is being turned off (on -> off transition)
-                    let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
+                    let audio_turned_off = self.audio_enabled && !resolved_audio;
                     // Check if audio state changed at all
-                    let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
+                    let audio_state_changed = self.audio_enabled != resolved_audio;
 
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
-                        self.audio.set_muted(!metadata.audio_enabled);
+                        self.audio.set_muted(!resolved_audio);
                         debug!(
                             "Audio state changed for peer {} - muted: {}",
-                            self.session_id, !metadata.audio_enabled
+                            self.session_id, !resolved_audio
                         );
                     }
 
-                    self.video_enabled = metadata.video_enabled;
-                    self.audio_enabled = metadata.audio_enabled;
-                    self.screen_enabled = metadata.screen_enabled;
+                    self.video_enabled = resolved_video;
+                    self.audio_enabled = resolved_audio;
+                    self.screen_enabled = resolved_screen;
                     self.is_speaking = metadata.is_speaking;
                     if !metadata.is_speaking {
                         self.audio_level = 0.0;
                     }
+                    // Capture peer's announced transport. Unknown enum
+                    // values (e.g., from a future client) decay to
+                    // TRANSPORT_UNKNOWN rather than crashing.
+                    self.transport_type = metadata
+                        .transport_type
+                        .enum_value()
+                        .unwrap_or(TransportType::TRANSPORT_UNKNOWN);
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {
@@ -694,13 +999,14 @@ impl Peer {
     /// Track the sequence number of an incoming video/screen packet and detect
     /// genuine packet loss using a sliding-window reorder buffer.
     ///
-    /// Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent for this
-    /// peer, or `None` if no request is needed.
+    /// Returns a [`SeqTrackResult`] carrying any pending KEYFRAME_REQUEST plus,
+    /// on ~1Hz window rollover, the freshly-computed per-stream loss/keyframe
+    /// rates for the diagnostics bus.
     ///
     /// Unlike the previous implementation, out-of-order arrivals within a 64-
     /// packet window are NOT treated as loss. Only packets that shift off the
     /// window without ever being received are counted as genuinely lost.
-    fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
+    fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> SeqTrackResult {
         // Both VIDEO and SCREEN packets use `video_metadata` for sequence
         // tracking. This is correct: `transform_screen_chunk` in
         // `encode/transform.rs` populates `VideoMetadata { sequence, .. }`
@@ -709,18 +1015,26 @@ impl Peer {
         let (seq, frame_type_str) = if let Some(vm) = packet.video_metadata.as_ref() {
             (vm.sequence, packet.frame_type.as_str())
         } else {
-            return None;
+            return SeqTrackResult {
+                keyframe_request: None,
+                rates: None,
+            };
         };
 
         let tracker = match media_type {
             MediaType::VIDEO => &mut self.video_seq_tracker,
             MediaType::SCREEN => &mut self.screen_seq_tracker,
-            _ => return None,
+            _ => {
+                return SeqTrackResult {
+                    keyframe_request: None,
+                    rates: None,
+                }
+            }
         };
 
         // Record the sequence number first. This may detect new losses
         // (packets that shifted off the window without being seen).
-        tracker.record_seq(seq);
+        let new_lost = tracker.record_seq(seq);
 
         // If this is a keyframe, clear loss state AFTER recording the seq.
         // Ordering matters: record_seq may add losses from the window shift,
@@ -731,10 +1045,19 @@ impl Peer {
         }
 
         let now = now_ms();
-        if tracker.should_request_keyframe(now) {
-            Some(media_type)
+        let kf_requested = tracker.should_request_keyframe(now);
+
+        // Feed the ~1s windowed rate accounting. `observe_window` returns true
+        // exactly on rollover, throttling bus emission to ~1Hz per stream.
+        let rates = if tracker.observe_window(now, new_lost, kf_requested) {
+            Some((tracker.loss_per_sec(), tracker.kf_per_sec()))
         } else {
             None
+        };
+
+        SeqTrackResult {
+            keyframe_request: kf_requested.then_some(media_type),
+            rates,
         }
     }
 
@@ -798,12 +1121,40 @@ pub struct PeerDecodeManager {
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
     pub on_peer_removed: Callback<String>,
+    /// Batched companion of `on_peer_removed` fired once per
+    /// `run_peer_monitor` pass with **all** peers removed in that pass.
+    ///
+    /// Phase 6 watchdog-cascade fix (cc7tp 2026-05-06): when N peers time
+    /// out together (e.g. a network blip drops 5 simultaneously), the
+    /// per-peer `on_peer_removed.emit(...)` loop triggered N consecutive
+    /// `peer_list_version` bumps in the dioxus UI, each of which forced a
+    /// full meeting-view re-render before the next removal completed. On
+    /// 2-core machines this could chain into a 5-second main-thread stall
+    /// that itself tripped the CPU-stall guard. Subscribers that only need
+    /// "something changed" (e.g. version bumps) should listen on this
+    /// callback and bump exactly once per pass; subscribers that need
+    /// per-peer cleanup (e.g. removing entries from per-peer maps) keep
+    /// using `on_peer_removed`. Both fire — they are not mutually
+    /// exclusive.
+    pub on_peers_removed_batch: Callback<Vec<String>>,
     vad_threshold: Option<f32>,
     /// Callback for sending packets back through the connection (used for
     /// KEYFRAME_REQUEST). Set by `VideoCallClient` after construction.
     send_packet: Option<Callback<PacketWrapper>>,
     /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
     local_user_id: String,
+    /// Cached snapshot of `connected_peers.ordered_keys()` rendered as
+    /// `Vec<String>`. Phase 6 fix: avoids walking the ordered key list and
+    /// allocating a fresh `Vec<String>` on every `sorted_peer_keys()` call
+    /// from the UI render path. Held as `Rc<Vec<String>>` so a single
+    /// allocation can be shared cheaply across many callers within one
+    /// render frame. Invalidated to `None` whenever the peer set changes
+    /// (insert / remove / drain) — see `invalidate_sorted_string_keys()`.
+    cached_sorted_string_keys: RefCell<Option<Rc<Vec<String>>>>,
+    /// Cancellation tokens for in-flight PEER_EVENT(screen_decode_started)
+    /// retries, keyed by publisher user_id. Set to `false` when the peer
+    /// stops screen-sharing or is removed, causing pending retries to no-op.
+    screen_decode_retry_tokens: HashMap<String, Rc<std::cell::Cell<bool>>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -823,9 +1174,12 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+            on_peers_removed_batch: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -839,9 +1193,12 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
             on_peer_removed: Callback::noop(),
+            on_peers_removed_batch: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            cached_sorted_string_keys: RefCell::new(None),
+            screen_decode_retry_tokens: HashMap::new(),
         }
     }
 
@@ -850,6 +1207,24 @@ impl PeerDecodeManager {
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
         self.send_packet = Some(callback);
         self.local_user_id = user_id;
+    }
+
+    /// Clear the send-packet callback. Called from
+    /// [`VideoCallClient::disconnect()`](crate::VideoCallClient::disconnect)
+    /// to break the `client -> peer_decode_manager.send_packet -> client`
+    /// `Rc` cycle that otherwise keeps `Inner` alive after the UI scope
+    /// holding the client has unmounted (issue: cc7tp meeting incident
+    /// 2026-05-01, github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    pub fn clear_send_packet_callback(&mut self) {
+        self.send_packet = None;
+    }
+
+    /// Test/observability helper: report whether the PLI send-packet
+    /// callback is currently set. Used by the disconnect regression
+    /// tests to assert that `clear_send_packet_callback` actually fired.
+    #[doc(hidden)]
+    pub fn has_send_packet_callback(&self) -> bool {
+        self.send_packet.is_some()
     }
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
@@ -865,6 +1240,7 @@ impl PeerDecodeManager {
     pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
         let session_ids = self.connected_peers.ordered_keys().clone();
         let mut screen_keyframe_requests: Vec<String> = Vec::new();
+        let mut video_keyframe_requests: Vec<String> = Vec::new();
         for session_id in session_ids {
             let visible = active_session_ids.contains(&session_id);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
@@ -878,16 +1254,59 @@ impl PeerDecodeManager {
                 if visible && peer.screen_enabled {
                     screen_keyframe_requests.push(peer.user_id.clone());
                 }
+                // Send a proactive video PLI when a video tile becomes visible
+                // so the decoder gets a keyframe immediately instead of waiting
+                // up to 5 s for the next periodic one (150 frames at 30 fps).
+                // Gated on video_enabled so we don't send spurious PLIs for
+                // peers that have their camera off.
+                if visible && peer.video_enabled {
+                    video_keyframe_requests.push(peer.user_id.clone());
+                }
                 peer.visible = visible;
             }
         }
         for user_id in &screen_keyframe_requests {
             self.send_keyframe_request(user_id, MediaType::SCREEN);
         }
+        for user_id in &video_keyframe_requests {
+            self.send_keyframe_request(user_id, MediaType::VIDEO);
+        }
     }
 
     pub fn sorted_keys(&self) -> &Vec<u64> {
         self.connected_peers.ordered_keys()
+    }
+
+    /// Memoised string-form of [`sorted_keys`] for hot UI render paths.
+    ///
+    /// Phase 6 fix (cc7tp 2026-05-06): the dioxus meeting view called
+    /// `VideoCallClient::sorted_peer_keys()` on every render, which used
+    /// to walk the ordered-key list and clone each `u64` into a fresh
+    /// `String`. With many peers and a render-storm bug bumping
+    /// `peer_list_version` 20+ times per second, that allocation cost
+    /// became measurable on 2-core hardware. The cache stores the
+    /// rendered `Vec<String>` inside an `Rc` so successive callers in
+    /// the same frame share one allocation, and is invalidated by
+    /// [`invalidate_sorted_string_keys`] whenever the peer set changes.
+    pub fn sorted_string_keys(&self) -> Rc<Vec<String>> {
+        if let Some(existing) = self.cached_sorted_string_keys.borrow().as_ref() {
+            return Rc::clone(existing);
+        }
+        let computed: Rc<Vec<String>> = Rc::new(
+            self.connected_peers
+                .ordered_keys()
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+        );
+        *self.cached_sorted_string_keys.borrow_mut() = Some(Rc::clone(&computed));
+        computed
+    }
+
+    /// Invalidate the [`sorted_string_keys`] cache. Called from every code
+    /// path that mutates the peer set. Cheap (sets one `Option` to `None`).
+    fn invalidate_sorted_string_keys(&self) {
+        *self.cached_sorted_string_keys.borrow_mut() = None;
     }
 
     pub fn get(&self, key: &u64) -> Option<&Peer> {
@@ -935,11 +1354,23 @@ impl PeerDecodeManager {
             .remove_if_and_return(|peer| peer.check_heartbeat());
         let mut removed_ids = Vec::new();
         for (_session_id, peer) in removed {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
             removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
+        }
+        if !removed_ids.is_empty() {
+            // Invalidate the sorted-keys cache and emit a single batched
+            // event so subscribers that only care about "something
+            // changed" can coalesce their work (e.g. a single
+            // peer_list_version bump on the dioxus side, instead of one
+            // per dead peer). See Phase 6 watchdog-cascade fix.
+            self.invalidate_sorted_string_keys();
+            self.on_peers_removed_batch.emit(removed_ids.clone());
         }
         removed_ids
     }
@@ -948,7 +1379,11 @@ impl PeerDecodeManager {
         let packet = Arc::new(response);
         let peer_session_id = packet.session_id;
 
+        // `userid` is the local (reporting) user — captured before the mutable
+        // borrow of `connected_peers` so `Peer::decode` can stamp it as the
+        // `from_peer` on its windowed loss/keyframe bus events (#1013).
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
+            let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
                 peer.video
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
@@ -956,9 +1391,14 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.context_initialized = true;
             }
-            match peer.decode(&packet) {
+            match peer.decode(&packet, userid) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
+                    let stopped_screen_share = was_screen_enabled && !peer.screen_enabled;
+                    let publisher_user_id = stopped_screen_share.then(|| peer.user_id.clone());
+                    if let Some(publisher_user_id) = publisher_user_id {
+                        self.cancel_screen_decode_retries(&publisher_user_id);
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status, keyframe_request)) => {
@@ -978,9 +1418,26 @@ impl PeerDecodeManager {
                         self.on_first_frame.emit((sid_str, media_type));
                     }
 
-                    // If gap detection triggered a keyframe request, clone
-                    // the peer's user_id before releasing the mutable borrow.
+                    // Capture state we may need after dropping the mutable
+                    // borrow of `peer`:
+                    //   - `screen_first_frame_publisher` notifies the
+                    //     publisher that we just decoded their first
+                    //     screen-share frame (HCL #893). One PEER_EVENT per
+                    //     (publisher, stream) because `first_frame` flips
+                    //     true exactly once.
+                    //   - `kf_info` carries any gap-driven keyframe request.
+                    let screen_first_frame_publisher =
+                        if decode_status.first_frame && media_type == MediaType::SCREEN {
+                            Some(peer.user_id.clone())
+                        } else {
+                            None
+                        };
                     let kf_info = keyframe_request.map(|mt| (peer.user_id.clone(), mt));
+
+                    // Mutable borrow on `peer` ends here.
+                    if let Some(publisher_user_id) = screen_first_frame_publisher {
+                        self.publish_screen_decode_started(&publisher_user_id);
+                    }
 
                     // Now we can immutably borrow self for sending.
                     if let Some((peer_uid, requested_media_type)) = kf_info {
@@ -1001,6 +1458,12 @@ impl PeerDecodeManager {
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(peer_session_id))
+        }
+    }
+
+    fn cancel_screen_decode_retries(&mut self, publisher_user_id: &str) {
+        if let Some(token) = self.screen_decode_retry_tokens.remove(publisher_user_id) {
+            token.set(false);
         }
     }
 
@@ -1060,6 +1523,95 @@ impl PeerDecodeManager {
         send_packet.emit(wrapper);
     }
 
+    /// Send a `PEER_EVENT(screen_decode_started)` to the publisher whose
+    /// screen-share we just decoded for the first time. The relay routes
+    /// the packet by `target_peer_id`, so only the publisher receives it.
+    ///
+    /// Sends immediately then retries twice (at 2s and 4s) to handle a
+    /// race condition where the publisher's NATS subscription may not be
+    /// active yet when the first packet arrives (the relay's JoinRoom
+    /// handler spawns the subscription asynchronously).
+    ///
+    /// `publisher_user_id` MUST be the publisher's user_id (the remote peer
+    /// whose screen frame we just decoded). The event's `stream_id` is set
+    /// to the same value because there is at most one screen-share per user.
+    fn publish_screen_decode_started(&mut self, publisher_user_id: &str) {
+        let Some(send_packet) = &self.send_packet else {
+            debug!("Cannot publish PEER_EVENT: no send_packet callback");
+            return;
+        };
+
+        let local_user_id = self.local_user_id.clone();
+        let target_user_id = publisher_user_id.to_string();
+        let send_packet = send_packet.clone();
+
+        let active = Rc::new(std::cell::Cell::new(true));
+        if let Some(previous) = self
+            .screen_decode_retry_tokens
+            .insert(target_user_id.clone(), Rc::clone(&active))
+        {
+            previous.set(false);
+        }
+
+        log::info!(
+            "Publishing PEER_EVENT(screen_decode_started) target={} (with retries)",
+            publisher_user_id
+        );
+
+        Self::emit_screen_decode_event(&send_packet, &local_user_id, &target_user_id);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            for delay_ms in [2000, 4000] {
+                gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+                if !active.get() {
+                    log::debug!(
+                        "PEER_EVENT(screen_decode_started) retry cancelled for target={}",
+                        target_user_id
+                    );
+                    return;
+                }
+                log::debug!(
+                    "Retry PEER_EVENT(screen_decode_started) target={} delay={}ms",
+                    target_user_id,
+                    delay_ms
+                );
+                Self::emit_screen_decode_event(&send_packet, &local_user_id, &target_user_id);
+            }
+        });
+    }
+
+    fn emit_screen_decode_event(
+        send_packet: &Callback<PacketWrapper>,
+        local_user_id: &str,
+        target_user_id: &str,
+    ) {
+        let peer_event = PeerEvent {
+            source_peer_id: local_user_id.as_bytes().to_vec(),
+            target_peer_id: target_user_id.as_bytes().to_vec(),
+            event_type: PEER_EVENT_SCREEN_DECODE_STARTED.to_string(),
+            stream_id: target_user_id.to_string(),
+            timestamp_ms: Date::now() as i64,
+            ..Default::default()
+        };
+
+        let data = match peer_event.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("Failed to serialize PeerEvent: {}", e);
+                return;
+            }
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::PEER_EVENT.into(),
+            user_id: local_user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+
+        send_packet.emit(wrapper);
+    }
+
     fn add_peer(
         &mut self,
         user_id: &str,
@@ -1092,17 +1644,31 @@ impl PeerDecodeManager {
             peer.display_name = Some(cached_name.clone());
         }
         self.connected_peers.insert(session_id, peer);
+        // Phase 6: invalidate the sorted-keys cache so the next
+        // `sorted_string_keys()` call rebuilds with the new peer.
+        self.invalidate_sorted_string_keys();
         Ok(())
     }
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
+                token.set(false);
+            }
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
             self.display_name_cache.remove(&session_id);
             self.is_guest_cache.remove(&session_id);
+            // Phase 6: invalidate the sorted-keys cache before notifying
+            // observers so any read in the callback sees a fresh list.
+            self.invalidate_sorted_string_keys();
+            let sid_str = peer.sid_str.clone();
             self.on_peer_removed.emit(peer.sid_str);
+            // Single-peer removals also fire the batched callback so
+            // subscribers can coalesce on it without subscribing to two
+            // separate notifications.
+            self.on_peers_removed_batch.emit(vec![sid_str]);
         }
     }
 
@@ -1111,17 +1677,30 @@ impl PeerDecodeManager {
     /// Called when the connection drops so stale workers don't linger and
     /// consume WASM memory while the client reconnects.
     pub fn clear_all_peers(&mut self) {
+        for token in self.screen_decode_retry_tokens.values() {
+            token.set(false);
+        }
+        self.screen_decode_retry_tokens.clear();
         let removed = self.connected_peers.drain_all();
+        let mut removed_ids: Vec<String> = Vec::with_capacity(removed.len());
         for (_session_id, peer) in removed {
             if let Some(diag) = &self.diagnostics {
                 diag.remove_peer(&peer.sid_str);
             }
+            removed_ids.push(peer.sid_str.clone());
             self.on_peer_removed.emit(peer.sid_str);
         }
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
         self.is_guest_cache.clear();
+        // Phase 6: invalidate the sorted-keys cache and emit a single
+        // batched event so observers can coalesce the bulk-clear into
+        // one notification.
+        self.invalidate_sorted_string_keys();
+        if !removed_ids.is_empty() {
+            self.on_peers_removed_batch.emit(removed_ids);
+        }
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -1209,11 +1788,18 @@ impl PeerDecodeManager {
     }
 
     /// Get the display name for a peer by session_id string.
+    ///
+    /// Checks the live peer entry first, then falls back to the persistent
+    /// `display_name_cache` (populated by PARTICIPANT_JOINED events that may
+    /// arrive before the first media packet creates the peer entry).
     pub fn get_peer_display_name(&self, session_id_str: &str) -> Option<String> {
         let sid: u64 = session_id_str.parse().ok()?;
-        self.connected_peers
-            .get(&sid)
-            .and_then(|peer| peer.display_name.clone())
+        if let Some(peer) = self.connected_peers.get(&sid) {
+            if peer.display_name.is_some() {
+                return peer.display_name.clone();
+            }
+        }
+        self.display_name_cache.get(&sid).cloned()
     }
 
     /// Get the server-vouched guest status for a peer by session_id string.
@@ -1306,16 +1892,20 @@ mod tests {
 
     // -- helpers ----------------------------------------------------------
 
-    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
-    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+    fn packet_wrapper(media: &MediaPacket, session_id: u64) -> PacketWrapper {
         let data = media.write_to_bytes().expect("serialize MediaPacket");
-        Arc::new(PacketWrapper {
+        PacketWrapper {
             data,
             user_id: "test@test.com".into(),
             packet_type: PacketType::MEDIA.into(),
             session_id,
             ..Default::default()
-        })
+        }
+    }
+
+    /// Wrap a `MediaPacket` into a `PacketWrapper` ready for `Peer::decode`.
+    fn wrap(media: &MediaPacket, session_id: u64) -> Arc<PacketWrapper> {
+        Arc::new(packet_wrapper(media, session_id))
     }
 
     fn heartbeat_packet(
@@ -1397,11 +1987,106 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
         };
         (peer, muted_handle)
+    }
+
+    #[wasm_bindgen_test]
+    fn heartbeat_screen_off_cancels_pending_screen_decode_retries() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(42);
+        peer.screen_enabled = true;
+        peer.has_received_heartbeat = true;
+        manager.connected_peers.insert(42, peer);
+
+        let token = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("test@test.com".to_string(), token.clone());
+
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"test@test.com".to_vec(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: false,
+                audio_enabled: false,
+                screen_enabled: false,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+
+        manager
+            .decode(packet_wrapper(&media, 42), "test@test.com")
+            .expect("screen-off heartbeat should decode");
+
+        assert!(
+            !token.get(),
+            "screen-off heartbeat must cancel pending screen_decode_started retries"
+        );
+        assert!(
+            !manager
+                .screen_decode_retry_tokens
+                .contains_key("test@test.com"),
+            "cancelled retry token should be removed from the manager"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn new_screen_decode_publish_cancels_previous_retry_token() {
+        let collected = Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = Callback::from(move |packet: PacketWrapper| {
+            collected_clone.borrow_mut().push(packet);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "viewer@test.com".to_string());
+
+        let previous = Rc::new(Cell::new(true));
+        manager
+            .screen_decode_retry_tokens
+            .insert("publisher@test.com".to_string(), previous.clone());
+
+        manager.publish_screen_decode_started("publisher@test.com");
+
+        assert!(
+            !previous.get(),
+            "re-publishing for the same publisher must cancel the old retry loop"
+        );
+        assert!(
+            manager
+                .screen_decode_retry_tokens
+                .get("publisher@test.com")
+                .is_some_and(|token| token.get()),
+            "new publish should install an active retry token"
+        );
+
+        let packets = collected.borrow();
+        assert_eq!(
+            packets.len(),
+            1,
+            "publish sends the first event immediately"
+        );
+        assert_eq!(
+            packets[0].packet_type.enum_value(),
+            Ok(PacketType::PEER_EVENT)
+        );
+        let peer_event =
+            PeerEvent::parse_from_bytes(&packets[0].data).expect("peer event should parse");
+        assert_eq!(
+            peer_event.event_type,
+            PEER_EVENT_SCREEN_DECODE_STARTED.to_string()
+        );
+        assert_eq!(peer_event.target_peer_id, b"publisher@test.com".to_vec());
     }
 
     // -- straggler guard tests --------------------------------------------
@@ -1416,7 +2101,7 @@ mod tests {
         let packet = video_frame_packet(1);
         // Video decode will fail (noop decoder gets dummy data) but
         // state inference happens before the codec call.
-        let _ = peer.decode(&packet);
+        let _ = peer.decode(&packet, "");
         assert!(peer.video_enabled, "video_enabled should be inferred true");
     }
 
@@ -1428,14 +2113,14 @@ mod tests {
 
         // Receive heartbeat: video off, audio off, screen off.
         let hb = heartbeat_packet(2, false, false, false);
-        let result = peer.decode(&hb);
+        let result = peer.decode(&hb, "");
         assert!(result.is_ok());
         assert!(peer.has_received_heartbeat);
         assert!(!peer.video_enabled);
 
         // Now a straggler video frame arrives.
         let packet = video_frame_packet(2);
-        let result = peer.decode(&packet);
+        let result = peer.decode(&packet, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
@@ -1455,7 +2140,7 @@ mod tests {
         assert!(muted_handle.get(), "audio should start muted");
 
         let packet = audio_frame_packet(3);
-        let _ = peer.decode(&packet);
+        let _ = peer.decode(&packet, "");
         assert!(peer.audio_enabled, "audio_enabled should be inferred true");
         assert!(
             !muted_handle.get(),
@@ -1470,12 +2155,12 @@ mod tests {
         let (mut peer, _muted) = make_test_peer(4);
 
         let hb = heartbeat_packet(4, false, false, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.has_received_heartbeat);
         assert!(!peer.audio_enabled);
 
         let packet = audio_frame_packet(4);
-        let result = peer.decode(&packet);
+        let result = peer.decode(&packet, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
@@ -1493,10 +2178,203 @@ mod tests {
         assert!(!peer.screen_enabled);
 
         let packet = screen_frame_packet(5);
-        let _ = peer.decode(&packet);
+        let _ = peer.decode(&packet, "");
         assert!(
             peer.screen_enabled,
             "screen_enabled should be inferred true"
+        );
+    }
+
+    // --- HCL bug #1: heartbeat-vs-SCREEN-frame race -----------------------
+    //
+    // These tests pin down `apply_heartbeat_enabled_flag`, the pure
+    // decision function the HEARTBEAT branch consults to decide whether a
+    // stale `metadata.X_enabled = false` is allowed to clobber a locally
+    // tracked `X_enabled = true`. The bug fix REQUIRES this function — a
+    // regression that simplifies it back to "always trust the heartbeat"
+    // will fail every one of these tests.
+
+    /// `heartbeat=true` always wins, regardless of whether we have any
+    /// recent media. The publisher is the source of truth for "on."
+    #[test]
+    fn apply_hb_flag_affirmative_heartbeat_wins() {
+        // No media observed.
+        assert!(apply_heartbeat_enabled_flag(false, true, 0, 5_000));
+        // Stale media (older than the freshness window).
+        assert!(apply_heartbeat_enabled_flag(false, true, 1_000, 10_000));
+        // Fresh media.
+        assert!(apply_heartbeat_enabled_flag(true, true, 4_500, 5_000));
+    }
+
+    /// `heartbeat=false` with a SCREEN frame inside the freshness window
+    /// MUST preserve the current `true` flag — this is the WT-race fix.
+    /// The user-visible symptom of regressing this is the split-screen
+    /// layout collapsing for one heartbeat period after every SCREEN
+    /// keyframe on WebTransport.
+    ///
+    /// Uses `MEDIA_FRESH_WINDOW_MS - 100` so the test tracks the constant
+    /// rather than baking in a literal — if the window is widened or
+    /// narrowed in future, the test stays load-bearing.
+    #[test]
+    fn apply_hb_flag_keeps_current_when_media_is_fresh() {
+        let delta = MEDIA_FRESH_WINDOW_MS - 100;
+        let now = 10_000_u64;
+        let last_frame = now - delta;
+        assert!(apply_heartbeat_enabled_flag(
+            true,       /* current */
+            false,      /* heartbeat */
+            last_frame, /* last_frame_ms */
+            now,        /* now_ms */
+        ));
+    }
+
+    /// `heartbeat=false` with a SCREEN frame OLDER than the freshness
+    /// window must let the heartbeat win — the publisher has genuinely
+    /// stopped sharing, and a single very-old frame should not pin the
+    /// flag on forever.
+    ///
+    /// Uses `MEDIA_FRESH_WINDOW_MS + 100` so the test tracks the constant.
+    #[test]
+    fn apply_hb_flag_heartbeat_wins_when_media_is_stale() {
+        let delta = MEDIA_FRESH_WINDOW_MS + 100;
+        let now = 10_000_u64;
+        let last_frame = now - delta;
+        assert!(!apply_heartbeat_enabled_flag(
+            true,       /* current */
+            false,      /* heartbeat */
+            last_frame, /* last_frame_ms */
+            now,        /* now_ms */
+        ));
+    }
+
+    /// Boundary test: pin the 5000ms cadence value explicitly so a
+    /// future "let's shrink the window back to 2000ms" change fails
+    /// loudly. The PR-review fix raised the window to match
+    /// `HEARTBEAT_KEEPALIVE_INTERVAL_MS = 5000ms` because heartbeats
+    /// ride lossy datagrams and can arrive up to one full cadence late
+    /// on bad links — a sub-cadence window lets a stale heartbeat
+    /// clobber a live SCREEN stream on WT/3G/mobile and re-introduces
+    /// the "shared content in a small tile only" bug.
+    #[test]
+    fn apply_hb_flag_5000ms_window_covers_heartbeat_cadence() {
+        // The constant itself must be ≥ 5000ms.
+        assert!(
+            MEDIA_FRESH_WINDOW_MS >= 5_000,
+            "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
+             a shorter window lets a stale heartbeat clobber live media on lossy WT"
+        );
+
+        let now = 10_000_u64;
+
+        // A 4900ms-old frame is still inside the 5000ms window → KEEP.
+        let fresh = apply_heartbeat_enabled_flag(
+            true,        /* current */
+            false,       /* heartbeat */
+            now - 4_900, /* last_frame_ms — 4900ms ago */
+            now,
+        );
+        assert!(
+            fresh,
+            "frame 4900ms old must still suppress a stale heartbeat (worst-case \
+             cadence-late heartbeat is up to 5000ms behind)"
+        );
+
+        // A 5100ms-old frame is outside the window → heartbeat wins.
+        let stale = apply_heartbeat_enabled_flag(
+            true,        /* current */
+            false,       /* heartbeat */
+            now - 5_100, /* last_frame_ms — 5100ms ago */
+            now,
+        );
+        assert!(
+            !stale,
+            "frame 5100ms old is past the cadence-aligned window — the heartbeat \
+             is presumed current and must be honoured"
+        );
+    }
+
+    /// `heartbeat=false` with NO media ever (last_frame_ms = 0) must let
+    /// the heartbeat win even though `now_ms - 0 < MEDIA_FRESH_WINDOW_MS`
+    /// arithmetically. The sentinel `0` means "never observed," not
+    /// "observed at epoch."
+    #[test]
+    fn apply_hb_flag_zero_sentinel_is_not_fresh() {
+        assert!(!apply_heartbeat_enabled_flag(
+            true,  /* current */
+            false, /* heartbeat */
+            0,     /* never observed */
+            500    /* now_ms inside window arithmetically */
+        ));
+    }
+
+    /// Clock skew guard: if `last_frame_ms > now_ms` (timestamp from the
+    /// future — possible in test fixtures or under clock adjustment),
+    /// the saturating subtraction must NOT panic / wrap, and the frame
+    /// should be treated as fresh.
+    #[test]
+    fn apply_hb_flag_clock_skew_treats_future_frame_as_fresh() {
+        assert!(apply_heartbeat_enabled_flag(
+            true, false, 10_000, /* last_frame_ms */
+            5_000,  /* now_ms — earlier than last_frame */
+        ));
+    }
+
+    /// Integration: simulate the exact WT-race scenario. A SCREEN
+    /// keyframe lands first (auto-enables `screen_enabled`), then a
+    /// stale heartbeat carrying `screen_enabled = false` arrives. The
+    /// peer's local flag MUST remain true — this is the test that
+    /// would fail before the fix.
+    #[wasm_bindgen_test]
+    fn screen_enabled_survives_stale_heartbeat_after_frame() {
+        let (mut peer, _muted) = make_test_peer(193);
+        assert!(!peer.screen_enabled);
+
+        // SCREEN keyframe arrives first → `screen_enabled = true` and
+        // `last_screen_frame_ms` is stamped to a recent value.
+        let screen = screen_frame_packet(193);
+        let _ = peer.decode(&screen, "");
+        assert!(
+            peer.screen_enabled,
+            "SCREEN frame should auto-enable screen_enabled"
+        );
+        assert!(
+            peer.last_screen_frame_ms > 0,
+            "SCREEN frame should stamp last_screen_frame_ms"
+        );
+
+        // Stale heartbeat with screen_enabled=false arrives within the
+        // freshness window. Before the fix: peer.screen_enabled flips
+        // back to false, has_screen_share goes false in the UI, split
+        // layout collapses. After the fix: the flag must remain true.
+        let hb = heartbeat_packet(193, false, false, false);
+        let _ = peer.decode(&hb, "");
+        assert!(
+            peer.screen_enabled,
+            "HCL bug #1: stale heartbeat must not clobber fresh SCREEN \
+             stream — the split-layout would otherwise collapse on WT"
+        );
+    }
+
+    /// Integration: a heartbeat arriving AFTER the freshness window
+    /// elapses must be honoured. The publisher really did stop sharing
+    /// — we should not pin the flag on indefinitely just because we
+    /// once saw a SCREEN frame.
+    #[wasm_bindgen_test]
+    fn screen_enabled_cleared_by_heartbeat_when_media_stops() {
+        let (mut peer, _muted) = make_test_peer(194);
+
+        // Force the timestamp into the past so a subsequent heartbeat
+        // is OUTSIDE the freshness window. We can't actually sleep
+        // 2s in a unit test; instead we install the value directly
+        // (peer is pub-field accessible from inside the same module).
+        peer.screen_enabled = true;
+        peer.last_screen_frame_ms = 1; // ancient frame
+                                       // The current monotonic clock is now ~now_ms() ≫ 1 + 2000.
+        let hb = heartbeat_packet(194, false, false, false);
+        let _ = peer.decode(&hb, "");
+        assert!(
+            !peer.screen_enabled,
+            "heartbeat must clear screen_enabled when last frame is stale"
         );
     }
 
@@ -1507,12 +2385,12 @@ mod tests {
         let (mut peer, _muted) = make_test_peer(6);
 
         let hb = heartbeat_packet(6, false, false, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.has_received_heartbeat);
         assert!(!peer.screen_enabled);
 
         let packet = screen_frame_packet(6);
-        let result = peer.decode(&packet);
+        let result = peer.decode(&packet, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
@@ -1531,12 +2409,12 @@ mod tests {
 
         // Heartbeat enables video.
         let hb = heartbeat_packet(7, true, false, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.video_enabled);
 
         // A video frame should pass the guard (video_enabled is already true).
         let packet = video_frame_packet(7);
-        let _ = peer.decode(&packet);
+        let _ = peer.decode(&packet, "");
         // video_enabled should remain true.
         assert!(peer.video_enabled);
     }
@@ -1548,17 +2426,17 @@ mod tests {
 
         // Enable video via heartbeat.
         let hb_on = heartbeat_packet(8, true, false, false);
-        let _ = peer.decode(&hb_on);
+        let _ = peer.decode(&hb_on, "");
         assert!(peer.video_enabled);
 
         // Disable video via heartbeat.
         let hb_off = heartbeat_packet(8, false, false, false);
-        let _ = peer.decode(&hb_off);
+        let _ = peer.decode(&hb_off, "");
         assert!(!peer.video_enabled);
 
         // Straggler video frame should be dropped.
         let packet = video_frame_packet(8);
-        let result = peer.decode(&packet);
+        let result = peer.decode(&packet, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
@@ -1629,7 +2507,7 @@ mod tests {
 
         // Heartbeat with all disabled (is_speaking defaults to false)
         let hb = heartbeat_packet(102, false, false, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
 
         assert!(
             (peer.audio_level - 0.0).abs() < f32::EPSILON,
@@ -1645,22 +2523,22 @@ mod tests {
 
         // 1. Enable video via heartbeat.
         let hb_on = heartbeat_packet(9, true, false, false);
-        let _ = peer.decode(&hb_on);
+        let _ = peer.decode(&hb_on, "");
         assert!(peer.video_enabled);
 
         // 2. Legitimate video frame while enabled — should pass through.
         let frame = video_frame_packet(9);
-        let _ = peer.decode(&frame);
+        let _ = peer.decode(&frame, "");
         assert!(peer.video_enabled, "legitimate frame must not change state");
 
         // 3. Disable video via heartbeat.
         let hb_off = heartbeat_packet(9, false, false, false);
-        let _ = peer.decode(&hb_off);
+        let _ = peer.decode(&hb_off, "");
         assert!(!peer.video_enabled);
 
         // 4. Straggler video frame after disable — must be dropped.
         let straggler = video_frame_packet(9);
-        let result = peer.decode(&straggler);
+        let result = peer.decode(&straggler, "");
         assert!(result.is_ok());
         let (_media_type, status, _kf_req) = result.unwrap();
         assert!(!status.rendered, "straggler must not be rendered");
@@ -1783,7 +2661,7 @@ mod tests {
                 }
             });
             assert!(
-                result.is_none(),
+                result.keyframe_request.is_none(),
                 "Sequential seq={seq} should not trigger keyframe request"
             );
         }
@@ -1811,7 +2689,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
 
         // Send seq 70 -- this shifts positions 2..6 off the 64-packet window,
         // confirming them as genuinely lost (they never arrived).
@@ -1827,7 +2707,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        let result = peer
+            .track_sequence(MediaType::VIDEO, &pkt70)
+            .keyframe_request;
 
         // Loss should be recorded.
         assert!(
@@ -1860,7 +2742,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
 
         // Introduce genuine loss: seq 70 shifts positions 2..6 off the window.
         let pkt70 = {
@@ -1875,7 +2759,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt70)
+            .keyframe_request;
         assert!(peer.video_seq_tracker.lost_count > 0);
 
         // Simulate time having passed: backdate the loss detection timestamp
@@ -1898,7 +2784,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
+        let result = peer
+            .track_sequence(MediaType::VIDEO, &pkt71)
+            .keyframe_request;
         assert_eq!(
             result,
             Some(MediaType::VIDEO),
@@ -1925,7 +2813,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -1938,7 +2828,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt70)
+            .keyframe_request;
 
         // Backdate loss so timeout is satisfied.
         peer.video_seq_tracker.loss_detected_at_ms =
@@ -1958,7 +2850,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
+        let result = peer
+            .track_sequence(MediaType::VIDEO, &pkt71)
+            .keyframe_request;
         assert_eq!(result, Some(MediaType::VIDEO), "First request should fire");
 
         // last_keyframe_request_ms is now set to ~now. A second call
@@ -1975,7 +2869,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result2 = peer.track_sequence(MediaType::VIDEO, &pkt72);
+        let result2 = peer
+            .track_sequence(MediaType::VIDEO, &pkt72)
+            .keyframe_request;
         assert!(
             result2.is_none(),
             "Second request should be rate-limited (too soon)"
@@ -2002,7 +2898,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
 
         let pkt3 = {
             use videocall_types::protos::media_packet::VideoMetadata;
@@ -2016,7 +2914,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt3);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt3)
+            .keyframe_request;
 
         // Advance to seq 67 (shift = 64), pushing seq 2 off the window as lost.
         let pkt67 = {
@@ -2031,7 +2931,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt67);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt67)
+            .keyframe_request;
         assert!(peer.video_seq_tracker.lost_count > 0, "Loss should exist");
 
         // Now receive a keyframe -- should clear the loss state.
@@ -2047,7 +2949,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &key_pkt);
+        let result = peer
+            .track_sequence(MediaType::VIDEO, &key_pkt)
+            .keyframe_request;
         assert!(result.is_none(), "Keyframe should not trigger request");
         assert_eq!(
             peer.video_seq_tracker.lost_count, 0,
@@ -2078,7 +2982,7 @@ mod tests {
                     ..Default::default()
                 }
             };
-            let _ = peer.track_sequence(MediaType::VIDEO, &pkt);
+            let _ = peer.track_sequence(MediaType::VIDEO, &pkt).keyframe_request;
         }
         assert_eq!(peer.video_seq_tracker.lost_count, 0);
 
@@ -2095,7 +2999,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &screen1);
+        let _ = peer
+            .track_sequence(MediaType::SCREEN, &screen1)
+            .keyframe_request;
 
         let screen70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
@@ -2109,7 +3015,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &screen70);
+        let _ = peer
+            .track_sequence(MediaType::SCREEN, &screen70)
+            .keyframe_request;
 
         // Video should have no loss, screen should have loss.
         assert_eq!(
@@ -2146,7 +3054,9 @@ mod tests {
                     ..Default::default()
                 }
             };
-            let _ = peer_a.track_sequence(MediaType::VIDEO, &pkt);
+            let _ = peer_a
+                .track_sequence(MediaType::VIDEO, &pkt)
+                .keyframe_request;
         }
 
         // Peer B: genuine loss (seq 1 -> seq 70).
@@ -2162,7 +3072,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer_b.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer_b
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -2175,7 +3087,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer_b.track_sequence(MediaType::VIDEO, &pkt70);
+        let _ = peer_b
+            .track_sequence(MediaType::VIDEO, &pkt70)
+            .keyframe_request;
 
         assert_eq!(
             peer_a.video_seq_tracker.lost_count, 0,
@@ -2205,7 +3119,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::SCREEN, &pkt1)
+            .keyframe_request;
 
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
@@ -2219,7 +3135,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::SCREEN, &pkt70);
+        let _ = peer
+            .track_sequence(MediaType::SCREEN, &pkt70)
+            .keyframe_request;
 
         // Backdate loss and clear rate limit.
         peer.screen_seq_tracker.loss_detected_at_ms =
@@ -2238,7 +3156,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::SCREEN, &pkt71);
+        let result = peer
+            .track_sequence(MediaType::SCREEN, &pkt71)
+            .keyframe_request;
         assert_eq!(
             result,
             Some(MediaType::SCREEN),
@@ -2256,7 +3176,7 @@ mod tests {
             // No video_metadata set.
             ..Default::default()
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt).keyframe_request;
         assert!(
             result.is_none(),
             "Missing video_metadata should return None"
@@ -2281,7 +3201,7 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::AUDIO, &pkt);
+        let result = peer.track_sequence(MediaType::AUDIO, &pkt).keyframe_request;
         assert!(result.is_none(), "AUDIO should not be tracked");
     }
 
@@ -2295,14 +3215,14 @@ mod tests {
 
         // Enable video via heartbeat so the straggler guard doesn't block.
         let hb = heartbeat_packet(210, true, true, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.video_enabled);
 
         // Mark invisible.
         peer.visible = false;
 
         let pkt = video_frame_packet(210);
-        let result = peer.decode(&pkt);
+        let result = peer.decode(&pkt, "");
         assert!(result.is_ok());
         let (_mt, status, _kf) = result.unwrap();
         assert!(
@@ -2319,14 +3239,14 @@ mod tests {
 
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(211, false, false, true);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.screen_enabled);
 
         // Mark invisible.
         peer.visible = false;
 
         let pkt = screen_frame_packet(211);
-        let result = peer.decode(&pkt);
+        let result = peer.decode(&pkt, "");
         assert!(result.is_ok());
         let (_mt, status, _kf) = result.unwrap();
         assert!(
@@ -2344,7 +3264,7 @@ mod tests {
         peer.visible = false;
 
         let pkt = audio_frame_packet(212);
-        let result = peer.decode(&pkt);
+        let result = peer.decode(&pkt, "");
         assert!(result.is_ok());
         // Audio_enabled should be inferred true (no heartbeat received).
         assert!(
@@ -2363,14 +3283,14 @@ mod tests {
 
         // Enable video via heartbeat.
         let hb = heartbeat_packet(213, true, false, false);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
 
         // Go invisible, then visible again.
         peer.visible = false;
         peer.visible = true;
 
         let pkt = video_frame_packet(213);
-        let result = peer.decode(&pkt);
+        let result = peer.decode(&pkt, "");
         // The decode will go through to the actual video decoder (noop).
         // Even if the noop decoder "fails" on dummy data, it won't return
         // SKIPPED due to visibility.
@@ -2470,7 +3390,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt1)
+            .keyframe_request;
         let pkt70 = {
             use videocall_types::protos::media_packet::VideoMetadata;
             MediaPacket {
@@ -2483,7 +3405,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt70);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt70)
+            .keyframe_request;
         assert!(peer.video_seq_tracker.lost_count > 0);
 
         // Backdate and trigger request.
@@ -2502,7 +3426,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let result = peer.track_sequence(MediaType::VIDEO, &pkt71);
+        let result = peer
+            .track_sequence(MediaType::VIDEO, &pkt71)
+            .keyframe_request;
         assert_eq!(result, Some(MediaType::VIDEO));
 
         // Clear loss with a keyframe.
@@ -2518,7 +3444,7 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &key);
+        let _ = peer.track_sequence(MediaType::VIDEO, &key).keyframe_request;
         assert_eq!(
             peer.video_seq_tracker.lost_count, 0,
             "Loss should be cleared by keyframe"
@@ -2537,7 +3463,9 @@ mod tests {
                 ..Default::default()
             }
         };
-        let _ = peer.track_sequence(MediaType::VIDEO, &pkt140);
+        let _ = peer
+            .track_sequence(MediaType::VIDEO, &pkt140)
+            .keyframe_request;
         assert!(
             peer.video_seq_tracker.lost_count > 0,
             "Second loss should be detected independently"
@@ -2602,7 +3530,7 @@ mod tests {
 
         // Enable screen via heartbeat so the straggler guard doesn't block.
         let hb = heartbeat_packet(230, false, false, true);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.screen_enabled);
 
         // The noop screen decoder always returns is_waiting_for_keyframe() = true,
@@ -2614,7 +3542,7 @@ mod tests {
 
         // Send a screen frame -- should trigger a proactive keyframe request.
         let pkt = screen_frame_packet(230);
-        let result = peer.decode(&pkt);
+        let result = peer.decode(&pkt, "");
         assert!(result.is_ok());
         let (_mt, _status, kf_req) = result.unwrap();
         assert_eq!(
@@ -2631,19 +3559,19 @@ mod tests {
 
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(231, false, false, true);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         peer.screen_seq_tracker.last_keyframe_request_ms = 0;
 
         // First frame — triggers proactive PLI.
         let pkt1 = screen_frame_packet(231);
-        let result1 = peer.decode(&pkt1);
+        let result1 = peer.decode(&pkt1, "");
         assert!(result1.is_ok());
         let (_, _, kf1) = result1.unwrap();
         assert_eq!(kf1, Some(MediaType::SCREEN), "First should trigger PLI");
 
         // Immediately send another — should be rate-limited.
         let pkt2 = screen_frame_packet(231);
-        let result2 = peer.decode(&pkt2);
+        let result2 = peer.decode(&pkt2, "");
         assert!(result2.is_ok());
         let (_, _, kf2) = result2.unwrap();
         assert!(kf2.is_none(), "Second should be rate-limited");
@@ -2657,13 +3585,13 @@ mod tests {
 
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(232, false, false, true);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
         assert!(peer.screen_enabled);
 
         // Go invisible — frames are skipped.
         peer.visible = false;
         let pkt1 = screen_frame_packet(232);
-        let result1 = peer.decode(&pkt1);
+        let result1 = peer.decode(&pkt1, "");
         assert!(result1.is_ok());
         let (_, status1, _) = result1.unwrap();
         assert!(!status1.rendered, "Invisible frame should be skipped");
@@ -2674,7 +3602,7 @@ mod tests {
 
         // Next frame — decoder is waiting for keyframe, proactive PLI fires.
         let pkt2 = screen_frame_packet(232);
-        let result2 = peer.decode(&pkt2);
+        let result2 = peer.decode(&pkt2, "");
         assert!(result2.is_ok());
         let (_, _, kf_req) = result2.unwrap();
         assert_eq!(
@@ -2693,7 +3621,7 @@ mod tests {
 
         // Enable screen via heartbeat.
         let hb = heartbeat_packet(233, false, false, true);
-        let _ = peer.decode(&hb);
+        let _ = peer.decode(&hb, "");
 
         // Go invisible.
         peer.visible = false;
@@ -2715,7 +3643,7 @@ mod tests {
             };
             wrap(&media, 233)
         };
-        let _ = peer.decode(&pkt1);
+        let _ = peer.decode(&pkt1, "");
 
         // Introduce genuine loss: seq 1 -> 70 shifts positions off window.
         let pkt70 = {
@@ -2733,7 +3661,7 @@ mod tests {
             };
             wrap(&media, 233)
         };
-        let _ = peer.decode(&pkt70);
+        let _ = peer.decode(&pkt70, "");
         assert!(
             peer.screen_seq_tracker.lost_count > 0,
             "Loss should be detected"
@@ -2760,7 +3688,7 @@ mod tests {
             };
             wrap(&media, 233)
         };
-        let result = peer.decode(&pkt71);
+        let result = peer.decode(&pkt71, "");
         assert!(result.is_ok());
         let (_, status, kf_req) = result.unwrap();
         assert!(!status.rendered, "Should still be invisible/skipped");
@@ -2796,7 +3724,7 @@ mod tests {
                     ..Default::default()
                 }
             };
-            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt).keyframe_request;
             assert!(
                 result.is_none(),
                 "Out-of-order seq={seq} should not trigger keyframe request"
@@ -2832,6 +3760,61 @@ mod tests {
         let lost = tracker.record_seq(66);
         assert_eq!(lost, 1, "Only seq 1 was genuinely skipped");
         assert_eq!(tracker.lost_count, 1);
+    }
+
+    /// Freeze observability (#1013): `observe_window` accumulates loss and
+    /// keyframe-request counts and, on ~1s rollover, computes per-second rates
+    /// while signalling exactly one emit (throttling bus output to ~1Hz).
+    #[wasm_bindgen_test]
+    fn observe_window_computes_loss_and_keyframe_rates() {
+        let mut tracker = SequenceTracker::new();
+
+        // t=0: window starts; no rollover yet.
+        assert!(
+            !tracker.observe_window(0, 2, false),
+            "first observation must not roll over"
+        );
+        // Mid-window accumulation, still under 1000ms — no rollover, no emit.
+        assert!(!tracker.observe_window(300, 1, true));
+        assert!(!tracker.observe_window(600, 0, true));
+        // Rates have not been published yet (still the initial zeros).
+        assert_eq!(tracker.loss_per_sec(), 0.0);
+        assert_eq!(tracker.kf_per_sec(), 0.0);
+
+        // t=1000: window elapsed == 1000ms → rollover, fresh rates available.
+        assert!(
+            tracker.observe_window(1000, 0, false),
+            "rollover should fire at >=1000ms elapsed"
+        );
+        // Accumulated this window: lost = 2+1+0+0 = 3, kf = 2 (the two `true`s).
+        // denom = 1000ms → rate == count.
+        assert!((tracker.loss_per_sec() - 3.0).abs() < 1e-9);
+        assert!((tracker.kf_per_sec() - 2.0).abs() < 1e-9);
+
+        // Window counters reset: a fresh quiet window yields zero rates.
+        assert!(!tracker.observe_window(1500, 0, false));
+        assert!(tracker.observe_window(2000, 0, false));
+        assert_eq!(tracker.loss_per_sec(), 0.0);
+        assert_eq!(tracker.kf_per_sec(), 0.0);
+    }
+
+    /// A window longer than 1s normalizes correctly to a per-second rate
+    /// (denominator is actual elapsed ms, not a fixed 1000).
+    #[wasm_bindgen_test]
+    fn observe_window_normalizes_long_window() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe_window(0, 0, false); // start window at t=0
+                                             // 10 losses over a 2000ms window → 5 lost/sec.
+        for t in [400u64, 800, 1200, 1600] {
+            assert!(!tracker.observe_window(t, 2, false));
+        }
+        let rolled = tracker.observe_window(2000, 2, false);
+        assert!(rolled, "rollover at 2000ms");
+        assert!(
+            (tracker.loss_per_sec() - 5.0).abs() < 1e-9,
+            "10 losses / 2s = 5/s, got {}",
+            tracker.loss_per_sec()
+        );
     }
 
     /// Late arrival (out-of-order) within the window should fill in the
@@ -2993,7 +3976,7 @@ mod tests {
                         ..Default::default()
                     }
                 };
-                let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+                let result = peer.track_sequence(MediaType::VIDEO, &pkt).keyframe_request;
                 assert!(
                     result.is_none(),
                     "Reordered seq={seq} should not trigger keyframe request"
@@ -3147,5 +4130,580 @@ mod tests {
         assert_eq!(tracker.current_backoff_ms, KEYFRAME_REQUEST_MIN_INTERVAL_MS);
         assert_eq!(tracker.lost_count, 0);
         assert!(tracker.loss_detected_at_ms.is_none());
+    }
+
+    // -- Acceptance tests: keyframe-request routing correctness ------
+    //
+    // These tests verify the fix for the O(N) encoder amplification bug:
+    // `try_handle_keyframe_request` must only trigger a keyframe for the peer
+    // whose `user_id` matches the request target. This is tested at the
+    // `PeerDecodeManager` level by confirming that `send_keyframe_request`
+    // populates the `user_id` field of the outbound PLI correctly, and at the
+    // `set_active_decode_set` level by confirming that a proactive video PLI
+    // is sent exactly once per newly-visible video-enabled peer.
+
+    /// `send_keyframe_request` must set `media_packet.user_id` to the target
+    /// peer's user_id so the receiving client can apply the guard.
+    #[wasm_bindgen_test]
+    fn keyframe_request_packet_targets_correct_peer() {
+        use protobuf::Message as _;
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::MediaPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let sent_packets: Vec<PacketWrapper> = Vec::new();
+        let collector = sent_packets.clone();
+        // Use a Cell to collect packets from the closure.
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
+
+        // Clear the send counter baseline.
+        let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+
+        // Manually invoke send_keyframe_request for a specific peer.
+        manager.send_keyframe_request("alice@example.com", MediaType::VIDEO);
+
+        // One PLI should have been sent.
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            baseline + 1,
+            "Exactly one KEYFRAME_REQUEST should have been sent"
+        );
+
+        // Verify the packet targets the correct peer.
+        let pkts = collected.borrow();
+        assert_eq!(pkts.len(), 1, "Expected exactly one outbound packet");
+        let wrapper = &pkts[0];
+        assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEDIA));
+
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data)
+            .expect("Should deserialize inner MediaPacket");
+        assert_eq!(
+            inner.media_type.enum_value(),
+            Ok(MediaType::KEYFRAME_REQUEST),
+            "Inner packet should be KEYFRAME_REQUEST"
+        );
+        assert_eq!(
+            inner.user_id,
+            b"alice@example.com".to_vec(),
+            "PLI target user_id must be the requested peer, not the local user"
+        );
+        assert_ne!(
+            inner.user_id,
+            b"me@example.com".to_vec(),
+            "PLI must not target the local user"
+        );
+        drop(collector);
+    }
+
+    /// `set_active_decode_set` must send exactly one video PLI per newly-visible
+    /// video-enabled peer (Option 3 + Bug 2 fix acceptance test).
+    /// At N=1..4 each peer that transitions invisible→visible with video_enabled=true
+    /// should receive exactly one proactive VIDEO keyframe request.
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_sends_video_pli_for_newly_visible_peers() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
+
+        // Insert N=4 peers, all with video_enabled=true and currently invisible.
+        let peer_ids = [500u64, 501, 502, 503];
+        let peer_uids = ["peer0@x.com", "peer1@x.com", "peer2@x.com", "peer3@x.com"];
+        for (i, &sid) in peer_ids.iter().enumerate() {
+            let (mock_audio, _) = MockAudioDecoder::new();
+            let peer = Peer {
+                audio: Box::new(mock_audio),
+                video: VideoPeerDecoder::noop(),
+                screen: VideoPeerDecoder::noop(),
+                session_id: sid,
+                sid_str: sid.to_string(),
+                user_id: peer_uids[i].to_string(),
+                video_canvas_id: format!("video-{sid}"),
+                screen_canvas_id: format!("screen-{sid}"),
+                aes: None,
+                activity_count: 1,
+                missed_heartbeat_checks: 0,
+                video_enabled: true,
+                audio_enabled: false,
+                screen_enabled: false,
+                display_name: None,
+                is_guest: false,
+                visible: false,
+                context_initialized: false,
+                has_received_heartbeat: false,
+                is_speaking: false,
+                audio_level: 0.0,
+                transport_type: TransportType::TRANSPORT_UNKNOWN,
+                vad_threshold: None,
+                video_seq_tracker: SequenceTracker::new(),
+                screen_seq_tracker: SequenceTracker::new(),
+                last_screen_frame_ms: 0,
+                last_video_frame_ms: 0,
+                last_audio_frame_ms: 0,
+            };
+            manager.connected_peers.insert(sid, peer);
+        }
+
+        let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+
+        // Make all 4 peers visible at once (layout change).
+        manager.set_active_decode_set(&HashSet::from(peer_ids));
+
+        let pkts = collected.borrow();
+        // Each of the 4 peers should have received exactly one VIDEO PLI.
+        assert_eq!(
+            pkts.len(),
+            4,
+            "Exactly 4 video PLIs should be sent for 4 newly-visible video peers"
+        );
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            baseline + 4,
+            "KEYFRAME_REQUESTS_SENT counter should increase by 4"
+        );
+
+        // Verify each PLI targets a different peer and is a VIDEO request.
+        let mut target_ids: Vec<String> = pkts
+            .iter()
+            .map(|w| {
+                let inner = MediaPacket::parse_from_bytes(&w.data).expect("deserialize");
+                assert_eq!(
+                    inner.media_type.enum_value(),
+                    Ok(MediaType::VIDEO),
+                    "Proactive PLI for video peer should request VIDEO keyframe, not SCREEN"
+                );
+                String::from_utf8(inner.user_id).expect("user_id is valid utf8")
+            })
+            .collect();
+        target_ids.sort();
+        let mut expected: Vec<&str> = peer_uids.to_vec();
+        expected.sort();
+        assert_eq!(
+            target_ids,
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "Each PLI should target a distinct peer"
+        );
+    }
+
+    /// Calling `set_active_decode_set` again with the same set must NOT send
+    /// duplicate PLIs (idempotency check — Option 3 acceptance).
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_no_duplicate_plis_on_same_set() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
+
+        let (mock_audio, _) = MockAudioDecoder::new();
+        let peer = Peer {
+            audio: Box::new(mock_audio),
+            video: VideoPeerDecoder::noop(),
+            screen: VideoPeerDecoder::noop(),
+            session_id: 510,
+            sid_str: "510".to_string(),
+            user_id: "peerX@x.com".to_string(),
+            video_canvas_id: "video-510".to_string(),
+            screen_canvas_id: "screen-510".to_string(),
+            aes: None,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
+            video_enabled: true,
+            audio_enabled: false,
+            screen_enabled: false,
+            display_name: None,
+            is_guest: false,
+            visible: false,
+            context_initialized: false,
+            has_received_heartbeat: false,
+            is_speaking: false,
+            audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
+            vad_threshold: None,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
+        };
+        manager.connected_peers.insert(510, peer);
+
+        // First call: peer becomes visible → 1 PLI.
+        manager.set_active_decode_set(&HashSet::from([510u64]));
+        assert_eq!(collected.borrow().len(), 1, "First call should send 1 PLI");
+
+        // Second call with same set: peer already visible → 0 PLIs.
+        manager.set_active_decode_set(&HashSet::from([510u64]));
+        assert_eq!(
+            collected.borrow().len(),
+            1,
+            "Second identical call should send no additional PLIs"
+        );
+    }
+
+    /// A peer with `video_enabled=false` becoming visible must NOT trigger a
+    /// video PLI (camera is off — there is nothing to unfreeze).
+    #[wasm_bindgen_test]
+    fn set_active_decode_set_no_pli_for_camera_off_peer() {
+        let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PacketWrapper>::new()));
+        let collected_clone = collected.clone();
+        let callback = crate::Callback::from(move |pkt: PacketWrapper| {
+            collected_clone.borrow_mut().push(pkt);
+        });
+
+        let mut manager = PeerDecodeManager::new();
+        manager.set_send_packet_callback(callback, "me@example.com".to_string());
+
+        let (mock_audio, _) = MockAudioDecoder::new();
+        let peer = Peer {
+            audio: Box::new(mock_audio),
+            video: VideoPeerDecoder::noop(),
+            screen: VideoPeerDecoder::noop(),
+            session_id: 520,
+            sid_str: "520".to_string(),
+            user_id: "peerY@x.com".to_string(),
+            video_canvas_id: "video-520".to_string(),
+            screen_canvas_id: "screen-520".to_string(),
+            aes: None,
+            activity_count: 1,
+            missed_heartbeat_checks: 0,
+            video_enabled: false, // camera off
+            audio_enabled: false,
+            screen_enabled: false,
+            display_name: None,
+            is_guest: false,
+            visible: false,
+            context_initialized: false,
+            has_received_heartbeat: false,
+            is_speaking: false,
+            audio_level: 0.0,
+            transport_type: TransportType::TRANSPORT_UNKNOWN,
+            vad_threshold: None,
+            video_seq_tracker: SequenceTracker::new(),
+            screen_seq_tracker: SequenceTracker::new(),
+            last_screen_frame_ms: 0,
+            last_video_frame_ms: 0,
+            last_audio_frame_ms: 0,
+        };
+        manager.connected_peers.insert(520, peer);
+
+        manager.set_active_decode_set(&HashSet::from([520u64]));
+
+        assert_eq!(
+            collected.borrow().len(),
+            0,
+            "No PLI should be sent for a peer with camera off"
+        );
+    }
+
+    // -- display_name_cache fallback tests ------------------------------------
+
+    /// When PARTICIPANT_JOINED seeds the cache before the first media packet
+    /// creates the peer entry, `get_peer_display_name` should return the
+    /// cached value via `display_name_cache` fallback.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_no_peer_entry() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 200;
+
+        // No peer entry exists yet — simulates PARTICIPANT_JOINED arriving
+        // before the first media packet.
+        manager.set_peer_display_name(session_id, "Alice".to_string());
+
+        // get_peer_display_name should find the name in the cache fallback.
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("Alice".to_string()),
+            "should fall back to display_name_cache when peer entry is missing"
+        );
+    }
+
+    /// When a peer entry exists WITH a display_name, the peer entry value
+    /// takes priority over the cache.
+    #[wasm_bindgen_test]
+    fn display_name_peer_entry_takes_priority_over_cache() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 201;
+
+        // Seed cache with one name.
+        manager.set_peer_display_name(session_id, "OldName".to_string());
+
+        // Manually insert a peer entry with a different display name.
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.display_name = Some("NewName".to_string());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("NewName".to_string()),
+            "peer entry display_name should take priority over cache"
+        );
+    }
+
+    /// When a peer entry exists but display_name is None, the cache fallback
+    /// should be used. This is the key scenario for the host display-name bug:
+    /// media packets create the peer entry, but PARTICIPANT_JOINED (which
+    /// populates display_name) never fires for the local user.
+    #[wasm_bindgen_test]
+    fn display_name_cache_fallback_when_peer_has_no_name() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 202;
+
+        // Seed cache (e.g. from SESSION_ASSIGNED or earlier PARTICIPANT_JOINED).
+        manager.set_peer_display_name(session_id, "HostUser".to_string());
+
+        // Insert a peer entry WITHOUT display_name (simulates add_peer called
+        // before cache was populated, or cache was populated for a different
+        // reason).
+        let (peer, _muted) = make_test_peer(session_id);
+        assert!(peer.display_name.is_none());
+        manager.connected_peers.insert(session_id, peer);
+
+        let name = manager.get_peer_display_name(&session_id.to_string());
+        assert_eq!(
+            name,
+            Some("HostUser".to_string()),
+            "should fall back to cache when peer entry has no display_name"
+        );
+    }
+
+    /// No peer entry and no cache → should return None.
+    #[wasm_bindgen_test]
+    fn display_name_returns_none_when_completely_unknown() {
+        let manager = PeerDecodeManager::new();
+        let name = manager.get_peer_display_name("999");
+        assert_eq!(name, None, "should return None for unknown session_id");
+    }
+
+    // -- Phase 6: sorted_string_keys memoisation tests --------------------
+
+    /// Insert a peer, then call `sorted_string_keys()` twice. The two
+    /// returned `Rc<Vec<String>>` should point at the **same** allocation
+    /// (verified via `Rc::ptr_eq`) because no peer-set mutation happened
+    /// between the calls. This is the core caching contract.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_returns_cached_rc_when_unchanged() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(700);
+        manager.connected_peers.insert(700, peer);
+
+        let first = manager.sorted_string_keys();
+        let second = manager.sorted_string_keys();
+
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "sorted_string_keys should return the same Rc on back-to-back calls"
+        );
+        assert_eq!(*first, vec!["700".to_string()]);
+    }
+
+    /// Adding a peer must invalidate the cache: the next call returns a
+    /// fresh `Rc` (not pointer-equal to the prior one) and reflects the
+    /// new peer set.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_add_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer1, _muted1) = make_test_peer(710);
+        manager.connected_peers.insert(710, peer1);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(*first, vec!["710".to_string()]);
+
+        // Add a second peer through the public API so invalidation runs.
+        manager
+            .add_peer("user711@test.com", 711, None)
+            .expect("add_peer should succeed");
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after add_peer"
+        );
+        assert_eq!(second.len(), 2, "fresh result should include both peers");
+        assert!(second.contains(&"710".to_string()));
+        assert!(second.contains(&"711".to_string()));
+    }
+
+    /// Removing a peer via `delete_peer` must also invalidate the cache.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_delete_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer1, _muted1) = make_test_peer(720);
+        let (peer2, _muted2) = make_test_peer(721);
+        manager.connected_peers.insert(720, peer1);
+        manager.connected_peers.insert(721, peer2);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(first.len(), 2);
+
+        manager.delete_peer(720);
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after delete_peer"
+        );
+        assert_eq!(*second, vec!["721".to_string()]);
+    }
+
+    /// `clear_all_peers` must invalidate the cache; subsequent reads
+    /// return an empty `Vec`.
+    #[wasm_bindgen_test]
+    fn sorted_string_keys_invalidates_on_clear_all() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(730);
+        manager.connected_peers.insert(730, peer);
+
+        let first = manager.sorted_string_keys();
+        assert_eq!(first.len(), 1);
+
+        manager.clear_all_peers();
+
+        let second = manager.sorted_string_keys();
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "cache must be invalidated after clear_all_peers"
+        );
+        assert!(second.is_empty(), "after clear_all the cache is empty");
+    }
+
+    // -- Phase 6: batched on_peers_removed_batch test ---------------------
+
+    /// Synthesise 5 peers timing out in the same `run_peer_monitor` pass
+    /// and assert:
+    ///   - `on_peer_removed` fires 5 times (per-peer)
+    ///   - `on_peers_removed_batch` fires **exactly once** with all 5 IDs
+    ///   - the returned `removed_ids` Vec contains all 5
+    ///
+    /// Reproduces the cc7tp 2026-05-06 watchdog cascade: without
+    /// batching, 5 simultaneous peer removals triggered 5 sequential
+    /// `peer_list_version` bumps in the dioxus UI, each forcing a full
+    /// re-render before the next removal completed.
+    #[wasm_bindgen_test]
+    fn run_peer_monitor_emits_single_batch_for_simultaneous_timeouts() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Wire callbacks. We use shared Rc<RefCell<Vec<...>>> sinks so
+        // tests can inspect the per-peer and batched sequences.
+        let per_peer_sink: Rc<std::cell::RefCell<Vec<String>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let batch_sink: Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        {
+            let sink = per_peer_sink.clone();
+            manager.on_peer_removed = Callback::from(move |sid: String| {
+                sink.borrow_mut().push(sid);
+            });
+        }
+        {
+            let sink = batch_sink.clone();
+            manager.on_peers_removed_batch = Callback::from(move |sids: Vec<String>| {
+                sink.borrow_mut().push(sids);
+            });
+        }
+
+        // Insert 5 peers and force them into the "about to time out"
+        // state: missed_heartbeat_checks=2, activity_count=0. The next
+        // run_peer_monitor pass increments to 3, which triggers removal.
+        let session_ids: [u64; 5] = [801, 802, 803, 804, 805];
+        for sid in &session_ids {
+            let (mut peer, _muted) = make_test_peer(*sid);
+            peer.activity_count = 0;
+            peer.missed_heartbeat_checks = 2;
+            manager.connected_peers.insert(*sid, peer);
+        }
+        assert_eq!(manager.connected_peers.ordered_keys().len(), 5);
+
+        let removed_ids = manager.run_peer_monitor();
+
+        // All 5 peers should be in removed_ids.
+        assert_eq!(
+            removed_ids.len(),
+            5,
+            "all 5 dead peers should be returned by run_peer_monitor"
+        );
+        // The peer set should now be empty.
+        assert_eq!(
+            manager.connected_peers.ordered_keys().len(),
+            0,
+            "all dead peers should be removed from the peer map"
+        );
+
+        // Per-peer callback fires once per dead peer.
+        assert_eq!(
+            per_peer_sink.borrow().len(),
+            5,
+            "on_peer_removed should fire once per dead peer"
+        );
+
+        // Batch callback fires exactly once with all 5 IDs.
+        let batches = batch_sink.borrow();
+        assert_eq!(
+            batches.len(),
+            1,
+            "on_peers_removed_batch should fire exactly once for the whole pass"
+        );
+        let batch = &batches[0];
+        assert_eq!(
+            batch.len(),
+            5,
+            "the single batch should contain all 5 removed peer IDs"
+        );
+        for sid in &session_ids {
+            assert!(
+                batch.contains(&sid.to_string()),
+                "batch should include peer {sid}"
+            );
+        }
+    }
+
+    /// `run_peer_monitor` with no dead peers must NOT fire the batch
+    /// callback. Only fires when there is something to report.
+    #[wasm_bindgen_test]
+    fn run_peer_monitor_no_dead_peers_skips_batch_callback() {
+        let mut manager = PeerDecodeManager::new();
+        let batch_sink: Rc<std::cell::RefCell<Vec<Vec<String>>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let sink = batch_sink.clone();
+            manager.on_peers_removed_batch = Callback::from(move |sids: Vec<String>| {
+                sink.borrow_mut().push(sids);
+            });
+        }
+
+        // make_test_peer initialises activity_count=1, so check_heartbeat
+        // returns true — the peer is alive.
+        let (peer, _muted) = make_test_peer(810);
+        manager.connected_peers.insert(810, peer);
+
+        let removed = manager.run_peer_monitor();
+        assert!(
+            removed.is_empty(),
+            "no peers should be removed when all are alive"
+        );
+        assert_eq!(
+            batch_sink.borrow().len(),
+            0,
+            "batch callback must not fire when no peers were removed"
+        );
     }
 }

@@ -192,7 +192,7 @@ The Meeting Backend enforces CORS on all responses. The behavior depends on the 
 | `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
 | `JWT_SECRET` | Yes | -- | Shared HMAC-SHA256 secret (must match Media Server) |
 | `LISTEN_ADDR` | No | `0.0.0.0:8081` | HTTP bind address |
-| `TOKEN_TTL_SECS` | No | `600` | Room access token lifetime (seconds) |
+| `TOKEN_TTL_SECS` | No | `86400` (24h) | Room access token lifetime (seconds). Must cover longest expected meeting + re-election — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562). |
 | `SESSION_TTL_SECS` | No | `315360000` (~10y) | Session JWT lifetime (seconds) |
 | `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
 | `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |

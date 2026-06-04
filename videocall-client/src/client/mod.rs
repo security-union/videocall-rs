@@ -17,5 +17,8 @@
  */
 
 mod video_call_client;
+mod viewport_sender;
 
-pub use video_call_client::{VideoCallClient, VideoCallClientOptions};
+pub use video_call_client::{
+    RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
+};

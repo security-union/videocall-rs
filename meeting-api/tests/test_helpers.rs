@@ -16,12 +16,15 @@
 #![allow(dead_code)]
 
 use axum::http;
+use axum::http::HeaderName;
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
-use meeting_api::{routes, state::AppState, token::generate_session_token};
+use meeting_api::cors::{ALLOWED_CUSTOM_HEADERS, ALLOWED_HEADERS, ALLOWED_METHODS};
+use meeting_api::{config::DevUser, routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
@@ -52,7 +55,19 @@ pub async fn cleanup_test_data(pool: &PgPool, room_id: &str) {
 }
 
 /// Build the Axum router backed by the given pool, ready for `tower::ServiceExt::oneshot`.
+/// `dev_user` is `None` — the auto-login endpoint returns 404.
 pub fn build_app(pool: PgPool) -> Router {
+    build_app_inner(pool, None)
+}
+
+/// Build the Axum router with a specific `DEV_USER` identity configured.
+/// Allows integration tests to exercise the auto-login happy path without
+/// setting an environment variable.
+pub fn build_app_with_dev_user(pool: PgPool, dev_user: DevUser) -> Router {
+    build_app_inner(pool, Some(dev_user))
+}
+
+fn build_app_inner(pool: PgPool, dev_user: Option<DevUser>) -> Router {
     let state = AppState {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
@@ -71,12 +86,31 @@ pub fn build_app(pool: PgPool) -> Router {
         )),
         display_name_rate_limiter_ops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search: None,
-        // Integration tests use the unauthenticated entrypoints and expect a
-        // stable anonymous identity to be issued when no cookie is present.
-        allow_anonymous: true,
-        dev_user: None,
+        display_name_rate_limit_disabled: false,
+        dev_user,
     };
     routes::router().with_state(state)
+}
+
+/// Build the Axum router with the production CORS layer attached.
+pub fn build_app_with_cors(pool: PgPool) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods(ALLOWED_METHODS.to_vec())
+        .allow_headers(
+            ALLOWED_HEADERS
+                .iter()
+                .cloned()
+                .chain(
+                    ALLOWED_CUSTOM_HEADERS
+                        .iter()
+                        .map(|h| HeaderName::from_static(h)),
+                )
+                .collect::<Vec<_>>(),
+        )
+        .allow_credentials(true);
+
+    build_app(pool).layer(cors)
 }
 
 /// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.

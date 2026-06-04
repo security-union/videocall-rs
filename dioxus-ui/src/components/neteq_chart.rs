@@ -2,6 +2,8 @@ use dioxus::prelude::*;
 pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 
+use crate::theme::color as theme_color;
+
 // UI-friendly structure for charts (keeping the old one)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetEqStats {
@@ -174,32 +176,32 @@ fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> E
                 height: "{height}",
                 view_box: "{view_box}",
                 // Y-axis
-                line { x1: "{ml}", y1: "{mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml}", y1: "{mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // X-axis
-                line { x1: "{ml}", y1: "{ph_mt}", x2: "{cw_mr}", y2: "{ph_mt}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml}", y1: "{ph_mt}", x2: "{cw_mr}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // Y-axis tick marks
-                line { x1: "{ml5}", y1: "{mt}", x2: "{ml}", y2: "{mt}", stroke: "#666", stroke_width: "1" }
-                line { x1: "{ml5}", y1: "{mid_y}", x2: "{ml}", y2: "{mid_y}", stroke: "#666", stroke_width: "1" }
-                line { x1: "{ml5}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml5}", y1: "{mt}", x2: "{ml}", y2: "{mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
+                line { x1: "{ml5}", y1: "{mid_y}", x2: "{ml}", y2: "{mid_y}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
+                line { x1: "{ml5}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // X-axis tick marks
-                line { x1: "{ml}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt5}", stroke: "#666", stroke_width: "1" }
-                line { x1: "{ml_pw}", y1: "{ph_mt}", x2: "{ml_pw}", y2: "{ph_mt5}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
+                line { x1: "{ml_pw}", y1: "{ph_mt}", x2: "{ml_pw}", y2: "{ph_mt5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // Data series
                 for elem in series_elements { {elem} }
                 // Legend
                 for elem in legend_elements { {elem} }
                 // Y-axis labels
-                text { x: "{ml10}", y: "{y_zero_label}", fill: "#aaa", font_size: "12", text_anchor: "end", "0" }
-                text { x: "{ml10}", y: "{y_mid_label}", fill: "#aaa", font_size: "12", text_anchor: "end", "{half_max}" }
-                text { x: "{ml10}", y: "{y_max_label}", fill: "#aaa", font_size: "12", text_anchor: "end", "{max_str}" }
+                text { x: "{ml10}", y: "{y_zero_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "0" }
+                text { x: "{ml10}", y: "{y_mid_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "{half_max}" }
+                text { x: "{ml10}", y: "{y_max_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "{max_str}" }
                 // X-axis time labels
-                text { x: "{ml_pw}", y: "{ch10}", fill: "#aaa", font_size: "13", text_anchor: "middle", "0s" }
-                text { x: "{mid_x}", y: "{ch10}", fill: "#aaa", font_size: "13", text_anchor: "middle", "{mid_time}" }
-                text { x: "{ml}", y: "{ch10}", fill: "#aaa", font_size: "13", text_anchor: "middle", "{max_time}" }
+                text { x: "{ml_pw}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "0s" }
+                text { x: "{mid_x}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "{mid_time}" }
+                text { x: "{ml}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "{max_time}" }
                 // Y-axis unit label
-                text { x: "5", y: "{mid_y}", fill: "#aaa", font_size: "11", transform: "{rotate_transform}", "{config.y_axis_label}" }
+                text { x: "5", y: "{mid_y}", fill: "{theme_color::TEXT_MUTED}", font_size: "11", transform: "{rotate_transform}", "{config.y_axis_label}" }
                 // Chart title
-                text { x: "{cx2}", y: "15", fill: "#fff", font_size: "14", text_anchor: "middle", font_weight: "bold", "{config.title}" }
+                text { x: "{cx2}", y: "15", fill: "{theme_color::TEXT_PRIMARY}", font_size: "14", text_anchor: "middle", font_weight: "bold", "{config.title}" }
             }
         }
     }
@@ -223,8 +225,8 @@ pub enum AdvancedChartType {
 impl ChartType {
     fn stroke_color(&self) -> &'static str {
         match self {
-            ChartType::Buffer => "#8ef",
-            ChartType::Jitter => "#ff8",
+            ChartType::Buffer => theme_color::NETEQ_BUFFER,
+            ChartType::Jitter => theme_color::NETEQ_JITTER,
         }
     }
 
@@ -298,19 +300,19 @@ pub fn NetEqChart(data: Vec<u64>, chart_type: ChartType, width: u32, height: u32
                 view_box: "{view_box}",
                 preserve_aspect_ratio: "none",
                 // Y-axis
-                line { x1: "{ml}", y1: "5", x2: "{ml}", y2: "{ph5}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml}", y1: "5", x2: "{ml}", y2: "{ph5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // X-axis
-                line { x1: "{ml}", y1: "{ph5}", x2: "{cw5}", y2: "{ph5}", stroke: "#666", stroke_width: "1" }
+                line { x1: "{ml}", y1: "{ph5}", x2: "{cw5}", y2: "{ph5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
                 // Data line
                 if !points.is_empty() {
                     polyline { points: "{points}", fill: "none", stroke: "{stroke_color}", stroke_width: "2" }
                 }
                 // Y-axis labels
-                text { x: "0", y: "10", fill: "#888", font_size: "11", "{max_val}" }
-                text { x: "0", y: "{ph5}", fill: "#888", font_size: "11", "0" }
+                text { x: "0", y: "10", fill: "{theme_color::TEXT_SUBTLE}", font_size: "11", "{max_val}" }
+                text { x: "0", y: "{ph5}", fill: "{theme_color::TEXT_SUBTLE}", font_size: "11", "0" }
                 // X-axis labels
-                text { x: "{ml}", y: "{ch1}", fill: "#888", font_size: "11", "0s" }
-                text { x: "{cw20}", y: "{ch1}", fill: "#888", font_size: "11", "{time_label}" }
+                text { x: "{ml}", y: "{ch1}", fill: "{theme_color::TEXT_SUBTLE}", font_size: "11", "0s" }
+                text { x: "{cw20}", y: "{ch1}", fill: "{theme_color::TEXT_SUBTLE}", font_size: "11", "{time_label}" }
             }
         }
     }
@@ -334,13 +336,13 @@ impl ChartConfig {
             series: vec![
                 ChartSeries {
                     data_points: buffer_data,
-                    color: "#007bff",
+                    color: theme_color::NETEQ_BLUE,
                     label: "Current Buffer",
                     scale_factor: 1.0,
                 },
                 ChartSeries {
                     data_points: target_data,
-                    color: "#28a745",
+                    color: theme_color::NETEQ_GREEN,
                     label: "Target Buffer",
                     scale_factor: 1.0,
                 },
@@ -373,7 +375,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.normal_per_sec as f64)
                         .collect(),
-                    color: "#28a745",
+                    color: theme_color::NETEQ_GREEN,
                     label: "Normal",
                     scale_factor: 1.0,
                 },
@@ -382,7 +384,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.expand_per_sec as f64)
                         .collect(),
-                    color: "#dc3545",
+                    color: theme_color::NETEQ_RED,
                     label: "Expand",
                     scale_factor: 1.0,
                 },
@@ -391,7 +393,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.accelerate_per_sec as f64)
                         .collect(),
-                    color: "#fd7e14",
+                    color: theme_color::NETEQ_ORANGE,
                     label: "Accelerate",
                     scale_factor: 1.0,
                 },
@@ -400,7 +402,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.preemptive_expand_per_sec as f64)
                         .collect(),
-                    color: "#6f42c1",
+                    color: theme_color::NETEQ_PURPLE,
                     label: "Preemptive Expand",
                     scale_factor: 1.0,
                 },
@@ -409,7 +411,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.merge_per_sec as f64)
                         .collect(),
-                    color: "#17a2b8",
+                    color: theme_color::NETEQ_TEAL,
                     label: "Merge",
                     scale_factor: 1.0,
                 },
@@ -434,7 +436,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.packets_awaiting_decode as f64)
                         .collect(),
-                    color: "#6f42c1",
+                    color: theme_color::NETEQ_PURPLE,
                     label: "Packets",
                     scale_factor: 1.0,
                 },
@@ -443,7 +445,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.underruns as f64 * 0.3)
                         .collect(),
-                    color: "#dc3545",
+                    color: theme_color::NETEQ_RED,
                     label: "Underruns",
                     scale_factor: 0.3,
                 },
@@ -474,7 +476,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.reorder_rate as f64)
                         .collect(),
-                    color: "#dc3545",
+                    color: theme_color::NETEQ_RED,
                     label: "Reorder Rate",
                     scale_factor: 1.0,
                 },
@@ -483,7 +485,7 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.max_reorder_distance as f64)
                         .collect(),
-                    color: "#17a2b8",
+                    color: theme_color::NETEQ_TEAL,
                     label: "Max Distance",
                     scale_factor: 1.0,
                 },
@@ -514,13 +516,13 @@ impl ChartConfig {
                         .iter()
                         .map(|s| s.calls_per_sec as f64)
                         .collect(),
-                    color: "#28a745",
+                    color: theme_color::NETEQ_GREEN,
                     label: "Calls/sec",
                     scale_factor: 1.0,
                 },
                 ChartSeries {
                     data_points: stats_history.iter().map(|s| s.avg_frames as f64).collect(),
-                    color: "#ffc107",
+                    color: theme_color::NETEQ_AMBER,
                     label: "Avg Frames",
                     scale_factor: 1.0,
                 },

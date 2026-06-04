@@ -1,0 +1,153 @@
+name: PR Preview Cleanup on Close
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+concurrency:
+  group: pr-cleanup-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  cleanup:
+    name: Cleanup preview environment
+    runs-on: ubuntu-latest
+    outputs:
+      slot_existed: ${{ steps.find-slot.outputs.exists }}
+      slot: ${{ steps.find-slot.outputs.slot }}
+    steps:
+      - name: Configure kubectl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
+
+      - name: Find deployment slot
+        id: find-slot
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+
+          # Find which slot this PR is using
+          # || true: kubectl exits 1 when jsonpath hits an empty array (no match);
+          # suppress that so -e doesn't kill the script before the [ -z ] check.
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null || true)
+
+          if [ -z "$SLOT" ]; then
+            echo "No preview environment found for PR #${PR_NUM}, nothing to cleanup"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "PR #${PR_NUM} is deployed in slot ${SLOT}, will cleanup"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "slot=${SLOT}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete namespace
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          NAMESPACE="preview-slot-${SLOT}"
+
+          echo "Deleting namespace: ${NAMESPACE} (slot ${SLOT}, PR #${PR_NUM})"
+          kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
+
+          echo "✅ Namespace deleted"
+          echo "✅ Slot ${SLOT} is now available"
+
+      - name: Drop postgres database
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          DB_NAME="preview_slot_${SLOT}"
+
+          echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
+
+          # Get postgres password from secret
+          # || true: prevents -e from exiting if the secret doesn't exist
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n preview-infra \
+            -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || true)
+
+          if [ -z "$PG_PASSWORD" ]; then
+            echo "⚠️  Failed to get postgres credentials, skipping database drop"
+          else
+            kubectl exec -n preview-infra postgres-postgresql-0 -- \
+              env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
+                echo "⚠️  Failed to drop database, may need manual cleanup"
+              }
+            echo "✅ Database dropped for slot ${SLOT}"
+          fi
+
+      - name: Summary
+        if: steps.find-slot.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          echo "✅ Cleanup complete for PR #${PR_NUM} (slot ${SLOT})"
+          echo ""
+          echo "Removed:"
+          echo "  - Namespace preview-slot-${SLOT}"
+          echo "  - Database preview_slot_${SLOT}"
+          echo ""
+          echo "📊 Slot ${SLOT} is now available for other PRs"
+
+  comment-success:
+    name: Comment on cleanup success
+    needs: cleanup
+    if: always() && needs.cleanup.result == 'success' && needs.cleanup.outputs.slot_existed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post cleanup success comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const slot = '${{ needs.cleanup.outputs.slot }}';
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Preview environment cleaned up**
+
+            The preview for PR #${prNumber} has been automatically cleaned up.
+
+            **Resources removed:**
+            - Namespace \`preview-slot-${slot}\` (includes all pods and services)
+            - Database \`preview_slot_${slot}\`
+            - Images tagged \`pr-${prNumber}\` (purged automatically after 7 days)
+
+            📊 **Slot ${slot} is now available** for other PRs.`
+            })
+
+  comment-failure:
+    name: Comment on cleanup failure
+    needs: cleanup
+    if: always() && needs.cleanup.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on cleanup failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.pull_request.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **PR cleanup failed**
+
+            Automatic preview cleanup encountered an error when PR #${{ github.event.pull_request.number }} was closed.
+
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })

@@ -2,7 +2,10 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::context::{confirm_transport_change, TransportPreference};
+use crate::context::{
+    clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
+    save_transport_preference_session, save_transport_sticky, TransportPreference,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -299,10 +302,22 @@ pub fn DeviceSettingsModal(
     visible: bool,
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
+    #[props(default)] initial_section: Option<String>,
 ) -> Element {
     let is_ios_safari = is_ios();
-    let mut active_section = use_signal(|| SettingsSection::Audio);
+    // The parent uses a `key` (generation counter) to recreate this component
+    // each time the modal opens, so `use_signal`'s initializer runs fresh with
+    // the correct starting section.  No render-body signal mutations needed.
+    let initial = match initial_section.as_deref() {
+        Some("appearance") => SettingsSection::Appearance,
+        Some("network") => SettingsSection::Network,
+        Some("video") => SettingsSection::Video,
+        _ => SettingsSection::Audio,
+    };
+    let mut active_section = use_signal(move || initial);
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
+    let mut sticky_transport = use_signal(load_transport_sticky);
+    let mut pending_protocol = use_signal(|| transport_preference);
 
     if !visible {
         return rsx! {};
@@ -345,28 +360,22 @@ pub fn DeviceSettingsModal(
                     }
                 },
 
-                div { class: "device-settings-header settings-header",
-                    h2 {
-                        id: "device-settings-title",
-                        "Settings"
-                    }
-                    button {
-                        class: "close-button",
-                        r#type: "button",
-                        "aria-label": "Close settings",
-                        onclick: move |_| on_close.call(()),
+                button {
+                    class: "settings-modal-close",
+                    r#type: "button",
+                    "aria-label": "Close settings",
+                    onclick: move |_| on_close.call(()),
 
-                        svg {
-                            view_box: "0 0 24 24",
-                            width: "18",
-                            height: "18",
+                    svg {
+                        view_box: "0 0 24 24",
+                        width: "16",
+                        height: "16",
 
-                            path {
-                                d: "M6 6L18 18M18 6L6 18",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                stroke_linecap: "round"
-                            }
+                        path {
+                            d: "M6 6L18 18M18 6L6 18",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round"
                         }
                     }
                 }
@@ -376,6 +385,12 @@ pub fn DeviceSettingsModal(
                         class: "settings-sidebar",
                         role: "tablist",
                         "aria-label": "Settings sections",
+
+                        h2 {
+                            id: "device-settings-title",
+                            class: "settings-sidebar-title",
+                            "Settings"
+                        }
 
                         for section in SettingsSection::all() {
                             SettingsNavButton {
@@ -501,33 +516,162 @@ pub fn DeviceSettingsModal(
                                         "Choose the transport protocol for media connections."
                                     }
 
+                                    // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
-                                        label { r#for: "modal-transport-select", "Protocol" }
-                                        SettingsGlassSelect {
-                                            id: "modal-transport-select",
-                                            options: vec![
-                                                GlassSelectOption { value: "auto".to_string(), label: "Auto".to_string() },
-                                                GlassSelectOption { value: "webtransport".to_string(), label: "WebTransport".to_string() },
-                                                GlassSelectOption { value: "websocket".to_string(), label: "WebSocket".to_string() },
-                                            ],
-                                            selected_value: match transport_preference {
-                                                TransportPreference::Auto => "auto".to_string(),
-                                                TransportPreference::WebTransportOnly => "webtransport".to_string(),
-                                                TransportPreference::WebSocketOnly => "websocket".to_string(),
-                                            },
-                                            on_change: move |value: String| {
-                                                confirm_transport_change(
-                                                    &value,
-                                                    transport_preference,
-                                                    "modal-transport-select",
-                                                );
-                                            },
-                                            open_dropdown,
+                                        span {
+                                            id: "transport-segmented-label",
+                                            class: "transport-segmented-label",
+                                            "Protocol"
+                                        }
+                                        div {
+                                            class: "transport-segmented",
+                                            role: "radiogroup",
+                                            "aria-labelledby": "transport-segmented-label",
+                                            for option in [
+                                                (TransportPreference::WebTransport, "WebTransport (default)", "transport-radio-webtransport"),
+                                                (TransportPreference::WebSocket, "WebSocket", "transport-radio-websocket"),
+                                            ] {
+                                                {
+                                                    let (value, label, test_id) = option;
+                                                    let is_selected = pending_protocol() == value;
+                                                    rsx! {
+                                                        button {
+                                                            key: "{test_id}",
+                                                            r#type: "button",
+                                                            role: "radio",
+                                                            "aria-checked": if is_selected { "true" } else { "false" },
+                                                            "data-testid": test_id,
+                                                            class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                                            onclick: move |_| {
+                                                                pending_protocol.set(value);
+                                                            },
+                                                            "{label}"
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 
-                                    p { class: "transport-preference-note",
-                                        "Changing protocol will reload the page."
+                                    // Hidden for the default (WebTransport) since pinning the
+                                    // implicit default is a no-op.
+                                    if pending_protocol() != TransportPreference::default() {
+                                        div { class: "device-setting-group sticky-protocol-row",
+                                            div { class: "sticky-protocol-row-inner",
+                                                div { class: "sticky-protocol-text",
+                                                    label {
+                                                        r#for: "sticky-transport-checkbox",
+                                                        class: "sticky-protocol-label",
+                                                        "Remember protocol choice"
+                                                    }
+                                                    p { class: "sticky-protocol-hint",
+                                                        "Pin this protocol across browser sessions."
+                                                    }
+                                                }
+                                                label {
+                                                    class: "glow-switch",
+                                                    "aria-label": "Remember protocol choice across browser sessions",
+                                                    input {
+                                                        id: "sticky-transport-checkbox",
+                                                        r#type: "checkbox",
+                                                        checked: sticky_transport(),
+                                                        onchange: move |evt: Event<FormData>| {
+                                                            // Persist immediately so the choice survives an unexpected tab close.
+                                                            let checked = evt.checked();
+                                                            sticky_transport.set(checked);
+                                                            if checked {
+                                                                save_transport_preference(pending_protocol());
+                                                                save_transport_sticky(true);
+                                                            } else {
+                                                                clear_transport_sticky_and_pref();
+                                                            }
+                                                        },
+                                                    }
+                                                    span { class: "glow-switch-track" }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Default+sticky is a silent no-op, so suppress the advisory there.
+                                    if sticky_transport() && pending_protocol() != TransportPreference::default() {
+                                        div {
+                                            class: "settings-info-panel",
+                                            role: "note",
+                                            div { class: "settings-info-panel-icon",
+                                                svg {
+                                                    view_box: "0 0 24 24",
+                                                    width: "16",
+                                                    height: "16",
+                                                    "aria-hidden": "true",
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "12",
+                                                        r: "10",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                    }
+                                                    path {
+                                                        d: "M12 8v5",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "1.5",
+                                                        stroke_linecap: "round",
+                                                    }
+                                                    circle {
+                                                        cx: "12",
+                                                        cy: "16",
+                                                        r: "0.9",
+                                                        fill: "currentColor",
+                                                    }
+                                                }
+                                            }
+                                            div { class: "settings-info-panel-body",
+                                                p { class: "settings-info-panel-title",
+                                                    "Protocol pinned"
+                                                }
+                                                p { class: "settings-info-panel-text",
+                                                    "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Only shown when the pending selection diverges from the active one.
+                                    if pending_protocol() != transport_preference {
+                                        div { class: "transport-apply-row",
+                                            p { class: "transport-preference-note",
+                                                "Changing protocol will reload the page."
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                class: "transport-apply-button",
+                                                "data-testid": "transport-apply-button",
+                                                onclick: move |_| {
+                                                    let pref = pending_protocol();
+                                                    let is_default = pref == TransportPreference::default();
+                                                    match (is_default, sticky_transport()) {
+                                                        // Default + not sticky: clear all storage so the
+                                                        // implicit default takes over on reload.
+                                                        (true, false) => {
+                                                            clear_transport_sticky_and_pref();
+                                                        }
+                                                        (_, true) => {
+                                                            save_transport_preference(pref);
+                                                            save_transport_sticky(true);
+                                                        }
+                                                        (false, false) => {
+                                                            // Session-scoped: survives the reload only.
+                                                            save_transport_preference_session(pref);
+                                                        }
+                                                    }
+                                                    if let Some(w) = web_sys::window() {
+                                                        let _ = w.location().reload();
+                                                    }
+                                                },
+                                                "Apply"
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -572,8 +716,86 @@ fn SettingsNavButton(
             "data-testid": section.test_id(),
             tabindex: if active { "0" } else { "-1" },
             onclick: move |evt| onclick.call(evt),
-            "{section.title()}"
+            {render_nav_icon(section)}
+            span { class: "settings-nav-label", "{section.title()}" }
         }
+    }
+}
+
+// Monochrome stroke-only icons for the settings sidebar. Rendered with
+// `currentColor` so they pick up the nav button's own text color in both
+// themes — no per-tab color, no glow, no fill.
+fn render_nav_icon(section: SettingsSection) -> Element {
+    match section {
+        SettingsSection::Audio => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M5 9v6h3l5 4V5L8 9H5z" }
+                path { d: "M16 8a5 5 0 0 1 0 8" }
+                path { d: "M19 5a9 9 0 0 1 0 14" }
+            }
+        },
+        SettingsSection::Video => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                rect { x: "3", y: "6", width: "13", height: "12", rx: "2" }
+                path { d: "M16 10l5-3v10l-5-3z" }
+            }
+        },
+        SettingsSection::Network => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M5 18h2v-4H5v4z" }
+                path { d: "M11 18h2v-7h-2v7z" }
+                path { d: "M17 18h2V7h-2v11z" }
+            }
+        },
+        SettingsSection::Appearance => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                // Sun: small disc on the upper-left with a few rays
+                circle { cx: "9", cy: "9", r: "3.2" }
+                path { d: "M9 3.4v1.6 M9 13v1.6 M3.4 9h1.6 M13 9h1.6 M5.1 5.1l1.1 1.1 M11.8 11.8l1.1 1.1 M12.9 5.1l-1.1 1.1 M6.2 11.8l-1.1 1.1" }
+                // Moon: crescent on the lower-right
+                path { d: "M20.5 14.2a6 6 0 1 1-6.7-6.7 4.6 4.6 0 0 0 6.7 6.7z" }
+            }
+        },
     }
 }
 

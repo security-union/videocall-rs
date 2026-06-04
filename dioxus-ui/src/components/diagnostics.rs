@@ -19,7 +19,9 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
-use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
+use crate::context::{
+    confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
+};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,15 @@ pub struct ConnectionManagerState {
     pub election_state: String,
     pub election_progress: Option<f64>,
     pub servers_total: Option<u64>,
+    /// Total configured servers (WS + WT URLs) the manager was set up with,
+    /// independent of the `ElectionState`. Emitted as `configured_servers_total`
+    /// from the connection-manager bus. Phase 7 (discussion 562).
+    pub configured_servers_total: Option<u64>,
+    /// `true` when the manager has at most one configured server. The UI
+    /// renders a "Limited connectivity" badge while this is set, since
+    /// re-elections are gated on having multiple candidates. Phase 7
+    /// (discussion 562).
+    pub single_server_only: Option<bool>,
     pub active_connection_id: Option<String>,
     pub active_server_url: Option<String>,
     pub active_server_type: Option<String>,
@@ -91,6 +102,8 @@ impl Default for ConnectionManagerState {
             election_state: "unknown".to_string(),
             election_progress: None,
             servers_total: None,
+            configured_servers_total: None,
+            single_server_only: None,
             active_connection_id: None,
             active_server_url: None,
             active_server_type: None,
@@ -146,6 +159,18 @@ impl ConnectionManagerState {
                 "servers_total" => {
                     if let MetricValue::U64(total) = &metric.value {
                         state.servers_total = Some(*total);
+                    }
+                }
+                "configured_servers_total" => {
+                    if let MetricValue::U64(total) = &metric.value {
+                        state.configured_servers_total = Some(*total);
+                    }
+                }
+                "single_server_only" => {
+                    if let MetricValue::U64(flag) = &metric.value {
+                        // Encoded as u64-bool to match the
+                        // `server_active`/`server_connected` convention.
+                        state.single_server_only = Some(*flag != 0);
                     }
                 }
                 "active_connection_id" => {
@@ -282,6 +307,28 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
                             div { class: "status-item",
                                 span { class: "status-label", "Total Servers:" }
                                 span { class: "status-value", "{total}" }
+                            }
+                        }
+                        if let Some(total) = state.configured_servers_total {
+                            div { class: "status-item",
+                                span { class: "status-label", "Configured Servers:" }
+                                span { class: "status-value", "{total}" }
+                            }
+                        }
+                    }
+                    if state.single_server_only == Some(true) {
+                        // Phase 7 (discussion 562): when only one (or zero)
+                        // candidates are configured, the watchdog suppresses
+                        // re-election (it would re-elect onto the same host).
+                        // Surface a badge so the user knows recovery is gated
+                        // and isn't just a silent stall.
+                        div { class: "limited-connectivity-badge",
+                            role: "alert",
+                            aria_live: "polite",
+                            span { class: "badge-icon", "!" }
+                            span { class: "badge-text",
+                                "Limited connectivity \u{2014} only 1 server reachable. \
+                                 Re-elections disabled."
                             }
                         }
                     }
@@ -451,6 +498,7 @@ pub fn Diagnostics(
     let mut neteq_stats_per_peer = use_signal(HashMap::<String, Vec<String>>::new);
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
+    let mut peer_transport_per_peer = use_signal(HashMap::<String, String>::new);
     let mut diag_task = use_signal(|| None::<Task>);
     let mut backend_versions = use_signal(Vec::<serde_json::Value>::new);
 
@@ -471,6 +519,7 @@ pub fn Diagnostics(
             neteq_stats_per_peer.set(HashMap::new());
             neteq_buffer_per_peer.set(HashMap::new());
             neteq_jitter_per_peer.set(HashMap::new());
+            peer_transport_per_peer.set(HashMap::new());
             diag_task.set(None);
             return;
         }
@@ -481,6 +530,11 @@ pub fn Diagnostics(
             let mut neteq_stats = HashMap::<String, Vec<String>>::new();
             let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
             let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
+            // Per-peer transport label, locally cached. peer_status events
+            // arrive on every heartbeat (~periodic), so we only push to the
+            // signal when the value actually changes — heartbeat ticks must
+            // not cause UI re-renders.
+            let mut peer_transport = HashMap::<String, String>::new();
 
             while let Ok(evt) = rx.recv().await {
                 match evt.subsystem {
@@ -608,6 +662,38 @@ pub fn Diagnostics(
                         }
                         if jitter_dirty {
                             neteq_jitter_per_peer.set(neteq_jitter.clone());
+                        }
+                    }
+                    "peer_status" => {
+                        let mut peer_id: Option<String> = None;
+                        let mut transport: Option<String> = None;
+                        for m in &evt.metrics {
+                            match m.name {
+                                "to_peer" => {
+                                    if let MetricValue::Text(t) = &m.value {
+                                        peer_id = Some(t.clone());
+                                    }
+                                }
+                                "peer_transport" => {
+                                    if let MetricValue::Text(t) = &m.value {
+                                        transport = Some(t.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(p), Some(t)) = (peer_id, transport) {
+                            // Only push to the signal when the value
+                            // actually changes; otherwise we'd re-render
+                            // on every heartbeat tick.
+                            let changed = match peer_transport.get(&p) {
+                                Some(prev) => prev != &t,
+                                None => true,
+                            };
+                            if changed {
+                                peer_transport.insert(p, t);
+                                peer_transport_per_peer.set(peer_transport.clone());
+                            }
                         }
                     }
                     "connection_manager" => {
@@ -776,21 +862,17 @@ pub fn Diagnostics(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
                                     "diagnostics-transport-select",
+                                    load_transport_sticky(),
                                 );
                             },
                             option {
-                                value: "auto",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::Auto,
-                                "Auto"
-                            }
-                            option {
                                 value: "webtransport",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransportOnly,
-                                "WebTransport"
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
+                                "WebTransport (default)"
                             }
                             option {
                                 value: "websocket",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocketOnly,
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
                                 "WebSocket"
                             }
                         }
@@ -869,16 +951,30 @@ pub fn Diagnostics(
                     div { class: "diagnostics-section",
                         h3 { "Per-Peer Summary" }
                         div { class: "peer-summary",
-                            for (peer_id, _) in stats_map.iter() {
-                                {
-                                    let display = peer_display_name(peer_id);
-                                    let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
-                                    let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
-                                    let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
-                                    rsx! {
-                                        div { class: "peer-summary-item",
-                                            strong { "{display}" }
-                                            span { "{summary}" }
+                            {
+                                let transport_map = peer_transport_per_peer();
+                                rsx! {
+                                    for (peer_id, _) in stats_map.iter() {
+                                        {
+                                            let display = peer_display_name(peer_id);
+                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
+                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
+                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
+                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
+                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
+                                            };
+                                            rsx! {
+                                                div { class: "peer-summary-item",
+                                                    strong { "{display}" }
+                                                    div {
+                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
+                                                        span { "{summary}" }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

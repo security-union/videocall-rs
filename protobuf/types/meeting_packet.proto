@@ -24,6 +24,12 @@ message MeetingPacket {
     PARTICIPANT_DISPLAY_NAME_CHANGED = 9;
     // Meeting settings updated mid-meeting
     MEETING_SETTINGS_UPDATED = 10;
+    // Host requests participants mute their mic
+    HOST_MUTE_PARTICIPANT = 11;
+    // Host requests participants disable their video
+    HOST_DISABLE_VIDEO = 12;
+    // Host removes a participant from the meeting
+    PARTICIPANT_KICKED = 13;
   }
 
   MeetingEventType event_type = 1;

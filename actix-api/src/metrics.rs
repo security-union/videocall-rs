@@ -21,8 +21,8 @@
 use actix_web::{HttpResponse, Responder};
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge_vec, register_histogram, Counter,
-    CounterVec, Encoder, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec,
 };
 
 /// Shared Prometheus metrics HTTP handler for relay server binaries.
@@ -303,6 +303,22 @@ lazy_static! {
     )
     .expect("Failed to create video_quality_score metric");
 
+    /// Per-peer windowed video sequence packet-loss rate (freeze indicator)
+    pub static ref VIDEO_SEQ_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_video_seq_loss_per_sec",
+        "Per-peer windowed video sequence packet-loss rate (lost packets/sec) observed by the receiver; freeze indicator",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_seq_loss_per_sec metric");
+
+    /// Per-peer windowed rate of keyframe (PLI) requests sent to the peer
+    pub static ref KEYFRAME_REQUESTS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_keyframe_requests_per_sec",
+        "Per-peer windowed rate of keyframe (PLI) requests this client sent to the peer; sustained nonzero => stream cannot recover",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create keyframe_requests_per_sec metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",
@@ -379,21 +395,21 @@ lazy_static! {
     )
     .expect("Failed to create adaptive_audio_tier metric");
 
-    /// Cumulative datagram drops (writable stream locked)
-    pub static ref DATAGRAM_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
-        "videocall_datagram_drops_total",
-        "Cumulative datagrams dropped due to locked writable stream",
+    /// Cumulative datagrams dropped as of the latest client health snapshot.
+    pub static ref DATAGRAM_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_datagram_drops",
+        "Cumulative datagrams dropped due to locked writable stream as of the latest client health snapshot",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
-    .expect("Failed to create datagram_drops_total metric");
+    .expect("Failed to create datagram_drops metric");
 
-    /// Cumulative WebSocket packets dropped (backpressure)
-    pub static ref WEBSOCKET_DROPS_TOTAL: GaugeVec = register_gauge_vec!(
-        "videocall_websocket_drops_total",
-        "Cumulative WebSocket packets dropped due to send buffer backpressure",
+    /// Cumulative WebSocket packet drops as of the latest client health snapshot.
+    pub static ref WEBSOCKET_DROPS: GaugeVec = register_gauge_vec!(
+        "videocall_websocket_drops",
+        "Cumulative WebSocket packets dropped due to send buffer backpressure as of the latest client health snapshot",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
-    .expect("Failed to create websocket_drops_total metric");
+    .expect("Failed to create websocket_drops metric");
 
     /// Cumulative keyframe requests sent (PLI)
     pub static ref KEYFRAME_REQUESTS_SENT_TOTAL: GaugeVec = register_gauge_vec!(
@@ -413,15 +429,13 @@ lazy_static! {
     )
     .expect("Failed to create encoder_fps_ratio metric");
 
-    /// Peer FPS signal driving encoder decisions.
-    /// NOTE: As of PR-A (#312), this reports p75 aggregated FPS, not worst-peer FPS.
-    /// TODO(PR-G): rename metric to `videocall_encoder_p75_peer_fps`.
-    pub static ref ENCODER_WORST_PEER_FPS: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_worst_peer_fps",
-        "FPS from the worst-performing receiver driving encoder decisions",
+    /// p75 peer FPS signal driving encoder decisions.
+    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_p75_peer_fps",
+        "p75 peer FPS driving adaptive quality decisions",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
-    .expect("Failed to create encoder_worst_peer_fps metric");
+    .expect("Failed to create encoder_p75_peer_fps metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
@@ -462,6 +476,48 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create encoder_bitrate_ratio metric");
+
+    // ===== DECODE-BUDGET STATE (#987 / PR #999) =====
+
+    /// Current effective tile cap enforced by the decode-budget controller.
+    pub static ref DECODE_BUDGET_EFFECTIVE_CAP: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_effective_cap",
+        "Current effective decode-budget tile cap",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_effective_cap metric");
+
+    /// Natural/unconstrained tile count before any decode-budget cap is applied.
+    pub static ref DECODE_BUDGET_NATURAL: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_natural",
+        "Natural (unconstrained) decode-budget tile count before capping",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_natural metric");
+
+    /// Decode-budget pressured latch (1=pressured, 0=not pressured).
+    pub static ref DECODE_BUDGET_PRESSURED: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_pressured",
+        "Decode-budget pressured latch (1=pressured, 0=not pressured)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_pressured metric");
+
+    /// Decode-budget override mode (0=unspecified, 1=auto, 2=fixed).
+    pub static ref DECODE_BUDGET_OVERRIDE_MODE: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_override_mode",
+        "Decode-budget override mode (0=unspecified, 1=auto, 2=fixed)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_override_mode metric");
+
+    /// User-configured fixed tile cap, set only when override_mode == fixed.
+    pub static ref DECODE_BUDGET_OVERRIDE_FIXED_N: GaugeVec = register_gauge_vec!(
+        "videocall_decode_budget_override_fixed_n",
+        "Decode-budget user-configured fixed tile cap (override_mode=fixed)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_budget_override_fixed_n metric");
 
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
@@ -529,13 +585,109 @@ lazy_static! {
     // filter ~96% of series. If cardinality becomes a problem, switch
     // counters to room-less aggregates or add periodic label cleanup.
 
-    /// Total packet drops from try_send() failures on outbound channels/mailboxes
+    /// Total packet drops from try_send() failures on outbound channels/mailboxes.
+    ///
+    /// This counter is for UNINTENTIONAL backpressure loss only (full outbound
+    /// queue / actor mailbox). Intentional, policy-driven drops (e.g. viewport
+    /// filtering) are tracked on their own metric so backpressure dashboards
+    /// and alerts that sum across labels are not polluted. See
+    /// [`RELAY_VIEWPORT_FILTERED_TOTAL`].
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "relay_packet_drops_total",
-        "Total packets dropped due to full outbound queue or mailbox",
+        "Total packets dropped due to full outbound queue or mailbox (backpressure loss only; intentional viewport drops are counted by relay_viewport_filtered_total)",
         &["room", "transport", "drop_reason"]
     )
     .expect("Failed to create relay_packet_drops_total metric");
+
+    /// VIDEO packets INTENTIONALLY not forwarded because the receiver's
+    /// viewport set (HCL issue #988) does not include the source session.
+    ///
+    /// This is an expected, bandwidth-saving drop — NOT a backpressure loss —
+    /// so it is deliberately kept off `relay_packet_drops_total`.
+    ///
+    /// CARDINALITY: `room` is user-provided (unbounded over time), same
+    /// caveats as the other room-labeled counters above.
+    pub static ref RELAY_VIEWPORT_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_filtered_total",
+        "Total VIDEO packets intentionally dropped by viewport-aware relay filtering (off-screen source not in receiver's viewport)",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_filtered_total metric");
+
+    /// VIDEO packets that PASSED the viewport filter and were forwarded — the
+    /// denominator complement of `relay_viewport_filtered_total` (HCL #988).
+    ///
+    /// Without this baseline the filtered counter has no scale: you cannot tell
+    /// "5 drops/s out of 5000 forwarded/s" (healthy) from "5 drops/s out of 6
+    /// forwarded/s" (the wrongly-dropping / froze-my-video signature). The
+    /// "% filtered" panel is `filtered / (filtered + forwarded)`.
+    ///
+    /// Incremented in the `is_video && !drop_video` branch — the exact
+    /// complement of the filtered increment, so the two are mutually exclusive
+    /// and together cover every VIDEO packet that reached the filter.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time — same
+    /// caveat as the other room-labeled counters above). No per-source/session
+    /// label: session IDs churn on reconnect (see
+    /// `videocall_outbound_channel_drops_total` for the same call).
+    pub static ref RELAY_VIEWPORT_FORWARDED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_forwarded_total",
+        "Total VIDEO packets forwarded after passing viewport-aware relay filtering (on-screen, or fail-open). Denominator complement of relay_viewport_filtered_total",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_forwarded_total metric");
+
+    /// Current viewport (desired-streams) set size, per room (HCL #988).
+    ///
+    /// Updated on every ACCEPTED VIEWPORT inside `try_intercept_viewport`. A
+    /// collapse toward 0/1 while peers are still publishing is the
+    /// wrongly-dropping ("froze my video") signature — the relay is the only
+    /// place this is observable, because the client-FPS cross-check telemetry
+    /// does NOT land on these clusters.
+    ///
+    /// A `GaugeVec` (NOT a counter) so the per-room series can be REMOVED when
+    /// the room drains — see the cleanup in `forget_room_if_empty` /
+    /// `forget_session`. Counters cannot be unregistered cheaply; a stale gauge
+    /// series for a dead room would otherwise read its last value forever.
+    ///
+    /// CARDINALITY: `room` only. Because we deliberately do NOT key on the
+    /// receiver session (unbounded, churns on reconnect), the gauge is
+    /// LAST-WRITER-WINS across the receivers in a room: it reflects the most
+    /// recently-accepted viewport set size for the room, which is sufficient
+    /// for the "is the whole room collapsing toward 0/1" signal. Per-session
+    /// forensics live in the `chat_server=debug` VIDEO-drop log, not in labels.
+    pub static ref RELAY_VIEWPORT_SET_SIZE: GaugeVec = register_gauge_vec!(
+        "relay_viewport_set_size",
+        "Most recently accepted viewport (desired-streams) set size per room; a collapse toward 0/1 is the wrongly-dropping signature (HCL #988)",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_set_size metric");
+
+    /// VIEWPORT control-packet update outcomes, per room (HCL #988).
+    ///
+    /// Makes the DoS guards in `try_intercept_viewport` observable — today the
+    /// cap (`VIEWPORT_MAX_SESSION_IDS`) and the rate limit
+    /// (`VIEWPORT_MIN_UPDATE_INTERVAL`) fire SILENTLY. Also gives plain
+    /// "VIEWPORT received" visibility via the `accepted` outcome.
+    ///
+    /// `outcome` is bounded — exactly 4 values:
+    /// - `accepted`:              update was applied to the receiver's set.
+    /// - `rate_limited`:          arrived within `VIEWPORT_MIN_UPDATE_INTERVAL`
+    ///   of the last accepted update; consumed but ignored.
+    /// - `truncated`:             the session_id list exceeded
+    ///   `VIEWPORT_MAX_SESSION_IDS` and was capped (fail-open on the excess).
+    ///   Counted in ADDITION to `accepted` for the same packet (it was both
+    ///   truncated AND applied).
+    /// - `ignored_other_subject`: arrived on a subject other than the receiver's
+    ///   own; expected for normal NATS fan-out and dropped without mutating state.
+    ///
+    /// CARDINALITY: bounded — `room` × 4 outcomes. No per-session label.
+    pub static ref RELAY_VIEWPORT_UPDATES_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_updates_total",
+        "VIEWPORT control-packet update outcomes per room (accepted|rate_limited|truncated|ignored_other_subject) (HCL #988)",
+        &["room", "outcome"]
+    )
+    .expect("Failed to create relay_viewport_updates_total metric");
 
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
@@ -568,4 +720,335 @@ lazy_static! {
         &["room", "direction"]
     )
     .expect("Failed to create relay_room_bytes_total metric");
+
+    // ===== AUTH & TRANSPORT TELEMETRY (Phase 8b — TELEM-7, TELEM-8, AUTH-3) =====
+    //
+    // These counters back the alerting rules that fire when JWT rejection rate
+    // or relay outbound-channel drops cross threshold. Designed so on-call can
+    // query rate(...)[5m] without log scraping. See discussion #562 Phase 8b.
+
+    /// JWT room-token rejections, labeled by reason.
+    ///
+    /// CARDINALITY: bounded — exactly 5 series (`token_expired`, `invalid_signature`,
+    /// `missing_claim`, `malformed`, `other`). Safe for indefinite retention.
+    ///
+    /// Incremented from `token_validator::decode_room_token` and
+    /// `validate_room_token` on the error-return path so every JWT auth failure
+    /// is counted regardless of whether it came from the WS or WT entry point.
+    pub static ref AUTH_REJECTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_auth_rejections_total",
+        "Total JWT room-token rejections by reason",
+        &["reason"]
+    )
+    .expect("Failed to create videocall_auth_rejections_total metric");
+
+    /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
+    ///
+    /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
+    /// `kind` is one of `audio`|`video`|`screen`|`media`|`control`|`rtt`|`unknown`|
+    /// `priority_drop_video`|`priority_drop_audio`|`overflow_critical`.
+    /// ~20 series total.
+    ///
+    /// CARDINALITY TRADE-OFF: We deliberately do NOT include `session_id` as a
+    /// label — session IDs are unbounded and would explode storage. The existing
+    /// `relay_packet_drops_total` carries `room` for room-level attribution; this
+    /// new counter is the protocol-wide aggregate that backs alerting (rate()
+    /// over 5m). Use `relay_packet_drops_total` for per-room investigation.
+    ///
+    /// `kind` values (set in `wt_chat_session::drop_kind_label` and the
+    /// matching helper in `ws_chat_session`):
+    /// - `audio`: MEDIA packet whose inner `MediaPacket.media_type == AUDIO`,
+    ///   dropped on a real channel-full event (NOT the new priority policy —
+    ///   audio at >=95% goes to `priority_drop_audio` instead).
+    ///   Added 2026-05-08 to attribute congestion-storm drops to audio.
+    /// - `video`: MEDIA packet whose inner `MediaPacket.media_type == VIDEO`,
+    ///   dropped on a real channel-full event.
+    /// - `screen`: MEDIA packet whose inner `MediaPacket.media_type == SCREEN`,
+    ///   dropped on a real channel-full event.
+    /// - `media`: legacy catch-all for MEDIA packets we could not refine —
+    ///   encrypted/unparseable inner payloads, HEARTBEAT, KEYFRAME_REQUEST,
+    ///   or any future MediaType not in the audio/video/screen set. Kept
+    ///   so existing alerts pivoting on `kind="media"` still see a series.
+    /// - `control`: any non-media outbound (heartbeats, session-assigned, etc.)
+    ///   dropped on a real channel-full event (rare: control should never
+    ///   be preempted by the priority policy — see `overflow_critical`).
+    /// - `rtt`: RTT echo path that drops on a full datagram queue
+    /// - `unknown`: caller could not classify (parse failure / unparsed paths)
+    /// - `priority_drop_video`: MEDIA video or screen frame *preemptively*
+    ///   dropped at the enqueue site because the per-session outbound
+    ///   channel reached the video-drop fill ratio (~80% by default).
+    ///   See `actors::priority_drop` for the policy.
+    ///   Added 2026-05-11 (discussion #699): under saturation we drop
+    ///   video first because audio loss is far worse for UX.
+    /// - `priority_drop_audio`: MEDIA audio frame *preemptively* dropped
+    ///   because the per-session outbound channel reached the audio-drop
+    ///   fill ratio (~95% by default). Should be rare; surfacing this
+    ///   non-zero in production means audio is being lost despite the
+    ///   priority cushion. Treat as an alerting trigger.
+    ///   Added 2026-05-11 (discussion #699).
+    /// - `overflow_critical`: a Critical-class control packet
+    ///   (SESSION_ASSIGNED, CONGESTION, RSA_PUB_KEY, MEETING) was
+    ///   dropped on a real channel-full event. Should be exceptional;
+    ///   indicates the channel is so saturated that even the highest-
+    ///   priority lifecycle packets cannot be admitted. Page on this.
+    ///   Added 2026-05-11 (discussion #699).
+    ///
+    /// BACKWARDS-COMPAT NOTE FOR DASHBOARDS: queries grouped on `kind="media"`
+    /// will only see the catch-all bucket after this change; audio/video/screen
+    /// drops now land on their own labels. Update saved Grafana queries with
+    /// `kind=~"audio|video|screen|media"` (or sum across) to preserve totals.
+    pub static ref OUTBOUND_CHANNEL_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "videocall_outbound_channel_drops_total",
+        "Total outbound channel drops (try_send full) by transport and packet kind",
+        &["transport", "kind"]
+    )
+    .expect("Failed to create videocall_outbound_channel_drops_total metric");
+
+    // ===== CLIENT TELEMETRY: TELEM-7, TELEM-8, TELEM-9 =====
+
+    /// TELEM-7: Static per-session client metadata (value always 1, info in labels)
+    pub static ref CLIENT_INFO: GaugeVec = register_gauge_vec!(
+        "videocall_client_info",
+        "Static per-session client metadata (value always 1, info in labels)",
+        &["meeting_id", "session_id", "display_name",
+          "cores", "architecture", "gpu_family",
+          "network_effective_type", "capability_score"]
+    )
+    .expect("Failed to create videocall_client_info metric");
+
+    /// TELEM-8: Long task duration histogram (main-thread stalls)
+    pub static ref CLIENT_LONGTASK_DURATION_MS: HistogramVec = register_histogram_vec!(
+        "videocall_client_longtask_duration_ms",
+        "Main-thread long task durations observed by the client (ms)",
+        &["meeting_id", "session_id", "display_name"],
+        vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0]
+    )
+    .expect("Failed to create videocall_client_longtask_duration_ms metric");
+
+    /// TELEM-9: Main-thread rAF cadence (frames per second)
+    pub static ref CLIENT_RENDER_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_client_render_fps",
+        "Main-thread rAF cadence (fps)",
+        &["meeting_id", "session_id", "display_name"]
+    )
+    .expect("Failed to create videocall_client_render_fps metric");
+}
+
+// =============================================================================
+// Phase 8b unit tests
+// =============================================================================
+//
+// These tests verify the counter wiring in isolation. End-to-end behavior is
+// covered by `token_validator::tests` (auth) and is the responsibility of the
+// integration test suite for the transport drop sites.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Snapshot the counter, mutate, and assert delta. The counter is a global
+    /// static so any concurrent test in the same process could alter it; we
+    /// gate with `#[serial]` to keep deltas exact.
+    fn snapshot(counter: &CounterVec, labels: &[&str]) -> f64 {
+        counter.with_label_values(labels).get()
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_increments_per_kind() {
+        // Cardinality contract: every documented `kind` must be an
+        // independent series. The audio/video/screen labels were added
+        // 2026-05-08 to refine the legacy `media` bucket; the
+        // priority_drop_video/priority_drop_audio/overflow_critical
+        // labels were added 2026-05-11 for the priority drop policy
+        // (discussion #699). This test also acts as the regression
+        // guard against accidental label typos drifting between the
+        // helpers and the dashboards.
+        let kinds = [
+            "audio",
+            "video",
+            "screen",
+            "media",
+            "control",
+            "rtt",
+            "unknown",
+            "priority_drop_video",
+            "priority_drop_audio",
+            "overflow_critical",
+        ];
+        let before: Vec<f64> = kinds
+            .iter()
+            .map(|k| snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]))
+            .collect();
+
+        for k in &kinds {
+            OUTBOUND_CHANNEL_DROPS_TOTAL
+                .with_label_values(&["webtransport", k])
+                .inc();
+        }
+
+        for (i, k) in kinds.iter().enumerate() {
+            let after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", k]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "kind={k} should have incremented exactly once"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(outbound_channel_drops_metric)]
+    fn outbound_channel_drops_distinguishes_transport_label() {
+        // Verify that `webtransport` and `websocket` series are independent —
+        // bumping one must not bump the other. This is a regression guard:
+        // mistakenly hard-coding "webtransport" in the WS path would cause
+        // the WS counter to silently stay at zero in production.
+        let wt_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_before = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        OUTBOUND_CHANNEL_DROPS_TOTAL
+            .with_label_values(&["websocket", "media"])
+            .inc();
+        let wt_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["webtransport", "media"]);
+        let ws_after = snapshot(&OUTBOUND_CHANNEL_DROPS_TOTAL, &["websocket", "media"]);
+        assert_eq!(
+            ws_after - ws_before,
+            1.0,
+            "websocket+media bump should land on the websocket series"
+        );
+        assert_eq!(
+            wt_after - wt_before,
+            0.0,
+            "websocket+media bump must not leak into the webtransport series"
+        );
+    }
+
+    #[test]
+    #[serial(token_validator_counter)]
+    fn auth_rejections_counter_is_labeled_by_reason() {
+        // Cardinality contract: only the five documented reasons are valid
+        // labels. This test bumps each one and asserts independence.
+        let reasons = [
+            "token_expired",
+            "invalid_signature",
+            "missing_claim",
+            "malformed",
+            "other",
+        ];
+        let before: Vec<f64> = reasons
+            .iter()
+            .map(|r| snapshot(&AUTH_REJECTIONS_TOTAL, &[r]))
+            .collect();
+        for r in &reasons {
+            AUTH_REJECTIONS_TOTAL.with_label_values(&[r]).inc();
+        }
+        for (i, r) in reasons.iter().enumerate() {
+            let after = snapshot(&AUTH_REJECTIONS_TOTAL, &[r]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "reason={r} should have incremented exactly once"
+            );
+        }
+    }
+
+    // ===== Viewport observability (HCL #988) =====
+
+    #[test]
+    #[serial(viewport_forwarded_metric)]
+    fn viewport_forwarded_is_labeled_by_room_and_independent_of_filtered() {
+        // The forwarded counter is the denominator complement of the filtered
+        // counter. Regression guard: the two must be independent series so the
+        // "% filtered" panel (filtered / (filtered + forwarded)) is correct;
+        // mistakenly bumping both on one decision would skew the ratio.
+        let room = "wiretest_room_fwd";
+        let fwd_before = snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]);
+        let filt_before = snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]);
+
+        RELAY_VIEWPORT_FORWARDED_TOTAL
+            .with_label_values(&[room])
+            .inc();
+
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]) - fwd_before,
+            1.0,
+            "forwarded bump must land on the forwarded series for this room"
+        );
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]) - filt_before,
+            0.0,
+            "forwarded bump must NOT leak into the filtered series"
+        );
+    }
+
+    #[test]
+    #[serial(viewport_updates_metric)]
+    fn viewport_updates_increments_per_outcome() {
+        // Cardinality contract: exactly four outcomes are valid labels. This
+        // test bumps each one and asserts independence — a regression guard
+        // against label typos drifting between try_intercept_viewport and the
+        // dashboard's `outcome=~` breakdown.
+        let room = "wiretest_room_upd";
+        let outcomes = [
+            "accepted",
+            "rate_limited",
+            "truncated",
+            "ignored_other_subject",
+        ];
+        let before: Vec<f64> = outcomes
+            .iter()
+            .map(|o| snapshot(&RELAY_VIEWPORT_UPDATES_TOTAL, &[room, o]))
+            .collect();
+
+        for o in &outcomes {
+            RELAY_VIEWPORT_UPDATES_TOTAL
+                .with_label_values(&[room, o])
+                .inc();
+        }
+
+        for (i, o) in outcomes.iter().enumerate() {
+            let after = snapshot(&RELAY_VIEWPORT_UPDATES_TOTAL, &[room, o]);
+            assert_eq!(
+                after - before[i],
+                1.0,
+                "outcome={o} should have incremented exactly once"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(viewport_set_size_metric)]
+    fn viewport_set_size_gauge_observes_and_removes_per_room() {
+        // The set-size gauge is a GaugeVec (NOT a counter) so the per-room
+        // series can be torn down when the room drains. This test verifies the
+        // set/observe semantics AND that remove_label_values drops the series
+        // (the cleanup contract relied on by forget_room_if_empty).
+        let room = "wiretest_room_size";
+
+        RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).set(5.0);
+        assert_eq!(
+            RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).get(),
+            5.0,
+            "gauge must reflect the last observed set size"
+        );
+
+        // Collapse-toward-1 signature is just a smaller observation.
+        RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).set(1.0);
+        assert_eq!(
+            RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).get(),
+            1.0
+        );
+
+        // Room drained: the series must be removable so it does not read its
+        // last value forever for a dead room.
+        RELAY_VIEWPORT_SET_SIZE
+            .remove_label_values(&[room])
+            .expect("series for an active room must be removable");
+        // After removal a fresh handle starts at the gauge default (0.0).
+        assert_eq!(
+            RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).get(),
+            0.0,
+            "removed series must not retain its prior value"
+        );
+    }
 }

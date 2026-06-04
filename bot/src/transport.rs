@@ -22,21 +22,118 @@ use tokio::sync::mpsc::Receiver;
 use tracing::info;
 use url::Url;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+/// Characters that must be percent-encoded in a URL path segment (RFC 3986).
+/// This encodes: control chars, space, and the delimiter characters that would
+/// break path parsing (/, ?, #, [, ], @, !, $, &, ', (, ), *, +, ,, ;, =, %).
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'[')
+    .add(b']')
+    .add(b'@')
+    .add(b'!')
+    .add(b'$')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b';')
+    .add(b'=')
+    .add(b'%');
+
 use crate::config::{ClientConfig, Transport};
 use crate::inbound_stats::InboundStats;
+#[cfg(feature = "metrics")]
+use crate::metrics_server::BotMetrics;
 use crate::token;
 use crate::websocket_client::WebSocketClient;
 use crate::webtransport_client::WebTransportClient;
 
+/// Hook installed by the netsim shim. When present, inbound readers hand
+/// each raw payload to the hook instead of calling `InboundStats::record_packet`
+/// directly — the hook typically posts the payload to a `NetSimInbound` task
+/// that applies the downlink profile and then records it after the delay.
+///
+/// Left `None` for passthrough bots so the hot path is a direct method call.
+pub type InboundHook = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+
+/// Coarse media-type label for an outbound [`OutboundFrame`].
+///
+/// Producers already know the packet type at construction time — tagging the
+/// frame here lets the outbound shim + metrics-counting tasks pick a
+/// Prometheus label without re-parsing the protobuf on the hot path. The
+/// variant set is intentionally small and stable so the `media_type` label
+/// cardinality on `bot_packets_sent_total` stays bounded.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MediaTypeLabel {
+    Audio,
+    Video,
+    Health,
+    Heartbeat,
+    Diagnostics,
+    Other,
+}
+
+impl MediaTypeLabel {
+    /// Stable string label used as the `media_type` Prometheus label value.
+    /// Kept here (not in metrics_server) so non-metrics builds still get the
+    /// same strings for debug logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaTypeLabel::Audio => "audio",
+            MediaTypeLabel::Video => "video",
+            MediaTypeLabel::Health => "health",
+            MediaTypeLabel::Heartbeat => "heartbeat",
+            MediaTypeLabel::Diagnostics => "diagnostics",
+            MediaTypeLabel::Other => "other",
+        }
+    }
+}
+
+/// A payload produced by an audio/video/health/heartbeat producer, tagged
+/// with its coarse media type so downstream consumers (outbound shim,
+/// metrics-counting shim) can label Prometheus counters without re-parsing
+/// the serialized protobuf.
+///
+/// The `bytes` field is the already-serialized `PacketWrapper` — consumers
+/// forward it verbatim to the transport sender.
+#[derive(Debug)]
+pub struct OutboundFrame {
+    pub kind: MediaTypeLabel,
+    pub bytes: Vec<u8>,
+}
+
+impl OutboundFrame {
+    pub fn new(kind: MediaTypeLabel, bytes: Vec<u8>) -> Self {
+        Self { kind, bytes }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum TransportClient {
     WebSocket(WebSocketClient),
     WebTransport(WebTransportClient),
 }
 
 impl TransportClient {
-    pub fn new(transport: &Transport, config: ClientConfig) -> Self {
+    pub fn new(
+        transport: &Transport,
+        config: ClientConfig,
+        #[cfg(feature = "metrics")] metrics: Option<std::sync::Arc<BotMetrics>>,
+    ) -> Self {
         match transport {
-            Transport::WebSocket => TransportClient::WebSocket(WebSocketClient::new(config)),
+            Transport::WebSocket => TransportClient::WebSocket(WebSocketClient::new(
+                config,
+                #[cfg(feature = "metrics")]
+                metrics,
+            )),
             Transport::WebTransport => {
                 TransportClient::WebTransport(WebTransportClient::new(config))
             }
@@ -59,7 +156,11 @@ impl TransportClient {
             let token = token::mint_token(secret, user_id, meeting_id, token_ttl_secs)?;
             format!("{base}/lobby?token={token}")
         } else {
-            format!("{base}/lobby/{user_id}/{meeting_id}")
+            // Percent-encode user_id and meeting_id so that special characters
+            // (/, ?, #, unicode) don't break the URL path structure.
+            let encoded_user = utf8_percent_encode(user_id, PATH_SEGMENT_ENCODE_SET);
+            let encoded_meeting = utf8_percent_encode(meeting_id, PATH_SEGMENT_ENCODE_SET);
+            format!("{base}/lobby/{encoded_user}/{encoded_meeting}")
         };
 
         // For WebSocket, convert https:// to wss:// and http:// to ws://
@@ -79,16 +180,18 @@ impl TransportClient {
         insecure: bool,
         stats: Arc<Mutex<InboundStats>>,
         is_speaking: Arc<AtomicBool>,
+        inbound_hook: Option<InboundHook>,
     ) -> anyhow::Result<()> {
         match self {
             TransportClient::WebSocket(c) => {
                 if insecure {
                     info!("Note: --insecure flag has no effect on WebSocket (TLS handled by tokio-tungstenite with system roots)");
                 }
-                c.connect(lobby_url, stats).await
+                c.connect(lobby_url, stats, inbound_hook).await
             }
             TransportClient::WebTransport(c) => {
-                c.connect(lobby_url, insecure, stats, is_speaking).await
+                c.connect(lobby_url, insecure, stats, is_speaking, inbound_hook)
+                    .await
             }
         }
     }
@@ -105,5 +208,117 @@ impl TransportClient {
             TransportClient::WebSocket(c) => c.stop().await,
             TransportClient::WebTransport(c) => c.stop(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportClient;
+    use crate::config::Transport;
+    use url::Url;
+
+    #[test]
+    fn build_lobby_url_uses_ws_scheme_and_trims_trailing_slash() {
+        let server_url = Url::parse("https://relay.example.com/").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebSocket,
+            &server_url,
+            None,
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "wss://relay.example.com/lobby/bot-1/meeting-1"
+        );
+    }
+
+    #[test]
+    fn build_lobby_url_preserves_webtransport_scheme_and_port() {
+        let server_url = Url::parse("https://relay.example.com:4443/base").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebTransport,
+            &server_url,
+            None,
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://relay.example.com:4443/base/lobby/bot-1/meeting-1"
+        );
+    }
+
+    #[test]
+    fn build_lobby_url_mints_token_for_authenticated_path() {
+        let server_url = Url::parse("https://relay.example.com").unwrap();
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebSocket,
+            &server_url,
+            Some("secret"),
+            "bot-1",
+            "meeting-1",
+            60,
+        )
+        .unwrap();
+
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.path(), "/lobby");
+        assert!(url.query().unwrap_or_default().starts_with("token="));
+    }
+
+    #[test]
+    fn build_lobby_url_encodes_special_characters_in_path() {
+        let server_url = Url::parse("https://relay.example.com/").unwrap();
+
+        // meeting_id with characters that would break URL parsing
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebSocket,
+            &server_url,
+            None,
+            "user/admin",
+            "room?id=1#top",
+            60,
+        )
+        .unwrap();
+
+        // Verify the URL is valid and special chars are encoded
+        assert_eq!(url.scheme(), "wss");
+        assert!(
+            !url.path().contains('?'),
+            "path must not contain raw '?' — got: {}",
+            url.path()
+        );
+        assert!(
+            !url.path().contains('#'),
+            "path must not contain raw '#' — got: {}",
+            url.path()
+        );
+        // The path should have exactly 4 segments: "", "lobby", encoded_user, encoded_meeting
+        let segments: Vec<_> = url.path().split('/').collect();
+        assert_eq!(segments.len(), 4, "expected /lobby/<user>/<meeting>");
+        assert_eq!(segments[1], "lobby");
+
+        // Unicode meeting_id
+        let url = TransportClient::build_lobby_url(
+            &Transport::WebTransport,
+            &server_url,
+            None,
+            "bot-1",
+            "salle-réunion",
+            60,
+        )
+        .unwrap();
+        assert!(
+            url.as_str().contains("salle-r%C3%A9union"),
+            "unicode should be percent-encoded — got: {}",
+            url.as_str()
+        );
     }
 }

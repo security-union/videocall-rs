@@ -17,8 +17,16 @@
  */
 
 use crate::connection::ConnectionController;
+use crate::connection::{connection_handshake_failures, connection_session_drops};
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
+use crate::encode::{
+    camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
+    camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
+    camera_encoder_frames_submitted_ok, screen_encoder_errors_closed_codec,
+    screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
+    screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
+};
 use log::{debug, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
@@ -26,8 +34,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
+    decode_budget::OverrideMode as PbOverrideMode, DecodeBudget as PbDecodeBudget,
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
     NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
     PeerStats as PbPeerStats, TierDwell as PbTierDwell, TierTransition as PbTierTransition,
@@ -122,6 +132,28 @@ pub struct ClimbLimiterSnapshot {
     pub step_up_blocked_screen_share: u64,
 }
 
+/// Snapshot of the adaptive decode-budget controller's current decision (#987).
+///
+/// Captured from the `decode_budget` diagnostics subsystem (published by the
+/// Dioxus control loop) and folded into each HEALTH packet so population-scale
+/// dashboards can observe the receiver-side tile-cap decision that today only
+/// exists in client console logs. Mirrors how the AdaptiveQuality tier atomics
+/// ride the health packet.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeBudgetSnapshot {
+    /// Current effective cap on simultaneously decoded video tiles.
+    pub effective_cap: u32,
+    /// Natural/unconstrained tile count the layout would show (∩ CANVAS_LIMIT).
+    pub natural: u32,
+    /// Whether the pressured latch is engaged (the loop owns the cap).
+    pub pressured: bool,
+    /// Override mode, as the proto `OverrideMode` enum integer value
+    /// (1 = Auto, 2 = Fixed; 0 = unset/Auto).
+    pub override_mode: u32,
+    /// User's hard tile cap; meaningful only when `override_mode` is Fixed.
+    pub override_fixed_n: u32,
+}
+
 /// Shared buffer of tier transition records from camera and screen encoders.
 type TierTransitionBuffers = Rc<RefCell<Vec<Rc<RefCell<Vec<TierTransitionRecord>>>>>>;
 
@@ -156,8 +188,8 @@ pub struct HealthReporter {
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
     encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder worst peer FPS (f32 bits in AtomicU32).
-    encoder_worst_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Encoder p75 peer FPS (f32 bits in AtomicU32).
+    encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder bitrate_ratio (f32 bits in AtomicU32).
     encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
@@ -167,7 +199,7 @@ pub struct HealthReporter {
     /// Screen sharing active flag.
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
-    encoder_output_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
     /// Climb-rate limiter snapshot, updated by the encoder each tick.
@@ -178,6 +210,162 @@ pub struct HealthReporter {
     /// Dwell time samples buffer, drained each health packet.
     /// Double-wrapped for the same late-binding reason as `climb_limiter_snapshot`.
     dwell_samples: SharedDwellSamples,
+    /// Shutdown flag set by [`shutdown()`](Self::shutdown). The
+    /// `start_health_reporting` future captures a `Weak<AtomicBool>` clone of
+    /// this and exits as soon as the flag is observed `true`. Required because
+    /// that future also clones the send-packet callback (an `Rc` strong
+    /// reference back into the `VideoCallClient`), creating a cycle that
+    /// otherwise prevents `Inner` from dropping after a meeting page unmount.
+    /// Without this flag the leaked `VideoCallClient` would keep running until
+    /// the server eventually tore down its WebTransport session — the bug
+    /// reproduced in the cc7tp meeting incident on 2026-05-01.
+    shutdown: Rc<AtomicBool>,
+    /// TELEM-8: Accumulated long-task durations (ms) since last health packet.
+    longtask_buffer: Rc<RefCell<Vec<f64>>>,
+    /// TELEM-9: Latest render FPS reading from the rAF cadence observer.
+    render_fps: Rc<RefCell<Option<f64>>>,
+    /// #987: Latest adaptive decode-budget snapshot from the `decode_budget`
+    /// diagnostics subsystem. `None` until the controller publishes its first
+    /// decision (no peers / pre-warmup), in which case the field is omitted.
+    decode_budget: Rc<RefCell<Option<DecodeBudgetSnapshot>>>,
+}
+
+/// Static client metadata read from JS globals (TELEM-7).
+#[derive(Debug, Clone, Default)]
+pub struct ClientMetadata {
+    pub cores: u32,
+    pub architecture: String,
+    pub gpu_family: String,
+    pub network_effective_type: String,
+    pub network_downlink: f64,
+    pub network_rtt: u32,
+    pub battery_charging: Option<bool>,
+    pub battery_level: Option<f64>,
+    pub capability_score: u32,
+}
+
+/// Normalize a raw GPU renderer string to a short family name.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn normalize_gpu_family(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.contains("Apple") {
+        return "Apple GPU".to_string();
+    }
+    if raw.contains("NVIDIA") || raw.contains("GeForce") {
+        if let Some(pos) = raw.find("GeForce") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+        if let Some(pos) = raw.find("NVIDIA") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+    }
+    if raw.contains("AMD") || raw.contains("Radeon") {
+        if let Some(pos) = raw.find("Radeon") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(24).collect();
+            return family.trim().to_string();
+        }
+        return "AMD GPU".to_string();
+    }
+    if raw.contains("Intel") {
+        if let Some(pos) = raw.find("Intel") {
+            let sub = &raw[pos..];
+            let family: String = sub.chars().take(32).collect();
+            return family.trim().to_string();
+        }
+    }
+    raw.chars().take(32).collect::<String>().trim().to_string()
+}
+
+/// Read client metadata from `window.__videocall_client_metadata` and
+/// `navigator.hardwareConcurrency`.
+#[cfg(target_arch = "wasm32")]
+fn read_client_metadata() -> ClientMetadata {
+    use js_sys::Reflect;
+    use wasm_bindgen::JsValue;
+
+    let mut meta = ClientMetadata::default();
+
+    let Some(window) = web_sys::window() else {
+        return meta;
+    };
+
+    // Cores from navigator
+    meta.cores = {
+        let cores_f64 = window.navigator().hardware_concurrency();
+        if cores_f64.is_finite() && cores_f64 >= 1.0 {
+            cores_f64.min(u32::MAX as f64) as u32
+        } else {
+            0
+        }
+    };
+
+    // Capability score from window.__videocall_capability_score
+    if let Ok(score_val) = Reflect::get(&window, &JsValue::from_str("__videocall_capability_score"))
+    {
+        if let Some(score) = score_val.as_f64() {
+            if score.is_finite() && score > 0.0 {
+                meta.capability_score = score.min(u32::MAX as f64) as u32;
+            }
+        }
+    }
+
+    // Read __videocall_client_metadata object
+    let Ok(obj) = Reflect::get(&window, &JsValue::from_str("__videocall_client_metadata")) else {
+        return meta;
+    };
+    if obj.is_undefined() || obj.is_null() {
+        return meta;
+    }
+
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("architecture")) {
+        if let Some(s) = v.as_string() {
+            meta.architecture = s;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("gpu")) {
+        if let Some(s) = v.as_string() {
+            meta.gpu_family = normalize_gpu_family(&s);
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_effective_type")) {
+        if let Some(s) = v.as_string() {
+            meta.network_effective_type = s;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_downlink")) {
+        if let Some(f) = v.as_f64() {
+            meta.network_downlink = f;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("network_rtt")) {
+        if let Some(f) = v.as_f64() {
+            meta.network_rtt = f as u32;
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("battery_charging")) {
+        if let Some(b) = v.as_bool() {
+            meta.battery_charging = Some(b);
+        }
+    }
+    if let Ok(v) = Reflect::get(&obj, &JsValue::from_str("battery_level")) {
+        if let Some(f) = v.as_f64() {
+            meta.battery_level = Some(f);
+        }
+    }
+
+    meta
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_client_metadata() -> ClientMetadata {
+    ClientMetadata::default()
 }
 
 impl HealthReporter {
@@ -200,19 +388,38 @@ impl HealthReporter {
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
-            encoder_worst_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
                 f32::NAN.to_bits(),
             )))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
-            encoder_output_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
                 ClimbLimiterSnapshot::default(),
             )))),
             dwell_samples: Rc::new(RefCell::new(Rc::new(RefCell::new(Vec::new())))),
+            shutdown: Rc::new(AtomicBool::new(false)),
+            longtask_buffer: Rc::new(RefCell::new(Vec::new())),
+            render_fps: Rc::new(RefCell::new(None)),
+            decode_budget: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Signal the health-reporting future to exit on its next tick. Sets the
+    /// shutdown flag and clears the send-packet callback so that future ticks
+    /// after this call cannot publish further packets even if a tick races
+    /// the flag. Called from [`VideoCallClient::disconnect()`](
+    /// crate::VideoCallClient::disconnect).
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.send_packet_callback = None;
+        // Drop the strong reference to the connection controller so we don't
+        // keep it alive past the explicit disconnect.
+        if let Ok(mut cc) = self.connection_controller.try_borrow_mut() {
+            *cc = None;
         }
     }
 
@@ -273,25 +480,37 @@ impl HealthReporter {
         *self.adaptive_audio_tier.borrow_mut() = audio_tier;
     }
 
+    /// Returns a clone of the video tier index atomic for external reads.
+    ///
+    /// Used by `VideoCallClient::camera_tier_index()` to expose the current
+    /// camera quality tier for adaptive screen-share tier selection.
+    pub fn video_tier_index(&self) -> Option<Rc<AtomicU32>> {
+        if let Ok(tier) = self.adaptive_video_tier.try_borrow() {
+            Some(tier.clone())
+        } else {
+            None
+        }
+    }
+
     /// Bind the encoder metric atomics from CameraEncoder and ScreenEncoder so the
     /// health reporter can include encoder decision inputs in each health packet.
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
         fps_ratio: Rc<AtomicU32>,
-        worst_peer_fps: Rc<AtomicU32>,
+        p75_peer_fps: Rc<AtomicU32>,
         bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
-        output_fps: Rc<AtomicU32>,
+        output_fps: Arc<AtomicU32>,
         camera_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
     ) {
         *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
-        *self.encoder_worst_peer_fps.borrow_mut() = worst_peer_fps;
+        *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
         *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
@@ -310,6 +529,9 @@ impl HealthReporter {
         let active_server_url = Rc::downgrade(&self.active_server_url);
         let active_server_type = Rc::downgrade(&self.active_server_type);
         let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
+        let longtask_buffer = Rc::downgrade(&self.longtask_buffer);
+        let render_fps_state = Rc::downgrade(&self.render_fps);
+        let decode_budget_state = Rc::downgrade(&self.decode_budget);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -365,6 +587,62 @@ impl HealthReporter {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+                    // TELEM-8/9: capture client_perf subsystem events
+                    if event.subsystem == "client_perf" {
+                        for m in &event.metrics {
+                            match m.name {
+                                "client_longtask_duration_ms" => {
+                                    if let MetricValue::F64(duration) = &m.value {
+                                        if let Some(buf) = Weak::upgrade(&longtask_buffer) {
+                                            if let Ok(mut v) = buf.try_borrow_mut() {
+                                                v.push(*duration);
+                                            }
+                                        }
+                                    }
+                                }
+                                "client_render_fps" => {
+                                    if let MetricValue::F64(fps) = &m.value {
+                                        if let Some(fps_rc) = Weak::upgrade(&render_fps_state) {
+                                            if let Ok(mut f) = fps_rc.try_borrow_mut() {
+                                                *f = Some(*fps);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // #987: capture the adaptive decode-budget snapshot. The
+                    // Dioxus control loop publishes one event per decision change
+                    // (state-change driven, not per render), so we simply overwrite
+                    // the latest snapshot here and read it at packet-assembly time.
+                    if event.subsystem == "decode_budget" {
+                        if let Some(db_rc) = Weak::upgrade(&decode_budget_state) {
+                            let mut snap = DecodeBudgetSnapshot::default();
+                            for m in &event.metrics {
+                                if let MetricValue::U64(v) = &m.value {
+                                    match m.name {
+                                        "decode_budget_effective_cap" => {
+                                            snap.effective_cap = *v as u32
+                                        }
+                                        "decode_budget_natural" => snap.natural = *v as u32,
+                                        "decode_budget_pressured" => snap.pressured = *v != 0,
+                                        "decode_budget_override_mode" => {
+                                            snap.override_mode = *v as u32
+                                        }
+                                        "decode_budget_override_fixed_n" => {
+                                            snap.override_fixed_n = *v as u32
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Ok(mut cell) = db_rc.try_borrow_mut() {
+                                *cell = Some(snap);
                             }
                         }
                     }
@@ -550,6 +828,21 @@ impl HealthReporter {
                             }
                             _ => {}
                         },
+                        // Freeze observability (#1013): windowed per-stream
+                        // packet-loss rate and keyframe-request rate, emitted by
+                        // the decoder. Stored in the camera/screen video_stats
+                        // bucket (split by is_screen) so they fold into the
+                        // per-peer health packet and the video quality score.
+                        "video_seq_loss_per_sec" => {
+                            if let MetricValue::F64(loss) = &metric.value {
+                                video_stats["video_seq_loss_per_sec"] = json!(loss);
+                            }
+                        }
+                        "keyframe_requests_per_sec" => {
+                            if let MetricValue::F64(kf) = &metric.value {
+                                video_stats["keyframe_requests_per_sec"] = json!(kf);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -579,6 +872,12 @@ impl HealthReporter {
         let display_name = self.display_name.clone();
         let send_callback = self.send_packet_callback.clone().unwrap();
         let interval_ms = self.health_interval_ms;
+        // Weak ref to the shutdown flag. We never need the strong reference
+        // here — `Rc::downgrade` keeps the future from holding the
+        // `Rc<AtomicBool>` past the HealthReporter's own lifetime, but the
+        // flag itself can also be observed `true` directly via `shutdown()`
+        // for prompt teardown without waiting for a tick.
+        let shutdown = Rc::downgrade(&self.shutdown);
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
         let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
         let active_server_url = Rc::downgrade(&self.active_server_url);
@@ -588,7 +887,7 @@ impl HealthReporter {
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
         let encoder_fps_ratio = self.encoder_fps_ratio.clone();
-        let encoder_worst_peer_fps = self.encoder_worst_peer_fps.clone();
+        let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
         let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
@@ -597,6 +896,9 @@ impl HealthReporter {
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
+        let longtask_buffer = self.longtask_buffer.clone();
+        let render_fps_cell = self.render_fps.clone();
+        let decode_budget_cell = self.decode_budget.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -604,6 +906,23 @@ impl HealthReporter {
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
+
+                // Honour an explicit shutdown signal (e.g. UI unmount) without
+                // waiting for the HealthReporter's `Rc` count to fall to zero.
+                // `send_callback` is an `Rc` strong reference back into
+                // `VideoCallClient`, so without this exit the reporter loop
+                // would keep the entire client alive until the server tore the
+                // session down on its own — the leak observed in cc7tp.
+                if let Some(flag) = Weak::upgrade(&shutdown) {
+                    if flag.load(Ordering::Acquire) {
+                        debug!("HealthReporter shutdown signalled, stopping health reporting");
+                        break;
+                    }
+                } else {
+                    // The HealthReporter (and its shutdown flag) have been
+                    // dropped already — nothing to report against.
+                    break;
+                }
 
                 // Upgrade session_id Weak ref; if the HealthReporter was dropped, stop.
                 let session_id_val = match Weak::upgrade(&session_id) {
@@ -653,8 +972,8 @@ impl HealthReporter {
                         let fps_ratio_val =
                             f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
                                 as f64;
-                        let worst_peer_fps_val =
-                            f32::from_bits(encoder_worst_peer_fps.borrow().load(Ordering::Relaxed))
+                        let p75_peer_fps_val =
+                            f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
                                 as f64;
                         let bitrate_ratio_val =
                             f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
@@ -696,6 +1015,24 @@ impl HealthReporter {
                             })
                             .unwrap_or_default();
 
+                        // TELEM-8: drain accumulated long-task durations
+                        let drained_longtasks: Vec<f64> = longtask_buffer
+                            .try_borrow_mut()
+                            .ok()
+                            .map(|mut v| std::mem::take(&mut *v))
+                            .unwrap_or_default();
+
+                        // TELEM-9: read latest render FPS
+                        let current_render_fps = render_fps_cell.try_borrow().ok().and_then(|v| *v);
+
+                        // #987: read latest decode-budget snapshot (None until the
+                        // controller has published its first decision).
+                        let decode_budget_snapshot =
+                            decode_budget_cell.try_borrow().ok().and_then(|v| *v);
+
+                        // TELEM-7: read client metadata from JS globals
+                        let client_meta = read_client_metadata();
+
                         let health_packet = Self::create_health_packet(
                             &session_id_val,
                             &meeting_id,
@@ -716,7 +1053,7 @@ impl HealthReporter {
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
                             fps_ratio_val,
-                            worst_peer_fps_val,
+                            p75_peer_fps_val,
                             bitrate_ratio_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
@@ -725,6 +1062,12 @@ impl HealthReporter {
                             drained_transitions,
                             limiter_snap,
                             drained_dwells,
+                            connection_handshake_failures(),
+                            connection_session_drops(),
+                            drained_longtasks,
+                            current_render_fps,
+                            client_meta,
+                            decode_budget_snapshot,
                         );
 
                         if let Some(packet) = health_packet {
@@ -762,7 +1105,7 @@ impl HealthReporter {
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
         encoder_fps_ratio: f64,
-        encoder_worst_peer_fps: f64,
+        encoder_p75_peer_fps: f64,
         encoder_bitrate_ratio: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
@@ -771,6 +1114,12 @@ impl HealthReporter {
         tier_transitions: Vec<TierTransitionRecord>,
         climb_limiter: ClimbLimiterSnapshot,
         dwell_samples: Vec<(String, f64)>,
+        handshake_failures_total: u64,
+        session_drops_total: u64,
+        longtask_durations: Vec<f64>,
+        render_fps: Option<f64>,
+        client_metadata: ClientMetadata,
+        decode_budget: Option<DecodeBudgetSnapshot>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -791,10 +1140,20 @@ impl HealthReporter {
             pb.display_name = Some(display_name.to_string());
         }
 
-        // Include active connection info if available
-        if let Some(url) = active_server_url {
-            pb.active_server_url = url;
-        }
+        // Include active connection info if available.
+        //
+        // SECURITY: do NOT copy `active_server_url` into the protobuf. The lobby
+        // URL carries the user's room JWT (`?token=<JWT>&instance_id=<UUID>`),
+        // and HealthPacket is republished by the relay onto the NATS telemetry
+        // topic `health.diagnostics.{region}.{service_type}.{server_id}` — any
+        // health-pipeline consumer would receive the credential in cleartext.
+        // The `active_server_type` and `active_server_rtt_ms` fields below are
+        // sufficient for downstream observability; transport identity is
+        // additionally available via `active_connection_id` on the diagnostic
+        // bus (UI side). The proto field is left at its default empty string
+        // and is slated for deprecation in a follow-up PR.
+        // The `active_server_url` argument is intentionally swallowed here.
+        let _ = active_server_url;
         if let Some(typ) = active_server_type {
             pb.active_server_type = typ;
         }
@@ -818,8 +1177,8 @@ impl HealthReporter {
         if encoder_fps_ratio.is_finite() {
             pb.encoder_fps_ratio = Some(encoder_fps_ratio);
         }
-        if encoder_worst_peer_fps.is_finite() {
-            pb.encoder_worst_peer_fps = Some(encoder_worst_peer_fps);
+        if encoder_p75_peer_fps.is_finite() {
+            pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);
         pb.screen_sharing_active = Some(screen_sharing_active);
@@ -870,6 +1229,109 @@ impl HealthReporter {
             pb_d.tier = tier_label.clone();
             pb_d.dwell_ms = *dwell_ms;
             pb.tier_dwells.push(pb_d);
+        }
+
+        // Encoder error counters (cumulative, global statics — zero-cost to read).
+        // Only emit when non-zero to keep packet size small in the common (healthy) case.
+        let cam_closed = camera_encoder_errors_closed_codec();
+        let cam_vpx = camera_encoder_errors_vpx_mem_alloc();
+        let cam_configure = camera_encoder_errors_configure_fatal();
+        let cam_generic = camera_encoder_errors_generic();
+        let cam_frames = camera_encoder_frames_submitted_ok();
+        let scr_closed = screen_encoder_errors_closed_codec();
+        let scr_vpx = screen_encoder_errors_vpx_mem_alloc();
+        let scr_configure = screen_encoder_errors_configure_fatal();
+        let scr_generic = screen_encoder_errors_generic();
+        let scr_frames = screen_encoder_frames_submitted_ok();
+
+        if cam_closed > 0 {
+            pb.camera_encoder_errors_closed_codec = Some(cam_closed);
+        }
+        if cam_vpx > 0 {
+            pb.camera_encoder_errors_vpx_mem_alloc = Some(cam_vpx);
+        }
+        if cam_configure > 0 {
+            pb.camera_encoder_errors_configure_fatal = Some(cam_configure);
+        }
+        if cam_generic > 0 {
+            pb.camera_encoder_errors_generic = Some(cam_generic);
+        }
+        if cam_frames > 0 {
+            pb.camera_encoder_frames_submitted_ok = Some(cam_frames);
+        }
+        if scr_closed > 0 {
+            pb.screen_encoder_errors_closed_codec = Some(scr_closed);
+        }
+        if scr_vpx > 0 {
+            pb.screen_encoder_errors_vpx_mem_alloc = Some(scr_vpx);
+        }
+        if scr_configure > 0 {
+            pb.screen_encoder_errors_configure_fatal = Some(scr_configure);
+        }
+        if scr_generic > 0 {
+            pb.screen_encoder_errors_generic = Some(scr_generic);
+        }
+        if scr_frames > 0 {
+            pb.screen_encoder_frames_submitted_ok = Some(scr_frames);
+        }
+
+        // Connection-loss reason counters
+        if handshake_failures_total > 0 {
+            pb.connection_handshake_failures_total = Some(handshake_failures_total);
+        }
+        if session_drops_total > 0 {
+            pb.connection_session_drops_total = Some(session_drops_total);
+        }
+
+        // TELEM-7: Static client metadata
+        if client_metadata.cores > 0 {
+            pb.client_cores = Some(client_metadata.cores);
+        }
+        if !client_metadata.architecture.is_empty() {
+            pb.client_architecture = Some(client_metadata.architecture.clone());
+        }
+        if !client_metadata.gpu_family.is_empty() {
+            pb.client_gpu_family = Some(client_metadata.gpu_family.clone());
+        }
+        if !client_metadata.network_effective_type.is_empty() {
+            pb.client_network_effective_type = Some(client_metadata.network_effective_type.clone());
+        }
+        if client_metadata.network_downlink > 0.0 {
+            pb.client_network_downlink = Some(client_metadata.network_downlink);
+        }
+        if client_metadata.network_rtt > 0 {
+            pb.client_network_rtt = Some(client_metadata.network_rtt);
+        }
+        pb.client_battery_charging = client_metadata.battery_charging;
+        pb.client_battery_level = client_metadata.battery_level;
+        if client_metadata.capability_score > 0 {
+            pb.client_capability_score = Some(client_metadata.capability_score);
+        }
+
+        // TELEM-8: Long task durations since last packet
+        pb.longtask_durations_ms = longtask_durations;
+
+        // TELEM-9: Render FPS
+        pb.render_fps = render_fps;
+
+        // #987: Adaptive decode-budget controller snapshot. Only present once the
+        // controller has published a decision (so a no-peer / pre-warmup packet
+        // omits it). Mirrors how the AdaptiveQuality tier fields ride the packet.
+        if let Some(db) = decode_budget {
+            let mut pb_db = PbDecodeBudget::new();
+            pb_db.effective_cap = db.effective_cap;
+            pb_db.natural = db.natural;
+            pb_db.pressured = db.pressured;
+            // Map the integer override mode (1 = Auto, 2 = Fixed; 0/other = Auto)
+            // to the proto enum. `override_fixed_n` is only meaningful for Fixed.
+            pb_db.override_mode = ::protobuf::EnumOrUnknown::new(match db.override_mode {
+                2 => PbOverrideMode::OVERRIDE_MODE_FIXED,
+                _ => PbOverrideMode::OVERRIDE_MODE_AUTO,
+            });
+            if db.override_mode == 2 {
+                pb_db.override_fixed_n = db.override_fixed_n;
+            }
+            pb.decode_budget = ::protobuf::MessageField::some(pb_db);
         }
 
         // Tab visibility and throttling
@@ -1050,6 +1512,20 @@ impl HealthReporter {
                 {
                     ps.frames_dropped_per_sec = error_rate;
                 }
+
+                // Freeze observability (#1013): windowed per-stream loss /
+                // keyframe-request rates (camera only this pass). These feed the
+                // video quality score so a frozen-but-still-decoding stream
+                // (fps reads ~30, video visually stuck) no longer scores 100.
+                if let Some(loss) = video.get("video_seq_loss_per_sec").and_then(|v| v.as_f64()) {
+                    ps.video_seq_loss_per_sec = Some(loss);
+                }
+                if let Some(kf) = video
+                    .get("keyframe_requests_per_sec")
+                    .and_then(|v| v.as_f64())
+                {
+                    ps.keyframe_requests_per_sec = Some(kf);
+                }
             }
 
             // Screen share video mapping (new field, separate from camera)
@@ -1108,29 +1584,27 @@ impl HealthReporter {
             }
 
             // Video quality (0-100): only meaningful when frames are actively arriving.
-            // fps > 0.0 already proves video is flowing; video_enabled (sender self-report
-            // from peer_status events) is not required here and would suppress scores
-            // if peer_status hasn't arrived yet.
+            // fps > 0.0 already proves decode CALLS are flowing; video_enabled (sender
+            // self-report from peer_status events) is not required here and would suppress
+            // scores if peer_status hasn't arrived yet.
+            //
+            // Freeze observability (#1013): during a freeze, fps_received still reads ~30
+            // because decode calls keep firing fire-and-forget, yet the picture is visually
+            // frozen because packets are lost and the stream is stuck requesting keyframes.
+            // We fold the windowed loss rate and keyframe-request rate into the score so it
+            // drops well below 100 in that state.
             let fps = ps
                 .video_stats
                 .as_ref()
                 .map(|v| v.fps_received)
                 .unwrap_or(0.0);
             if video_fresh && fps > 0.0 {
-                let dropped = ps.frames_dropped_per_sec;
-
-                // Video health: measures whether video is present and stable, not
-                // hardware FPS capability. A 15fps camera in low light is not a
-                // "problem" — it is the camera doing auto-exposure correctly.
-                //
-                // fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
-                // fps 1–4   → 0–50 (near-frozen; something is likely wrong)
-                // fps == 0  → handled by outer guard; score is absent (None)
-                let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
-                // Decode error penalty: 0/s→0, 10+/s→−50
-                let drop_penalty = (dropped / 10.0).min(1.0) * 50.0;
-                let score = (video_health - drop_penalty).clamp(0.0, 100.0);
-                ps.video_quality_score = Some(score);
+                ps.video_quality_score = video_quality_score(
+                    fps,
+                    ps.frames_dropped_per_sec,
+                    ps.video_seq_loss_per_sec.unwrap_or(0.0),
+                    ps.keyframe_requests_per_sec.unwrap_or(0.0),
+                );
             }
 
             // Call quality: worst of whichever streams are active
@@ -1183,5 +1657,342 @@ impl HealthReporter {
         } else {
             None
         }
+    }
+}
+
+/// Compute the per-peer video quality score (0–100), or `None` when no frames
+/// are flowing.
+///
+/// Freeze observability (#1013): a broadcast-relay stream can read fps ≈ 30
+/// while being visually frozen — decode CALLS keep firing fire-and-forget even
+/// as packets are lost and the stream is stuck requesting keyframes. fps alone
+/// therefore cannot detect a freeze. We add two penalties on top of the
+/// fps/decode-error health so a sustained loss or keyframe storm forces the
+/// score well below 100:
+///
+/// * `loss_per_sec` — windowed packet-loss rate from `SequenceTracker`.
+///   `5 lost/s → −30`. Mirrors the audio `loss_penalty` shape.
+/// * `kf_per_sec`   — windowed keyframe-request (PLI) rate. A stream that is
+///   continuously asking for keyframes is, by definition, not decoding cleanly,
+///   so even a *sustained* ≥1 PLI/s is a strong freeze signal: `1 PLI/s → −40`.
+///
+/// The caller applies the outer `video_fresh && fps > 0.0` guard, so a true
+/// freeze with zero fps yields `None` (Grafana renders a gap) rather than a
+/// misleading 0 — `None` is the correct "no signal" state.
+///
+/// Returns `None` only when `fps <= 0.0` (defensive; the caller already
+/// guards this), otherwise `Some(score)` clamped to `0..=100`.
+fn video_quality_score(
+    fps: f64,
+    dropped_per_sec: f64,
+    loss_per_sec: f64,
+    kf_per_sec: f64,
+) -> Option<f64> {
+    if fps <= 0.0 {
+        return None;
+    }
+
+    // Video health: measures whether video is present and stable, not hardware
+    // FPS capability. A 15fps camera in low light is not a "problem" — it is the
+    // camera doing auto-exposure correctly.
+    //   fps >= 5  → 100  (video is working; FPS is hardware context, not quality)
+    //   fps 1–4   → 0–50 (near-frozen; something is likely wrong)
+    let video_health = if fps >= 5.0 { 100.0 } else { fps / 5.0 * 50.0 };
+
+    // Decode error penalty: 0/s→0, 10+/s→−50.
+    let drop_penalty = (dropped_per_sec / 10.0).min(1.0) * 50.0;
+    // Packet-loss penalty: 0/s→0, 5+/s→−30 (mirrors the audio loss penalty).
+    let loss_penalty = (loss_per_sec / 5.0).min(1.0) * 30.0;
+    // Keyframe-storm penalty: a sustained ≥1 PLI/s means the decoder cannot make
+    // forward progress → −40.
+    let kf_penalty = (kf_per_sec / 1.0).min(1.0) * 40.0;
+
+    let score = (video_health - drop_penalty - loss_penalty - kf_penalty).clamp(0.0, 100.0);
+    Some(score)
+}
+
+// ===================================================================
+// Security: HealthPacket credential-leak guard
+// ===================================================================
+//
+// These tests guard the JWT-leak fix on branch
+// `fix/security-redact-jwt-active-server-url`. A regression here means the
+// user's room JWT escapes the client over the NATS health pipeline.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protobuf::Message;
+    use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
+
+    // ── Freeze observability (#1013): video_quality_score ────────────────
+
+    /// Healthy stream: fps≥5, no loss, no keyframe storm → score 100.
+    #[test]
+    fn video_quality_score_healthy_is_100() {
+        assert_eq!(video_quality_score(30.0, 0.0, 0.0, 0.0), Some(100.0));
+    }
+
+    /// fps == 0 yields None (absent), not 0 — a freeze with zero fps must show
+    /// a Grafana gap, not a misleading zero.
+    #[test]
+    fn video_quality_score_zero_fps_is_none() {
+        assert_eq!(video_quality_score(0.0, 0.0, 0.0, 0.0), None);
+    }
+
+    /// The core #1013 case: fps reads a healthy ~30 (decode calls still firing)
+    /// but the stream is under sustained packet loss AND a keyframe storm. The
+    /// score MUST drop well below 100 (it used to read 100 here — the bug).
+    #[test]
+    fn video_quality_score_drops_during_freeze_with_loss_and_keyframe_storm() {
+        // 30 fps, no decode errors, 5 lost/s (-30), 1 PLI/s (-40) => 100-30-40=30.
+        let score = video_quality_score(30.0, 0.0, 5.0, 1.0).expect("fps>0 => Some");
+        assert!(
+            score < 80.0,
+            "freeze (loss + keyframe storm) should score well below 80, got {score}"
+        );
+        assert!((score - 30.0).abs() < 1e-9, "expected 30.0, got {score}");
+    }
+
+    /// Loss alone (no keyframe storm) still pulls the score down.
+    #[test]
+    fn video_quality_score_loss_only_penalty() {
+        // 30 fps, 5 lost/s (-30) => 70.
+        let score = video_quality_score(30.0, 0.0, 5.0, 0.0).expect("fps>0 => Some");
+        assert!((score - 70.0).abs() < 1e-9, "expected 70.0, got {score}");
+    }
+
+    /// A sustained keyframe-request rate alone is a strong freeze signal.
+    #[test]
+    fn video_quality_score_keyframe_storm_only_penalty() {
+        // 30 fps, 1 PLI/s (-40) => 60.
+        let score = video_quality_score(30.0, 0.0, 0.0, 1.0).expect("fps>0 => Some");
+        assert!((score - 60.0).abs() < 1e-9, "expected 60.0, got {score}");
+    }
+
+    /// Penalties saturate and the score clamps at 0, never negative.
+    #[test]
+    fn video_quality_score_clamps_at_zero() {
+        let score = video_quality_score(30.0, 100.0, 100.0, 100.0).expect("fps>0 => Some");
+        assert_eq!(score, 0.0);
+    }
+
+    /// Construct a `HealthPacket` via the production `create_health_packet`
+    /// path, passing a `Some(...)` URL containing a JWT, and assert that the
+    /// resulting protobuf has an empty `active_server_url` field.
+    ///
+    /// This test fails if anyone reintroduces `pb.active_server_url = url;` —
+    /// preventing accidental regression of the credential leak.
+    #[test]
+    fn health_packet_does_not_carry_active_server_url() {
+        // Seed `health_map` with at least one entry so `create_health_packet`
+        // does not early-return `None`.
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let dirty_url = "https://webtransport.example.com:4433/lobby?token=eyJhbGciOiJIUzI1NiJ9.payload.sig&instance_id=11111111-2222-3333-4444-555555555555".to_string();
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            Some(dirty_url.clone()), // active_server_url — must be ignored
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        // Round-trip the wrapper through the protobuf so we are asserting on
+        // exactly what goes on the wire, not an in-memory builder field.
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+
+        assert!(
+            pb.active_server_url.is_empty(),
+            "HealthPacket.active_server_url must be empty (no JWT leak); got {:?}",
+            pb.active_server_url
+        );
+        assert!(
+            !pb.active_server_url.contains("eyJ"),
+            "HealthPacket.active_server_url must not contain JWT-prefix `eyJ`"
+        );
+        assert!(
+            !pb.active_server_url.contains("token="),
+            "HealthPacket.active_server_url must not contain `token=`"
+        );
+
+        // Sanity: `active_server_type` and `active_server_rtt_ms` are still
+        // populated — the security fix must not break observability of
+        // transport identity and RTT.
+        assert_eq!(pb.active_server_type, "webtransport");
+        assert_eq!(pb.active_server_rtt_ms, 42.0);
+    }
+
+    /// Build a HealthPacket through the production `create_health_packet` path
+    /// with the given decode-budget snapshot, then round-trip it through the
+    /// protobuf so the assertions are on exactly what goes on the wire (#987).
+    fn health_packet_with_decode_budget(
+        decode_budget: Option<DecodeBudgetSnapshot>,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            decode_budget,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_pressured_auto() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 5,
+            natural: 12,
+            pressured: true,
+            override_mode: 1, // Auto
+            override_fixed_n: 0,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 5);
+        assert_eq!(db.natural, 12);
+        assert!(db.pressured);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_AUTO
+        );
+        // override_fixed_n is meaningless in Auto and left at its default.
+        assert_eq!(db.override_fixed_n, 0);
+    }
+
+    #[test]
+    fn decode_budget_snapshot_rides_health_packet_fixed_override() {
+        let pb = health_packet_with_decode_budget(Some(DecodeBudgetSnapshot {
+            effective_cap: 3,
+            natural: 12,
+            pressured: false,
+            override_mode: 2, // Fixed
+            override_fixed_n: 3,
+        }));
+
+        let db = pb
+            .decode_budget
+            .as_ref()
+            .expect("decode_budget must be set");
+        assert_eq!(db.effective_cap, 3);
+        assert_eq!(
+            db.override_mode.enum_value_or_default(),
+            PbOverrideMode::OVERRIDE_MODE_FIXED
+        );
+        assert_eq!(db.override_fixed_n, 3);
+    }
+
+    #[test]
+    fn decode_budget_absent_when_no_snapshot() {
+        // No snapshot (controller pre-warmup / no peers) → field omitted so a
+        // healthy no-peer packet stays minimal and backward-compatible.
+        let pb = health_packet_with_decode_budget(None);
+        assert!(pb.decode_budget.is_none());
+    }
+
+    #[test]
+    fn normalize_gpu_family_known_vendors() {
+        assert_eq!(normalize_gpu_family("Apple M1 Pro"), "Apple GPU");
+        assert_eq!(normalize_gpu_family("Apple GPU"), "Apple GPU");
+        assert_eq!(
+            normalize_gpu_family(
+                "ANGLE (Intel(R) Iris(R) Plus Graphics 645 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            ),
+            "Intel(R) Iris(R) Plus Graphics 6"
+        );
+        assert_eq!(
+            normalize_gpu_family("ANGLE (NVIDIA GeForce RTX 3060 Direct3D11)"),
+            "GeForce RTX 3060 Direct3"
+        );
+        assert_eq!(
+            normalize_gpu_family("AMD Radeon Pro 5500M"),
+            "Radeon Pro 5500M"
+        );
+        assert_eq!(normalize_gpu_family(""), "");
+    }
+
+    #[test]
+    fn normalize_gpu_family_unknown_truncates() {
+        let long = "SomeUnknownVendor With A Very Long Renderer String That Exceeds 32 Chars";
+        let result = normalize_gpu_family(long);
+        assert!(result.len() <= 32);
     }
 }

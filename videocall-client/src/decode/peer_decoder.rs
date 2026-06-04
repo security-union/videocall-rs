@@ -81,6 +81,45 @@ struct CanvasRenderer {
 pub struct VideoPeerDecoder {
     decoder: Box<dyn VideoFrameDecoder>,
     canvas_renderer: Rc<RefCell<Option<CanvasRenderer>>>,
+    /// Discriminator tag emitted on diagnostics events so consumers can tell
+    /// camera-video resolution events apart from screen-share ones. Mirrors
+    /// the `media_type` metric already carried by the FPS/bitrate events
+    /// (`"VIDEO"` or `"SCREEN"`).
+    media_type: &'static str,
+    /// Last `(source_width, source_height)` we saw on a `MediaPacket`'s
+    /// `VideoMetadata`. Used to dedupe `video_source_resolution` diag events
+    /// — those would otherwise fire on every decoded frame. `(0, 0)` means
+    /// either we've never seen the field or the publisher is older /
+    /// doesn't report it; in both cases we suppress the broadcast.
+    last_source_dims: RefCell<(u32, u32)>,
+    /// Issue #903: last `(encoder_target_bitrate_kbps, adaptive_tier,
+    /// cause_hint)` we saw on a `VideoMetadata`. Used to dedupe
+    /// `screen_encoder_state` diag events the same way `last_source_dims`
+    /// dedupes resolution events. Empty / zero tuple means either the
+    /// publisher hasn't stamped the fields yet or the field has never
+    /// changed since the last broadcast. The tuple is owned strings (not
+    /// `&'static str`) because the values flow from a protobuf message
+    /// the consumer can't reason about lifetime-wise.
+    last_encoder_state: RefCell<(u32, String, String)>,
+    /// Peer-id pair used to tag the source-resolution diag event. We can't
+    /// borrow it from the `CanvasRenderer` because that storage may be
+    /// `None` when the canvas hasn't been wired yet, but
+    /// `set_stream_context` *does* run before any decoded frames. Set there.
+    stream_context: RefCell<Option<(String, String)>>,
+    /// HCL issue 893: pending acknowledgement that the underlying
+    /// `WasmDecoder` has produced its first decoded frame and rendered it
+    /// to the canvas. The decoder pipeline is asynchronous — `decode()`
+    /// pushes a `FrameBuffer` into a worker and returns immediately, so
+    /// the synchronous return value cannot carry a "first frame decoded"
+    /// signal. Instead the `on_video_frame` callback (which runs on the
+    /// render thread when the decoder hands a real `VideoFrame` back) sets
+    /// this flag to `true` on its first invocation. The next `decode()`
+    /// call observes the flag, swaps it back to `false`, and returns
+    /// `first_frame: true` so `peer_decode_manager` can fire the
+    /// `PEER_EVENT(screen_decode_started)` ack to the publisher. Without
+    /// this signal the screen-share visibility toast on the publisher
+    /// would time out at 10s on every share, even on the happy path.
+    first_render_pending_ack: Rc<RefCell<bool>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -113,10 +152,60 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     }
 }
 
+/// Media-type discriminator passed to [`VideoPeerDecoder::new`]. Distinguishes
+/// camera video streams from screen-share streams in diagnostics events so the
+/// UI can chart them separately. The values match the existing `media_type`
+/// metric carried on FPS/bitrate events.
+pub const MEDIA_TYPE_CAMERA: &str = "VIDEO";
+pub const MEDIA_TYPE_SCREEN: &str = "SCREEN";
+
+/// Decide what `(from_peer, to_peer)` to stamp on a freshly-constructed
+/// [`CanvasRenderer`] inside [`VideoPeerDecoder::set_canvas`].
+///
+/// Two real-world orderings have to converge here:
+///
+/// 1. Canvas attached *before* `set_stream_context` (camera path: the
+///    `<canvas>` element exists at peer-tile mount, before the first packet
+///    arrives). The renderer was created with `(None, None)`, then
+///    `set_stream_context` populated it directly. Subsequent re-attachments
+///    must preserve that pair.
+/// 2. Canvas attached *after* `set_stream_context` (screen-share path: the
+///    `ScreenCanvas` tile only mounts once the peer's screen-share is
+///    advertised, which is after the first media packet — and the first
+///    packet is what triggers `set_stream_context`). The prior renderer is
+///    either absent or carries `(None, None)` and we must seed the new
+///    renderer from the decoder-level `stream_context` instead, otherwise
+///    `render_to_canvas_cached` cannot emit `video_resolution` diag events
+///    (it gates on `renderer.to_peer.is_some()`) and the screen-share
+///    resolution stays hidden in the Signal Quality tooltip for the whole
+///    session. This was the #883 regression.
+fn resolve_renderer_context(
+    prior_renderer_ctx: Option<(Option<String>, Option<String>)>,
+    decoder_stream_ctx: Option<&(String, String)>,
+) -> (Option<String>, Option<String>) {
+    if let Some((fp, tp)) = prior_renderer_ctx {
+        if fp.is_some() || tp.is_some() {
+            return (fp, tp);
+        }
+    }
+    match decoder_stream_ctx {
+        Some((fp, tp)) => (Some(fp.clone()), Some(tp.clone())),
+        None => (None, None),
+    }
+}
+
 impl VideoPeerDecoder {
     /// Create a new video decoder with optional canvas element.
     /// Use `set_canvas()` to provide the canvas if not available at construction time.
-    pub fn new(canvas: Option<HtmlCanvasElement>) -> Result<Self, JsValue> {
+    ///
+    /// `media_type` tags the resolution diagnostics event so the UI can route
+    /// camera-video and screen-share resolution updates to the right place.
+    /// Use [`MEDIA_TYPE_CAMERA`] for the peer's camera decoder and
+    /// [`MEDIA_TYPE_SCREEN`] for the peer's screen-share decoder.
+    pub fn new(
+        canvas: Option<HtmlCanvasElement>,
+        media_type: &'static str,
+    ) -> Result<Self, JsValue> {
         let canvas_renderer = Rc::new(RefCell::new(None));
 
         // Initialize canvas if provided
@@ -136,9 +225,22 @@ impl VideoPeerDecoder {
             });
         }
 
+        // HCL #893: shared flag the async render callback uses to tell the
+        // next synchronous `decode()` call that a frame has actually
+        // landed on the canvas. See doc comment on `first_render_pending_ack`.
+        let first_render_pending_ack = Rc::new(RefCell::new(false));
+
         let canvas_ref = canvas_renderer.clone();
+        let first_render_flag = first_render_pending_ack.clone();
+        // Track within the closure (cheap `Cell` would suffice but we already
+        // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
+        // closure). `mark_first_render` only flips once per
+        // `VideoPeerDecoder` — every later render is a no-op (see the
+        // `mark_first_render_*` tests for the pinned semantics).
+        let first_render_fired = Rc::new(RefCell::new(false));
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
-            Self::render_to_canvas_cached(&canvas_ref, video_frame);
+            mark_first_render(&first_render_fired, &first_render_flag);
+            Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
@@ -152,6 +254,11 @@ impl VideoPeerDecoder {
         Ok(Self {
             decoder,
             canvas_renderer,
+            media_type,
+            last_source_dims: RefCell::new((0, 0)),
+            last_encoder_state: RefCell::new((0, String::new(), String::new())),
+            stream_context: RefCell::new(None),
+            first_render_pending_ack,
         })
     }
 
@@ -164,11 +271,11 @@ impl VideoPeerDecoder {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let mut guard = self.canvas_renderer.borrow_mut();
-        // Preserve existing peer context when the canvas is swapped.
-        let (from_peer, to_peer) = guard
+        let prior_ctx = guard
             .as_ref()
-            .map(|r| (r.from_peer.clone(), r.to_peer.clone()))
-            .unwrap_or_default();
+            .map(|r| (r.from_peer.clone(), r.to_peer.clone()));
+        let (from_peer, to_peer) =
+            resolve_renderer_context(prior_ctx, self.stream_context.borrow().as_ref());
         *guard = Some(CanvasRenderer {
             canvas,
             context,
@@ -184,6 +291,11 @@ impl VideoPeerDecoder {
     /// Also stores the peer context in the canvas renderer so resolution changes can
     /// be broadcast with the correct peer_id.
     pub fn set_stream_context(&self, from_peer: String, to_peer: String) {
+        // Mirror the peer-id pair on `self` so `decode()` can tag the
+        // source-resolution diag event regardless of whether the canvas
+        // renderer is set yet.
+        *self.stream_context.borrow_mut() = Some((from_peer.clone(), to_peer.clone()));
+
         // Store peer context in the canvas renderer for resolution broadcasts.
         if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
             renderer.from_peer = Some(from_peer.clone());
@@ -200,6 +312,7 @@ impl VideoPeerDecoder {
                         metric!("resolution_height", renderer.last_height as u64),
                         metric!("from_peer", from_peer.clone()),
                         metric!("to_peer", to_peer.clone()),
+                        metric!("media_type", self.media_type.to_string()),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
@@ -212,6 +325,7 @@ impl VideoPeerDecoder {
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
+        media_type: &'static str,
     ) {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
@@ -238,6 +352,7 @@ impl VideoPeerDecoder {
                             metric!("resolution_height", height as u64),
                             metric!("from_peer", renderer.from_peer.clone().unwrap_or_default()),
                             metric!("to_peer", to_peer.clone()),
+                            metric!("media_type", media_type.to_string()),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);
@@ -290,6 +405,11 @@ impl VideoPeerDecoder {
         Self {
             decoder: Box::new(NoopDecoder),
             canvas_renderer: Rc::new(RefCell::new(None)),
+            media_type: MEDIA_TYPE_CAMERA,
+            last_source_dims: RefCell::new((0, 0)),
+            last_encoder_state: RefCell::new((0, String::new(), String::new())),
+            stream_context: RefCell::new(None),
+            first_render_pending_ack: Rc::new(RefCell::new(false)),
         }
     }
 }
@@ -297,6 +417,87 @@ impl VideoPeerDecoder {
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
+            // Surface publisher-side source dimensions (from
+            // `MediaStreamTrack.getSettings()` on the encoder side) so the
+            // UI can show Source vs Received and detect in-transit
+            // downscaling. Dedupe by tracking the last-seen pair — without
+            // this we'd flood the diag bus with one event per decoded frame.
+            // Proto3 default-zero acts as "unknown": older publishers that
+            // don't stamp the fields are skipped here.
+            let src_w = video_metadata.source_width;
+            let src_h = video_metadata.source_height;
+            if src_w != 0 && src_h != 0 {
+                let mut last = self.last_source_dims.borrow_mut();
+                if *last != (src_w, src_h) {
+                    *last = (src_w, src_h);
+                    drop(last);
+                    if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                        let evt = DiagEvent {
+                            subsystem: "video_source_resolution",
+                            stream_id: None,
+                            ts_ms: now_ms(),
+                            metrics: vec![
+                                metric!("source_width", src_w as u64),
+                                metric!("source_height", src_h as u64),
+                                metric!("from_peer", from_peer),
+                                metric!("to_peer", to_peer),
+                                metric!("media_type", self.media_type.to_string()),
+                            ],
+                        };
+                        let _ = global_sender().try_broadcast(evt);
+                    }
+                }
+            }
+
+            // Issue #903: surface publisher-side encoder state so the UI
+            // can render a `Cause:` line below the Screen row explaining
+            // *why* the encoder downscaled. Only emitted for the screen
+            // decoder (`media_type=SCREEN`); the camera path ignores these
+            // fields today. We dedupe on the full `(bitrate, tier, hint)`
+            // tuple so the diag bus only fires on actual change.
+            //
+            // Suppression rules:
+            //   * `media_type != SCREEN` — only the screen decoder forwards.
+            //   * All three values zero / empty — older publishers that
+            //     don't stamp the fields; emitting would mislead the UI
+            //     into rendering a Cause line with no data.
+            if self.media_type == MEDIA_TYPE_SCREEN {
+                let target_bitrate = video_metadata.encoder_target_bitrate_kbps;
+                let adaptive_tier = video_metadata.adaptive_tier.as_str();
+                let cause_hint = video_metadata.cause_hint.as_str();
+                let any_present =
+                    target_bitrate != 0 || !adaptive_tier.is_empty() || !cause_hint.is_empty();
+                if any_present {
+                    let mut last = self.last_encoder_state.borrow_mut();
+                    let changed =
+                        last.0 != target_bitrate || last.1 != adaptive_tier || last.2 != cause_hint;
+                    if changed {
+                        *last = (
+                            target_bitrate,
+                            adaptive_tier.to_string(),
+                            cause_hint.to_string(),
+                        );
+                        drop(last);
+                        if let Some((from_peer, to_peer)) = self.stream_context.borrow().clone() {
+                            let evt = DiagEvent {
+                                subsystem: "screen_encoder_state",
+                                stream_id: None,
+                                ts_ms: now_ms(),
+                                metrics: vec![
+                                    metric!("encoder_target_bitrate_kbps", target_bitrate as f64),
+                                    metric!("adaptive_tier", adaptive_tier.to_string()),
+                                    metric!("cause_hint", cause_hint.to_string()),
+                                    metric!("from_peer", from_peer),
+                                    metric!("to_peer", to_peer),
+                                    metric!("media_type", self.media_type.to_string()),
+                                ],
+                            };
+                            let _ = global_sender().try_broadcast(evt);
+                        }
+                    }
+                }
+            }
+
             // Convert protobuf VideoCodec to internal FrameCodec
             let frame_codec = match video_metadata.codec.enum_value() {
                 Ok(VideoCodec::VP8) => FrameCodec::Vp8,
@@ -332,10 +533,61 @@ impl PeerDecode for VideoPeerDecoder {
             self.decoder.push_frame(frame_buffer);
         }
 
+        // HCL #893: consume the async "first frame rendered" flag set by the
+        // `on_video_frame` callback. The decode pipeline is async, so the
+        // very first `push_frame` call returns here BEFORE the worker has
+        // produced a `VideoFrame`. The flag will fire on a later `decode()`
+        // call (typically the second or third packet for SCREEN, where the
+        // worker has had time to decode the keyframe). When we observe the
+        // flag we return `first_frame: true` exactly once, which lets
+        // `peer_decode_manager` fire the `PEER_EVENT(screen_decode_started)`
+        // ack to the publisher.
+        let first_frame = consume_first_render_flag(&self.first_render_pending_ack);
+
         Ok(DecodeStatus {
             _rendered: true,
-            first_frame: false,
+            first_frame,
         })
+    }
+}
+
+/// HCL #893: consume the `first_render_pending_ack` flag, returning `true`
+/// exactly once after the async render callback flips it.
+///
+/// Extracted from `VideoPeerDecoder::decode()` so the consume semantics
+/// can be unit-tested without a real `WasmDecoder` (which would require
+/// WebCodecs / a browser worker).
+///
+/// Invariants:
+///   - First call after the flag is set: returns `true` and clears the flag.
+///   - Subsequent calls (until the flag is set again): return `false`.
+///   - Calls before the flag is ever set: return `false`.
+///
+/// A regression that "fixes" this to keep returning `true` on every call
+/// would make `peer_decode_manager` fire `PEER_EVENT(screen_decode_started)`
+/// on every SCREEN packet — a per-frame storm to the publisher. The
+/// unit tests pin the exactly-once semantics.
+fn consume_first_render_flag(flag: &Rc<RefCell<bool>>) -> bool {
+    let mut guard = flag.borrow_mut();
+    if *guard {
+        *guard = false;
+        true
+    } else {
+        false
+    }
+}
+
+/// HCL #893: helper used by the `on_video_frame` callback the first time
+/// the WasmDecoder hands a `VideoFrame` back to the render path. Flips
+/// the shared `first_render_pending_ack` flag exactly once per decoder
+/// lifetime; subsequent calls are no-ops.
+///
+/// Extracted so the "first call sets, later calls don't" behaviour is
+/// covered by a unit test independent of the real WasmDecoder.
+fn mark_first_render(fired: &Rc<RefCell<bool>>, ack: &Rc<RefCell<bool>>) {
+    if !*fired.borrow() {
+        *fired.borrow_mut() = true;
+        *ack.borrow_mut() = true;
     }
 }
 
@@ -458,5 +710,203 @@ impl PeerDecode for StandardAudioPeerDecoder {
             _rendered: true,
             first_frame,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Camera path: canvas was attached first, so the renderer already carries
+    /// a valid `(from_peer, to_peer)`. Even if `stream_context` is populated,
+    /// we must keep the prior pair — overwriting it would erase a peer-id swap
+    /// that landed via `set_stream_context` after the renderer was constructed.
+    #[test]
+    fn resolve_renderer_context_keeps_prior_pair_when_present() {
+        let prior = Some((Some("alice".to_string()), Some("session-1".to_string())));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Screen-share path: the first packet arrives before the dioxus
+    /// `ScreenCanvas` tile mounts, so `set_stream_context` populates the
+    /// decoder-level `stream_context` while the renderer is still absent. When
+    /// the tile finally calls `set_canvas`, we have to seed the new renderer
+    /// from `stream_context` — otherwise `render_to_canvas_cached`'s
+    /// `video_resolution` broadcast stays gated on `to_peer.is_some()` and
+    /// never fires. This is the #883 regression.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_renderer_absent() {
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(None, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Renderer existed but was created before `set_stream_context` ran (canvas
+    /// passed at construction time, peer-id pair plumbed in later). Both
+    /// fields are `None`, so we must fall back to `stream_context`.
+    #[test]
+    fn resolve_renderer_context_seeds_from_stream_ctx_when_prior_pair_empty() {
+        let prior = Some((None, None));
+        let stream_ctx = ("alice".to_string(), "session-1".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert_eq!(tp.as_deref(), Some("session-1"));
+    }
+
+    /// Neither source has data — return `(None, None)` so the renderer
+    /// remains in an un-tagged state until `set_stream_context` runs.
+    #[test]
+    fn resolve_renderer_context_returns_none_when_both_empty() {
+        let (fp, tp) = resolve_renderer_context(None, None);
+        assert!(fp.is_none());
+        assert!(tp.is_none());
+    }
+
+    /// Partial prior context (only `from_peer` or only `to_peer` known) is
+    /// still preserved — never overwritten by `stream_context`. This avoids
+    /// accidentally clobbering a half-set state during a canvas swap, which
+    /// can happen if `set_canvas` is called twice in a row by Dioxus
+    /// `use_effect` re-runs.
+    #[test]
+    fn resolve_renderer_context_preserves_partial_prior() {
+        let prior = Some((Some("alice".to_string()), None));
+        let stream_ctx = ("bob".to_string(), "session-2".to_string());
+        let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
+        assert_eq!(fp.as_deref(), Some("alice"));
+        assert!(tp.is_none());
+    }
+
+    // --- HCL #893: `first_render_pending_ack` flag semantics --------------
+    //
+    // These tests pin down the exactly-once behaviour of the async
+    // "first SCREEN frame rendered" signal. A regression that loosens
+    // the helpers — e.g., "set the flag on every render" or "return
+    // true on every decode" — would produce a per-frame PEER_EVENT
+    // storm to the publisher and fail these tests.
+
+    /// `consume_first_render_flag` returns `false` when the flag was
+    /// never set — the no-op case the decoder hits on every packet
+    /// before the worker has produced its first frame.
+    #[test]
+    fn consume_first_render_flag_returns_false_when_unset() {
+        let flag = Rc::new(RefCell::new(false));
+        assert!(!consume_first_render_flag(&flag));
+        // Unchanged on the return — no side effect when there was
+        // nothing to consume.
+        assert!(!*flag.borrow());
+    }
+
+    /// `consume_first_render_flag` returns `true` exactly once after the
+    /// flag is set, and clears the flag so subsequent calls return `false`.
+    /// This is the LOAD-BEARING behaviour: it guarantees
+    /// `peer_decode_manager` fires `PEER_EVENT(screen_decode_started)`
+    /// exactly once per share, not on every SCREEN packet.
+    #[test]
+    fn consume_first_render_flag_returns_true_once_and_clears() {
+        let flag = Rc::new(RefCell::new(true));
+        assert!(
+            consume_first_render_flag(&flag),
+            "first call must observe the set flag and return true"
+        );
+        assert!(
+            !*flag.borrow(),
+            "flag must be cleared after consume so the next call \
+             does NOT re-fire the publisher ack"
+        );
+        assert!(
+            !consume_first_render_flag(&flag),
+            "subsequent calls must return false until the render \
+             callback sets the flag again"
+        );
+    }
+
+    /// Multiple consume calls after a single flag-set must return
+    /// `true` exactly once — defends against accidentally inverting
+    /// the clear semantics inside `decode()`.
+    #[test]
+    fn consume_first_render_flag_is_exactly_once() {
+        let flag = Rc::new(RefCell::new(true));
+        let mut true_count = 0;
+        for _ in 0..10 {
+            if consume_first_render_flag(&flag) {
+                true_count += 1;
+            }
+        }
+        assert_eq!(
+            true_count, 1,
+            "exactly one consume call must observe the flag — got {true_count}"
+        );
+    }
+
+    /// `mark_first_render` flips both flags on the first invocation but
+    /// is a no-op on every subsequent call, even if the consumer side
+    /// already cleared `ack`. This guarantees a SINGLE PEER_EVENT per
+    /// VideoPeerDecoder lifetime.
+    #[test]
+    fn mark_first_render_fires_once_per_decoder() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        mark_first_render(&fired, &ack);
+        assert!(*fired.borrow(), "first call must set `fired`");
+        assert!(*ack.borrow(), "first call must set `ack`");
+
+        // Consumer side clears the ack (simulates `decode()` reading
+        // the flag).
+        *ack.borrow_mut() = false;
+
+        // A subsequent render must NOT re-arm the ack — that would
+        // cause `decode()` to return `first_frame: true` again and
+        // fire a duplicate PEER_EVENT to the publisher.
+        mark_first_render(&fired, &ack);
+        assert!(
+            !*ack.borrow(),
+            "subsequent renders must not re-arm `ack` — would cause \
+             a duplicate PEER_EVENT(screen_decode_started) per share"
+        );
+    }
+
+    /// End-to-end: simulate the decoder loop. Decode N packets,
+    /// have the async callback fire once between packet 2 and 3,
+    /// confirm exactly one `decode()` returns `first_frame: true`.
+    #[test]
+    fn first_render_ack_round_trip() {
+        let fired = Rc::new(RefCell::new(false));
+        let ack = Rc::new(RefCell::new(false));
+
+        // Packet 1: no render yet → false.
+        assert!(!consume_first_render_flag(&ack));
+
+        // Packet 2: still no render → false.
+        assert!(!consume_first_render_flag(&ack));
+
+        // Worker produces its first VideoFrame.
+        mark_first_render(&fired, &ack);
+
+        // Packet 3: consume the ack.
+        assert!(
+            consume_first_render_flag(&ack),
+            "the first decode() call after the render callback fires \
+             must return first_frame: true"
+        );
+
+        // Packets 4..N: never again.
+        for _ in 0..5 {
+            assert!(!consume_first_render_flag(&ack));
+        }
+
+        // Worker produces more frames — does NOT re-arm the ack.
+        for _ in 0..3 {
+            mark_first_render(&fired, &ack);
+        }
+        assert!(
+            !consume_first_render_flag(&ack),
+            "additional render callbacks must not produce a second \
+             first_frame: true"
+        );
     }
 }

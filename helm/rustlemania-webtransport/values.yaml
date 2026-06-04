@@ -38,10 +38,26 @@ env:
     value: webtransport
   - name: SERVER_STATS_INTERVAL_SECS
     value: "5"
+  # Bumped from 2 to 4: 2 worker threads serialised ~30 sessions in
+  # the 17-peer cc7tp meeting on 2026-05-06, contributing to outbound
+  # channel back-pressure. 4 threads matches the new 1500m CPU limit.
   - name: TOKIO_WORKER_THREADS
-    value: "2"
+    value: "4"
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
+  # WT outbound mpsc capacity per session. Default in code is 512
+  # (fail-fast per issue #979: a deep queue only buffers stale, useless
+  # video for slow receivers — the priority-drop policy + CONGESTION
+  # feedback are the correct response, not a bigger buffer). Override
+  # here only for exceptional workloads.
+  #
+  # Shedding is NOT env-tunable: the priority-drop policy lives in
+  # actix-api/src/actors/priority_drop.rs and uses fixed fill ratios
+  # (video/screen shed at 0.80, audio at 0.95, control/critical never
+  # preempted). There is no WT_OUTBOUND_SHEDDING_THRESHOLD env var — the
+  # old dead var was removed in #731.
+  # - name: WT_OUTBOUND_CHANNEL_CAPACITY
+  #   value: "1024"
   # JWT_SECRET must match the secret used by meeting-api to sign room access tokens.
   # Create the secret with: kubectl create secret generic jwt-secret --from-literal=secret=<value>
   - name: JWT_SECRET
@@ -50,9 +66,19 @@ env:
         name: jwt-secret
         key: secret
 resources:
+  # Bumped from 500m / 256Mi: a 17-peer cc7tp meeting on 2026-05-06
+  # peaked at 0.47 CPU against the 0.5 limit and saw the outbound mpsc
+  # queue overflow ~38.5k times. 1500m gives ~3x headroom for 17-peer
+  # meetings; the observed 7d memory peak was 60 MiB, so 512Mi keeps
+  # ample headroom for the 512-slot per-session queue (each slot is a
+  # `WtOutbound` enum holding at most one ~1200-byte datagram or a
+  # bounded stream message, so worst-case per-session queue <1 MiB and
+  # the dominant memory line item remains the codec/session state, not
+  # the queue) while keeping the customer-facing default right-sized
+  # rather than over-inflated.
   limits:
-    cpu: "500m"
-    memory: "256Mi"
+    cpu: "1500m"
+    memory: "512Mi"
   requests:
     cpu: "100m"
     memory: "32Mi"
@@ -74,5 +100,24 @@ autoscaling:
   targetMemoryUtilizationPercentage: 80
 nodeSelector: {}
 tolerations: []
-affinity: {}
+# Soft anti-affinity so the replicas of a single 30-person meeting do
+# not all land on the same node. `preferred` (not `required`) so a
+# small cluster with fewer nodes than replicas still schedules.
+#
+# The selector value matches the chart's `app.kubernetes.io/name`
+# label as defined in `_helpers.tpl` -> `rustlemania.selectorLabels`,
+# which defaults to the chart name `rustlemania-webtransport`.
+# Override `nameOverride` in values to match if you change the chart.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - rustlemania-webtransport
+          topologyKey: kubernetes.io/hostname
 loadBalancerAnnotations: {}

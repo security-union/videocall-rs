@@ -18,6 +18,7 @@ use wasm_bindgen_test::*;
 use dioxus::prelude::*;
 use dioxus_ui::components::peer_list_item::PeerListItem;
 use dioxus_ui::constants::vad_threshold;
+use dioxus_ui::context::{AppearanceSettings, AppearanceSettingsCtx};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -64,6 +65,8 @@ async fn vad_threshold_errors_without_config() {
 async fn peer_list_item_speaking_adds_speaking_class() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
+        let appearance_settings = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
         rsx! { PeerListItem { name: "Alice".to_string(), speaking: true, muted: false } }
     }
     render_into(&mount, wrapper);
@@ -82,6 +85,8 @@ async fn peer_list_item_speaking_adds_speaking_class() {
 async fn peer_list_item_not_speaking_lacks_speaking_class() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
+        let appearance_settings = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
         rsx! { PeerListItem { name: "Bob".to_string(), speaking: false, muted: false } }
     }
     render_into(&mount, wrapper);
@@ -100,6 +105,8 @@ async fn peer_list_item_not_speaking_lacks_speaking_class() {
 async fn peer_list_item_muted_renders_mic_icon() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
+        let appearance_settings = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
         rsx! { PeerListItem { name: "Charlie".to_string(), muted: true, speaking: false } }
     }
     render_into(&mount, wrapper);
@@ -118,6 +125,8 @@ async fn peer_list_item_muted_renders_mic_icon() {
 async fn peer_list_item_speaking_and_muted_has_speaking_class() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
+        let appearance_settings = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
         rsx! { PeerListItem { name: "Diana".to_string(), speaking: true, muted: true } }
     }
     render_into(&mount, wrapper);
@@ -136,6 +145,8 @@ async fn peer_list_item_speaking_and_muted_has_speaking_class() {
 async fn peer_list_item_host_with_speaking_shows_crown_and_speaking() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
+        let appearance_settings = use_signal(AppearanceSettings::default);
+        use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
         rsx! { PeerListItem { name: "Host".to_string(), is_host: true, speaking: true, muted: false } }
     }
     render_into(&mount, wrapper);

@@ -518,6 +518,85 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
             }
         });
     }
+
+    /// Re-enumerates devices and updates internal lists/selections without emitting callbacks.
+    ///
+    /// This is useful for UI-only refreshes (for example opening a settings modal)
+    /// where we want up-to-date options without triggering encoder/device-switch side effects.
+    pub fn refresh_devices_safely(&self) {
+        let audio_input_devices = self.audio_inputs.devices.clone();
+        let video_input_devices = self.video_inputs.devices.clone();
+        let audio_output_devices = self.audio_outputs.devices.clone();
+
+        let audio_input_selected = self.audio_inputs.selected.clone();
+        let video_input_selected = self.video_inputs.selected.clone();
+        let audio_output_selected = self.audio_outputs.selected.clone();
+
+        let provider_promise = self.provider.enumerate_devices();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let future = JsFuture::from(provider_promise);
+            let devices = future
+                .await
+                .expect("await devices")
+                .unchecked_into::<Array>();
+            let devices = devices.to_vec();
+            let devices = devices
+                .into_iter()
+                .map(|d| d.unchecked_into::<MediaDeviceInfo>())
+                .collect::<Vec<MediaDeviceInfo>>();
+
+            let audio_devices = devices
+                .clone()
+                .into_iter()
+                .filter(|device| device.kind() == MediaDeviceKind::Audioinput)
+                .collect::<Vec<MediaDeviceInfo>>();
+
+            let video_devices = devices
+                .clone()
+                .into_iter()
+                .filter(|device| device.kind() == MediaDeviceKind::Videoinput)
+                .collect::<Vec<MediaDeviceInfo>>();
+
+            let audio_output_device_list = devices
+                .into_iter()
+                .filter(|device| device.kind() == MediaDeviceKind::Audiooutput)
+                .collect::<Vec<MediaDeviceInfo>>();
+
+            *audio_input_devices.borrow_mut() = audio_devices.clone();
+            *video_input_devices.borrow_mut() = video_devices.clone();
+            *audio_output_devices.borrow_mut() = audio_output_device_list.clone();
+
+            let next_audio_selected = audio_input_selected
+                .borrow()
+                .as_ref()
+                .filter(|selected_id| audio_devices.iter().any(|d| d.device_id() == **selected_id))
+                .cloned()
+                .or_else(|| audio_devices.first().map(|d| d.device_id()));
+
+            let next_video_selected = video_input_selected
+                .borrow()
+                .as_ref()
+                .filter(|selected_id| video_devices.iter().any(|d| d.device_id() == **selected_id))
+                .cloned()
+                .or_else(|| video_devices.first().map(|d| d.device_id()));
+
+            let next_audio_output_selected = audio_output_selected
+                .borrow()
+                .as_ref()
+                .filter(|selected_id| {
+                    audio_output_device_list
+                        .iter()
+                        .any(|d| d.device_id() == **selected_id)
+                })
+                .cloned()
+                .or_else(|| audio_output_device_list.first().map(|d| d.device_id()));
+
+            *audio_input_selected.borrow_mut() = next_audio_selected;
+            *video_input_selected.borrow_mut() = next_video_selected;
+            *audio_output_selected.borrow_mut() = next_audio_output_selected;
+        });
+    }
 }
 
 // Backward compatibility constructor - this is the main way the app should create MediaDeviceList

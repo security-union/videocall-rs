@@ -12,10 +12,39 @@ message PacketWrapper {
     MEETING = 7;
     SESSION_ASSIGNED = 8;
     CONGESTION = 9;
+    PEER_EVENT = 10;
+    // Client -> relay ONLY control packet. Carries the set of session_ids
+    // the sender is currently rendering (its viewport / "desired streams"
+    // set). The relay consumes this to filter VIDEO it forwards downstream
+    // (see ViewportPacket). It is never re-broadcast to other peers.
+    VIEWPORT = 11;
   }
-  
+
+  // Cleartext media-kind discriminator on the OUTER envelope.
+  //
+  // Under E2EE_ENABLED=true the inner MediaPacket (including its own
+  // `media_type`) is AES-sealed, so the relay — which never decrypts —
+  // cannot tell VIDEO from AUDIO/SCREEN. This field lets the publisher
+  // advertise the media kind in cleartext so the relay can apply
+  // viewport-aware VIDEO filtering while ALWAYS forwarding AUDIO.
+  //
+  // Set only by the publishing client on MEDIA packets. Other packet
+  // types leave it unspecified. The default (UNSPECIFIED = 0) MUST be
+  // treated as fail-open (forward) by the relay so that older clients,
+  // non-media packets, and any future packet type keep working unchanged.
+  enum MediaKind {
+    MEDIA_KIND_UNSPECIFIED = 0;
+    VIDEO = 1;
+    AUDIO = 2;
+    SCREEN = 3;
+  }
+
   PacketType packet_type = 1;
   bytes user_id = 2;
   bytes data = 3;
   uint64 session_id = 4;
+  // Simulcast layer id (#989/PR #993); see discussion #890.
+  uint32 simulcast_layer_id = 5;
+  // Cleartext discriminator; see MediaKind. Default 0 = unspecified = fail-open.
+  MediaKind media_kind = 6;
 }

@@ -16,12 +16,15 @@
  * conditions.
  */
 
+use crate::aq_controller::BotAq;
 use crate::costume_renderer::CostumeRenderer;
 use crate::ekg_renderer::EkgRenderer;
+use crate::i420_scale::scale_i420;
+use crate::transport::{MediaTypeLabel, OutboundFrame};
 use crate::video_encoder::VideoEncoderBuilder;
 use image::{ImageBuffer, Rgb};
 use protobuf::Message;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,7 +32,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub struct VideoProducer {
@@ -44,14 +47,20 @@ impl VideoProducer {
     ///
     /// No pre-generation needed -- each frame is rendered from RMS data
     /// directly in the video loop (~0.5ms per frame vs ~5ms for VP9 encode).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_ekg(
         user_id: String,
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
+        aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -67,6 +76,11 @@ impl VideoProducer {
                 quit_clone,
                 media_start,
                 loop_duration,
+                aq,
+                encoder_output_fps,
+                encoder_errors_generic,
+                encoder_frames_ok,
+                transport_drops_counter,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -82,13 +96,19 @@ impl VideoProducer {
     /// Create a video producer that renders costume sprite sheet frames.
     ///
     /// Reads pre-rendered I420 frames from the CostumeRenderer at 30fps.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_costume(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -103,6 +123,11 @@ impl VideoProducer {
                 media_start,
                 loop_duration,
                 is_speaking,
+                aq,
+                encoder_output_fps,
+                encoder_errors_generic,
+                encoder_frames_ok,
+                transport_drops_counter,
             ) {
                 error!("Costume video producer error: {}", e);
             }
@@ -121,27 +146,46 @@ impl VideoProducer {
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
+        aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
-        let width = 1280u32;
-        let height = 720u32;
-        let framerate = 15u32;
-        // Use microseconds to avoid truncation drift (1000/15 = 66.667ms,
-        // truncating to 66ms drifts ~10ms/sec = ~840ms over 84s).
-        let frame_interval_us: u64 = 1_000_000 / framerate as u64; // 66666us
+        // Seed encoder configuration from the AQ controller's current tier.
+        // `framerate` is driven by AQ (browser client EKG was 15 FPS; we honor
+        // whatever the tier says so step-downs actually slow the encoder).
+        let mut v = aq.snapshot_video();
+        let mut last_epoch: u64 = aq.tier_epoch();
+        let mut width: u32 = v.max_width;
+        let mut height: u32 = v.max_height;
+        let mut framerate: u32 = v.target_fps.max(1);
+        let mut frames_per_keyframe: u32 = v.keyframe_interval.max(1);
+        let mut frame_interval_us: u64 = 1_000_000 / framerate as u64;
 
         info!(
-            "Video producer started for {} ({}x{} @ {}fps, on-the-fly EKG)",
-            user_id, width, height, framerate
+            "Video producer started for {} ({}x{} @ {}fps, bitrate={}kbps, kf_interval={}, on-the-fly EKG, AQ tier={})",
+            user_id,
+            width,
+            height,
+            framerate,
+            v.bitrate_kbps,
+            frames_per_keyframe,
+            aq.video_tier_index(),
         );
+
+        // Publish the initial encoder FPS to the shared atomic so the health
+        // reporter can include it in HealthPacket.encoder_output_fps.
+        encoder_output_fps.store(framerate, Ordering::Relaxed);
 
         let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
             .set_resolution(width, height)
             .build()?;
-        video_encoder.update_bitrate_kbps(500)?;
+        video_encoder.update_bitrate_kbps(v.bitrate_kbps)?;
 
         let loop_duration_us = loop_duration.as_micros() as u64;
         if loop_duration_us == 0 {
@@ -154,7 +198,10 @@ impl VideoProducer {
         let mut prev_frame_index: Option<usize> = None;
         let mut global_sequence: u64 = 0;
 
-        // Pre-allocate reusable buffers to avoid per-frame heap allocation
+        // Pre-allocate reusable buffers to avoid per-frame heap allocation.
+        // These have to be rebuilt whenever the AQ tier changes resolution.
+        let mut renderer = renderer;
+        let renderer_color = renderer.color();
         let mut frame_buf = renderer.create_frame_buffer();
         let mut i420_buf = vec![0u8; (width * height * 3 / 2) as usize];
         let user_id_bytes = user_id.clone().into_bytes();
@@ -165,29 +212,100 @@ impl VideoProducer {
                 break;
             }
 
+            // Cheap lock-free poll: only re-snapshot when AQ actually changed
+            // the tier. Steady-state cost is one relaxed load per frame.
+            let current_epoch = aq.tier_epoch();
+            if current_epoch != last_epoch {
+                let new_v = aq.snapshot_video();
+                last_epoch = current_epoch;
+
+                // Bitrate always changes on a tier transition — cheap update.
+                if new_v.bitrate_kbps != v.bitrate_kbps {
+                    if let Err(e) = video_encoder.update_bitrate_kbps(new_v.bitrate_kbps) {
+                        warn!(
+                            "[{}] AQ: failed to update bitrate to {}kbps: {}",
+                            user_id, new_v.bitrate_kbps, e
+                        );
+                    }
+                }
+
+                // Resolution or FPS change: rebuild the encoder + renderer.
+                // This is expensive (codec re-init ~10-50ms) but rare — tier
+                // transitions are rate-limited by MIN_TIER_TRANSITION_INTERVAL_MS
+                // (3s) and STEP_UP_STABILIZATION_WINDOW_MS (5s) so this won't
+                // run faster than once every few seconds.
+                let fps = new_v.target_fps.max(1);
+                if new_v.max_width != width || new_v.max_height != height || fps != framerate {
+                    info!(
+                        "[{}] AQ: rebuilding encoder {}x{}@{}fps -> {}x{}@{}fps",
+                        user_id, width, height, framerate, new_v.max_width, new_v.max_height, fps,
+                    );
+                    width = new_v.max_width;
+                    height = new_v.max_height;
+                    framerate = fps;
+                    frame_interval_us = 1_000_000 / framerate as u64;
+
+                    // Rebuild encoder at new dimensions.
+                    match VideoEncoderBuilder::new(framerate, 5)
+                        .set_resolution(width, height)
+                        .build()
+                    {
+                        Ok(mut enc) => {
+                            let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
+                            video_encoder = enc;
+                            // Rebuild renderer + reusable buffers.
+                            renderer = EkgRenderer::new(renderer_color, width, height);
+                            frame_buf = renderer.create_frame_buffer();
+                            i420_buf = vec![0u8; (width * height * 3 / 2) as usize];
+                            // Force a keyframe on the next frame — the decoder
+                            // must see the new resolution as a clean IDR.
+                            prev_frame_index = None;
+                            // Update shared FPS for health reporter.
+                            encoder_output_fps.store(framerate, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error!(
+                                "[{}] AQ: failed to rebuild encoder at {}x{}@{}fps: {} — keeping old encoder",
+                                user_id, width, height, framerate, e
+                            );
+                            // Revert our shadow values so we don't diverge
+                            // from the real encoder state.
+                            width = v.max_width;
+                            height = v.max_height;
+                            framerate = v.target_fps.max(1);
+                            frame_interval_us = 1_000_000 / framerate as u64;
+                        }
+                    }
+                }
+
+                frames_per_keyframe = new_v.keyframe_interval.max(1);
+                v = new_v;
+            }
+
             let elapsed_us = media_start.elapsed().as_micros() as u64;
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
 
-            // Force keyframe at loop wrap, first frame, or every 5 seconds
+            // Force keyframe at loop wrap, first frame, or every keyframe_interval frames.
             let at_loop_wrap = match prev_frame_index {
                 Some(prev) => frame_in_loop < prev,
                 None => true,
             };
-            let periodic_keyframe = global_sequence.is_multiple_of(framerate as u64 * 5);
+            let periodic_keyframe = global_sequence.is_multiple_of(frames_per_keyframe as u64);
             let force_keyframe = at_loop_wrap || periodic_keyframe;
             prev_frame_index = Some(frame_in_loop);
 
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
                 let loop_num = elapsed_us / loop_duration_us;
                 info!(
-                    "[{}] seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s{}",
+                    "[{}] seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s, tier={}{}",
                     user_id,
                     global_sequence,
                     frame_in_loop,
                     loop_num,
                     position_in_loop_us as f64 / 1_000_000.0,
                     loop_duration_us as f64 / 1_000_000.0,
+                    aq.video_tier_index(),
                     if force_keyframe { " KEYFRAME" } else { "" }
                 );
             }
@@ -204,12 +322,39 @@ impl VideoProducer {
             // Encode to VP9
             let frames_result = if force_keyframe {
                 info!("Forcing keyframe for {} (seq={})", user_id, global_sequence);
-                video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)?
+                video_encoder.encode_keyframe(global_sequence as i64, &i420_buf)
             } else {
-                video_encoder.encode(global_sequence as i64, &i420_buf)?
+                video_encoder.encode(global_sequence as i64, &i420_buf)
             };
 
-            for frame in frames_result {
+            let frames = match frames_result {
+                Ok(f) => {
+                    encoder_frames_ok.fetch_add(1, Ordering::Relaxed);
+                    f
+                }
+                Err(e) => {
+                    encoder_errors_generic.fetch_add(1, Ordering::Relaxed);
+                    error!("Video producer encode error for {}: {}", user_id, e);
+                    global_sequence += 1;
+                    // Sleep until next frame deadline before continuing
+                    let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+                    let sleep_target_us = if next_frame_us >= loop_duration_us {
+                        loop_duration_us
+                    } else {
+                        next_frame_us
+                    };
+                    let loop_base_us = elapsed_us - position_in_loop_us;
+                    let absolute_target =
+                        media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+                    let now = Instant::now();
+                    if now < absolute_target {
+                        thread::sleep(absolute_target - now);
+                    }
+                    continue;
+                }
+            };
+
+            for frame in frames {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(),
@@ -230,13 +375,19 @@ impl VideoProducer {
                     packet_type: PacketType::MEDIA.into(),
                     user_id: user_id_bytes.clone(),
                     data: media_packet.write_to_bytes()?,
+                    // Cleartext discriminator so the relay can apply viewport-aware
+                    // VIDEO filtering without decrypting the inner MediaPacket
+                    // (HCL issue #988). Matches the real client (transform.rs).
+                    media_kind: MediaKind::VIDEO.into(),
                     ..Default::default()
                 };
 
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(_e) = packet_sender.try_send(packet_data) {
+                let out_frame = OutboundFrame::new(MediaTypeLabel::Video, packet_data);
+                if let Err(_e) = packet_sender.try_send(out_frame) {
                     static VIDEO_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = VIDEO_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    transport_drops_counter.fetch_add(1, Ordering::Relaxed);
                     if count % 100 == 1 {
                         warn!(
                             "Dropped video packets due to full send channel (total: {})",
@@ -279,26 +430,61 @@ impl VideoProducer {
     fn costume_video_loop(
         user_id: String,
         renderer: CostumeRenderer,
-        packet_sender: Sender<Vec<u8>>,
+        packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
+        encoder_output_fps: Arc<AtomicU32>,
+        encoder_errors_generic: Arc<AtomicU64>,
+        encoder_frames_ok: Arc<AtomicU64>,
+        transport_drops_counter: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
-        let width = renderer.width();
-        let height = renderer.height();
-        let framerate = 30u32;
-        let frame_interval_us: u64 = 1_000_000 / framerate as u64; // 33333us
+        // The costume sprite sheet is always 1280x720. The encoder may run
+        // at a lower resolution when AQ requests a tier step-down; in that
+        // case we downscale each source frame into `i420_buf` before encoding.
+        let native_w = renderer.width();
+        let native_h = renderer.height();
+
+        let mut v = aq.snapshot_video();
+        let mut last_epoch: u64 = aq.tier_epoch();
+        // Encoder resolution — starts at native, may be lowered by AQ.
+        let mut enc_w: u32 = v.max_width.min(native_w);
+        let mut enc_h: u32 = v.max_height.min(native_h);
+        let mut framerate: u32 = v.target_fps.max(1);
+        let mut frames_per_keyframe: u32 = v.keyframe_interval.max(1);
+        let mut frame_interval_us: u64 = 1_000_000 / framerate as u64;
+
+        // Whether we need to downscale (enc resolution < native).
+        let mut needs_scale = enc_w < native_w || enc_h < native_h;
+        // Reusable buffer for scaled frames. Allocated only when needed.
+        let mut i420_buf: Vec<u8> = if needs_scale {
+            vec![0u8; (enc_w * enc_h * 3 / 2) as usize]
+        } else {
+            Vec::new()
+        };
 
         info!(
-            "Costume video producer started for {} ({}x{} @ {}fps)",
-            user_id, width, height, framerate
+            "Costume video producer started for {} (native={}x{}, enc={}x{} @ {}fps, bitrate={}kbps, AQ tier={})",
+            user_id,
+            native_w,
+            native_h,
+            enc_w,
+            enc_h,
+            framerate,
+            v.bitrate_kbps,
+            aq.video_tier_index(),
         );
 
+        // Publish the initial encoder FPS to the shared atomic so the health
+        // reporter can include it in HealthPacket.encoder_output_fps.
+        encoder_output_fps.store(framerate, Ordering::Relaxed);
+
         let mut video_encoder = VideoEncoderBuilder::new(framerate, 5)
-            .set_resolution(width, height)
+            .set_resolution(enc_w, enc_h)
             .build()?;
-        video_encoder.update_bitrate_kbps(1000)?;
+        video_encoder.update_bitrate_kbps(v.bitrate_kbps)?;
 
         let loop_duration_us = loop_duration.as_micros() as u64;
         if loop_duration_us == 0 {
@@ -312,42 +498,137 @@ impl VideoProducer {
         let mut global_sequence: u64 = 0;
         let user_id_bytes = user_id.clone().into_bytes();
 
+        // Log once on first downscale activation.
+        static COSTUME_RES_WARNED: AtomicBool = AtomicBool::new(false);
+
         loop {
             if quit.load(Ordering::Relaxed) {
                 info!("Costume video producer stopping for {}", user_id);
                 break;
             }
 
+            // Cheap lock-free poll: only re-snapshot when AQ actually changed
+            // the tier. Costume path honors bitrate, FPS, and resolution.
+            let current_epoch = aq.tier_epoch();
+            if current_epoch != last_epoch {
+                let new_v = aq.snapshot_video();
+                last_epoch = current_epoch;
+
+                // Bitrate change — cheap encoder update.
+                if new_v.bitrate_kbps != v.bitrate_kbps {
+                    if let Err(e) = video_encoder.update_bitrate_kbps(new_v.bitrate_kbps) {
+                        warn!(
+                            "[{}] AQ (costume): failed to update bitrate to {}kbps: {}",
+                            user_id, new_v.bitrate_kbps, e
+                        );
+                    }
+                }
+
+                // Resolution or FPS change: rebuild the encoder.
+                // Cap requested resolution to native — upscaling would waste
+                // bits without improving quality.
+                let target_w = new_v.max_width.min(native_w);
+                let target_h = new_v.max_height.min(native_h);
+                let fps = new_v.target_fps.max(1);
+
+                if target_w != enc_w || target_h != enc_h || fps != framerate {
+                    info!(
+                        "[{}] AQ (costume): rebuilding encoder {}x{}@{}fps -> {}x{}@{}fps",
+                        user_id, enc_w, enc_h, framerate, target_w, target_h, fps,
+                    );
+
+                    match VideoEncoderBuilder::new(fps, 5)
+                        .set_resolution(target_w, target_h)
+                        .build()
+                    {
+                        Ok(mut enc) => {
+                            let _ = enc.update_bitrate_kbps(new_v.bitrate_kbps);
+                            video_encoder = enc;
+                            enc_w = target_w;
+                            enc_h = target_h;
+                            framerate = fps;
+                            frame_interval_us = 1_000_000 / framerate as u64;
+                            needs_scale = enc_w < native_w || enc_h < native_h;
+
+                            // (Re)allocate the scale buffer if needed.
+                            if needs_scale {
+                                let buf_len = (enc_w * enc_h * 3 / 2) as usize;
+                                i420_buf.resize(buf_len, 0);
+
+                                // Info log on first downscale activation.
+                                if !COSTUME_RES_WARNED.swap(true, Ordering::Relaxed) {
+                                    info!(
+                                        "[{}] AQ (costume): downscale active — {}x{} source -> {}x{} encoder",
+                                        user_id, native_w, native_h, enc_w, enc_h,
+                                    );
+                                }
+                            }
+
+                            prev_frame_index = None; // force keyframe
+                            encoder_output_fps.store(framerate, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error!(
+                                "[{}] AQ (costume): failed to rebuild encoder at {}x{}@{}fps: {} — keeping old encoder",
+                                user_id, target_w, target_h, fps, e
+                            );
+                            // Do not update enc_w/enc_h/framerate — keep old values.
+                        }
+                    }
+                }
+
+                frames_per_keyframe = new_v.keyframe_interval.max(1);
+                v = new_v;
+            }
+
             let elapsed_us = media_start.elapsed().as_micros() as u64;
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
 
-            // Force keyframe at loop wrap, first frame, or every 5 seconds
+            // Force keyframe at loop wrap, first frame, or every keyframe_interval frames.
             let at_loop_wrap = match prev_frame_index {
                 Some(prev) => frame_in_loop < prev,
                 None => true,
             };
-            let periodic_keyframe = global_sequence.is_multiple_of(framerate as u64 * 5);
+            let periodic_keyframe = global_sequence.is_multiple_of(frames_per_keyframe as u64);
             let force_keyframe = at_loop_wrap || periodic_keyframe;
             prev_frame_index = Some(frame_in_loop);
 
             if global_sequence.is_multiple_of(framerate as u64 * 5) {
                 let loop_num = elapsed_us / loop_duration_us;
                 info!(
-                    "[{}] costume seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s{}",
+                    "[{}] costume seq={}, frame={}, loop={}, pos={:.1}s/{:.1}s, tier={}, enc={}x{}{}",
                     user_id,
                     global_sequence,
                     frame_in_loop,
                     loop_num,
                     position_in_loop_us as f64 / 1_000_000.0,
                     loop_duration_us as f64 / 1_000_000.0,
+                    aq.video_tier_index(),
+                    enc_w,
+                    enc_h,
                     if force_keyframe { " KEYFRAME" } else { "" }
                 );
             }
 
-            // Read I420 frame directly from costume renderer
+            // Read native-resolution I420 frame from costume renderer.
             let speaking = is_speaking.load(Ordering::Relaxed);
-            let i420_data = renderer.frame_i420(speaking, frame_in_loop);
+            let source_frame = renderer.frame_i420(speaking, frame_in_loop);
+
+            // Downscale if encoder resolution is below native.
+            let encode_input: &[u8] = if needs_scale {
+                scale_i420(
+                    source_frame,
+                    native_w,
+                    native_h,
+                    &mut i420_buf,
+                    enc_w,
+                    enc_h,
+                );
+                &i420_buf[..]
+            } else {
+                source_frame
+            };
 
             // Encode to VP9
             let frames_result = if force_keyframe {
@@ -355,12 +636,39 @@ impl VideoProducer {
                     "Forcing keyframe for {} (costume seq={})",
                     user_id, global_sequence
                 );
-                video_encoder.encode_keyframe(global_sequence as i64, i420_data)?
+                video_encoder.encode_keyframe(global_sequence as i64, encode_input)
             } else {
-                video_encoder.encode(global_sequence as i64, i420_data)?
+                video_encoder.encode(global_sequence as i64, encode_input)
             };
 
-            for frame in frames_result {
+            let frames = match frames_result {
+                Ok(f) => {
+                    encoder_frames_ok.fetch_add(1, Ordering::Relaxed);
+                    f
+                }
+                Err(e) => {
+                    encoder_errors_generic.fetch_add(1, Ordering::Relaxed);
+                    error!("Costume video producer encode error for {}: {}", user_id, e);
+                    global_sequence += 1;
+                    // Sleep until next frame deadline before continuing
+                    let next_frame_us = (frame_in_loop as u64 + 1) * frame_interval_us;
+                    let sleep_target_us = if next_frame_us >= loop_duration_us {
+                        loop_duration_us
+                    } else {
+                        next_frame_us
+                    };
+                    let loop_base_us = elapsed_us - position_in_loop_us;
+                    let absolute_target =
+                        media_start + Duration::from_micros(loop_base_us + sleep_target_us);
+                    let now = Instant::now();
+                    if now < absolute_target {
+                        thread::sleep(absolute_target - now);
+                    }
+                    continue;
+                }
+            };
+
+            for frame in frames {
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
                     data: frame.data.to_vec(),
@@ -381,13 +689,19 @@ impl VideoProducer {
                     packet_type: PacketType::MEDIA.into(),
                     user_id: user_id_bytes.clone(),
                     data: media_packet.write_to_bytes()?,
+                    // Cleartext discriminator so the relay can apply viewport-aware
+                    // VIDEO filtering without decrypting the inner MediaPacket
+                    // (HCL issue #988). Matches the real client (transform.rs).
+                    media_kind: MediaKind::VIDEO.into(),
                     ..Default::default()
                 };
 
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(_e) = packet_sender.try_send(packet_data) {
+                let out_frame = OutboundFrame::new(MediaTypeLabel::Video, packet_data);
+                if let Err(_e) = packet_sender.try_send(out_frame) {
                     static COSTUME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = COSTUME_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    transport_drops_counter.fetch_add(1, Ordering::Relaxed);
                     if count % 100 == 1 {
                         warn!(
                             "Dropped costume video packets due to full send channel (total: {})",

@@ -65,6 +65,7 @@
 //!     rtt_probe_interval_ms: None,
 //!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //!     on_peer_removed: None,
+//!     on_peers_removed_batch: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
 //!     on_speaking_changed: None,
@@ -75,10 +76,17 @@
 //!     on_participant_rejected: None,
 //!     on_waiting_room_updated: None,
 //!     on_meeting_settings_updated: None,
-//!     on_peer_left: None,    // Option<Callback<(String, String)>> -- (display_name, user_id)
-//!     on_peer_joined: None,  // Option<Callback<(String, String)>> -- (display_name, user_id)
+//!     on_peer_left: None,    // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
+//!     on_peer_joined: None,  // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_display_name_changed: None,
+//!     on_host_mute: None,
+//!     on_host_disable_video: None,
+//!     on_participant_kicked: None,
+//!     on_peer_event: None,
 //!     decode_media: true,
+//!     is_guest: false,
+//!     allow_post_rebase_retry: true,
+//!     refresh_room_token_callback: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -100,6 +108,7 @@
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
+//! #     on_peers_removed_batch: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
 //! #     on_speaking_changed: None,
@@ -113,7 +122,14 @@
 //! #     on_peer_left: None,
 //! #     on_peer_joined: None,
 //! #     on_display_name_changed: None,
+//! #     on_host_mute: None,
+//! #     on_host_disable_video: None,
+//! #     on_participant_kicked: None,
+//! #     on_peer_event: None,
 //! #     decode_media: true,
+//! #     is_guest: false,
+//! #     allow_post_rebase_retry: true,
+//! #     refresh_room_token_callback: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
@@ -132,11 +148,15 @@
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
 //! );
+//! use std::sync::atomic::AtomicBool;
+//! use std::rc::Rc;
+//! let screen_sharing_active = Rc::new(AtomicBool::new(false));
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
 //!     Callback::noop(),
-//!     Callback::noop() // on_state_change callback for screen share events
+//!     Callback::noop(), // on_state_change callback for screen share events
+//!     screen_sharing_active,
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -189,10 +209,20 @@
 //!
 //! ```
 
-pub mod adaptive_quality_constants;
+/// Re-export shim for the centralized adaptive-quality constants.
+///
+/// The constants themselves now live in the `videocall-aq` crate so they can
+/// be shared between the browser client and native consumers (e.g. the
+/// load-test bot). Browser code that previously imported from
+/// `videocall_client::adaptive_quality_constants::*` continues to resolve
+/// unchanged.
+pub mod adaptive_quality_constants {
+    pub use videocall_aq::constants::*;
+}
 pub mod audio;
 pub mod audio_constants;
 pub mod audio_worklet_codec;
+pub mod capability;
 mod client;
 mod connection;
 pub mod constants;
@@ -201,11 +231,16 @@ pub mod decode;
 pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
+pub mod long_tasks;
 mod media_devices;
+pub mod render_fps;
 pub mod utils;
 mod wrappers;
-pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use connection::ConnectionState;
+pub use adaptive_quality_constants::initial_screen_tier;
+pub use client::{
+    RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
+};
+pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
@@ -217,4 +252,4 @@ pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
     MediaPermissionsErrorState, PermissionState, SelectableDevices,
 };
-pub use videocall_types::Callback;
+pub use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};

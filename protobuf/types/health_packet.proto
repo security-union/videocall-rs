@@ -67,6 +67,19 @@ message PeerStats {
 
   // Screen share video stats (separate from camera video_stats field 6)
   VideoStats screen_video_stats = 14;
+
+  // Freeze-detection metrics (issue #1013). videocall_video_fps counts decode
+  // calls, not visually distinct frames, so it reads ~30fps while video is
+  // frozen. These surface the loss signal that actually proves a freeze.
+  // Per-peer sequence loss rate (lost packets/sec, windowed) observed for this
+  // peer's video stream. Sustained loss => frozen/glitched video even when
+  // fps_received looks healthy.
+  optional double video_seq_loss_per_sec = 15;
+  // Per-peer keyframe (PLI) requests/sec this client sent TO this peer
+  // (windowed). A sustained nonzero rate is the direct symptom of a stream
+  // that cannot recover — feeds video_quality_score so it can't read 100/100
+  // during a keyframe storm.
+  optional double keyframe_requests_per_sec = 16;
 }
 
 message HealthPacket {
@@ -110,7 +123,8 @@ message HealthPacket {
 
   // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
   optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
-  optional double encoder_worst_peer_fps = 26;     // FPS from the worst-performing receiver
+  reserved 26;                                     // Was: encoder_worst_peer_fps. Replaced by encoder_p75_peer_fps (field 67) in PR #658; legacy emitters/readers removed in #366.
+  reserved "encoder_worst_peer_fps";
   optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
   optional bool screen_sharing_active = 28;        // Whether screen share is currently active
 
@@ -134,6 +148,69 @@ message HealthPacket {
   optional uint64 step_up_blocked_slowdown = 41;     // Cumulative blocks by recovery slowdown
   optional uint64 step_up_blocked_screen_share = 42; // Cumulative blocks by screen share ceiling
   repeated TierDwell tier_dwells = 43;               // Tier dwell samples since last packet
+
+  // Encoder error counters (cumulative, since page load).
+  // Server derives per-second rates via Prometheus rate().
+  optional uint64 camera_encoder_errors_closed_codec = 44;
+  optional uint64 camera_encoder_errors_vpx_mem_alloc = 45;
+  optional uint64 camera_encoder_errors_configure_fatal = 46;
+  optional uint64 camera_encoder_errors_generic = 47;
+  optional uint64 camera_encoder_frames_submitted_ok = 48;
+  optional uint64 screen_encoder_errors_closed_codec = 49;
+  optional uint64 screen_encoder_errors_vpx_mem_alloc = 50;
+  optional uint64 screen_encoder_errors_configure_fatal = 51;
+  optional uint64 screen_encoder_errors_generic = 52;
+  optional uint64 screen_encoder_frames_submitted_ok = 53;
+
+  // Connection-loss reason counters (cumulative since process start)
+  optional uint64 connection_handshake_failures_total = 54;
+  optional uint64 connection_session_drops_total = 55;
+
+  // TELEM-7: Static client metadata (re-sent every packet for late-joining observers)
+  optional uint32 client_cores = 56;                    // navigator.hardwareConcurrency
+  optional string client_architecture = 57;             // "x86" | "arm" | ""
+  optional string client_gpu_family = 58;               // Normalized GPU family name
+  optional string client_network_effective_type = 59;   // "4g" | "3g" | "2g" | "slow-2g"
+  optional double client_network_downlink = 60;         // Mbps from navigator.connection
+  optional uint32 client_network_rtt = 61;              // ms from navigator.connection
+  optional bool client_battery_charging = 62;           // Battery API charging state
+  optional double client_battery_level = 63;            // Battery API level 0.0-1.0
+  optional uint32 client_capability_score = 64;         // TELEM-6 benchmark iteration count
+
+  // TELEM-8: Long task durations accumulated since last health packet (ms)
+  repeated double longtask_durations_ms = 65;
+
+  // TELEM-9: Main-thread rAF cadence (frames per second)
+  optional double render_fps = 66;
+
+  // Compatibility field added after TELEM-7/8/9 consumed 56-66.
+  optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
+
+  // Adaptive decode-budget controller state (#987). Surfaces the receiver-side
+  // tile-cap decision so population-scale dashboards can see the adaptive loop's
+  // reasoning server-side instead of only in client console logs. Absent when
+  // the controller has not produced a snapshot yet (no peers / pre-warmup).
+  optional DecodeBudget decode_budget = 68;
+}
+
+// Receiver-side adaptive decode-budget state (#987). Mirrors the
+// AdaptiveQuality tier fields on HealthPacket: a periodic snapshot of the
+// current decision the local controller has reached for how many video tiles
+// to decode.
+message DecodeBudget {
+  uint32 effective_cap = 1;        // Current effective cap on simultaneously decoded tiles
+  uint32 natural = 2;              // Natural/unconstrained tile count the layout would show
+  bool pressured = 3;              // Pressured latch engaged (loop owns the cap)
+  OverrideMode override_mode = 4;  // Auto vs Fixed
+  // Set only when override_mode == OVERRIDE_MODE_FIXED: the user's hard tile cap.
+  uint32 override_fixed_n = 5;
+
+  // Manual override mode for the controller.
+  enum OverrideMode {
+    OVERRIDE_MODE_UNSPECIFIED = 0; // Treated as Auto by readers
+    OVERRIDE_MODE_AUTO = 1;        // Adaptive loop decides the cap
+    OVERRIDE_MODE_FIXED = 2;       // User hard-pinned the cap (see override_fixed_n)
+  }
 }
 
 message TierTransition {
@@ -148,4 +225,3 @@ message TierDwell {
   string tier = 1;       // Tier label (e.g. "hd_1080p")
   double dwell_ms = 2;   // Time spent in this tier before transitioning
 }
-

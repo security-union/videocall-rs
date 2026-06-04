@@ -49,7 +49,7 @@
 //! (RP-initiated logout via `end_session_endpoint` when configured).
 
 use crate::constants::{
-    login_url, logout_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
+    login_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
     oauth_redirect_url, oauth_scopes,
 };
 use crate::pkce::{self};
@@ -227,14 +227,18 @@ pub async fn check_session() -> anyhow::Result<()> {
     // guest — but only when no OAuth session could exist.  When PKCE-based
     // OAuth is active and tokens are present the user has logged in *after*
     // a guest session; bail-out would incorrectly reject a valid session.
-    if get_guest_session_id().is_some() {
-        let has_oauth_tokens = crate::constants::is_pkce_flow()
-            && (get_stored_access_token().is_some() || get_stored_id_token().is_some());
+    if get_guest_session_id().is_some() && crate::constants::is_pkce_flow() {
+        let has_oauth_tokens =
+            get_stored_access_token().is_some() || get_stored_id_token().is_some();
         if !has_oauth_tokens {
             clear_guest_session_id();
             return Err(anyhow!("guest session; no OAuth session cookie"));
         }
         // If OAuth tokens exist, fall through to normal check
+        clear_guest_session_id();
+    } else if get_guest_session_id().is_some() {
+        // Server-side OAuth: a backend session cookie may still be valid;
+        // clear the stale guest marker and fall through to the network check.
         clear_guest_session_id();
     }
     if crate::constants::is_pkce_flow()
@@ -522,28 +526,6 @@ pub fn redirect_not_authenticated(meeting_id: &str, allow_guests: bool) {
     } else {
         redirect_to_login();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Logout
-// ---------------------------------------------------------------------------
-
-/// Navigate the browser to the meeting-api `/logout` endpoint, clearing the
-/// stored id_token first.
-///
-/// Any `303` redirect to the OIDC provider's `end_session_endpoint` is
-/// followed as a real page load (terminating the provider session too).
-pub fn logout() -> Result<(), String> {
-    // Clear all session-scoped state before navigating away so subsequent
-    // requests are immediately unauthenticated, even if the navigation is slow.
-    clear_access_token();
-    clear_id_token();
-    clear_user_profile();
-    let url = logout_url()?;
-    window()
-        .location()
-        .set_href(&url)
-        .map_err(|e| format!("Navigation to logout URL failed: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------

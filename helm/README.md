@@ -47,3 +47,16 @@
 
 1. Update the tag in the videocall-website/values.yaml file
 1. Run ```helm dependency update && helm upgrade videocall-website . -f values.yaml```
+
+## Per-chart and per-environment READMEs
+
+- [`meeting-api/`](meeting-api/README.md) — meeting-api Helm chart (auth, OAuth,
+  room tokens, participant lifecycle, console-log collection).
+- [`external-dns/`](external-dns/README.md) — install notes for the external-DNS
+  chart.
+- [`digital-ocean-service-account/`](digital-ocean-service-account/README.md) —
+  Kubernetes dashboard / DigitalOcean service account setup notes.
+- [`global/us-east/grafana/`](global/us-east/grafana/README.md) — environment
+  values and resources for the us-east Grafana deployment.
+- [`global/us-east/postgres/`](global/us-east/postgres/README.md) — PostgreSQL
+  chart for the us-east region.

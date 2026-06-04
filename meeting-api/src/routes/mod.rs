@@ -15,6 +15,7 @@
 
 pub mod console_logs;
 pub mod dev;
+pub mod host;
 pub mod meetings;
 pub mod oauth;
 pub mod participants;
@@ -119,6 +120,19 @@ pub fn router() -> Router<AppState> {
         // Meeting CRUD
         .route("/api/v1/meetings", get(meetings::list_meetings))
         .route("/api/v1/meetings", post(meetings::create_meeting))
+        // Static segment registered before `{meeting_id}` so axum routes the
+        // literal path even though both share the `/api/v1/meetings/...` prefix.
+        // axum 0.8 already prefers static over dynamic, but the explicit order
+        // documents the intent and protects against future router changes.
+        .route(
+            "/api/v1/meetings/joined",
+            get(meetings::list_joined_meetings),
+        )
+        // Static segment registered before `{meeting_id}` so axum routes the
+        // literal path even though both share the `/api/v1/meetings/...`
+        // prefix. Returns the home-page feed: owned + admitted meetings,
+        // deduplicated, with server-computed `is_owner` on every row.
+        .route("/api/v1/meetings/feed", get(meetings::list_feed))
         .route("/api/v1/meetings/{meeting_id}", get(meetings::get_meeting))
         .route(
             "/api/v1/meetings/{meeting_id}",
@@ -185,6 +199,26 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/meetings/{meeting_id}/reject",
             post(waiting_room::reject_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/mute",
+            post(host::mute_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/mute-all",
+            post(host::mute_all),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/disable-video",
+            post(host::disable_video_participant),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/disable-video-all",
+            post(host::disable_video_all),
+        )
+        .route(
+            "/api/v1/meetings/{meeting_id}/kick",
+            post(host::kick_participant),
         )
         // Console log uploads
         .route(

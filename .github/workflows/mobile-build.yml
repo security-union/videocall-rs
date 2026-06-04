@@ -1,0 +1,109 @@
+name: Mobile Build Check
+
+on:
+  pull_request:
+    paths:
+      - 'videocall-ios/**'
+      - 'videocall-sdk/**'
+      - '.github/workflows/mobile-build.yml'
+  push:
+    tags:
+      - 'videocall-sdk-*'
+
+jobs:
+  build-ios:
+    name: Build iOS Library
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      
+      - name: Install cargo tools
+        run: |
+          cargo install cargo-lipo
+          cargo install bindgen-cli --force --locked
+      
+      - name: Build iOS library
+        run: |
+          cd videocall-sdk
+          ./build_ios.sh
+      
+      - name: Check XCFramework
+        run: |
+          if [ ! -d "videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework" ]; then
+            echo "XCFramework was not created successfully"
+            exit 1
+          fi
+          
+          # Check the structure
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers
+      
+      - name: Upload iOS artifacts
+        if: startsWith(github.ref, 'refs/tags/videocall-sdk-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: |
+            videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+            videocall-sdk/VideoCallKit/Sources/VideoCallKit/videocall.swift
+
+  build-android:
+    name: Build Android Library
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --install "ndk;25.2.9519653"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+      
+      - name: Build Android library
+        run: |
+          cd videocall-sdk
+          ./build_android.sh
+      
+      - name: Check AAR and Kotlin bindings
+        run: |
+          if [ ! -f "videocall-sdk/target/videocall-sdk.aar" ]; then
+            echo "AAR was not created successfully"
+            exit 1
+          fi
+          
+          if [ ! -f "videocall-sdk/target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
+            echo "Kotlin bindings were not created successfully"
+            exit 1
+          fi
+      
+      - name: Upload Android artifacts
+        if: startsWith(github.ref, 'refs/tags/videocall-sdk-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: |
+            videocall-sdk/target/videocall-sdk.aar
+            videocall-sdk/target/kotlin/com/videocall/uniffi/videocall.kt 

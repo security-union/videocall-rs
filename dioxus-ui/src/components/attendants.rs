@@ -16,15 +16,20 @@
  * conditions.
  */
 
+use crate::components::decode_budget::{
+    decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+};
+use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
+    capability_check::{assess_capability, CapabilityVerdict},
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
-    peer_list::PeerList,
+    peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
@@ -40,10 +45,14 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    load_appearance_settings_from_storage, resolve_transport_config,
-    save_appearance_settings_to_storage, save_display_name_to_storage, validate_display_name,
-    AppearanceSettingsCtx, DisplayNameCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, TransportPreference, TransportPreferenceCtx,
+    load_appearance_settings_from_storage, load_decode_budget_override, load_density_mode,
+    load_dock_autohide, load_dock_position, resolve_transport_config,
+    save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
+    save_dock_autohide, save_dock_position, validate_display_name, AppearanceSettingsCtx,
+    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
+    DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    TransportPreferenceCtx,
 };
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -51,54 +60,66 @@ use dioxus::web::WebEventExt;
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{
-    MediaAccessKind, MediaDeviceAccess, MediaPermission, MediaPermissionsErrorState,
-    PermissionState, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+    ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
+    MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
+    VideoCallClientOptions,
 };
-use wasm_bindgen::{closure::Closure, JsCast};
+#[cfg(feature = "media-server-jwt-auth")]
+use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
     Idle,
+    /// The browser's screen picker is open (getDisplayMedia Promise in flight).
+    /// The button is disabled but we have NOT yet told Host to start encoding.
     Requesting,
+    /// A MediaStream has been pre-acquired and stored in the shared
+    /// [`PreAcquiredScreenStream`] cell.  Host should consume the stream and
+    /// begin encoding via `ScreenEncoder::start_with_stream()`.
+    StreamReady,
     Active,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DockPosition {
-    Bottom,
-    Left,
-    Right,
+/// UI state of the screen-share visibility toast (HCL issue 893). @token-exempt
+///
+/// Walks through `Starting` -> `SuccessfullyShared` (on the first
+/// `PEER_EVENT(screen_decode_started)` ack from any peer) or
+/// `Failed(message)` (on a 10s timeout with no ack).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareToastState {
+    /// Local screen-share has started but no peer has confirmed visibility yet.
+    Starting,
+    /// At least one peer has acknowledged decoding our screen-share.
+    SuccessfullyShared,
+    /// The visibility window elapsed without any peer ack.
+    Failed(String),
 }
 
-impl DockPosition {
-    fn css_class(self) -> &'static str {
-        match self {
-            DockPosition::Bottom => "dock-bottom",
-            DockPosition::Left => "dock-left",
-            DockPosition::Right => "dock-right",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            DockPosition::Bottom => DockPosition::Left,
-            DockPosition::Left => DockPosition::Right,
-            DockPosition::Right => DockPosition::Bottom,
-        }
-    }
-}
+/// Shared cell that holds a pre-acquired `MediaStream` from `getDisplayMedia()`.
+///
+/// Safari requires `getDisplayMedia()` to be called synchronously within a
+/// user-gesture handler.  The onclick handler obtains the stream and stores it
+/// here; the `Host` component takes it out and passes it to
+/// `ScreenEncoder::start_with_stream()`.
+pub type PreAcquiredScreenStream = Rc<RefCell<Option<web_sys::MediaStream>>>;
 
 pub enum MediaErrorState {
     NoDevice,
     PermissionDenied,
     Other,
 }
+
+const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
+const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
@@ -110,7 +131,7 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
         },
         MediaErrorState::PermissionDenied => rsx! {
             p { " {device} is blocked in your browser." }
-            p { style: "front-size: 0.9rem; opacity: 0.8;",
+            p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
@@ -118,8 +139,16 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
 }
 
 impl ScreenShareState {
+    /// Returns `true` when a stream is ready or actively encoding -- i.e. when
+    /// the `Host` component should have `share_screen = true`.
+    ///
+    /// `Requesting` (picker dialog open) intentionally returns `false` so that
+    /// `Host` does not start the encoder before a stream is available.
     pub fn is_sharing(&self) -> bool {
-        !matches!(self, ScreenShareState::Idle)
+        matches!(
+            self,
+            ScreenShareState::StreamReady | ScreenShareState::Active
+        )
     }
 }
 
@@ -144,6 +173,41 @@ fn build_lobby_urls(token: &str, user_id: &str, id: &str) -> (Vec<String>, Vec<S
         .collect::<Vec<String>>();
 
     (websocket_urls, webtransport_urls)
+}
+
+/// Pure helper: combine the lobby URLs with the user's transport preference
+/// and the *current* server-side WebTransport-enabled flag.
+///
+/// Factored out so both component init AND `schedule_reconnect` go through
+/// exactly the same code path. Crucially, this means a reconnect happening
+/// after the runtime config finally loaded will see `server_wt_enabled ==
+/// true` even if the initial `use_hook` saw `false` — the previously empty
+/// WT URL list will populate, fixing the "stranded on a single server"
+/// regression from discussion 562 (Phase 7).
+///
+/// Returns `(effective_wt_enabled, websocket_urls, webtransport_urls)`.
+fn current_transport_urls(
+    token: &str,
+    user_id: &str,
+    id: &str,
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+) -> (bool, Vec<String>, Vec<String>) {
+    let (ws, wt) = build_lobby_urls(token, user_id, id);
+    current_transport_urls_from_lists(pref, server_wt_enabled, ws, wt)
+}
+
+/// Pure-logic core of [`current_transport_urls`] — takes already-built URL
+/// lists so it can be unit-tested without `window().__APP_CONFIG` being
+/// initialised. The wasm-only `current_transport_urls` is a thin wrapper
+/// that pairs `build_lobby_urls` with this function.
+fn current_transport_urls_from_lists(
+    pref: TransportPreference,
+    server_wt_enabled: bool,
+    ws_urls: Vec<String>,
+    wt_urls: Vec<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    resolve_transport_config(pref, server_wt_enabled, ws_urls, wt_urls)
 }
 
 fn play_user_joined() {
@@ -260,15 +324,25 @@ fn schedule_reconnect(
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
                     let latest_display_name = current_display_name();
-                    let (ws, wt) = build_lobby_urls(&new_token, &latest_display_name, &meeting_id);
 
-                    // Apply the user's transport preference so the reconnection
-                    // honours the same protocol selection as the initial connection.
+                    // Re-evaluate `webtransport_enabled()` at reconnect time —
+                    // not just at component init. If runtime config hadn't
+                    // loaded when `use_hook` ran, the WT URL list would have
+                    // been empty and `total_server_count() == 1` would have
+                    // suppressed re-election (see discussion 562, Phase 7).
+                    // Going through the same `current_transport_urls` helper
+                    // here means a delayed runtime config load now flows back
+                    // into the manager via `update_server_urls`.
                     let pref = transport_pref_signal();
                     let server_wt_enabled =
                         crate::constants::webtransport_enabled().unwrap_or(false);
-                    let (_enable_wt, ws, wt) =
-                        resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                    let (_enable_wt, ws, wt) = current_transport_urls(
+                        &new_token,
+                        &latest_display_name,
+                        &meeting_id,
+                        pref,
+                        server_wt_enabled,
+                    );
 
                     if let Some(client) = client_cell.borrow_mut().as_mut() {
                         client.update_server_urls(ws, wt);
@@ -348,8 +422,17 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
+/// Aspect ratio of a rendered tile in the participant grid.
+///
+/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
+/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
+/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
+/// than the tile and `place-self: center` will surface as visible internal
+/// padding around every tile.
+const TILE_AR: f64 = 3.0 / 2.0;
+
 /// Google Meet–style layout: try every column count, compute the maximum
-/// 16:9 tile size for each, and pick the variant with the largest tile area.
+/// 3:2 tile size for each, and pick the variant with the largest tile area.
 /// Returns `(cols, rows, tile_width)`.
 fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     if n == 0 {
@@ -359,7 +442,7 @@ fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
     let mut best_rows = 1_usize;
     let mut best_area = 0.0_f64;
     let mut best_tw = 0.0_f64;
-    let ar: f64 = 16.0 / 9.0;
+    let ar: f64 = TILE_AR;
 
     for cols in 1..=n {
         let rows = n.div_ceil(cols);
@@ -451,7 +534,6 @@ pub fn AttendantsComponent(
     e2ee_enabled: bool,
     #[props(default)] user_name: Option<String>,
     #[props(default)] user_id: Option<String>,
-    #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] host_display_name: Option<String>,
     #[props(default)] host_user_id: Option<String>,
     #[props(default)] auto_join: bool,
@@ -471,6 +553,8 @@ pub fn AttendantsComponent(
 
     // --- State signals ---
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
+    let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
+    let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
 
     let mut mic_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
@@ -479,8 +563,9 @@ pub fn AttendantsComponent(
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
-    let mut dock_position: Signal<DockPosition> = use_signal(|| DockPosition::Bottom);
+    let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
     let mut dock_menu_open = use_signal(|| false);
+    let mut autohide_enabled = use_signal(load_dock_autohide);
     let encoder_settings = use_signal(|| None::<String>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
@@ -489,8 +574,75 @@ pub fn AttendantsComponent(
     // Per-peer join time: session_id → first-seen timestamp (ms).
     // Used as fallback ordering when no speech data exists.
     let mut peer_join_time: Signal<HashMap<String, f64>> = use_signal(HashMap::new);
-    let mut density_mode: Signal<DensityMode> = use_signal(|| DensityMode::Auto);
+    let mut density_mode: Signal<DensityMode> = use_signal(load_density_mode);
     let mut density_open = use_signal(|| false);
+    // --- Adaptive decode budget (issue #987, task 1a.3) ---
+    // Manual override for the adaptive controller. `Auto` runs the loop;
+    // `Fixed(n)` is a hard override that bypasses the loop entirely. Task 1a.5
+    // (settings UI) mutates this through the `DecodeBudgetCtx` provided below.
+    // Loaded first so the initial `decode_budget_cap` can honour a persisted
+    // `Fixed(n)` immediately (no first-render flash; HCL #987 review FIX 2).
+    let decode_budget_override = use_signal(load_decode_budget_override);
+    // `decode_budget_cap` is the control-loop-owned cap: the maximum number of
+    // video tiles the layout may decode AFTER the loop has measured real
+    // pressure. It is NOT the actuator on its own — see the render-side
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2).
+    //
+    // Cap-ownership model (replaces the old one-shot seed latches):
+    //   - `Fixed(n)`: the render-side `effective_cap` clamps `n` directly, so a
+    //     manual "show N tiles" choice takes effect on the NEXT render with NO
+    //     dependency on a `client_render_fps` diagnostics event. The loop also
+    //     clamps `decode_budget_cap` as a backstop / state bookkeeping.
+    //   - `Auto`, never pressured: `effective_cap` tracks the live natural tile
+    //     count EXACTLY (== `total_tiles`, ∩ CANVAS_LIMIT). A healthy machine
+    //     therefore shows ALL natural tiles from the first render and keeps
+    //     showing every peer that joins later (staggered joins) with ZERO
+    //     avatars — independent of any FPS-event timing. `decode_budget_cap` is
+    //     NOT consulted on this path; the loop keeps `state.cap` synced to
+    //     `natural` so the first down-step starts from the displayed value.
+    //   - `Auto`, pressured: once the loop has measured sustained pressure and
+    //     taken a down-step, `decode_budget_pressured` latches true and the loop
+    //     becomes the sole owner of `decode_budget_cap`, applying its
+    //     conservative anti-oscillation growth. `effective_cap` then reads
+    //     `decode_budget_cap`.
+    let initial_cap = match *decode_budget_override.peek() {
+        DecodeBudgetOverride::Fixed(n) => n.clamp(MIN_CAP, CANVAS_LIMIT),
+        DecodeBudgetOverride::Auto => MIN_CAP,
+    };
+    let mut decode_budget_cap = use_signal(|| initial_cap);
+    // "Has a pressure-driven down-step occurred this Auto session?" (HCL #987
+    // review FIX 1 + FIX 2). While `false`, an Auto cap tracks the natural tile
+    // count exactly (render-side `effective_cap`), so a capable machine shows
+    // every peer — including staggered joins — with no avatars and no dependence
+    // on the ~1 Hz control-loop cadence. The control loop latches this `true`
+    // the first time `decide_step` returns `Down`, after which the loop owns the
+    // cap with its conservative growth. The latch stays set for the rest of the
+    // Auto session (a machine that has demonstrated it can struggle stays in
+    // conservative adaptive mode — safe, and only affects machines that genuinely
+    // hit pressure). It is reset to `false` on a Fixed -> Auto transition so
+    // resuming Auto re-reveals all natural tiles immediately.
+    let mut decode_budget_pressured = use_signal(|| false);
+    // Previous value of `decode_budget_override`, tracked in render scope so a
+    // render-driven `use_effect` can detect a Fixed -> Auto transition and reset
+    // the pressured latch IMMEDIATELY, with no dependence on the ~1 Hz control
+    // loop (HCL #987 review). Seeded to the current override so the very first
+    // render observes no transition. Read via `.peek()` inside the effect (never
+    // reactively) so writing it back cannot self-retrigger the effect.
+    let mut prev_override = use_signal(|| *decode_budget_override.peek());
+    // The uncapped layout tile count (`total_tiles`), republished from render
+    // so the async control loop can pass it to `decide_step` as `natural_count`
+    // and never raise the cap above what the layout would actually show.
+    // Seeded at MIN_CAP (matching the Auto cap seed pre-join); render overwrites
+    // it with the live `total_tiles` on the first frame, after which the loop
+    // seeds/tracks the cap up to it.
+    let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Last decode-budget snapshot published to the diagnostics bus (for the
+    // HEALTH packet, #987 P3): (effective_cap, natural_capped, pressured,
+    // is_fixed, fixed_n). Tracked so the publisher effect only emits a bus
+    // event when the decision actually moves, never per unrelated render. Read
+    // via `.peek()` inside that effect (never reactively) so writing it back
+    // cannot self-retrigger the effect.
+    let mut prev_db_snapshot = use_signal(|| (MIN_CAP, MIN_CAP, false, false, 0usize));
     // Viewport size signal — updated on window resize so layout recomputes.
     let mut viewport_version = use_signal(|| 0u32);
     {
@@ -532,7 +684,9 @@ pub fn AttendantsComponent(
             let nt_inner = nt1.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                controls_expanded.set(false);
+                if autohide_enabled() {
+                    controls_expanded.set(false);
+                }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -546,7 +700,9 @@ pub fn AttendantsComponent(
             let ht_inner = ht1.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                controls_visible.set(false);
+                if autohide_enabled() {
+                    controls_visible.set(false);
+                }
             });
             let id = win1
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -577,7 +733,9 @@ pub fn AttendantsComponent(
             let nt_inner = nt2.clone();
             let narrow_cb = Closure::<dyn FnMut()>::once(move || {
                 nt_inner.borrow_mut().take();
-                controls_expanded.set(false);
+                if autohide_enabled() {
+                    controls_expanded.set(false);
+                }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -590,7 +748,9 @@ pub fn AttendantsComponent(
             let ht_inner = ht2.clone();
             let hide_cb = Closure::<dyn FnMut()>::once(move || {
                 ht_inner.borrow_mut().take();
-                controls_visible.set(false);
+                if autohide_enabled() {
+                    controls_visible.set(false);
+                }
             });
             let id = win2
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -609,7 +769,9 @@ pub fn AttendantsComponent(
         let nt_init = narrow_timer.clone();
         let narrow_init = Closure::<dyn FnMut()>::once(move || {
             nt_init.borrow_mut().take();
-            controls_expanded.set(false);
+            if autohide_enabled() {
+                controls_expanded.set(false);
+            }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -623,7 +785,9 @@ pub fn AttendantsComponent(
         let ht_init = hide_timer.clone();
         let hide_init = Closure::<dyn FnMut()>::once(move || {
             ht_init.borrow_mut().take();
-            controls_visible.set(false);
+            if autohide_enabled() {
+                controls_visible.set(false);
+            }
         });
         let id = win
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -635,7 +799,16 @@ pub fn AttendantsComponent(
         hide_init.forget();
     });
 
+    use_effect(move || {
+        if !autohide_enabled() {
+            controls_visible.set(true);
+            controls_expanded.set(true);
+        }
+    });
+
     let mut device_settings_open = use_signal(|| false);
+    let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
+    let mut device_settings_generation = use_signal(|| 0u32);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -649,6 +822,10 @@ pub fn AttendantsComponent(
     let meeting_ended_message = use_signal(|| None::<String>);
     let mut meeting_info_open = use_signal(|| false);
     let peer_list_version = use_signal(|| 0u32);
+    // Phase 6 render-storm fix: shared "bump pending?" flag for the
+    // `peer_speaking` event handler. Lives on a `use_hook` so it survives
+    // across renders. See `schedule_throttled_bump`.
+    let peer_list_bump_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut screen_share_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
     let mic_error = use_signal(|| None::<MediaErrorState>);
@@ -674,11 +851,23 @@ pub fn AttendantsComponent(
     let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
+    // Pre-join capability verdict (Phase 9). Computed once at component mount —
+    // hardware concurrency / UA platform don't change while the page is open.
+    // Block / StrongWarn surfaces UI in the lobby below; Ok proceeds normally.
+    let capability_verdict = use_hook(assess_capability);
+    // Has the user explicitly dismissed the StrongWarn modal? Once true the
+    // join button (and the auto_join effect) proceeds normally for the rest
+    // of the lobby session.
+    let mut capability_acknowledged = use_signal(|| false);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    let show_muted_toast: Signal<bool> = use_signal(|| false);
+    let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
+    let show_video_off_toast: Signal<bool> = use_signal(|| false);
+    let video_off_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
     // Create the peer status map signal early so it can be captured by the
@@ -689,10 +878,24 @@ pub fn AttendantsComponent(
     // up departed peers' histories. Provided as context alongside PeerStatusMap.
     let peer_signal_history_map: PeerSignalHistoryMap = use_signal(HashMap::new);
 
+    // HCL bug #8 + #9: per-(peer, mode) signal-popup state map, owned by
+    // the parent so PeerTile remounts (peer leaves, layout switches) do
+    // not unmount the popup containers and accidentally close every
+    // other peer's open popup. Cleaned up alongside
+    // `peer_signal_history_map` when peers leave so we don't leak
+    // entries for departed peers.
+    let signal_popup_state_map: SignalPopupStateMap = use_signal(HashMap::new);
+
+    // Per-tile crop state — created early so on_peer_removed can clean up.
+    let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let transport_pref = (transport_pref_ctx.0)();
+
+    // Create the appearance settings signal on_peer_joined / on_peer_left callbacks
+    let appearance_settings = use_signal(load_appearance_settings_from_storage);
 
     // Create VideoCallClient and MediaDeviceAccess once.
     // We use an Rc<RefCell<Option<VideoCallClient>>> so the on_connection_lost
@@ -712,16 +915,21 @@ pub fn AttendantsComponent(
         let token = String::new();
 
         let initial_display_name = current_display_name();
-        let (websocket_urls, webtransport_urls) =
-            build_lobby_urls(&token, &initial_display_name, &id);
 
-        // Apply user's transport preference
+        // Apply user's transport preference. The `webtransport_enabled()`
+        // read here is the *initial* value — runtime config may not have
+        // loaded yet, in which case it returns `false` and `Auto` resolves
+        // to a WS-only URL list. The reconnect path goes through the same
+        // `current_transport_urls` helper so a later runtime-config load
+        // can repopulate the WT list and recover the user from the
+        // "stranded on a single server" state (discussion 562, Phase 7).
         let server_wt_enabled = crate::constants::webtransport_enabled().unwrap_or(false);
-        let (effective_wt_enabled, websocket_urls, webtransport_urls) = resolve_transport_config(
+        let (effective_wt_enabled, websocket_urls, webtransport_urls) = current_transport_urls(
+            &token,
+            &initial_display_name,
+            &id,
             transport_pref,
             server_wt_enabled,
-            websocket_urls,
-            webtransport_urls,
         );
 
         log::info!(
@@ -732,6 +940,7 @@ pub fn AttendantsComponent(
 
         let client_for_reconnect: Rc<RefCell<Option<VideoCallClient>>> =
             Rc::new(RefCell::new(None));
+        let client_for_kick = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
 
@@ -787,9 +996,12 @@ pub fn AttendantsComponent(
             on_connection_lost: {
                 let id = id.clone();
                 let client_cell = client_for_reconnect.clone();
-                VcCallback::from(move |reason: wasm_bindgen::JsValue| {
-                    let reason_str = reason.as_string().unwrap_or_else(|| format!("{reason:?}"));
-                    log::warn!("DIOXUS-UI: Connection lost — reason: {reason_str}");
+                VcCallback::from(move |reason: ConnectionLostReason| {
+                    log::warn!(
+                        "DIOXUS-UI: Connection lost ({}): {}",
+                        reason.label(),
+                        reason.message()
+                    );
                     let mut connection_error = connection_error;
                     let meeting_ended_message = meeting_ended_message;
                     connection_error.set(Some("Connection lost, reconnecting...".to_string()));
@@ -841,18 +1053,49 @@ pub fn AttendantsComponent(
                 //
                 // Note: we rebind to a local `mut` copy so the closure stays
                 // `Fn` (Signal is Copy; only the local is mutated each call).
+                //
+                // Phase 6 (cc7tp 2026-05-06): the `peer_list_version` bump
+                // moved to `on_peers_removed_batch` below so that a 5-peer
+                // watchdog cascade fires one re-render instead of five.
+                // Per-peer cleanup of side-maps stays here — these are O(1)
+                // and observers may rely on the per-peer fan-out.
                 let mut map = peer_status_map;
                 map.write().remove(&peer_id);
                 // Also remove the departed peer's signal history so the shared
                 // map does not grow unboundedly over long meetings.
                 let mut hist_map = peer_signal_history_map;
                 hist_map.write().remove(&peer_id);
+                // HCL bug #8: drop only this peer's open signal-meter popup
+                // entries; every other peer's popup state stays intact so
+                // their popups remain visible across the parent re-render.
+                let mut popup_map = signal_popup_state_map;
+                popup_map.write().retain(|(pid, _mode), _| pid != &peer_id);
                 let mut speech_map = peer_speech_priority;
                 speech_map.write().remove(&peer_id);
                 let mut jt_map = peer_join_time;
                 jt_map.write().remove(&peer_id);
+                let mut ct_map = cropped_tiles_signal;
+                ct_map.write().remove(&peer_id);
+                ct_map.write().remove(&format!("screen-share-{peer_id}"));
+            })),
+            on_peers_removed_batch: Some(VcCallback::from(move |peer_ids: Vec<String>| {
+                // Phase 6 fix: bump `peer_list_version` exactly once per
+                // removal pass, not once per dead peer. When the
+                // PeerDecodeManager watchdog times out N peers in a single
+                // tick (cc7tp incident: N=5), the per-peer
+                // `on_peer_removed` callback still fires N times for
+                // side-map cleanup, but the version-driven re-render
+                // happens only once.
+                if peer_ids.is_empty() {
+                    return;
+                }
+                log::info!(
+                    "Batched peer removal: {} peer(s) removed in one pass",
+                    peer_ids.len()
+                );
                 let mut v = peer_list_version;
-                v.set(v() + 1);
+                let next = *v.peek() + 1;
+                v.set(next);
             })),
             get_peer_video_canvas_id: VcCallback::from(|id| id),
             get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
@@ -873,8 +1116,18 @@ pub fn AttendantsComponent(
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
                     let mut meeting_start_time_server = meeting_start_time_server;
                     let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
                     meeting_start_time_server.set(Some(end_time_ms));
                     meeting_ended_message.set(Some(message));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
                 },
             )),
             on_speaking_changed: Some(VcCallback::from(move |speaking: bool| {
@@ -908,24 +1161,20 @@ pub fn AttendantsComponent(
                     .await
                     {
                         Ok(status) => {
-                            let waiting_room_enabled = status.waiting_room_enabled.unwrap_or(true);
-                            if waiting_room_toggle() != waiting_room_enabled {
-                                waiting_room_toggle.set(waiting_room_enabled);
+                            if waiting_room_toggle() != status.waiting_room_enabled {
+                                waiting_room_toggle.set(status.waiting_room_enabled);
                             }
 
-                            let admitted_can_admit = status.admitted_can_admit.unwrap_or(false);
-                            if admitted_can_admit_toggle() != admitted_can_admit {
-                                admitted_can_admit_toggle.set(admitted_can_admit);
+                            if admitted_can_admit_toggle() != status.admitted_can_admit {
+                                admitted_can_admit_toggle.set(status.admitted_can_admit);
                             }
 
-                            let end_on_host_leave = status.end_on_host_leave.unwrap_or(true);
-                            if end_on_host_leave_toggle() != end_on_host_leave {
-                                end_on_host_leave_toggle.set(end_on_host_leave);
+                            if end_on_host_leave_toggle() != status.end_on_host_leave {
+                                end_on_host_leave_toggle.set(status.end_on_host_leave);
                             }
 
-                            let allow_guests = status.allow_guests.unwrap_or(false);
-                            if allow_guests_toggle() != allow_guests {
-                                allow_guests_toggle.set(allow_guests);
+                            if allow_guests_toggle() != status.allow_guests {
+                                allow_guests_toggle.set(status.allow_guests);
                             }
                         }
                         Err(e) => {
@@ -934,54 +1183,178 @@ pub fn AttendantsComponent(
                     }
                 });
             })),
+            // The host's own client must NOT mute itself on mute-all — guard here
+            // by skipping the callback entirely when is_owner is true.
+            on_host_mute: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("HOST_MUTE: muting local microphone on host request");
+                    let mut mic_enabled = mic_enabled;
+                    let mut show_muted_toast = show_muted_toast;
+                    let mut toast_timer = toast_timer;
+                    mic_enabled.set(false);
+                    show_muted_toast.set(true);
+                    // Cancel any pending dismiss timer before scheduling a new one.
+                    toast_timer.set(None);
+                    toast_timer.set(Some(Timeout::new(6_000, move || {
+                        let mut show_muted_toast = show_muted_toast;
+                        let mut toast_timer = toast_timer;
+                        show_muted_toast.set(false);
+                        toast_timer.set(None);
+                    })));
+                }))
+            },
+            // Host's own client must NOT disable its own camera on disable-video-all —
+            // skip the callback entirely when is_owner is true (client-side guard).
+            //
+            // Self-protection model:
+            //   • disable-video-all  → client-side only: is_owner check here prevents the
+            //     host from receiving the broadcast as a target of its own "disable video for all" action.
+            //   • disable-video (single-target) → server-side: routes/host.rs rejects any
+            //     request where body.user_id == the authenticated caller's user_id.
+            //
+            on_host_disable_video: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    log::info!("HOST_DISABLE_VIDEO: disabling local camera on host request");
+                    let mut video_enabled = video_enabled;
+                    let mut show_video_off_toast = show_video_off_toast;
+                    let mut video_off_toast_timer = video_off_toast_timer;
+                    video_enabled.set(false);
+                    show_video_off_toast.set(true);
+                    video_off_toast_timer.set(None);
+                    video_off_toast_timer.set(Some(Timeout::new(6_000, move || {
+                        let mut show_video_off_toast = show_video_off_toast;
+                        let mut video_off_toast_timer = video_off_toast_timer;
+                        show_video_off_toast.set(false);
+                        video_off_toast_timer.set(None);
+                    })));
+                }))
+            },
+            on_participant_kicked: if is_owner {
+                None
+            } else {
+                Some(VcCallback::from(move |_: ()| {
+                    let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
+                    meeting_ended_message.set(Some(
+                        "You have been removed from the meeting by the host.".to_string(),
+                    ));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
+                    log::info!("PARTICIPANT_KICKED: removed from meeting by host");
+                    if let Some(client) = client_for_kick.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+                        }
+                    }
+                }))
+            },
+            on_peer_event: Some(VcCallback::from(
+                move |(source_user_id, event_type, _stream_id): (String, String, String)| {
+                    if event_type != videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
+                        log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
+                        return;
+                    }
+                    log::info!("PEER_EVENT screen_decode_started received from {source_user_id}");
+                    let mut screen_share_toast_state = screen_share_toast_state;
+                    let mut screen_share_toast_timer = screen_share_toast_timer;
+                    if !matches!(
+                        screen_share_toast_state.peek().as_ref(),
+                        Some(ScreenShareToastState::Starting)
+                    ) {
+                        return;
+                    }
+                    screen_share_toast_state.set(Some(ScreenShareToastState::SuccessfullyShared));
+                    screen_share_toast_timer.set(Some(Timeout::new(4_000, move || {
+                        let mut s = screen_share_toast_state;
+                        if matches!(
+                            s.peek().as_ref(),
+                            Some(ScreenShareToastState::SuccessfullyShared)
+                        ) {
+                            s.set(None);
+                        }
+                    })));
+                },
+            )),
             on_peer_left: {
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
+                    move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
-                        let mut toast_counter = toast_counter;
-                        let mut peer_toasts = peer_toasts;
-                        let mut toast_version = toast_version;
-                        let id = *toast_counter.peek();
-                        toast_counter.set(id + 1);
-                        let mut current = peer_toasts.peek().clone();
-                        current.push((id, display_name, user_id, false));
-                        peer_toasts.set(current);
-                        {
-                            let v = *toast_version.peek();
-                            toast_version.set(v + 1);
-                        }
-                        // Defer the leave sound: only play if the toast still exists
-                        // after 500ms (i.e. no join event cancelled it).
-                        Timeout::new(500, move || {
-                            if peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id) {
-                                play_user_left();
-                            }
-                        })
-                        .forget();
-                        // Schedule toast removal after 8 seconds.
-                        Timeout::new(8_000, move || {
-                            let updated: Vec<_> = peer_toasts
-                                .peek()
-                                .iter()
-                                .filter(|(tid, _, _, _)| *tid != id)
-                                .cloned()
-                                .collect();
-                            peer_toasts.set(updated);
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
+
+                        if show_toast {
+                            let mut toast_counter = toast_counter;
+                            let mut peer_toasts = peer_toasts;
+                            let mut toast_version = toast_version;
+                            let id = *toast_counter.peek();
+                            toast_counter.set(id + 1);
+                            let mut current = peer_toasts.peek().clone();
+                            current.push((id, display_name, user_id, false));
+                            peer_toasts.set(current);
                             {
                                 let v = *toast_version.peek();
                                 toast_version.set(v + 1);
                             }
-                        })
-                        .forget();
+                            // Defer the leave sound: only play if the toast still exists
+                            // after 500ms (i.e. no join event cancelled it).
+                            Timeout::new(500, move || {
+                                if play_sound
+                                    && peer_toasts.peek().iter().any(|(tid, _, _, _)| *tid == id)
+                                {
+                                    play_user_left();
+                                }
+                            })
+                            .forget();
+                            // Schedule toast removal after 8 seconds.
+                            Timeout::new(8_000, move || {
+                                let updated: Vec<_> = peer_toasts
+                                    .peek()
+                                    .iter()
+                                    .filter(|(tid, _, _, _)| *tid != id)
+                                    .cloned()
+                                    .collect();
+                                peer_toasts.set(updated);
+                                {
+                                    let v = *toast_version.peek();
+                                    toast_version.set(v + 1);
+                                }
+                            })
+                            .forget();
+                        } else if play_sound {
+                            play_user_left();
+                        }
                     },
                 ))
             },
             on_peer_joined: {
                 let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
-                    move |(display_name, user_id): (String, String)| {
-                        log::debug!("TOAST-RX: peer joined: {} ({})", display_name, user_id);
+                    move |(display_name, user_id, session_id): (String, String, String)| {
+                        log::debug!(
+                            "TOAST-RX: peer joined: {} ({}, session={})",
+                            display_name,
+                            user_id,
+                            session_id
+                        );
+
+                        let settings = appearance_settings.peek();
+                        let show_toast = settings.show_join_leave_notifications;
+                        let play_sound = settings.play_join_leave_sounds;
+                        drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
                             if client.is_reconnecting() {
@@ -990,9 +1363,30 @@ pub fn AttendantsComponent(
                                     user_id
                                 );
                                 true
-                            } else if client.has_peer_with_user_id(&user_id) {
+                            } else if !session_id.is_empty()
+                                && client.has_peer_with_session_id(&session_id)
+                            {
+                                // Suppress when THIS exact session is already
+                                // tracked — e.g. a reconnect replays the
+                                // PARTICIPANT_JOINED for an existing session
+                                // we still hold in the peer list. Sibling
+                                // same-user sessions have a distinct
+                                // session_id and therefore still surface a
+                                // toast (HCL issue 828).
                                 log::debug!(
-                                    "Suppressing join toast for {} (already in peer list)",
+                                    "Suppressing join toast for {} (session {} already in peer list)",
+                                    user_id,
+                                    session_id
+                                );
+                                true
+                            } else if session_id.is_empty()
+                                && client.has_peer_with_user_id(&user_id)
+                            {
+                                // Legacy fallback: if the server didn't stamp
+                                // a session_id, fall back to user-id-only
+                                // suppression to preserve pre-issue-828 behaviour.
+                                log::debug!(
+                                    "Suppressing join toast for {} (already in peer list, no session_id)",
                                     user_id
                                 );
                                 true
@@ -1009,8 +1403,10 @@ pub fn AttendantsComponent(
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
 
-                        if !suppress_toast {
-                            play_user_joined();
+                        if !suppress_toast && show_toast {
+                            if play_sound {
+                                play_user_joined();
+                            }
                             let id = *toast_counter.peek();
                             toast_counter.set(id + 1);
                             current.push((id, display_name, user_id, true));
@@ -1034,6 +1430,9 @@ pub fn AttendantsComponent(
                             })
                             .forget();
                         } else {
+                            if !suppress_toast && play_sound {
+                                play_user_joined();
+                            }
                             peer_toasts.set(current);
                         }
 
@@ -1044,52 +1443,183 @@ pub fn AttendantsComponent(
                     },
                 ))
             },
-            on_display_name_changed: Some(VcCallback::from(
-                move |(changed_user_id, new_display_name): (String, String)| {
+            on_display_name_changed: Some(VcCallback::from({
+                // The client is installed into this cell after
+                // `VideoCallClient::new` returns, so it is guaranteed to be
+                // `Some` by the time any DISPLAY_NAME_CHANGED broadcast arrives.
+                let client_cell = client_for_reconnect.clone();
+                move |(changed_user_id, new_display_name, event_session_id): (
+                    String,
+                    String,
+                    u64,
+                )| {
                     log::info!(
-                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\"",
+                        "DIOXUS-UI: DISPLAY_NAME_CHANGED received: user={} new_name=\"{}\" session_id={}",
                         changed_user_id,
                         new_display_name,
+                        event_session_id,
                     );
 
                     if user_id_for_display_name_changed.as_deref() == Some(changed_user_id.as_str())
                     {
-                        match validate_display_name(&new_display_name) {
-                            Ok(validated_name) => {
-                                log::info!(
-                                    "DIOXUS-UI: Local user display name confirmed by server: {}",
-                                    validated_name
-                                );
-                                save_display_name_to_storage(&validated_name);
-                                let mut current_display_name = current_display_name;
-                                current_display_name.set(validated_name.clone());
-                                let mut dn_ctx = display_name_ctx_signal;
-                                dn_ctx.set(Some(validated_name));
-                                log::debug!("DIOXUS-UI: current_display_name signal updated");
+                        // Resolve the local tab's own session_id (assigned by
+                        // SESSION_ASSIGNED). Parsed to u64 to compare against
+                        // the wire-format session_id from the meeting packet.
+                        let own_session_id: Option<u64> = client_cell
+                            .borrow()
+                            .as_ref()
+                            .and_then(|c| c.get_own_session_id())
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        // Gate the local-self update on session_id so sibling
+                        // tabs of the same authenticated user don't overwrite
+                        // their own self display name. `event_session_id == 0`
+                        // is the legacy broadcast (applies to all sessions).
+                        let is_for_this_session = if event_session_id == 0 {
+                            true
+                        } else {
+                            own_session_id == Some(event_session_id)
+                        };
+
+                        if is_for_this_session {
+                            match validate_display_name(&new_display_name) {
+                                Ok(validated_name) => {
+                                    log::info!(
+                                        "DIOXUS-UI: Local user display name confirmed by server (session match): {}",
+                                        validated_name
+                                    );
+                                    save_display_name_to_storage(&validated_name);
+                                    let mut current_display_name = current_display_name;
+                                    current_display_name.set(validated_name.clone());
+                                    let mut dn_ctx = display_name_ctx_signal;
+                                    dn_ctx.set(Some(validated_name));
+                                    log::debug!("DIOXUS-UI: current_display_name signal updated");
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
+                                        new_display_name,
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "DIOXUS-UI: Ignoring invalid display name from server: {:?} ({})",
-                                    new_display_name,
-                                    e
-                                );
-                            }
+                        } else {
+                            log::info!(
+                                "DIOXUS-UI: Skipping local-self update — rename event \
+                                 targets sibling session {} (our session: {:?})",
+                                event_session_id,
+                                own_session_id,
+                            );
                         }
                     }
 
                     let mut v = peer_display_name_version;
                     v.set(v() + 1);
                     log::debug!("DIOXUS-UI: peer_display_name_version bumped");
-                },
-            )),
+                }
+            })),
             // Full call participant: decode and play all inbound media.
             decode_media: true,
+            // Honour user transport preference: only allow the connection
+            // manager's post-rebase re-election retry when the user is on
+            // the default `WebTransport` mode (which advertises BOTH URL
+            // lists to the manager). A manual `WebSocket` selection is a
+            // deliberate single-transport choice and the retry must not
+            // override it — the single-candidate state in that mode is
+            // intentional, not a recoverable system condition.
+            allow_post_rebase_retry: transport_pref == TransportPreference::WebTransport,
+            // Phase 3 / AUTH-2 — discussion 562: let the connection
+            // manager preempt token expiry from inside its internal
+            // re-election. Without this, the manager re-uses the cached
+            // server URLs (with the original JWT in the query string) and
+            // every candidate gets rejected by the relay once the token
+            // has expired; only the UI-level `schedule_reconnect` path
+            // would eventually refresh — by which time the user has
+            // already perceived a disconnect.
+            //
+            // We supply this callback ONLY in the JWT-auth build, which is
+            // the build with token expiry at all. The non-JWT build keeps
+            // re-election simple (no refresh exists to perform).
+            #[cfg(feature = "media-server-jwt-auth")]
+            refresh_room_token_callback: {
+                let meeting_id_for_refresh = id.clone();
+                let display_name_signal = current_display_name;
+                let transport_pref_signal = transport_pref_ctx.0;
+                Some(RefreshRoomTokenCallback::from(move || {
+                    let meeting_id = meeting_id_for_refresh.clone();
+                    async move {
+                        match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                            Ok(new_token) => {
+                                let dn = display_name_signal();
+                                let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
+                                // Apply the user's transport preference so
+                                // the refreshed URL list matches what
+                                // the initial connection (and the existing
+                                // schedule_reconnect path) would build.
+                                let pref = transport_pref_signal();
+                                let server_wt_enabled =
+                                    crate::constants::webtransport_enabled().unwrap_or(false);
+                                let (_enable_wt, ws, wt) =
+                                    resolve_transport_config(pref, server_wt_enabled, ws, wt);
+                                log::info!(
+                                    "DIOXUS-UI: refresh_room_token_callback succeeded — providing {} ws / {} wt URLs to ConnectionManager",
+                                    ws.len(),
+                                    wt.len(),
+                                );
+                                Some(RefreshedTokens {
+                                    websocket_urls: ws,
+                                    webtransport_urls: wt,
+                                })
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "DIOXUS-UI: refresh_room_token_callback failed ({e}); ConnectionManager will re-election with cached URLs"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }))
+            },
+            #[cfg(not(feature = "media-server-jwt-auth"))]
+            refresh_room_token_callback: None,
         };
 
         let client = VideoCallClient::new(opts);
         *client_for_reconnect.borrow_mut() = Some(client.clone());
         client
     });
+
+    // Tear the VideoCallClient down synchronously when this component
+    // unmounts (Hangup button, browser back-nav, route push, route replace,
+    // tab close — every path Dioxus surfaces as a scope drop).
+    //
+    // The client is `Clone` and shares state through `Rc` handles. Several
+    // internal callbacks captured during `VideoCallClient::new` hold strong
+    // clones of the client (peer_decode_manager.send_packet,
+    // diagnostics.packet_handler, health_reporter's spawn_local future),
+    // forming `Rc` cycles that prevent `Inner` from ever dropping on its
+    // own. Without this hook an in-tab SPA route swap on the meeting page
+    // leaks the entire `VideoCallClient` — transports, encoders, atomics
+    // — for tens of seconds, until the server eventually tears the
+    // session down. That leak caused the cc7tp meeting incident on
+    // 2026-05-01 (UI panics, dropped media packets, ghost participant,
+    // spurious MEETING_ENDED broadcast).
+    //
+    // `disconnect()` is idempotent and safe to call even when the client
+    // never connected, and it kicks off async transport teardown via
+    // `ConnectionController::disconnect` while returning synchronously,
+    // so the next mount cannot race a still-running predecessor.
+    {
+        let client_for_drop = client.clone();
+        use_drop(move || {
+            log::info!("DIOXUS-UI: AttendantsComponent unmounted - disconnecting VideoCallClient");
+            if let Err(e) = client_for_drop.disconnect() {
+                log::warn!("DIOXUS-UI: VideoCallClient disconnect on unmount failed: {e}");
+            }
+        });
+    }
 
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
@@ -1179,12 +1709,14 @@ pub fn AttendantsComponent(
     });
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
+    // Only fires for users already in-meeting who had a prior denial — on the
+    // pre-join screen (meeting_joined=false) this is a no-op.
     {
         let mda = mda.clone();
         use_effect(move || {
             let value = mda.clone();
             let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-                if session_loaded() || connecting() {
+                if !meeting_joined() || session_loaded() || connecting() {
                     return;
                 }
 
@@ -1217,7 +1749,6 @@ pub fn AttendantsComponent(
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
     let _ = local_audio_level_ctx.0;
-    let appearance_settings = use_signal(load_appearance_settings_from_storage);
     use_context_provider(|| AppearanceSettingsCtx(appearance_settings));
     let appearance_save_timeout: Rc<RefCell<Option<Timeout>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
@@ -1245,6 +1776,14 @@ pub fn AttendantsComponent(
         }
     });
 
+    // Shared cell for passing a pre-acquired screen share MediaStream from
+    // the click handler to the Host component.  Safari requires getDisplayMedia()
+    // to be called synchronously inside a user gesture, so we obtain the stream
+    // in the button onclick and hand it off to the encoder via this cell.
+    let pre_acquired_screen_stream: PreAcquiredScreenStream =
+        use_hook(|| Rc::new(RefCell::new(None)));
+    use_context_provider(|| pre_acquired_screen_stream.clone());
+
     // Provide the peer status map as context for child PeerTile components.
     // The signal was created earlier so on_peer_removed can capture it.
     use_context_provider(|| peer_status_map);
@@ -1254,11 +1793,31 @@ pub fn AttendantsComponent(
     // by layout switches (grid -> split when screen sharing starts).
     use_context_provider(|| peer_signal_history_map);
 
+    // HCL bug #8 + #9: provide the popup-state map so PeerTile can look up
+    // each popup's open/free-position state. Surviving the parent re-render
+    // is what makes peer leaves stop tearing down every other open popup.
+    use_context_provider(|| signal_popup_state_map);
+
+    // Per-tile crop state — signal created early (near peer_status_map) so
+    // on_peer_removed can clean up; context provided here for child access.
+    use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
+
+    // Action bar dock position and autohide — exposed via context so that
+    // the AppearanceSettingsPanel can read/write them.
+    use_context_provider(|| DockPositionCtx(dock_position));
+    use_context_provider(|| AutohideCtx(autohide_enabled));
+    use_context_provider(|| DensityModeCtx(density_mode));
+    // Provide the decode-budget override so the settings UI (task 1a.5) can read
+    // and mutate it. Exposed exactly like density: a single shared signal.
+    use_context_provider(|| DecodeBudgetCtx(decode_budget_override));
+
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
     // dispatches peer_status events into a shared HashMap.
     let mut diagnostics_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let bump_pending_for_effect = peer_list_bump_pending.clone();
     use_effect(move || {
+        let bump_pending = bump_pending_for_effect.clone();
         let task = spawn(async move {
             let mut rx = videocall_diagnostics::subscribe();
             while let Ok(evt) = rx.recv().await {
@@ -1280,9 +1839,29 @@ pub fn AttendantsComponent(
                         };
                         if should_update {
                             peer_speech_priority.write().insert(peer_id, now);
-                            let mut v = peer_list_version;
-                            let next = *v.peek() + 1;
-                            v.set(next);
+                            // Phase 6 render-storm fix (cc7tp 2026-05-06):
+                            // coalesce bursty speaker activity into one
+                            // `peer_list_version` bump per 50 ms window
+                            // instead of per-event. Without this, multiple
+                            // active speakers triggered 3-5 full meeting-
+                            // view re-renders per second, which on 2-core
+                            // hardware compounded into 5 s main-thread
+                            // stalls.
+                            //
+                            // Signal<u32> is `Copy`, so we move a copy into
+                            // the throttled callback and re-bind it as
+                            // `mut` inside to satisfy the `Fn` bound on
+                            // the boxed closure.
+                            let v = peer_list_version;
+                            schedule_throttled_bump(
+                                bump_pending.clone(),
+                                PEER_LIST_VERSION_THROTTLE_MS,
+                                Rc::new(move || {
+                                    let mut v = v;
+                                    let next = *v.peek() + 1;
+                                    v.set(next);
+                                }),
+                            );
                         }
                     }
                     continue;
@@ -1324,6 +1903,466 @@ pub fn AttendantsComponent(
         }
     });
 
+    // --- Adaptive decode-budget control loop (issue #987, task 1a.3) ---
+    //
+    // A single lifecycle-scoped async task subscribes to the videocall
+    // diagnostics bus and drives the decode-budget actuator. It is modelled on
+    // the shared `peer_status` subscriber above: `subscribe()` inside a
+    // `spawn`, then `while let Ok(evt) = rx.recv().await`.
+    //
+    // It consumes exactly two `client_perf` metrics (see
+    // `videocall-client/src/{render_fps,long_tasks}.rs`):
+    //   - `client_render_fps`           (f64, emitted at ~1 Hz)  → sample cadence
+    //   - `client_longtask_duration_ms` (f64, event-driven)      → summed per bucket
+    //
+    // Every render-fps tick we close the current 1-second bucket: build a
+    // `BudgetSample` from the latest FPS plus the *sum* of long-task durations
+    // observed in that bucket (= longtask_ms_per_sec), push it into a rolling
+    // ~5-sample window, then call `decide_step`. The control loop — not
+    // `decide_step` — owns `BudgetState`: it increments `direction_hold` on each
+    // consecutive recovery-qualifying sample, resets it to 0 the moment recovery
+    // breaks, and on an applied Down/Up step updates `cap` and sets
+    // `last_step_ms = now_ms`. Cadence is driven off the 1 Hz render-fps event,
+    // never the 5 s health-reporter tick.
+    //
+    // Pressured-latch cap-ownership model (HCL #987 review FIX 1 + FIX 2,
+    // replaces the old one-shot seed latches):
+    //   - While NOT pressured (Auto): the render-side `effective_cap` tracks the
+    //     live `natural` tile count exactly, so a capable machine shows ALL
+    //     tiles (including staggered joins) with no avatars and NO dependence on
+    //     this loop's cadence. This loop does NOT write `decode_budget_cap` on
+    //     that path; it only keeps `state.cap` synced to `natural` so that, when
+    //     pressure first hits, `decide_step`'s down-step starts from the value
+    //     actually on screen rather than a stale seed. The FIRST time
+    //     `decide_step` returns `Down`, the loop latches `decode_budget_pressured`
+    //     true, applies the down-step, and writes `decode_budget_cap`.
+    //   - While pressured (Auto): this loop is the SOLE owner of
+    //     `decode_budget_cap`, running the existing Down/Up/Hold-growth logic
+    //     (including the non-distress growth gate, which now correctly governs
+    //     only RE-growth after real pressure). The latch stays set for the
+    //     session (a machine that demonstrated it can struggle stays in
+    //     conservative adaptive mode). It is reset on a Fixed -> Auto transition.
+    let mut decode_budget_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    use_effect(move || {
+        let task = spawn(async move {
+            use crate::components::decode_budget::{
+                median_render_fps, non_distress_growth_qualifying, recovery_qualifying, FPS_SEVERE,
+                LONGTASK_SEVERE_MS_PER_SEC, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+            };
+
+            /// Severe-tier label for a multi-tile (`magnitude > 1`) down-step,
+            /// reproducing `decide_step`'s catastrophic-pressure test EXACTLY so
+            /// the log is not misled by a single closing sample. FPS uses the
+            /// window median (`<= FPS_SEVERE`); long-task uses the SUSTAINED
+            /// window check (every one of the last `SUSTAIN_SAMPLES` samples at or
+            /// above `LONGTASK_SEVERE_MS_PER_SEC`) — the same condition
+            /// `decide_step` evaluates. Both may be true at once, hence the
+            /// `fps+longtask_severe` combined label. Observation only.
+            fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
+                let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
+                let longtask_severe = samples.len() >= SUSTAIN_SAMPLES
+                    && samples[samples.len() - SUSTAIN_SAMPLES..]
+                        .iter()
+                        .all(|s| s.longtask_ms_per_sec >= LONGTASK_SEVERE_MS_PER_SEC);
+                match (fps_severe, longtask_severe) {
+                    (true, true) => "fps+longtask_severe",
+                    (true, false) => "fps_severe",
+                    (false, true) => "longtask_severe",
+                    // Unreachable in practice: decide_step only returns magnitude>1
+                    // when at least one severe condition holds. Logged as `unknown`
+                    // rather than asserting, so logging can never panic.
+                    (false, false) => "unknown_severe",
+                }
+            }
+            use videocall_diagnostics::{now_ms, MetricValue};
+
+            /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
+            /// `decide_step` always has a full sustain window once warmed up.
+            const WINDOW: usize = 5;
+
+            let mut rx = videocall_diagnostics::subscribe();
+            // Rolling window of finished 1-second samples (most-recent-last).
+            let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
+            // Sum of long-task durations observed in the *current* (open) bucket.
+            let mut longtask_bucket_ms: f64 = 0.0;
+            // Controller-owned budget state. `cap` is seeded from the current
+            // actuator value; switching the override Auto -> Fixed -> Auto
+            // re-seeds it from whatever the cap is at that moment.
+            let mut state = BudgetState {
+                cap: *decode_budget_cap.peek(),
+                last_step_ms: 0.0,
+                direction_hold: 0,
+            };
+            // Tracks the last override we acted on so we can detect a transition
+            // back to Auto and cleanly re-seed `state` from the live cap.
+            let mut last_override = *decode_budget_override.peek();
+
+            while let Ok(evt) = rx.recv().await {
+                if evt.subsystem != "client_perf" {
+                    continue;
+                }
+
+                // Accumulate long-task durations into the open bucket. These
+                // arrive asynchronously between render-fps ticks.
+                for m in &evt.metrics {
+                    if m.name == "client_longtask_duration_ms" {
+                        if let MetricValue::F64(dur) = &m.value {
+                            longtask_bucket_ms += *dur;
+                        }
+                    }
+                }
+
+                // Only a render-fps event closes a bucket and advances the loop.
+                let render_fps = evt.metrics.iter().find_map(|m| {
+                    if m.name == "client_render_fps" {
+                        if let MetricValue::F64(v) = &m.value {
+                            return Some(*v);
+                        }
+                    }
+                    None
+                });
+                let Some(fps) = render_fps else {
+                    continue;
+                };
+
+                // Close the 1-second bucket into a sample and reset the bucket.
+                let sample = BudgetSample {
+                    render_fps: Some(fps),
+                    longtask_ms_per_sec: longtask_bucket_ms,
+                };
+                longtask_bucket_ms = 0.0;
+                samples.push(sample);
+                if samples.len() > WINDOW {
+                    let overflow = samples.len() - WINDOW;
+                    samples.drain(0..overflow);
+                }
+
+                // ---- Override handling (DECISION: hard override) ----
+                let current_override = *decode_budget_override.peek();
+                let natural = *decode_budget_natural.peek();
+
+                // Detect a return to Auto and re-seed BudgetState from the live
+                // cap so the loop resumes cleanly without a phantom step.
+                if current_override != last_override {
+                    // User override engaging: distinguish user-chosen caps from
+                    // auto-shed in triage. Fixed(n) = manual hard cap; Auto = resume.
+                    match (last_override, current_override) {
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=auto natural={}",
+                                n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={} prev=fixed prev_n={} natural={}",
+                                n,
+                                prev_n,
+                                natural,
+                            )
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::Auto) => {
+                            log::info!(
+                                "DecodeBudget: override=auto prev=fixed prev_n={} natural={} cap={}",
+                                prev_n,
+                                natural,
+                                *decode_budget_cap.peek(),
+                            )
+                        }
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Auto) => {}
+                    }
+                    if current_override == DecodeBudgetOverride::Auto {
+                        state = BudgetState {
+                            cap: *decode_budget_cap.peek(),
+                            last_step_ms: now_ms() as f64,
+                            direction_hold: 0,
+                        };
+                        // Loop-local hygiene: re-seed BudgetState so the loop
+                        // resumes cleanly without a phantom step. The pressured
+                        // latch reset now happens RENDER-SIDE (a `use_effect`
+                        // watching `decode_budget_override`), so resuming Auto
+                        // re-reveals all natural tiles immediately without waiting
+                        // for this FPS-gated loop to advance (HCL #987 review).
+                        // The loop re-latches pressured=true below only if it
+                        // measures fresh pressure after the Auto resume.
+                    }
+                    last_override = current_override;
+                }
+
+                if let DecodeBudgetOverride::Fixed(n) = current_override {
+                    // Hard override: bypass decide_step entirely and clamp the
+                    // actuator to n, the natural count, and CANVAS_LIMIT. The
+                    // upper bound (natural ∩ CANVAS_LIMIT) is floored at MIN_CAP
+                    // so `clamp` can never see `max < min` (natural may be 0
+                    // before any peers join).
+                    // MIN_CAP (1) < CANVAS_LIMIT, so this clamp never sees
+                    // `max < min`; it also floors a 0 natural count at MIN_CAP.
+                    let upper = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                    let forced = n.clamp(MIN_CAP, upper);
+                    if *decode_budget_cap.peek() != forced {
+                        decode_budget_cap.set(forced);
+                    }
+                    // Keep state.cap in sync so an Auto resume starts here.
+                    state.cap = forced;
+                    continue;
+                }
+
+                // ---- Auto path ----
+                let now = now_ms() as f64;
+                let pressured = *decode_budget_pressured.peek();
+
+                if !pressured {
+                    // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
+                    // render-side `effective_cap` already shows ALL natural tiles
+                    // here (including staggered joins), so this loop does NOT
+                    // write `decode_budget_cap`. It only keeps `state.cap` synced
+                    // to the live `natural` so that, when pressure FIRST hits,
+                    // `decide_step` computes the down-step from the value actually
+                    // on screen rather than a stale MIN_CAP seed. Likewise keep
+                    // `direction_hold` book-keeping live so the strict-recovery
+                    // gate is warm if we ever do step down then recover.
+                    state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+
+                    let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
+                    if qualifies {
+                        state.direction_hold = state.direction_hold.saturating_add(1);
+                    } else {
+                        state.direction_hold = 0;
+                    }
+
+                    // Only a DOWN decision matters before pressure: it latches
+                    // the controller into ownership of the cap. Up/Hold are
+                    // irrelevant here because the un-pressured cap already equals
+                    // natural (the maximum the loop would ever grow to).
+                    if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
+                    {
+                        // Closing-sample rationale for the decision logs below.
+                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                        let cur_fps = samples.last().and_then(|s| s.render_fps);
+                        let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+                        let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+
+                        decode_budget_pressured.set(true);
+                        state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                        state.last_step_ms = now;
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+
+                        // Pressured-latch edge (false->true): the controller now
+                        // owns the cap. Trigger is the first measured down-step.
+                        log::info!(
+                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={} cap={}",
+                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask,
+                            natural,
+                            state.cap,
+                        );
+                        // Severe-tier entry: a multi-tile down-step. The label
+                        // reproduces `decide_step`'s catastrophic test exactly
+                        // (median FPS + SUSTAINED long-task window), NOT a single
+                        // closing-sample inference. WITHOUT changing decide_step's
+                        // signature.
+                        if magnitude > 1 {
+                            log::info!(
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                magnitude,
+                                severe_label(&samples, median),
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                            );
+                        }
+                        // First cap transition (un-pressured -> pressured down-step).
+                        log::info!(
+                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                            prev_cap,
+                            state.cap,
+                            magnitude,
+                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask,
+                            natural,
+                        );
+                    }
+                    continue;
+                }
+
+                // ---- Pressured Auto path: the loop is the sole cap owner ----
+                let step = decide_step(&samples, &state, natural, now);
+
+                // Controller owns direction_hold: increment per consecutive
+                // recovery-qualifying sample, reset to 0 when recovery breaks.
+                // We call the SAME `recovery_qualifying` helper that
+                // `decide_step` uses for its step-up gate (HCL #987 review
+                // FIX 6) so the two can never silently drift apart.
+                let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
+                if qualifies {
+                    state.direction_hold = state.direction_hold.saturating_add(1);
+                } else {
+                    state.direction_hold = 0;
+                }
+
+                // Closing-sample rationale shared by every decision log in this
+                // arm. Cheap copies only — the `format!` allocations are inlined
+                // lazily into each `log::info!` so they are skipped both on the
+                // steady-state Hold path (no log fires) AND when the log level is
+                // disabled. `median` is also read by the `magnitude > 1` severe
+                // check. Observation only.
+                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                let cur_fps = samples.last().and_then(|s| s.render_fps);
+                let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+
+                // Apply the step: the controller owns cap + last_step_ms.
+                match step {
+                    BudgetStep::Down(magnitude) => {
+                        // Proportional/multi-tile down-step (HCL #987 review
+                        // FIX 4): `magnitude` is 1 under mild pressure, larger
+                        // under catastrophic pressure. Floor at MIN_CAP.
+                        let prev_cap = state.cap;
+                        state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
+                        state.last_step_ms = now;
+                        // A down-step ends the recovery streak. Because the
+                        // last_step_ms is updated here, the non-distress growth
+                        // gate below is held off by the up-cooldown, so a machine
+                        // that just dropped a tile under pressure cannot
+                        // instantly re-add it (anti-oscillation).
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        // Severe-tier entry: multi-tile down-step. The label
+                        // reproduces `decide_step`'s catastrophic test exactly
+                        // (median FPS + SUSTAINED long-task window), NOT a single
+                        // closing-sample inference. No `decide_step` signature
+                        // change.
+                        if magnitude > 1 {
+                            log::info!(
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                magnitude,
+                                severe_label(&samples, median),
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                            );
+                        }
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                magnitude,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
+                        }
+                    }
+                    BudgetStep::Up => {
+                        let prev_cap = state.cap;
+                        state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
+                        state.last_step_ms = now;
+                        // A consumed up-step resets the recovery streak so the
+                        // next up-step must re-earn RECOVERY_HOLD samples.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
+                        }
+                    }
+                    BudgetStep::Hold => {
+                        // Non-distress growth gate (HCL #987 review FIX 1).
+                        //
+                        // `decide_step` returned Hold, which means it did not see
+                        // a *strict-recovery* up-step (that path needs median FPS
+                        // >= FPS_STEP_UP=30 + RECOVERY_HOLD + up-cooldown). But a
+                        // perfectly healthy machine on a 30 Hz panel reports ~29
+                        // fps — it sits in the 24-30 hysteresis band forever and
+                        // would NEVER reach natural through the strict gate. That
+                        // is the dead-band trap the previous warm-up climb was
+                        // trying (and failing) to paper over.
+                        //
+                        // The rule we use to grow the cap toward `natural` here is
+                        // the COMPLEMENT of the step-DOWN condition — "not under
+                        // measured pressure" — rather than the strict recovery
+                        // gate:
+                        //
+                        //     median_fps >= FPS_STEP_DOWN  (>= 24, the distress
+                        //                                   floor; INCLUDES the
+                        //                                   24-30 band)
+                        //   AND every sample's longtask < LONGTASK_BUSY_MS_PER_SEC
+                        //
+                        // Why this avoids the dead band: a steady 29 fps idle
+                        // machine satisfies `>= FPS_STEP_DOWN`, so the cap can
+                        // RE-grow back toward == natural and HOLD there after a
+                        // pressure-driven down-step. (This arm only runs once
+                        // pressured; the un-pressured cap already equals natural.)
+                        //
+                        // Why this still preserves anti-oscillation: growth is
+                        // rate-limited to one tile per STEP_UP_COOLDOWN_MS using
+                        // the SAME `last_step_ms` that the Down arm refreshes. So
+                        // a machine that just dropped a tile under real pressure
+                        // cannot re-add it until a full up-cooldown has elapsed
+                        // with no further down-step — exactly the behaviour the
+                        // strict recovery gate gives, without excluding the 24-30
+                        // band. A genuinely flapping machine keeps tripping the
+                        // down condition (which refreshes last_step_ms and resets
+                        // direction_hold), so the up-cooldown never elapses and
+                        // the cap does not yo-yo. The strict recovery gate in
+                        // `decide_step` is simply the stricter subset of this
+                        // rule and remains the path that fires when FPS is in the
+                        // healthy >= 30 band.
+                        // `non_distress_growth_qualifying` is the single source
+                        // of truth for the non-distress condition (and returns
+                        // false on a short/incomplete window, so no underflow).
+                        let target = natural.max(MIN_CAP);
+                        let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
+                        let not_distressed =
+                            non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
+                        if state.cap < target && up_cooldown_elapsed && not_distressed {
+                            let prev_cap = state.cap;
+                            state.cap += 1;
+                            state.last_step_ms = now;
+                            decode_budget_cap.set(state.cap);
+                            // Non-distress growth: cap re-grows toward natural while
+                            // `decide_step` is Holding. dir=growth distinguishes this
+                            // from the strict-recovery dir=up step above.
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                prev_cap,
+                                state.cap,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask,
+                                natural,
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        decode_budget_task.write().replace(task);
+    });
+    use_drop(move || {
+        if let Some(task) = decode_budget_task.peek().as_ref() {
+            task.cancel();
+        }
+    });
+
+    // --- Test-only decode-budget injection hooks (issue #987, task 1a.6) ---
+    // Register `window.__videocall_inject_render_fps` /
+    // `window.__videocall_inject_longtask` so E2E specs can drive the adaptive
+    // control loop synthetically. The registration is itself gated on
+    // `MOCK_PEERS_ENABLED`, so it is a no-op (and attaches nothing to `window`)
+    // in production where that runtime-config flag is false.
+    use_hook(crate::components::decode_budget_inject::register_decode_budget_inject_hooks);
+
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
     // the entire meeting view on every audio-level tick.
     // Note: host glow is intentionally not suppressed by pin state so the local
@@ -1352,12 +2391,26 @@ pub fn AttendantsComponent(
         }
     });
 
-    // Auto-join on first render if requested
+    // Auto-join on first render if requested.
+    // Gated by the Phase 9 capability verdict: a Block must surface its UI
+    // before media is acquired, and a StrongWarn must be acknowledged first.
     {
         let mda = mda.clone();
+        let verdict = capability_verdict.clone();
         use_effect(move || {
-            if auto_join {
-                mda.borrow().request();
+            if !auto_join {
+                return;
+            }
+            match &verdict {
+                CapabilityVerdict::Block(_) => {
+                    log::warn!("capability-check: auto_join suppressed by Block verdict");
+                }
+                CapabilityVerdict::StrongWarn(_) if !capability_acknowledged() => {
+                    log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
+                }
+                _ => {
+                    mda.borrow().request();
+                }
             }
         });
     }
@@ -1400,6 +2453,116 @@ pub fn AttendantsComponent(
     // Mock peers are layout-only placeholders and don't carry that cost.
     let capped_real = num_display_peers.min(CANVAS_LIMIT);
     let total_tiles = capped_real + mock_count;
+    // Republish the uncapped layout tile count so the adaptive decode-budget
+    // control loop (task 1a.3) can pass it to `decide_step` as `natural_count`
+    // and never raise the cap above what the layout would actually render.
+    // Writing only on change keeps this off the per-render hot path.
+    if *decode_budget_natural.peek() != total_tiles {
+        decode_budget_natural.set(total_tiles);
+    }
+
+    // Render-driven Fixed -> Auto pressured-reset (HCL #987 review). Reads
+    // `decode_budget_override` REACTIVELY so this effect re-runs the instant the
+    // override changes — independent of the ~1 Hz control loop. On a transition
+    // INTO Auto from a non-Auto value, clear the pressured latch so the
+    // render-side `effective_cap` re-reveals ALL natural tiles on the very next
+    // render (a previously-pressured machine no longer waits for an FPS tick to
+    // drop its reduced `decode_budget_cap`).
+    //
+    // It fires ONLY on the transition: `prev_override` is peeked (not read
+    // reactively), so writing it back does not self-retrigger, and while the
+    // override stays Auto `prev == current == Auto` makes the body a no-op — it
+    // therefore never fights the loop's mid-Auto pressure latch (the loop sets
+    // pressured=true on a real down-step; this effect leaves that alone).
+    use_effect(move || {
+        let current = decode_budget_override();
+        let previous = *prev_override.peek();
+        if previous != DecodeBudgetOverride::Auto && current == DecodeBudgetOverride::Auto {
+            decode_budget_pressured.set(false);
+            // Pressured-latch edge (true->false): leaving a Fixed override for Auto
+            // clears the latch render-side so all natural tiles re-reveal at once.
+            log::info!("DecodeBudget: pressured_latch=false trigger=override_resume_auto");
+        }
+        if previous != current {
+            prev_override.set(current);
+        }
+    });
+
+    // Publish the adaptive decode-budget decision onto the diagnostics bus so
+    // the HealthReporter (videocall-client) can fold it into the periodic
+    // HEALTH packet (#987 P3). This mirrors how the AdaptiveQuality tier state
+    // already rides the health packet: the controller's decision lives only in
+    // client console logs today, so population-scale dashboards are blind to it
+    // server-side. We publish the SNAPSHOT (current state), not a drained
+    // transition buffer — the snapshot is the must-have for dashboards.
+    //
+    // Reactive reads (`.read()`/calling the signal) of all four authoritative
+    // signals mean this effect re-runs the instant any of them changes, and the
+    // change-guard `prev_db_snapshot` ensures we only emit a bus event when the
+    // decision actually moved — not on every unrelated render. The effective
+    // cap is recomputed with the SAME three-mode logic as the render-side
+    // `effective_cap` actuator below (Fixed clamp / un-pressured == natural /
+    // pressured == loop-owned cap) so the reported value matches what is on
+    // screen. `decode_budget_natural` already equals the live `total_tiles`
+    // (written just above), so `natural_capped` here matches the render-side
+    // `canvas_capped_natural`.
+    use_effect(move || {
+        let override_mode = decode_budget_override();
+        let pressured = decode_budget_pressured();
+        let natural = decode_budget_natural();
+        let cap = decode_budget_cap();
+
+        let natural_capped = natural.min(CANVAS_LIMIT);
+        // Shared three-mode actuator: identical to the render-side
+        // `effective_cap` below, so reported telemetry can never drift from
+        // what is on screen (HCL #987 review FIX).
+        let effective = effective_cap(override_mode, pressured, natural, cap);
+
+        // Compact, comparable snapshot. Only emit on a real change so the
+        // diagnostics bus (and the health packet) is not spammed per render.
+        // `override_fixed_n` is 0 in Auto and meaningless to readers there
+        // (the proto enum carries the Auto/Fixed discriminator).
+        // Clamp the reported fixed cap to CANVAS_LIMIT so telemetry matches the
+        // displayed semantics: `parse_decode_budget_override` accepts any
+        // `usize > 0` from localStorage, but a tampered value above u32::MAX
+        // would otherwise silently truncate on the `as u64 -> as u32` path in
+        // the consumer. `effective_cap` is already clamped, so this only aligns
+        // the telemetry `override_fixed_n` with what is actually rendered.
+        let fixed_n = match override_mode {
+            DecodeBudgetOverride::Fixed(n) => n.min(CANVAS_LIMIT),
+            DecodeBudgetOverride::Auto => 0,
+        };
+        let is_fixed = matches!(override_mode, DecodeBudgetOverride::Fixed(_));
+        let snapshot = (effective, natural_capped, pressured, is_fixed, fixed_n);
+        if *prev_db_snapshot.peek() == snapshot {
+            return;
+        }
+        prev_db_snapshot.set(snapshot);
+
+        // Override mode encoded as the proto OverrideMode enum's integer value
+        // (1 = Auto, 2 = Fixed) so the HealthReporter can map it directly.
+        let override_mode_i = if is_fixed { 2u64 } else { 1u64 };
+        videocall_diagnostics::global_sender()
+            .try_broadcast(videocall_diagnostics::DiagEvent {
+                subsystem: "decode_budget",
+                stream_id: None,
+                ts_ms: videocall_diagnostics::now_ms(),
+                metrics: vec![
+                    videocall_diagnostics::metric!("decode_budget_effective_cap", effective as u64),
+                    videocall_diagnostics::metric!("decode_budget_natural", natural_capped as u64),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_pressured",
+                        if pressured { 1u64 } else { 0u64 }
+                    ),
+                    videocall_diagnostics::metric!("decode_budget_override_mode", override_mode_i),
+                    videocall_diagnostics::metric!(
+                        "decode_budget_override_fixed_n",
+                        fixed_n as u64
+                    ),
+                ],
+            })
+            .ok();
+    });
 
     // --- Viewport dimensions (needed for min-tile-size check & grid style) ---
     let vw = window()
@@ -1414,10 +2577,33 @@ pub fn AttendantsComponent(
         .unwrap_or(768.0);
     // Gap/padding must match #grid-container in style.css.
     // Breakpoint (568px) must match @media (max-width: 568px) in style.css.
-    let (gap, pad_top, pad_right, pad_bottom, pad_left) = if vw < 568.0 {
-        (8.0, 8.0, 8.0, 72.0, 8.0)
-    } else {
-        (16.0, 20.0, 20.0, 84.0, 20.0)
+    // pad_top: breathing room above top tile row.
+    // pad_bottom: pad_top + action-bar zone so tiles are visually centred
+    //             in the space ABOVE the action bar (Google Meet style).
+    //   Desktop action-bar zone ≈ 99px (79px bar + 20px offset).
+    //   Mobile  action-bar zone ≈ 73px (57px bar + 16px offset).
+    let (gap, pad_top, pad_right, pad_bottom, pad_left) = match dock_position() {
+        DockPosition::Bottom => {
+            if vw < 568.0 {
+                (8.0, 8.0, 8.0, 80.0, 8.0)
+            } else {
+                (16.0, 20.0, 20.0, 120.0, 20.0)
+            }
+        }
+        DockPosition::Left => {
+            if vw < 568.0 {
+                (8.0, 8.0, 8.0, 8.0, 80.0)
+            } else {
+                (16.0, 20.0, 20.0, 20.0, 120.0)
+            }
+        }
+        DockPosition::Right => {
+            if vw < 568.0 {
+                (8.0, 8.0, 80.0, 8.0, 8.0)
+            } else {
+                (16.0, 20.0, 120.0, 20.0, 20.0)
+            }
+        }
     };
     let avail_w = (vw - pad_left - pad_right).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
@@ -1502,20 +2688,100 @@ pub fn AttendantsComponent(
         t
     };
 
-    // Show density selector only when modes would produce different results.
-    // If even Standard (most restrictive) can show all tiles, hide it.
-    let show_density_selector = {
-        let std_min = DensityMode::Standard.min_tile_width(vw);
-        let (_c, _r, tw) = compute_layout(total_tiles, avail_w, avail_h, gap);
-        tw < std_min // Standard can't fit everyone → modes matter
-    };
-
-    let (visible_tile_count, overflow_count) = if total_tiles > effective_visible {
-        let visible = effective_visible.saturating_sub(1).max(1);
-        (visible, total_tiles - visible)
+    // --- Adaptive decode-budget actuator (issue #987, task 1a.3) ---
+    // `effective_cap` is the real actuator: the ceiling on the number of RENDERED
+    // video tiles, folded into the same overflow path that density /
+    // min-tile-width already use (one more upper bound on how many tiles fit).
+    //
+    // It is derived HERE, in render scope, from REACTIVE reads of the override
+    // and pressured signals (`.read()`, not `.peek()`), so the render re-runs the
+    // instant either changes — this is what makes a manual "show N tiles" choice
+    // (HCL #987 review FIX 1) and an un-pressured Auto machine's staggered-join
+    // tracking (HCL #987 review FIX 2) take effect on the NEXT render with NO
+    // dependency on the ~1 Hz control-loop / `client_render_fps` event:
+    //
+    //   - `Fixed(n)`           → clamp `n` to [MIN_CAP, total_tiles ∩ CANVAS_LIMIT]
+    //   - `Auto`, NOT pressured → `total_tiles ∩ CANVAS_LIMIT` (== natural; tracks
+    //                             joins immediately, ZERO avatars)
+    //   - `Auto`, pressured     → `decode_budget_cap()` (the loop owns the cap
+    //                             with its conservative anti-oscillation growth)
+    //
+    // On a healthy, unpressured machine (or one showing exactly `n` <= natural
+    // tiles) `effective_cap >= layout_limit`, so the `min()` below is a no-op and
+    // all displayed peers decode, including the mock-peer / `debug_peer_count`
+    // path. Avatars only materialise once Auto has measured real pressure and the
+    // loop steps `decode_budget_cap` below the layout capacity.
+    //
+    // Capping `visible_tile_count` here naturally shrinks `visible_tiles` (the
+    // slice below) and therefore the `active_decode_set` derived from it, so we
+    // do NOT cap the decode set independently of layout.
+    //
+    // --- Three buckets (issue #987, task 1a.4) ---
+    // The decode-budget cap and the natural layout capacity are SEPARATE
+    // ceilings, and they partition the sorted tile list into three buckets:
+    //
+    //   1. Decoded video tiles  `[0 .. visible_tile_count)`
+    //        Bounded by the decode-budget cap. These feed `active_decode_set`
+    //        and render live `<canvas>` video via `PeerTile`.
+    //   2. Off-budget avatar tiles `[visible_tile_count .. displayed_tile_count)`
+    //        Peers that the LAYOUT could show but the budget cap excludes from
+    //        decode. They render as initials/avatar placeholders (no video
+    //        decode → the CPU saving) but stay on screen so the user still sees
+    //        who is present. Audio is untouched (see note below).
+    //   3. True overflow `[displayed_tile_count .. total_tiles)`
+    //        Peers beyond the natural layout capacity. Folded into the `+N`
+    //        badge exactly as before.
+    //
+    // CRITICAL no-cap invariant: whether the `+N` badge appears depends ONLY on
+    // the layout capacity (`effective_visible`), never on the budget cap. When
+    // the controller is idle (healthy, unpressured Auto), `effective_cap` equals
+    // `total_tiles ∩ CANVAS_LIMIT`, so `budget_cap >= effective_visible` always
+    // holds: `decoded_limit == layout_limit`, `avatar_count == 0`, and
+    // `visible_tile_count` / `overflow_count` are byte-for-byte identical to the
+    // pre-1a.4 values. The avatar tier only materialises when `effective_cap <
+    // effective_visible` — i.e. after the loop steps the cap down under measured
+    // pressure (Auto, pressured), or under an explicit `Fixed(n)` below natural.
+    //
+    // Audio note: `active_decode_set` (built below from `visible_tiles`) gates
+    // ONLY video decode via `client.set_active_decode_set`. Audio playback runs
+    // through the independent NetEQ path and the per-peer diagnostics stream
+    // every `PeerTile` subscribes to globally, neither of which consults this
+    // set. Avatar-tier (and even +N-overflow) peers therefore remain audible.
+    //
+    // `effective_cap` derivation (HCL #987 review FIX 1 + FIX 2). Reactive reads
+    // (`.read()`) so a change to either signal re-runs render immediately, with
+    // no dependence on the 1 Hz control loop.
+    // Shared three-mode actuator (HCL #987 review FIX): the SAME function the
+    // telemetry producer uses, so the reported cap can never drift from what is
+    // rendered here. Fixed(n) clamps into [MIN_CAP, min(natural, CANVAS_LIMIT)];
+    // un-pressured Auto == natural (staggered joins decode immediately, no
+    // avatars); pressured Auto defers to the loop-owned cap.
+    let effective_cap = effective_cap(
+        *decode_budget_override.read(),
+        decode_budget_pressured(),
+        total_tiles,
+        decode_budget_cap(),
+    );
+    let budget_cap = effective_cap;
+    // Natural layout capacity (already bounded by CANVAS_LIMIT through
+    // `total_tiles`/`capped_real`). This decides the +N badge boundary.
+    let layout_limit = effective_visible;
+    // Decode-budget ceiling: how many of the displayed tiles may decode video.
+    let decoded_limit = layout_limit.min(budget_cap.max(MIN_CAP));
+    // Tiles actually placed in the grid (video + avatar), and the +N count.
+    // Reserve one grid slot for the badge only when there is true overflow
+    // beyond the layout capacity — identical to the prior badge logic.
+    let (displayed_tile_count, overflow_count) = if total_tiles > layout_limit {
+        let displayed = layout_limit.saturating_sub(1).max(1);
+        (displayed, total_tiles - displayed)
     } else {
         (total_tiles, 0)
     };
+    // Bucket 1 / bucket 2 split within the displayed tiles. `visible_tile_count`
+    // keeps its meaning: the count of DECODED video tiles. The remainder are
+    // off-budget avatar tiles.
+    let visible_tile_count = displayed_tile_count.min(decoded_limit);
+    let avatar_tile_count = displayed_tile_count - visible_tile_count;
     // --- Build unified tile list (real + mock peers) sorted by join time ---
     // Tiles are ordered by join time (earliest first) rather than by speech
     // activity. This provides a stable, predictable grid that doesn't shuffle
@@ -1559,16 +2825,60 @@ pub fn AttendantsComponent(
         );
     }
 
-    // The visible portion of the unified tile list (used by the normal grid layout).
-    let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
+    // --- Pinned-peer promotion (HCL #987 review FIX 7) ---
+    // A pinned peer is force-added to `active_decode_set` (phase 3, below), so
+    // it is ALWAYS decoded regardless of the budget cap. If that peer is ranked
+    // beyond `visible_tile_count` (e.g. it joined late and is silent), it would
+    // otherwise land in `avatar_tiles` and render with `force_avatar = true`
+    // ("Video paused") while it is in fact being decoded — wasted decode AND a
+    // misleading UI. Promote it into the decoded bucket so decode and render
+    // agree. We swap it into the LAST decoded slot to disturb ordering least.
+    if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
+        if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
+            // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
+            // the pinned peer's tile index by mapping each session_id back to
+            // its user_id. Mock tiles ("mock-N") never match a real user_id.
+            let pinned_idx = all_tiles.iter().position(|tile_id| {
+                client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+            });
+            if let Some(idx) = pinned_idx {
+                if idx >= visible_tile_count {
+                    // Swap the pinned peer into the last decoded slot.
+                    all_tiles.swap(visible_tile_count - 1, idx);
+                }
+            }
+        }
+    }
 
-    // Map session IDs to user IDs for display (peer list sidebar — real peers only).
-    let peers_for_display: Vec<String> = display_peers
+    // Bucket 1: the DECODED portion of the unified tile list. These render live
+    // video and seed `active_decode_set` below. (Used by the normal grid layout.)
+    let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
+    // Bucket 2 (issue #987, task 1a.4): off-budget avatar tiles. These are the
+    // tiles the layout could show but the decode-budget cap excludes from video
+    // decode. They render as initials/avatar placeholders so the user still sees
+    // who is present (and keeps hearing them — audio is independent of the decode
+    // set). Empty unless the budget cap is below the natural layout capacity, so
+    // the no-cap path produces an empty slice and is unchanged.
+    let avatar_tiles: Vec<String> = all_tiles
+        .iter()
+        .skip(visible_tile_count)
+        .take(avatar_tile_count)
+        .cloned()
+        .collect();
+
+    // Build the peer-list sidebar entries keyed by `session_id` so each open
+    // browser tab is its own row. `user_id` is carried alongside only for
+    // host-action callbacks (mute / disable video), which remain per-user.
+    let peers_for_display: Vec<PeerListEntry> = display_peers
         .iter()
         .map(|session_id| {
-            client
+            let user_id = client
                 .get_peer_user_id(session_id)
-                .unwrap_or_else(|| session_id.clone())
+                .unwrap_or_else(|| session_id.clone());
+            PeerListEntry {
+                session_id: session_id.clone(),
+                user_id,
+            }
         })
         .collect();
 
@@ -1701,6 +3011,18 @@ pub fn AttendantsComponent(
         }
     }
 
+    // Tile count drives the `participants-N` class modifier on the grid
+    // container AND the `compute_layout` cell sizing, which lets CSS branch
+    // layout behavior (see `.participants-1 .grid-item.full-bleed` rule in
+    // style.css that drops the 3:2 cap on the lone tile for the 2-peer meeting
+    // case — HCL #7).
+    //
+    // Must count BOTH decoded video tiles AND off-budget avatar tiles (task
+    // 1a.4), because both occupy real grid cells. `avatar_tile_count` is 0 when
+    // no budget cap is active, so `displayed_tile_count == visible_tile_count`
+    // and this is identical to the pre-1a.4 value.
+    let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 };
+
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
         "position: absolute; inset: 0; width: 100%; height: 100%; \
@@ -1713,9 +3035,37 @@ pub fn AttendantsComponent(
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
         // screen-share (flex) back to normal (grid) is clean.
-        let tile_count = visible_tile_count + if overflow_count > 0 { 1 } else { 0 };
         let (cols, rows, tw) = compute_layout(tile_count, avail_w, avail_h, gap);
-        let th = tw / (16.0 / 9.0);
+        // Cell height tracks the same 3:2 ratio `.grid-item` is capped at, so
+        // the cell exactly fits the tile and `place-self: center` has no
+        // surplus to distribute. Using a wider ratio here would leave
+        // `tw - th * TILE_AR` of internal padding on every cell.
+        let th = tw / TILE_AR;
+        // 1-tile case (HCL #7, 2-peer meeting): let the lone remote tile
+        // stretch to fill the entire grid area. The `.participants-1
+        // .grid-item.full-bleed` CSS rule drops the 3:2 cap on this lone
+        // tile so the remote peer fills the viewport — combined with `1fr`
+        // tracks and `stretch` packing, the tile reaches edge-to-edge.
+        // 2+ tiles (HCL #6): size tracks to the natural 3:2 tile dimensions
+        // and pack left/top so surplus viewport width sits on the right
+        // edge as empty space instead of being distributed between tiles.
+        // This is the only way to guarantee the 3:2 aspect holds in narrow
+        // viewports where `1fr` cells would be taller than `cell_w * 2/3`
+        // and `.grid-item { height: 100% }` would otherwise stretch the
+        // tile vertically. See HCL bug report for the 3-peer-aspect issue.
+        let (track_cols, track_rows, pack) = if tile_count == 1 {
+            (
+                format!("repeat({cols}, 1fr)"),
+                format!("repeat({rows}, 1fr)"),
+                "justify-content: stretch; align-content: stretch;",
+            )
+        } else {
+            (
+                format!("repeat({cols}, var(--tile-w))"),
+                format!("repeat({rows}, var(--tile-h))"),
+                "justify-content: start; align-content: start;",
+            )
+        };
         format!(
             "display: grid; \
              position: absolute; inset: 0; \
@@ -1724,10 +3074,18 @@ pub fn AttendantsComponent(
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
              width: 100%; height: 100%; \
-             grid-template-columns: repeat({cols}, 1fr); grid-template-rows: repeat({rows}, 1fr); \
+             grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
+             {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
         )
     };
+
+    // `participants-N` modifier; CSS uses `.participants-1 .grid-item.full-bleed`
+    // (HCL #7) to drop the 3:2 cap on the lone remote tile in a 2-peer
+    // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
+    // size is driven by `--tile-w` / `--tile-h` (set above) — see the
+    // `tile_count == 1` branch in `container_style`.
+    let container_class = format!("participants-{tile_count}");
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -1741,6 +3099,21 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
+        // Phase 9 capability gating. Snapshot the verdict for this render so we
+        // don't pay the navigator cost again — `assess_capability` already ran
+        // at component mount via `use_hook`.
+        let verdict = capability_verdict.clone();
+        let is_blocked = matches!(verdict, CapabilityVerdict::Block(_));
+        let strong_warn_msg = match &verdict {
+            CapabilityVerdict::StrongWarn(msg) => Some(msg.clone()),
+            _ => None,
+        };
+        let block_msg = match &verdict {
+            CapabilityVerdict::Block(msg) => Some(msg.clone()),
+            _ => None,
+        };
+        let show_strong_warn_modal = strong_warn_msg.is_some() && !capability_acknowledged();
+
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
@@ -1749,19 +3122,122 @@ pub fn AttendantsComponent(
                     div { class: "floating-element floating-element-2" }
                     div { class: "floating-element floating-element-3" }
                     div { class: "hero-content",
-                        PreJoinSettingsCard {
-                            is_owner,
-                            meeting_id: id.clone(),
-                            waiting_room_toggle,
-                            admitted_can_admit_toggle,
-                            end_on_host_leave_toggle,
-                            allow_guests_toggle,
-                            saving,
-                            toggle_error,
-                            connection_error,
-                            on_join: move |_| {
-                                mda.borrow().request();
-                            },
+                        if let Some(msg) = block_msg.clone() {
+                            // Hard-block: render an error card in place of the
+                            // join card. The user has to switch to a different
+                            // device — there is no override for this verdict.
+                            div { class: "settings-card",
+                                role: "alert",
+                                "aria-live": "assertive",
+                                div { class: "join-meeting-header",
+                                    h2 { class: "join-meeting-title",
+                                        span { class: "join-meeting-title-text",
+                                            "Device not supported"
+                                        }
+                                    }
+                                }
+                                p { class: "toggle-error", "{msg}" }
+                                div { class: "settings-action-row",
+                                    button {
+                                        class: "btn-apple btn-primary settings-action-btn",
+                                        disabled: true,
+                                        "aria-disabled": "true",
+                                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                                    }
+                                }
+                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
+                                    "Meeting join is disabled for this device."
+                                }
+                            }
+                        } else {
+                            PreJoinSettingsCard {
+                                is_owner,
+                                meeting_id: id.clone(),
+                                waiting_room_toggle,
+                                admitted_can_admit_toggle,
+                                end_on_host_leave_toggle,
+                                allow_guests_toggle,
+                                saving,
+                                toggle_error,
+                                connection_error,
+                                on_join: {
+                                    let mda = mda.clone();
+                                    let has_strong_warn = strong_warn_msg.is_some();
+                                    move |_| {
+                                        if is_blocked {
+                                            // Defensive: the card should not be
+                                            // rendered when blocked, but in case
+                                            // it ever is, ignore the click.
+                                            log::warn!(
+                                                "capability-check: join click ignored — Block verdict"
+                                            );
+                                            return;
+                                        }
+                                        if has_strong_warn && !capability_acknowledged() {
+                                            // Bring up the strong-warn modal
+                                            // instead of immediately requesting
+                                            // media. The modal's CTAs will set
+                                            // `capability_acknowledged` and
+                                            // re-fire the request.
+                                            log::info!(
+                                                "capability-check: showing StrongWarn modal"
+                                            );
+                                            return;
+                                        }
+                                        mda.borrow().request();
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+                if show_strong_warn_modal {
+                    {
+                        let msg = strong_warn_msg.clone().unwrap_or_default();
+                        let mda_continue = mda.clone();
+                        let mda_audio = mda.clone();
+                        rsx! {
+                            div {
+                                class: "modal-overlay",
+                                role: "dialog",
+                                "aria-modal": "true",
+                                "aria-labelledby": "capability-warn-title",
+                                div { class: "modal-window",
+                                    h3 { id: "capability-warn-title", "Performance warning" }
+                                    p { style: "margin-top: 0.5rem;", "{msg}" }
+                                    div { style: "display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap;",
+                                        button {
+                                            class: "btn-apple btn-secondary",
+                                            onclick: move |_| {
+                                                // Audio-only: camera defaults to
+                                                // off in this lobby, so we just
+                                                // acknowledge and request media.
+                                                // Mic/camera buttons in the
+                                                // post-join controls remain
+                                                // available if the user changes
+                                                // their mind.
+                                                log::info!(
+                                                    "capability-check: user chose Audio-only"
+                                                );
+                                                capability_acknowledged.set(true);
+                                                mda_audio.borrow().request();
+                                            },
+                                            "Switch to audio-only"
+                                        }
+                                        button {
+                                            class: "btn-apple btn-primary",
+                                            onclick: move |_| {
+                                                log::info!(
+                                                    "capability-check: user chose Continue anyway"
+                                                );
+                                                capability_acknowledged.set(true);
+                                                mda_continue.borrow().request();
+                                            },
+                                            "Continue anyway"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1806,6 +3282,15 @@ pub fn AttendantsComponent(
         meeting_start_time: meeting_start_time_server(),
     });
 
+    // Snapshot the local session_id once per render so every PeerTile can pin
+    // self-identification on session_id instead of user_id. Two tabs of the
+    // same authenticated user share a user_id but always have distinct
+    // session_ids — a user-id compare collapses sibling tabs into one "self"
+    // tile in split layouts and screen-share paths (HCL issue 828). May be `None`
+    // before SESSION_ASSIGNED is received; in that case no tile is treated as
+    // self until the assignment arrives.
+    let my_session_id: Option<String> = client.get_own_session_id();
+
     info!("Rendering meeting view with {} peers", display_peers.len());
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
@@ -1837,6 +3322,14 @@ pub fn AttendantsComponent(
         // Dedup: only push to client when the set actually changed.
         let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
         if *previous_active_decode_set != active_decode_set {
+            // Render actuator: the effective decode-budget cap applied to the
+            // visible tile set. Logged at debug to correlate with the info-level
+            // cap-transition decisions above without spamming the steady state.
+            log::debug!(
+                "DecodeBudget: active_decode_set size={} budget_cap={}",
+                active_decode_set.len(),
+                budget_cap,
+            );
             client.set_active_decode_set(&active_decode_set);
             *previous_active_decode_set = active_decode_set.clone();
         }
@@ -1863,11 +3356,165 @@ pub fn AttendantsComponent(
             // Provide MeetingTime context
             // Provide VideoCallClient context
             div { id: "main-container", class: "meeting-page",
+                onclick: move |_| {
+                    dock_menu_open.set(false);
+                    density_open.set(false);
+                    mock_peers_open.set(false);
+                },
                 BrowserCompatibility {}
 
                 // "participant joined/left" toast notifications
-                if !peer_toasts().is_empty() {
+                if !peer_toasts().is_empty()
+                    || show_muted_toast()
+                    || show_video_off_toast()
+                    || screen_share_toast_state().is_some()
+                {
                     div { class: "peer-toasts",
+                        // Screen-share visibility toast (HCL issue 893). @token-exempt
+                        // Rendered first so it sits above other transient toasts.
+                        {
+                            let toast = screen_share_toast_state.read().clone();
+                            match toast {
+                                Some(ScreenShareToastState::Starting) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-loading screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Starting to share content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                path { d: "M21 12a9 9 0 1 1-6.219-8.56" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Starting to share content..."
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::SuccessfullyShared) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-success screen-share-toast",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "Others can now see your shared content",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                polyline { points: "20 6 9 17 4 12" }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name",
+                                                "Others can now see your shared content"
+                                            }
+                                        }
+                                    }
+                                },
+                                Some(ScreenShareToastState::Failed(msg)) => rsx! {
+                                    div {
+                                        class: "peer-toast toast-error screen-share-toast",
+                                        role: "alert",
+                                        aria_live: "assertive",
+                                        aria_label: "Screen share visibility error",
+                                        span { class: "toast-icon",
+                                            svg {
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "10" }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "8",
+                                                    x2: "12",
+                                                    y2: "12",
+                                                }
+                                                line {
+                                                    x1: "12",
+                                                    y1: "16",
+                                                    x2: "12.01",
+                                                    y2: "16",
+                                                }
+                                            }
+                                        }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{msg}" }
+                                        }
+                                    }
+                                },
+                                None => rsx! {},
+                            }
+                        }
+                        if show_muted_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                        path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host muted your microphone" }
+                                    br {}
+                                    span { class: "toast-action", "Click the mic button to unmute." }
+                                }
+                            }
+                        }
+                        if show_video_off_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host turned off your camera" }
+                                    br {}
+                                    span { class: "toast-action", "Click the camera button to turn it back on." }
+                                }
+                            }
+                        }
                         for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
@@ -1941,7 +3588,7 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div { id: "grid-container", style: "{container_style}",
+                div { id: "grid-container", class: "{container_class}", style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();
@@ -1993,8 +3640,11 @@ pub fn AttendantsComponent(
                                             full_bleed: true,
                                             host_user_id: host_user_id.clone(),
                                             render_mode: TileMode::ScreenOnly,
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
+                                            // HCL bug #2: the shared-content tile shows
+                                            // ONLY the screen-share metric in its popup.
+                                            meter_mode: SignalMeterMode::ScreenOnly,
                                             on_toggle_pin: toggle_pin.clone(),
                                         }
                                     }
@@ -2007,15 +3657,34 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles
+                                // Right panel — 1 or 2-column grid of compact peer tiles.
+                                //
+                                // HCL issues #3 + #4: columns are sized to the tile's natural
+                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
+                                // the grid stretch each cell to fill `right_pct%`, leaving the
+                                // 3:2-capped `.split-peer-tile` centered with surplus on both
+                                // sides — visually "centered with too-large column gaps" on a
+                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
+                                // with `justify-content: start` packs the tiles to the left
+                                // edge and keeps the inter-tile gap exactly `8px`, matching
+                                // the non-share grid feel. Tiles still hold their 3:2 cap
+                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
+                                // so wide-screen viewports leave empty space on the right
+                                // edge of the panel instead of stretching the tiles.
                                 div {
                                     style: {
-                                        let grid_cols = if ss_cols > 1.0 { "1fr 1fr" } else { "1fr" };
+                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
+                                        let grid_cols = if ss_cols > 1.0 {
+                                            format!("repeat(2, {ss_tile_w:.0}px)")
+                                        } else {
+                                            format!("{ss_tile_w:.0}px")
+                                        };
                                         format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
                                                 display: grid; grid-template-columns: {grid_cols}; \
                                                 grid-auto-rows: {ss_tile_h:.0}px; \
                                                 gap: 8px; padding: 6px; \
-                                                align-content: start; overflow: visible;")
+                                                justify-content: start; align-content: start; \
+                                                overflow: visible;")
                                     },
                                     for tile_id in ss_tiles.iter() {
                                         {
@@ -2028,7 +3697,7 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         on_toggle_pin: move |_: String| {},
                                                     }
                                                 }
@@ -2040,9 +3709,11 @@ pub fn AttendantsComponent(
                                                         full_bleed: false,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
-                                                        my_peer_id: user_id.clone(),
+                                                        my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
                                                     }
                                                 }
                                             }
@@ -2074,7 +3745,7 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed: false,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             on_toggle_pin: move |_: String| {},
                                         }
                                     }
@@ -2085,9 +3756,55 @@ pub fn AttendantsComponent(
                                             peer_id: tile_id.clone(),
                                             full_bleed,
                                             host_user_id: host_user_id.clone(),
-                                            my_peer_id: user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Off-budget avatar tiles (issue #987, task 1a.4) ----
+                        // Peers the layout could show but the decode-budget cap
+                        // excluded from video decode. They render via the SAME
+                        // `PeerTile` component with `force_avatar: true`, so they
+                        // show the avatar/initials placeholder (no canvas, no
+                        // decode) while keeping name, mic state and host controls.
+                        // They are NOT in `active_decode_set` (it is built from
+                        // `visible_tiles` only), but their audio is untouched.
+                        // `avatar_tiles` is empty unless a budget cap is active,
+                        // so this loop is a no-op on the default path.
+                        for tile_id in avatar_tiles.iter() {
+                            {
+                                let is_mock = tile_id.starts_with("mock-");
+                                if is_mock {
+                                    rsx! {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            force_avatar: true,
+                                            host_user_id: host_user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
+                                            on_toggle_pin: move |_: String| {},
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            force_avatar: true,
+                                            host_user_id: host_user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 }
@@ -2109,7 +3826,7 @@ pub fn AttendantsComponent(
                                 class: "card-apple",
                                 style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
                                 h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "font-size: 0.9rem; opacity: 0.8;",
+                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                                     "Share this meeting link with others you want in the meeting"
                                 }
                                 div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
@@ -2157,7 +3874,7 @@ pub fn AttendantsComponent(
                                         }
                                     }
                                 }
-                                p { style: "font-size: 0.8rem; opacity: 0.7;",
+                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
                                     "People who use this meeting link must get your permission before they can join."
                                 }
                                 div {
@@ -2249,16 +3966,114 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting);
+                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
                                                         disabled: is_disabled,
-                                                        onclick: move |_| {
-                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                screen_share_state.set(ScreenShareState::Requesting);
-                                                            } else {
-                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                        onclick: {
+                                                            let stream_cell = pre_acquired_screen_stream.clone();
+                                                            move |_| {
+                                                                if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                    // Call getDisplayMedia synchronously within the user
+                                                                    // gesture (click) handler.  Safari rejects the call if
+                                                                    // it crosses an async boundary (spawn_local / Timeout).
+                                                                    // Obtaining the Promise is synchronous and satisfies the
+                                                                    // gesture requirement; only the await happens later.
+                                                                    let navigator = gloo_utils::window().navigator();
+                                                                    let media_devices = match navigator.media_devices() {
+                                                                        Ok(md) => md,
+                                                                        Err(e) => {
+                                                                            log::error!("Failed to get media devices: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Build constraints identical to those in ScreenEncoder::start()
+                                                                    let width_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &width_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1920.0),
+                                                                    );
+                                                                    let height_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &height_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(1080.0),
+                                                                    );
+                                                                    let framerate_constraint = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &framerate_constraint,
+                                                                        &JsValue::from_str("ideal"),
+                                                                        &JsValue::from_f64(10.0),
+                                                                    );
+                                                                    let video_constraints = js_sys::Object::new();
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("width"),
+                                                                        &width_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("height"),
+                                                                        &height_constraint.into(),
+                                                                    );
+                                                                    let _ = js_sys::Reflect::set(
+                                                                        &video_constraints,
+                                                                        &JsValue::from_str("frameRate"),
+                                                                        &framerate_constraint.into(),
+                                                                    );
+
+                                                                    let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                                                                    constraints.set_video(&video_constraints.into());
+                                                                    constraints.set_audio(&JsValue::FALSE);
+
+                                                                    // This call happens synchronously in the click handler --
+                                                                    // the browser returns a Promise without rejecting.
+                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                        Ok(p) => p,
+                                                                        Err(e) => {
+                                                                            log::error!("getDisplayMedia failed synchronously: {e:?}");
+                                                                            return;
+                                                                        }
+                                                                    };
+
+                                                                    // Mark as requesting immediately so the button shows disabled
+                                                                    screen_share_state.set(ScreenShareState::Requesting);
+
+                                                                    // Now await the promise asynchronously -- this is fine,
+                                                                    // the gesture requirement was satisfied above.
+                                                                    let cell = stream_cell.clone();
+                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                                        match JsFuture::from(promise).await {
+                                                                            Ok(stream) => {
+                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                cell.borrow_mut().replace(media_stream);
+                                                                                // StreamReady causes is_sharing() to return true,
+                                                                                // which gives Host share_screen=true so it picks
+                                                                                // up the pre-acquired stream and starts encoding.
+                                                                                screen_share_state.set(ScreenShareState::StreamReady);
+                                                                            }
+                                                                            Err(e) => {
+                                                                                // User cancelled or browser denied
+                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                    .ok()
+                                                                                    .and_then(|v| v.as_string())
+                                                                                    .map(|n| n == "NotAllowedError")
+                                                                                    .unwrap_or(false);
+                                                                                if is_cancel {
+                                                                                    log::info!("User cancelled screen sharing");
+                                                                                } else {
+                                                                                    log::error!("getDisplayMedia rejected: {e:?}");
+                                                                                }
+                                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                } else {
+                                                                    screen_share_state.set(ScreenShareState::Idle);
+                                                                }
                                                             }
                                                         },
                                                     }
@@ -2268,115 +4083,195 @@ pub fn AttendantsComponent(
                                         PeerListButton {
                                             open: peer_list_open(),
                                             onclick: move |_| {
-                                                peer_list_open.set(!peer_list_open());
-                                                if peer_list_open() {
+                                                let opening = !peer_list_open();
+                                                peer_list_open.set(opening);
+                                                if opening {
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
-                                        if show_density_selector && !has_screen_share {
+                                        if !has_screen_share {
                                             DensityModeButton {
                                                 label: density_mode().label().to_string(),
                                                 open: density_open(),
-                                                onclick: move |_| {
-                                                    density_open.set(!density_open());
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    let opening = !density_open();
+                                                    density_open.set(opening);
+                                                    if opening {
+                                                        dock_menu_open.set(false);
+                                                        mock_peers_open.set(false);
+
+                                                    }
                                                 },
+                                            }
+                                        }
+                                        // (а) Dock position dropdown — grouped with the tile-layout (density)
+                                        // button because both control how the meeting view is arranged.
+                                        // Keeping them adjacent so users see "view / layout" preferences
+                                        // together. The popup menu escapes the controls-secondary overflow
+                                        // clip via CSS (`overflow: visible` on the expanded state).
+                                        div { class: "dock-position-wrapper",
+                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                                button {
+                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                    title: "Dock position",
+                                                    r#type: "button",
+                                                    "aria-haspopup": "listbox",
+                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let opening = !dock_menu_open();
+                                                        dock_menu_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            mock_peers_open.set(false);
+
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        // Horizontal bar outline
+                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                        // Three dots inside the bar
+                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    }
+                                                }
+                                                if dock_menu_open() {
+                                                    div {
+                                                        class: "glass-select-menu",
+                                                        role: "listbox",
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Bottom"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Left"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Right"
+                                                        }
+                                                        // Separator
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            if autohide_enabled() {
+                                                                "Turn Hiding Off"
+                                                            } else {
+                                                                "Turn Hiding On"
+                                                            }
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                device_settings_initial_section
+                                                                    .set(Some("appearance".to_string()));
+                                                                device_settings_generation
+                                                                    .set(device_settings_generation() + 1);
+                                                                device_settings_open.set(true);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            "Dock Settings\u{2026}"
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         if mock_peers_enabled() {
                                             MockPeersButton {
                                                 open: mock_peers_open(),
-                                                onclick: move |_| {
-                                                    mock_peers_open.set(!mock_peers_open());
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    let opening = !mock_peers_open();
+                                                    mock_peers_open.set(opening);
+                                                    if opening {
+                                                        density_open.set(false);
+                                                        dock_menu_open.set(false);
+
+                                                    }
                                                 },
                                             }
                                         }
                                         DiagnosticsButton {
                                             open: diagnostics_open(),
                                             onclick: move |_| {
-                                                diagnostics_open.set(!diagnostics_open());
-                                                if diagnostics_open() {
+                                                let opening = !diagnostics_open();
+                                                diagnostics_open.set(opening);
+                                                if opening {
                                                     peer_list_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
                                         }
                                         DeviceSettingsButton {
                                             open: device_settings_open(),
                                             onclick: move |_| {
+                                                device_settings_initial_section.set(None);
+                                                let was_closed = !device_settings_open();
                                                 device_settings_open.set(!device_settings_open());
-                                                if device_settings_open() {
+                                                if was_closed {
+                                                    device_settings_generation
+                                                        .set(device_settings_generation() + 1);
                                                     peer_list_open.set(false);
                                                     diagnostics_open.set(false);
+                                                    density_open.set(false);
+                                                    dock_menu_open.set(false);
+                                                    mock_peers_open.set(false);
+
                                                 }
                                             },
-                                        }
-                                    }
-                                    // (а) Dock position dropdown — glass-select style
-                                    div { class: "dock-position-wrapper",
-                                        div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
-                                            button {
-                                                class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
-                                                title: "Dock position",
-                                                r#type: "button",
-                                                "aria-haspopup": "listbox",
-                                                "aria-expanded": if dock_menu_open() { "true" } else { "false" },
-                                                onclick: move |e| {
-                                                    e.stop_propagation();
-                                                    dock_menu_open.set(!dock_menu_open());
-                                                },
-                                                svg {
-                                                    xmlns: "http://www.w3.org/2000/svg",
-                                                    width: "20",
-                                                    height: "20",
-                                                    view_box: "0 0 24 24",
-                                                    fill: "none",
-                                                    stroke: "currentColor",
-                                                    stroke_width: "2",
-                                                    stroke_linecap: "round",
-                                                    stroke_linejoin: "round",
-                                                    rect { x: "3", y: "3", width: "7", height: "7" }
-                                                    rect { x: "14", y: "3", width: "7", height: "7" }
-                                                    rect { x: "3", y: "14", width: "7", height: "7" }
-                                                    rect { x: "14", y: "14", width: "7", height: "7" }
-                                                }
-                                            }
-                                            if dock_menu_open() {
-                                                div {
-                                                    class: "glass-select-menu",
-                                                    role: "listbox",
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Bottom);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Bottom"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Left);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Left"
-                                                    }
-                                                    div {
-                                                        class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                        role: "option",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            dock_position.set(DockPosition::Right);
-                                                            dock_menu_open.set(false);
-                                                        },
-                                                        "Right"
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     {
@@ -2454,7 +4349,10 @@ pub fn AttendantsComponent(
                                     video_enabled: video_enabled(),
                                     on_encoder_settings_update: move |_s: String| {},
                                     device_settings_open: device_settings_open(),
+                                    device_settings_initial_section: device_settings_initial_section(),
+                                    device_settings_generation: device_settings_generation(),
                                     on_device_settings_toggle: move |_| {
+                                        device_settings_initial_section.set(None);
                                         device_settings_open.set(!device_settings_open());
                                     },
                                     on_microphone_error: move |err: String| {
@@ -2469,16 +4367,48 @@ pub fn AttendantsComponent(
                                     },
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
+                                        let mut screen_share_toast_state = screen_share_toast_state;
+                                        let mut screen_share_toast_timer = screen_share_toast_timer;
                                         match event {
                                             ScreenShareEvent::Started(_stream) => {
                                                 screen_share_state.set(ScreenShareState::Active);
+                                                screen_share_toast_state
+                                                    .set(Some(ScreenShareToastState::Starting));
+                                                screen_share_toast_timer.set(Some(Timeout::new(
+                                                    10_000,
+                                                    move || {
+                                                        let mut s = screen_share_toast_state;
+                                                        if matches!(
+                                                            s.peek().as_ref(),
+                                                            Some(ScreenShareToastState::Starting)
+                                                        ) {
+                                                            s.set(Some(ScreenShareToastState::Failed(
+                                                                "No peers received the shared content within 10 seconds."
+                                                                    .to_string(),
+                                                            )));
+                                                            let mut t = screen_share_toast_timer;
+                                                            t.set(Some(Timeout::new(
+                                                                6_000,
+                                                                move || {
+                                                                    let mut s2 =
+                                                                        screen_share_toast_state;
+                                                                    s2.set(None);
+                                                                },
+                                                            )));
+                                                        }
+                                                    },
+                                                )));
                                             }
                                             ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                             }
                                             ScreenShareEvent::Failed(ref msg) => {
                                                 log::error!("Screen share failed: {msg}");
                                                 screen_share_state.set(ScreenShareState::Idle);
+                                                screen_share_toast_state.set(None);
+                                                screen_share_toast_timer.set(None);
                                                 user_error.set(Some(format!("Screen share failed: {msg}")));
                                             }
                                         }
@@ -2522,6 +4452,7 @@ pub fn AttendantsComponent(
                                 if meeting_info_open() {
                                     diagnostics_open.set(false);
                                     device_settings_open.set(false);
+                                    device_settings_initial_section.set(None);
                                 }
                             },
                             host_display_name: host_display_name.clone(),
@@ -2547,6 +4478,16 @@ pub fn AttendantsComponent(
                     UpdateDisplayNameModal {
                         current_display_name: current_display_name(),
                         meeting_id: id.clone(),
+                        // HCL issue 828 follow-up: parse the local session_id
+                        // (a numeric string from the client) into u64 so the
+                        // rename REST request can identify this tab. Falls back
+                        // to None when the session has not yet been assigned or
+                        // the value is unparseable — the server then renames
+                        // every session of the caller's user_id (legacy
+                        // behaviour).
+                        session_id: my_session_id
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok()),
                         on_close: move |_| {
                             display_name_modal_open.set(false);
                         },
@@ -2585,6 +4526,7 @@ pub fn AttendantsComponent(
                 // Mock peers popover (only shown when env-gated)
                 if mock_peers_enabled() && mock_peers_open() {
                     div { class: "mock-peers-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {
@@ -2629,14 +4571,16 @@ pub fn AttendantsComponent(
                 }
 
                 // Density mode popover
-                if show_density_selector && !has_screen_share && density_open() {
+                if !has_screen_share && density_open() {
                     div { class: "density-popover",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
                         for mode in DENSITY_MODES {
                             div {
                                 key: "{mode.label()}",
                                 class: if density_mode() == mode { "density-option active" } else { "density-option" },
                                 onclick: move |_| {
                                     density_mode.set(mode);
+                                    save_density_mode(mode);
                                     density_open.set(false);
                                 },
                                 span { class: "density-option-label", "{mode.label()}" }
@@ -2648,6 +4592,53 @@ pub fn AttendantsComponent(
             }
         }
     }
+}
+
+/// Default 50 ms coalescing window for [`schedule_throttled_bump`].
+///
+/// Selected as a render-friendly upper bound: at 60 fps a frame is ~16 ms,
+/// so 50 ms guarantees at most one re-render per ~3 frames even under a
+/// sustained burst of speech events. See Phase 6 render-storm fix
+/// (cc7tp 2026-05-06).
+pub(crate) const PEER_LIST_VERSION_THROTTLE_MS: u32 = 50;
+
+/// Coalesce a burst of "something tiny changed" events into at most one
+/// invocation of `bump` per `delay_ms` window.
+///
+/// `pending` is an `Rc<Cell<bool>>` that survives across calls (typically
+/// stored via `use_hook`). When clear, this function sets it and schedules
+/// a [`Timeout`] of `delay_ms` that will:
+///   1. Invoke `bump` (the actual work — e.g. a `peer_list_version.set()`).
+///   2. Clear `pending` so the next call schedules a new window.
+///
+/// When `pending` is already set, this call is a no-op — the bump is
+/// already inbound. This is the kernel of the Phase 6 render-storm fix:
+/// `peer_speaking` events fire 3-5×/sec/speaker on a busy call, and
+/// without coalescing each one drove a full meeting-view re-render. With
+/// the throttle, bursty speech activity collapses into one re-render
+/// every 50 ms regardless of how many speakers are active.
+///
+/// Note: only "soft" bumps (the ones driven by speech activity, where
+/// the peer set is unchanged and the version bump exists purely to nudge
+/// memo-keyed children) should go through this throttle. Real peer
+/// add/remove events must bump immediately.
+pub(crate) fn schedule_throttled_bump(pending: Rc<Cell<bool>>, delay_ms: u32, bump: Rc<dyn Fn()>) {
+    if pending.get() {
+        return;
+    }
+    pending.set(true);
+    let pending_clone = pending.clone();
+    let bump_clone = bump.clone();
+    Timeout::new(delay_ms, move || {
+        // Clear the flag BEFORE running `bump` so any new event fired
+        // synchronously from inside `bump` (or from a subscriber that
+        // reacts to the version change) can re-arm the throttle for the
+        // next 50 ms window. Otherwise the next event would silently
+        // drop and we'd miss a coalescing boundary.
+        pending_clone.set(false);
+        bump_clone();
+    })
+    .forget();
 }
 
 /// Parse a `peer_status` diagnostics event into a `(peer_id, PeerMediaState)`.
@@ -2795,5 +4786,231 @@ mod tests {
                 assert!(d >= 500, "attempt {attempt}: delay {d} must be >= 500");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for current_transport_urls (Phase 7, discussion 562)
+    //
+    // These exercise the pure-logic core via `current_transport_urls_from_lists`
+    // so they don't require `window().__APP_CONFIG` to be set up. The full
+    // `current_transport_urls` (with `build_lobby_urls`) is a thin wrapper
+    // that just calls into this core.
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_webtransport_with_wt_enabled_returns_both_lists() {
+        // WebTransport pref + server says WT enabled: both lists must come
+        // through. This is the WT-with-WS-fallback shape — the connection
+        // manager creates candidates for every URL and the election prefers
+        // WT, but if every WT candidate fails the WS candidates remain
+        // available for the manager to elect. This is the scenario the
+        // dioxus-ui hits on a normal reconnect once runtime config has
+        // loaded.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(enable_wt, "WebTransport+server-WT-enabled must enable WT");
+        assert_eq!(
+            ws_out, ws,
+            "WebTransport must keep the WS list — it's the fallback if every \
+             WT candidate fails its handshake"
+        );
+        assert_eq!(wt_out, wt, "WT list passed through unchanged");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_webtransport_with_wt_disabled_returns_only_ws() {
+        // WebTransport pref + runtime config hasn't loaded (or WT disabled
+        // at the server): the WT list is dropped from the effective config,
+        // collapsing to WS-only. This is the *initial* shape that strands
+        // the user before the reconnect path re-evaluates.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(
+            !enable_wt,
+            "WebTransport+server-WT-disabled must disable WT"
+        );
+        assert_eq!(ws_out, ws, "WS list still populated");
+        assert_eq!(
+            wt_out, wt,
+            "WebTransport preserves the WT list shape (resolve_transport_config returns it as-is); \
+             the manager's enable_webtransport=false is what gates use of WT"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_websocket_drops_wt_list() {
+        // Explicit WebSocket preference: WT list must always be empty,
+        // regardless of what the server-side flag says.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+        let (enable_wt, ws_out, wt_out) =
+            current_transport_urls_from_lists(TransportPreference::WebSocket, true, ws.clone(), wt);
+        assert!(!enable_wt, "WebSocket must report WT disabled");
+        assert_eq!(ws_out, ws);
+        assert!(wt_out.is_empty(), "WebSocket must drop the WT list");
+    }
+
+    #[wasm_bindgen_test]
+    fn current_transport_urls_recovery_path_repopulates_wt_after_runtime_load() {
+        // Regression for discussion 562: same input lists, but the user's
+        // initial `webtransport_enabled()` returned false (runtime config
+        // not loaded) and the reconnect's read returns true (loaded by
+        // then). The reconnect call must yield a richer URL set than the
+        // initial call — that's what flips `total_server_count() > 1` in
+        // the manager and lets the watchdog actually re-elect.
+        let ws = vec!["wss://ws-1".to_string()];
+        let wt = vec!["https://wt-1".to_string()];
+
+        // Initial call (runtime config still loading)
+        let (init_enable_wt, init_ws, _init_wt) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            false,
+            ws.clone(),
+            wt.clone(),
+        );
+        assert!(!init_enable_wt);
+        assert_eq!(init_ws, ws);
+        // Note: `WebTransport` keeps the wt list value; it's the bool that gates use.
+        // The recovery story is that `init_enable_wt == false` makes the manager
+        // treat the WT list as unusable even though it's present in the vec —
+        // see `resolve_transport_config`. The bool is the real signal, not the
+        // list contents.
+
+        // Reconnect call (runtime config now loaded — WT enabled)
+        let (reconn_enable_wt, reconn_ws, reconn_wt) = current_transport_urls_from_lists(
+            TransportPreference::WebTransport,
+            true,
+            ws.clone(),
+            wt,
+        );
+        assert!(reconn_enable_wt, "reconnect path now has WT enabled");
+        assert_eq!(reconn_ws, ws, "WS list still populated");
+        assert!(
+            !reconn_wt.is_empty(),
+            "reconnect path repopulates the WT list — this is the recovery \
+             from the single-server-stranding state"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6: schedule_throttled_bump tests
+    // -----------------------------------------------------------------
+
+    use gloo_timers::future::TimeoutFuture;
+
+    /// 5 calls to `schedule_throttled_bump` within the throttle window
+    /// should result in exactly **one** invocation of the bump callback.
+    /// Reproduces the cc7tp 2026-05-06 render-storm scenario where 5
+    /// `peer_speaking` events from different speakers all coalesce
+    /// into a single `peer_list_version` bump.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_coalesces_burst_into_single_invocation() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        // Use a 50 ms throttle window. We then issue 5 bumps within ~30
+        // ms (roughly back-to-back) and wait long enough for the timer
+        // to fire.
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Tiny await to make sure each call observes a real `await`
+            // boundary but stays inside the 50 ms window.
+            TimeoutFuture::new(5).await;
+        }
+
+        // Wait for the throttle window plus generous margin.
+        TimeoutFuture::new(120).await;
+
+        assert_eq!(
+            counter.get(),
+            1,
+            "5 bumps within the throttle window must coalesce into 1 invocation"
+        );
+        assert!(
+            !pending.get(),
+            "pending flag should be cleared after the bump fires"
+        );
+    }
+
+    /// 5 calls spaced 100 ms apart (well outside a 50 ms throttle
+    /// window) must each get their own bump — the throttle re-arms
+    /// between windows.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_does_not_drop_events_outside_window() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        for _ in 0..5 {
+            schedule_throttled_bump(pending.clone(), 50, make_bump());
+            // Wait > 50 ms so each call sees an empty `pending` flag and
+            // schedules a fresh window.
+            TimeoutFuture::new(100).await;
+        }
+
+        // Final tail wait so the last scheduled timeout has fired.
+        TimeoutFuture::new(100).await;
+
+        assert_eq!(
+            counter.get(),
+            5,
+            "5 bumps spaced > throttle window must each fire their own invocation"
+        );
+    }
+
+    /// Once the throttle window completes the flag must be clear so
+    /// the next event can schedule a new window. Equivalent to: bump,
+    /// wait for fire, bump again — both should fire.
+    #[wasm_bindgen_test]
+    async fn throttled_bump_rearm_after_window_completes() {
+        let pending = Rc::new(Cell::new(false));
+        let counter = Rc::new(Cell::new(0u32));
+
+        let make_bump = || -> Rc<dyn Fn()> {
+            let counter = counter.clone();
+            Rc::new(move || {
+                counter.set(counter.get() + 1);
+            })
+        };
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        assert!(pending.get(), "pending should be set after first schedule");
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(counter.get(), 1, "first bump should have fired");
+        assert!(!pending.get(), "pending should be cleared after fire");
+
+        schedule_throttled_bump(pending.clone(), 50, make_bump());
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            counter.get(),
+            2,
+            "second bump should have fired after re-arm"
+        );
     }
 }

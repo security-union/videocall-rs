@@ -12,6 +12,222 @@ use dioxus::prelude::*;
 use dioxus_sdk_storage::{LocalStorage, StorageBacking};
 use videocall_client::VideoCallClient;
 
+/// Per-tile crop state: canvas ID → is-cropped.
+/// Survives re-renders caused by peer list changes so crop toggles persist.
+#[derive(Clone, Copy)]
+pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
+
+/// Action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPosition {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            DockPosition::Bottom => "dock-bottom",
+            DockPosition::Left => "dock-left",
+            DockPosition::Right => "dock-right",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            DockPosition::Bottom => DockPosition::Left,
+            DockPosition::Left => DockPosition::Right,
+            DockPosition::Right => DockPosition::Bottom,
+        }
+    }
+}
+
+/// Context for the action bar dock position (Bottom / Left / Right).
+#[derive(Clone, Copy)]
+pub struct DockPositionCtx(pub Signal<DockPosition>);
+
+/// Context for the action bar autohide setting.
+#[derive(Clone, Copy)]
+pub struct AutohideCtx(pub Signal<bool>);
+
+// ---------------------------------------------------------------------------
+// Dock position & autohide persistence
+// ---------------------------------------------------------------------------
+
+const DOCK_POSITION_KEY: &str = "vc_dock_position";
+const DOCK_AUTOHIDE_KEY: &str = "vc_dock_autohide";
+
+/// Load dock position from localStorage. Defaults to Bottom.
+pub fn load_dock_position() -> DockPosition {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_POSITION_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "left" => DockPosition::Left,
+            "right" => DockPosition::Right,
+            _ => DockPosition::Bottom,
+        })
+        .unwrap_or(DockPosition::Bottom)
+}
+
+/// Resolve a raw localStorage value (e.g. `Some("true")`, `Some("false")`, or
+/// `None` when no preference has been persisted) into the initial autohide
+/// signal value. When no preference is stored, default to `false` (always
+/// visible) so first-time users see the action bar without learning the
+/// dock menu first.
+pub fn resolve_dock_autohide(stored: Option<&str>) -> bool {
+    match stored {
+        Some(v) => v != "false",
+        None => false,
+    }
+}
+
+/// Load dock autohide from localStorage. Defaults to `false` (no hiding)
+/// when no preference has been persisted yet.
+pub fn load_dock_autohide() -> bool {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten());
+    resolve_dock_autohide(stored.as_deref())
+}
+
+/// Persist dock position to localStorage.
+pub fn save_dock_position(pos: DockPosition) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match pos {
+            DockPosition::Bottom => "bottom",
+            DockPosition::Left => "left",
+            DockPosition::Right => "right",
+        };
+        let _ = storage.set_item(DOCK_POSITION_KEY, val);
+    }
+}
+
+/// Persist dock autohide to localStorage.
+pub fn save_dock_autohide(enabled: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(DOCK_AUTOHIDE_KEY, if enabled { "true" } else { "false" });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Density mode persistence
+// ---------------------------------------------------------------------------
+
+use crate::components::density::DensityMode;
+
+/// Context for the tile density mode.
+#[derive(Clone, Copy)]
+pub struct DensityModeCtx(pub Signal<DensityMode>);
+
+const DENSITY_MODE_KEY: &str = "vc_density_mode";
+
+/// Load density mode from localStorage. Defaults to Auto.
+pub fn load_density_mode() -> DensityMode {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DENSITY_MODE_KEY).ok().flatten())
+        .map(|v| match v.as_str() {
+            "standard" => DensityMode::Standard,
+            "dense" => DensityMode::Dense,
+            "maximum" => DensityMode::Maximum,
+            _ => DensityMode::Auto,
+        })
+        .unwrap_or(DensityMode::Auto)
+}
+
+/// Persist density mode to localStorage.
+pub fn save_density_mode(mode: DensityMode) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let val = match mode {
+            DensityMode::Auto => "auto",
+            DensityMode::Standard => "standard",
+            DensityMode::Dense => "dense",
+            DensityMode::Maximum => "maximum",
+        };
+        let _ = storage.set_item(DENSITY_MODE_KEY, val);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode-budget override persistence
+// ---------------------------------------------------------------------------
+
+/// Manual override for the adaptive decode-budget controller.
+///
+/// `Auto` (the default) lets the adaptive control loop in `attendants.rs`
+/// decide how many tiles to decode. `Fixed(n)` is a **hard override**: it
+/// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
+/// type is purely the persisted/shared state — the bypass behavior lives in
+/// the control loop (task 1a.3), not here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DecodeBudgetOverride {
+    #[default]
+    Auto,
+    Fixed(usize),
+}
+
+/// Context for the decode-budget override.
+#[derive(Clone, Copy)]
+pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
+
+/// Parse a persisted decode-budget override string. Mirrors the density-mode
+/// manual-match style: `"auto"` (or any unparseable value) yields the default
+/// `Auto`; a positive integer string yields `Fixed(n)`. A stored `Fixed(0)`
+/// (or any value that fails to parse as a non-zero `usize`) collapses to
+/// `Auto`, since a zero-tile hard override is meaningless.
+fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
+    match raw {
+        "auto" => DecodeBudgetOverride::Auto,
+        other => match other.parse::<usize>() {
+            Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
+            _ => DecodeBudgetOverride::Auto,
+        },
+    }
+}
+
+/// Serialize a decode-budget override to its compact storage string: `"auto"`
+/// for `Auto`, or the bare integer for `Fixed(n)`.
+fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
+    match value {
+        DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Load the decode-budget override from localStorage. Defaults to `Auto`.
+pub fn load_decode_budget_override() -> DecodeBudgetOverride {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DECODE_BUDGET_OVERRIDE_KEY).ok().flatten())
+        .map(|v| parse_decode_budget_override(&v))
+        .unwrap_or_default()
+}
+
+/// Persist the decode-budget override to localStorage.
+pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
+    // User override engaging: log the user's explicit choice (Fixed cap vs Auto
+    // resume) so support can distinguish a user-chosen cap from an auto-shed.
+    match value {
+        DecodeBudgetOverride::Fixed(n) => {
+            log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::Auto => {
+            log::info!("DecodeBudget: override=auto source=user_setting")
+        }
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(
+            DECODE_BUDGET_OVERRIDE_KEY,
+            &serialize_decode_budget_override(value),
+        );
+    }
+}
+
 /// Wrapper for the display name signal used as context.
 #[derive(Clone, Copy)]
 pub struct DisplayNameCtx(pub Signal<Option<String>>);
@@ -134,6 +350,8 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+    pub show_join_leave_notifications: bool,
+    pub play_join_leave_sounds: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -143,6 +361,8 @@ impl Default for AppearanceSettings {
             glow_color: GlowColor::MintGreen,
             glow_brightness: 1.0,
             inner_glow_strength: 1.0,
+            show_join_leave_notifications: true,
+            play_join_leave_sounds: true,
         }
     }
 }
@@ -155,6 +375,8 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY: &str = "vc_appearance_join_leave_notifications";
+const APPEARANCE_JOIN_LEAVE_SOUNDS_KEY: &str = "vc_appearance_join_leave_sounds";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -185,6 +407,17 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
+    if let Some(value) =
+        LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string())
+    {
+        settings.show_join_leave_notifications = value != "false";
+    }
+
+    if let Some(value) = LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string())
+    {
+        settings.play_join_leave_sounds = value != "false";
+    }
+
     settings
 }
 
@@ -205,6 +438,14 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     LocalStorage::set(
         APPEARANCE_INNER_STORAGE_KEY.to_string(),
         &settings.inner_glow_strength.clamp(0.0, 1.0),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string(),
+        &settings.show_join_leave_notifications.to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string(),
+        &settings.play_join_leave_sounds.to_string(),
     );
 }
 
@@ -284,6 +525,22 @@ pub type PeerSignalHistoryMap = Signal<
     std::collections::HashMap<
         String,
         Rc<RefCell<crate::components::signal_quality::PeerSignalHistory>>,
+    >,
+>;
+
+/// HCL bug #8 / #9: per-(peer, mode) signal-quality popup state, lifted out
+/// of `PeerTile`'s per-component lifecycle so a peer leaving the meeting (or
+/// a layout switch between grid / split / full-bleed) does not unmount every
+/// open popup. Only the popup whose anchored peer left is dropped; all other
+/// open popups survive untouched.
+///
+/// Bug #9 also stores the user's drag-and-drop position here so that
+/// switching layouts (grid → split when a peer starts screen sharing, etc.)
+/// keeps the popup pinned to wherever the user dragged it.
+pub type SignalPopupStateMap = Signal<
+    std::collections::HashMap<
+        (String, crate::components::signal_quality::SignalMeterMode),
+        crate::components::signal_quality::SignalPopupState,
     >,
 >;
 
@@ -440,23 +697,39 @@ pub fn migrate_legacy_storage() {
 ///
 /// Stored in `localStorage` under `vc_transport_preference` and read at
 /// connection time to override the server-provided WebTransport flag.
+///
+/// **Semantics:**
+///
+/// - `WebTransport` (default): attempt WebTransport first; if WebTransport is
+///   unavailable, blocked by a firewall, or fails its handshake, automatically
+///   fall back to WebSocket. This is what the legacy `Auto` variant did and is
+///   the recommended setting for nearly all users.
+/// - `WebSocket`: use WebSocket only — no WebTransport attempt is made.
+///
+/// **Migration**: a persisted value of `"auto"` (the legacy default) is
+/// transparently coerced to `WebTransport` by [`FromStr`]. The first time
+/// [`load_transport_preference`] sees such a value it logs the migration so
+/// operators can verify the upgrade path. The migration is one-shot — on the
+/// next storage write the value is canonical.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TransportPreference {
-    /// Honour the server-side `webTransportEnabled` flag (default behaviour).
+    /// Attempt WebTransport with automatic WebSocket fallback.
+    ///
+    /// Both URL lists are advertised to the connection manager, which runs
+    /// an election preferring WebTransport candidates. When WebTransport is
+    /// unavailable (browser support, UDP blocked, server returns non-2xx,
+    /// handshake timeout) the manager falls back to the WebSocket candidates.
     #[default]
-    Auto,
-    /// Force WebTransport — WebSocket URLs are cleared.
-    WebTransportOnly,
-    /// Force WebSocket — WebTransport is disabled.
-    WebSocketOnly,
+    WebTransport,
+    /// Use WebSocket exclusively — no WebTransport attempt.
+    WebSocket,
 }
 
 impl std::fmt::Display for TransportPreference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            TransportPreference::Auto => "auto",
-            TransportPreference::WebTransportOnly => "webtransport",
-            TransportPreference::WebSocketOnly => "websocket",
+            TransportPreference::WebTransport => "webtransport",
+            TransportPreference::WebSocket => "websocket",
         };
         f.write_str(s)
     }
@@ -467,9 +740,11 @@ impl std::str::FromStr for TransportPreference {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Ok(TransportPreference::Auto),
-            "webtransport" => Ok(TransportPreference::WebTransportOnly),
-            "websocket" => Ok(TransportPreference::WebSocketOnly),
+            // Legacy "auto" value — migrate to WebTransport. The new
+            // WebTransport variant carries the WT-with-WS-fallback semantics
+            // that "auto" used to mean.
+            "auto" | "webtransport" => Ok(TransportPreference::WebTransport),
+            "websocket" => Ok(TransportPreference::WebSocket),
             _ => Err(()),
         }
     }
@@ -480,20 +755,132 @@ impl std::str::FromStr for TransportPreference {
 pub struct TransportPreferenceCtx(pub Signal<TransportPreference>);
 
 const TRANSPORT_PREF_KEY: &str = "vc_transport_preference";
+const TRANSPORT_STICKY_KEY: &str = "vc_transport_sticky";
+const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 
-/// Load the persisted transport preference from `localStorage`.
+/// Load the persisted transport preference, honouring the sticky flag.
+///
+/// Resolution order:
+///
+/// 1. **Sticky enabled** (`vc_transport_sticky == "true"`): read the
+///    persistent preference from `localStorage`. This is the explicit
+///    "remember my choice" path the user opted into via the Network tab.
+/// 2. **Sticky disabled**: any leftover `vc_transport_preference` is treated
+///    as stale data from older releases that wrote unconditionally — clear
+///    it for backward compatibility, then fall back to `sessionStorage`. The
+///    session value is set when the user changes the protocol without ticking
+///    "remember", so the change survives the page reload triggered by the
+///    select but is forgotten on tab close.
+/// 3. Otherwise: `WebTransport` (the new default — was `Auto` before the
+///    protocol-settings simplification).
+///
+/// **Legacy "auto" migration**: when this function reads `"auto"` from
+/// storage (the previous default value), it logs the migration once and
+/// canonicalises the stored value to `"webtransport"`. The new
+/// `WebTransport` variant carries the WT-with-WS-fallback semantics that
+/// `Auto` used to mean, so user behaviour is unchanged.
 pub fn load_transport_preference() -> TransportPreference {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(TRANSPORT_PREF_KEY).ok().flatten())
-        .and_then(|val| val.parse::<TransportPreference>().ok())
-        .unwrap_or_default()
+    let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
+
+    let sticky = local_storage
+        .as_ref()
+        .and_then(|s| s.get_item(TRANSPORT_STICKY_KEY).ok().flatten())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if sticky {
+        if let Some(storage) = local_storage.as_ref() {
+            if let Ok(Some(raw)) = storage.get_item(TRANSPORT_PREF_KEY) {
+                let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+                // Canonicalise the persisted value if it came in as legacy
+                // "auto" — the variant is gone, but the stored string would
+                // linger otherwise.
+                if raw == "auto" {
+                    log::info!(
+                        "Migrating persisted transport preference \"auto\" -> \"{}\" \
+                         (Auto removed in favour of WebTransport-with-WS-fallback)",
+                        parsed
+                    );
+                    let _ = storage.set_item(TRANSPORT_PREF_KEY, &parsed.to_string());
+                }
+                return parsed;
+            }
+        }
+        return TransportPreference::default();
+    }
+
+    // Backward-compat: silently drop a stale persistent preference left over
+    // from before the sticky checkbox existed, so previous explicit choices
+    // do not "stick" surprise-style after the upgrade.
+    if let Some(storage) = local_storage.as_ref() {
+        let _ = storage.remove_item(TRANSPORT_PREF_KEY);
+    }
+
+    if let Some(storage) = session_storage.as_ref() {
+        if let Ok(Some(raw)) = storage.get_item(TRANSPORT_SESSION_KEY) {
+            let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+            if raw == "auto" {
+                log::info!(
+                    "Migrating session transport preference \"auto\" -> \"{}\" \
+                     (Auto removed in favour of WebTransport-with-WS-fallback)",
+                    parsed
+                );
+                let _ = storage.set_item(TRANSPORT_SESSION_KEY, &parsed.to_string());
+            }
+            return parsed;
+        }
+    }
+    TransportPreference::default()
 }
 
-/// Persist the transport preference to `localStorage`.
+/// Persist the transport preference to `localStorage` (the sticky path).
 pub fn save_transport_preference(pref: TransportPreference) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(TRANSPORT_PREF_KEY, &pref.to_string());
+    }
+}
+
+/// Persist the transport preference to `sessionStorage` (the non-sticky path).
+///
+/// Used when the user changes the protocol without enabling "remember
+/// protocol choice" — the value must survive the page reload triggered by
+/// the change but should be discarded once the browsing session ends.
+pub fn save_transport_preference_session(pref: TransportPreference) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_SESSION_KEY, &pref.to_string());
+    }
+}
+
+/// Read whether the user has opted to remember the transport choice.
+pub fn load_transport_sticky() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(TRANSPORT_STICKY_KEY).ok().flatten())
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Persist the sticky flag.
+pub fn save_transport_sticky(sticky: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(TRANSPORT_STICKY_KEY, if sticky { "true" } else { "false" });
+    }
+}
+
+/// Reset all transport-preference storage entries — both the persistent
+/// (`localStorage`) keys and the per-session (`sessionStorage`) value — so
+/// the next page load resolves to the default (`WebTransport`).
+///
+/// This is the single source of truth for "go back to default" so callers
+/// don't have to know about the three keys involved.
+pub fn clear_transport_sticky_and_pref() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(TRANSPORT_STICKY_KEY);
+        let _ = storage.remove_item(TRANSPORT_PREF_KEY);
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.remove_item(TRANSPORT_SESSION_KEY);
     }
 }
 
@@ -501,6 +888,19 @@ pub fn save_transport_preference(pref: TransportPreference) {
 /// the server-provided WebTransport flag.
 ///
 /// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
+///
+/// **WebTransport-with-WS-fallback**: when the user has selected
+/// `WebTransport` (the default), BOTH URL lists are returned. The
+/// connection manager creates candidates for every URL and runs an election
+/// — if any WebTransport candidate completes its handshake it wins, but if
+/// every WT candidate fails (browser support missing, UDP blocked, server
+/// rejected the handshake) the WS candidates become the only ones that can
+/// be elected and the client automatically uses WebSocket. The fallback is
+/// thus structural, not a separate retry: see
+/// `videocall-client/src/connection/connection_manager.rs::create_all_connections`.
+///
+/// `WebSocket` forces a single-transport configuration with the WT list
+/// emptied — there is no fallback in that mode by design.
 pub fn resolve_transport_config(
     pref: TransportPreference,
     server_wt_enabled: bool,
@@ -508,21 +908,42 @@ pub fn resolve_transport_config(
     wt_urls: Vec<String>,
 ) -> (bool, Vec<String>, Vec<String>) {
     match pref {
-        TransportPreference::Auto => (server_wt_enabled, ws_urls, wt_urls),
-        TransportPreference::WebTransportOnly => (true, vec![], wt_urls),
-        TransportPreference::WebSocketOnly => (false, ws_urls, vec![]),
+        // WebTransport selection ≡ legacy Auto: surface BOTH URL lists so
+        // the manager's election can fall back to WebSocket if every WT
+        // candidate fails. The `server_wt_enabled` flag still gates whether
+        // the manager will attempt the WT URLs at all (e.g. when runtime
+        // config hasn't loaded yet) — this is unchanged from Auto behaviour.
+        TransportPreference::WebTransport => (server_wt_enabled, ws_urls, wt_urls),
+        TransportPreference::WebSocket => (false, ws_urls, vec![]),
     }
 }
 
 /// Handle a transport preference change from transport selection controls.
 ///
-/// Shows a confirmation dialog. If the user confirms, saves the preference and
-/// reloads the page. If cancelled, attempts to reset a native `<select>`
-/// control (when present) back to the current value so it doesn't appear stale.
+/// Shows a confirmation dialog. If the user confirms, persists the preference
+/// (sticky vs session-only depending on `sticky`) and reloads the page. If
+/// cancelled, attempts to reset a native `<select>` control (when present)
+/// back to the current value so it doesn't appear stale.
 ///
-/// Custom controls (like the settings modal glass dropdown) are state-driven and
-/// naturally re-render with the current value when the user cancels.
-pub fn confirm_transport_change(new_value: &str, current: TransportPreference, select_id: &str) {
+/// Routing rules:
+///
+/// - The default (`WebTransport`) selected with `sticky == false`: clear every
+///   transport-preference storage key so the next load resolves to the default
+///   without needing a remembered choice.
+/// - Selecting any value with `sticky == true`: write to `localStorage` so the
+///   choice persists across browser sessions.
+/// - Non-default selection with `sticky == false`: write to `sessionStorage`
+///   so the choice survives the imminent page reload but evaporates when the
+///   tab closes.
+///
+/// Custom controls (like the settings modal glass dropdown) are state-driven
+/// and naturally re-render with the current value when the user cancels.
+pub fn confirm_transport_change(
+    new_value: &str,
+    current: TransportPreference,
+    select_id: &str,
+    sticky: bool,
+) {
     use wasm_bindgen::JsCast;
 
     let pref = new_value.parse::<TransportPreference>().unwrap_or_default();
@@ -539,7 +960,17 @@ pub fn confirm_transport_change(new_value: &str, current: TransportPreference, s
         })
         .unwrap_or(false);
     if confirmed {
-        save_transport_preference(pref);
+        let is_default = pref == TransportPreference::default();
+        match (is_default, sticky) {
+            // Default + not sticky: clear all storage — implicit default
+            // doesn't need to be remembered.
+            (true, false) => clear_transport_sticky_and_pref(),
+            (_, true) => {
+                save_transport_preference(pref);
+                save_transport_sticky(true);
+            }
+            (false, false) => save_transport_preference_session(pref),
+        }
         if let Some(w) = web_sys::window() {
             let _ = w.location().reload();
         }
@@ -560,3 +991,292 @@ pub use videocall_types::validation::{
     email_to_display_name, is_allowed_display_name_char, is_guid_like, is_valid_meeting_id,
     validate_display_name, DISPLAY_NAME_MAX_LEN,
 };
+
+// ── Theme preference ──────────────────────────────────────────────────────────
+
+/// Application colour theme.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    /// Follow the OS `prefers-color-scheme` media query.
+    System,
+    Light,
+}
+
+impl Theme {
+    /// Stored value written to localStorage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::System => "system",
+            Theme::Light => "light",
+        }
+    }
+
+    /// Label shown in the UI toggle.
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::System => "System",
+            Theme::Light => "Light",
+        }
+    }
+}
+
+impl std::str::FromStr for Theme {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "system" => Ok(Theme::System),
+            "light" | "dawn" => Ok(Theme::Light),
+            _ => Ok(Theme::Dark),
+        }
+    }
+}
+
+/// Context providing the active theme signal to the component tree.
+#[derive(Clone, Copy)]
+pub struct ThemePreferenceCtx(pub Signal<Theme>);
+
+const THEME_STORAGE_KEY: &str = "ui-theme";
+
+/// Load theme from localStorage; falls back to `Theme::Dark`.
+pub fn load_theme_from_storage() -> Theme {
+    LocalStorage::get::<String>(&THEME_STORAGE_KEY.to_string())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default()
+}
+
+/// Apply `data-theme` on `<html>` without touching localStorage.
+/// Use this for the FOUC-prevention path where the value is already loaded.
+/// When `theme` is `Theme::System` the resolved value is read from the
+/// `prefers-color-scheme` media query at call time.
+pub fn apply_theme_to_dom(theme: Theme) {
+    let resolved = match theme {
+        Theme::System => {
+            let prefers_dark = web_sys::window()
+                .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
+                .map(|mql| mql.matches())
+                .unwrap_or(true);
+            if prefers_dark {
+                "dark"
+            } else {
+                "light"
+            }
+        }
+        _ => theme.as_str(),
+    };
+    if let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    {
+        let _ = root.set_attribute("data-theme", resolved);
+    }
+}
+
+/// Persist theme to localStorage and apply `data-theme` on `<html>`.
+pub fn apply_and_save_theme(theme: Theme) {
+    LocalStorage::set(THEME_STORAGE_KEY.to_string(), &theme.as_str().to_string());
+    apply_theme_to_dom(theme);
+}
+
+/// Handle to a `(prefers-color-scheme: dark)` MediaQueryList `change` listener.
+///
+/// Keeping the [`Closure`] alive as a field is what prevents JS from
+/// reclaiming the underlying callback while the listener is still
+/// registered.  `remove()` detaches the listener — call it on app unmount
+/// so we never accumulate dangling listeners across hot reloads.
+pub struct PrefersColorSchemeHandle {
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
+    mql: web_sys::MediaQueryList,
+}
+
+impl PrefersColorSchemeHandle {
+    pub fn remove(&self) {
+        use wasm_bindgen::JsCast;
+        let _ = self
+            .mql
+            .remove_event_listener_with_callback("change", self.closure.as_ref().unchecked_ref());
+    }
+}
+
+/// Subscribe to OS-level `prefers-color-scheme` changes.
+///
+/// While [`Theme::System`] is the active preference, an OS dark↔light
+/// switch (e.g. macOS sunset, manual iOS toggle) re-runs
+/// [`apply_theme_to_dom`] so the page follows the OS without a reload.
+/// For [`Theme::Dark`] / [`Theme::Light`] the change is ignored — the user
+/// has expressed an explicit preference.
+pub fn register_prefers_color_scheme_listener(
+    theme: Signal<Theme>,
+) -> Option<std::rc::Rc<PrefersColorSchemeHandle>> {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    let mql = web_sys::window()
+        .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())?;
+
+    let theme_signal = theme;
+    let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |_evt: web_sys::Event| {
+        if matches!(*theme_signal.peek(), Theme::System) {
+            apply_theme_to_dom(Theme::System);
+        }
+    });
+
+    mql.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
+        .ok()?;
+
+    Some(std::rc::Rc::new(PrefersColorSchemeHandle { closure, mql }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_position_css_class() {
+        assert_eq!(DockPosition::Bottom.css_class(), "dock-bottom");
+        assert_eq!(DockPosition::Left.css_class(), "dock-left");
+        assert_eq!(DockPosition::Right.css_class(), "dock-right");
+    }
+
+    #[test]
+    fn dock_position_next_cycles() {
+        assert_eq!(DockPosition::Bottom.next(), DockPosition::Left);
+        assert_eq!(DockPosition::Left.next(), DockPosition::Right);
+        assert_eq!(DockPosition::Right.next(), DockPosition::Bottom);
+    }
+
+    #[test]
+    fn dock_position_next_full_roundtrip() {
+        let start = DockPosition::Bottom;
+        let result = start.next().next().next();
+        assert_eq!(result, start);
+    }
+
+    #[test]
+    fn density_mode_labels() {
+        assert_eq!(DensityMode::Auto.label(), "Auto");
+        assert_eq!(DensityMode::Standard.label(), "Standard");
+        assert_eq!(DensityMode::Dense.label(), "Dense");
+        assert_eq!(DensityMode::Maximum.label(), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_debug_impl() {
+        assert_eq!(format!("{:?}", DensityMode::Auto), "Auto");
+        assert_eq!(format!("{:?}", DensityMode::Standard), "Standard");
+        assert_eq!(format!("{:?}", DensityMode::Dense), "Dense");
+        assert_eq!(format!("{:?}", DensityMode::Maximum), "Maximum");
+    }
+
+    #[test]
+    fn density_mode_clone_and_eq() {
+        let original = DensityMode::Dense;
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DensityMode::Auto, DensityMode::Standard);
+        assert_ne!(DensityMode::Dense, DensityMode::Maximum);
+        assert_ne!(DensityMode::Auto, DensityMode::Maximum);
+    }
+
+    #[test]
+    fn density_mode_ctx_clone() {
+        // Compile-time check that DensityModeCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DensityModeCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_default_is_auto() {
+        assert_eq!(DecodeBudgetOverride::default(), DecodeBudgetOverride::Auto);
+    }
+
+    #[test]
+    fn decode_budget_override_debug_impl() {
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Auto), "Auto");
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Fixed(4)), "Fixed(4)");
+    }
+
+    #[test]
+    fn decode_budget_override_clone_and_eq() {
+        let original = DecodeBudgetOverride::Fixed(8);
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(1));
+        assert_ne!(
+            DecodeBudgetOverride::Fixed(2),
+            DecodeBudgetOverride::Fixed(3)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_ctx_clone() {
+        // Compile-time check that DecodeBudgetCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DecodeBudgetCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_auto() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Auto);
+        assert_eq!(serialized, "auto");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Auto
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_fixed() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Fixed(12));
+        assert_eq!(serialized, "12");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Fixed(12)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_parse_invalid_falls_back_to_auto() {
+        // Garbage, empty, negative, and zero all collapse to the default Auto,
+        // mirroring the density-mode "_ => Auto" fallback semantics.
+        assert_eq!(
+            parse_decode_budget_override("garbage"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(parse_decode_budget_override(""), DecodeBudgetOverride::Auto);
+        assert_eq!(
+            parse_decode_budget_override("-5"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(
+            parse_decode_budget_override("0"),
+            DecodeBudgetOverride::Auto
+        );
+    }
+
+    #[test]
+    fn resolve_dock_autohide_defaults_to_false_when_unset() {
+        // First-time users with no persisted preference should see the
+        // action bar always visible — autohide must default to false.
+        assert!(!resolve_dock_autohide(None));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_true() {
+        // Regression guard: a user who has explicitly enabled autohide must
+        // keep that preference after the default-off fix.
+        assert!(resolve_dock_autohide(Some("true")));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_false() {
+        // Explicitly disabled autohide stays disabled.
+        assert!(!resolve_dock_autohide(Some("false")));
+    }
+}

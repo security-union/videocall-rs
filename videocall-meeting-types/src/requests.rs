@@ -97,6 +97,14 @@ pub struct GuestJoinRequest {
 pub struct UpdateDisplayNameRequest {
     /// New display name for the participant.
     pub display_name: String,
+    /// Optional session_id of the renaming tab. When provided, the server
+    /// scopes the rename and its `PARTICIPANT_DISPLAY_NAME_CHANGED` broadcast
+    /// to this single session, so sibling tabs of the same authenticated
+    /// user keep their own display names (HCL issue #828 follow-up). When
+    /// omitted (legacy clients), the server falls back to renaming every
+    /// session that shares the caller's `user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/admit`
@@ -135,4 +143,74 @@ impl Default for ListMeetingsQuery {
             q: None,
         }
     }
+}
+
+/// Query parameters for `GET /api/v1/meetings/joined`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListJoinedMeetingsQuery {
+    /// Maximum number of joined meetings to return. Defaults to 5 when omitted.
+    /// Server clamps to a maximum of 50; negative values return 400 INVALID_INPUT.
+    #[serde(default = "default_joined_limit")]
+    pub limit: i64,
+}
+
+fn default_joined_limit() -> i64 {
+    5
+}
+
+impl Default for ListJoinedMeetingsQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_joined_limit(),
+        }
+    }
+}
+
+/// Query parameters for `GET /api/v1/meetings/feed`.
+///
+/// `limit` defaults to and is clamped at 200. Negative values are rejected
+/// with `400 INVALID_INPUT`. The 200-row cap is intentional — datasets larger
+/// than that should be reached via the search modal
+/// (`GET /api/v1/meetings?q=...`) rather than expanding the home-feed payload.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListFeedQuery {
+    /// Maximum number of meetings to return. Defaults to 200 when omitted.
+    /// Server clamps to a maximum of 200; negative values return 400 INVALID_INPUT.
+    #[serde(default = "default_feed_limit")]
+    pub limit: i64,
+}
+
+fn default_feed_limit() -> i64 {
+    200
+}
+
+impl Default for ListFeedQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_feed_limit(),
+        }
+    }
+}
+
+/// Query parameters for `POST /api/v1/meetings/{meeting_id}/mute`
+/// and `POST /api/v1/meetings/{meeting_id}/mute-all`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MuteParticipantRequest {
+    /// User ID of the participant to ask to mute.
+    pub user_id: String,
+}
+
+/// Query parameters for `POST /api/v1/meetings/{meeting_id}/disable-video`
+/// and `POST /api/v1/meetings/{meeting_id}/disable-video-all`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DisableVideoParticipantRequest {
+    /// User ID of the participant to ask to disable video.
+    pub user_id: String,
+}
+
+/// Request body for `POST /api/v1/meetings/{meeting_id}/kick`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KickParticipantRequest {
+    /// User ID of the participant to remove from the meeting.
+    pub user_id: String,
 }

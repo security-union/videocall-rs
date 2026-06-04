@@ -230,6 +230,8 @@ env:
 ```
 
 > **Note:** When `OAUTH_ISSUER` is not set, `OAUTH_AUTH_URL` and `OAUTH_TOKEN_URL` are required. JWKS-based signature verification is only available when `OAUTH_JWKS_URL` is set (either manually or via discovery).
+>
+> **Security gate:** If OAuth is enabled and the final post-discovery config still has no JWKS URL, `meeting-api` now refuses to start unless `OAUTH_ALLOW_UNVERIFIED=true` is set explicitly. That opt-in is a break-glass development mode only: the service will accept ID tokens without signature verification and logs a startup error banner to make the risk obvious in boot logs.
 
 ---
 
@@ -244,6 +246,7 @@ env:
 | `OAUTH_AUTH_URL` | Cond. | — | Authorization endpoint. Required when `OAUTH_ISSUER` not set. |
 | `OAUTH_TOKEN_URL` | Cond. | — | Token endpoint. Required when `OAUTH_ISSUER` not set. |
 | `OAUTH_JWKS_URL` | No | — | JWKS endpoint. Overrides discovery. Enables ID token verification. |
+| `OAUTH_ALLOW_UNVERIFIED` | No | `false` | Break-glass opt-in for running OAuth without a JWKS URL. Only for controlled dev/triage use; startup fails if JWKS is absent and this is not `true`. |
 | `OAUTH_USERINFO_URL` | No | — | UserInfo endpoint. Fallback when ID token lacks `email`. |
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated scopes. |
 | `AFTER_LOGIN_URL` | No | `/` | Default redirect after login (primary frontend URL). |

@@ -21,6 +21,8 @@
 /// track of connection status.
 ///
 use super::task::Task;
+use super::url_log::strip_query_for_log;
+use super::webmedia::MediaStreamKey;
 use super::ConnectOptions;
 use crate::adaptive_quality_constants::HEARTBEAT_KEEPALIVE_INTERVAL_MS;
 use crate::crypto::aes::Aes128State;
@@ -30,7 +32,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
+use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
@@ -58,6 +60,10 @@ pub struct Connection {
     /// unlike `session_id` which is shared with the heartbeat `Interval` closure.
     userid: RefCell<Option<String>>,
     url: String,
+    /// Transport announced to peers in our outgoing heartbeats. This is a
+    /// passive label of the locally-chosen transport; it does not affect
+    /// connection selection.
+    transport_type: TransportType,
 }
 
 impl Connection {
@@ -66,6 +72,28 @@ impl Connection {
         options: ConnectOptions,
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
+        // Phase 3c (discussion #793): on the first call per tab,
+        // parse `?netsim=<profile>` from `window.location` and
+        // install the matching `NetSimShim` in the per-tab hook slot.
+        // `std::sync::Once` makes this idempotent across reconnects —
+        // a re-election or session drop that calls `Connection::connect`
+        // again must not reinstall and reset the hook. Safe on
+        // `wasm32-unknown-unknown` because (a) a browser tab is
+        // single-threaded, so `Once`'s "first call wins" is race-free
+        // and maps to "first connect per tab wins", and (b)
+        // `window.location` query params are immutable for the tab
+        // lifetime (a real URL change is a navigation that tears down
+        // this wasm instance), so re-parsing on reconnect would yield
+        // the same profile — skipping it is an optimization, not a
+        // behavior change. See `connection/netsim_url.rs`.
+        #[cfg(feature = "netsim")]
+        {
+            static NETSIM_URL_INSTALL: std::sync::Once = std::sync::Once::new();
+            NETSIM_URL_INSTALL.call_once(|| {
+                let _ = super::netsim_url::try_install_from_url();
+            });
+        }
+
         let mut new_options = options.clone();
         let status = Rc::new(Cell::new(Status::Connecting));
 
@@ -90,8 +118,24 @@ impl Connection {
         let monitor = new_options.peer_monitor.clone();
         let task = Task::connect(webtransport, new_options)?;
 
+        let transport_type = if webtransport {
+            TransportType::TRANSPORT_WEBTRANSPORT
+        } else {
+            TransportType::TRANSPORT_WEBSOCKET
+        };
+
+        let task = Rc::new(task);
+
+        // Phase 3b (discussion #793): register a `Weak<Task>` with
+        // the per-tab netsim hook so the async `Delay` /
+        // `DelayAndDuplicate` paths can re-enter the send pipeline
+        // after the simulated delay. See
+        // `connection/netsim_hook.rs` for the full design.
+        #[cfg(feature = "netsim")]
+        super::netsim_hook::install_task(Some(Rc::downgrade(&task)));
+
         let connection = Self {
-            task: Rc::new(task),
+            task,
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
                 monitor.emit(());
@@ -105,6 +149,7 @@ impl Connection {
             session_id: Rc::new(RefCell::new(None)),
             userid: RefCell::new(None),
             url,
+            transport_type,
         };
 
         Ok(connection)
@@ -124,6 +169,7 @@ impl Connection {
         let screen_enabled = Rc::clone(&self.screen_enabled);
         let is_speaking = Rc::clone(&self.is_speaking);
         let session_id = Rc::clone(&self.session_id);
+        let transport_type = self.transport_type;
 
         self.heartbeat = Some(Interval::new(HEARTBEAT_KEEPALIVE_INTERVAL_MS, move || {
             if let Some(packet_wrapper) = build_heartbeat_packet(
@@ -134,6 +180,7 @@ impl Connection {
                 &is_speaking,
                 &aes,
                 &session_id,
+                transport_type,
             ) {
                 if let Status::Connected = status.get() {
                     // Heartbeats are periodic and expendable — use datagrams
@@ -154,9 +201,14 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: PacketWrapper) {
+    /// Send a packet via the reliable stream selected by `stream_key`.
+    ///
+    /// `stream_key` selects which persistent QUIC stream the packet rides
+    /// on under WebTransport (one per media type to prevent head-of-line
+    /// blocking).  Ignored by WebSocket.
+    pub fn send_packet(&self, packet: PacketWrapper, stream_key: MediaStreamKey) {
         if let Status::Connected = self.status.get() {
-            self.task.send_packet(packet);
+            self.task.send_packet(packet, stream_key);
         }
     }
 
@@ -226,6 +278,7 @@ impl Connection {
             &self.is_speaking,
             &self.aes,
             &self.session_id,
+            self.transport_type,
         ) {
             self.task.send_packet_datagram(packet_wrapper);
         }
@@ -241,6 +294,14 @@ impl Connection {
         }
     }
 
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn is_webtransport(&self) -> bool {
+        self.transport_type == TransportType::TRANSPORT_WEBTRANSPORT
+    }
+
     pub fn set_session_id(&self, session_id: u64) {
         *self.session_id.borrow_mut() = Some(session_id);
     }
@@ -253,26 +314,29 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        log::debug!("Dropping Connection to {}", self.url);
+        log::debug!("Dropping Connection to {}", strip_query_for_log(&self.url));
         self.stop_heartbeat();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_heartbeat_packet(
     userid: &str,
     video_enabled: &AtomicBool,
     audio_enabled: &AtomicBool,
     screen_enabled: &AtomicBool,
-    _is_speaking: &AtomicBool,
+    is_speaking: &AtomicBool,
     aes: &Aes128State,
     session_id: &RefCell<Option<u64>>,
+    transport_type: TransportType,
 ) -> Option<PacketWrapper> {
     let heartbeat_metadata = HeartbeatMetadata {
         video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
         audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
         screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        // is_speaking not in proto currently
-        ..Default::default()
+        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        transport_type: ::protobuf::EnumOrUnknown::new(transport_type),
+        special_fields: ::protobuf::SpecialFields::new(),
     };
 
     let packet = MediaPacket {

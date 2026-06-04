@@ -47,8 +47,8 @@
 |--------|-----------------|
 | `videocall_adaptive_video_tier` | Current camera video tier (0=best, 7=minimal) |
 | `videocall_adaptive_audio_tier` | Current audio tier (0=high, 3=emergency) |
-| `videocall_datagram_drops_total` | Cumulative WT datagram drops |
-| `videocall_websocket_drops_total` | Cumulative WS packet drops |
+| `videocall_datagram_drops` | Latest WT datagram-drop snapshot |
+| `videocall_websocket_drops` | Latest WS packet-drop snapshot |
 | `videocall_keyframe_requests_sent_total` | PLI requests sent |
 | `videocall_client_active_server_rtt_ms` | RTT to active relay |
 | `videocall_client_active_server` | Which relay (WS/WT) |

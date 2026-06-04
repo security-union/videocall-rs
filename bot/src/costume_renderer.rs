@@ -17,7 +17,8 @@
  */
 
 use anyhow::{anyhow, Context};
-use std::fs;
+use memmap2::Mmap;
+use std::fs::File;
 use std::path::Path;
 use tracing::info;
 
@@ -26,8 +27,10 @@ const HEIGHT: u32 = 720;
 const FRAME_BYTES: usize = (WIDTH as usize) * (HEIGHT as usize) * 3 / 2; // I420
 
 pub struct CostumeRenderer {
-    idle_frames: Vec<u8>,
-    talking_frames: Vec<u8>,
+    /// Read-only memory maps let the OS page cache manage residency and share
+    /// the same costume blobs across multiple bot processes on a host.
+    idle_frames: Mmap,
+    talking_frames: Mmap,
     idle_count: usize,
     talking_count: usize,
 }
@@ -37,10 +40,18 @@ impl CostumeRenderer {
         let idle_path = costume_dir.join("idle.i420");
         let talking_path = costume_dir.join("talking.i420");
 
-        let idle_frames = fs::read(&idle_path)
-            .with_context(|| format!("Failed to read {}", idle_path.display()))?;
-        let talking_frames = fs::read(&talking_path)
-            .with_context(|| format!("Failed to read {}", talking_path.display()))?;
+        let idle_file = File::open(&idle_path)
+            .with_context(|| format!("Failed to open {}", idle_path.display()))?;
+        let talking_file = File::open(&talking_path)
+            .with_context(|| format!("Failed to open {}", talking_path.display()))?;
+
+        // SAFETY: The files are opened read-only and the resulting mappings
+        // live for at most as long as the renderer. The costume assets are
+        // immutable blobs, so no concurrent mutation invalidates the slices.
+        let idle_frames = unsafe { Mmap::map(&idle_file) }
+            .with_context(|| format!("Failed to mmap {}", idle_path.display()))?;
+        let talking_frames = unsafe { Mmap::map(&talking_file) }
+            .with_context(|| format!("Failed to mmap {}", talking_path.display()))?;
 
         if idle_frames.len() % FRAME_BYTES != 0 || idle_frames.is_empty() {
             return Err(anyhow!(

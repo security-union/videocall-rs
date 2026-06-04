@@ -23,9 +23,12 @@ use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
+// SignalMeterMode is referenced via SignalInfo internally — no direct import
+// needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
-use crate::context::{AppearanceSettings, VideoCallClientCtx};
+use crate::context::{AppearanceSettings, CroppedTilesCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
+use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use wasm_bindgen::JsCast;
@@ -282,10 +285,44 @@ pub struct AudioLevels {
     pub mic: f32,
 }
 
+/// HCL bugs #8 + #9: bundled per-tile signal-popup state + callbacks
+/// passed into [`generate_for_peer`]. Replaces the previous
+/// `Signal<bool>` so the popup state can be owned by a context-wide map
+/// (surviving peer-leave-induced remounts and layout switches) and so
+/// drag/reanchor wiring lives alongside the toggle/close events.
+pub struct SignalPopupHandlers {
+    /// Whether the popup is currently open for this tile.
+    pub show: bool,
+    /// HCL bug #9: `Some(left, top)` when the user has dragged the popup
+    /// to a fixed viewport position; `None` re-engages the anchored
+    /// follow-the-tile behaviour.
+    pub free_position: Option<(f64, f64)>,
+    /// Fired when the user clicks the signal-meter icon to toggle the
+    /// popup open/closed.
+    pub on_toggle: EventHandler<()>,
+    /// Fired when the user explicitly dismisses the popup via the "X".
+    pub on_close: EventHandler<()>,
+    /// HCL bug #9: fired when the user drops the popup at a new
+    /// viewport position. The host commits the position to the
+    /// popup-state map so the popup re-mounts at the same place on
+    /// later renders.
+    pub on_drag_commit: EventHandler<(f64, f64)>,
+    /// HCL bug #9: fired when the user clicks the 📌 reanchor button so
+    /// the popup snaps back to the tile.
+    pub on_reanchor: EventHandler<()>,
+}
+
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. The `audio_levels.raw` parameter (0.0–1.0) drives
 /// a glow whose intensity scales with voice volume.
 /// If `host_user_id` matches the peer's authenticated user_id, a crown icon is displayed next to the name.
+///
+/// `my_session_id` is the LOCAL session_id (from `VideoCallClient::get_own_session_id`). It is
+/// compared against `key` (the peer's session_id) to detect the local user's own tile. Prior
+/// versions of this function used the local user_id, which caused sibling same-user sessions to
+/// be misidentified as "self" (HCL issue 828): each tab of the same authenticated user has its own
+/// distinct session_id but a shared user_id, so a user-id compare collapses sibling tabs into a
+/// single "self" tile in split layouts and screen-share paths.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_for_peer(
     client: &VideoCallClient,
@@ -294,18 +331,46 @@ pub fn generate_for_peer(
     audio_levels: AudioLevels,
     host_user_id: Option<&str>,
     mode: TileMode,
-    my_peer_id: Option<&str>,
+    my_session_id: Option<&str>,
     signal_info: SignalInfo,
-    mut show_signal_popup: Signal<bool>,
+    signal_popup: SignalPopupHandlers,
+    mut show_tile_menu: Signal<bool>,
+    on_mute: Option<EventHandler<()>>,
+    on_disable_video: Option<EventHandler<()>>,
+    on_kick: Option<EventHandler<()>>,
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
+    // Issue #987, task 1a.4: when `true`, this tile is "off-budget" — the
+    // adaptive decode-budget controller has excluded the peer from video decode
+    // to save CPU. The tile renders the avatar/initials placeholder instead of a
+    // live `<canvas>` (so no decode pipeline is bound) and tags the grid item
+    // with `off-budget-tile` for styling / E2E. Audio is unaffected: the peer is
+    // simply not in `active_decode_set`. Always `false` on the screen-share /
+    // full-bleed paths (the avatar tier only appears in the multi-tile grid).
+    force_avatar: bool,
 ) -> Element {
+    let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
+        try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let audio_level = audio_levels.raw;
     let mic_audio_level = audio_levels.mic;
     let signal_level = signal_info.level;
     let signal_history = signal_info.history;
     let meeting_start_ms = signal_info.meeting_start_ms;
+    // Pulled out once before rsx so the SignalQualityPopup call sites
+    // below can each pass an `Option<String>` clone without hunting
+    // through the bundle.
+    let signal_transport = signal_info.transport;
+    let signal_meter_mode = signal_info.meter_mode;
+    // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
+    let SignalPopupHandlers {
+        show: show_signal_popup,
+        free_position: signal_free_position,
+        on_toggle: on_toggle_signal_popup,
+        on_close: on_close_signal_popup,
+        on_drag_commit: on_drag_commit_signal_popup,
+        on_reanchor: on_reanchor_signal_popup,
+    } = signal_popup;
     let peer_user_id = client.get_peer_user_id(key).unwrap_or_else(|| key.clone());
     let peer_display_name = client
         .get_peer_display_name(key)
@@ -323,6 +388,15 @@ pub fn generate_for_peer(
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+
+    // Issue #987, task 1a.4: an off-budget tile renders the avatar placeholder
+    // even when the peer's camera is on, because the decode-budget controller
+    // has excluded it from `active_decode_set` (no frames are being decoded for
+    // it). `show_canvas` therefore requires BOTH the peer's camera to be on AND
+    // the tile not to be forced into avatar mode. When `force_avatar` is false
+    // (the no-cap default and every screen-share / full-bleed call) this is
+    // exactly `is_video_enabled_for_peer`, so behaviour is unchanged.
+    let show_canvas = is_video_enabled_for_peer && !force_avatar;
 
     let is_pinned = pinned_peer_id
         .map(|p| p == peer_user_id.as_str())
@@ -346,15 +420,18 @@ pub fn generate_for_peer(
     let mic_inline_style = mic_style(visible_mic_level, visible_audio_level, appearance);
 
     // ---- Split-layout: screen-share left panel --------------------------------
+    // Self-identification keys on session_id, not user_id: two tabs/devices of
+    // the same authenticated user share a user_id but have distinct session_ids,
+    // and a sibling session must not be treated as "self" (HCL issue 828).
     if matches!(mode, TileMode::ScreenOnly) {
         // Don't render the local user's own screen share
-        if !is_screen_share_enabled_for_peer || my_peer_id == Some(peer_user_id.as_str()) {
+        if !is_screen_share_enabled_for_peer || my_session_id == Some(key.as_str()) {
             return rsx! {};
         }
     }
 
     // ---- Split-layout: early return for ScreenOnly / VideoOnly ----------------
-    let is_self_peer = my_peer_id == Some(peer_user_id.as_str());
+    let is_self_peer = my_session_id == Some(key.as_str());
     let decision = split_layout_decision(&mode, is_screen_share_enabled_for_peer, is_self_peer);
 
     if decision == TileDecision::Empty {
@@ -369,14 +446,35 @@ pub fn generate_for_peer(
         let peer_user_id_for_pin_ss = peer_user_id.clone();
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
+        // HCL bug #2: the shared-content tile gets its own signal-meter
+        // icon + popup. The popup-state map keys on `(peer_id, meter_mode)`,
+        // so this popup and the matching peer-tile popup coexist without
+        // collision. Anchor on the screen-share div so the portal positioner
+        // tracks it through layout reflows.
+        // HCL follow-up 957 (@token-exempt): anchor the signal-meter
+        // popup directly on the signal-quality button so the popup reads
+        // as "growing out of" the button on first open. The button id is
+        // stable (`<tile-div-id>-signal-btn`), unique per tile, and ASCII
+        // safe — mirrors the existing `<tile-div-id>-name` pattern from
+        // PR 952.
+        let ss_name_id = format!("{}-name", &*ss_div_id);
+        let ss_signal_btn_id = format!("{}-signal-btn", &*ss_div_id);
+        let ss_anchor_id = ss_signal_btn_id.clone();
+        let ss_split_class = if show_signal_popup {
+            "split-screen-tile signal-popup-open"
+        } else {
+            "split-screen-tile"
+        };
         return rsx! {
             div {
                 id: "{ss_div_id}",
-                class: "split-screen-tile",
+                class: "{ss_split_class}",
+                "data-tile-root": "true",
                 div {
                     class: "canvas-container video-on",
                     ScreenCanvas { peer_id: key.clone() }
                     h4 {
+                        id: "{ss_name_id}",
                         class: "floating-name",
                         title: "{ss_name_title}",
                         dir: "auto",
@@ -387,6 +485,18 @@ pub fn generate_for_peer(
                     }
                     div {
                         class: "tile-top-icons",
+                        // HCL bug #2: signal-meter icon button on the
+                        // shared-content tile. Visually identical to peer
+                        // tiles (same `.signal-indicator` class + bars
+                        // icon). Toggles the SCREEN-ONLY popup for this
+                        // publisher.
+                        button {
+                            id: "{ss_signal_btn_id}",
+                            class: "signal-indicator",
+                            "aria-label": "Show screen-share signal quality",
+                            onclick: move |_| on_toggle_signal_popup.call(()),
+                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
+                        }
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&ss_div_pin);
@@ -395,10 +505,39 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                            class: "crop-icon",
-                            CropIcon {}
+                        {
+                            let ss_crop_class = ss_canvas_crop.clone();
+                            rsx! {
+                                button {
+                                    onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                    CropIcon {}
+                                }
+                            }
+                        }
+                    }
+                }
+                if show_signal_popup {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = ss_anchor_id.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                meter_mode: signal_meter_mode,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
+                            }
                         }
                     }
                 }
@@ -429,15 +568,27 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let split_peer_class = if show_signal_popup() {
+        let split_peer_class = if show_signal_popup {
             "split-peer-tile signal-popup-open"
         } else {
             "split-peer-tile"
         };
+        // HCL follow-up 957 (@token-exempt): the signal-meter popup
+        // anchors directly on the signal-quality button (id below) so
+        // the popup overlays the button's top-left corner on first open.
+        // The portal positioner reads the button's bounding rect through
+        // ResizeObserver / window listeners so the popup stays glued to
+        // the button through grid reflows. `split_name_id` is still
+        // emitted on the `<h4>` so the fallback walker has a stable
+        // tile-relative anchor if the button id lookup ever misses.
+        let split_name_id = format!("{}-name", &*peer_video_div_id);
+        let split_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+        let split_anchor_id = split_signal_btn_id.clone();
         return rsx! {
             div {
                 class: "{split_peer_class}{vo_speaking}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{vo_tile_style}",
                 div {
                     class: "{grid_class}",
@@ -456,6 +607,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{split_name_id}",
                         class: "floating-name",
                         title: "{title_vo}",
                         dir: "auto",
@@ -477,12 +629,142 @@ pub fn generate_for_peer(
                         }
                         // Signal icon (always visible, clickable)
                         button {
+                            id: "{split_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
-                            onclick: move |_| show_signal_popup.toggle(),
+                            onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
-                        // Pin (visible on hover only)
+                        // Crop (visible on hover only, hidden when video disabled)
+                        if is_video_enabled_for_peer {
+                            {
+                                let pv_crop_class = pv_canvas_crop.clone();
+                                rsx! {
+                                    button {
+                                        onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                        CropIcon {}
+                                    }
+                                }
+                            }
+                        }
+                        // Three-dot host control menu (visible on hover, only for host)
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                            {
+                                let on_mute_clone = on_mute;
+                                let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
+                                rsx! {
+                                    div { class: "tile-mute-menu-wrapper",
+                                        button {
+                                            class: "tile-mute-btn",
+                                            title: "Host actions",
+                                            "aria-label": "Host actions",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                show_tile_menu.set(!show_tile_menu());
+                                            },
+                                            svg {
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "1" }
+                                                circle { cx: "12", cy: "5", r: "1" }
+                                                circle { cx: "12", cy: "19", r: "1" }
+                                            }
+                                        }
+                                        if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
+                                            div { class: "tile-context-menu",
+                                                if let Some(cb) = on_mute_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                            path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                            line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                            line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                        }
+                                                        "Mute"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_disable_video_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                        }
+                                                        "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Pin (visible on hover / when speaking)
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&div_id_pin);
@@ -491,26 +773,34 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        // Crop (visible on hover only)
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                            class: "crop-icon",
-                            CropIcon {}
-                        }
                     }
-                    if show_signal_popup() {
-                        {
-                            let h = signal_history.clone();
-                            let popup_peer_id = key.clone();
-                            let popup_peer_name = peer_display_name.clone();
-                            rsx! {
-                                SignalQualityPopup {
-                                    peer_id: popup_peer_id,
-                                    peer_name: popup_peer_name,
-                                    history: h,
-                                    meeting_start_ms,
-                                    on_close: move |_| show_signal_popup.set(false),
-                                }
+                }
+                // Signal-quality popup rendered as a sibling of
+                // `.canvas-container` (rather than a child) so the
+                // tile's `overflow: hidden` border-radius clip from
+                // PR #923 cannot cut it off. The popup itself is // @token-exempt: PR ref, not a color
+                // `position: fixed` (see `.signal-quality-popup-portal`
+                // in style.css) and anchors to this tile by id.
+                if show_signal_popup {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = split_anchor_id.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                meter_mode: signal_meter_mode,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
                             }
                         }
                     }
@@ -538,15 +828,24 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let full_bleed_grid_class = if show_signal_popup() {
+        let full_bleed_grid_class = if show_signal_popup {
             "grid-item full-bleed signal-popup-open"
         } else {
             "grid-item full-bleed"
         };
+        // HCL follow-up 957 (@token-exempt): anchor the popup on the
+        // tile's signal-quality button (id below) so the popup overlays
+        // the button's top-left corner on first open. `fb_name_id` is
+        // kept so the fallback walker still has a tile-relative
+        // `.floating-name` to land on if the button lookup misses.
+        let fb_name_id = format!("{}-name", &*peer_video_div_id);
+        let fb_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+        let fb_anchor_id = fb_signal_btn_id.clone();
         return rsx! {
             div {
                 class: "{full_bleed_grid_class}{speaking_class}",
                 id: "{peer_video_div_id}",
+                "data-tile-root": "true",
                 style: "{tile_style}",
                 div {
                     class: "{full_bleed_class}",
@@ -568,6 +867,7 @@ pub fn generate_for_peer(
                         }
                     }
                     h4 {
+                        id: "{fb_name_id}",
                         class: "floating-name",
                         title: "{title}",
                         dir: "auto",
@@ -589,12 +889,142 @@ pub fn generate_for_peer(
                         }
                         // Signal icon (always visible, clickable)
                         button {
+                            id: "{fb_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
-                            onclick: move |_| show_signal_popup.toggle(),
+                            onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
-                        // Pin and Crop (visible on hover only)
+                        // Crop (visible on hover only)
+                        if is_video_enabled_for_peer {
+                            {
+                                let crop_class = canvas_id_crop.clone();
+                                rsx! {
+                                    button {
+                                        onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
+                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                        CropIcon {}
+                                    }
+                                }
+                            }
+                        }
+                        // Three-dot host control menu (visible on hover, only for host)
+                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                            {
+                                let on_mute_clone = on_mute;
+                                let on_disable_video_clone = on_disable_video;
+                                let on_kick_clone = on_kick;
+                                rsx! {
+                                    div { class: "tile-mute-menu-wrapper",
+                                        button {
+                                            class: "tile-mute-btn",
+                                            title: "Host actions",
+                                            "aria-label": "Host actions",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                show_tile_menu.set(!show_tile_menu());
+                                            },
+                                            svg {
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                width: "16",
+                                                height: "16",
+                                                view_box: "0 0 24 24",
+                                                fill: "none",
+                                                stroke: "currentColor",
+                                                stroke_width: "2",
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                circle { cx: "12", cy: "12", r: "1" }
+                                                circle { cx: "12", cy: "5", r: "1" }
+                                                circle { cx: "12", cy: "19", r: "1" }
+                                            }
+                                        }
+                                        if show_tile_menu() {
+                                            div {
+                                                style: "position: fixed; inset: 0; z-index: 99;",
+                                                onclick: move |_| show_tile_menu.set(false),
+                                            }
+                                            div { class: "tile-context-menu",
+                                                if let Some(cb) = on_mute_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                            path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                            line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                            line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                        }
+                                                        "Mute"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_disable_video_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                        }
+                                                        "Disable video"
+                                                    }
+                                                }
+                                                if let Some(cb) = on_kick_clone {
+                                                    button {
+                                                        class: "tile-context-menu-item",
+                                                        onclick: move |_| {
+                                                            show_tile_menu.set(false);
+                                                            cb.call(());
+                                                        },
+                                                        svg {
+                                                            xmlns: "http://www.w3.org/2000/svg",
+                                                            width: "14",
+                                                            height: "14",
+                                                            view_box: "0 0 24 24",
+                                                            fill: "none",
+                                                            stroke: "currentColor",
+                                                            stroke_width: "2",
+                                                            stroke_linecap: "round",
+                                                            stroke_linejoin: "round",
+                                                            path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                            polyline { points: "17 8 21 12 17 16" }
+                                                            line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                        }
+                                                        "Remove from meeting"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Pin (leftmost via row-reverse, visible on hover / when speaking)
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&div_id_pin);
@@ -603,25 +1033,30 @@ pub fn generate_for_peer(
                             class: "pin-icon",
                             PushPinIcon {}
                         }
-                        button {
-                            onclick: move |_| toggle_canvas_crop(&canvas_id_crop),
-                            class: "crop-icon",
-                            CropIcon {}
-                        }
                     }
-                    if show_signal_popup() {
-                        {
-                            let h = signal_history.clone();
-                            let popup_peer_id = key.clone();
-                            let popup_peer_name = peer_display_name.clone();
-                            rsx! {
-                                SignalQualityPopup {
-                                    peer_id: popup_peer_id,
-                                    peer_name: popup_peer_name,
-                                    history: h,
-                                    meeting_start_ms,
-                                    on_close: move |_| show_signal_popup.set(false),
-                                }
+                }
+                // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
+                // border-radius `overflow: hidden` clip cannot crop it.
+                if show_signal_popup {
+                    {
+                        let h = signal_history.clone();
+                        let popup_peer_id = key.clone();
+                        let popup_peer_name = peer_display_name.clone();
+                        let popup_transport = signal_transport.clone();
+                        let popup_anchor = fb_anchor_id.clone();
+                        rsx! {
+                            SignalQualityPopup {
+                                peer_id: popup_peer_id,
+                                peer_name: popup_peer_name,
+                                history: h,
+                                meeting_start_ms,
+                                transport: popup_transport,
+                                anchor_id: popup_anchor,
+                                meter_mode: signal_meter_mode,
+                                free_position: signal_free_position,
+                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                on_close: move |_| on_close_signal_popup.call(()),
                             }
                         }
                     }
@@ -658,12 +1093,14 @@ pub fn generate_for_peer(
     };
 
     // Derive flat &str values so the rsx! condition is a simple != comparison.
-    let peer_id = peer_user_id.as_str();
-    let my_peer_id = my_peer_id.unwrap_or("");
+    // Self-identification keys on session_id (`key`), not user_id, so sibling
+    // same-user sessions get their own screen-share canvas (HCL issue 828).
+    let peer_session_id = key.as_str();
+    let my_session_id_str = my_session_id.unwrap_or("");
 
     rsx! {
         // Canvas for Screen share.
-        if peer_id != my_peer_id && is_screen_share_enabled_for_peer {
+        if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
                 id: "{screen_share_div_id}",
@@ -684,10 +1121,15 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
-                    button {
-                        onclick: move |_| toggle_canvas_crop(&ss_canvas_crop),
-                        class: "crop-icon",
-                        CropIcon {}
+                    {
+                        let ss_crop_class = ss_canvas_crop.clone();
+                        rsx! {
+                            button {
+                                onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                CropIcon {}
+                            }
+                        }
                     }
                     button {
                         onclick: move |_| {
@@ -701,7 +1143,7 @@ pub fn generate_for_peer(
             }
         }
         {
-            let grid_class = if is_video_enabled_for_peer {
+            let grid_class = if show_canvas {
                 "canvas-container video-on"
             } else {
                 "canvas-container"
@@ -709,15 +1151,40 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
-            let grid_item_class = if show_signal_popup() {
+            // Issue #987, task 1a.4: tag off-budget tiles with `off-budget-tile`
+            // so CSS can style them and E2E can query them
+            // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
+            // so the rendered class list is unchanged when no budget is active.
+            let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
+            let grid_item_class = if show_signal_popup {
                 "grid-item signal-popup-open"
             } else {
                 "grid-item"
             };
+            // HCL follow-up 957 (@token-exempt): anchor the popup on
+            // the tile's signal-quality button (id below) so the popup
+            // overlays the button's top-left corner on first open.
+            // `grid_name_id` is still emitted on the `<h4>` for the
+            // fallback walker.
+            let grid_name_id = format!("{}-name", &*peer_video_div_id);
+            let grid_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
+            let grid_anchor_id = grid_signal_btn_id.clone();
+            // Placeholder wording reflects WHY there is no video:
+            //   - camera genuinely off               → "Video Disabled" (unchanged)
+            //   - camera on but decode budget-paused  → "Video paused" (task 1a.4)
+            // An off-budget tile whose camera is also off keeps the camera-off
+            // wording, since that is the more fundamental reason.
+            let placeholder_label = if force_avatar && is_video_enabled_for_peer {
+                "Video paused"
+            } else {
+                "Video Disabled"
+            };
             rsx! {
                 div {
-                    class: "{grid_item_class}{grid_speaking}",
+                    class: "{grid_item_class}{grid_speaking}{off_budget_class}",
                     id: "{peer_video_div_id}",
+                    "data-tile-root": "true",
+                    "data-off-budget": if force_avatar { "true" } else { "false" },
                     style: "{grid_tile_style}",
                     // One canvas for the User Video
                     div {
@@ -727,15 +1194,16 @@ pub fn generate_for_peer(
                                 toggle_pinned_div(&pv_div_mobile);
                             }
                         },
-                        if is_video_enabled_for_peer {
+                        if show_canvas {
                             UserVideo { id: key_clone.clone(), hidden: false }
                         } else {
                             div { class: "placeholder-content",
                                 PeerIcon {}
-                                span { class: "placeholder-text", "Video Disabled" }
+                                span { class: "placeholder-text", "{placeholder_label}" }
                             }
                         }
                         h4 {
+                            id: "{grid_name_id}",
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
@@ -757,12 +1225,144 @@ pub fn generate_for_peer(
                             }
                             // Signal icon (always visible, clickable)
                             button {
+                                id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
                                 "aria-label": "Show signal quality",
-                                onclick: move |_| show_signal_popup.toggle(),
+                                onclick: move |_| on_toggle_signal_popup.call(()),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
-                            // Pin and Crop (visible on hover only)
+                            // Crop (visible on hover only). Gated on `show_canvas`
+                            // so off-budget avatar tiles — which have no canvas —
+                            // don't show a no-op crop button (task 1a.4).
+                            if show_canvas {
+                                {
+                                    let pv_crop_class = pv_canvas_crop.clone();
+                                    rsx! {
+                                        button {
+                                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                            CropIcon {}
+                                        }
+                                    }
+                                }
+                            }
+                            // Three-dot host control menu (visible on hover, only for host)
+                            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                                {
+                                    let on_mute_clone = on_mute;
+                                    let on_disable_video_clone = on_disable_video;
+                                    let on_kick_clone = on_kick;
+                                    rsx! {
+                                        div { class: "tile-mute-menu-wrapper",
+                                            button {
+                                                class: "tile-mute-btn",
+                                                title: "Host actions",
+                                                "aria-label": "Host actions",
+                                                onclick: move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    show_tile_menu.set(!show_tile_menu());
+                                                },
+                                                svg {
+                                                    xmlns: "http://www.w3.org/2000/svg",
+                                                    width: "16",
+                                                    height: "16",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    circle { cx: "12", cy: "12", r: "1" }
+                                                    circle { cx: "12", cy: "5", r: "1" }
+                                                    circle { cx: "12", cy: "19", r: "1" }
+                                                }
+                                            }
+                                            if show_tile_menu() {
+                                                div {
+                                                    style: "position: fixed; inset: 0; z-index: 99;",
+                                                    onclick: move |_| show_tile_menu.set(false),
+                                                }
+                                                div { class: "tile-context-menu",
+                                                    if let Some(cb) = on_mute_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                                path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
+                                                                path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
+                                                                line { x1: "12", y1: "19", x2: "12", y2: "23" }
+                                                                line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                                            }
+                                                            "Mute"
+                                                        }
+                                                    }
+                                                    if let Some(cb) = on_disable_video_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                                                line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                                            }
+                                                            "Disable video"
+                                                        }
+                                                    }
+                                                    if let Some(cb) = on_kick_clone {
+                                                        button {
+                                                            class: "tile-context-menu-item",
+                                                            onclick: move |_| {
+                                                                show_tile_menu.set(false);
+                                                                cb.call(());
+                                                            },
+                                                            svg {
+                                                                xmlns: "http://www.w3.org/2000/svg",
+                                                                width: "14",
+                                                                height: "14",
+                                                                view_box: "0 0 24 24",
+                                                                fill: "none",
+                                                                stroke: "currentColor",
+                                                                stroke_width: "2",
+                                                                stroke_linecap: "round",
+                                                                stroke_linejoin: "round",
+                                                                path { d: "M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7" }
+                                                                polyline { points: "17 8 21 12 17 16" }
+                                                                line { x1: "21", y1: "12", x2: "9", y2: "12" }
+                                                            }
+                                                            "Remove from meeting"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Pin (visible on hover / when speaking)
                             button {
                                 onclick: move |_| {
                                     toggle_pinned_div(&pv_div_pin);
@@ -771,25 +1371,30 @@ pub fn generate_for_peer(
                                 class: "pin-icon",
                                 PushPinIcon {}
                             }
-                            button {
-                                onclick: move |_| toggle_canvas_crop(&pv_canvas_crop),
-                                class: "crop-icon",
-                                CropIcon {}
-                            }
                         }
-                        if show_signal_popup() {
-                            {
-                                let h = signal_history.clone();
-                                let popup_peer_id = key.clone();
-                                let popup_peer_name = peer_display_name.clone();
-                                rsx! {
-                                    SignalQualityPopup {
-                                        peer_id: popup_peer_id,
-                                        peer_name: popup_peer_name,
-                                        history: h,
-                                        meeting_start_ms,
-                                        on_close: move |_| show_signal_popup.set(false),
-                                    }
+                    }
+                    // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
+                    // border-radius `overflow: hidden` clip cannot crop it.
+                    if show_signal_popup {
+                        {
+                            let h = signal_history.clone();
+                            let popup_peer_id = key.clone();
+                            let popup_peer_name = peer_display_name.clone();
+                            let popup_transport = signal_transport.clone();
+                            let popup_anchor = grid_anchor_id.clone();
+                            rsx! {
+                                SignalQualityPopup {
+                                    peer_id: popup_peer_id,
+                                    peer_name: popup_peer_name,
+                                    history: h,
+                                    meeting_start_ms,
+                                    transport: popup_transport,
+                                    anchor_id: popup_anchor,
+                                    meter_mode: signal_meter_mode,
+                                    free_position: signal_free_position,
+                                    on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
+                                    on_reanchor: move |_| on_reanchor_signal_popup.call(()),
+                                    on_close: move |_| on_close_signal_popup.call(()),
                                 }
                             }
                         }
@@ -803,7 +1408,9 @@ pub fn generate_for_peer(
 #[component]
 fn UserVideo(id: String, hidden: bool) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let id_for_effect = id.clone();
+    let id_for_class = id.clone();
 
     use_effect(move || {
         if let Some(elem) = gloo_utils::document().get_element_by_id(&id_for_effect) {
@@ -817,11 +1424,17 @@ fn UserVideo(id: String, hidden: bool) -> Element {
         }
     });
 
+    let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
+        "uncropped"
+    } else {
+        "cropped"
+    };
+
     rsx! {
         canvas {
             id: "{id}",
             hidden: hidden,
-            class: "uncropped",
+            class: crop_class,
         }
     }
 }
@@ -829,8 +1442,10 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 #[component]
 fn ScreenCanvas(peer_id: String) -> Element {
     let client = use_context::<VideoCallClientCtx>();
+    let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
     let canvas_id = format!("screen-share-{}", peer_id);
     let canvas_id_for_effect = canvas_id.clone();
+    let canvas_id_for_class = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
 
     use_effect(move || {
@@ -845,10 +1460,16 @@ fn ScreenCanvas(peer_id: String) -> Element {
         }
     });
 
+    let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
+        "uncropped"
+    } else {
+        "cropped"
+    };
+
     rsx! {
         canvas {
             id: "{canvas_id}",
-            class: "uncropped",
+            class: crop_class,
         }
     }
 }
@@ -876,21 +1497,24 @@ fn is_mobile_viewport() -> bool {
     false
 }
 
-fn toggle_canvas_crop(canvas_id: &str) {
-    if let Some(canvas) = window()
-        .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(canvas_id))
-    {
-        let class_list = canvas.class_list();
-        let is_cropped = class_list.contains("cropped");
-        if is_cropped {
-            let _ = class_list.remove_1("cropped");
-            let _ = class_list.add_1("uncropped");
-        } else {
-            let _ = class_list.remove_1("uncropped");
-            let _ = class_list.add_1("cropped");
-        }
+fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<String, bool>>>) {
+    if let Some(mut ct) = cropped_tiles {
+        ct.with_mut(|map| {
+            let entry = map.entry(canvas_id.to_string()).or_insert(false);
+            *entry = !*entry;
+        });
     }
+}
+
+/// Returns whether the given canvas is currently in cropped mode.
+fn is_canvas_cropped(
+    canvas_id: &str,
+    cropped_tiles: &Option<Signal<HashMap<String, bool>>>,
+) -> bool {
+    cropped_tiles
+        .as_ref()
+        .and_then(|ct| ct.read().get(canvas_id).copied())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,5 +1651,55 @@ mod tests {
 
         assert!(style.contains("box-shadow: none;"));
         assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
+    }
+
+    // -- Crop state: HashMap toggle/lookup logic ---------------------------------
+
+    #[test]
+    fn crop_toggle_roundtrip() {
+        let mut map = HashMap::<String, bool>::new();
+        let id = "peer-abc";
+
+        // Initially not cropped
+        assert!(!map.get(id).copied().unwrap_or(false));
+
+        // First toggle → cropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(map.get(id).copied().unwrap_or(false));
+
+        // Second toggle → uncropped
+        let entry = map.entry(id.to_string()).or_insert(false);
+        *entry = !*entry;
+        assert!(!map.get(id).copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_cleanup_on_peer_removal() {
+        let mut map = HashMap::<String, bool>::new();
+        let peer_id = "session-123";
+
+        // Set crop state for both video and screen-share canvases
+        map.insert(peer_id.to_string(), true);
+        map.insert(format!("screen-share-{peer_id}"), true);
+        assert_eq!(map.len(), 2);
+
+        // Simulate on_peer_removed cleanup
+        map.remove(peer_id);
+        map.remove(&format!("screen-share-{peer_id}"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn crop_missing_id_returns_false() {
+        let map = HashMap::<String, bool>::new();
+        assert!(!map.get("nonexistent").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn crop_none_context_returns_false() {
+        let ct: Option<&HashMap<String, bool>> = None;
+        let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
+        assert!(!result);
     }
 }

@@ -17,11 +17,60 @@
 //! NATS is not configured (graceful degradation).
 
 use protobuf::Message;
+use serde::{Deserialize, Serialize};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
+
+/// NATS subject for fanning out per-meeting policy flag changes to every
+/// `actix-api` chat_server instance. The chat_server caches these flags at
+/// JoinRoom time from the JWT, so without this fanout a mid-meeting PATCH
+/// would not take effect until the host reconnected.
+///
+/// Mirrors the public `MEETING_SETTINGS_UPDATED` protobuf event but uses
+/// JSON over a separate internal subject so the wire format for clients
+/// stays untouched. The corresponding consumer lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_SETTINGS_UPDATE_SUBJECT`).
+pub const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
+
+/// NATS subject consumed by `meeting-api` to write `state='ended'` to the
+/// `meetings` table when `actix-api` broadcasts MEETING_ENDED on a host
+/// disconnect with `end_on_host_leave=true`. Mirrors the REST POST /leave
+/// flow's `db_meetings::end_meeting` call so the meetings list stays
+/// consistent with the broadcast clients receive.
+///
+/// The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_ENDED_BY_HOST_SUBJECT`).
+pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
+
+/// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
+///
+/// Carries the four per-meeting policy flags so chat_server can refresh
+/// its full `RoomPolicy` snapshot without a DB round-trip. All flags are
+/// always populated — the consumer overwrites the cache wholesale rather
+/// than merging field-by-field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsUpdatePayload {
+    pub room_id: String,
+    pub end_on_host_leave: bool,
+    pub admitted_can_admit: bool,
+    pub waiting_room_enabled: bool,
+    pub allow_guests: bool,
+}
+
+/// Payload consumed on [`MEETING_ENDED_BY_HOST_SUBJECT`].
+///
+/// Sent by chat_server when the host-leave broadcast fires. The `meeting-api`
+/// consumer looks up the meeting by `room_id` and transitions its DB row
+/// to `state='ended'`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingEndedByHostPayload {
+    pub room_id: String,
+}
 
 /// Build a `PacketWrapper` containing a serialized `MeetingPacket`.
 fn build_meeting_wrapper(meeting_packet: &MeetingPacket) -> Vec<u8> {
@@ -123,11 +172,19 @@ pub async fn publish_waiting_room_updated(nats: Option<&async_nats::Client>, roo
 }
 
 /// Publish `PARTICIPANT_DISPLAY_NAME_CHANGED` when a participant updates their display name.
+///
+/// When `session_id` is `Some(sid)`, the broadcast packet carries that session
+/// identifier so the chat_server consumer and peer clients scope the rename to
+/// the originating tab only — not every session sharing the renaming user's
+/// `user_id` (HCL issue #828 follow-up). When `None`, the proto field is left
+/// at its default (`0`), which both peers and the chat_server handler interpret
+/// as the legacy "rename every session of this user" path.
 pub async fn publish_participant_display_name_changed(
     nats: Option<&async_nats::Client>,
     room_id: &str,
     target_user_id: &str,
     new_display_name: &str,
+    session_id: Option<u64>,
 ) {
     let Some(nats) = nats else { return };
     let packet = MeetingPacket {
@@ -135,14 +192,81 @@ pub async fn publish_participant_display_name_changed(
         room_id: room_id.to_string(),
         target_user_id: target_user_id.as_bytes().to_vec(),
         display_name: new_display_name.as_bytes().to_vec(),
+        session_id: session_id.unwrap_or(0),
         ..Default::default()
     };
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
     tracing::debug!(
-        "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id}: {}",
+        "Published PARTICIPANT_DISPLAY_NAME_CHANGED for {target_user_id} in room {room_id} \
+         (session_id={}): {}",
+        session_id.unwrap_or(0),
         new_display_name
     );
+}
+
+/// Publish `HOST_MUTE_PARTICIPANT` for one participant — or, with an empty
+/// `target_user_id`, for every participant in the room (mute-all).
+pub async fn publish_host_mute(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!(
+        "Published HOST_MUTE_PARTICIPANT for room {room_id} target=\"{target_user_id}\""
+    );
+    Ok(())
+}
+
+/// Publish `HOST_DISABLE_VIDEO` for one participant — or, with an empty
+/// `target_user_id`, for every participant in the room (disable-video-all).
+pub async fn publish_host_disable_video(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!("Published HOST_DISABLE_VIDEO for room {room_id} target=\"{target_user_id}\"");
+    Ok(())
+}
+
+/// Publish `PARTICIPANT_KICKED` to tell one participant they have been removed.
+pub async fn publish_host_kick(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::PARTICIPANT_KICKED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
+    Ok(())
 }
 
 /// Publish `MEETING_SETTINGS_UPDATED` when meeting settings change.
@@ -156,6 +280,53 @@ pub async fn publish_meeting_settings_updated(nats: Option<&async_nats::Client>,
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
     tracing::debug!("Published MEETING_SETTINGS_UPDATED for room {room_id}");
+}
+
+/// Publish a server-internal [`MEETING_SETTINGS_UPDATE_SUBJECT`] event so
+/// every `actix-api` chat_server instance refreshes its in-memory
+/// `room_policy` cache. Caller passes the post-update authoritative flag
+/// values (typically the `MeetingRow` fields after a successful
+/// `update_meeting_settings` call).
+///
+/// Distinct from [`publish_meeting_settings_updated`]: that one tells
+/// **clients** to re-fetch settings via REST, this one tells **servers**
+/// to refresh their cache without any DB lookup.
+pub async fn publish_internal_meeting_settings_update(
+    nats: Option<&async_nats::Client>,
+    payload: &MeetingSettingsUpdatePayload,
+) {
+    let Some(nats) = nats else { return };
+    let bytes = match serde_json::to_vec(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize MeetingSettingsUpdatePayload for {}: {e}",
+                payload.room_id
+            );
+            return;
+        }
+    };
+    if let Err(e) = nats
+        .publish(MEETING_SETTINGS_UPDATE_SUBJECT, bytes.into())
+        .await
+    {
+        tracing::error!(
+            "Failed to publish {} for {}: {e}",
+            MEETING_SETTINGS_UPDATE_SUBJECT,
+            payload.room_id
+        );
+    } else {
+        tracing::debug!(
+            "Published {} for room {} (end_on_host_leave={}, admitted_can_admit={}, \
+             waiting_room_enabled={}, allow_guests={})",
+            MEETING_SETTINGS_UPDATE_SUBJECT,
+            payload.room_id,
+            payload.end_on_host_leave,
+            payload.admitted_can_admit,
+            payload.waiting_room_enabled,
+            payload.allow_guests
+        );
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +410,141 @@ mod tests {
     }
 
     #[test]
+    fn test_build_host_mute_packet_targeted() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "carol@example.com".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_MUTE_PARTICIPANT.into()
+        );
+        assert_eq!(
+            inner.target_user_id,
+            "carol@example.com".as_bytes().to_vec()
+        );
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_host_mute_packet_all_participants() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_MUTE_PARTICIPANT.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: Vec::new(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_MUTE_PARTICIPANT.into()
+        );
+        assert!(
+            inner.target_user_id.is_empty(),
+            "mute-all uses empty target_user_id as the broadcast marker"
+        );
+    }
+
+    #[test]
+    fn test_build_host_disable_video_packet_targeted() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "dan@example.com".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_DISABLE_VIDEO.into()
+        );
+        assert_eq!(inner.target_user_id, "dan@example.com".as_bytes().to_vec());
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_host_disable_video_packet_all_participants() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_DISABLE_VIDEO.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: Vec::new(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::HOST_DISABLE_VIDEO.into()
+        );
+        assert!(
+            inner.target_user_id.is_empty(),
+            "disable-video-all uses empty target_user_id as the broadcast marker"
+        );
+    }
+
+    #[test]
+    fn test_build_participant_display_name_changed_packet_with_session_id() {
+        // When `meeting-api` is told a rename came from a specific session
+        // (HCL issue #828 follow-up), the broadcast packet MUST carry the
+        // same `session_id` so chat_server and downstream peers can scope
+        // the rename to a single tab instead of every session of the user.
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "tony@example.com".as_bytes().to_vec(),
+            display_name: "Antonio (tab A)".as_bytes().to_vec(),
+            session_id: 4242,
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.event_type,
+            MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into()
+        );
+        assert_eq!(inner.target_user_id, "tony@example.com".as_bytes().to_vec());
+        assert_eq!(inner.display_name, "Antonio (tab A)".as_bytes().to_vec());
+        assert_eq!(
+            inner.session_id, 4242,
+            "session_id must be preserved on the wire so peers can scope the rename to one tab"
+        );
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_participant_display_name_changed_packet_legacy_no_session_id() {
+        // Legacy callers don't supply `session_id`. The proto-3 default `0`
+        // is the agreed sentinel for the user-id-wide rename path and MUST
+        // be preserved verbatim — both chat_server and peer clients depend
+        // on this exact value to fall back to the pre-#828 behaviour.
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "legacy@example.com".as_bytes().to_vec(),
+            display_name: "Legacy".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.session_id, 0,
+            "legacy callers must produce session_id=0 so consumers fall back to user-id-wide rename"
+        );
+    }
+
+    #[test]
     fn test_build_meeting_settings_updated_packet() {
         let packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_SETTINGS_UPDATED.into(),
@@ -282,5 +588,9 @@ mod tests {
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
         publish_meeting_settings_updated(None, "room").await;
+        let _ = publish_host_mute(None, "room", "user@test.com").await;
+        let _ = publish_host_mute(None, "room", "").await;
+        let _ = publish_host_disable_video(None, "room", "user@test.com").await;
+        let _ = publish_host_disable_video(None, "room", "").await;
     }
 }

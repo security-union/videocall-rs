@@ -1,0 +1,30 @@
+[package]
+name = "videocall-aq"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Adaptive quality (tier selection + PID bitrate control) primitives for videocall.rs. Shared between the browser client and native (bot, CLI) consumers."
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["adaptive-quality", "pid", "video-conferencing"]
+categories = ["multimedia"]
+
+[dependencies]
+log = "0.4.19"
+protobuf = "3.3.0"
+videocall-types = { path = "../videocall-types", version = "5.0.0" }
+
+[dependencies.pidgeon]
+version = "0.3.1"
+features = ["wasm"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.20"

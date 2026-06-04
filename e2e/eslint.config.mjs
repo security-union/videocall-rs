@@ -11,6 +11,15 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ["node_modules/", "test-results/", "playwright-report/"],
+    ignores: [
+      "node_modules/",
+      "test-results/",
+      "playwright-report/",
+      // The dashboard subtree has its own self-contained tooling
+      // (TypeScript / ESLint / Prettier / Vitest) — keep it out of
+      // the top-level e2e linter to avoid double-coverage and a
+      // dependency surface explosion in the parent package.json.
+      "bots-app/dashboard/",
+    ],
   },
 );

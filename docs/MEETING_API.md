@@ -62,6 +62,29 @@ The session JWT is obtained after a successful OAuth login via `GET /login`. The
 
 > **Browser note**: The web UI (`dioxus-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
+### Local development (no OAuth)
+
+For local development without an OAuth provider, the meeting-api auto-logs in a synthetic user via `DEV_USER`. Both `docker-compose.yaml` and `start_dev.sh` ship a default `DEV_USER=dev@local.test:Dev User`, so this works out of the box; override the env var if you need a different identity (format: `email:display_name`). When OAuth is disabled and `DEV_USER` is set, the meeting-api exposes:
+
+```
+GET /api/v1/dev/auto-login
+```
+
+This endpoint issues a signed session JWT in a `Set-Cookie` header and 302-redirects to `/`. The browser UI calls it automatically, but for curl / Postman you can fetch it once and extract the cookie:
+
+```bash
+# Get a session token via dev auto-login (no OAuth required).
+# -s -o /dev/null silences the redirect body; -c saves cookies.
+curl -s -o /dev/null -c /tmp/cookies.txt http://localhost:8081/api/v1/dev/auto-login
+
+# Extract the JWT value from the Netscape-format cookie file.
+# The default cookie name is "session"; substitute your COOKIE_NAME if customized.
+SESSION=$(awk '$6 == "session" {print $7}' /tmp/cookies.txt)
+curl -H "Authorization: Bearer $SESSION" http://localhost:8081/api/v1/meetings
+```
+
+> **Safety**: The `/api/v1/dev/auto-login` endpoint returns `404 Not Found` when OAuth is enabled (`OAUTH_CLIENT_ID` set) or when `DEV_USER` is unset. It is inert in production.
+
 ### Session JWT Claims
 
 The session JWT contains these claims:
@@ -88,7 +111,7 @@ Key points:
 - Issued when a participant's status becomes `admitted`
 - Scoped to a specific room and participant
 - Contains identity, room, host status, and display name
-- **Single-burner design**: tokens have a short TTL (default: 60 seconds, configurable via `TOKEN_TTL_SECS`). They are intended as one-time admission tickets, not long-lived credentials
+- **Meeting-scoped lifetime**: tokens default to `TOKEN_TTL_SECS=86400` (24 hours). TTL must cover both the longest expected meeting and connection re-election — short TTLs cause cached tokens in WT/WS URLs to expire mid-meeting and strand users. See [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562). Tokens are scoped to a single room + participant identity; a leak grants only meeting admission for that one user/room for the TTL duration.
 - Delivered in the `room_token` field of API responses
 - A fresh token is generated on every call to `GET /api/v1/meetings/{id}/status` when the participant is admitted
 
@@ -167,7 +190,10 @@ sequenceDiagram
 
 ## Timestamps
 
-All timestamps in API responses are **Unix seconds** (not milliseconds). This applies to `created_at`, `started_at`, `ended_at`, `joined_at`, and `admitted_at`.
+Timestamps in API responses use two different units depending on the field:
+
+- **Meeting timestamps** (`created_at`, `started_at`, `ended_at`) are **Unix milliseconds**.
+- **Participant timestamps** (`joined_at`, `admitted_at`) are **Unix seconds**.
 
 ---
 
@@ -203,9 +229,9 @@ GET /api/v1/meetings
         "host": "host@example.com",
         "state": "active",
         "has_password": false,
-        "created_at": 1706918400,
+        "created_at": 1706918400000,
         "participant_count": 3,
-        "started_at": 1706918400,
+        "started_at": 1706918400000,
         "ended_at": null,
         "waiting_count": 1
       }
@@ -270,7 +296,7 @@ POST /api/v1/meetings
   "result": {
     "meeting_id": "my-meeting",
     "host": "host@example.com",
-    "created_at": 1706918400,
+    "created_at": 1706918400000,
     "state": "idle",
     "attendees": ["user@example.com"],
     "has_password": true
@@ -923,7 +949,7 @@ curl -X POST http://localhost:8081/api/v1/meetings \
 
 # Response:
 # {"success":true,"result":{"meeting_id":"standup-2024","host":"host@example.com",
-#   "created_at":1706918400,"state":"idle","attendees":[],"has_password":false}}
+#   "created_at":1706918400000,"state":"idle","attendees":[],"has_password":false}}
 
 # 2. Host joins meeting (activates it, receives room token)
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \

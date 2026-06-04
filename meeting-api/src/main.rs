@@ -17,7 +17,10 @@
 //! and issues JWT room access tokens for the Media Server.
 
 use axum::http;
+use axum::http::HeaderName;
 use meeting_api::config::Config;
+use meeting_api::cors::{ALLOWED_CUSTOM_HEADERS, ALLOWED_HEADERS, ALLOWED_METHODS};
+use meeting_api::nats_consumers;
 use meeting_api::routes;
 use meeting_api::state::AppState;
 use sqlx::postgres::PgPoolOptions;
@@ -37,6 +40,9 @@ async fn main() {
         .resolve_discovery()
         .await
         .expect("OIDC discovery failed");
+    config
+        .validate_oauth_security()
+        .expect("invalid OAuth/JWKS security configuration");
 
     let pool = PgPoolOptions::new()
         .max_connections(20)
@@ -85,24 +91,18 @@ async fn main() {
                 AllowOrigin::list(hvs)
             }
         })
-        .allow_methods([
-            http::Method::GET,
-            http::Method::POST,
-            http::Method::PUT,
-            http::Method::DELETE,
-            http::Method::PATCH,
-            http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::COOKIE,
-            http::header::ACCEPT,
-            // Console log upload custom headers
-            http::HeaderName::from_static("x-user-id"),
-            http::HeaderName::from_static("x-session-timestamp"),
-            http::HeaderName::from_static("x-chunk-seq"),
-        ])
+        .allow_methods(ALLOWED_METHODS.to_vec())
+        .allow_headers(
+            ALLOWED_HEADERS
+                .iter()
+                .cloned()
+                .chain(
+                    ALLOWED_CUSTOM_HEADERS
+                        .iter()
+                        .map(|h| HeaderName::from_static(h)),
+                )
+                .collect::<Vec<_>>(),
+        )
         .allow_credentials(true);
 
     // Warn loudly at startup if DEV_USER auto-login is active.
@@ -114,6 +114,18 @@ async fn main() {
             dev_user.email
         );
     }
+
+    // Spawn the cross-service NATS consumers BEFORE constructing the AppState
+    // (so AppState retains its own clone of `nats`). Each consumer is a
+    // long-lived task that re-subscribes on disconnect; we hold the JoinHandle
+    // implicitly by leaking it (the task survives until process exit).
+    let _ended_consumer =
+        nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
+
+    // Spawn the in-process console-log retention task. Returns `None` (no-op)
+    // when `CONSOLE_LOG_UPLOAD_ENABLED` is not `"true"`. The handle is leaked
+    // for the life of the process, mirroring the NATS consumer above.
+    let _purge_handle = meeting_api::console_log_purge::spawn_purge_task();
 
     let state = AppState::new(pool, &config, nats);
     let app = routes::router().layer(cors).with_state(state);

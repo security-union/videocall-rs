@@ -99,7 +99,7 @@ animated EKG waveforms at 15fps/500kbps. Less realistic for load testing but zer
 # Transport — set one or both URLs
 ws_url: "wss://websocket.example.com"
 wt_url: "https://webtransport.example.com:443"
-wt_ratio: 0.0                     # fraction on WebTransport (0.0–1.0, see note below)
+wt_ratio: 0.0                     # fraction on WebTransport (0.0–1.0, rounded to bot count; see note below)
 
 # Or legacy single-transport
 # transport: "websocket"
@@ -221,7 +221,7 @@ On the remote machine:
 |-------|----------|---------|-------------|
 | `ws_url` | * | — | WebSocket relay URL (`wss://...`) |
 | `wt_url` | * | — | WebTransport relay URL (`https://...:443`) |
-| `wt_ratio` | no | `0.0` | Fraction of bots on WebTransport (0.0–1.0) |
+| `wt_ratio` | no | `0.0` | Fraction of bots on WebTransport (0.0–1.0), rounded via `round(ratio * total_bots)` |
 | `transport` | legacy | `"webtransport"` | Legacy: `"websocket"` or `"webtransport"` |
 | `server_url` | legacy | — | Legacy: single server URL |
 | `meeting_id` | yes | — | Room to join |

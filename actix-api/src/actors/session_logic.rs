@@ -27,6 +27,7 @@ use crate::actors::packet_handler::{classify_packet, KeyframeRequestLimiter, Pac
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
+    KEYFRAME_CONGESTION_RELAX_WINDOW,
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
@@ -100,6 +101,12 @@ pub struct CongestionTracker {
     /// Total drops since the last stale-entry cleanup. Cleanup runs every
     /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
     total_drops: u32,
+    /// Most recent instant at which this receiver crossed the drop threshold
+    /// for *any* sender (i.e. a CONGESTION notification was emitted). Used by
+    /// [`CongestionTracker::is_actively_congested`] to relax the
+    /// KEYFRAME_REQUEST rate limiter so a frozen receiver can recover
+    /// (issue #979).
+    last_congestion: Option<Instant>,
 }
 
 impl Default for CongestionTracker {
@@ -117,6 +124,7 @@ impl CongestionTracker {
         Self {
             senders: HashMap::new(),
             total_drops: 0,
+            last_congestion: None,
         }
     }
 
@@ -169,10 +177,28 @@ impl CongestionTracker {
             state.last_notify = Some(now);
             state.drop_count = 0;
             state.window_start = now;
+            // Record that this receiver is now actively congested so the
+            // KEYFRAME_REQUEST limiter can relax its per-pair budget and let
+            // a frozen receiver recover (issue #979).
+            self.last_congestion = Some(now);
             Some(sender_session_id)
         } else {
             None
         }
+    }
+
+    /// Whether this receiver crossed the congestion drop threshold recently
+    /// enough (within [`KEYFRAME_CONGESTION_RELAX_WINDOW`]) to be considered
+    /// in **active congestion** (issue #979).
+    ///
+    /// Used by the inbound KEYFRAME_REQUEST handler to decide whether to use
+    /// the relaxed per-pair keyframe budget. A receiver is "actively
+    /// congested" precisely when the relay has had to drop inbound media
+    /// destined for it — the scenario in which its decoder is most likely
+    /// frozen and genuinely needs fresh keyframes to recover.
+    pub fn is_actively_congested(&self) -> bool {
+        self.last_congestion
+            .is_some_and(|t| Instant::now().duration_since(t) <= KEYFRAME_CONGESTION_RELAX_WINDOW)
     }
 }
 
@@ -383,6 +409,11 @@ impl SessionLogic {
     /// Returns the action the transport should take.
     /// Observer sessions can still send RTT and health packets but all media
     /// data packets are silently dropped.
+    ///
+    /// This is the **inbound** half of the waiting-room isolation enforcement.
+    /// The **outbound** half lives in `ChatServer::handle_msg()` which drops all
+    /// non-allowlisted packets before they reach observer sessions.
+    /// See `handle_msg` doc comment for the full three-layer enforcement model.
     pub fn handle_inbound(&mut self, data: &[u8]) -> InboundAction {
         // Track received data
         RELAY_ROOM_BYTES_TOTAL
@@ -411,17 +442,37 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
-            PacketKind::KeyframeRequest => {
+            PacketKind::KeyframeRequest { target_user_id } => {
                 if self.observer {
                     return InboundAction::Processed;
                 }
-                // Rate-limit KEYFRAME_REQUEST packets to prevent abuse.
-                // A malicious client could flood these to force senders to
-                // continuously generate expensive keyframes.
-                if !self.keyframe_limiter.allow() {
+                // Rate-limit KEYFRAME_REQUEST packets per
+                // `(receiver, target_sender)` pair. The per-pair dimension
+                // is what allows a fresh joiner into a populated room to
+                // request keyframes from every existing sender within the
+                // first second after joining without being clipped — the
+                // fix for the frozen-video-on-join bug. A coarser global
+                // cap inside the limiter still bounds total fan-out as a
+                // defense against abuse.
+                //
+                // Issue #979: if the relay has recently had to drop inbound
+                // media destined for this receiver (active congestion), its
+                // decoder is likely frozen and genuinely needs fresh
+                // keyframes to recover. In that case relax the per-pair
+                // budget so the strict 1/sec steady-state limit does not
+                // hold the receiver frozen. The global per-receiver ceiling
+                // is unchanged, so the keyframe-storm risk (OSS #814) stays
+                // bounded — the cap is relaxed, not removed.
+                let congested = self.congestion_tracker.is_actively_congested();
+                if !self
+                    .keyframe_limiter
+                    .allow_with_congestion(&target_user_id, congested)
+                {
                     warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {})",
-                        self.id, self.user_id
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting {}",
+                        self.id,
+                        self.user_id,
+                        String::from_utf8_lossy(&target_user_id),
                     );
                     return InboundAction::Processed;
                 }
@@ -578,6 +629,59 @@ mod tests {
         assert_eq!(tracker.senders.len(), 2);
         assert!(tracker.senders.contains_key(&100));
         assert!(tracker.senders.contains_key(&200));
+    }
+
+    // =====================================================================
+    // Active-congestion flag for relaxed keyframe budget (issue #979)
+    // =====================================================================
+
+    #[test]
+    fn test_is_actively_congested_false_before_any_threshold_cross() {
+        let mut tracker = CongestionTracker::new();
+        assert!(
+            !tracker.is_actively_congested(),
+            "a tracker with no drops must not report active congestion"
+        );
+        // A few drops below the threshold must not flip the flag.
+        for _ in 0..(CONGESTION_DROP_THRESHOLD - 1) {
+            tracker.record_drop(1);
+        }
+        assert!(
+            !tracker.is_actively_congested(),
+            "sub-threshold drops must not flag active congestion"
+        );
+    }
+
+    #[test]
+    fn test_is_actively_congested_true_after_threshold_cross() {
+        let mut tracker = CongestionTracker::new();
+        // Cross the threshold so a CONGESTION notification fires.
+        let mut notified = false;
+        for _ in 0..CONGESTION_DROP_THRESHOLD {
+            notified |= tracker.record_drop(1).is_some();
+        }
+        assert!(notified, "threshold cross must emit a notification");
+        assert!(
+            tracker.is_actively_congested(),
+            "tracker must report active congestion right after a threshold cross"
+        );
+    }
+
+    #[test]
+    fn test_is_actively_congested_expires_after_relax_window() {
+        let mut tracker = CongestionTracker::new();
+        for _ in 0..CONGESTION_DROP_THRESHOLD {
+            tracker.record_drop(1);
+        }
+        assert!(tracker.is_actively_congested());
+
+        // Rewind the last_congestion timestamp past the relax window.
+        tracker.last_congestion =
+            Some(Instant::now() - (KEYFRAME_CONGESTION_RELAX_WINDOW + Duration::from_millis(50)));
+        assert!(
+            !tracker.is_actively_congested(),
+            "active congestion must lapse once the relax window elapses"
+        );
     }
 
     // =====================================================================

@@ -17,9 +17,10 @@
  */
 
 mod bridge;
+mod cert_preflight;
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
+use crate::actors::transports::wt_chat_session::WtChatSession;
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -163,7 +164,35 @@ pub async fn start(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
+    // Capture cert path for preflight diagnostics before `opt.certs` is moved
+    // into `get_key_and_cert_chain`. Used only to make error messages
+    // copy-pasteable; not load-bearing for the parse itself.
+    let cert_path_for_diagnostics = opt.certs.cert.display().to_string();
+
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
+
+    // Optional dev-only preflight: validates the leaf cert is shaped how
+    // Chromium's `serverCertificateHashes` API requires (ECDSA P-256,
+    // <=14d validity, SAN includes 127.0.0.1 + localhost). Gated behind
+    // WT_DEV_CERT_PREFLIGHT so production cert-manager-issued certs
+    // (RSA, multi-week validity) are not affected.
+    if cert_preflight::is_enabled() {
+        info!(
+            "{} is set; running WebTransport dev cert preflight on {}",
+            cert_preflight::PREFLIGHT_ENV_VAR,
+            cert_path_for_diagnostics,
+        );
+        if let Err(reason) = cert_preflight::validate_chain(&certs, &cert_path_for_diagnostics) {
+            cert_preflight::print_failure(&cert_path_for_diagnostics, &reason);
+            return Err(anyhow!(
+                "WT_DEV_CERT_PREFLIGHT rejected {}: {}",
+                cert_path_for_diagnostics,
+                reason
+            )
+            .into());
+        }
+        info!("WebTransport dev cert preflight passed");
+    }
 
     // Manually configure Quinn with custom transport settings for fast disconnect detection
     let provider = rustls::crypto::ring::default_provider();
@@ -191,6 +220,22 @@ pub async fn start(
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
         *QUIC_KEEP_ALIVE_INTERVAL_SECS,
     )));
+
+    // Cap the number of concurrent peer-initiated unidirectional streams per
+    // session. The bridge spawns one reader task per accepted uni stream
+    // (see `bridge::read_framed_packets_loop`), and each reader can hold a
+    // payload buffer up to `MAX_FRAME_SIZE` (4 MB). Together these bound
+    // transient memory per malicious session to roughly
+    // `MAX_CONCURRENT_UNI_STREAMS * MAX_FRAME_SIZE` ≈ 400 MB worst case;
+    // QUIC connection-level flow control caps it much lower in practice.
+    //
+    // This is intentionally pinned to quinn's current default (100). The
+    // explicit setting protects the invariant against a future quinn
+    // upgrade that changes the default, or against an operator who raises
+    // the limit without re-evaluating the worst-case memory footprint.
+    // If you raise this value, also re-evaluate `MAX_FRAME_SIZE` and the
+    // reader-task spawn pattern in `bridge.rs`.
+    transport_config.max_concurrent_uni_streams(100u32.into());
 
     server_config.transport_config(std::sync::Arc::new(transport_config));
 
@@ -365,9 +410,20 @@ async fn handle_webtransport_session(
     is_host: bool,
     end_on_host_leave: bool,
 ) -> anyhow::Result<()> {
-    // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) =
-        mpsc::channel::<WtOutbound>(crate::constants::WT_OUTBOUND_CHANNEL_CAPACITY);
+    // Create two channels for actor → WebTransport I/O — one per QUIC
+    // primitive. Phase 2 split (discussion #756): a stalled persistent
+    // uni-stream cannot back up the datagram path because the two
+    // channels are drained by independent writer tasks.
+    //
+    // * UniStream channel: env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY`,
+    //   defaults to 512 (fail-fast per issue #979). Carries video / screen /
+    //   oversized audio/control. Where QUIC flow control surfaces.
+    // * Datagram channel: small, fixed `WT_DATAGRAM_CHANNEL_CAPACITY`.
+    //   Carries small audio media + non-media control under MTU.
+    let (unistream_tx, unistream_rx) =
+        mpsc::channel::<bytes::Bytes>(crate::constants::wt_outbound_channel_capacity());
+    let (datagram_tx, datagram_rx) =
+        mpsc::channel::<bytes::Bytes>(crate::constants::WT_DATAGRAM_CHANNEL_CAPACITY);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -376,7 +432,8 @@ async fn handle_webtransport_session(
         username.to_string(),
         display_name.to_string(),
         is_guest,
-        outbound_tx,
+        unistream_tx,
+        datagram_tx,
         nats_client,
         tracker_sender,
         session_manager,
@@ -402,7 +459,8 @@ async fn handle_webtransport_session(
     let mut bridge = WebTransportBridge::new_with_callback(
         session,
         actor_addr.clone(),
-        outbound_rx,
+        unistream_rx,
+        datagram_rx,
         on_packet_sent,
     );
     bridge.wait_for_disconnect().await;
@@ -600,9 +658,26 @@ mod tests {
     }
 
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
+        // Phase 2 (discussion #756): the server's UniStream reader now consumes
+        // length-prefix-framed packets (`[u32 BE length][payload]`). One frame
+        // per stream is still a valid shape — the reader loop reads one frame,
+        // then `read_exact` for the next 4-byte header returns EOF when the
+        // client finishes the stream, and the per-stream task exits cleanly.
         let mut s = session.open_uni().await.expect("open uni");
-        s.write_all(&bytes).await.expect("write packet");
-        // Don't call finish() to avoid closing the session prematurely
+        let len: u32 = bytes
+            .len()
+            .try_into()
+            .expect("test packet exceeds u32::MAX bytes");
+        s.write_all(&len.to_be_bytes())
+            .await
+            .expect("write length header");
+        s.write_all(&bytes).await.expect("write packet payload");
+        // Finish the stream so the server reader cleanly sees EOF at a frame
+        // boundary after this single packet. Without finish() the reader's
+        // outer `accept_uni` loop would still receive subsequent streams, but
+        // the per-stream task would park indefinitely on `read_exact` for the
+        // next header — wasting a tokio task per test packet.
+        let _ = s.finish();
     }
 
     async fn keep_alive(session: &web_transport_quinn::Session) {
@@ -759,9 +834,14 @@ mod tests {
             }
         });
 
-        // Craft a MEDIA packet that is not RTT and not health
+        // Craft a MEDIA packet that is not RTT and not health.
+        // Using VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — which is what this test reads from. Phase 4 routes
+        // small AUDIO MediaPackets via QUIC datagrams instead, so an AUDIO
+        // packet would arrive on a different transport and miss the unistream
+        // assertion below.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: user_a.as_bytes().to_vec(),
             ..Default::default()
         };
@@ -1232,8 +1312,11 @@ mod tests {
     /// stream without needing protobuf framing.
     fn create_sequenced_test_packet(sender: &str, seq_num: u32) -> Vec<u8> {
         let marker = format!("SEQ:{seq_num:04}:END");
+        // Use VIDEO (not AUDIO) so the packet routes via the persistent
+        // UniStream — Phase 4 sends small AUDIO MediaPackets via QUIC
+        // datagrams which would bypass the ordered-stream assertions.
         let media = VcMediaPacket {
-            media_type: VcMediaType::AUDIO.into(),
+            media_type: VcMediaType::VIDEO.into(),
             user_id: sender.as_bytes().to_vec(),
             data: marker.into_bytes(),
             ..Default::default()
@@ -1705,6 +1788,7 @@ mod tests {
             "wt-jwt-room-1",
             true,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1729,6 +1813,7 @@ mod tests {
             "wt-jwt-room-2",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1751,6 +1836,7 @@ mod tests {
             "wt-jwt-room-3",
             false,
             "Alice",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1784,6 +1870,7 @@ mod tests {
             "wt-special-room",
             false,
             "Bob",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate token");
@@ -1840,6 +1927,7 @@ mod tests {
             room,
             true,
             "Host",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate host token");
@@ -1851,6 +1939,7 @@ mod tests {
             room,
             false,
             "Attendee",
+            false, // end_on_host_leave
             false, // is_guest
         )
         .expect("generate attendee token");

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::constants::*;
 use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
@@ -25,7 +26,9 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
+use videocall_client::{
+    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
@@ -68,11 +71,14 @@ pub fn Host(
     on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
+    #[props(default)] device_settings_initial_section: Option<String>,
+    #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    let pre_acquired_stream = use_context::<PreAcquiredScreenStream>();
 
     // Indirection cells for callbacks: updated each render, closed over by encoder callbacks
     let camera_settings_handler: Rc<RefCell<Option<EventHandler<String>>>> =
@@ -163,6 +169,7 @@ pub fn Host(
             screen_bitrate,
             screen_settings_cb,
             screen_state_cb,
+            camera.screen_sharing_flag(),
         );
 
         // Wire up congestion step-down, PLI keyframe, and re-election flags
@@ -170,11 +177,7 @@ pub fn Host(
         camera.set_force_keyframe_flag(client.force_camera_keyframe_flag());
         camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
-
-        // Wire up cross-stream bandwidth coordination: the screen encoder sets
-        // this flag when capture starts/stops; the camera encoder reads it to
-        // drop quality and set a ceiling, preventing bandwidth contention.
-        screen.set_screen_sharing_flag(camera.screen_sharing_flag());
+        screen.set_reelection_completed_signal(client.reelection_completed_signal());
 
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(
@@ -185,7 +188,7 @@ pub fn Host(
         // Wire encoder decision inputs + screen tier to health reporter for metrics
         client.set_encoder_metric_sources(
             camera.shared_encoder_fps_ratio(),
-            camera.shared_encoder_worst_peer_fps(),
+            camera.shared_encoder_p75_peer_fps(),
             camera.shared_encoder_bitrate_ratio(),
             camera.shared_encoder_target_bitrate_kbps(),
             screen.shared_screen_tier_index(),
@@ -224,6 +227,7 @@ pub fn Host(
             prev_share_screen: false,
             prev_mic_enabled: false,
             prev_video_enabled: false,
+            prev_device_settings_open: false,
             initialized: false,
             last_reload_counter: 0,
         }))
@@ -385,10 +389,16 @@ pub fn Host(
     {
         let mut s = state.borrow_mut();
 
-        if s.last_reload_counter != reload_devices_counter {
+        let did_full_reload = s.last_reload_counter != reload_devices_counter;
+        if did_full_reload {
             s.media_devices.load();
             s.last_reload_counter = reload_devices_counter;
         }
+
+        if !did_full_reload && !s.prev_device_settings_open && device_settings_open {
+            s.media_devices.refresh_devices_safely();
+        }
+        s.prev_device_settings_open = device_settings_open;
 
         log::info!(
             "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
@@ -400,12 +410,40 @@ pub fn Host(
             s.prev_share_screen = share_screen;
             if share_screen {
                 s.screen.set_enabled(true);
-                log::info!("Start screen share encoder");
-                let state_clone = state.clone();
-                Timeout::new(1000, move || {
-                    state_clone.borrow_mut().screen.start();
-                })
-                .forget();
+
+                // Adaptive initial tier selection: inspect network signals at
+                // the moment screen sharing starts to choose a conservative
+                // starting tier that gives a readable first frame on constrained
+                // uplinks without waiting for the PID loop to ramp down.
+                let rtt_ms = client.average_rtt_ms();
+                let camera_tier_index = client.camera_tier_index();
+                let initial_tier = initial_screen_tier(rtt_ms, camera_tier_index);
+
+                log::info!(
+                    "Start screen share encoder: rtt={:?}ms, camera_tier={:?}, initial_tier={}",
+                    rtt_ms,
+                    camera_tier_index,
+                    initial_tier
+                );
+
+                // Check if the onclick handler already acquired a MediaStream
+                // (required for Safari which mandates getDisplayMedia be called
+                // synchronously within a user gesture handler).
+                let maybe_stream = pre_acquired_stream.borrow_mut().take();
+                if let Some(stream) = maybe_stream {
+                    log::info!("Start screen share encoder with pre-acquired stream");
+                    s.screen.start_with_stream(stream, initial_tier);
+                } else {
+                    // Fallback: let the encoder call getDisplayMedia itself.
+                    // This path works on Chrome/Firefox where the gesture
+                    // chain survives the timeout + spawn_local boundaries.
+                    log::info!("Start screen share encoder (encoder-acquired stream)");
+                    let state_clone = state.clone();
+                    Timeout::new(1000, move || {
+                        state_clone.borrow_mut().screen.start(initial_tier);
+                    })
+                    .forget();
+                }
             } else {
                 s.screen.set_enabled(false);
                 s.screen.stop();
@@ -593,6 +631,7 @@ pub fn Host(
             let on_spk = on_speaker_change.clone();
             rsx! {
                 DeviceSettingsModal {
+                    key: "{device_settings_generation}",
                     microphones: microphones,
                     cameras: cameras,
                     speakers: speakers,
@@ -605,6 +644,7 @@ pub fn Host(
                     visible: device_settings_open,
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
+                    initial_section: device_settings_initial_section.clone(),
                 }
             }
         }
@@ -620,6 +660,7 @@ struct HostState {
     prev_share_screen: bool,
     prev_mic_enabled: bool,
     prev_video_enabled: bool,
+    prev_device_settings_open: bool,
     initialized: bool,
     last_reload_counter: u32,
 }

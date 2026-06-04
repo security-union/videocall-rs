@@ -518,6 +518,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.17",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+ "synstructure",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1042,17 +1081,25 @@ dependencies = [
  "futures",
  "futures-util",
  "hound",
+ "hyper 0.14.32",
  "image 0.25.9",
  "jsonwebtoken",
+ "memmap2",
  "opus",
- "protobuf 3.7.1",
+ "percent-encoding",
+ "prometheus",
+ "protobuf 3.7.2",
+ "rand 0.8.5",
  "serde",
  "serde_yaml",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "url",
+ "videocall-aq",
+ "videocall-netsim",
  "videocall-types",
  "web-transport-quinn",
 ]
@@ -2054,6 +2101,20 @@ dependencies = [
  "const-oid",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -4704,7 +4765,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "oauth2",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.26",
@@ -4713,11 +4774,13 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
+ "tempfile",
  "tokio",
  "tower 0.5.2",
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "url",
  "uuid 1.21.0",
  "videocall-meeting-types",
@@ -5277,6 +5340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5779,9 +5851,9 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "protobuf"
-version = "3.7.1"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a7c64d9bf75b1b8d981124c14c179074e8caa7dfe7b6a12e6222ddcd0c8f72"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
 dependencies = [
  "once_cell",
  "protobuf-support",
@@ -5790,9 +5862,9 @@ dependencies = [
 
 [[package]]
 name = "protobuf-support"
-version = "3.7.1"
+version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b088fd20b938a875ea00843b6faf48579462630015c3788d397ad6a786663252"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -6354,6 +6426,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -7944,6 +8025,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-test"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracing-test-macro",
+]
+
+[[package]]
+name = "tracing-test-macro"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
+dependencies = [
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "tracing-wasm"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8363,7 +8465,7 @@ dependencies = [
  "futures-util",
  "log",
  "native-tls",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "ratatui",
  "tokio",
  "tokio-tungstenite",
@@ -8400,7 +8502,7 @@ dependencies = [
  "meeting-api",
  "oauth2",
  "prometheus",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "r2d2",
  "r2d2_postgres",
  "regex",
@@ -8411,6 +8513,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
@@ -8422,6 +8525,19 @@ dependencies = [
  "videocall-meeting-types",
  "videocall-types",
  "web-transport-quinn",
+ "x509-parser",
+]
+
+[[package]]
+name = "videocall-aq"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "log",
+ "pidgeon",
+ "protobuf 3.7.2",
+ "videocall-types",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -8434,7 +8550,7 @@ dependencies = [
  "env-libvpx-sys",
  "image 0.25.9",
  "opus",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -8460,17 +8576,18 @@ dependencies = [
  "js-sys",
  "log",
  "neteq",
- "pidgeon",
  "prost",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "rand 0.8.5",
  "rsa",
  "serde",
  "serde-wasm-bindgen 0.6.5",
  "serde_bytes",
  "serde_json",
+ "videocall-aq",
  "videocall-codecs",
  "videocall-diagnostics",
+ "videocall-netsim",
  "videocall-transport",
  "videocall-types",
  "wasm-bindgen",
@@ -8533,6 +8650,16 @@ name = "videocall-meeting-types"
 version = "0.1.2"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "videocall-netsim"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.16",
+ "rand 0.8.5",
+ "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]
@@ -8654,7 +8781,7 @@ name = "videocall-types"
 version = "5.0.0"
 dependencies = [
  "anyhow",
- "protobuf 3.7.1",
+ "protobuf 3.7.2",
  "serde",
  "serde_json",
 ]
@@ -9864,6 +9991,23 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom 7.1.3",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 2.0.17",
+ "time",
+]
 
 [[package]]
 name = "xml-rs"

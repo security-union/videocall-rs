@@ -7,6 +7,8 @@ members = [
     "videocall-types",
     "videocall-meeting-types",
     "videocall-meeting-client",
+    "videocall-aq",
+    "videocall-netsim",
     "videocall-client",
     "videocall-cli",
     "dioxus-ui",

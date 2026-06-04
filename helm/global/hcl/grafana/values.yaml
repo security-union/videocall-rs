@@ -44,6 +44,8 @@ grafana:
     server:
       domain: grafana.videocall.fnxlabs.com
       root_url: https://grafana.videocall.fnxlabs.com
+    feature_toggles:
+      publicDashboards: true
     security:
       admin_user: admin
       admin_password: password

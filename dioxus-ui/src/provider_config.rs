@@ -2,10 +2,10 @@
 
 //! Fetches and caches the OAuth provider configuration from the meeting-api.
 //!
-//! Both [`crate::auth`] (needs `auth_url` + `client_id` to build the
+//! Both [`crate::auth`] (needs `auth_url` and `client_id` to build the
 //! authorization URL) and [`crate::pages::oauth_callback`] (needs `token_url`
-//! + `issuer` for the token exchange) fall back to this module when the values
-//! are not present in `window.__APP_CONFIG`.
+//! and `issuer` for the token exchange) fall back to this module when the
+//! values are not present in `window.__APP_CONFIG`.
 //!
 //! The full response is cached in `sessionStorage` as a JSON string on the
 //! first successful fetch so that subsequent calls within the same tab are

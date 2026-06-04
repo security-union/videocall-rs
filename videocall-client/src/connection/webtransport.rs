@@ -21,7 +21,9 @@
 // Sets up all the stream handling to support the callbacks on_connected, on_connection_lost, and
 // on_inbound_media
 //
-use super::webmedia::{ConnectOptions, WebMedia};
+use super::connection_lost_reason::ConnectionLostReason;
+use super::url_log::strip_query_for_log;
+use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
@@ -57,6 +59,16 @@ enum MessageType {
 
 impl WebMedia<WebTransportTask> for WebTransportTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebTransportTask> {
+        // Phase 3c: the netsim shim is installed once-per-tab from
+        // `?netsim=<profile>` by `Connection::connect` via
+        // `super::netsim_url::try_install_from_url`. We deliberately do
+        // **not** install or clear the hook here — doing so would
+        // overwrite the URL-driven slot with the unused, hardcoded
+        // `ConnectOptions::netsim_hook` placeholder and silently
+        // disable the simulator on every reconnect. See
+        // `connection/netsim_hook.rs` for the full design (Option A —
+        // thread-local hook + re-entrancy flag).
+
         let on_datagram = {
             let callback = options.on_inbound_media.clone();
             Callback::from(move |bytes: Vec<u8>| {
@@ -83,11 +95,28 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             let connection_lost_callback = options.on_connection_lost.clone();
             Callback::from(move |status| match status {
                 WebTransportStatus::Opened => connected_callback.emit(()),
-                WebTransportStatus::Closed(error) => connection_lost_callback.emit(error),
-                WebTransportStatus::Error(error) => connection_lost_callback.emit(error),
+                WebTransportStatus::ClosedBeforeReady(msg) => {
+                    connection_lost_callback.emit(ConnectionLostReason::HandshakeFailed(msg));
+                }
+                WebTransportStatus::ClosedAfterReady(msg) => {
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
+                // Legacy variants — these should no longer fire with the updated
+                // transport, but keep them as a defensive fallback.
+                WebTransportStatus::Closed(e) => {
+                    let msg = format!("{e:?}");
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
+                WebTransportStatus::Error(e) => {
+                    let msg = format!("{e:?}");
+                    connection_lost_callback.emit(ConnectionLostReason::SessionDropped(msg));
+                }
             })
         };
-        info!("WebTransport connecting to {}", &options.webtransport_url);
+        info!(
+            "WebTransport connecting to {}",
+            strip_query_for_log(&options.webtransport_url)
+        );
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,
@@ -99,46 +128,87 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
         Ok(task)
     }
 
-    fn send_bytes(&self, bytes: Vec<u8>) {
-        WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+    /// Reliable media-packet send path.
+    ///
+    /// Phase 2 of the WebTransport freeze fix: every reliable packet rides on
+    /// a **persistent** per-media-type QUIC unidirectional stream rather than
+    /// opening a fresh stream per packet (~80 streams/sec/sender in the legacy
+    /// pattern).  Stream identity is `stream_key.as_u8()`; the server-side
+    /// reader at `actix-api/src/webtransport/bridge.rs` reads length-prefixed
+    /// frames from each stream in a loop until EOF and routes by the MediaType
+    /// inside the encrypted protobuf payload.
+    fn send_bytes(&self, bytes: Vec<u8>, stream_key: MediaStreamKey) {
+        // Phase 3b: consult the per-tab netsim shim. When the
+        // `netsim` feature is off the entire block compiles out and
+        // the send path is byte-for-byte identical to pre-3b.
+        #[cfg(feature = "netsim")]
+        {
+            if super::netsim_hook::shape_uplink_reliable(&bytes, stream_key) {
+                return;
+            }
+        }
+        WebTransportTask::send_on_persistent_stream(
+            self.transport.clone(),
+            self.persistent_streams.clone(),
+            stream_key.as_u8(),
+            bytes,
+        );
     }
 
     fn send_bytes_datagram(&self, bytes: Vec<u8>) {
         use crate::adaptive_quality_constants::DATAGRAM_MAX_SIZE;
 
+        // Phase 3b: consult the per-tab netsim shim. See
+        // `send_bytes` above for the no-feature compile-out.
+        #[cfg(feature = "netsim")]
+        {
+            if super::netsim_hook::shape_uplink_datagram(&bytes) {
+                return;
+            }
+        }
+
         if bytes.len() <= DATAGRAM_MAX_SIZE {
             // Packet fits within the datagram MTU -- send as unreliable datagram
-            // for lower latency and no head-of-line blocking.
+            // for lower latency and no head-of-line blocking.  Datagrams are
+            // on a separate primitive from persistent streams and are NOT
+            // length-prefix framed.
             WebTransportTask::send_datagram(self.transport.clone(), bytes);
         } else {
             // Packet exceeds datagram size limit (e.g., a keyframe).
-            // Fall back to a per-packet unidirectional stream so the server's
-            // `read_to_end` can receive it as a complete frame.
+            // Fall back to the Control persistent stream so the server's
+            // framed reader can receive it as a complete frame without
+            // application-layer fragmentation.
             debug!(
-                "Packet size {} exceeds datagram MTU {}, falling back to unistream",
+                "Packet size {} exceeds datagram MTU {}, falling back to Control persistent stream",
                 bytes.len(),
                 DATAGRAM_MAX_SIZE
             );
-            WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+            WebTransportTask::send_on_persistent_stream(
+                self.transport.clone(),
+                self.persistent_streams.clone(),
+                MediaStreamKey::Control.as_u8(),
+                bytes,
+            );
         }
     }
 }
 
-/// Reads from a unidirectional QUIC stream, handling two framing modes:
+/// Reads from a **persistent length-prefixed unidirectional QUIC stream**
+/// (server -> client) and emits each complete frame to `on_inbound_media`.
 ///
-/// 1. **Legacy per-packet streams**: The sender opens a stream, writes one
-///    packet, and closes the stream.  `done` becomes truthy after the first
-///    (or only) read and any buffered data is emitted as a single packet.
+/// The server keeps the stream open and prefixes every packet with a 4-byte
+/// big-endian length header (see `actix-api/src/webtransport/bridge.rs::
+/// spawn_unistream_writer`).  This reader accumulates chunks across QUIC
+/// chunk boundaries and extracts complete `[length][payload]` frames as
+/// they arrive, emitting each immediately.
 ///
-/// 2. **Persistent length-prefixed streams** (server -> client): The server
-///    keeps the stream open and prefixes every packet with a 4-byte big-endian
-///    length header.  The reader accumulates chunks and extracts complete
-///    `[length][payload]` frames as they arrive, emitting each immediately.
-///
-/// The two modes are distinguished at runtime: if we can extract at least one
-/// complete length-prefixed frame from the buffer we stay in framed mode;
-/// otherwise, when `done` is signalled we fall back to emitting the raw buffer
-/// (legacy mode).
+/// **Framed-only.** Issue #776: the legacy per-packet "emit raw buffer on
+/// done" fallback was removed alongside the rest of PR #772 — both ends of
+/// the WebTransport unidirectional path are framed-only.  A truncated
+/// frame at EOF (server crash mid-write, or a corrupt-length break) leaves
+/// `pending` with bytes that cannot be parsed as a `PacketWrapper`; we
+/// drop them on the floor with a warning rather than emit garbage to the
+/// decoder.
 fn handle_unidirectional_stream(
     stream: WebTransportReceiveStream,
     on_inbound_media: Callback<PacketWrapper>,
@@ -157,8 +227,8 @@ fn handle_unidirectional_stream(
     });
     wasm_bindgen_futures::spawn_local(async move {
         // Buffer for accumulating partial reads across QUIC chunk boundaries.
-        // For per-packet (legacy) streams this typically holds a single chunk.
-        // For persistent streams it may span multiple length-prefixed frames.
+        // May span multiple length-prefixed frames within a single chunk,
+        // or split a single frame across multiple chunks.
         let mut pending: Vec<u8> = Vec::new();
 
         loop {
@@ -188,15 +258,15 @@ fn handle_unidirectional_stream(
                                 as usize;
 
                         if len == 0 || len > MAX_INBOUND_STREAM_SIZE {
-                            // Corrupt or oversized frame -- not a framed stream.
-                            // This can happen on a legacy per-packet stream whose
-                            // first 4 bytes happen to decode to a bad length.
-                            // We will emit the raw buffer when `done` fires.
+                            // Corrupt or oversized length header on a
+                            // framed-only stream — the server should
+                            // never emit this.  Drop the rest of the
+                            // buffer and stop reading from this stream.
                             error!(
-                                "Frame length {} invalid (max {}), treating as non-framed stream",
+                                "Frame length {} invalid (max {}), dropping framed unistream",
                                 len, MAX_INBOUND_STREAM_SIZE
                             );
-                            break;
+                            return;
                         }
 
                         if pending.len() < 4 + len {
@@ -210,11 +280,22 @@ fn handle_unidirectional_stream(
                     }
 
                     if done {
-                        // Stream finished. Any remaining data in `pending` is
-                        // from a legacy per-packet stream (single packet, no
-                        // length prefix) -- emit it as-is.
+                        // Stream finished.  With both ends framed-only, a
+                        // non-empty `pending` here means either (a) the
+                        // server crashed mid-frame leaving a truncated
+                        // `[len][partial-payload]` on the wire, or (b) the
+                        // loop above broke out of frame extraction because
+                        // pending.len() < 4 + len for the current header.
+                        // In either case the bytes are not a complete
+                        // `PacketWrapper`; drop them and log.  Issue #776
+                        // removed the legacy "emit raw buffer" fallback —
+                        // emitting truncated bytes would only have produced
+                        // a downstream parse failure.
                         if !pending.is_empty() {
-                            callback.emit(std::mem::take(&mut pending));
+                            warn!(
+                                "Framed unistream EOF with {} unconsumed bytes (truncated frame); dropping",
+                                pending.len()
+                            );
                         }
                         break;
                     }

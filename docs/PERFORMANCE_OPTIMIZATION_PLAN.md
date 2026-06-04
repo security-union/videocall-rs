@@ -51,7 +51,7 @@ The investigation covered five areas: adaptive bitrate control, network transpor
 | C1 | **No FEC (Forward Error Correction)** | No redundant packets sent | Single packet loss = frame loss |
 | C2 | **No audio/video sync (lip-sync)** | Audio and video decoded independently | Noticeable desync under jitter |
 | C3 | **No SVC (Scalable Video Coding)** | Single video bitstream only | Server cannot selectively forward quality layers per receiver |
-| C4 | **Server drops packets silently** | WebTransport outbound channel drops when full (256 items), no feedback | Silent quality degradation for constrained receivers |
+| C4 | **Server drops packets when receiver is slow** | WebTransport outbound channel drops when full (default 512 items, fail-fast per #979). Now mitigated by priority-aware dropping (video before audio before control) and CONGESTION feedback to senders | Slow/constrained receivers shed video first rather than freezing the whole stream |
 | C5 | **No connection quality re-election** | Once a server is elected, client stays even if RTT degrades | Stuck on degraded network path mid-call |
 
 ---

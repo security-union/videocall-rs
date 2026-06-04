@@ -20,7 +20,7 @@ use gloo_utils::window;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{MediaStream, MediaStreamConstraints, MediaStreamTrack};
+use web_sys::{MediaStream, MediaStreamConstraints, MediaStreamTrack, MediaTrackConstraints};
 
 #[derive(Clone, Copy)]
 pub enum MediaAccessKind {
@@ -146,8 +146,17 @@ impl MediaDeviceAccess {
 
         let constraints = MediaStreamConstraints::new();
 
-        // Request access to the microphone
-        constraints.set_audio(&JsValue::from_bool(true));
+        // Request access to the microphone with the same audio-processing
+        // hints we use on the live mic stream (see `microphone_encoder.rs`).
+        // These are non-breaking "ideal" hints: the browser will still grant
+        // the probe even if it can't honor a flag, so probe-grant behavior
+        // is unchanged. Keeping them in sync with the live constraints
+        // avoids subtle permission/grant-state differences across browsers.
+        let audio_constraints = MediaTrackConstraints::new();
+        audio_constraints.set_echo_cancellation(&JsValue::TRUE);
+        audio_constraints.set_noise_suppression(&JsValue::TRUE);
+        audio_constraints.set_auto_gain_control(&JsValue::TRUE);
+        constraints.set_audio(&audio_constraints.into());
 
         let promise = media_devices
             .get_user_media_with_constraints(&constraints)

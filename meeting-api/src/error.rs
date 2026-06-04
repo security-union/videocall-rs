@@ -86,6 +86,10 @@ impl AppError {
         Self::new(StatusCode::FORBIDDEN, APIError::not_host())
     }
 
+    pub fn bad_request(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, APIError::bad_request(detail))
+    }
+
     pub fn not_owner() -> Self {
         Self::new(StatusCode::FORBIDDEN, APIError::not_owner())
     }

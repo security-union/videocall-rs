@@ -304,3 +304,55 @@ prometheus:
               annotations:
                 summary: "Container memory > 85% of limit"
                 description: "{{ $labels.container }} at {{ $value | printf \"%.0f\" }}% memory"
+
+        # =====================================================================
+        # videocall_client_stability_alerts
+        #
+        # Issue #711 / Discussion #699: the 2026-05-11 incident cascade was
+        # diagnosed only post-mortem because the early-warning signals
+        # (client heap growth and client-upstream datagram drops) were
+        # instrumented but not alerted on. These alerts close that gap.
+        # =====================================================================
+        - name: videocall_client_stability_alerts
+          rules:
+            # Client JS heap has at least doubled vs. its first-seen value in
+            # the last 5 minutes. The cumulative gauge is per
+            # (meeting_id, session_id, peer_id, display_name) so each line
+            # is compared against its own meeting-preamble baseline.
+            - alert: ClientHeapGrowthHigh
+              expr: videocall_client_memory_used_bytes / on(meeting_id, session_id, peer_id, display_name) first_over_time(videocall_client_memory_used_bytes[5m]) > 2
+              for: 60s
+              labels:
+                severity: critical
+                page: "true"
+              annotations:
+                summary: "Client heap >2x preamble during active meeting"
+                description: "{{ $labels.display_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) heap is {{ $value | printf \"%.2f\" }}x its first-seen value. Likely leak or unbounded buffer."
+
+            # Any client is dropping its own outbound datagrams (writable stream
+            # locked / backpressured). videocall_datagram_drops_total is a
+            # cumulative gauge so we use deriv() to extract per-second rate.
+            - alert: ClientUpstreamDropsActive
+              expr: deriv(videocall_datagram_drops_total[1m]) > 0
+              for: 30s
+              labels:
+                severity: critical
+                page: "true"
+              annotations:
+                summary: "Client dropping upstream datagrams"
+                description: "{{ $labels.display_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is dropping {{ $value | printf \"%.1f\" }} datagrams/sec on its upstream — receiver-side audio/video will degrade."
+
+            # Server-wide outbound channel saturating. This is the
+            # protocol-wide counter (no session label by design — see
+            # actix-api/src/metrics.rs OUTBOUND_CHANNEL_DROPS_TOTAL).
+            # Use the relay_packet_drops_total per-room alert
+            # (RelayPacketDrops, already present) for per-room attribution.
+            - alert: RelayOutboundSaturating
+              expr: sum by (transport, kind) (rate(videocall_outbound_channel_drops_total[1m])) > 5
+              for: 30s
+              labels:
+                severity: critical
+                page: "true"
+              annotations:
+                summary: "Relay outbound channel saturating ({{ $labels.transport }} {{ $labels.kind }})"
+                description: "Relay is dropping {{ $value | printf \"%.1f\" }} {{ $labels.kind }} packets/sec on {{ $labels.transport }}. Check relay CPU, NATS publish latency, and per-room drops."

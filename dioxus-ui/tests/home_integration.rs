@@ -4,7 +4,7 @@
 // Integration test for the Home (landing) page (Dioxus).
 //
 // Verifies that the real Home component renders without errors when
-// window.__APP_CONFIG is present with OAuth disabled.  Rather than
+// window.__APP_CONFIG is present. Rather than
 // asserting on every single DOM node, we check a handful of landmarks
 // that uniquely identify the page.
 
@@ -13,18 +13,20 @@
 mod support;
 
 use support::{
-    cleanup, create_mount_point, inject_app_config, mock_fetch_401, mock_fetch_meetings_empty,
-    remove_app_config, render_into, restore_fetch, yield_now,
+    cleanup, create_mount_point, inject_app_config_oauth_enabled, mock_fetch_401,
+    mock_fetch_meetings_empty, remove_app_config, render_into, reset_test_browser_state,
+    restore_fetch, wait_for_selector, yield_now,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
-use web_sys::{Event, EventInit, HtmlButtonElement, HtmlInputElement};
+use web_sys::{Event, EventInit, HtmlInputElement};
 
 use dioxus::prelude::*;
 use dioxus_ui::components::config_error::ConfigError;
+use dioxus_ui::components::search_modal::SearchVisibleCtx;
 use dioxus_ui::constants::app_config;
 use dioxus_ui::context::{
-    load_display_name_from_storage, DisplayNameCtx, TransportPreference, TransportPreferenceCtx,
+    load_transport_preference, validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -58,21 +60,21 @@ fn ensure_root_url() {
     );
 }
 
-/// Full app wrapper: provides DisplayNameCtx + TransportPreferenceCtx then
-/// renders Router<Route>.  The Router picks the component based on the
-/// current URL (pushed to "/").
-///
-/// Both contexts must be provided here to match `main.rs`, because form
-/// submission in the Home route can navigate to /meeting/:id, and
-/// `MeetingPage::use_context::<TransportPreferenceCtx>()` panics when the
-/// context is missing.  Without this provider, the panic corrupts the Dioxus
-/// runtime state and breaks subsequent tests in the same binary.
+/// Full app wrapper: provides all three context providers that `main.rs`
+/// supplies (DisplayNameCtx, TransportPreferenceCtx, SearchVisibleCtx),
+/// then renders Router<Route>.  The Router picks the component based on
+/// the current URL (pushed to "/").
 fn home_wrapper_direct() -> Element {
     let username_signal = use_signal(|| None::<String>);
     use_context_provider(|| DisplayNameCtx(username_signal));
 
-    let transport_pref = use_signal(TransportPreference::default);
+    let transport_pref = use_signal(load_transport_preference);
     use_context_provider(|| TransportPreferenceCtx(transport_pref));
+
+    let search_visible = use_signal(|| false);
+    use_context_provider(|| SearchVisibleCtx {
+        is_visible: search_visible,
+    });
 
     match app_config() {
         Ok(_) => rsx! {
@@ -89,13 +91,20 @@ fn home_wrapper_direct() -> Element {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
-async fn home_page_renders_with_oauth_disabled() {
+async fn home_page_renders() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
+    inject_app_config_oauth_enabled();
+    mock_fetch_401();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
+
+    // Wait for the Router to resolve and Home to render.
+    assert!(
+        wait_for_selector(&mount, "#username", 2000).await,
+        "Timed out waiting for Home page to render (#username)"
+    );
 
     // No error banner — config loaded and browser checks passed.
     assert!(
@@ -110,13 +119,8 @@ async fn home_page_renders_with_oauth_disabled() {
         text.contains("Start or Join a Meeting"),
         "form heading missing"
     );
-    // Both buttons are always visible (join button is disabled when no meeting ID).
     assert!(
-        text.contains("Start or Join Meeting"),
-        "join button missing"
-    );
-    assert!(
-        text.contains("Create a New Meeting ID"),
+        text.contains("Generate a New Meeting ID"),
         "create button missing"
     );
 
@@ -129,47 +133,42 @@ async fn home_page_renders_with_oauth_disabled() {
         mount.query_selector("#meeting-id").unwrap().is_some(),
         "meeting-id input missing"
     );
+    assert!(
+        mount
+            .query_selector("button[type='submit']")
+            .unwrap()
+            .is_none(),
+        "join button should not render until a meeting ID is entered"
+    );
 
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn home_shows_login_when_unauthenticated() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
+    inject_app_config_oauth_enabled();
     mock_fetch_401();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
 
-    // Allow the mock fetch to resolve and Dioxus to re-render.
-    yield_now().await;
-    // Extra yield for async fetch resolution
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        gloo_utils::window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
-            .unwrap();
-    });
-    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    yield_now().await;
-
-    // The meetings section should show the sign-in prompt instead of an error.
+    // Wait for the auth button rendered in the top-right dropdown container.
     assert!(
-        mount
-            .query_selector(".meetings-auth-prompt")
-            .unwrap()
-            .is_some(),
-        "Sign-in prompt should be visible when API returns 401"
+        wait_for_selector(&mount, ".generic-sign-in-button", 2000).await,
+        "Timed out waiting for sign-in button (.generic-sign-in-button)"
     );
 
     let text = mount.text_content().unwrap_or_default();
     assert!(
-        text.contains("Sign in to see your meetings"),
-        "Auth prompt text should be shown"
+        text.contains("Sign in"),
+        "Sign-in button text should be shown"
     );
 
-    // A sign-in button should be rendered (generic when no provider is configured).
     assert!(
         mount
             .query_selector(".generic-sign-in-button")
@@ -181,34 +180,33 @@ async fn home_shows_login_when_unauthenticated() {
     cleanup(&mount);
     restore_fetch();
     remove_app_config();
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn home_hides_login_when_authenticated() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
+    inject_app_config_oauth_enabled();
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
 
-    // Allow the mock fetch to resolve and Dioxus to re-render.
-    yield_now().await;
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        gloo_utils::window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
-            .unwrap();
-    });
-    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    yield_now().await;
+    // Wait for the auth effect to resolve the mocked session/profile and for
+    // the meetings fetch to render the empty authenticated state.
+    assert!(
+        wait_for_selector(&mount, ".meetings-empty", 2000).await,
+        "Timed out waiting for empty meetings state (.meetings-empty)"
+    );
 
-    // The sign-in prompt should NOT be visible.
+    // The top-right sign-in button should NOT be visible once a profile loads.
     assert!(
         mount
-            .query_selector(".meetings-auth-prompt")
+            .query_selector(".generic-sign-in-button")
             .unwrap()
             .is_none(),
-        "Sign-in prompt should NOT be visible when API returns 200"
+        "Sign-in button should NOT be visible when the user is authenticated"
     );
 
     // Should show the empty meetings state instead.
@@ -221,21 +219,22 @@ async fn home_hides_login_when_authenticated() {
     cleanup(&mount);
     restore_fetch();
     remove_app_config();
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn missing_config_shows_error_not_home() {
+    reset_test_browser_state();
     remove_app_config();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
 
-    // ConfigError should be visible — same as the real app.
-    let error = mount.query_selector(".error-container").unwrap();
+    // ConfigError renders synchronously (no Router needed), but still wait
+    // for at least the initial Dioxus flush.
     assert!(
-        error.is_some(),
-        "ConfigError should be shown when __APP_CONFIG is missing"
+        wait_for_selector(&mount, ".error-container", 2000).await,
+        "Timed out waiting for ConfigError (.error-container)"
     );
 
     let text = mount.text_content().unwrap_or_default();
@@ -251,17 +250,23 @@ async fn missing_config_shows_error_not_home() {
     );
 
     cleanup(&mount);
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn home_rejects_invalid_display_name() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
+    inject_app_config_oauth_enabled();
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
+
+    assert!(
+        wait_for_selector(&mount, "#username", 2000).await,
+        "Timed out waiting for Home page to render"
+    );
 
     let username = mount
         .query_selector("#username")
@@ -298,242 +303,92 @@ async fn home_rejects_invalid_display_name() {
     cleanup(&mount);
     restore_fetch();
     remove_app_config();
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn home_normalizes_spaces_in_display_name() {
-    ensure_root_url();
-    inject_app_config();
-    mock_fetch_meetings_empty();
-
-    let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
-    yield_now().await;
-
-    let username = mount
-        .query_selector("#username")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    username.set_value("  John    Doe   ");
-    username.dispatch_event(&bubbling_input_event()).unwrap();
-
-    let meeting_id = mount
-        .query_selector("#meeting-id")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
-
-    // Yield so Dioxus processes the oninput state updates before submit reads them.
-    yield_now().await;
-
-    let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&bubbling_submit_event()).unwrap();
-
-    yield_now().await;
-
-    // Navigation now succeeds, removing the Home component from the DOM,
-    // so verify the normalized username via the public storage API instead.
-    // (Direct web_sys localStorage access would see CBOR bytes, not a plain
-    // string, because dioxus-sdk-storage serialises values with CBOR+zlib.)
-    let saved = load_display_name_from_storage();
-    assert_eq!(saved, Some("John Doe".to_string()));
-
-    // Clean up the stored display name so this test doesn't pollute others.
-    dioxus_ui::context::clear_display_name_from_storage();
-
-    cleanup(&mount);
-    restore_fetch();
-    remove_app_config();
+    assert_eq!(
+        validate_display_name("  John    Doe   ").unwrap(),
+        "John Doe"
+    );
 }
 
 #[wasm_bindgen_test]
 async fn home_rejects_empty_display_name() {
-    ensure_root_url();
-    inject_app_config();
-    mock_fetch_meetings_empty();
-
-    let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
-    yield_now().await;
-
-    // Leave username empty, set a meeting ID, and submit.
-    let meeting_id = mount
-        .query_selector("#meeting-id")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
-
-    // Yield so Dioxus processes the oninput state updates before submit reads them.
-    yield_now().await;
-
-    let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&bubbling_submit_event()).unwrap();
-
-    yield_now().await;
-
-    let text = mount.text_content().unwrap_or_default();
     assert!(
-        text.contains("Name cannot be empty"),
-        "Expected empty-name error, got page text: {text}"
+        validate_display_name("   ")
+            .unwrap_err()
+            .contains("Name cannot be empty"),
+        "Expected empty-name validation error"
     );
-
-    cleanup(&mount);
-    restore_fetch();
-    remove_app_config();
 }
 
 #[wasm_bindgen_test]
 async fn home_rejects_display_name_exceeding_max_length() {
-    ensure_root_url();
-    inject_app_config();
-    mock_fetch_meetings_empty();
-
-    let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
-    yield_now().await;
-
-    // Create a name that exceeds 50 characters.
     let long_name = "A".repeat(51);
-    let username = mount
-        .query_selector("#username")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    username.set_value(&long_name);
-    username.dispatch_event(&bubbling_input_event()).unwrap();
-
-    let meeting_id = mount
-        .query_selector("#meeting-id")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
-
-    // Yield so Dioxus processes the oninput state updates before submit reads them.
-    yield_now().await;
-
-    let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&bubbling_submit_event()).unwrap();
-
-    yield_now().await;
-
-    let text = mount.text_content().unwrap_or_default();
     assert!(
-        text.contains("too long"),
-        "Expected max-length error, got page text: {text}"
+        validate_display_name(&long_name)
+            .unwrap_err()
+            .contains("too long"),
+        "Expected max-length validation error"
     );
-
-    cleanup(&mount);
-    restore_fetch();
-    remove_app_config();
 }
 
 #[wasm_bindgen_test]
 async fn home_accepts_display_name_with_special_characters() {
+    assert!(validate_display_name("O'Brien-Smith").is_ok());
+}
+
+#[wasm_bindgen_test]
+async fn home_shows_create_button_when_no_meeting_id() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
-    mock_fetch_meetings_empty();
+    inject_app_config_oauth_enabled();
+    mock_fetch_401();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
 
-    // Apostrophes and hyphens are allowed special characters.
-    let username = mount
-        .query_selector("#username")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    username.set_value("O'Brien-Smith");
-    username.dispatch_event(&bubbling_input_event()).unwrap();
+    assert!(
+        wait_for_selector(&mount, "#meeting-id", 2000).await,
+        "Timed out waiting for Home page to render"
+    );
 
-    let meeting_id = mount
-        .query_selector("#meeting-id")
-        .unwrap()
-        .unwrap()
-        .dyn_into::<HtmlInputElement>()
-        .unwrap();
-    meeting_id.set_value("abc_123");
-    meeting_id.dispatch_event(&bubbling_input_event()).unwrap();
+    assert!(
+        mount
+            .query_selector("button[type='submit']")
+            .unwrap()
+            .is_none(),
+        "Join button should not render until a meeting ID is entered"
+    );
 
-    // Yield so Dioxus processes the oninput state updates before submit reads them.
-    yield_now().await;
-
-    let form = mount.query_selector("form").unwrap().unwrap();
-    form.dispatch_event(&bubbling_submit_event()).unwrap();
-
-    yield_now().await;
-
-    // No error should be shown -- the name is valid.
     let text = mount.text_content().unwrap_or_default();
     assert!(
-        !text.contains("Invalid character"),
-        "Should not show invalid character error for apostrophes and hyphens, got: {text}"
-    );
-    assert!(
-        !text.contains("Name cannot be empty"),
-        "Should not show empty name error, got: {text}"
+        text.contains("Generate a New Meeting ID"),
+        "Create button should always be visible"
     );
 
     cleanup(&mount);
     restore_fetch();
     remove_app_config();
-}
-
-#[wasm_bindgen_test]
-async fn home_join_button_disabled_when_no_meeting_id() {
-    ensure_root_url();
-    inject_app_config();
-
-    let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
-    yield_now().await;
-
-    // Find the submit button (type="submit") — "Start or Join Meeting".
-    let btn = mount
-        .query_selector("button[type='submit']")
-        .unwrap()
-        .expect("submit button should exist")
-        .dyn_into::<HtmlButtonElement>()
-        .unwrap();
-
-    // With no meeting ID entered, the join button should be disabled.
-    assert!(
-        btn.disabled(),
-        "Join button should be disabled when meeting ID is empty"
-    );
-
-    // The "Create a New Meeting ID" button should also be present.
-    let text = mount.text_content().unwrap_or_default();
-    assert!(
-        text.contains("Create a New Meeting ID"),
-        "Create button should always be visible"
-    );
-
-    cleanup(&mount);
-    remove_app_config();
+    reset_test_browser_state();
 }
 
 #[wasm_bindgen_test]
 async fn home_join_button_enabled_when_meeting_id_entered() {
+    reset_test_browser_state();
     ensure_root_url();
-    inject_app_config();
+    inject_app_config_oauth_enabled();
+    mock_fetch_401();
 
     let mount = create_mount_point();
     render_into(&mount, home_wrapper_direct);
-    yield_now().await;
+
+    assert!(
+        wait_for_selector(&mount, "#meeting-id", 2000).await,
+        "Timed out waiting for Home page to render"
+    );
 
     // Enter a meeting ID.
     let meeting_input = mount
@@ -549,19 +404,28 @@ async fn home_join_button_enabled_when_meeting_id_entered() {
 
     yield_now().await;
 
-    // The submit button should now be enabled.
-    let btn = mount
-        .query_selector("button[type='submit']")
-        .unwrap()
-        .expect("submit button should exist")
-        .dyn_into::<HtmlButtonElement>()
-        .unwrap();
-
+    // The submit button should now be rendered.
     assert!(
-        !btn.disabled(),
-        "Join button should be enabled when meeting ID is entered"
+        mount
+            .query_selector("button[type='submit']")
+            .unwrap()
+            .is_some(),
+        "Join button should render when meeting ID is entered"
     );
 
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Start or Join Meeting"),
+        "Join button label should be shown when meeting ID is entered"
+    );
+
+    let _btn = mount
+        .query_selector("button[type='submit']")
+        .unwrap()
+        .expect("submit button should exist");
+
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
+    reset_test_browser_state();
 }

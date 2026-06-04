@@ -1,0 +1,7 @@
+host: pushgateway.videocall.fnxlabs.com
+serviceName: prometheus-prometheus-pushgateway
+servicePort: 9091
+tlsSecretName: pushgateway-tls
+issuer: letsencrypt-prod
+# CI runner (videocallci.fnxlabs.com) + K3s node (local cluster traffic)
+allowedSourceRange: "10.190.252.135/32,10.190.252.83/32,10.42.0.0/16"

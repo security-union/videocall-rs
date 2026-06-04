@@ -148,6 +148,7 @@
 //!     None, // vad_threshold
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //! use std::sync::atomic::AtomicBool;
 //! use std::rc::Rc;
@@ -158,6 +159,7 @@
 //!     Callback::noop(),
 //!     Callback::noop(), // on_state_change callback for screen share events
 //!     screen_sharing_active,
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //!
 //! // Select devices and start/stop encoding

@@ -202,15 +202,17 @@ pub const SIMULCAST_MAX_LAYERS: usize = 3;
 /// Generic, ladder-length-driven replacement for the old hand-authored
 /// `match n { 1|2|3 }` selection (issue #1082). The selection rule is:
 ///
-/// - Always include the **base** (position 0) and, when `n >= 2`, the **top**
-///   (position `len - 1`), then space the remaining picks evenly across the
-///   interior. This reproduces the existing contract exactly for the current
-///   3-rung ladder:
-///     - `n == 1` → `[0]`          → `[low]`
-///     - `n == 2` → `[0, 2]`       → `[low, hd]`   (deliberate middle-skip kept)
-///     - `n == 3` → `[0, 1, 2]`    → `[low, standard, hd]`
-///   and generalizes cleanly to a deeper ladder so raising
-///   [`SIMULCAST_MAX_LAYERS`] later "just works" with no code change here.
+/// Always include the **base** (position 0) and, when `n >= 2`, the **top**
+/// (position `len - 1`), then space the remaining picks evenly across the
+/// interior. This reproduces the existing contract exactly for the current
+/// 3-rung ladder:
+///
+/// - `n == 1` → `[0]`       → `[low]`
+/// - `n == 2` → `[0, 2]`    → `[low, hd]`   (deliberate middle-skip kept)
+/// - `n == 3` → `[0, 1, 2]` → `[low, standard, hd]`
+///
+/// It generalizes cleanly to a deeper ladder so raising
+/// [`SIMULCAST_MAX_LAYERS`] later "just works" with no code change here.
 ///
 /// `n` is clamped into `1..=len` so it can never index out of range (matches
 /// the client's `clamp_layer_count`; an out-of-range request is degraded, not a

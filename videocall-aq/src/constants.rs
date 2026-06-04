@@ -269,6 +269,116 @@ pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
     }
 }
 
+/// Sender uplink budget (kbps) for the currently-active simulcast layers
+/// (issue #989, Phase 1).
+///
+/// Publishing N simultaneous layers costs the *sum* of their bitrates on the
+/// sender's uplink, not the cost of one layer. The sender's AQ must therefore
+/// account for that sum, not just the per-layer tier band. We define the budget
+/// as the **sum of the active layers' tier ideals** — i.e. the bitrate the
+/// ladder was authored to fit comfortably when all `active` layers run at their
+/// nominal quality. Examples for the standard ladder (`[low, standard, hd]`,
+/// ideals 400 / 900 / 1500):
+///
+/// - 1 active layer  → 400 kbps
+/// - 2 active layers → 1300 kbps
+/// - 3 active layers → 2800 kbps
+///
+/// `active` is `active_layer_count` (the top shed layers cost nothing), so as
+/// the sender's AQ sheds the top layer under congestion the budget shrinks with
+/// it. `tiers` is the full ladder, lowest layer first; only the first `active`
+/// entries are summed. Pure function so the budget rule is unit-testable.
+///
+/// # Panics
+/// Never panics; `active` is clamped to `[0, tiers.len()]`.
+pub fn uplink_budget_kbps(tiers: &[VideoQualityTier], active: usize) -> f64 {
+    let active = active.min(tiers.len());
+    tiers[..active]
+        .iter()
+        .map(|t| t.ideal_bitrate_kbps as f64)
+        .sum()
+}
+
+/// Cap a set of per-layer target bitrates to the sender's uplink budget,
+/// preserving each layer's tier floor (issue #989, Phase 1).
+///
+/// Takes the per-layer targets the per-layer PIDs produced (`targets[i]`, kbps,
+/// lowest layer first) for the **active** layers and, if their sum exceeds
+/// [`uplink_budget_kbps`], scales them down so the total fits — but never pushes
+/// any layer below its tier `min_bitrate_kbps` (the per-layer floor). The base
+/// layer (index 0) is the most resilient and the one every receiver decodes, so
+/// floors guarantee it stays viewable even when the budget is tight.
+///
+/// Algorithm (proportional headroom scaling above the floors):
+///   1. Compute `floor = Σ min_bitrate_kbps` over the active layers and the
+///      requested `sum = Σ targets`. If `sum <= budget`, return unchanged.
+///   2. If even the floors exceed the budget (`floor >= budget`), the budget is
+///      unsatisfiable without dropping a layer (that is the AQ layer-shed's job,
+///      not this function's); return every active layer pinned to its floor —
+///      the minimum-cost configuration for the current active set.
+///   3. Otherwise distribute the affordable `budget - floor` headroom across the
+///      layers in proportion to each layer's own headroom request
+///      (`target - min`), so layers that asked for more give up more, and no
+///      layer drops below its floor.
+///
+/// Only the first `active` entries of `targets` are considered; the rest (shed
+/// layers) are returned unchanged (they are not encoded/sent). Operates in
+/// place. Pure (no I/O / clock), so it is host-unit-testable.
+pub fn cap_layers_to_budget(
+    targets: &mut [f64],
+    tiers: &[VideoQualityTier],
+    active: usize,
+    budget_kbps: f64,
+) {
+    let active = active.min(tiers.len()).min(targets.len());
+    if active == 0 {
+        return;
+    }
+
+    let sum: f64 = targets[..active].iter().sum();
+    if sum <= budget_kbps {
+        return; // Already within budget — no scaling needed.
+    }
+
+    let floor: f64 = tiers[..active]
+        .iter()
+        .map(|t| t.min_bitrate_kbps as f64)
+        .sum();
+
+    if floor >= budget_kbps {
+        // Budget cannot fit even the floors; pin every active layer to its
+        // floor. Shedding a layer to actually fit the budget is the AQ
+        // top-layer-drop's responsibility, not this cap's.
+        for (i, t) in targets[..active].iter_mut().enumerate() {
+            *t = tiers[i].min_bitrate_kbps as f64;
+        }
+        return;
+    }
+
+    // Affordable headroom above the floors, and the total headroom requested.
+    let affordable = budget_kbps - floor;
+    let requested: f64 = tiers[..active]
+        .iter()
+        .zip(targets[..active].iter())
+        .map(|(tier, &want)| (want - tier.min_bitrate_kbps as f64).max(0.0))
+        .sum();
+
+    if requested <= 0.0 {
+        // Every layer already at/below its floor (degenerate); pin to floors.
+        for (i, t) in targets[..active].iter_mut().enumerate() {
+            *t = tiers[i].min_bitrate_kbps as f64;
+        }
+        return;
+    }
+
+    let scale = affordable / requested;
+    for (i, t) in targets[..active].iter_mut().enumerate() {
+        let min = tiers[i].min_bitrate_kbps as f64;
+        let want_headroom = (*t - min).max(0.0);
+        *t = min + want_headroom * scale;
+    }
+}
+
 /// Label of the video quality tier to use as camera ceiling during screen sharing.
 ///
 /// When screen share starts, the camera is forced to this tier and capped here
@@ -1180,6 +1290,89 @@ mod tests {
             DEFAULT_VIDEO_TIER_INDEX,
             VIDEO_QUALITY_TIERS.len(),
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Uplink budget tests (issue #989, Phase 1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_uplink_budget_is_sum_of_active_tier_ideals() {
+        // Standard ladder [low, standard, hd] = ideals 400 / 900 / 1500.
+        let tiers = simulcast_layers(3);
+        assert_eq!(uplink_budget_kbps(tiers, 1), 400.0);
+        assert_eq!(uplink_budget_kbps(tiers, 2), 1300.0);
+        assert_eq!(uplink_budget_kbps(tiers, 3), 2800.0);
+        // active is clamped to the ladder length (cannot over-count).
+        assert_eq!(uplink_budget_kbps(tiers, 99), 2800.0);
+        // Zero active layers → zero budget.
+        assert_eq!(uplink_budget_kbps(tiers, 0), 0.0);
+    }
+
+    #[test]
+    fn test_cap_noop_when_within_budget() {
+        // Targets that already fit must be returned unchanged (the common case
+        // at low tiers and the byte-identical guarantee for N=1).
+        let tiers = simulcast_layers(3);
+        let budget = uplink_budget_kbps(tiers, 3); // 2800
+        let mut targets = [300.0, 700.0, 1200.0]; // sum 2200 <= 2800
+        let before = targets;
+        cap_layers_to_budget(&mut targets, tiers, 3, budget);
+        assert_eq!(targets, before, "within-budget targets must not change");
+    }
+
+    #[test]
+    fn test_cap_scales_down_to_budget_and_respects_floors() {
+        // Targets that exceed the budget must be scaled so the active sum fits,
+        // and no layer may drop below its tier floor (200 / 500 / 800).
+        let tiers = simulcast_layers(3);
+        let floors: Vec<f64> = tiers.iter().map(|t| t.min_bitrate_kbps as f64).collect();
+        let budget = uplink_budget_kbps(tiers, 3); // 2800
+                                                   // All layers asking for their tier max: 600 + 1500 + 2000 = 4100 > 2800.
+        let mut targets = [600.0, 1500.0, 2000.0];
+        cap_layers_to_budget(&mut targets, tiers, 3, budget);
+
+        let sum: f64 = targets.iter().sum();
+        assert!(
+            sum <= budget + 1e-6,
+            "active sum {sum} must fit within budget {budget}"
+        );
+        for (i, &t) in targets.iter().enumerate() {
+            assert!(
+                t >= floors[i] - 1e-6,
+                "layer {i} ({t}) must stay at/above its floor {}",
+                floors[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_cap_pins_to_floors_when_budget_below_floor_sum() {
+        // If the budget cannot fit even the floors, pin every active layer to
+        // its floor (shedding a layer to actually fit is the AQ's job, not the
+        // cap's). Floors sum = 200+500+800 = 1500; pass a budget below that.
+        let tiers = simulcast_layers(3);
+        let mut targets = [600.0, 1500.0, 2000.0];
+        cap_layers_to_budget(&mut targets, tiers, 3, 1000.0);
+        assert_eq!(targets[0], tiers[0].min_bitrate_kbps as f64);
+        assert_eq!(targets[1], tiers[1].min_bitrate_kbps as f64);
+        assert_eq!(targets[2], tiers[2].min_bitrate_kbps as f64);
+    }
+
+    #[test]
+    fn test_cap_only_touches_active_layers() {
+        // Shed (inactive) top layers must be left untouched: with active=1 only
+        // index 0 is considered, even if its lone target exceeds the 1-layer
+        // budget; indices 1..2 keep their stale values.
+        let tiers = simulcast_layers(3);
+        let budget = uplink_budget_kbps(tiers, 1); // 400 (= low ideal)
+        let mut targets = [600.0, 9999.0, 8888.0];
+        cap_layers_to_budget(&mut targets, tiers, 1, budget);
+        // Active layer 0 capped to its floor-respecting share of 400.
+        assert!(targets[0] <= budget + 1e-6 && targets[0] >= 200.0 - 1e-6);
+        // Shed layers untouched.
+        assert_eq!(targets[1], 9999.0);
+        assert_eq!(targets[2], 8888.0);
     }
 
     #[test]

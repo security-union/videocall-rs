@@ -22,10 +22,11 @@ use std::sync::Arc;
 
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
-    screen_share_camera_ceiling_index, simulcast_layers, AudioQualityTier, VideoQualityTier,
-    AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO, MAX_BITRATE_SLEW_KBPS_PER_SEC,
-    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
-    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    cap_layers_to_budget, screen_share_camera_ceiling_index, simulcast_layers, uplink_budget_kbps,
+    AudioQualityTier, VideoQualityTier, AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO,
+    MAX_BITRATE_SLEW_KBPS_PER_SEC, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
+    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -835,7 +836,15 @@ impl EncoderBitrateController {
             // Computed here (not inside the mutable layer loop) to avoid borrowing
             // `quality_manager` while `layer_pids` is mutably borrowed.
             let congestion_hold = self.quality_manager.congestion_hold_active(now);
-            self.compute_layer_bitrates(fps_received, target_fps, jitter, dt, congestion_hold);
+            let active = self.quality_manager.active_layer_count();
+            self.compute_layer_bitrates(
+                fps_received,
+                target_fps,
+                jitter,
+                dt,
+                congestion_hold,
+                active,
+            );
         }
 
         self.last_correction_time = now;
@@ -858,6 +867,7 @@ impl EncoderBitrateController {
         jitter: f64,
         dt: f64,
         congestion_hold: bool,
+        active: usize,
     ) {
         for i in 0..self.layer_pids.len() {
             // Keep each layer's setpoint synced to the (possibly changing) target.
@@ -916,6 +926,32 @@ impl EncoderBitrateController {
             };
             layer.last_target_bitrate_kbps = slewed;
             self.last_layer_target_bitrates_kbps[i] = slewed;
+        }
+
+        // --- Sender uplink budget cap (issue #989, Phase 1) ---
+        // The per-layer PIDs above each clamp to their OWN tier band, so their
+        // SUM can exceed what the sender's uplink can afford (e.g. 3 layers at
+        // their tier ideals = 2800 kbps). Publishing N layers costs the sum, so
+        // cap the ACTIVE layers' targets to the uplink budget (sum of active
+        // tier ideals), proportionally shedding bitrate above each layer's tier
+        // floor. This shrinks automatically as the AQ sheds the top layer under
+        // congestion (`active` drops → budget drops). Shed layers are untouched
+        // (not encoded/sent). The base layer keeps its floor so it stays
+        // viewable. No-op when the layers already fit (the common case at low
+        // tiers), so it never disturbs an already-affordable configuration.
+        let tiers = simulcast_layers(self.layer_pids.len());
+        let budget = uplink_budget_kbps(tiers, active);
+        cap_layers_to_budget(
+            &mut self.last_layer_target_bitrates_kbps,
+            tiers,
+            active,
+            budget,
+        );
+        // Keep each layer's slew baseline in sync with the capped value so the
+        // next tick's slew limiter measures delta from what we actually emitted,
+        // not from the pre-cap PID target (which would let the cap "snap back").
+        for i in 0..active.min(self.layer_pids.len()) {
+            self.layer_pids[i].last_target_bitrate_kbps = self.last_layer_target_bitrates_kbps[i];
         }
     }
 
@@ -2750,6 +2786,59 @@ mod tests {
         controller.force_video_step_down();
         assert_eq!(controller.active_layer_count(), 1);
         assert!(controller.layer_target_bitrates_kbps().is_empty());
+    }
+
+    #[test]
+    fn test_active_layer_sum_stays_within_uplink_budget() {
+        // After processing many diagnostics ticks in 3-layer simulcast, the SUM
+        // of the ACTIVE layers' target bitrates must never exceed the uplink
+        // budget (sum of active tier ideals), and each layer must stay at/above
+        // its tier floor. This is the core Phase-1 budget guarantee.
+        use crate::constants::{simulcast_layers, uplink_budget_kbps};
+
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(500, target_fps);
+        controller.set_simulcast_layers(3);
+
+        // Perfect conditions push every per-layer PID toward its tier ideal/max,
+        // which (un-capped) would sum to 2800+ kbps — exercising the cap.
+        let base = 1000.0;
+        for i in 0..30 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base + (i as f64 * 1100.0),
+            );
+        }
+
+        let active = controller.active_layer_count();
+        let tiers = simulcast_layers(3);
+        let budget = uplink_budget_kbps(tiers, active);
+        let bitrates = controller.layer_target_bitrates_kbps();
+        let active_sum: f64 = bitrates[..active].iter().sum();
+        assert!(
+            active_sum <= budget + 1e-6,
+            "active sum {active_sum} (active={active}) must fit within budget {budget}"
+        );
+        for i in 0..active {
+            assert!(
+                bitrates[i] >= tiers[i].min_bitrate_kbps as f64 - 1e-6,
+                "layer {i} ({}) below its floor {}",
+                bitrates[i],
+                tiers[i].min_bitrate_kbps,
+            );
+        }
+    }
+
+    #[test]
+    fn test_budget_shrinks_as_top_layer_is_shed() {
+        // The budget is the sum of ACTIVE tier ideals, so shedding the top layer
+        // must lower the budget the active set is held to. 3 active = 2800,
+        // 2 active = 1300, 1 active = 400.
+        use crate::constants::{simulcast_layers, uplink_budget_kbps};
+        let tiers = simulcast_layers(3);
+        assert!(uplink_budget_kbps(tiers, 3) > uplink_budget_kbps(tiers, 2));
+        assert!(uplink_budget_kbps(tiers, 2) > uplink_budget_kbps(tiers, 1));
+        assert_eq!(uplink_budget_kbps(tiers, 1), 400.0);
     }
 
     #[test]

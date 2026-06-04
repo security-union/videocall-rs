@@ -1627,7 +1627,7 @@
         }
       ],
       "title": "Keyframe Requests/sec",
-      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures \u2014 the receiver is asking the sender to re-sync.",
+      "description": "Rate of PLI (keyframe) requests sent. Spikes indicate video decode failures — the receiver is asking the sender to re-sync.",
       "type": "timeseries"
     },
     {
@@ -1723,12 +1723,45 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
               }
             ]
           },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "fps"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "blue",
+                      "value": null
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -1754,18 +1787,28 @@
       },
       "targets": [
         {
-          "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
+          "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
+          "legendFormat": "seq-loss/s: {{reporter_name}} → {{peer_name}}",
           "refId": "A"
         },
         {
           "expr": "videocall_video_fps{meeting_id=~\"$meeting\"}",
-          "legendFormat": "fps: {{reporter_name}} \u2192 {{peer_name}}",
+          "legendFormat": "fps: {{reporter_name}} → {{peer_name}}",
           "refId": "B"
+        },
+        {
+          "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
+          "legendFormat": "frames-dropped/s: {{reporter_name}} → {{peer_name}}",
+          "refId": "C"
+        },
+        {
+          "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+          "legendFormat": "decode-err/s: {{reporter_name}} → {{peer_name}}",
+          "refId": "D"
         }
       ],
-      "title": "Decode Errors & FPS (Receiver)",
-      "description": "Video decode errors/sec and received FPS per peer pair. Decode errors indicate corrupted frames; FPS drop indicates frozen video.",
+      "title": "Reference Loss, Decode Errors & FPS (Receiver)",
+      "description": "Per-peer receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series, left axis) is the always-on signal and returns to 0 when healthy — sustained > 0 while FPS still reads ~30 is the classic frozen-but-decoding case. FPS (videocall_video_fps) is plotted on the right axis so it does not flatten the loss series or trip the loss threshold. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update when a hard WebCodecs decode fault occurs) — read these two as 'has a fault occurred', not 'is one occurring right now'. All three loss/error gauges are registered + emitted server-side and conditionally populated.",
       "type": "timeseries"
     },
     {
@@ -1774,7 +1817,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 71
       },
       "id": 26,
       "title": "Meeting Overview",
@@ -1813,7 +1856,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "id": 27,
       "options": {
@@ -1875,7 +1918,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 54
+        "y": 62
       },
       "id": 28,
       "options": {
@@ -1940,7 +1983,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 54
+        "y": 62
       },
       "id": 29,
       "options": {
@@ -1961,11 +2004,22 @@
       "targets": [
         {
           "expr": "videocall_client_memory_used_bytes{meeting_id=~\"$meeting\"}",
-          "legendFormat": "{{display_name}}",
-          "refId": ""
+          "legendFormat": "JS heap used: {{display_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_client_wasm_memory_bytes{meeting_id=~\"$meeting\"}",
+          "legendFormat": "WASM linear: {{display_name}}",
+          "refId": "B"
+        },
+        {
+          "expr": "videocall_client_memory_total_bytes{meeting_id=~\"$meeting\"}",
+          "legendFormat": "JS heap limit: {{display_name}}",
+          "refId": "C"
         }
       ],
-      "title": "Client Memory Usage",
+      "title": "Client Memory Usage (JS Heap + WASM)",
+      "description": "Per-client memory pressure (#1032 non-heap telemetry). JS heap used (Chrome only) + WASM linear memory (WebAssembly.Memory.buffer.byteLength, always available) + JS heap limit. The JS-heap gauge alone misses the multi-GB WASM/decode buffer pressure that drives freezes, so WASM linear is overlaid here. videocall_client_agent_memory_bytes (measureUserAgentSpecificMemory) is Chrome + crossOriginIsolated-gated and may be absent.",
       "type": "timeseries"
     },
     {
@@ -1974,7 +2028,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 70
       },
       "id": 30,
       "title": "Server Resources (CPU & Memory vs Limits)",
@@ -2028,7 +2082,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 63
+        "y": 71
       },
       "id": 31,
       "options": {
@@ -2046,12 +2100,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (container)(rate(container_cpu_usage_seconds_total{namespace=\"$namespace\",container=~\"rustlemania-.*|websocket-.*|webtransport-.*\"}[1m]))",
+          "expr": "sum by (container)(rate(container_cpu_usage_seconds_total{namespace=\"$namespace\",container=~\"videocall-websocket|videocall-webtransport\"}[1m]))",
           "legendFormat": "{{container}} usage",
           "refId": "A"
         },
         {
-          "expr": "sum by (container)(kube_pod_container_resource_limits{namespace=\"$namespace\",container=~\"rustlemania-.*|websocket-.*|webtransport-.*\",resource=\"cpu\"})",
+          "expr": "sum by (container)(kube_pod_container_resource_limits{namespace=\"$namespace\",container=~\"videocall-websocket|videocall-webtransport\",resource=\"cpu\"})",
           "legendFormat": "{{container}} limit",
           "refId": "B"
         }
@@ -2107,7 +2161,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 63
+        "y": 71
       },
       "id": 32,
       "options": {
@@ -2125,12 +2179,12 @@
       },
       "targets": [
         {
-          "expr": "container_memory_working_set_bytes{namespace=\"$namespace\",container=~\"rustlemania-.*|websocket-.*|webtransport-.*\"}",
+          "expr": "container_memory_working_set_bytes{namespace=\"$namespace\",container=~\"videocall-websocket|videocall-webtransport\"}",
           "legendFormat": "{{container}} usage",
           "refId": "A"
         },
         {
-          "expr": "kube_pod_container_resource_limits{namespace=\"$namespace\",container=~\"rustlemania-.*|websocket-.*|webtransport-.*\",resource=\"memory\"}",
+          "expr": "kube_pod_container_resource_limits{namespace=\"$namespace\",container=~\"videocall-websocket|videocall-webtransport\",resource=\"memory\"}",
           "legendFormat": "{{container}} limit",
           "refId": "B"
         }
@@ -2176,7 +2230,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 63
+        "y": 71
       },
       "id": 33,
       "options": {
@@ -2243,7 +2297,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "id": 34,
       "options": {
@@ -2291,7 +2345,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 71
+        "y": 79
       },
       "id": 35,
       "options": {
@@ -2342,7 +2396,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 71
+        "y": 79
       },
       "id": 36,
       "options": {
@@ -2370,7 +2424,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 87
       },
       "id": 42,
       "title": "Adaptive Quality Debugging",
@@ -2726,14 +2780,24 @@
           },
           "targets": [
             {
-              "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
-              "legendFormat": "{{reporter_name}} \u2192 {{peer_name}}",
+              "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"}",
+              "legendFormat": "seq-loss/s: {{reporter_name}} → {{peer_name}}",
               "refId": "A"
+            },
+            {
+              "expr": "deriv(videocall_decoder_errors_total{meeting_id=~\"$meeting\"}[$__rate_interval])",
+              "legendFormat": "decode-err/s: {{reporter_name}} → {{peer_name}}",
+              "refId": "B"
+            },
+            {
+              "expr": "videocall_video_frames_dropped{meeting_id=~\"$meeting\"}",
+              "legendFormat": "frames-dropped/s: {{reporter_name}} → {{peer_name}}",
+              "refId": "C"
             }
           ],
-          "title": "Decoder Errors (per receiver)",
-        "description": "Rate of WebCodecs decoder errors per receiver pair. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread.",
-        "type": "timeseries"
+          "title": "Reference Loss & Decode Errors (per receiver)",
+          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) — read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
+          "type": "timeseries"
         }
       ]
     },
@@ -2743,7 +2807,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "id": 46,
       "title": "Decode-Budget (Client-Side)",
@@ -2782,7 +2846,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 92
+        "y": 100
       },
       "id": 47,
       "options": {
@@ -2849,7 +2913,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 92
+        "y": 100
       },
       "id": 48,
       "options": {
@@ -2930,7 +2994,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 92
+        "y": 100
       },
       "id": 49,
       "options": {
@@ -2962,6 +3026,157 @@
       ],
       "title": "Decode Budget: Override Mode & Fixed Cap",
       "description": "User override mode per session (0=unspecified, 1=auto, 2=fixed) with the chosen fixed cap (override_fixed_n) overlaid. mode=2 means the user manually capped tiles (user-chosen), vs auto-shed by the system - important for triage.",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 108
+      },
+      "id": 50,
+      "panels": [],
+      "title": "Freeze & Reference Loss (#1013 / #1032)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 109
+      },
+      "id": 51,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_video_seq_loss_per_sec{meeting_id=~\"$meeting\"} > 0",
+          "legendFormat": "{{reporter_name}} → {{peer_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "#1013 Reference Loss — Video Seq Loss/sec",
+      "description": "Per-peer-pair inbound video sequence-number loss rate (lost packets/sec) observed by each receiver — the #1013 reference-loss / freeze signal. A reference frame lost to packet loss freezes the stream until a keyframe arrives, so any SUSTAINED value > 0 (red) for a pair is a freeze red flag, cross-checked against Keyframe Requests/sec (sustained PLI => stream cannot self-recover). The `> 0` filter hides idle/healthy pairs so a busy meeting's chart stays readable. seq-loss is the always-on proxy and returns to 0 when healthy; the exact hard-failure counters (videocall_decoder_errors_total, cumulative; videocall_video_frames_dropped, latches its last nonzero value) are overlaid on the per-receiver panels above. Broken out by reporter → observed peer. Live signal (570 series).",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 109
+      },
+      "id": 52,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_wasm_memory_bytes{meeting_id=~\"$meeting\"}",
+          "legendFormat": "WASM linear: {{display_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_client_memory_total_bytes{meeting_id=~\"$meeting\"}",
+          "legendFormat": "JS heap limit: {{display_name}}",
+          "refId": "B"
+        },
+        {
+          "expr": "videocall_client_agent_memory_bytes{meeting_id=~\"$meeting\"}",
+          "legendFormat": "agent total: {{display_name}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Client Non-Heap & Total Memory (#1032)",
+      "description": "Non-heap memory telemetry (#1032) the JS-heap-only 'Client Memory Usage' panel misses. WASM linear memory (WebAssembly.Memory.buffer.byteLength — always available, holds decode/jitter buffers and is the multi-GB pressure that drives freezes), JS heap limit (memory_total_bytes), and total agent memory (measureUserAgentSpecificMemory — Chrome + crossOriginIsolated only, so this series may be absent for many clients). Pair with the JS-heap 'Client Memory Usage' panel above for the full picture.",
       "type": "timeseries"
     }
   ],

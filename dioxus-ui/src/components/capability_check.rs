@@ -677,7 +677,7 @@ mod tests {
     /// This models that `min` at the host call site without a browser.
     #[test]
     fn default_on_still_gates_weak_device_to_one_layer() {
-        const DEFAULT_FLAG: u32 = 3; // experimentalSimulcastMaxLayers default (#1082)
+        const DEFAULT_FLAG: u32 = 3; // experimentalSimulcastMaxLayers default (issue 1082)
 
         // Block verdict → ceiling 1 → effective 1.
         let weak_block =

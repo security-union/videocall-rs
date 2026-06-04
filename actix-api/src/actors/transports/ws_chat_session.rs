@@ -365,6 +365,8 @@ impl Handler<Message> for WsChatSession {
             OUTBOUND_CHANNEL_DROPS_TOTAL
                 .with_label_values(&["websocket", reason])
                 .inc();
+            // Per-session attribution (Tier B #1): name the slow receiver.
+            self.logic.record_session_drop(reason);
             trace!(
                 "Priority-drop {reason} on WS session {}: free={free_capacity}/{}",
                 self.logic.id,
@@ -415,6 +417,8 @@ impl Handler<Message> for WsChatSession {
                 OUTBOUND_CHANNEL_DROPS_TOTAL
                     .with_label_values(&["websocket", kind])
                     .inc();
+                // Per-session attribution (Tier B #1): name the slow receiver.
+                self.logic.record_session_drop(kind);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 ctx.stop();

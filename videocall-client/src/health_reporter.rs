@@ -17,7 +17,10 @@
  */
 
 use crate::connection::ConnectionController;
-use crate::connection::{connection_handshake_failures, connection_session_drops};
+use crate::connection::{
+    connection_handshake_failures, connection_session_drops, reelection_aborted_total,
+    reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
+};
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
@@ -1204,6 +1207,12 @@ impl HealthReporter {
                             drained_dwells,
                             connection_handshake_failures(),
                             connection_session_drops(),
+                            [
+                                reelection_proceeded_total(),
+                                reelection_aborted_total(),
+                                reelection_preserved_total(),
+                                reelection_failed_total(),
+                            ],
                             drained_longtasks,
                             current_render_fps,
                             client_meta,
@@ -1257,6 +1266,11 @@ impl HealthReporter {
         dwell_samples: Vec<(String, f64)>,
         handshake_failures_total: u64,
         session_drops_total: u64,
+        // Cumulative re-election outcome totals (Tier B #3), in the fixed order
+        // [proceeded, aborted, preserved, failed]. Cumulative since process
+        // start — the relay maps these onto a GaugeVec it .set()s, so the
+        // monotonic client value charts correctly with increase()/rate().
+        reelection_totals: [u64; 4],
         longtask_durations: Vec<f64>,
         render_fps: Option<f64>,
         client_metadata: ClientMetadata,
@@ -1422,6 +1436,23 @@ impl HealthReporter {
         }
         if session_drops_total > 0 {
             pb.connection_session_drops_total = Some(session_drops_total);
+        }
+
+        // Re-election outcome counters (Tier B #3). Only attach a field when its
+        // cumulative value is non-zero — keeps the packet small for the common
+        // case (most sessions never re-elect) and mirrors the connection-loss
+        // counters directly above. Order: [proceeded, aborted, preserved, failed].
+        if reelection_totals[0] > 0 {
+            pb.reelection_proceeded_total = Some(reelection_totals[0]);
+        }
+        if reelection_totals[1] > 0 {
+            pb.reelection_aborted_total = Some(reelection_totals[1]);
+        }
+        if reelection_totals[2] > 0 {
+            pb.reelection_preserved_total = Some(reelection_totals[2]);
+        }
+        if reelection_totals[3] > 0 {
+            pb.reelection_failed_total = Some(reelection_totals[3]);
         }
 
         // TELEM-7: Static client metadata
@@ -1989,6 +2020,7 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
@@ -2066,6 +2098,7 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
@@ -2119,6 +2152,7 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
@@ -2185,6 +2219,7 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),

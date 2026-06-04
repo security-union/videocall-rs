@@ -432,6 +432,13 @@ pub struct ReceivedLayerSnapshot {
 /// truth for the receiver-side audio ladder size (see [`AUDIO_LAYER_CAP`]).
 const AUDIO_LAYER_KBPS: &[u32] = &[24, 32, 50];
 
+/// Length of the receiver-side audio layer ladder, exposed as a `const fn` so
+/// the publisher (`microphone_encoder.rs`) can tie its own ladder to this with a
+/// compile-time assert and the two can never silently diverge (issue #1077).
+pub const fn audio_layer_kbps_len() -> usize {
+    AUDIO_LAYER_KBPS.len()
+}
+
 /// Receiver-side per-kind layer ceilings (issue #1082). Video and Screen are
 /// tied at compile time to the AQ ladder sizes (`videocall_aq`'s
 /// `SIMULCAST_MAX_LAYERS` / `SCREEN_SIMULCAST_MAX_LAYERS`); Audio is tied to
@@ -912,6 +919,55 @@ mod tests {
         assert_eq!(max_layers_for_kind(PrefMediaKind::Video), 3);
         assert_eq!(max_layers_for_kind(PrefMediaKind::Screen), 3);
         assert_eq!(max_layers_for_kind(PrefMediaKind::Audio), 3);
+    }
+
+    #[test]
+    fn audio_chooser_traverses_three_rungs() {
+        // Phase C verification (issue #1082): with audio now a 3-rung ladder, the
+        // (kind-agnostic) chooser must climb to the top audio layer (index 2 =
+        // max_layers_for_kind(Audio) - 1) under sustained clean downlink, then
+        // step down rung-by-rung under congestion. This exercises the exact
+        // selector the receiver drives for audio.
+        let top_audio = max_layers_for_kind(PrefMediaKind::Audio) - 1;
+        assert_eq!(top_audio, 2);
+
+        let mut c = LayerChooser::new(0);
+        let mut t = 1000u64;
+        // Sustained headroom climbs all the way to the top audio rung.
+        for _ in 0..30 {
+            c.choose(clean(), top_audio, t);
+            t += 1100;
+        }
+        assert_eq!(c.current(), 2, "audio must climb to the top 3-rung layer");
+
+        // Congestion steps down one rung at a time: 2 -> 1 -> 0.
+        assert_eq!(c.choose(congested(), top_audio, t), 1);
+        t += 1100;
+        assert_eq!(c.choose(congested(), top_audio, t), 0);
+        t += 1100;
+        assert_eq!(c.choose(congested(), top_audio, t), 0, "floors at base");
+    }
+
+    #[test]
+    fn audio_observed_layer_id_climb_to_top_rung() {
+        // The receiver learns availability from observed layer ids; a publisher
+        // emitting all 3 audio rungs must let the chooser reach index 2. The
+        // clamp keeps an out-of-range id from inflating availability beyond the
+        // ladder, but in-range ids 0/1/2 must all be learnable (issue #1082).
+        let mut avail = LayerAvailability::new();
+        let now = 1_000u64;
+        for raw in 0u32..=2 {
+            avail.observe(clamp_observed_layer_id(PrefMediaKind::Audio, raw), now);
+        }
+        assert_eq!(
+            avail.highest_available(now),
+            2,
+            "all three audio rungs must be learnable"
+        );
+        // A bogus higher id is clamped down to the top audio index, not learned
+        // as a 4th rung.
+        avail.observe(clamp_observed_layer_id(PrefMediaKind::Audio, 99), now);
+        assert_eq!(avail.highest_available(now), 2);
     }
 
     #[test]

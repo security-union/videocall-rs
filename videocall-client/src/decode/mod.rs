@@ -27,7 +27,7 @@ pub mod peer_decoder;
 pub mod video_decoder_wrapper;
 
 pub use layer_chooser::{
-    KindLayerBounds, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot,
+    max_layers_for_kind, KindLayerBounds, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot,
 };
 pub use peer_decode_manager::{PeerDecodeManager, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;

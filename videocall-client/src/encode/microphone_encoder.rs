@@ -60,19 +60,33 @@ use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
 
-/// Upper bound on AUDIO simulcast layers (issue #989, Phase 3c). Audio simulcast
-/// is intentionally a small ladder — 2 layers — because audio is ~1-3% of call
-/// bandwidth, so the per-receiver savings are marginal and a deep ladder is not
-/// worth the encode cost.
-const AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 2;
+/// Per-layer AUDIO simulcast bitrates in kbps, **lowest layer first** (index ==
+/// `simulcast_layer_id`). Audio simulcast is intentionally a shallow ladder
+/// (issue #989, Phase 3c → 3 rungs in #1082) because audio is ~1-3% of call
+/// bandwidth, so a deep ladder is not worth the per-layer Opus encode cost.
+///
+/// - layer 0 = LOW (24 kbps) — the base the relay always forwards and a
+///   congested receiver pulls. Matches the AQ "low" tier.
+/// - layer 1 = MID (32 kbps) — an intermediate rung for moderate downlinks.
+/// - layer 2 = HIGH (50 kbps) — the upgrade layer a receiver with headroom
+///   selects. Matches the AQ "high" tier.
+///
+/// This slice is the **single source of truth** for the publisher-side audio
+/// ladder; its length defines the maximum supported audio layer count and is
+/// kept in lockstep with the receiver-side `AUDIO_LAYER_KBPS` table by the
+/// compile-time assert below (issue #1077).
+const AUDIO_SIMULCAST_LAYER_KBPS: &[u32] = &[24, 32, 50];
 
-/// Base (layer 0) audio simulcast bitrate in kbps — the LOW layer the relay
-/// always forwards and a congested receiver pulls. Matches the AQ "low" tier.
-const AUDIO_SIMULCAST_LOW_KBPS: u32 = 24;
+/// Upper bound on AUDIO simulcast layers — the ladder length (issue #1082).
+const AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = AUDIO_SIMULCAST_LAYER_KBPS.len() as u32;
 
-/// High (layer 1) audio simulcast bitrate in kbps — the upgrade layer a
-/// receiver with downlink headroom selects. Matches the AQ "high" tier.
-const AUDIO_SIMULCAST_HIGH_KBPS: u32 = 50;
+// Compile-time tie between the publisher ladder and the receiver-side
+// `AUDIO_LAYER_KBPS` snapshot table so the two cannot silently diverge
+// (issue #1077): if either table changes length, this assert fails to compile.
+const _: () = assert!(
+    AUDIO_SIMULCAST_LAYER_KBPS.len() == crate::decode::layer_chooser::audio_layer_kbps_len(),
+    "publisher AUDIO_SIMULCAST_LAYER_KBPS and receiver AUDIO_LAYER_KBPS must have the same length"
+);
 
 /// Clamp a requested audio `max_layers` to `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
 /// `0`/`1` → single layer (feature off, byte-identical mic path). Free function
@@ -168,19 +182,25 @@ pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
     _on_encoder_settings_update: Option<Callback<String>>,
-    /// Base-layer Opus encoder (layer 0). In single-layer mode (the default)
-    /// this is the only encoder and runs at the tier bitrate, byte-identical to
-    /// the pre-simulcast mic path. In 2-layer simulcast mode this is the LOW
-    /// (base) layer at [`AUDIO_SIMULCAST_LOW_KBPS`].
-    codec: AudioWorkletCodec,
-    /// High-layer Opus encoder (layer 1), only instantiated in 2-layer simulcast
-    /// mode (issue #989, Phase 3c). A second `AudioWorkletNode` on the SAME
-    /// `AudioContext`, fed the same captured audio, encoding at
-    /// [`AUDIO_SIMULCAST_HIGH_KBPS`] and stamping `simulcast_layer_id = 1`.
-    /// `Default` (empty) when single-layer.
-    codec_high: AudioWorkletCodec,
-    /// Maximum audio simulcast layers (issue #989, Phase 3c). 1 = single layer
-    /// (default, byte-identical). 2 = low base + high. Clamped in `start`.
+    /// Per-layer Opus encoders, **lowest layer first** (index ==
+    /// `simulcast_layer_id`). Always at least one element: index 0 is the BASE
+    /// layer, which in single-layer mode (the default) is the only encoder and
+    /// runs at the tier bitrate, byte-identical to the pre-simulcast mic path.
+    /// In N-layer simulcast mode (issue #989 / #1082) indices `1..N` are
+    /// additional `AudioWorkletNode`s on the SAME `AudioContext`, each fed the
+    /// same captured audio (fanned out from the analyser node) and encoding at
+    /// its rung's [`AUDIO_SIMULCAST_LAYER_KBPS`] bitrate, stamping
+    /// `simulcast_layer_id == index`.
+    ///
+    /// `AudioWorkletCodec` is `Rc<RefCell<…>>`-backed, so cloning a codec out of
+    /// this Vec into a worker closure shares the same underlying node (cheap).
+    /// Sized to the effective layer count in [`MicrophoneEncoder::start`]; holds
+    /// a single default (empty) codec until then so `set_enabled`/`stop` are
+    /// safe before `start`.
+    codecs: Vec<AudioWorkletCodec>,
+    /// Maximum audio simulcast layers (issue #989, Phase 3c → up to 3 in #1082).
+    /// 1 = single layer (default, byte-identical). Clamped in `start` to
+    /// `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
     max_layers: u32,
     on_error: Option<Callback<String>>,
     is_speaking: Rc<AtomicBool>,
@@ -225,8 +245,10 @@ impl MicrophoneEncoder {
             client,
             state: EncoderState::new(),
             _on_encoder_settings_update: Some(on_encoder_settings_update),
-            codec: AudioWorkletCodec::default(),
-            codec_high: AudioWorkletCodec::default(),
+            // Start with a single (empty) base codec; `start` resizes to the
+            // effective layer count. Always non-empty so pre-`start`
+            // enable/stop are safe.
+            codecs: vec![AudioWorkletCodec::default()],
             max_layers,
             on_error: Some(on_error),
             is_speaking: Rc::new(AtomicBool::new(false)),
@@ -248,13 +270,15 @@ impl MicrophoneEncoder {
         let is_changed = self.state.set_enabled(value);
         if is_changed {
             if value {
-                let _ = self.codec.start();
-                // Start the high layer too (no-op if not instantiated).
-                let _ = self.codec_high.start();
+                // Start every layer (no-op for any not yet instantiated).
+                for codec in &self.codecs {
+                    let _ = codec.start();
+                }
             } else {
                 // First stop the codec(s) to prevent new audio frames
-                let _ = self.codec.stop();
-                let _ = self.codec_high.stop();
+                for codec in &self.codecs {
+                    let _ = codec.stop();
+                }
                 // The monitoring loop in start() will detect the enabled flag change
                 // and stop the microphone capture within 100ms
                 if let Some(interval) = self.vad_interval.borrow_mut().take() {
@@ -274,8 +298,9 @@ impl MicrophoneEncoder {
     }
     pub fn stop(&mut self) {
         self.state.stop();
-        self.codec.destroy();
-        self.codec_high.destroy();
+        for codec in &self.codecs {
+            codec.destroy();
+        }
         if let Some(interval) = self.vad_interval.borrow_mut().take() {
             drop(interval);
         }
@@ -300,10 +325,13 @@ impl MicrophoneEncoder {
             return;
         }
 
-        if self.state.switching.load(Ordering::Acquire) && self.codec.is_instantiated() {
+        // The BASE codec (index 0) is the canary for "already running": it is
+        // always the first instantiated and last destroyed.
+        let base_instantiated = self.codecs[0].is_instantiated();
+        if self.state.switching.load(Ordering::Acquire) && base_instantiated {
             self.stop();
         }
-        if self.state.is_enabled() && self.codec.is_instantiated() {
+        if self.state.is_enabled() && base_instantiated {
             return;
         }
         let aes = client.aes();
@@ -312,16 +340,26 @@ impl MicrophoneEncoder {
             enabled, switching, ..
         } = self.state.clone();
 
-        // Clone atomic values for use in different closures
-        // Audio simulcast layer count (issue #989, Phase 3c). 1 = single layer
-        // (default, byte-identical). 2 = LOW base (layer 0) + HIGH (layer 1).
-        let n_audio_layers = clamp_audio_layer_count(self.max_layers);
+        // Clone atomic values for use in different closures.
+        // Audio simulcast layer count (issue #989, Phase 3c → up to 3 in #1082).
+        // 1 = single layer (default, byte-identical). N>1 = LOW base (layer 0)
+        // plus the higher rungs of AUDIO_SIMULCAST_LAYER_KBPS.
+        let n_audio_layers = clamp_audio_layer_count(self.max_layers) as usize;
         let audio_simulcast = n_audio_layers > 1;
+
+        // Resize the per-layer codec Vec to the effective layer count. Index 0
+        // (the base) is preserved (it is the canary `is_instantiated` checks
+        // read); higher rungs get fresh empty codecs. Done before the async
+        // block so the clones it captures are the right length.
+        if self.codecs.len() != n_audio_layers {
+            self.codecs
+                .resize_with(n_audio_layers, AudioWorkletCodec::default);
+        }
 
         // Per-layer audio output handler builder. `layer_id` is stamped on every
         // emitted packet; each layer owns its own seq counter + RED previous-
         // frame buffer so a receiver decoding ONE audio layer sees a dense
-        // sequence. The captured values are cloned per handler so two handlers
+        // sequence. The captured values are cloned per handler so the handlers
         // can coexist. For N=1 only the base (layer 0) handler is built —
         // byte-identical to the legacy path.
         let make_audio_handler = |layer_id: u32| -> Box<dyn FnMut(MessageEvent)> {
@@ -400,17 +438,26 @@ impl MicrophoneEncoder {
                 }
             })
         };
-        // Base layer (0) handler — always built.
+        // Base layer (0) handler — always built (the legacy path for N=1).
         let audio_output_handler = make_audio_handler(0);
-        // High layer (1) handler — only in 2-layer simulcast mode.
-        let audio_output_handler_high = if audio_simulcast {
-            Some(make_audio_handler(1))
+        // Higher-layer handlers (indices 1..N) — only in simulcast mode. One
+        // per extra rung, lowest first, so `higher_handlers[i]` drives layer
+        // `i + 1`. Empty when not simulcasting.
+        let higher_handlers: Vec<Box<dyn FnMut(MessageEvent)>> = if audio_simulcast {
+            (1..n_audio_layers as u32).map(make_audio_handler).collect()
         } else {
-            None
+            Vec::new()
         };
 
-        let codec = self.codec.clone();
-        let codec_high = self.codec_high.clone();
+        // Clone the codec handles for the async block. `AudioWorkletCodec` is
+        // Rc-backed so these share the underlying nodes. `base_codec` is index
+        // 0; `higher_codecs` are indices 1..N (parallel to `higher_handlers`).
+        // `all_codecs_for_teardown` is a parallel clone kept alive so the
+        // monitor loop can destroy every layer on stop (the `for` loop below
+        // consumes `higher_codecs` by value).
+        let base_codec = self.codecs[0].clone();
+        let higher_codecs: Vec<AudioWorkletCodec> = self.codecs[1..].to_vec();
+        let all_codecs_for_teardown: Vec<AudioWorkletCodec> = self.codecs.clone();
         let is_speaking_for_vad = self.is_speaking.clone();
         let client_for_vad = client.clone();
         let vad_interval_holder = self.vad_interval.clone();
@@ -590,7 +637,7 @@ impl MicrophoneEncoder {
             analyser.set_fft_size(VAD_FFT_SIZE);
             analyser.set_smoothing_time_constant(VAD_SMOOTHING_TIME_CONSTANT);
 
-            let worklet = match codec
+            let worklet = match base_codec
                 .create_node(
                     &context,
                     "/encoderWorker.min.js",
@@ -611,7 +658,7 @@ impl MicrophoneEncoder {
 
             let output_handler =
                 Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
-            codec.set_onmessage(output_handler.as_ref().unchecked_ref());
+            base_codec.set_onmessage(output_handler.as_ref().unchecked_ref());
             output_handler.forget();
 
             // Use the tier-controlled bitrate (defaults to AUDIO_QUALITY_TIERS[0]),
@@ -621,15 +668,15 @@ impl MicrophoneEncoder {
             // ignores them.  See audio_worklet_codec.rs for details.
             let initial_tier = &AUDIO_QUALITY_TIERS[0];
             // Base-layer bitrate: in single-layer mode use the tier default
-            // (byte-identical to today). In 2-layer simulcast the base layer IS
-            // the LOW layer (the relay always forwards it; a congested receiver
-            // pulls it), so it inits at AUDIO_SIMULCAST_LOW_KBPS.
+            // (byte-identical to today). In simulcast mode the base layer IS the
+            // LOW layer (the relay always forwards it; a congested receiver pulls
+            // it), so it inits at the lowest rung AUDIO_SIMULCAST_LAYER_KBPS[0].
             let base_bitrate_bps = if audio_simulcast {
-                AUDIO_SIMULCAST_LOW_KBPS * 1000
+                AUDIO_SIMULCAST_LAYER_KBPS[0] * 1000
             } else {
                 initial_tier.bitrate_kbps * 1000
             };
-            let _ = codec.send_message(&CodecMessages::Init {
+            let _ = base_codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
                     original_sample_rate: Some(input_rate),
@@ -673,15 +720,29 @@ impl MicrophoneEncoder {
                 return;
             }
 
-            // --- Audio simulcast HIGH layer (issue #989, Phase 3c) ---
-            // Build a SECOND AudioWorkletNode on the SAME context, fed the same
-            // captured audio (fan out from the analyser node), encoding at the
-            // HIGH bitrate and stamping layer_id = 1. A per-layer Opus encode is
-            // the only way to get a second bitrate (the worklet has no dynamic
-            // bitrate reconfig). On any failure we log + fall back to base-only
-            // (the base layer keeps working) rather than tearing down audio.
-            if let Some(high_handler) = audio_output_handler_high {
-                match codec_high
+            // --- Audio simulcast HIGHER layers (issue #989, Phase 3c → #1082) ---
+            // For each rung above the base, build an additional AudioWorkletNode
+            // on the SAME context, fed the same captured audio (fanned out from
+            // the analyser node), encoding at that rung's
+            // AUDIO_SIMULCAST_LAYER_KBPS bitrate and stamping layer_id = index.
+            // A per-layer Opus encode is the only way to get a distinct bitrate
+            // (the worklet has no dynamic bitrate reconfig). On any per-layer
+            // failure we log + skip that layer (the base + lower layers keep
+            // working) rather than tearing down audio.
+            //
+            // `higher_codecs[i]` / `higher_handlers[i]` both correspond to
+            // simulcast layer `i + 1` (lowest extra rung first).
+            for (i, (codec_n, handler_n)) in
+                higher_codecs.into_iter().zip(higher_handlers).enumerate()
+            {
+                let layer_id = (i + 1) as u32;
+                // Per-layer bitrate from the ladder; guard the index defensively
+                // (codecs were sized from the same n, so this always hits).
+                let layer_kbps = AUDIO_SIMULCAST_LAYER_KBPS
+                    .get(layer_id as usize)
+                    .copied()
+                    .unwrap_or(AUDIO_SIMULCAST_LAYER_KBPS[AUDIO_SIMULCAST_LAYER_KBPS.len() - 1]);
+                match codec_n
                     .create_node(
                         &context,
                         "/encoderWorker.min.js",
@@ -690,41 +751,40 @@ impl MicrophoneEncoder {
                     )
                     .await
                 {
-                    Ok(worklet_high) => {
-                        let high_output =
-                            Closure::wrap(high_handler as Box<dyn FnMut(MessageEvent)>);
-                        codec_high.set_onmessage(high_output.as_ref().unchecked_ref());
-                        high_output.forget();
-                        let _ = codec_high.send_message(&CodecMessages::Init {
+                    Ok(worklet_n) => {
+                        let output_n = Closure::wrap(handler_n as Box<dyn FnMut(MessageEvent)>);
+                        codec_n.set_onmessage(output_n.as_ref().unchecked_ref());
+                        output_n.forget();
+                        let _ = codec_n.send_message(&CodecMessages::Init {
                             options: Some(EncoderInitOptions {
                                 encoder_frame_size: Some(20),
                                 original_sample_rate: Some(input_rate),
-                                encoder_bit_rate: Some(AUDIO_SIMULCAST_HIGH_KBPS * 1000),
+                                encoder_bit_rate: Some(layer_kbps * 1000),
                                 encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                                 encoder_fec: Some(initial_tier.enable_fec),
                                 encoder_dtx: Some(initial_tier.enable_dtx),
                                 ..Default::default()
                             }),
                         });
-                        // Fan out the captured audio to the high encoder too.
-                        if let Err(e) = analyser.connect_with_audio_node(&worklet_high) {
+                        // Fan out the captured audio to this encoder too.
+                        if let Err(e) = analyser.connect_with_audio_node(&worklet_n) {
                             log::error!(
-                                "Audio simulcast: failed to connect HIGH layer, falling back to base-only: {e:?}"
+                                "Audio simulcast: failed to connect layer {layer_id}, skipping it: {e:?}"
                             );
-                            codec_high.destroy();
+                            codec_n.destroy();
                         } else {
                             // Match the base codec's started/stopped state.
                             if enabled.load(Ordering::Acquire) {
-                                let _ = codec_high.start();
+                                let _ = codec_n.start();
                             }
                             log::info!(
-                                "Audio simulcast: HIGH layer (layer 1, {AUDIO_SIMULCAST_HIGH_KBPS}kbps) active"
+                                "Audio simulcast: layer {layer_id} ({layer_kbps}kbps) active"
                             );
                         }
                     }
                     Err(e) => {
                         log::error!(
-                            "Audio simulcast: failed to create HIGH layer worklet, base-only: {e:?}"
+                            "Audio simulcast: failed to create layer {layer_id} worklet, skipping it: {e:?}"
                         );
                     }
                 }
@@ -835,8 +895,12 @@ impl MicrophoneEncoder {
                         log::error!("Error closing AudioContext: {e:?}");
                     }
 
-                    // Destroy the codec
-                    codec.destroy();
+                    // Destroy every layer's codec (context.close() above already
+                    // tears down the attached worklet nodes; this releases the
+                    // codecs' own state for each simulcast layer).
+                    for codec in &all_codecs_for_teardown {
+                        codec.destroy();
+                    }
 
                     log::info!("Microphone audio encoder stopped and cleaned up");
                     break;
@@ -850,7 +914,9 @@ impl MicrophoneEncoder {
 /// Phase 3c). No browser needed.
 #[cfg(test)]
 mod layer_count_tests {
-    use super::{clamp_audio_layer_count, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS};
+    use super::{
+        clamp_audio_layer_count, AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
+    };
 
     #[test]
     fn clamp_audio_layer_count_treats_zero_and_one_as_one() {
@@ -860,18 +926,37 @@ mod layer_count_tests {
     }
 
     #[test]
-    fn clamp_audio_layer_count_caps_at_two() {
-        // Audio ladder is intentionally shallow: max 2 layers.
+    fn clamp_audio_layer_count_caps_at_three() {
+        // Audio ladder is shallow but now 3 rungs (issue #1082).
         assert_eq!(clamp_audio_layer_count(2), 2);
+        assert_eq!(clamp_audio_layer_count(3), 3);
         assert_eq!(
-            clamp_audio_layer_count(3),
+            clamp_audio_layer_count(4),
             AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS
         );
         assert_eq!(
             clamp_audio_layer_count(99),
             AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS
         );
-        assert_eq!(AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS, 2);
+        assert_eq!(AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS, 3);
+    }
+
+    #[test]
+    fn audio_ladder_is_three_rungs_low_mid_high() {
+        // The publisher ladder is the single source of truth for the cap and is
+        // ordered lowest→highest (issue #1082).
+        assert_eq!(AUDIO_SIMULCAST_LAYER_KBPS, &[24, 32, 50]);
+        assert_eq!(
+            AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS as usize,
+            AUDIO_SIMULCAST_LAYER_KBPS.len()
+        );
+        // Strictly ascending bitrate per rung.
+        for w in AUDIO_SIMULCAST_LAYER_KBPS.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "audio layer bitrates must ascend: {AUDIO_SIMULCAST_LAYER_KBPS:?}"
+            );
+        }
     }
 }
 
@@ -915,6 +1000,17 @@ mod tests {
         let with_one = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 1);
         let parsed = PacketWrapper::parse_from_bytes(&with_one.write_to_bytes().unwrap()).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 1);
+        assert_eq!(parsed.media_kind.enum_value(), Ok(MediaKind::AUDIO));
+    }
+
+    /// Issue #1082: the new top audio rung (layer 2) round-trips with media_kind
+    /// AUDIO, confirming the 3-rung ladder is wire-representable.
+    #[wasm_bindgen_test]
+    fn audio_chunk_layer_two_round_trips() {
+        let aes = Rc::new(Aes128State::new(false));
+        let with_two = transform_audio_chunk(&make_audio_data(), "alice", 0, aes, None, 2);
+        let parsed = PacketWrapper::parse_from_bytes(&with_two.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 2);
         assert_eq!(parsed.media_kind.enum_value(), Ok(MediaKind::AUDIO));
     }
 

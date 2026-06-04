@@ -114,9 +114,28 @@ pub fn Host(
         //
         // This `use_hook` closure runs once per Host component mount, so the
         // WARN below fires once per session — never per frame.
-        let effective_max_layers = experimental_simulcast_max_layers()
+        //
+        // VIDEO/SCREEN share the CPU-derived capability ceiling because each
+        // extra WebCodecs VIDEO encoder is ~N× main-thread encode cost (the
+        // 2-core Intel Mac stall mode, discussion #562/#890).
+        let flag_max_layers = experimental_simulcast_max_layers();
+        let effective_max_layers = flag_max_layers
             .min(crate::components::capability_check::capability_max_simulcast_layers());
         log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
+
+        // AUDIO is decoupled from the VIDEO capability ceiling (issue #1082):
+        // Opus encoders run on the AudioWorklet thread (off the main thread) and
+        // cost ~1-3% of call bandwidth, so a device that is correctly capped to
+        // 1 VIDEO layer can still run the full audio ladder. Audio's ceiling is
+        // the audio ladder size itself (`max_layers_for_kind(Audio)`), still
+        // gated by the SAME runtime flag — so audio stays single-layer (feature
+        // OFF) until an operator raises `experimentalSimulcastMaxLayers`.
+        let audio_capability_ceiling = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+        let audio_effective_max_layers = flag_max_layers.min(audio_capability_ceiling);
+        log::info!(
+            "MicrophoneEncoder: effective audio simulcast layers = {audio_effective_max_layers} \
+             (flag={flag_max_layers}, audio_ceiling={audio_capability_ceiling})"
+        );
         if effective_max_layers > 1 {
             log::warn!(
                 "SIMULCAST EXPERIMENTAL: publishing {effective_max_layers} video layers. \
@@ -172,10 +191,12 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
-            // Audio simulcast layer ceiling (issue #989, Phase 3c) — same flag +
-            // capability gating as camera/screen, so OFF by default (single
-            // audio layer, byte-identical to the pre-simulcast mic path).
-            effective_max_layers,
+            // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
+            // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
+            // and is cheap), but still gated by the SAME runtime flag so it stays
+            // OFF by default (single audio layer, byte-identical to the
+            // pre-simulcast mic path).
+            audio_effective_max_layers,
         );
 
         let screen_settings_cell = screen_settings_handler.clone();

@@ -6193,3 +6193,277 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   font-size: 11px;
   opacity: 0.6;
 }
+
+/* ──────────────────────────────────────────────────────────────────
+   Performance settings panel + quality VU meters (issue #961)
+   All colors are design tokens (see global.css) — no literals.
+   ────────────────────────────────────────────────────────────────── */
+
+.perf-stream-group {
+  margin: 18px 0;
+  padding: 14px 16px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.perf-stream-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.perf-stream-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-fixed-badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+}
+
+/* "Auto" reset button, pinned to the right of the stream header. */
+.perf-auto-button {
+  margin-left: auto;
+  min-height: 32px;
+  padding: 4px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-auto-button:hover {
+  background: var(--field-bg-hover);
+}
+
+.perf-auto-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Auto ACTIVE (toggle pressed): green/active. The aria-pressed state + label
+   convey this to AT, so color is not the sole signal. */
+.perf-auto-button.is-active {
+  color: var(--success);
+  background: var(--success-bg-soft);
+  border-color: var(--success-border-vivid);
+}
+
+.perf-auto-button.is-active:hover {
+  background: var(--success-bg-soft-hover);
+}
+
+/* ── Dual-thumb range slider ── */
+
+.perf-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Auto ACTIVE: the slider is disabled + dimmed and ignores pointer input.
+   (The inputs also carry the `disabled` attribute, so they are removed from the
+   tab order — this is the visual half.) */
+.perf-range.is-auto {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.perf-range-end-label {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: center;
+}
+
+/* The two range inputs are absolutely stacked over a shared track. */
+.perf-range-track-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  height: 44px; /* >=44px touch target for the thumbs */
+}
+
+.perf-range-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 6px;
+  transform: translateY(-50%);
+  background: var(--border);
+  border-radius: var(--radius-pill);
+}
+
+.perf-range-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+  transition: left 0.3s ease, right 0.3s ease;
+}
+
+.perf-range-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  /* Let pointer events fall through the track area to whichever thumb is under
+     the cursor; thumbs re-enable pointer events below. */
+  pointer-events: none;
+}
+
+.perf-range-input:focus-visible {
+  outline: none;
+}
+
+/* WebKit thumb */
+.perf-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Firefox thumb */
+.perf-range-input::-moz-range-thumb {
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-moz-range-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.perf-range-value {
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+/* Space the audio caveat info-panel away from the slider above it. */
+.perf-audio-info {
+  margin-top: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-range-fill {
+    transition: none;
+  }
+}
+
+/* ── VU meters ── */
+
+.perf-vu-section {
+  margin: 22px 0 8px;
+}
+
+.perf-vu-section-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.perf-vu-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.perf-vu-gauge {
+  flex: 1 1 160px;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 14px 12px 12px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+
+.perf-vu-svg {
+  width: 120px;
+  height: 78px;
+}
+
+.perf-vu-arc {
+  stroke: var(--border-emphasis);
+}
+
+.perf-vu-tick {
+  stroke: var(--text-quaternary);
+}
+
+.perf-vu-needle {
+  stroke: var(--accent);
+  /* Pivot at the hub so rotation looks like an analog needle. */
+  transform-origin: 60px 64px;
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.perf-vu-hub {
+  fill: var(--accent);
+}
+
+.perf-vu-label {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-vu-readout {
+  margin-top: 2px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-vu-needle {
+    transition: none;
+  }
+}

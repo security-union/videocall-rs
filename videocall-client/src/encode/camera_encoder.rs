@@ -122,6 +122,72 @@ fn stop_media_stream_tracks(stream: &MediaStream) {
     }
 }
 
+/// User-configurable adaptive-quality tier bounds (issue #961), shared from the
+/// UI into the running encoder control loop.
+///
+/// QUALITY IS THE INVERSE OF INDEX: tier index 0 = BEST quality. So each
+/// `*_best` field is the user's MAX quality = a FLOOR on the index (never step UP
+/// past it), and each `*_worst` field is the user's MIN quality = a CAP on the
+/// index (never step DOWN past it). `None` on any end means "Auto" (no user
+/// bound). Indices are tier indices into `VIDEO_QUALITY_TIERS` /
+/// `AUDIO_QUALITY_TIERS`. The UI maps resolution/bitrate labels to indices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityTierBounds {
+    /// Video best/floor index (user MAX quality). `None` = Auto.
+    pub video_best: Option<usize>,
+    /// Video worst/cap index (user MIN quality). `None` = Auto.
+    pub video_worst: Option<usize>,
+    /// Audio best/floor index (user MAX quality). `None` = Auto.
+    pub audio_best: Option<usize>,
+    /// Audio worst/cap index (user MIN quality). `None` = Auto.
+    pub audio_worst: Option<usize>,
+}
+
+/// Shared, mutable quality-bounds preference plus a "dirty" generation counter.
+///
+/// The UI writes new bounds via `CameraEncoder::set_quality_tier_bounds`, which
+/// updates `bounds` and bumps `generation`. The encoder control loop reads
+/// `generation` each tick and, when it advanced, applies `bounds` to the live
+/// `EncoderBitrateController`. This is the same live-reconfig pattern used by the
+/// congestion / re-election shared flags — the loop never blocks and bounds are
+/// applied at the next diagnostics tick (≤1s). The preference is also stored so
+/// it can be (re)applied whenever the encoder (re)starts.
+#[derive(Debug, Default)]
+struct SharedQualityBounds {
+    bounds: QualityTierBounds,
+    /// Monotonic counter bumped on every write so the loop detects changes
+    /// without comparing every field.
+    generation: u64,
+}
+
+/// A real-time snapshot of the encoder's current adaptive-quality state, sized
+/// for the UI VU meter (issue #961).
+///
+/// All fields are resolved from the live shared atomics + the AQ tier tables at
+/// call time, so the UI never needs to index `VIDEO_QUALITY_TIERS` /
+/// `AUDIO_QUALITY_TIERS` itself (avoiding out-of-bounds risk). Tier indices are
+/// included so the UI can also render the index↔quality relationship.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveQualitySnapshot {
+    /// Current video tier index (0 = best / 1080p, 7 = worst / 240p).
+    pub video_tier_index: usize,
+    /// Current video tier max width (px).
+    pub video_width: u32,
+    /// Current video tier max height (px).
+    pub video_height: u32,
+    /// Current video tier target fps.
+    pub video_fps: u32,
+    /// Current video tier ideal bitrate (kbps).
+    pub video_ideal_kbps: u32,
+    /// Current audio tier index (0 = best / 50kbps, 3 = worst / 16kbps).
+    pub audio_tier_index: usize,
+    /// Current audio tier bitrate (kbps).
+    pub audio_kbps: u32,
+    /// Live PID target bitrate (kbps) the encoder is actually aiming at — the
+    /// real-time "needle" value for the VU meter (distinct from the tier ideal).
+    pub target_bitrate_kbps: f32,
+}
+
 /// One simulcast layer's encoder and its per-layer mutable encode state
 /// (issue #989). Local to `CameraEncoder::start`'s encode task.
 ///
@@ -224,6 +290,12 @@ pub struct CameraEncoder {
     /// Re-election completed signal. Set by ConnectionManager, consumed by the
     /// encoder control loop to call `notify_reelection_completed()`.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// User-configurable adaptive-quality tier bounds (issue #961). Written by
+    /// the UI via [`Self::set_quality_tier_bounds`], read by the encoder control
+    /// loop (which applies them live to the `EncoderBitrateController`) and on
+    /// every encoder (re)start. See [`SharedQualityBounds`] for the apply
+    /// mechanism and [`QualityTierBounds`] for the index↔quality inversion.
+    quality_bounds: Rc<RefCell<SharedQualityBounds>>,
     /// Maximum number of simulcast layers this publisher is allowed to emit
     /// (issue #989). Computed in the UI from device capability + the
     /// `experimentalSimulcastMaxLayers` runtime flag and passed into the constructor.
@@ -327,6 +399,7 @@ impl CameraEncoder {
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
             shared_dwell_samples: Rc::new(RefCell::new(Vec::new())),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
+            quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
         }
     }
@@ -367,11 +440,25 @@ impl CameraEncoder {
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
         let shared_dwell_samples = self.shared_dwell_samples.clone();
         let reelection_completed_signal = self.reelection_completed_signal.clone();
+        let quality_bounds = self.quality_bounds.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );
+
+            // Apply any user quality bounds set before the encoder started, and
+            // track the generation we last applied so the loop only re-applies
+            // when the UI actually changes them (issue #961).
+            let mut applied_bounds_generation = {
+                let shared = quality_bounds.borrow();
+                encoder_control
+                    .set_video_quality_bounds(shared.bounds.video_best, shared.bounds.video_worst);
+                encoder_control
+                    .set_audio_quality_bounds(shared.bounds.audio_best, shared.bounds.audio_worst);
+                shared.generation
+            };
+
             let mut prev_screen_active = false;
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
@@ -387,6 +474,30 @@ impl CameraEncoder {
                         "CameraEncoder: screen sharing {} — camera tier coordination applied",
                         if screen_active { "ACTIVE" } else { "INACTIVE" },
                     );
+                }
+
+                // Apply user-configurable quality bounds if the UI changed them
+                // since we last applied (issue #961). Cheap generation check
+                // avoids touching the controller every tick; the actual snap-
+                // into-range happens inside the controller and surfaces via
+                // take_tier_changed() below.
+                {
+                    let shared = quality_bounds.borrow();
+                    if shared.generation != applied_bounds_generation {
+                        applied_bounds_generation = shared.generation;
+                        let b = shared.bounds;
+                        drop(shared);
+                        encoder_control.set_video_quality_bounds(b.video_best, b.video_worst);
+                        encoder_control.set_audio_quality_bounds(b.audio_best, b.audio_worst);
+                        log::info!(
+                            "CameraEncoder: applied user quality bounds video(best={:?},worst={:?}) \
+                             audio(best={:?},worst={:?})",
+                            b.video_best,
+                            b.video_worst,
+                            b.audio_best,
+                            b.audio_worst,
+                        );
+                    }
                 }
 
                 // Check for server congestion step-down request before
@@ -595,6 +706,37 @@ impl CameraEncoder {
         self.current_fps.clone()
     }
 
+    /// Real-time adaptive-quality snapshot for the UI VU meter (issue #961).
+    ///
+    /// Resolves the live shared atomics (`shared_video_tier_index`,
+    /// `shared_audio_tier_index`, `shared_encoder_target_bitrate_kbps`) against
+    /// the AQ tier tables and returns a [`LiveQualitySnapshot`] with the current
+    /// video resolution / fps / ideal-kbps, audio kbps, and the live PID target
+    /// bitrate. Indices are clamped to valid table bounds, so this never panics
+    /// even mid-transition. Call it on the UI's render/poll tick.
+    pub fn live_quality_snapshot(&self) -> LiveQualitySnapshot {
+        let v_idx = (self.shared_video_tier_index.load(Ordering::Relaxed) as usize)
+            .min(VIDEO_QUALITY_TIERS.len().saturating_sub(1));
+        let a_idx = (self.shared_audio_tier_index.load(Ordering::Relaxed) as usize)
+            .min(AUDIO_QUALITY_TIERS.len().saturating_sub(1));
+        let v = &VIDEO_QUALITY_TIERS[v_idx];
+        let a = &AUDIO_QUALITY_TIERS[a_idx];
+        let target_bitrate_kbps = f32::from_bits(
+            self.shared_encoder_target_bitrate_kbps
+                .load(Ordering::Relaxed),
+        );
+        LiveQualitySnapshot {
+            video_tier_index: v_idx,
+            video_width: v.max_width,
+            video_height: v.max_height,
+            video_fps: v.target_fps,
+            video_ideal_kbps: v.ideal_bitrate_kbps,
+            audio_tier_index: a_idx,
+            audio_kbps: a.bitrate_kbps,
+            target_bitrate_kbps,
+        }
+    }
+
     /// Returns the encoder fps_ratio atomic (f32 bits).
     pub fn shared_encoder_fps_ratio(&self) -> Rc<AtomicU32> {
         self.shared_encoder_fps_ratio.clone()
@@ -673,6 +815,52 @@ impl CameraEncoder {
     /// which sets it when a server CONGESTION signal is received.
     pub fn set_congestion_step_down_flag(&mut self, flag: Arc<AtomicBool>) {
         self.congestion_step_down = flag;
+    }
+
+    /// Set user-configurable adaptive-quality tier bounds (issue #961).
+    ///
+    /// This is the public API the Dioxus Performance settings panel calls. The
+    /// arguments are **tier indices** into `VIDEO_QUALITY_TIERS` /
+    /// `AUDIO_QUALITY_TIERS`.
+    ///
+    /// **QUALITY IS THE INVERSE OF INDEX — index 0 is the BEST tier.** So:
+    /// - `video_best` / `audio_best` = the user's **max quality** = the *best*
+    ///   tier allowed = a **FLOOR on the index** (adaptation never steps UP past
+    ///   it, i.e. never picks a smaller index / higher quality).
+    /// - `video_worst` / `audio_worst` = the user's **min quality** = the *worst*
+    ///   tier allowed = a **CAP on the index** (adaptation never steps DOWN past
+    ///   it, i.e. never picks a larger index / lower quality).
+    /// - `None` on any end = "Auto" (no user bound on that end). Passing all
+    ///   `None` restores fully-automatic behaviour.
+    /// - When `best == worst` the tier is pinned to that single index.
+    ///
+    /// The UI is responsible for mapping its resolution / bitrate labels to
+    /// indices (e.g. "1080p" → 0, "240p" → 7 for video).
+    ///
+    /// Bounds are applied live to the running encoder at the next diagnostics
+    /// tick (≤1s) AND stored so they are re-applied on every encoder (re)start,
+    /// so the call is valid whether or not the encoder is currently running. Out-
+    /// of-range or inverted ranges are clamped/normalized inside the AQ manager.
+    pub fn set_quality_tier_bounds(
+        &mut self,
+        video_best: Option<usize>,
+        video_worst: Option<usize>,
+        audio_best: Option<usize>,
+        audio_worst: Option<usize>,
+    ) {
+        let mut shared = self.quality_bounds.borrow_mut();
+        shared.bounds = QualityTierBounds {
+            video_best,
+            video_worst,
+            audio_best,
+            audio_worst,
+        };
+        shared.generation = shared.generation.wrapping_add(1);
+    }
+
+    /// Returns the current user-configured quality tier bounds (issue #961).
+    pub fn quality_tier_bounds(&self) -> QualityTierBounds {
+        self.quality_bounds.borrow().bounds
     }
 
     // The next three methods delegate to self.state

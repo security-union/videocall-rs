@@ -151,6 +151,65 @@ fn set_vbr_mode(config: &VideoEncoderConfig) {
     );
 }
 
+/// User-configurable adaptive-quality tier bounds for SCREEN SHARE (issue #961
+/// follow-up), shared from the UI into the running screen encoder control loop.
+///
+/// QUALITY IS THE INVERSE OF INDEX over the 3-tier `SCREEN_QUALITY_TIERS` ladder:
+/// index 0 = BEST (1080p), index 2 = WORST (low). So `best` is the user's MAX
+/// quality = a FLOOR on the index (adaptation never steps UP past it), and
+/// `worst` is the user's MIN quality = a CAP on the index (never steps DOWN past
+/// it). `None` on either end = "Auto" (no user bound). Screen has no audio, so
+/// only video-style bounds exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScreenQualityTierBounds {
+    /// Best/floor screen tier index (user MAX quality). `None` = Auto.
+    pub best: Option<usize>,
+    /// Worst/cap screen tier index (user MIN quality). `None` = Auto.
+    pub worst: Option<usize>,
+}
+
+/// Shared, mutable screen quality-bounds preference plus a "dirty" generation
+/// counter. Same live-reconfig pattern as the camera encoder's
+/// `SharedQualityBounds`: the UI writes via
+/// `ScreenEncoder::set_quality_tier_bounds` (updating `bounds` + bumping
+/// `generation`); the screen encoder control loop reads `generation` each tick
+/// and applies `bounds` to the live `EncoderBitrateController` when it advanced.
+/// Because the control loop is spawned once and outlives individual share
+/// sessions, stored bounds are also (re)applied to the controller whenever the
+/// next share starts — the loop just sees the controller's persistent tier and
+/// clamps it.
+#[derive(Debug, Default)]
+struct SharedScreenQualityBounds {
+    bounds: ScreenQualityTierBounds,
+    /// Monotonic counter bumped on every write so the loop detects changes
+    /// without comparing every field.
+    generation: u64,
+}
+
+/// A real-time snapshot of the SCREEN encoder's current adaptive-quality state,
+/// sized for the UI VU meter needle (issue #961 follow-up).
+///
+/// Video-only — screen share carries no audio. All fields are resolved from the
+/// live shared atomics + `SCREEN_QUALITY_TIERS` at call time, indices clamped, so
+/// the call is panic-safe and cheap enough to poll each render tick. The UI gets
+/// `None` (not this struct) from [`ScreenEncoder::live_screen_snapshot`] while
+/// not sharing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenQualitySnapshot {
+    /// Current screen tier index (0 = best / 1080p, 2 = worst / low).
+    pub tier_index: usize,
+    /// Current screen tier max width (px).
+    pub width: u32,
+    /// Current screen tier max height (px).
+    pub height: u32,
+    /// Current screen tier target fps.
+    pub fps: u32,
+    /// Current screen tier ideal bitrate (kbps).
+    pub ideal_kbps: u32,
+    /// Live encoder target bitrate (kbps) — the real-time needle value.
+    pub target_bitrate_kbps: u32,
+}
+
 /// Events emitted by [ScreenEncoder] to notify about screen share state changes.
 ///
 /// This allows the UI to react to screen share lifecycle events without managing
@@ -231,6 +290,13 @@ pub struct ScreenEncoder {
     /// `"cpu-pressure"`, `"network-rtt"`, `"network-loss"`, `"manual-cap"`.
     /// Empty when AQ is unconstrained or no transition has happened yet.
     shared_screen_cause_hint: Rc<RefCell<String>>,
+    /// User-configurable screen-share quality tier bounds (issue #961 follow-up).
+    /// Written by the UI via [`Self::set_quality_tier_bounds`], read by the
+    /// screen encoder control loop (which applies them live to the
+    /// `EncoderBitrateController`). See [`SharedScreenQualityBounds`] for the
+    /// apply mechanism and [`ScreenQualityTierBounds`] for the index↔quality
+    /// inversion.
+    quality_bounds: Rc<RefCell<SharedScreenQualityBounds>>,
 }
 
 impl ScreenEncoder {
@@ -271,6 +337,7 @@ impl ScreenEncoder {
             shared_screen_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_screen_adaptive_tier: Rc::new(RefCell::new(String::new())),
             shared_screen_cause_hint: Rc::new(RefCell::new(String::new())),
+            quality_bounds: Rc::new(RefCell::new(SharedScreenQualityBounds::default())),
         }
     }
 
@@ -286,6 +353,79 @@ impl ScreenEncoder {
     /// Returns the shared tier transitions buffer for health reporting.
     pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
         self.shared_tier_transitions.clone()
+    }
+
+    /// Set user-configurable SCREEN-SHARE quality tier bounds (issue #961
+    /// follow-up). This is the public API the Dioxus "Screen Share Thresholds"
+    /// slider calls. The arguments are **tier indices** into
+    /// `SCREEN_QUALITY_TIERS` (the 3-tier ladder: 0 = high/1080p, 1 =
+    /// medium/720p, 2 = low).
+    ///
+    /// **QUALITY IS THE INVERSE OF INDEX — index 0 is the BEST tier.** So:
+    /// - `best` = the user's **max quality** = the *best* tier allowed = a
+    ///   **FLOOR on the index** (adaptation never steps UP past it).
+    /// - `worst` = the user's **min quality** = the *worst* tier allowed = a
+    ///   **CAP on the index** (adaptation never steps DOWN past it).
+    /// - `None` on any end = "Auto"; passing both `None` restores fully-automatic
+    ///   behaviour. When `best == worst` the tier is pinned to that single index.
+    ///
+    /// Screen share has no audio, so there is no audio bound here. The camera's
+    /// [`CameraEncoder::set_quality_tier_bounds`](crate::CameraEncoder::set_quality_tier_bounds)
+    /// is a separate setter on a separate encoder object — this one is screen-only.
+    ///
+    /// Bounds apply live to a running screen encoder at the next diagnostics tick
+    /// (≤1s) AND are stored so they are re-applied when the screen encoder
+    /// (re)starts on the next share, so the call is valid whether or not screen
+    /// sharing is currently active. Out-of-range / inverted ranges are
+    /// clamped/normalized inside the AQ manager.
+    pub fn set_quality_tier_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let mut shared = self.quality_bounds.borrow_mut();
+        shared.bounds = ScreenQualityTierBounds { best, worst };
+        shared.generation = shared.generation.wrapping_add(1);
+    }
+
+    /// Returns the current user-configured screen quality tier bounds.
+    pub fn quality_tier_bounds(&self) -> ScreenQualityTierBounds {
+        self.quality_bounds.borrow().bounds
+    }
+
+    /// Real-time screen adaptive-quality snapshot for the UI VU meter needle
+    /// (issue #961 follow-up).
+    ///
+    /// Returns `None` when screen sharing is NOT active (so the UI can render a
+    /// "Not sharing" empty state), and `Some(snapshot)` while sharing. The
+    /// snapshot resolves the live shared atomics (`shared_screen_tier_index`,
+    /// `shared_screen_encoder_target_bitrate_kbps`) against `SCREEN_QUALITY_TIERS`
+    /// with the index clamped, so it never panics mid-transition and is cheap
+    /// enough to poll each render tick.
+    ///
+    /// Note on `target_bitrate_kbps`: the shared target atomic reads `0` at tier
+    /// 0 by the issue #903 "omit-on-unconstrained" wire contract. To give the VU
+    /// needle a meaningful value, this falls back to the current tier's
+    /// `ideal_bitrate_kbps` when the live target reads `0`.
+    pub fn live_screen_snapshot(&self) -> Option<ScreenQualitySnapshot> {
+        if !self.screen_sharing_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let idx = (self.shared_screen_tier_index.load(Ordering::Relaxed) as usize)
+            .min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+        let tier = &SCREEN_QUALITY_TIERS[idx];
+        let live_target = self
+            .shared_screen_encoder_target_bitrate_kbps
+            .load(Ordering::Relaxed);
+        let target_bitrate_kbps = if live_target > 0 {
+            live_target
+        } else {
+            tier.ideal_bitrate_kbps
+        };
+        Some(ScreenQualitySnapshot {
+            tier_index: idx,
+            width: tier.max_width,
+            height: tier.max_height,
+            fps: tier.target_fps,
+            ideal_kbps: tier.ideal_bitrate_kbps,
+            target_bitrate_kbps,
+        })
     }
 
     pub fn set_encoder_control(
@@ -305,10 +445,41 @@ impl ScreenEncoder {
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
+        let quality_bounds = self.quality_bounds.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
+
+            // Apply any user screen-quality bounds set before the loop started,
+            // and track the generation we last applied so we only re-apply when
+            // the UI actually changes them (issue #961 follow-up). The screen
+            // controller's clamp logic is generic over its 3-tier ladder.
+            let mut applied_bounds_generation = {
+                let shared = quality_bounds.borrow();
+                encoder_control.set_video_quality_bounds(shared.bounds.best, shared.bounds.worst);
+                shared.generation
+            };
+
             while let Some(event) = diagnostics_receiver.next().await {
+                // Apply user screen-quality bounds if the UI changed them since
+                // we last applied. Cheap generation check; the controller snaps
+                // the current tier into range and surfaces it via
+                // take_tier_changed() below.
+                {
+                    let shared = quality_bounds.borrow();
+                    if shared.generation != applied_bounds_generation {
+                        applied_bounds_generation = shared.generation;
+                        let b = shared.bounds;
+                        drop(shared);
+                        encoder_control.set_video_quality_bounds(b.best, b.worst);
+                        log::info!(
+                            "ScreenEncoder: applied user quality bounds (best={:?}, worst={:?})",
+                            b.best,
+                            b.worst,
+                        );
+                    }
+                }
+
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {

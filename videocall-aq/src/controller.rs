@@ -857,6 +857,52 @@ impl EncoderBitrateController {
         self.quality_manager.notify_reelection_completed(now);
     }
 
+    /// Set user-configurable VIDEO quality bounds (issue #961).
+    ///
+    /// QUALITY IS THE INVERSE OF INDEX: `best` is the user's MAX quality = a
+    /// FLOOR on the tier index (never step UP past it); `worst` is the user's MIN
+    /// quality = a CAP on the tier index (never step DOWN past it). Each end is
+    /// independently optional (`None` = Auto). Forwards to
+    /// [`AdaptiveQualityManager::set_video_quality_bounds`], which clamps,
+    /// normalizes an inverted range, and snaps the current tier into range
+    /// immediately. If the snap changes the tier, the new ideal bitrate is
+    /// applied and the PID is reset so the encoder picks it up at once.
+    pub fn set_video_quality_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let now = self.clock.now_ms();
+        let before = self.quality_manager.video_tier_index();
+        self.quality_manager
+            .set_video_quality_bounds(best, worst, now);
+        if self.quality_manager.video_tier_index() != before {
+            self.tier_changed = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: user_quality_bounds)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+    }
+
+    /// Set user-configurable AUDIO quality bounds (issue #961).
+    ///
+    /// Same inverse-of-index semantics as [`Self::set_video_quality_bounds`]:
+    /// `best` is a FLOOR on the audio tier index, `worst` is a CAP. `None` =
+    /// Auto. Forwards to [`AdaptiveQualityManager::set_audio_quality_bounds`],
+    /// which snaps the current audio tier into range immediately. Flags a tier
+    /// change so the microphone encoder picks up the new audio settings.
+    pub fn set_audio_quality_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let before = self.quality_manager.audio_tier_index();
+        self.quality_manager.set_audio_quality_bounds(best, worst);
+        if self.quality_manager.audio_tier_index() != before {
+            self.tier_changed = true;
+        }
+    }
+
     /// Return the current crash ceiling state, if active.
     /// `(ceiling_index, tier_label, current_decay_ms)`
     pub fn crash_ceiling_info(&self) -> Option<(usize, &'static str, f64)> {
@@ -1622,6 +1668,43 @@ mod tests {
         assert_eq!(
             controller.ideal_bitrate_kbps, expected_bitrate,
             "Initial ideal_bitrate_kbps should match the starting tier's ideal_bitrate_kbps"
+        );
+    }
+
+    #[test]
+    fn test_screen_controller_set_quality_bounds_pins_and_clamps() {
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        // The screen ScreenEncoder wires set_video_quality_bounds onto a
+        // new_for_screen controller (issue #961 follow-up). Confirm the generic
+        // clamp works over the 3-tier screen ladder: pinning to the worst tier
+        // snaps the current tier into range immediately and the controller
+        // reports the change.
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+        let max = SCREEN_QUALITY_TIERS.len() - 1; // 2
+
+        // Pin to the worst screen tier (best == worst == max). Starts at the
+        // midpoint (1), so this must snap DOWN to max immediately and flag the
+        // change for the encoder loop.
+        controller.set_video_quality_bounds(Some(max), Some(max));
+        assert_eq!(
+            controller.video_tier_index(),
+            max,
+            "Screen controller must snap to the pinned worst tier at once"
+        );
+        assert!(
+            controller.take_tier_changed(),
+            "Snapping the screen tier into range must flag tier_changed"
+        );
+
+        // Now floor at best (0) with no cap — must snap UP to 0 immediately.
+        controller.set_video_quality_bounds(Some(0), Some(0));
+        assert_eq!(
+            controller.video_tier_index(),
+            0,
+            "Re-pinning the screen controller to the best tier must snap UP at once"
         );
     }
 

@@ -246,7 +246,8 @@ pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
 pub use encode::{
-    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,
+    QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot, ScreenQualityTierBounds,
     ScreenShareEvent,
 };
 pub use media_devices::{

@@ -18,6 +18,10 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::performance_settings::{
+    load_performance_preference, preference_to_encoder_bounds, save_performance_preference,
+    PerformancePreference, ScreenSnapshotReader, SnapshotReader,
+};
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
@@ -234,6 +238,22 @@ pub fn Host(
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
         screen.set_encoder_control(rx);
+
+        // Apply the user's persisted performance (quality-bounds) preference
+        // (issue #961) before the encoder starts, so the very first encode honors
+        // the bounds. All-Auto (the default) is a no-op. The bounds are also
+        // stored inside the encoder and re-applied on every (re)start, so this
+        // single call survives camera restarts.
+        let perf_pref = load_performance_preference();
+        let bounds = preference_to_encoder_bounds(&perf_pref);
+        camera.set_quality_tier_bounds(
+            bounds.video_best,
+            bounds.video_worst,
+            bounds.audio_best,
+            bounds.audio_worst,
+        );
+        // Screen share bounds live on the separate ScreenEncoder (issue #961).
+        screen.set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
 
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();
@@ -629,6 +649,65 @@ pub fn Host(
         })
     };
 
+    // Performance (quality-bounds) preference, restored from localStorage and
+    // surfaced to the settings modal (issue #961). The encoder already had the
+    // restored bounds applied at construction time above; this signal is the
+    // UI's source of truth for the selector positions.
+    let performance_preference = use_signal(load_performance_preference);
+
+    // Apply a changed performance preference: persist it and push the inverted
+    // best/worst bounds to the live encoder. The encoder stores them and
+    // re-applies on every (re)start, so this works whether or not the camera is
+    // currently running.
+    let on_performance_change: Rc<dyn Fn(PerformancePreference)> = {
+        let state = state.clone();
+        Rc::new(move |pref: PerformancePreference| {
+            save_performance_preference(&pref);
+            let mut performance_preference = performance_preference;
+            performance_preference.set(pref);
+            let bounds = preference_to_encoder_bounds(&pref);
+            let mut s = state.borrow_mut();
+            s.camera.set_quality_tier_bounds(
+                bounds.video_best,
+                bounds.video_worst,
+                bounds.audio_best,
+                bounds.audio_worst,
+            );
+            // Screen share is a separate encoder object (issue #961).
+            s.screen
+                .set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+        })
+    };
+
+    // Live snapshot reader for the VU meters. Returns `None` while the camera is
+    // off so the meters show placeholders rather than a stale pinned tier.
+    // Built once per mount (via `use_hook`) so its `Rc` identity is stable and
+    // the meter component doesn't see a "changed" prop every render.
+    let read_quality_snapshot: SnapshotReader = {
+        let state = state.clone();
+        use_hook(move || {
+            SnapshotReader(Rc::new(move || {
+                let s = state.borrow();
+                if s.prev_video_enabled {
+                    Some(s.camera.live_quality_snapshot())
+                } else {
+                    None
+                }
+            }))
+        })
+    };
+
+    // Live screen-share snapshot reader for the third VU meter. The encoder
+    // already returns `None` while not sharing, so no extra gate is needed.
+    let read_screen_snapshot: ScreenSnapshotReader = {
+        let state = state.clone();
+        use_hook(move || {
+            ScreenSnapshotReader(Rc::new(move || {
+                state.borrow().screen.live_screen_snapshot()
+            }))
+        })
+    };
+
     let on_speaker_change: Rc<dyn Fn(DeviceInfo)> = {
         let state = state.clone();
         let client = client.clone();
@@ -709,6 +788,9 @@ pub fn Host(
             let on_mic = on_mic_change.clone();
             let on_cam = on_cam_change.clone();
             let on_spk = on_speaker_change.clone();
+            let on_perf = on_performance_change.clone();
+            let read_snap = read_quality_snapshot.clone();
+            let read_screen_snap = read_screen_snapshot.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -725,6 +807,10 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
+                    performance_preference: performance_preference(),
+                    on_performance_change: move |p: PerformancePreference| on_perf(p),
+                    read_quality_snapshot: read_snap.clone(),
+                    read_screen_snapshot: read_screen_snap.clone(),
                 }
             }
         }

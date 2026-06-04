@@ -107,6 +107,42 @@ impl PartialEq for ScreenSnapshotReader {
     }
 }
 
+// ── direction toggle (Receive | Send) ─────────────────────────────
+
+/// Which direction the panel is currently showing. The panel renders only the
+/// three rows (Video / Audio / Screen) for the active direction at a time, so
+/// the modal shows 3 rows instead of 6 and fits without excessive vertical
+/// scroll (the #961 "fit all sections" requirement). Defaults to
+/// [`Direction::Receive`] — the user's original receive-centric framing and the
+/// multicast-era primary control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Bound what this client RECEIVES from peers (saves download).
+    Receive,
+    /// Bound what this client SENDS to peers (saves upload + CPU).
+    Send,
+}
+
+impl Direction {
+    /// The default direction the panel opens on: Receive (the original #961
+    /// receive-centric framing + the multicast-era primary control).
+    pub fn default_for_panel() -> Direction {
+        Direction::Receive
+    }
+
+    /// Whether this direction renders the RECEIVE rows (vs the SEND rows). Pure
+    /// seam so the toggle's "which rows show" contract is host-testable without
+    /// rendering the component.
+    pub fn shows_receive(self) -> bool {
+        matches!(self, Direction::Receive)
+    }
+}
+
+/// testid for the Receive segment of the direction toggle.
+pub const TESTID_DIRECTION_RECEIVE: &str = "perf-direction-receive";
+/// testid for the Send segment of the direction toggle.
+pub const TESTID_DIRECTION_SEND: &str = "perf-direction-send";
+
 // ── localStorage key + persisted shape (SEND) ─────────────────────
 
 /// `localStorage` key for the persisted send-quality preference. Follows the
@@ -1057,129 +1093,112 @@ fn HelpPopover(
 /// row and a **Send** row, each with its own needle gauge, dual-thumb slider,
 /// Auto toggle, Fixed badge, "?" help popover and live range text.
 ///
-/// Receive uses the natural index convention (0 = lowest) and bounds the layers
-/// pulled from peers; Send uses the inverted tier convention (0 = best) and
-/// bounds what this peer publishes. They are wired to independent callbacks and
-/// distinct testids / needle ids so they never cross.
+/// One kind's SEND row: a per-kind title (with the "your upload" consequence),
+/// needle gauge, dual-thumb slider, Auto/help/Fixed header and live range text.
+/// Rendered (one per kind) when the panel's direction toggle is on **Send**.
+///
+/// Send uses the inverted tier convention (0 = best) and bounds what this peer
+/// publishes; the counterpart [`receive::ReceiveRow`] uses the direct layer
+/// convention (0 = lowest). Distinct testids / needle ids keep them from
+/// crossing.
 #[allow(clippy::too_many_arguments)]
 #[component]
-fn KindSection(
-    kind: PrefMediaKind,
-    title: &'static str,
+fn SendRow(
+    /// Display title for the kind, e.g. "Video" / "Audio" / "Screen Share".
+    kind_title: &'static str,
     stream_noun: &'static str,
     /// Send id prefix, e.g. "perf-video".
-    send_id_prefix: &'static str,
-    send_min_testid: &'static str,
-    send_max_testid: &'static str,
-    send_auto_testid: &'static str,
-    send_fixed_testid: &'static str,
-    send_help_testid: &'static str,
-    send_vu_testid: &'static str,
-    send_vu_needle_id: &'static str,
-    send_vu_readout_id: &'static str,
-    send_vu_label: &'static str,
-    send_vu_initial_deg: f32,
-    send_vu_initial_readout: String,
-    send_labels: Vec<&'static str>,
-    send_best: Option<usize>,
-    send_worst: Option<usize>,
-    send_is_fixed: bool,
-    send_is_auto: bool,
-    /// Receive needle first-paint values + the kind's persisted receive sub-pref.
-    recv_vu_initial_deg: f32,
-    recv_vu_initial_readout: String,
-    recv_sub: KindReceivePref,
+    id_prefix: &'static str,
+    min_testid: &'static str,
+    max_testid: &'static str,
+    auto_testid: &'static str,
+    fixed_testid: &'static str,
+    help_testid: &'static str,
+    vu_testid: &'static str,
+    vu_needle_id: &'static str,
+    vu_readout_id: &'static str,
+    vu_label: &'static str,
+    vu_initial_deg: f32,
+    vu_initial_readout: String,
+    labels: Vec<&'static str>,
+    best: Option<usize>,
+    worst: Option<usize>,
+    is_fixed: bool,
+    is_auto: bool,
     /// Shared single-open help signal (opening any popover closes the others).
     open_help: Signal<Option<&'static str>>,
-    on_send_change: EventHandler<RangeSel>,
-    on_send_auto_toggle: EventHandler<bool>,
-    on_recv_change: EventHandler<KindReceivePref>,
+    on_change: EventHandler<RangeSel>,
+    on_auto_toggle: EventHandler<bool>,
 ) -> Element {
-    let send_sel = bounds_to_thumbs(send_best, send_worst, send_labels.len());
-    let send_range_str = span_text(send_sel, &send_labels);
-    let send_auto_class = if send_is_auto {
+    let sel = bounds_to_thumbs(best, worst, labels.len());
+    let range_str = span_text(sel, &labels);
+    let auto_class = if is_auto {
         "perf-auto-button is-active"
     } else {
         "perf-auto-button"
     };
 
     rsx! {
-        div { class: "perf-kind-group",
-            div { class: "perf-kind-header",
-                span { class: "perf-kind-title", "{title}" }
-            }
-
-            // ── RECEIVE row (save MY downlink) ──
-            receive::ReceiveRow {
-                kind,
-                stream_noun,
-                vu_initial_deg: recv_vu_initial_deg,
-                vu_initial_readout: recv_vu_initial_readout,
-                sub: recv_sub,
-                open_help,
-                on_change: move |sub: KindReceivePref| on_recv_change.call(sub),
-            }
-
-            // ── SEND row (save MY uplink / CPU) ──
-            div { class: "perf-stream-group perf-send-row",
-                div { class: "perf-stream-header",
-                    span { class: "perf-stream-title", "Send" }
-                    HelpPopover {
-                        key_id: send_id_prefix,
-                        help_testid: send_help_testid,
-                        help_label: send_vu_label,
-                        help_body: "Sets the best (right) and worst (left) quality this device PUBLISHES, to save your upload bandwidth and CPU. The app adapts within these limits based on your network. Auto uses the full range.",
-                        open_help,
-                    }
-                    if send_is_fixed {
-                        span {
-                            class: "perf-fixed-badge",
-                            "data-testid": send_fixed_testid,
-                            title: "Send quality is pinned to a single tier — this stream won't adapt",
-                            "aria-label": "{stream_noun} send quality pinned to a single tier — adaptation disabled",
-                            "Fixed"
-                        }
-                    }
-                    button {
-                        r#type: "button",
-                        class: send_auto_class,
-                        "data-testid": send_auto_testid,
-                        "aria-pressed": if send_is_auto { "true" } else { "false" },
-                        "aria-label": "Automatic {stream_noun} send quality",
-                        title: if send_is_auto {
-                            "Automatic (full range) — click to set manual send limits"
-                        } else {
-                            "Manual limits — click for fully automatic send quality"
-                        },
-                        onclick: move |_| on_send_auto_toggle.call(!send_is_auto),
-                        "Auto"
+        div { class: "perf-stream-group perf-send-row",
+            div { class: "perf-stream-header",
+                // Per-kind title + the consequence, legible without the popover.
+                span { class: "perf-stream-title", "{kind_title}" }
+                span { class: "perf-stream-consequence", "your upload" }
+                HelpPopover {
+                    key_id: id_prefix,
+                    help_testid,
+                    help_label: vu_label,
+                    help_body: "Sets the best (right) and worst (left) quality this device PUBLISHES, to save your upload bandwidth and CPU. The app adapts within these limits based on your network. Auto uses the full range.",
+                    open_help,
+                }
+                if is_fixed {
+                    span {
+                        class: "perf-fixed-badge",
+                        "data-testid": fixed_testid,
+                        title: "Send quality is pinned to a single tier — this stream won't adapt",
+                        "aria-label": "{stream_noun} send quality pinned to a single tier — adaptation disabled",
+                        "Fixed"
                     }
                 }
-                div { class: "perf-stream-body",
-                    VuGauge {
-                        testid: send_vu_testid,
-                        needle_id: send_vu_needle_id,
-                        readout_id: send_vu_readout_id,
-                        label: send_vu_label,
-                        initial_deg: send_vu_initial_deg,
-                        initial_readout: send_vu_initial_readout,
+                button {
+                    r#type: "button",
+                    class: auto_class,
+                    "data-testid": auto_testid,
+                    "aria-pressed": if is_auto { "true" } else { "false" },
+                    "aria-label": "Automatic {stream_noun} send quality",
+                    title: if is_auto {
+                        "Automatic (full range) — click to set manual send limits"
+                    } else {
+                        "Manual limits — click for fully automatic send quality"
+                    },
+                    onclick: move |_| on_auto_toggle.call(!is_auto),
+                    "Auto"
+                }
+            }
+            div { class: "perf-stream-body",
+                VuGauge {
+                    testid: vu_testid,
+                    needle_id: vu_needle_id,
+                    readout_id: vu_readout_id,
+                    label: vu_label,
+                    initial_deg: vu_initial_deg,
+                    initial_readout: vu_initial_readout,
+                }
+                div { class: "perf-stream-controls",
+                    DualRangeSlider {
+                        id_prefix,
+                        min_testid,
+                        max_testid,
+                        stream_noun,
+                        labels: labels.clone(),
+                        sel,
+                        on_change: move |s: RangeSel| on_change.call(s),
                     }
-                    div { class: "perf-stream-controls",
-                        DualRangeSlider {
-                            id_prefix: send_id_prefix,
-                            min_testid: send_min_testid,
-                            max_testid: send_max_testid,
-                            stream_noun,
-                            labels: send_labels.clone(),
-                            sel: send_sel,
-                            on_change: move |s: RangeSel| on_send_change.call(s),
-                        }
-                        p {
-                            class: "perf-range-value",
-                            "data-testid": "{send_id_prefix}-range-value",
-                            "aria-live": "polite",
-                            "Sending: {send_range_str}"
-                        }
+                    p {
+                        class: "perf-range-value",
+                        "data-testid": "{id_prefix}-range-value",
+                        "aria-live": "polite",
+                        "Sending: {range_str}"
                     }
                 }
             }
@@ -1187,15 +1206,92 @@ fn KindSection(
     }
 }
 
-/// The unified Performance settings panel body: per kind (Video, Audio,
-/// Screen/content) a Receive control + a Send control, each with its own live
-/// needle. Two headless rAF drivers update the "Sending" and "Receiving"
-/// needles independently.
+/// Segmented `Receive | Send` toggle shown at the top of the panel. A
+/// radiogroup of two `role="radio"` buttons (`aria-checked` + roving focus via
+/// the arrow keys / Home / End), so it is fully keyboard-accessible and announced
+/// as a single-choice group. Switching it changes which direction's three rows
+/// the panel renders, halving visible rows (6 → 3) so the panel fits.
+#[component]
+fn DirectionToggle(active: Direction, on_change: EventHandler<Direction>) -> Element {
+    let recv_active = active == Direction::Receive;
+    let send_active = active == Direction::Send;
+    let recv_class = if recv_active {
+        "perf-direction-segment is-active"
+    } else {
+        "perf-direction-segment"
+    };
+    let send_class = if send_active {
+        "perf-direction-segment is-active"
+    } else {
+        "perf-direction-segment"
+    };
+    rsx! {
+        div {
+            class: "perf-direction-toggle",
+            role: "radiogroup",
+            "aria-label": "Quality direction",
+            button {
+                r#type: "button",
+                class: recv_class,
+                "data-testid": TESTID_DIRECTION_RECEIVE,
+                role: "radio",
+                "aria-checked": if recv_active { "true" } else { "false" },
+                // Only the active radio is in the tab order; arrows move within.
+                tabindex: if recv_active { "0" } else { "-1" },
+                onclick: move |_| on_change.call(Direction::Receive),
+                onkeydown: move |evt: KeyboardEvent| {
+                    match evt.key() {
+                        Key::ArrowRight | Key::ArrowDown | Key::End => {
+                            evt.prevent_default();
+                            on_change.call(Direction::Send);
+                        }
+                        Key::Home => {
+                            evt.prevent_default();
+                            on_change.call(Direction::Receive);
+                        }
+                        _ => {}
+                    }
+                },
+                "Receive"
+            }
+            button {
+                r#type: "button",
+                class: send_class,
+                "data-testid": TESTID_DIRECTION_SEND,
+                role: "radio",
+                "aria-checked": if send_active { "true" } else { "false" },
+                tabindex: if send_active { "0" } else { "-1" },
+                onclick: move |_| on_change.call(Direction::Send),
+                onkeydown: move |evt: KeyboardEvent| {
+                    match evt.key() {
+                        Key::ArrowLeft | Key::ArrowUp | Key::Home => {
+                            evt.prevent_default();
+                            on_change.call(Direction::Receive);
+                        }
+                        Key::End => {
+                            evt.prevent_default();
+                            on_change.call(Direction::Send);
+                        }
+                        _ => {}
+                    }
+                },
+                "Send"
+            }
+        }
+    }
+}
+
+/// The unified Performance settings panel body. A `Receive | Send` segmented
+/// toggle (default Receive) at the top selects the direction; the panel then
+/// renders only that direction's three rows (Video, Audio, Screen), each with
+/// its own live needle. Two headless rAF drivers update the "Sending" and
+/// "Receiving" needles independently, regardless of which direction is visible.
 ///
 /// `pref` (send) + `receive_pref` are the current persisted preferences
 /// (controlled by the parent). On any change the panel derives the new bounds
 /// and calls the matching callback; the parent persists it and pushes it to the
-/// encoder (send) or client (receive). The panel is otherwise stateless.
+/// encoder (send) or client (receive). The panel is otherwise stateless apart
+/// from the local direction-toggle + open-popover signals.
 #[component]
 pub fn PerformanceSettingsPanel(
     // SEND side (#961).
@@ -1224,120 +1320,153 @@ pub fn PerformanceSettingsPanel(
     let rgs = receive::gauge_state(received_reader.read(PrefMediaKind::Screen).as_ref());
 
     // Which popover (if any) is currently open. `None` = all closed. Shared
-    // across every section/row so opening one closes the others.
+    // across every row so opening one closes the others.
     let open_help: Signal<Option<&'static str>> = use_signal(|| None);
+
+    // Active direction. Default Receive (the original #961 receive-centric
+    // framing + the multicast-era primary control). Only this direction's three
+    // rows render at a time, so the panel shows 3 rows, not 6, and fits without
+    // excessive vertical scroll.
+    let mut direction: Signal<Direction> = use_signal(Direction::default_for_panel);
+    let active = direction();
+    let showing_receive = active.shows_receive();
 
     rsx! {
         h3 { class: "settings-section-title", "Performance" }
         p { class: "settings-section-description",
-            "Per stream: limit what you RECEIVE from others (saves your download) and "
-            "what you SEND to others (saves your upload + CPU). Each control adapts "
-            "within its range; the needles show what's flowing right now."
+            "Limit what you "
+            span { class: "perf-emph-recv", "receive" }
+            " from others (saves your download) and what you "
+            span { class: "perf-emph-send", "send" }
+            " to others (saves your upload + CPU). Each control adapts within its "
+            "range; the needle shows what's flowing right now."
+        }
+
+        // Direction toggle: switches the panel between the Receive and Send rows.
+        DirectionToggle {
+            active,
+            on_change: move |d: Direction| direction.set(d),
         }
 
         // Headless drivers: one ~4 Hz rAF loop each, updating the Sending and
-        // Receiving needles by id. They render nothing; gauges live in the
-        // sections below.
+        // Receiving needles by id. They render nothing and run regardless of the
+        // visible direction; writes to a needle that isn't currently mounted
+        // simply no-op until that direction is shown.
         QualityVuMeterDriver { read_snapshot, read_screen_snapshot }
         receive::ReceivedQualityDriver { reader: received_reader }
 
-        // ── Video ──
-        KindSection {
-            kind: PrefMediaKind::Video,
-            title: "Video",
-            stream_noun: "video",
-            send_id_prefix: "perf-video",
-            send_min_testid: TESTID_VIDEO_RANGE_MIN,
-            send_max_testid: TESTID_VIDEO_RANGE_MAX,
-            send_auto_testid: TESTID_VIDEO_AUTO,
-            send_fixed_testid: "perf-video-fixed-badge",
-            send_help_testid: "perf-video-help",
-            send_vu_testid: TESTID_VU_VIDEO,
-            send_vu_needle_id: VIDEO_NEEDLE_ID,
-            send_vu_readout_id: VIDEO_READOUT_ID,
-            send_vu_label: "Sending video",
-            send_vu_initial_deg: g.video_deg,
-            send_vu_initial_readout: g.video_text.clone(),
-            send_labels: VIDEO_TIER_LABELS.to_vec(),
-            send_best: pref.video_max,
-            send_worst: pref.video_min,
-            send_is_fixed: video_fixed,
-            send_is_auto: pref.video_auto,
-            recv_vu_initial_deg: rgv.deg,
-            recv_vu_initial_readout: rgv.text.clone(),
-            recv_sub: receive_pref.video,
-            open_help,
-            on_send_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
-            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
-            on_recv_change: move |sub: KindReceivePref| {
-                on_receive_change.call((PrefMediaKind::Video, sub));
-            },
-        }
-
-        // ── Audio ──
-        KindSection {
-            kind: PrefMediaKind::Audio,
-            title: "Audio",
-            stream_noun: "audio",
-            send_id_prefix: "perf-audio",
-            send_min_testid: TESTID_AUDIO_RANGE_MIN,
-            send_max_testid: TESTID_AUDIO_RANGE_MAX,
-            send_auto_testid: TESTID_AUDIO_AUTO,
-            send_fixed_testid: "perf-audio-fixed-badge",
-            send_help_testid: "perf-audio-help",
-            send_vu_testid: TESTID_VU_AUDIO,
-            send_vu_needle_id: AUDIO_NEEDLE_ID,
-            send_vu_readout_id: AUDIO_READOUT_ID,
-            send_vu_label: "Sending audio",
-            send_vu_initial_deg: g.audio_deg,
-            send_vu_initial_readout: g.audio_text.clone(),
-            send_labels: AUDIO_TIER_LABELS.to_vec(),
-            send_best: pref.audio_max,
-            send_worst: pref.audio_min,
-            send_is_fixed: audio_fixed,
-            send_is_auto: pref.audio_auto,
-            recv_vu_initial_deg: rga.deg,
-            recv_vu_initial_readout: rga.text.clone(),
-            recv_sub: receive_pref.audio,
-            open_help,
-            on_send_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
-            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
-            on_recv_change: move |sub: KindReceivePref| {
-                on_receive_change.call((PrefMediaKind::Audio, sub));
-            },
-        }
-
-        // ── Screen / shared content ──
-        KindSection {
-            kind: PrefMediaKind::Screen,
-            title: "Screen Share",
-            stream_noun: "screen share",
-            send_id_prefix: "perf-screen",
-            send_min_testid: TESTID_SCREEN_RANGE_MIN,
-            send_max_testid: TESTID_SCREEN_RANGE_MAX,
-            send_auto_testid: TESTID_SCREEN_AUTO,
-            send_fixed_testid: "perf-screen-fixed-badge",
-            send_help_testid: "perf-screen-help",
-            send_vu_testid: TESTID_VU_SCREEN,
-            send_vu_needle_id: SCREEN_NEEDLE_ID,
-            send_vu_readout_id: SCREEN_READOUT_ID,
-            send_vu_label: "Sending screen",
-            send_vu_initial_deg: g.screen_deg,
-            send_vu_initial_readout: g.screen_text.clone(),
-            send_labels: SCREEN_TIER_LABELS.to_vec(),
-            send_best: pref.screen_max,
-            send_worst: pref.screen_min,
-            send_is_fixed: screen_fixed,
-            send_is_auto: pref.screen_auto,
-            recv_vu_initial_deg: rgs.deg,
-            recv_vu_initial_readout: rgs.text.clone(),
-            recv_sub: receive_pref.screen,
-            open_help,
-            on_send_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
-            on_send_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
-            on_recv_change: move |sub: KindReceivePref| {
-                on_receive_change.call((PrefMediaKind::Screen, sub));
-            },
+        if showing_receive {
+            // ── RECEIVE rows (save MY download) ──
+            receive::ReceiveRow {
+                kind: PrefMediaKind::Video,
+                kind_title: "Video",
+                stream_noun: "video",
+                vu_initial_deg: rgv.deg,
+                vu_initial_readout: rgv.text.clone(),
+                sub: receive_pref.video,
+                open_help,
+                on_change: move |sub: KindReceivePref| {
+                    on_receive_change.call((PrefMediaKind::Video, sub));
+                },
+            }
+            receive::ReceiveRow {
+                kind: PrefMediaKind::Audio,
+                kind_title: "Audio",
+                stream_noun: "audio",
+                vu_initial_deg: rga.deg,
+                vu_initial_readout: rga.text.clone(),
+                sub: receive_pref.audio,
+                open_help,
+                on_change: move |sub: KindReceivePref| {
+                    on_receive_change.call((PrefMediaKind::Audio, sub));
+                },
+            }
+            receive::ReceiveRow {
+                kind: PrefMediaKind::Screen,
+                kind_title: "Screen Share",
+                stream_noun: "shared content",
+                vu_initial_deg: rgs.deg,
+                vu_initial_readout: rgs.text.clone(),
+                sub: receive_pref.screen,
+                open_help,
+                on_change: move |sub: KindReceivePref| {
+                    on_receive_change.call((PrefMediaKind::Screen, sub));
+                },
+            }
+        } else {
+            // ── SEND rows (save MY upload / CPU) ──
+            SendRow {
+                kind_title: "Video",
+                stream_noun: "video",
+                id_prefix: "perf-video",
+                min_testid: TESTID_VIDEO_RANGE_MIN,
+                max_testid: TESTID_VIDEO_RANGE_MAX,
+                auto_testid: TESTID_VIDEO_AUTO,
+                fixed_testid: "perf-video-fixed-badge",
+                help_testid: "perf-video-help",
+                vu_testid: TESTID_VU_VIDEO,
+                vu_needle_id: VIDEO_NEEDLE_ID,
+                vu_readout_id: VIDEO_READOUT_ID,
+                vu_label: "Sending video",
+                vu_initial_deg: g.video_deg,
+                vu_initial_readout: g.video_text.clone(),
+                labels: VIDEO_TIER_LABELS.to_vec(),
+                best: pref.video_max,
+                worst: pref.video_min,
+                is_fixed: video_fixed,
+                is_auto: pref.video_auto,
+                open_help,
+                on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
+                on_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
+            }
+            SendRow {
+                kind_title: "Audio",
+                stream_noun: "audio",
+                id_prefix: "perf-audio",
+                min_testid: TESTID_AUDIO_RANGE_MIN,
+                max_testid: TESTID_AUDIO_RANGE_MAX,
+                auto_testid: TESTID_AUDIO_AUTO,
+                fixed_testid: "perf-audio-fixed-badge",
+                help_testid: "perf-audio-help",
+                vu_testid: TESTID_VU_AUDIO,
+                vu_needle_id: AUDIO_NEEDLE_ID,
+                vu_readout_id: AUDIO_READOUT_ID,
+                vu_label: "Sending audio",
+                vu_initial_deg: g.audio_deg,
+                vu_initial_readout: g.audio_text.clone(),
+                labels: AUDIO_TIER_LABELS.to_vec(),
+                best: pref.audio_max,
+                worst: pref.audio_min,
+                is_fixed: audio_fixed,
+                is_auto: pref.audio_auto,
+                open_help,
+                on_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
+                on_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
+            }
+            SendRow {
+                kind_title: "Screen Share",
+                stream_noun: "screen share",
+                id_prefix: "perf-screen",
+                min_testid: TESTID_SCREEN_RANGE_MIN,
+                max_testid: TESTID_SCREEN_RANGE_MAX,
+                auto_testid: TESTID_SCREEN_AUTO,
+                fixed_testid: "perf-screen-fixed-badge",
+                help_testid: "perf-screen-help",
+                vu_testid: TESTID_VU_SCREEN,
+                vu_needle_id: SCREEN_NEEDLE_ID,
+                vu_readout_id: SCREEN_READOUT_ID,
+                vu_label: "Sending screen",
+                vu_initial_deg: g.screen_deg,
+                vu_initial_readout: g.screen_text.clone(),
+                labels: SCREEN_TIER_LABELS.to_vec(),
+                best: pref.screen_max,
+                worst: pref.screen_min,
+                is_fixed: screen_fixed,
+                is_auto: pref.screen_auto,
+                open_help,
+                on_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
+                on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
+            }
         }
     }
 }
@@ -1883,11 +2012,15 @@ pub mod receive {
         }
     }
 
-    /// One kind's RECEIVE row: needle gauge + dual-thumb slider + Auto/help/Fixed
-    /// header + live range text. Used inside [`super::KindSection`].
+    /// One kind's RECEIVE row: a per-kind title (with the "your download"
+    /// consequence), needle gauge, dual-thumb slider, Auto/help/Fixed header and
+    /// live range text. Rendered (one per kind) when the panel's direction toggle
+    /// is on **Receive**.
     #[component]
     pub fn ReceiveRow(
         kind: PrefMediaKind,
+        /// Display title for the kind, e.g. "Video" / "Audio" / "Screen Share".
+        kind_title: &'static str,
         stream_noun: &'static str,
         vu_initial_deg: f32,
         vu_initial_readout: String,
@@ -1910,7 +2043,9 @@ pub mod receive {
         rsx! {
             div { class: "perf-stream-group perf-recv-row",
                 div { class: "perf-stream-header",
-                    span { class: "perf-stream-title", "Receive" }
+                    // Per-kind title + the consequence, legible without the popover.
+                    span { class: "perf-stream-title", "{kind_title}" }
+                    span { class: "perf-stream-consequence", "your download" }
                     super::HelpPopover {
                         key_id: meta.id_prefix,
                         help_testid: meta.help_testid,
@@ -1975,7 +2110,7 @@ pub mod receive {
                             class: "perf-range-value",
                             "data-testid": "{meta.id_prefix}-range-value",
                             "aria-live": "polite",
-                            "Receiving up to: {range_str}"
+                            "Receiving: {range_str}"
                         }
                     }
                 }
@@ -2298,6 +2433,29 @@ pub mod receive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direction_toggle_defaults_to_receive() {
+        // The panel opens on Receive (the original #961 receive-centric framing).
+        assert_eq!(Direction::default_for_panel(), Direction::Receive);
+    }
+
+    #[test]
+    fn direction_selects_which_rows_render() {
+        // The pure seam the panel uses to decide which 3 rows to render: Receive
+        // shows the receive rows, Send shows the send rows. This is what halves
+        // the visible rows (6 → 3) so the panel fits without excessive scroll.
+        assert!(Direction::Receive.shows_receive());
+        assert!(!Direction::Send.shows_receive());
+    }
+
+    #[test]
+    fn direction_toggle_testids_are_stable() {
+        // e2e drives the toggle by these ids; pin them so a rename is a test
+        // failure rather than a silently-broken selector.
+        assert_eq!(TESTID_DIRECTION_RECEIVE, "perf-direction-receive");
+        assert_eq!(TESTID_DIRECTION_SEND, "perf-direction-send");
+    }
 
     #[test]
     fn position_tier_index_round_trips() {

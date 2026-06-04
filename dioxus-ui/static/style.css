@@ -6202,36 +6202,71 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
    (see global.css) — no literals.
    ────────────────────────────────────────────────────────────────── */
 
-/* One media kind's group: a title header, then a Receive row + a Send row.
-   The two rows are visually grouped under the kind so the user reads
-   "Video → Receive / Send" rather than six disconnected sliders. */
-.perf-kind-group {
-  margin: 20px 0;
-  padding: 4px 0 2px;
-  border-top: 1px solid var(--border);
-}
-
-.perf-kind-group:first-of-type {
-  border-top: none;
-}
-
-.perf-kind-header {
+/* Segmented Receive | Send direction toggle (top of the panel). Only the
+   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
+   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
+.perf-direction-toggle {
   display: flex;
-  align-items: baseline;
-  margin: 6px 2px 2px;
+  gap: 2px;
+  margin: 14px 0 16px;
+  padding: 3px;
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
 }
 
-.perf-kind-title {
-  font-size: 15px;
-  font-weight: 700;
+.perf-direction-segment {
+  flex: 1 1 0;
+  min-height: 34px;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-direction-segment:hover {
   color: var(--text-primary);
+  background: var(--field-bg-hover);
 }
 
-/* The Receive / Send rows reuse .perf-stream-group styling but sit tighter
-   together inside a kind group (less vertical margin so the panel fits
-   without excessive scroll — the #961 "fit" goal, now with 2 rows/kind). */
-.perf-kind-group .perf-stream-group {
-  margin: 8px 0;
+.perf-direction-segment:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Active segment: filled with the accent surface. aria-checked also conveys
+   selection to AT, so color is not the sole signal. */
+.perf-direction-segment.is-active {
+  color: var(--accent);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Inline "your download" / "your upload" consequence beside each row title, so
+   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+.perf-stream-consequence {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* Receive / Send emphasis in the intro paragraph — bold + direction accent
+   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
+.perf-emph-recv,
+.perf-emph-send {
+  font-weight: 700;
+}
+
+.perf-emph-recv {
+  color: var(--accent);
+}
+
+.perf-emph-send {
+  color: var(--success);
 }
 
 .perf-stream-group {
@@ -6446,6 +6481,24 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
 
 .perf-range-input:focus-visible {
   outline: none;
+}
+
+/* N3 fix: when both thumbs collapse to one position (Fixed state), the max
+   input (later in the DOM) would otherwise sit on top and swallow pointer
+   drags meant for the min thumb. Raise the min input above the max input so its
+   thumb stays grabbable by mouse; the max thumb remains reachable (it is to the
+   right of, or coincident with, the min thumb). A focused input always wins so
+   keyboard control is unaffected. */
+.perf-range-input-min {
+  z-index: 2;
+}
+
+.perf-range-input-max {
+  z-index: 1;
+}
+
+.perf-range-input:focus-visible {
+  z-index: 3;
 }
 
 /* WebKit thumb */

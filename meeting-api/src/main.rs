@@ -121,6 +121,8 @@ async fn main() {
     // implicitly by leaking it (the task survives until process exit).
     let _ended_consumer =
         nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
+    let _empty_consumer =
+        nats_consumers::spawn_meeting_became_empty_consumer(nats.clone(), pool.clone());
 
     // Spawn the in-process console-log retention task. Returns `None` (no-op)
     // when `CONSOLE_LOG_UPLOAD_ENABLED` is not `"true"`. The handle is leaked

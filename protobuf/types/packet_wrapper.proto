@@ -18,6 +18,14 @@ message PacketWrapper {
     // set). The relay consumes this to filter VIDEO it forwards downstream
     // (see ViewportPacket). It is never re-broadcast to other peers.
     VIEWPORT = 11;
+    // Client -> relay ONLY control packet (#989, Phase 1b). Carries the
+    // per-sender simulcast layer each receiver wants the relay to forward
+    // (its "layer preferences"). The relay consumes this to drop simulcast
+    // VIDEO layers the receiver did not select (see LayerPreferencePacket).
+    // It is never re-broadcast to other peers, and — like VIEWPORT — it is
+    // recorded ONLY when it arrives on the receiver's own NATS subject, so a
+    // forged payload only self-degrades the forger's OWN view.
+    LAYER_PREFERENCE = 12;
   }
 
   // Cleartext media-kind discriminator on the OUTER envelope.

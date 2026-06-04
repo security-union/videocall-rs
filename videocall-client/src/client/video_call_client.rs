@@ -2351,9 +2351,49 @@ impl Inner {
                                 is_mute_all,
                                 is_targeted_at_self
                             );
-                            if is_mute_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the mute-all fast path can exclude
+                            // the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
+                            // #1034 / #1036: reflect the muted state on every
+                            // affected peer's tile immediately instead of waiting
+                            // out the heartbeat freshness window (~5s freeze). A
+                            // host command is authoritative, so this bypasses
+                            // `apply_heartbeat_enabled_flag`. The self path
+                            // (below) still performs the target's own local mute
+                            // via `on_host_mute`.
+                            //
+                            // Three cases:
+                            //   * SPECIFIC target (non-empty target): force-mute
+                            //     just that peer via `force_peer_media_off`, a
+                            //     safe no-op on the target's and host's own
+                            //     clients (neither holds a peer entry for itself).
+                            //   * MUTE-ALL with a non-empty `creator_id`: #1036
+                            //     makes this a host-excluded fast path too —
+                            //     force-mute every peer EXCEPT the issuing host
+                            //     (whose user_id the server put in `creator_id`),
+                            //     so the host's tile is never force-muted on any
+                            //     participant's screen.
+                            //   * MUTE-ALL with an EMPTY `creator_id` (older
+                            //     server, or any edge case): do NOTHING new and
+                            //     fall back to the slow heartbeat path — the safe
+                            //     fallback that avoids the host-mute regression,
+                            //     since without the host id we cannot exclude it.
+                            if !is_mute_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    true,
+                                    false,
+                                );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, true, false);
+                            }
+
+                            if is_mute_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_mute", &target_str) {
                                     if let Some(cb) = &self.options.on_host_mute {
                                         cb.emit(());
@@ -2378,9 +2418,41 @@ impl Inner {
                                 is_disable_all,
                                 is_targeted_at_self
                             );
-                            if is_disable_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the disable-all fast path can
+                            // exclude the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
+                            // #1034 / #1036: immediately flip every affected
+                            // peer's tile to video-off, clearing the frozen last
+                            // frame via the decoder flush, instead of waiting out
+                            // the heartbeat freshness window. Self/host local
+                            // paths are unaffected (no self peer entry). Mirrors
+                            // the HOST_MUTE_PARTICIPANT handler's three cases:
+                            //   * SPECIFIC target → `force_peer_media_off`.
+                            //   * DISABLE-ALL with non-empty `creator_id` (#1036)
+                            //     → host-excluded fast path: force video-off on
+                            //     every peer EXCEPT the issuing host (from
+                            //     `creator_id`), so the host's tile is never
+                            //     force-disabled on any participant's screen.
+                            //   * DISABLE-ALL with EMPTY `creator_id` → do nothing
+                            //     new, fall back to the slow heartbeat path (safe
+                            //     fallback; without the host id we cannot exclude
+                            //     it, so we must not iterate all peers).
+                            if !is_disable_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    false,
+                                    true,
+                                );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, false, true);
+                            }
+
+                            if is_disable_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_disable_video", &target_str)
                                 {
                                     if let Some(cb) = &self.options.on_host_disable_video {
@@ -2462,6 +2534,13 @@ impl Inner {
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
+                        Ok(MeetingEventType::PARTICIPANT_LIST_REQUEST) => {
+                            // Server-internal event: a joiner asking existing
+                            // peers to re-announce themselves. The relay consumes
+                            // it and never forwards it to clients, so reaching the
+                            // client is unexpected — ignore it.
+                            debug!("Ignoring server-internal PARTICIPANT_LIST_REQUEST");
+                        }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",
@@ -2532,6 +2611,13 @@ impl Inner {
                 // #988): the relay consumes it for viewport-aware video
                 // filtering and never forwards it to peers. A client should
                 // never receive one; ignore it defensively if it ever appears.
+            }
+            Ok(PacketType::LAYER_PREFERENCE) => {
+                // LAYER_PREFERENCE is a client -> relay ONLY control packet
+                // (#989, Phase 1b): the relay consumes it to drop unselected
+                // simulcast layers and never forwards it to peers. Like
+                // VIEWPORT, a client should never receive one; ignore it
+                // defensively if it ever appears.
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(

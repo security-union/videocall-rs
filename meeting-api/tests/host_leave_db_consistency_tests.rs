@@ -224,7 +224,7 @@ async fn meeting_ended_by_host_consumer_marks_meeting_ended() {
     // Without this, there is a window between spawn() returning and the
     // task's subscribe() call completing where a published message is lost.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-    let _handle = meeting_api::nats_consumers::spawn_consumer_inner(
+    let _handle = meeting_api::nats_consumers::spawn_meeting_ended_by_host_consumer_inner(
         Some(nats.clone()),
         pool.clone(),
         Some(ready_tx),

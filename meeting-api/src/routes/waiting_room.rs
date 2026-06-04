@@ -99,6 +99,16 @@ pub async fn admit_participant(
         .await?
         .ok_or_else(|| AppError::participant_not_found(&body.user_id))?;
 
+    // Admitting a participant adds a present participant to the call, so the
+    // meeting must be `active` (idle->active). `activate` is idempotent — on an
+    // already-active meeting it touches nothing — so calling it on every admit
+    // is safe and closes the gap where a meeting that briefly went `idle`
+    // (e.g. a stale empty event) would otherwise stay idle even though a
+    // participant just entered. It never resurrects an `ended` meeting in a way
+    // that surprises the admit flow because an ended meeting would not have a
+    // waiting participant to admit. See `db_meetings::activate`.
+    db_meetings::activate(&state.db, meeting.id).await?;
+
     // Notify the admitted participant via NATS. The client will fetch its room
     // token via HTTP after receiving this notification.
     nats_events::publish_participant_admitted(state.nats.as_ref(), &meeting_id, &body.user_id)
@@ -124,6 +134,13 @@ pub async fn admit_all(
 
     let rows = db_participants::admit_all(&state.db, meeting.id).await?;
     let admitted_count = rows.len();
+
+    // If we admitted anyone, the meeting now has present participants and must
+    // be `active` (idle->active). Idempotent on an already-active meeting; one
+    // call covers the whole batch (no per-row activate, no NATS/DB storm).
+    if admitted_count > 0 {
+        db_meetings::activate(&state.db, meeting.id).await?;
+    }
 
     // Notify all admitted participants via NATS in parallel. Clients will fetch
     // their room tokens via HTTP after receiving the notification.

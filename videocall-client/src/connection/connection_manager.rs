@@ -205,6 +205,57 @@ pub fn connection_session_drops() -> u64 {
     CONNECTION_SESSION_DROPS.load(Ordering::Relaxed)
 }
 
+// Transport re-election outcome counters (dashboard audit Tier B #3;
+// discussion #562). Module-level `AtomicU64`s mirroring the
+// handshake-failure / session-drop counters above: incremented from the four
+// terminal branches of `complete_election`, read by the health reporter at
+// packet-build time, and expanded by the relay's metrics_server into
+// `videocall_client_reelection_total{result=...}` so Grafana can chart
+// re-election rate AND outcome without console logs. Process-global (not
+// per-manager) for the same reason as the sibling counters: a reconnect builds
+// a fresh `ConnectionManager`, and we want the cumulative total across the
+// whole page session, which is exactly what `rate()`/`increase()` expects.
+//
+// Statics (not struct fields) also sidestep the borrow dance: they are bumped
+// from `&mut self` `complete_election` and read from the `&self` health-report
+// path with no interior mutability.
+
+/// Cumulative re-elections that switched to a NEW winning connection
+/// (excludes the cold-start initial election).
+static REELECTION_PROCEEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that ran but KEPT the existing connection because
+/// the winner was not meaningfully better (hysteresis abort).
+static REELECTION_ABORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections where all candidates failed but the old connection
+/// was still fresh and was PRESERVED (candidate-failure path, #539).
+static REELECTION_PRESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that FAILED with no usable connection
+/// ("Election failed: No valid connections") — the participant dropped off.
+static REELECTION_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that switched to a new winner since process start.
+pub fn reelection_proceeded_total() -> u64 {
+    REELECTION_PROCEEDED.load(Ordering::Relaxed)
+}
+
+/// Cumulative re-elections aborted by hysteresis since process start.
+pub fn reelection_aborted_total() -> u64 {
+    REELECTION_ABORTED.load(Ordering::Relaxed)
+}
+
+/// Cumulative re-elections that preserved the old connection since process start.
+pub fn reelection_preserved_total() -> u64 {
+    REELECTION_PRESERVED.load(Ordering::Relaxed)
+}
+
+/// Cumulative failed re-elections (no valid connection) since process start.
+pub fn reelection_failed_total() -> u64 {
+    REELECTION_FAILED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Testing {
@@ -1352,6 +1403,11 @@ impl ConnectionManager {
                             self.baseline_rtt = Some(comparison_rtt);
                             self.degradation_counter = 0;
                             self.reelection_in_progress = false;
+                            // Tier B #3: re-election ran but the winner was not
+                            // meaningfully better, so we kept the existing
+                            // connection. This `aborted` outcome is only ever
+                            // reached inside `if self.reelection_in_progress`.
+                            REELECTION_ABORTED.fetch_add(1, Ordering::Relaxed);
                             self.old_active_rtt = None;
                             self.old_active_rtt_measurement = None;
                             // The cycle reached an orderly conclusion — clear
@@ -1471,6 +1527,15 @@ impl ConnectionManager {
                 // Store baseline RTT for re-election quality monitoring.
                 self.baseline_rtt = measurement.average_rtt;
                 self.degradation_counter = 0;
+                // Tier B #3: count a `proceeded` outcome ONLY when this was a
+                // re-election (a switch away from a prior active connection),
+                // not the initial election — the dashboard story is "how often
+                // do we re-elect", so the cold-start election must not inflate
+                // the rate. `reelection_in_progress` is still true here; it is
+                // reset on the next line.
+                if self.reelection_in_progress {
+                    REELECTION_PROCEEDED.fetch_add(1, Ordering::Relaxed);
+                }
                 self.reelection_in_progress = false;
                 // Successful election — restore the full post-rebase retry budget.
                 self.post_rebase_retry_count = 0;
@@ -1532,6 +1597,10 @@ impl ConnectionManager {
                 // existing disconnect path so a genuinely dead session does
                 // not get pinned to a ghost connection forever.
                 if self.try_preserve_old_connection_on_candidate_failure(&e.to_string()) {
+                    // Tier B #3: all candidates failed but the old connection
+                    // was still fresh, so it was preserved (the call has NOT
+                    // dropped — distinct from the `failed` outcome below).
+                    REELECTION_PRESERVED.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
 
@@ -1539,6 +1608,23 @@ impl ConnectionManager {
                     reason: e.to_string(),
                     failed_at: monotonic_now_ms(),
                 };
+                // Tier B #3: terminal RE-ELECTION failure — no usable
+                // connection ("Election failed: No valid connections") for a
+                // participant who WAS already on a call and lost it. Gated on
+                // `reelection_in_progress` (same as `proceeded`/`aborted`) so
+                // the four buckets share one denominator: re-election outcomes
+                // only. `complete_election` also runs for the cold-start
+                // election (via `check_and_complete_election`); a first-connect
+                // that fails here must NOT bump this metric — that case is the
+                // initial-connect failure, already covered by the connection-
+                // failure counters, not a re-election. (`preserved` above is
+                // naturally re-election-only: it needs an `old_active_connection`
+                // that exists only during a re-election.) This matches the
+                // documented contract "buckets mirror the four terminal
+                // branches of re-election."
+                if self.reelection_in_progress {
+                    REELECTION_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
                 self.old_active_rtt = None;
                 self.old_active_rtt_measurement = None;
                 self.reelection_preserved_once = false;
@@ -3825,6 +3911,78 @@ mod tests {
 
         let packets = forwarded.borrow().clone();
         packets
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier B #3: re-election outcome counters (REELECTION_FAILED gating).
+    //
+    // `complete_election` runs for BOTH the cold-start election and re-elections
+    // (it is reached via `check_and_complete_election`). The fix gates the
+    // `REELECTION_FAILED` increment on `self.reelection_in_progress` so the four
+    // outcome buckets share one denominator (re-election only) and a first-
+    // connect failure does NOT pollute the `failed` bucket. These tests pin both
+    // halves of that contract.
+    //
+    // The counter is a process-global `AtomicU64`. These two tests are the ONLY
+    // callers of `complete_election` in the suite, but they could still race
+    // each other under the default parallel test runner, so they serialize on a
+    // shared mutex and assert on the DELTA (load before/after) rather than an
+    // absolute value — robust to any residual cross-test increment.
+    static REELECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drive `complete_election` into its terminal `Err` ("No valid
+    /// connections") branch: `rtt_measurements` is empty, so
+    /// `find_best_connection` returns `Err` and no preservation is possible.
+    /// Returns the increase in `REELECTION_FAILED` caused by this one call.
+    fn failed_delta_for_election(reelection_in_progress: bool) -> u64 {
+        let mut mgr = make_test_manager();
+        // No measurements => find_best_connection() fails => Err arm.
+        assert!(mgr.rtt_measurements.is_empty());
+        // No old_active_connection => try_preserve returns false => we reach
+        // the REELECTION_FAILED site.
+        assert!(mgr.old_active_connection.is_none());
+        mgr.reelection_in_progress = reelection_in_progress;
+
+        let before = REELECTION_FAILED.load(Ordering::Relaxed);
+        mgr.complete_election();
+        let after = REELECTION_FAILED.load(Ordering::Relaxed);
+        // Sanity: we actually landed in the Failed terminal state.
+        assert!(
+            matches!(mgr.election_state, ElectionState::Failed { .. }),
+            "expected ElectionState::Failed after a no-candidate election"
+        );
+        after - before
+    }
+
+    #[test]
+    fn cold_start_election_failure_does_not_bump_reelection_failed() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // reelection_in_progress == false models the initial cold-start
+        // election. Its failure is an initial-connect failure (covered by the
+        // connection-failure counters), NOT a re-election outcome.
+        let delta = failed_delta_for_election(/* reelection_in_progress = */ false);
+        assert_eq!(
+            delta, 0,
+            "cold-start election failure must NOT increment REELECTION_FAILED \
+             (it is not a re-election; gate on reelection_in_progress)"
+        );
+    }
+
+    #[test]
+    fn reelection_failure_bumps_reelection_failed() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // reelection_in_progress == true models a participant already on a call
+        // whose re-election found no usable connection ("No valid connections").
+        let delta = failed_delta_for_election(/* reelection_in_progress = */ true);
+        assert_eq!(
+            delta, 1,
+            "a re-election that hits 'No valid connections' MUST increment \
+             REELECTION_FAILED exactly once"
+        );
     }
 
     #[test]

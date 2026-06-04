@@ -190,6 +190,59 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
     String::new()
 }
 
+/// Simulcast capability gate (issue #989).
+///
+/// Maps a device's [`CapabilityVerdict`], its `videocall_capability_score()`
+/// (a synthetic per-device benchmark; higher = faster — see
+/// `videocall-client/src/capability.rs`), and the `older_intel` heuristic to
+/// the maximum number of simulcast layers the publisher should encode.
+///
+/// Encoding N layers is ~N× the encode CPU, so this is deliberately
+/// conservative — a weak publisher that overcommits to 3 layers would stall its
+/// own main thread (the exact failure mode discussion #890 / #562 documents on
+/// 2-core Intel Macs). Rules:
+///
+/// * **1 layer** (single stream, byte-identical to pre-simulcast) when the
+///   device is at all marginal: a [`Block`](CapabilityVerdict::Block) or
+///   [`StrongWarn`](CapabilityVerdict::StrongWarn) verdict, OR an older Intel
+///   Mac, OR a benchmark `score < 5000`.
+/// * **2 layers** for an [`Ok`](CapabilityVerdict::Ok) device with
+///   `5000 <= score < 30000`.
+/// * **3 layers** for an [`Ok`](CapabilityVerdict::Ok) device with
+///   `score >= 30000`.
+///
+/// Note this is only the *capability ceiling*. The effective layer count the
+/// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
+/// and the flag defaults to 1 (feature off) — so a high-end device still emits a single
+/// layer until an operator raises the flag for a controlled test meeting.
+///
+/// The only non-test caller is the wasm32-gated `capability_max_simulcast_layers`
+/// below, so a native non-test build (e.g. `cargo clippy --all`) sees this as
+/// dead code; the `allow` keeps that build warning-free without hiding genuine
+/// dead code on wasm or in the host test build.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn max_simulcast_layers(verdict: &CapabilityVerdict, score: u32, older_intel: bool) -> u32 {
+    const SCORE_FOR_2_LAYERS: u32 = 5000;
+    const SCORE_FOR_3_LAYERS: u32 = 30000;
+
+    let marginal = matches!(
+        verdict,
+        CapabilityVerdict::Block(_) | CapabilityVerdict::StrongWarn(_)
+    ) || older_intel
+        || score < SCORE_FOR_2_LAYERS;
+
+    if marginal {
+        return 1;
+    }
+
+    if score >= SCORE_FOR_3_LAYERS {
+        3
+    } else {
+        // Ok verdict, not older-intel, 5000 <= score < 30000.
+        2
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Browser-side wrapper. Compiled for both host and wasm32 — the lib itself
 // targets host for `cargo test --lib`, and `web_sys::window()` returning
@@ -247,6 +300,63 @@ pub fn assess_capability() -> CapabilityVerdict {
     }
 
     verdict
+}
+
+/// Device-capability ceiling on simulcast layers (issue #989), sniffed from
+/// the live browser environment.
+///
+/// Sniffs `navigator.hardwareConcurrency` + UA platform exactly once, derives
+/// the [`CapabilityVerdict`] and the `older_intel` heuristic from them, reads
+/// the publisher CPU benchmark via
+/// `videocall_client::capability::videocall_capability_score()`, then applies
+/// [`max_simulcast_layers`]. Returns a conservative **1** if the browser
+/// globals are unreachable.
+///
+/// This is only the capability ceiling; the encoder uses
+/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag defaults to 1.
+///
+/// wasm32-only: it sniffs `web_sys` navigator and calls
+/// `videocall_client::capability::videocall_capability_score()`, which is
+/// itself `#[cfg(target_arch = "wasm32")]`. The pure-logic
+/// [`max_simulcast_layers`] above is available on host for unit testing.
+#[cfg(target_arch = "wasm32")]
+pub fn capability_max_simulcast_layers() -> u32 {
+    let Some(window) = web_sys::window() else {
+        return 1;
+    };
+    let navigator = window.navigator();
+
+    let cores_f64 = navigator.hardware_concurrency();
+    let cores: u32 = if cores_f64.is_finite() && cores_f64 >= 1.0 {
+        cores_f64.min(u32::MAX as f64) as u32
+    } else {
+        0
+    };
+
+    let user_agent = navigator.user_agent().unwrap_or_default();
+    let platform = parse_platform_from_ua(&user_agent);
+
+    let verdict = assess_from_inputs(cores, &platform);
+    let older_intel = is_older_intel_mac(&platform, cores);
+    let score = videocall_client::capability::videocall_capability_score();
+
+    let layers = max_simulcast_layers(&verdict, score, older_intel);
+    log::info!(
+        "simulcast capability ceiling: {layers} layer(s) (cores={cores} platform={platform:?} score={score} older_intel={older_intel})"
+    );
+    layers
+}
+
+/// Host-build stub of [`capability_max_simulcast_layers`]. The real
+/// implementation is wasm32-only (it needs `web_sys` navigator + the
+/// wasm-gated capability benchmark). On host — where `cargo test --lib`
+/// compiles `host.rs` — there is no browser to sniff, so we return the
+/// conservative single-layer ceiling. `host.rs` is browser-only at runtime, so
+/// this stub is never actually exercised; it exists purely so the native test
+/// build links.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn capability_max_simulcast_layers() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -495,5 +605,66 @@ mod tests {
     fn unknown_ua_returns_empty_platform() {
         assert_eq!(parse_platform_from_ua("Mozilla/5.0 (Unknown OS)"), "");
         assert_eq!(parse_platform_from_ua(""), "");
+    }
+
+    // --- max_simulcast_layers (issue #989) ------------------------------
+    //
+    // Six boundary cases spanning every branch and both score thresholds.
+
+    #[test]
+    fn simulcast_block_verdict_is_one_layer() {
+        // A Block verdict pins to 1 even with an otherwise-huge score.
+        assert_eq!(
+            max_simulcast_layers(&CapabilityVerdict::Block("too weak".into()), 99_999, false),
+            1
+        );
+    }
+
+    #[test]
+    fn simulcast_strong_warn_verdict_is_one_layer() {
+        // StrongWarn (e.g. cores < 6) pins to 1 regardless of score.
+        assert_eq!(
+            max_simulcast_layers(
+                &CapabilityVerdict::StrongWarn("limited cpu".into()),
+                99_999,
+                false
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn simulcast_older_intel_is_one_layer() {
+        // Older Intel Mac pins to 1 even on an Ok verdict + high score.
+        assert_eq!(
+            max_simulcast_layers(&CapabilityVerdict::Ok, 99_999, true),
+            1
+        );
+    }
+
+    #[test]
+    fn simulcast_low_score_ok_is_one_layer() {
+        // Ok verdict but score just below the 2-layer threshold → 1.
+        assert_eq!(max_simulcast_layers(&CapabilityVerdict::Ok, 4999, false), 1);
+    }
+
+    #[test]
+    fn simulcast_mid_score_ok_is_two_layers() {
+        // Lower boundary of the 2-layer band (inclusive).
+        assert_eq!(max_simulcast_layers(&CapabilityVerdict::Ok, 5000, false), 2);
+        // Just below the 3-layer threshold stays at 2.
+        assert_eq!(
+            max_simulcast_layers(&CapabilityVerdict::Ok, 29_999, false),
+            2
+        );
+    }
+
+    #[test]
+    fn simulcast_high_score_ok_is_three_layers() {
+        // Lower boundary of the 3-layer band (inclusive).
+        assert_eq!(
+            max_simulcast_layers(&CapabilityVerdict::Ok, 30_000, false),
+            3
+        );
     }
 }

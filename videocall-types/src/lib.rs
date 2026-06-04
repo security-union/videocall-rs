@@ -99,6 +99,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::VIEWPORT => {
                 write!(f, "VIEWPORT")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::LAYER_PREFERENCE => {
+                write!(f, "LAYER_PREFERENCE")
+            }
         }
     }
 }

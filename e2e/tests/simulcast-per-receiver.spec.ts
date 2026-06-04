@@ -34,10 +34,13 @@
  *          and the >1-layer assertion is capability-gated like VIDEO send.
  *
  *   - FLAG-OFF CONTROL (separate describe block at the bottom):
- *       Default config (no `enableSimulcastFlag`) → flag = 1 = OFF. The publisher
- *       emits a SINGLE layer for every kind, so each received-quality readout
- *       reports `/1`. This guards the no-regression byte-identical single-layer
- *       path for #1082 (the ladder machinery went N-generic but default behavior
+ *       Flag pinned to 1 via `pinSimulcastMaxLayers(ctx, 1)` = single layer =
+ *       feature OFF. (The runtime DEFAULT was flipped 1 → 3, so the OFF path can
+ *       no longer be reached by simply omitting the flag — it must be pinned to 1
+ *       explicitly.) The publisher then emits a SINGLE layer for every kind, so
+ *       each received-quality readout reports `/1`. This guards the
+ *       no-regression byte-identical single-layer path for #1082 (the ladder
+ *       machinery went N-generic but the single-layer behavior
  *       must be unchanged).
  *
  *   - RUNS UNDER THE `@impair` PROJECT ONLY (issue #1080):
@@ -83,7 +86,7 @@
 
 import { test, expect, chromium, Browser, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
-import { enableSimulcastFlag } from "../helpers/simulcast-config";
+import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
   routeDownlinkThroughProxy,
   impairDownlink,
@@ -834,31 +837,34 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Flag-OFF control (default production config) — no-regression guard for #1082.
+// Flag-OFF control — single-layer no-regression guard for #1082.
 //
-// With NO `enableSimulcastFlag` call the flag falls back to its serde default of
-// 1 (= single layer / feature OFF), which is exactly what production ships. The
-// #1082 ladder machinery went N-generic but MUST NOT change this default path:
-// the publisher emits a single layer for every kind, byte-identical to the
-// pre-simulcast encoders. The DOM-observable proof is that every received
-// readout reports `/1` (a single-layer ladder) once decoding begins.
+// IMPORTANT: the runtime default of `experimentalSimulcastMaxLayers` was flipped
+// from 1 → 3 (multicast ON by default). So "set no flag" no longer means OFF —
+// it now means 3. To genuinely exercise the single-layer / feature-OFF path this
+// test PINS the flag to 1 explicitly via `pinSimulcastMaxLayers(ctx, 1)` on both
+// ends. The #1082 ladder machinery went N-generic but MUST NOT change the
+// single-layer path: with the flag at 1 the publisher emits a single layer for
+// every kind, byte-identical to the pre-simulcast encoders. The DOM-observable
+// proof is that every received readout reports `/1` (a single-layer ladder)
+// once decoding begins.
 // ---------------------------------------------------------------------------
-test.describe("Simulcast flag OFF (default) — single-layer no-regression", () => {
+test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression", () => {
   test.describe.configure({ timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test("default config emits a single layer for video, audio, and content", async ({ baseURL }) => {
+  test("flag pinned to 1 emits a single layer for video, audio, and content", async ({
+    baseURL,
+  }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_off_${Date.now()}`;
 
     const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
     const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
-      // NOTE: deliberately NO enableSimulcastFlag() — exercise the production
-      // default (flag = 1 = OFF) on BOTH ends.
       const pubCtx = await createAuthenticatedContext(
         pubBrowser,
         "sim-off-pub@videocall.rs",
@@ -871,6 +877,11 @@ test.describe("Simulcast flag OFF (default) — single-layer no-regression", () 
         "SimOffReceiver",
         uiURL,
       );
+      // Explicitly PIN the flag to 1 (= single layer / OFF) on BOTH ends. The
+      // runtime default is now 3, so omitting the flag would NOT exercise the
+      // OFF path — it would emit 3 layers. Must run before the first navigation.
+      await pinSimulcastMaxLayers(pubCtx, 1);
+      await pinSimulcastMaxLayers(rxCtx, 1);
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();

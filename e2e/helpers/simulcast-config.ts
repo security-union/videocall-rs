@@ -97,3 +97,32 @@ export async function enableSimulcastFlag(
     });
   });
 }
+
+/**
+ * Pin `experimentalSimulcastMaxLayers` to an EXPLICIT value for a context,
+ * regardless of the production default. Thin wrapper over
+ * {@link enableSimulcastFlag} so the OFF-path / single-layer no-regression test
+ * reads correctly (`pinSimulcastMaxLayers(ctx, 1)`) instead of the misleading
+ * `enableSimulcastFlag(ctx, 1)`.
+ *
+ * ## Why this is now REQUIRED for the OFF path (not just stylistic)
+ *
+ * The runtime default of `experimentalSimulcastMaxLayers`
+ * (`dioxus-ui/src/constants.rs`) has been flipped from `1` → `3` (multicast ON
+ * by default). A test that sets NO flag therefore now gets `3`, not `1`. To
+ * genuinely exercise the single-layer / feature-OFF path, the OFF test must pin
+ * the value to `1` explicitly via this helper rather than relying on the
+ * (no-longer-1) default.
+ *
+ * Must be called BEFORE the first navigation in the context (same constraint as
+ * {@link enableSimulcastFlag}).
+ *
+ * @param context   The BrowserContext to patch (route is context-scoped).
+ * @param maxLayers The exact value to inject (e.g. `1` for the OFF path).
+ */
+export async function pinSimulcastMaxLayers(
+  context: BrowserContext,
+  maxLayers: number,
+): Promise<void> {
+  await enableSimulcastFlag(context, maxLayers);
+}

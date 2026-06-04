@@ -60,13 +60,52 @@ use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
 
 use crate::adaptive_quality_constants::{
-    BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX, ENCODER_PLI_COOLDOWN_MS,
-    SCREEN_QUALITY_TIERS,
+    simulcast_screen_layers, BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX,
+    ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use videocall_aq::fit_within_preserving_aspect;
+
+/// Upper bound on SCREEN simulcast layers regardless of what the caller
+/// requests (issue #989, Phase 3b). Matches the 3-tier screen ladder the AQ
+/// crate defines (`simulcast_screen_layers`). The caller passes 1 by default
+/// (feature off → single layer, byte-identical to the pre-simulcast path).
+const SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
+
+/// Clamp a requested screen `max_layers` to the supported range. `0` (meaningless
+/// — there is always the base layer) becomes 1. Free function so it is
+/// unit-testable without a live `ScreenEncoder`.
+fn clamp_screen_layer_count(max_layers: u32) -> u32 {
+    max_layers.clamp(1, SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS)
+}
+
+/// One screen simulcast layer's encoder + per-layer mutable encode state
+/// (issue #989, Phase 3b). Mirrors the camera's `LayerEncoder`. Local to
+/// `run_screen_encoding`. The WebCodecs output/error `Closure`s must outlive the
+/// `VideoEncoder` that holds JS references to them, so they are stored here
+/// (leading underscore = held only to keep the JS callbacks alive).
+struct LayerEncoder {
+    /// This layer's WebCodecs `VideoEncoder`.
+    encoder: Box<VideoEncoder>,
+    /// Reused config object for in-place bitrate/dimension reconfiguration.
+    config: VideoEncoderConfig,
+    /// Output-handler-owned sequence cell, read back after the encode loop to
+    /// persist this layer's sequence across `'restart`.
+    seq_out: Rc<std::cell::Cell<u64>>,
+    /// This layer's simulcast id, stamped onto every emitted `PacketWrapper`.
+    layer_id: u32,
+    /// Cached bitrate (bps) last applied to this layer's encoder. Resolution is
+    /// FIXED per screen tier (set once at construction), so unlike the camera's
+    /// `LayerEncoder` there are no per-layer width/height fields — only the
+    /// bitrate adapts.
+    local_bitrate: u32,
+    /// Kept alive so the JS output callback stays valid.
+    _output_closure: Closure<dyn FnMut(JsValue)>,
+    /// Kept alive so the JS error callback stays valid.
+    _error_closure: Closure<dyn FnMut(JsValue)>,
+}
 
 // ── Screen encoder error observability counters (cumulative, since page load) ─
 // Mirrors the camera encoder pattern. See camera_encoder.rs for design rationale.
@@ -231,6 +270,22 @@ pub struct ScreenEncoder {
     /// `"cpu-pressure"`, `"network-rtt"`, `"network-loss"`, `"manual-cap"`.
     /// Empty when AQ is unconstrained or no transition has happened yet.
     shared_screen_cause_hint: Rc<RefCell<String>>,
+    /// Maximum number of SCREEN simulcast layers to emit (issue #989, Phase 3b).
+    /// Computed in the UI as `min(experimentalSimulcastMaxLayers, capability
+    /// ceiling)`, exactly like the camera. Defaults to 1 (feature off →
+    /// single-layer, byte-identical to the pre-simulcast screen path).
+    max_layers: u32,
+    /// Number of screen layers currently active (encoded + sent), written by the
+    /// screen AQ control loop and read by the encode loop. 1 in single-stream
+    /// mode (gates nothing). The encode loop encodes only layers with
+    /// `layer_id < active_layer_count`, so a shed top layer costs no egress or
+    /// sender encode CPU.
+    shared_active_layer_count: Rc<AtomicU32>,
+    /// Per-layer target bitrate (bps), one atomic per screen ladder layer
+    /// (lowest first, index == `layer_id`). Written by the screen AQ control
+    /// loop in simulcast mode; read by the encode loop. Empty in single-stream
+    /// mode (the legacy `current_bitrate` atomic is used instead).
+    shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
 }
 
 impl ScreenEncoder {
@@ -241,6 +296,11 @@ impl ScreenEncoder {
     /// * `on_encoder_settings_update` - callback for encoder settings updates (e.g., bitrate changes)
     /// * `on_state_change` - callback for screen share state changes (started, cancelled, stopped)
     /// * `screen_sharing_active` - shared coordination flag; obtain from [`CameraEncoder::screen_sharing_flag()`](crate::CameraEncoder::screen_sharing_flag)
+    /// * `max_layers` - maximum number of SCREEN simulcast layers to emit (issue
+    ///   #989, Phase 3b). The UI passes `min(experimentalSimulcastMaxLayers,
+    ///   capability ceiling)`, exactly like the camera. Clamped to
+    ///   [`SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS`]; `0`/`1` yield a single layer
+    ///   (byte-identical to the legacy screen path).
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     pub fn new(
@@ -249,6 +309,7 @@ impl ScreenEncoder {
         on_encoder_settings_update: Callback<String>,
         on_state_change: Callback<ScreenShareEvent>,
         screen_sharing_active: Rc<AtomicBool>,
+        max_layers: u32,
     ) -> Self {
         let default_tier = &SCREEN_QUALITY_TIERS[DEFAULT_SCREEN_TIER_INDEX];
         Self {
@@ -271,7 +332,18 @@ impl ScreenEncoder {
             shared_screen_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_screen_adaptive_tier: Rc::new(RefCell::new(String::new())),
             shared_screen_cause_hint: Rc::new(RefCell::new(String::new())),
+            max_layers,
+            shared_active_layer_count: Rc::new(AtomicU32::new(clamp_screen_layer_count(
+                max_layers,
+            ))),
+            shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// Effective number of screen simulcast layers to encode this session.
+    /// Clamps the caller-supplied `max_layers` to `[1, MAX]`. Default 1.
+    fn effective_layer_count(&self) -> u32 {
+        clamp_screen_layer_count(self.max_layers)
     }
 
     /// Replace the internal re-election completed signal with an externally-owned one.
@@ -305,11 +377,41 @@ impl ScreenEncoder {
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
+        // Screen simulcast (issue #989, Phase 3b): mirror the camera wiring.
+        let n_layers = self.effective_layer_count() as usize;
+        let shared_active_layer_count = self.shared_active_layer_count.clone();
+        let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
+            // Enable simulcast on the screen controller when >1 layer. The
+            // controller is `is_screen`, so its per-layer PIDs use the SCREEN
+            // ladder. n_layers == 1 leaves it single-stream (byte-identical).
+            if n_layers > 1 {
+                encoder_control.set_simulcast_layers(n_layers);
+                let mut atomics = shared_layer_bitrates_bps.borrow_mut();
+                if atomics.len() != n_layers {
+                    *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
+                }
+            }
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
+
+                // Screen simulcast (issue #989, Phase 3b): publish the active
+                // layer count + per-layer target bitrates to the encode loop
+                // every tick. Skipped entirely in single-stream mode, so the
+                // legacy behavior is byte-identical.
+                if encoder_control.is_simulcast() {
+                    let active = encoder_control.active_layer_count() as u32;
+                    shared_active_layer_count.store(active, Ordering::Relaxed);
+                    let per_layer = encoder_control.layer_target_bitrates_kbps();
+                    let atomics = shared_layer_bitrates_bps.borrow();
+                    for (i, atomic) in atomics.iter().enumerate() {
+                        if let Some(&kbps) = per_layer.get(i) {
+                            atomic.store((kbps * 1000.0) as u32, Ordering::Relaxed);
+                        }
+                    }
+                }
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
                         // Only update if change is greater than threshold
@@ -628,6 +730,9 @@ impl ScreenEncoder {
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
+        let n_layers = self.effective_layer_count() as usize;
+        let shared_active_layer_count = self.shared_active_layer_count.clone();
+        let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let screen_to_share = stream;
@@ -656,6 +761,9 @@ impl ScreenEncoder {
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
+                n_layers,
+                shared_active_layer_count,
+                shared_layer_bitrates_bps,
             )
             .await;
         });
@@ -704,6 +812,9 @@ impl ScreenEncoder {
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
+        let n_layers = self.effective_layer_count() as usize;
+        let shared_active_layer_count = self.shared_active_layer_count.clone();
+        let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -820,6 +931,9 @@ impl ScreenEncoder {
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
+                n_layers,
+                shared_active_layer_count,
+                shared_layer_bitrates_bps,
             )
             .await;
         });
@@ -865,7 +979,19 @@ impl ScreenEncoder {
         shared_target_bitrate: Rc<AtomicU32>,
         shared_adaptive_tier: Rc<RefCell<String>>,
         shared_cause_hint: Rc<RefCell<String>>,
+        // Screen simulcast (issue #989, Phase 3b). `n_layers == 1` → single
+        // encoder, byte-identical to the legacy path. `n_layers > 1` → one
+        // VideoEncoder per layer at its fixed SCREEN-ladder resolution, with the
+        // AQ controller shedding the top active layer under sender congestion.
+        n_layers: usize,
+        shared_active_layer_count: Rc<AtomicU32>,
+        shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
     ) {
+        let simulcast = n_layers > 1;
+        // Per-layer sequence numbers persist across restarts so a receiver
+        // decoding one screen layer sees a dense 0,1,2,… stream (no phantom
+        // loss). N=1 is a single-element Vec behaving like the old scalar.
+        let mut sequence_numbers: Vec<u64> = vec![0; n_layers];
         // Signal camera encoder ASAP after capture is confirmed so it begins
         // stepping down during encoder setup, not after encoding starts.
         screen_sharing_active.store(true, Ordering::Release);
@@ -1005,6 +1131,9 @@ impl ScreenEncoder {
                     target_bitrate_now,
                     adaptive_tier_now,
                     cause_hint_now,
+                    // N=1 single-layer path: layer 0 (wire-absent), byte-identical
+                    // to the pre-simulcast screen publisher.
+                    0,
                 );
                 // Phase 2 of WT freeze fix: route screen-share video on its
                 // own persistent QUIC stream, isolated from the camera and
@@ -1296,6 +1425,123 @@ impl ScreenEncoder {
                 continue 'restart;
             }
 
+            // --- Screen simulcast: build the HIGHER layers (issue #989, P3b) ---
+            // The existing `screen_encoder` above IS the base layer (layer 0),
+            // driven unchanged by the loop below so the N=1 path is byte-
+            // identical. For simulcast we additionally build layers 1..n, each
+            // its own VideoEncoder at its FIXED SCREEN-ladder resolution + its
+            // own per-layer output handler (own seq + layer_id stamp). The
+            // encode loop feeds the same captured frame to every active layer
+            // and reconfigures each layer's bitrate from the AQ control loop.
+            // Layers >= active_layer_count are skipped (shed) — no encode CPU,
+            // no egress.
+            let mut extra_layers: Vec<LayerEncoder> = Vec::new();
+            if simulcast {
+                let screen_tiers = simulcast_screen_layers(n_layers);
+                // layer_idx 1..n (layer 0 is the base `screen_encoder`).
+                for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate().skip(1) {
+                    let layer_id = layer_idx as u32;
+                    let tier = &screen_tiers[layer_idx];
+                    let layer_w = tier.max_width;
+                    let layer_h = tier.max_height;
+                    let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
+
+                    // Per-layer output handler: own seq cell + #903 metadata
+                    // (shared, stream-level) + layer_id stamp.
+                    let (output_box, seq_out) = {
+                        let client = client.clone();
+                        let userid = userid.clone();
+                        let aes = aes.clone();
+                        let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
+                        let mut local_seq = initial_seq;
+                        let seq_out = Rc::new(std::cell::Cell::new(initial_seq));
+                        let seq_out_inner = seq_out.clone();
+                        let source_w = source_width_atomic.clone();
+                        let source_h = source_height_atomic.clone();
+                        let target_bitrate = shared_target_bitrate.clone();
+                        let adaptive_tier = shared_adaptive_tier.clone();
+                        let cause_hint = shared_cause_hint.clone();
+                        (
+                            Box::new(move |chunk: JsValue| {
+                                let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                                // NOTE: higher layers do NOT update current_fps
+                                // (only the base layer does), so the AQ setpoint
+                                // is not inflated N×.
+                                let byte_length = chunk.byte_length() as usize;
+                                if buffer.len() < byte_length {
+                                    buffer.resize(byte_length, 0);
+                                }
+                                let packet: PacketWrapper = transform_screen_chunk(
+                                    chunk,
+                                    local_seq,
+                                    buffer.as_mut_slice(),
+                                    &userid,
+                                    aes.clone(),
+                                    source_w.load(Ordering::Relaxed),
+                                    source_h.load(Ordering::Relaxed),
+                                    target_bitrate.load(Ordering::Relaxed),
+                                    adaptive_tier.borrow().clone(),
+                                    cause_hint.borrow().clone(),
+                                    layer_id,
+                                );
+                                client.send_media_packet(packet, MediaStreamKey::Screen);
+                                local_seq += 1;
+                                seq_out_inner.set(local_seq);
+                            }) as Box<dyn FnMut(JsValue)>,
+                            seq_out,
+                        )
+                    };
+                    let error_closure = Closure::wrap(Box::new(move |e: JsValue| {
+                        error!("Screen encoder error (layer {layer_id}): {e:?}");
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+                    let output_closure = Closure::wrap(output_box);
+                    let init = VideoEncoderInit::new(
+                        error_closure.as_ref().unchecked_ref(),
+                        output_closure.as_ref().unchecked_ref(),
+                    );
+                    let encoder = match VideoEncoder::new(&init) {
+                        Ok(enc) => Box::new(enc),
+                        Err(e) => {
+                            error!("Failed to create screen encoder (layer {layer_id}): {e:?}");
+                            for built in &extra_layers {
+                                let _ = built.encoder.close();
+                            }
+                            let _ = screen_encoder.close();
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                    };
+                    let config =
+                        VideoEncoderConfig::new(get_video_codec_string(), layer_h, layer_w);
+                    config.set_bitrate(init_bitrate_bps);
+                    config.set_latency_mode(LatencyMode::Realtime);
+                    set_vbr_mode(&config);
+                    if let Err(e) = encoder.configure(&config) {
+                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                        error!("Error configuring screen encoder (layer {layer_id}): {e:?}");
+                        if is_fatal_encoder_error(&e) {
+                            let _ = encoder.close();
+                            for built in &extra_layers {
+                                let _ = built.encoder.close();
+                            }
+                            let _ = screen_encoder.close();
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                    }
+                    extra_layers.push(LayerEncoder {
+                        encoder,
+                        config,
+                        seq_out,
+                        layer_id,
+                        local_bitrate: init_bitrate_bps as u32,
+                        _output_closure: output_closure,
+                        _error_closure: error_closure,
+                    });
+                }
+            }
+
             // --- Create MediaStreamTrackProcessor + reader ---
             // These must be re-created each restart because the previous reader
             // may be in an error state after the encoder died mid-read.
@@ -1371,6 +1617,10 @@ impl ScreenEncoder {
                     track_ref.stop();
                     if let Err(e) = screen_encoder.close() {
                         error!("Error closing screen encoder: {e:?}");
+                    }
+                    // Close higher simulcast layers too (no-op when N=1).
+                    for layer in &extra_layers {
+                        let _ = layer.encoder.close();
                     }
                     // Break to final cleanup — not a restart.
                     break 'restart;
@@ -1485,6 +1735,72 @@ impl ScreenEncoder {
                     }
                 } else if new_bitrate != local_bitrate {
                     local_bitrate = new_bitrate;
+                }
+
+                // --- Screen simulcast per-layer bitrate reconfigure (#989 P3b) ---
+                // In simulcast mode, drive the BASE layer (layer 0) bitrate from
+                // its per-layer atomic (budget-capped by the AQ controller) and
+                // reconfigure each ACTIVE higher layer's bitrate from its atomic.
+                // Layers >= active are shed (skipped). No-op when N=1.
+                let local_active_layers = if simulcast {
+                    shared_active_layer_count.load(Ordering::Relaxed) as usize
+                } else {
+                    1
+                };
+                if simulcast {
+                    let atomics = shared_layer_bitrates_bps.borrow();
+                    // Base layer (0): apply its per-layer target to screen_encoder.
+                    if let Some(a) = atomics.first() {
+                        let want = a.load(Ordering::Relaxed);
+                        if want > 0
+                            && want != local_bitrate
+                            && screen_encoder.state() != CodecState::Closed
+                        {
+                            local_bitrate = want;
+                            let cfg = VideoEncoderConfig::new(
+                                get_video_codec_string(),
+                                current_encoder_height,
+                                current_encoder_width,
+                            );
+                            cfg.set_bitrate(local_bitrate as f64);
+                            cfg.set_latency_mode(LatencyMode::Realtime);
+                            set_vbr_mode(&cfg);
+                            if let Err(e) = screen_encoder.configure(&cfg) {
+                                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                error!("Error reconfiguring base screen layer bitrate: {e:?}");
+                                if is_fatal_encoder_error(&e) {
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+                            }
+                        }
+                    }
+                    // Higher layers: per-layer bitrate (fixed resolution).
+                    for layer in extra_layers.iter_mut() {
+                        if (layer.layer_id as usize) >= local_active_layers {
+                            continue; // shed
+                        }
+                        let want = atomics
+                            .get(layer.layer_id as usize)
+                            .map(|a| a.load(Ordering::Relaxed))
+                            .unwrap_or(0);
+                        if want > 0
+                            && want != layer.local_bitrate
+                            && layer.encoder.state() != CodecState::Closed
+                        {
+                            layer.local_bitrate = want;
+                            layer.config.set_bitrate(layer.local_bitrate as f64);
+                            if let Err(e) = layer.encoder.configure(&layer.config) {
+                                SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                error!(
+                                    "Error reconfiguring screen layer {} bitrate: {e:?}",
+                                    layer.layer_id
+                                );
+                            }
+                        }
+                    }
                 }
 
                 match JsFuture::from(screen_reader.read()).await {
@@ -1643,6 +1959,49 @@ impl ScreenEncoder {
                                 error!("Error encoding screen frame: {e:?}");
                             }
                         }
+
+                        // --- Screen simulcast: feed the SAME frame to active
+                        // higher layers (issue #989, P3b) ---
+                        // Reuse the same `opts` so every layer's keyframes are
+                        // synchronized. Higher layers downscale the frame to
+                        // their fixed tier resolution automatically. Shed layers
+                        // (layer_id >= active) are skipped — zero CPU/egress.
+                        // A non-fatal per-layer encode error is logged and the
+                        // base layer continues; the base layer alone governs the
+                        // restart counter (every receiver can decode the base).
+                        for layer in extra_layers.iter_mut() {
+                            if (layer.layer_id as usize) >= local_active_layers {
+                                continue;
+                            }
+                            match layer.encoder.encode_with_options(&video_frame, &opts) {
+                                Ok(_) => {
+                                    SCREEN_ENCODER_FRAMES_SUBMITTED_OK
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    let msg = format!("{e:?}");
+                                    match classify_encode_error(&msg) {
+                                        EncodeErrorBucket::ClosedCodec => {
+                                            SCREEN_ENCODER_ERRORS_CLOSED_CODEC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::VpxMemAlloc => {
+                                            SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        EncodeErrorBucket::Generic => {
+                                            SCREEN_ENCODER_ERRORS_GENERIC
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    error!(
+                                        "Error encoding screen frame (layer {}): {e:?}",
+                                        layer.layer_id
+                                    );
+                                }
+                            }
+                        }
+
                         video_frame.close();
                         screen_frame_counter += 1;
                     }
@@ -1654,9 +2013,20 @@ impl ScreenEncoder {
             } // end 'encode
 
             // --- Post-inner-loop: decide restart vs full exit ---
-            // Close the dead encoder before restarting (best-effort; it may
+            // Persist each higher layer's sequence so the next restart cycle
+            // continues numbering where we left off (dense per-layer stream).
+            for layer in &extra_layers {
+                sequence_numbers[layer.layer_id as usize] = layer.seq_out.get();
+            }
+            // Close the dead encoder(s) before restarting (best-effort; they may
             // already be closed).
             let _ = screen_encoder.close();
+            for layer in &extra_layers {
+                let _ = layer.encoder.close();
+            }
+            // Drop the higher layers (and their closures) before the next
+            // 'restart iteration rebuilds them.
+            drop(extra_layers);
 
             if fatal_encode_exit {
                 // Fatal encode error: the encoder died but the stream may be
@@ -1709,9 +2079,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::cause_hint_from_trigger;
+    use super::clamp_screen_layer_count;
     use super::is_fatal_encoder_error_message;
     use super::should_reacquire_screen_capture;
     use super::ScreenEncoder;
+    use super::SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS;
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
 
     fn build_test_client() -> VideoCallClient {
@@ -1770,6 +2142,23 @@ mod tests {
     }
 
     #[test]
+    fn clamp_screen_layer_count_treats_zero_and_one_as_one() {
+        // 0 and 1 → single layer (feature off / byte-identical screen path).
+        assert_eq!(clamp_screen_layer_count(0), 1);
+        assert_eq!(clamp_screen_layer_count(1), 1);
+    }
+
+    #[test]
+    fn clamp_screen_layer_count_passes_through_and_caps() {
+        assert_eq!(clamp_screen_layer_count(2), 2);
+        assert_eq!(clamp_screen_layer_count(3), 3);
+        assert_eq!(
+            clamp_screen_layer_count(99),
+            SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS
+        );
+    }
+
+    #[test]
     fn screen_encoder_fatal_errors_match_closed_codec_signatures() {
         assert!(is_fatal_encoder_error_message(
             "InvalidStateError: closed codec"
@@ -1808,6 +2197,7 @@ mod tests {
             Callback::from(|_: String| {}),
             Callback::from(|_: ScreenShareEvent| {}),
             Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
         );
         let shared_signal = Rc::new(AtomicBool::new(false));
         encoder.set_reelection_completed_signal(shared_signal.clone());
@@ -1850,6 +2240,7 @@ mod tests {
             Callback::from(|_: String| {}),
             Callback::from(|_: ScreenShareEvent| {}),
             Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
         );
 
         encoder.apply_initial_tier(0);
@@ -1885,6 +2276,7 @@ mod tests {
             Callback::from(|_: String| {}),
             Callback::from(|_: ScreenShareEvent| {}),
             Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
         );
 
         encoder.apply_initial_tier(1);

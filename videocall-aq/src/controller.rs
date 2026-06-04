@@ -421,6 +421,11 @@ pub struct EncoderBitrateController {
     /// rest are retained so a layer that is re-added resumes near its last
     /// target rather than jumping. Empty in single-stream mode.
     last_layer_target_bitrates_kbps: Vec<f64>,
+    /// Whether this controller drives SCREEN share (issue #989, Phase 3b). When
+    /// true, [`set_simulcast_layers`](Self::set_simulcast_layers) builds its
+    /// per-layer PIDs from the SCREEN ladder (`simulcast_screen_layers`) rather
+    /// than the camera ladder (`simulcast_layers`). Set by `new_for_screen`.
+    is_screen: bool,
 }
 
 impl EncoderBitrateController {
@@ -443,7 +448,14 @@ impl EncoderBitrateController {
     ) -> Self {
         let quality_manager =
             AdaptiveQualityManager::with_clock(VIDEO_QUALITY_TIERS, Arc::clone(&clock));
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager, clock)
+        // is_screen = false → camera simulcast ladder.
+        Self::build(
+            ideal_bitrate_kbps,
+            target_fps,
+            quality_manager,
+            clock,
+            false,
+        )
     }
 
     /// Create a new bitrate controller for screen share.
@@ -469,15 +481,21 @@ impl EncoderBitrateController {
         let quality_manager =
             AdaptiveQualityManager::new_for_screen_with_clock(video_tiers, Arc::clone(&clock));
         let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        Self::build(tier_ideal, target_fps, quality_manager, clock)
+        // is_screen = true so simulcast layer PIDs use the SCREEN ladder.
+        Self::build(tier_ideal, target_fps, quality_manager, clock, true)
     }
 
     /// Internal constructor shared by `new` and `new_for_screen`.
+    ///
+    /// `is_screen` selects which simulcast ladder
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers) builds per-layer PIDs
+    /// from: the SCREEN ladder when `true`, otherwise the camera ladder.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Arc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
         clock: Arc<dyn Clock>,
+        is_screen: bool,
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
@@ -523,6 +541,7 @@ impl EncoderBitrateController {
             // set_simulcast_layers().
             layer_pids: Vec::new(),
             last_layer_target_bitrates_kbps: Vec::new(),
+            is_screen,
         }
     }
 
@@ -547,13 +566,24 @@ impl EncoderBitrateController {
             return;
         }
         let initial_target = self.target_fps.load(Ordering::Relaxed) as f64;
-        let tiers = simulcast_layers(effective);
+        let tiers = self.simulcast_ladder(effective);
         self.layer_pids = tiers
             .iter()
             .map(|tier| LayerPidState::new(tier, initial_target))
             .collect();
         self.last_layer_target_bitrates_kbps =
             tiers.iter().map(|t| t.ideal_bitrate_kbps as f64).collect();
+    }
+
+    /// The simulcast layer ladder for this controller: SCREEN ladder when this
+    /// controller drives screen share, otherwise the camera ladder (issue #989,
+    /// Phase 3b). Both are `&'static` and lowest-layer-first.
+    fn simulcast_ladder(&self, n: usize) -> &'static [VideoQualityTier] {
+        if self.is_screen {
+            crate::constants::simulcast_screen_layers(n)
+        } else {
+            simulcast_layers(n)
+        }
     }
 
     // Calculate the standard deviation of FPS values to measure jitter
@@ -939,7 +969,7 @@ impl EncoderBitrateController {
         // (not encoded/sent). The base layer keeps its floor so it stays
         // viewable. No-op when the layers already fit (the common case at low
         // tiers), so it never disturbs an already-affordable configuration.
-        let tiers = simulcast_layers(self.layer_pids.len());
+        let tiers = self.simulcast_ladder(self.layer_pids.len());
         let budget = uplink_budget_kbps(tiers, active);
         cap_layers_to_budget(
             &mut self.last_layer_target_bitrates_kbps,
@@ -2669,6 +2699,31 @@ mod tests {
         assert!(!controller.is_simulcast());
         assert_eq!(controller.active_layer_count(), 1);
         assert!(controller.layer_target_bitrates_kbps().is_empty());
+    }
+
+    #[test]
+    fn test_screen_controller_uses_screen_simulcast_ladder() {
+        // Phase 3b: a SCREEN controller must build its per-layer PIDs from the
+        // SCREEN ladder (simulcast_screen_layers), NOT the camera ladder. The
+        // 3-layer screen ladder is [low 720p, medium 720p, high 1080p].
+        use crate::constants::{simulcast_screen_layers, SCREEN_QUALITY_TIERS};
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+        controller.set_simulcast_layers(3);
+        assert!(controller.is_simulcast());
+        let tiers = simulcast_screen_layers(3);
+        assert_eq!(
+            controller.layer_resolution(0),
+            Some((tiers[0].max_width, tiers[0].max_height))
+        );
+        assert_eq!(
+            controller.layer_resolution(2),
+            Some((tiers[2].max_width, tiers[2].max_height))
+        );
+        // The top screen layer must be 1080p (distinct from the camera ladder's
+        // 720p top), proving the screen ladder is in use.
+        assert_eq!(controller.layer_resolution(2), Some((1920, 1080)));
     }
 
     #[test]

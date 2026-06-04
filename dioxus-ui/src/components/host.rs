@@ -194,6 +194,10 @@ pub fn Host(
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
+            // Screen simulcast layer ceiling (issue #989, Phase 3b) — same
+            // flag + capability gating as the camera, so it's OFF by default
+            // (single layer, byte-identical to the pre-simulcast screen path).
+            effective_max_layers,
         );
 
         // Wire up congestion step-down, PLI keyframe, and re-election flags

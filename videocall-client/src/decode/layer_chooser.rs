@@ -426,17 +426,34 @@ pub struct ReceivedLayerSnapshot {
 }
 
 /// Audio simulcast bitrates (kbps) by layer, lowest-first (issue #989, Phase 3c
-/// / 4). Mirrors the publisher's 2-layer model (low 24 / high 50). Kept here so
-/// the snapshot resolver has no dependency on the encoder module.
-const AUDIO_LAYER_KBPS: &[u32] = &[24, 50];
+/// / 4; extended to 3 rungs in issue #1082). Mirrors the publisher's 3-layer
+/// model (low 24 / mid 32 / high 50). Kept here so the snapshot resolver has no
+/// dependency on the encoder module. This slice's length is the single source of
+/// truth for the receiver-side audio ladder size (see [`AUDIO_LAYER_CAP`]).
+const AUDIO_LAYER_KBPS: &[u32] = &[24, 32, 50];
 
-/// Number of simulcast layers the ladder defines for a media kind (issue #989):
-/// video/screen = 3, audio = 2. Single source of truth for the per-kind ladder
-/// size used by the snapshot resolver and the availability-id clamp.
+/// Receiver-side per-kind layer ceilings (issue #1082). Video and Screen are
+/// tied at compile time to the AQ ladder sizes (`videocall_aq`'s
+/// `SIMULCAST_MAX_LAYERS` / `SCREEN_SIMULCAST_MAX_LAYERS`); Audio is tied to
+/// [`AUDIO_LAYER_KBPS`]'s length. Tying them here means a publisher↔receiver
+/// ladder-size mismatch is impossible to silently introduce (issue #1077): bump
+/// the source const and the receiver cap follows automatically.
+const VIDEO_LAYER_CAP: u32 = videocall_aq::constants::SIMULCAST_MAX_LAYERS as u32;
+const SCREEN_LAYER_CAP: u32 = videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS as u32;
+const AUDIO_LAYER_CAP: u32 = AUDIO_LAYER_KBPS.len() as u32;
+
+/// Number of simulcast layers the ladder defines for a media kind (issue #989;
+/// per-kind decoupling + cross-crate tie in issues #1082 / #1077): video/screen
+/// = `SIMULCAST_MAX_LAYERS`/`SCREEN_SIMULCAST_MAX_LAYERS`, audio =
+/// `AUDIO_LAYER_KBPS.len()`. Single source of truth for the per-kind ladder size
+/// used by the snapshot resolver and the availability-id clamp.
 pub fn max_layers_for_kind(kind: PrefMediaKind) -> u32 {
     match kind {
-        PrefMediaKind::Video | PrefMediaKind::Screen => 3,
-        PrefMediaKind::Audio => 2,
+        // Video and Screen share the same value today but are independent arms
+        // (issue #1082) so a future per-kind divergence is a one-line change.
+        PrefMediaKind::Video => VIDEO_LAYER_CAP,
+        PrefMediaKind::Screen => SCREEN_LAYER_CAP,
+        PrefMediaKind::Audio => AUDIO_LAYER_CAP,
     }
 }
 
@@ -834,12 +851,15 @@ mod tests {
 
     #[test]
     fn snapshot_audio_has_no_resolution_and_kbps_by_layer() {
-        let low = received_layer_snapshot(PrefMediaKind::Audio, 0, 2);
+        // Audio is now a 3-rung ladder (issue #1082): low 24 / mid 32 / high 50.
+        let low = received_layer_snapshot(PrefMediaKind::Audio, 0, 3);
         assert_eq!((low.width, low.height), (0, 0));
         assert_eq!(low.kbps, 24);
-        let high = received_layer_snapshot(PrefMediaKind::Audio, 1, 2);
+        let mid = received_layer_snapshot(PrefMediaKind::Audio, 1, 3);
+        assert_eq!(mid.kbps, 32);
+        let high = received_layer_snapshot(PrefMediaKind::Audio, 2, 3);
         assert_eq!(high.kbps, 50);
-        assert_eq!(high.layer_count, 2);
+        assert_eq!(high.layer_count, 3);
     }
 
     #[test]
@@ -848,10 +868,10 @@ mod tests {
         let s = received_layer_snapshot(PrefMediaKind::Video, 99, 99);
         assert_eq!(s.layer_count, 3, "ladder size capped to 3 for video");
         assert_eq!(s.layer_index, 2, "index clamped to count-1");
-        // Audio capped to 2.
+        // Audio capped to 3 (issue #1082).
         let a = received_layer_snapshot(PrefMediaKind::Audio, 99, 99);
-        assert_eq!(a.layer_count, 2);
-        assert_eq!(a.layer_index, 1);
+        assert_eq!(a.layer_count, 3);
+        assert_eq!(a.layer_index, 2);
     }
 
     #[test]
@@ -874,9 +894,24 @@ mod tests {
 
     #[test]
     fn max_layers_for_kind_matches_ladders() {
+        // Tied to the publisher-side ladder sizes at compile time (issues #1082 /
+        // #1077): video/screen = AQ SIMULCAST ceilings, audio = AUDIO_LAYER_KBPS.
+        assert_eq!(
+            max_layers_for_kind(PrefMediaKind::Video),
+            videocall_aq::constants::SIMULCAST_MAX_LAYERS as u32
+        );
+        assert_eq!(
+            max_layers_for_kind(PrefMediaKind::Screen),
+            videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS as u32
+        );
+        assert_eq!(
+            max_layers_for_kind(PrefMediaKind::Audio),
+            AUDIO_LAYER_KBPS.len() as u32
+        );
+        // Concrete values for the current ladders.
         assert_eq!(max_layers_for_kind(PrefMediaKind::Video), 3);
         assert_eq!(max_layers_for_kind(PrefMediaKind::Screen), 3);
-        assert_eq!(max_layers_for_kind(PrefMediaKind::Audio), 2);
+        assert_eq!(max_layers_for_kind(PrefMediaKind::Audio), 3);
     }
 
     #[test]
@@ -886,8 +921,9 @@ mod tests {
         assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 2), 2);
         assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, 3), 2);
         assert_eq!(clamp_observed_layer_id(PrefMediaKind::Video, u32::MAX), 2);
-        // Audio caps at index 1.
-        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 5), 1);
+        // Audio now caps at index 2 (3-rung ladder, issue #1082).
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 2), 2);
+        assert_eq!(clamp_observed_layer_id(PrefMediaKind::Audio, 5), 2);
     }
 
     #[test]

@@ -249,9 +249,12 @@ pub struct CameraEncoder {
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
-/// Matches the 3-tier ladder (low / standard / hd) the AQ crate will define in
-/// PR B. In PR A this is only used to clamp `max_layers`; the caller passes 1.
-const SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = 3;
+///
+/// Tied directly to the AQ crate's `SIMULCAST_MAX_LAYERS` (the owner of the
+/// simulcast tier ladder) so the encoder cap and the ladder size can never
+/// silently diverge (issue #1077). Bumping the ladder size in `videocall-aq`
+/// automatically raises this cap — no second edit, no doc-comment-only sync.
+const SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = videocall_aq::constants::SIMULCAST_MAX_LAYERS as u32;
 
 /// Clamp a requested `max_layers` to the supported range.
 ///

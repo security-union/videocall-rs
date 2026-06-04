@@ -197,11 +197,54 @@ const SIMULCAST_LAYER_TIER_INDICES: &[usize] = &[5, 3, 2];
 /// crate owns the tier mapping).
 pub const SIMULCAST_MAX_LAYERS: usize = 3;
 
+/// Pick `n` well-spaced indices from a `len`-element ladder, **lowest first**.
+///
+/// Generic, ladder-length-driven replacement for the old hand-authored
+/// `match n { 1|2|3 }` selection (issue #1082). The selection rule is:
+///
+/// - Always include the **base** (position 0) and, when `n >= 2`, the **top**
+///   (position `len - 1`), then space the remaining picks evenly across the
+///   interior. This reproduces the existing contract exactly for the current
+///   3-rung ladder:
+///     - `n == 1` → `[0]`          → `[low]`
+///     - `n == 2` → `[0, 2]`       → `[low, hd]`   (deliberate middle-skip kept)
+///     - `n == 3` → `[0, 1, 2]`    → `[low, standard, hd]`
+///   and generalizes cleanly to a deeper ladder so raising
+///   [`SIMULCAST_MAX_LAYERS`] later "just works" with no code change here.
+///
+/// `n` is clamped into `1..=len` so it can never index out of range (matches
+/// the client's `clamp_layer_count`; an out-of-range request is degraded, not a
+/// crash). Returns positions into the ladder slice, lowest layer first.
+fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
+    debug_assert!(len >= 1, "ladder must be non-empty");
+    let len = len.max(1);
+    let n = n.clamp(1, len);
+    if n == 1 {
+        return vec![0];
+    }
+    if n == len {
+        return (0..len).collect();
+    }
+    // n in 2..len: anchor the base (0) and the top (len-1), distribute the
+    // interior picks evenly. Round to the nearest interior position so the
+    // spread is symmetric; dedup defensively (cannot collide for n <= len).
+    let mut positions: Vec<usize> = (0..n)
+        .map(|i| {
+            // Map i in [0, n-1] linearly onto [0, len-1].
+            let pos = (i as f64) * ((len - 1) as f64) / ((n - 1) as f64);
+            pos.round() as usize
+        })
+        .collect();
+    positions.dedup();
+    positions
+}
+
 /// Resolve the simulcast layer tiers for an `n`-layer ladder.
 ///
 /// Returns a slice of [`VideoQualityTier`] references, **lowest layer first**
 /// (index in the returned slice == `layer_id`). The mapping is derived from
-/// [`SIMULCAST_LAYER_TIER_INDICES`]:
+/// [`SIMULCAST_LAYER_TIER_INDICES`] via [`spaced_ladder_positions`], so it is
+/// driven entirely by the ladder length — for the current 3-rung ladder:
 ///
 /// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
 ///   device is too weak; the AQ controller treats this exactly like today's
@@ -211,36 +254,23 @@ pub const SIMULCAST_MAX_LAYERS: usize = 3;
 ///   are well separated in resolution/bitrate).
 /// - `n == 3` → `[low, standard, hd]` (full ladder).
 ///
-/// # Panics
-/// Panics if `n` is not in `{1, 2, 3}`. Callers must clamp first (the client's
-/// `clamp_layer_count` guarantees this); an out-of-range `n` is a programmer
-/// error, not a runtime condition.
+/// `n` is clamped into `1..=SIMULCAST_MAX_LAYERS`; it never panics (a `0` or
+/// out-of-range request degrades to the nearest valid ladder rather than
+/// crashing a live call — issue #1082). Callers should still clamp upstream
+/// (the client's `clamp_layer_count`).
 pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
-    // Static, build-once tables so the function can return `&'static`.
-    // Each entry is a reference into VIDEO_QUALITY_TIERS (no value duplication
-    // — we copy the *struct* into a fixed array sized per ladder, since
-    // VideoQualityTier is plain data and the source tiers are themselves
-    // 'static). To keep returns `&'static [VideoQualityTier]` without copying,
-    // we build the per-ladder slices lazily via `OnceLock`.
+    // Static, build-once tables so the function can return `&'static`. We build
+    // one cached `Vec<VideoQualityTier>` per ladder size lazily via `OnceLock`.
     use std::sync::OnceLock;
 
     fn ladder(n: usize) -> Vec<VideoQualityTier> {
-        // Take the lowest `n` rungs of the ladder definition. The ladder is
-        // authored low→high in SIMULCAST_LAYER_TIER_INDICES, but the 2-layer
-        // subset is [low, hd] (skip standard), so select explicitly per n.
-        let indices: &[usize] = match n {
-            1 => &SIMULCAST_LAYER_TIER_INDICES[0..1], // [low]
-            2 => &[
-                SIMULCAST_LAYER_TIER_INDICES[0],
-                SIMULCAST_LAYER_TIER_INDICES[2],
-            ], // [low, hd]
-            3 => SIMULCAST_LAYER_TIER_INDICES,        // [low, standard, hd]
-            other => panic!("simulcast_layers: n must be in {{1,2,3}}, got {other}"),
-        };
-        indices
-            .iter()
-            .map(|&i| {
-                let t = &VIDEO_QUALITY_TIERS[i];
+        // Derive the lowest-`n` well-spaced rungs generically from the ladder
+        // definition (issue #1082): no per-`n` `match` arm, so raising
+        // SIMULCAST_MAX_LAYERS requires no change here.
+        spaced_ladder_positions(n, SIMULCAST_LAYER_TIER_INDICES.len())
+            .into_iter()
+            .map(|pos| {
+                let t = &VIDEO_QUALITY_TIERS[SIMULCAST_LAYER_TIER_INDICES[pos]];
                 // VideoQualityTier is Copy-able plain data; clone field-by-field
                 // so the returned vec owns 'static-compatible values.
                 VideoQualityTier {
@@ -257,16 +287,14 @@ pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
             .collect()
     }
 
-    static LADDER_1: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
-    static LADDER_2: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
-    static LADDER_3: OnceLock<Vec<VideoQualityTier>> = OnceLock::new();
+    // One OnceLock cache cell per supported ladder size. Indexed by clamped n.
+    static LADDERS: [OnceLock<Vec<VideoQualityTier>>; SIMULCAST_MAX_LAYERS] =
+        [const { OnceLock::new() }; SIMULCAST_MAX_LAYERS];
 
-    match n {
-        1 => LADDER_1.get_or_init(|| ladder(1)).as_slice(),
-        2 => LADDER_2.get_or_init(|| ladder(2)).as_slice(),
-        3 => LADDER_3.get_or_init(|| ladder(3)).as_slice(),
-        other => panic!("simulcast_layers: n must be in {{1,2,3}}, got {other}"),
-    }
+    let clamped = n.clamp(1, SIMULCAST_MAX_LAYERS);
+    LADDERS[clamped - 1]
+        .get_or_init(|| ladder(clamped))
+        .as_slice()
 }
 
 /// Sender uplink budget (kbps) for the currently-active simulcast layers
@@ -1328,15 +1356,69 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "n must be in")]
-    fn test_simulcast_layers_rejects_zero() {
-        let _ = simulcast_layers(0);
+    fn test_simulcast_layers_clamps_zero_to_base() {
+        // Issue #1082: `0` is meaningless (there is always a base layer) and now
+        // clamps up to the single base layer instead of panicking, so a degenerate
+        // request can never crash a live call.
+        let l0 = simulcast_layers(0);
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l0[0].label, "low");
+        // Identical to the n=1 result.
+        assert_eq!(l0[0].label, simulcast_layers(1)[0].label);
     }
 
     #[test]
-    #[should_panic(expected = "n must be in")]
-    fn test_simulcast_layers_rejects_too_many() {
-        let _ = simulcast_layers(SIMULCAST_MAX_LAYERS + 1);
+    fn test_simulcast_layers_clamps_too_many_to_max() {
+        // Issue #1082: an over-large request now clamps down to the full ladder
+        // (SIMULCAST_MAX_LAYERS) rather than panicking.
+        let over = simulcast_layers(SIMULCAST_MAX_LAYERS + 1);
+        assert_eq!(over.len(), SIMULCAST_MAX_LAYERS);
+        // Identical to the max-layer ladder.
+        let full = simulcast_layers(SIMULCAST_MAX_LAYERS);
+        assert_eq!(over.len(), full.len());
+        for (a, b) in over.iter().zip(full.iter()) {
+            assert_eq!(a.label, b.label);
+        }
+    }
+
+    #[test]
+    fn test_spaced_ladder_positions_matches_current_contract() {
+        // Pin the generic selection against the existing 3-rung contract
+        // (issue #1082): n=1 → [0]; n=2 → [0, 2] (middle-skip); n=3 → [0, 1, 2].
+        assert_eq!(spaced_ladder_positions(1, 3), vec![0]);
+        assert_eq!(spaced_ladder_positions(2, 3), vec![0, 2]);
+        assert_eq!(spaced_ladder_positions(3, 3), vec![0, 1, 2]);
+        // Clamp: 0 → base only; over-large → full ladder.
+        assert_eq!(spaced_ladder_positions(0, 3), vec![0]);
+        assert_eq!(spaced_ladder_positions(99, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_spaced_ladder_positions_generalizes_to_deeper_ladder() {
+        // Forward-looking (issue #1082): on a future 5-rung ladder the selection
+        // must always anchor base+top and space the interior evenly, with no
+        // collisions for n <= len. This proves a 3→5 bump needs no code change.
+        for len in 3..=5usize {
+            for n in 1..=len {
+                let pos = spaced_ladder_positions(n, len);
+                assert_eq!(pos.len(), n, "len={len} n={n}: must pick exactly n rungs");
+                assert_eq!(pos[0], 0, "len={len} n={n}: base must be first");
+                if n >= 2 {
+                    assert_eq!(
+                        *pos.last().unwrap(),
+                        len - 1,
+                        "len={len} n={n}: top rung must be last"
+                    );
+                }
+                // Strictly ascending (no duplicates, lowest-first).
+                for w in pos.windows(2) {
+                    assert!(
+                        w[1] > w[0],
+                        "len={len} n={n}: positions must ascend: {pos:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

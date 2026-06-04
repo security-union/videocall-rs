@@ -233,11 +233,11 @@
                     },
                     {
                       "color": "orange",
-                      "value": 30
+                      "value": 2000
                     },
                     {
                       "color": "green",
-                      "value": 60
+                      "value": 4000
                     }
                   ]
                 }
@@ -272,6 +272,22 @@
           "id": "labelsToFields",
           "options": {
             "mode": "columns"
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "capability_score",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "cores",
+                "destinationType": "number"
+              }
+            ],
+            "fields": {}
           }
         },
         {

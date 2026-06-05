@@ -323,6 +323,23 @@ pub struct CameraEncoder {
     /// the other's state. **Stage 1: the controller only stores this value (no
     /// shed/tier effect), so it is observability-only.**
     shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Relay layer-union hint for this publisher's VIDEO ladder (issue #1108,
+    /// Stage 3). The relay tracks the MAX simulcast layer ANY receiver currently
+    /// wants for this (publisher, VIDEO) and delivers it on the publisher's own
+    /// self-subject via a `LAYER_HINT` packet. `VideoCallClient`'s dispatch arm
+    /// writes the received max-layer id here; the AQ control loop reads it each
+    /// tick and feeds it to
+    /// [`EncoderBitrateController::observe_union_requested_layer`], which caps the
+    /// published ladder so the encoder stops spending CPU/uplink on a top layer
+    /// no receiver wants.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (no cap):** until a hint arrives,
+    /// the controller keeps its full backpressure-governed ladder. Reset back to
+    /// `u32::MAX` on reconnect so a stale cap from the old relay cannot suppress
+    /// against a freshly-allocated session on a new relay. Borrow-safe bridge
+    /// (atomic) between the inbound-packet task and the control-loop task, exactly
+    /// like `shared_encoder_queue_depth`.
+    shared_union_requested_layer: Rc<AtomicU32>,
     /// Liveness token whose sole purpose is to bound the lifetime of the AQ
     /// control-loop `spawn_local` future (issue #1108). The encoder holds the
     /// only strong reference; `set_encoder_control` captures a [`Weak`] and
@@ -441,6 +458,10 @@ impl CameraEncoder {
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
             shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // Relay layer-union hint (issue #1108, Stage 3). Starts at u32::MAX
+            // (fail-open / no cap): the controller keeps its full ladder until a
+            // LAYER_HINT arrives. Reset to u32::MAX on reconnect.
+            shared_union_requested_layer: Rc::new(AtomicU32::new(u32::MAX)),
             // AQ control-loop liveness token (issue #1108). The encoder is the
             // sole strong owner; the self-tick loop holds a Weak and exits when
             // this drops (encoder torn down on Host unmount).
@@ -498,6 +519,10 @@ impl CameraEncoder {
         // READS the depth the encode loop published and forwards it to the
         // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Relay layer-union hint (issue #1108, Stage 3): the control loop READS
+        // the max-layer the client wrote (from a LAYER_HINT packet) and forwards
+        // it to the controller's union cap each tick.
+        let shared_union_requested_layer = self.shared_union_requested_layer.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token.
         // The loop below breaks as soon as this fails to upgrade, i.e. when the
         // CameraEncoder is dropped (Host unmount). Without this, the
@@ -642,6 +667,14 @@ impl CameraEncoder {
                 // its own loop; here we forward the live WebCodecs queue depth.
                 encoder_control.observe_encoder_queue_depth(
                     shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
+                // Relay layer-union hint (issue #1108, Stage 3): feed the latest
+                // max-requested-layer the client wrote (u32::MAX = fail-open / no
+                // cap) so the controller caps the published ladder to what some
+                // receiver actually wants. Applied right before `tick` so the cap
+                // composes with the just-observed backpressure decision.
+                encoder_control.observe_union_requested_layer(
+                    shared_union_requested_layer.load(Ordering::Relaxed),
                 );
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
@@ -882,6 +915,19 @@ impl CameraEncoder {
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
     pub fn shared_encoder_target_bitrate_kbps(&self) -> Rc<AtomicU32> {
         self.shared_encoder_target_bitrate_kbps.clone()
+    }
+
+    /// Returns the relay layer-union hint atomic for this VIDEO ladder (issue
+    /// #1108, Stage 3).
+    ///
+    /// `VideoCallClient` stores this clone (via
+    /// [`VideoCallClient::set_camera_union_requested_layer`](crate::VideoCallClient::set_camera_union_requested_layer))
+    /// and writes the MAX-requested-layer carried by an inbound `LAYER_HINT`
+    /// packet into it. The encoder's AQ control loop reads it each tick to cap the
+    /// published ladder. The value is a max-layer **id** (`u32::MAX` = fail-open /
+    /// no cap); the controller converts it to an active-layer count.
+    pub fn shared_union_requested_layer(&self) -> Rc<AtomicU32> {
+        self.shared_union_requested_layer.clone()
     }
 
     /// Returns the shared tier transitions buffer for health reporting.

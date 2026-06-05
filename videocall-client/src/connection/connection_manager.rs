@@ -590,7 +590,14 @@ fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>
     // the throttled sender's session_id so that sender can step down quality.
     // They must pass this transport-level self-filter and be handled by
     // VideoCallClient, which still ignores cross-session CONGESTION.
+    //
+    // LAYER_HINT (issue #1108, Stage 3) is the same shape: the relay stamps the
+    // PUBLISHER's own session_id and delivers the per-source layer-union hint on
+    // that publisher's self-subject, so it too must survive this self-filter and
+    // reach VideoCallClient (which re-checks self-targeting before applying the
+    // cap). Whitelist it alongside CONGESTION.
     packet.packet_type != PacketType::CONGESTION.into()
+        && packet.packet_type != PacketType::LAYER_HINT.into()
 }
 
 impl ConnectionManager {
@@ -3995,11 +4002,23 @@ mod tests {
     }
 
     #[test]
+    fn self_packet_filter_exempts_self_targeted_layer_hint() {
+        // Issue #1108, Stage 3: the relay stamps the publisher's own session_id on
+        // the LAYER_HINT and delivers it on the publisher's self-subject, so it
+        // must survive the self-filter exactly like CONGESTION.
+        let pkt = packet(PacketType::LAYER_HINT, 42);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(42)),
+            "self-targeted LAYER_HINT must reach VideoCallClient so the AQ can cap the ladder"
+        );
+    }
+
+    #[test]
     fn self_packet_filter_still_drops_non_congestion_self_packets() {
         let pkt = packet(PacketType::MEDIA, 42);
         assert!(
             should_filter_self_packet(&pkt, Some(42)),
-            "non-CONGESTION self packets must still be filtered"
+            "non-whitelisted self packets must still be filtered"
         );
     }
 

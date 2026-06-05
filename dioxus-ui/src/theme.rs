@@ -14,6 +14,11 @@ pub mod color {
     /// Matches --error-text in global.css.
     pub const ERROR_TEXT: &str = "#FF7A6E";
 
+    /// Warning foreground text — used for non-fatal, attention-getting hints
+    /// like the moderate (25–50%) screen-share downscale badge. Same amber
+    /// hue as the NetEQ amber token but exposed as a foreground-text alias.
+    pub const WARNING_TEXT: &str = "#ffc107";
+
     pub const AXIS: &str = "#666";
 
     pub const SIGNAL_AUDIO: &str = "#4FC3F7";

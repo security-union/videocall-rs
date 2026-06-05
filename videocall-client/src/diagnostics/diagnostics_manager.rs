@@ -163,27 +163,6 @@ impl FpsTracker {
         self.total_decode_errors += 1;
     }
 
-    // Check if no frames have been received for a while and reset FPS if needed
-    fn _check_inactive(&mut self, now: f64) {
-        let inactive_ms = now - self.last_frame_time;
-
-        // If no frames for more than 1 second, consider the feed inactive
-        if inactive_ms > 1000.0 {
-            // Set FPS and bitrate to zero immediately when inactive
-            if self.fps > 0.0 || self.current_bitrate > 0.0 {
-                log::info!(
-                    "Detected inactive stream, setting metrics to 0 (inactive for {inactive_ms:.0}ms)"
-                );
-                self.fps = 0.0;
-                self.current_bitrate = 0.0;
-                self.frames_count = 0;
-                self.bytes_received = 0;
-                self.last_fps_update = now;
-                self.last_bitrate_update = now;
-            }
-        }
-    }
-
     fn get_metrics(&self) -> (f64, f64) {
         let now = Date::now();
         let inactive_ms = now - self.last_frame_time;

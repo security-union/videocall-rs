@@ -89,32 +89,36 @@ test.describe("Protocol selection (transport preference)", () => {
     await injectSessionCookie(context, { baseURL });
   });
 
-  // 1. Network tab shows segmented control with Auto selected by default
-  test("Network tab shows segmented control with Auto selected by default", async ({ page }) => {
+  // 1. Network tab shows segmented control with WebTransport selected by default
+  test("Network tab shows only WebTransport and WebSocket with WebTransport selected by default", async ({
+    page,
+  }) => {
     const meetingId = `e2e_proto_default_${Date.now()}`;
     await joinMeeting(page, meetingId, "proto-user-1");
 
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Auto pill should be selected by default
-    await expect(page.locator('[data-testid="transport-radio-auto"]')).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    // WebTransport pill should be selected by default (the new default — was Auto)
     await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
       "aria-checked",
-      "false",
+      "true",
     );
     await expect(page.locator('[data-testid="transport-radio-websocket"]')).toHaveAttribute(
       "aria-checked",
       "false",
     );
 
+    // Auto option must no longer exist — the simplification removed it
+    await expect(page.locator('[data-testid="transport-radio-auto"]')).toHaveCount(0);
+
+    // The radiogroup must expose exactly two pills (WebTransport + WebSocket).
+    await expect(page.locator('.transport-segmented [role="radio"]')).toHaveCount(2);
+
     // Apply button should not be visible (no pending change)
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
 
-    // Sticky toggle row should not be visible while Auto is selected
+    // Sticky toggle row should not be visible while the default is selected
     await expect(page.locator("#sticky-transport-checkbox")).not.toBeVisible();
   });
 
@@ -136,36 +140,38 @@ test.describe("Protocol selection (transport preference)", () => {
     await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
   });
 
-  // 3. Selecting Auto hides Apply button when already on Auto
-  test("selecting Auto hides Apply button when already on Auto", async ({ page }) => {
-    const meetingId = `e2e_proto_auto_hide_${Date.now()}`;
+  // 3. Selecting back to default WebTransport hides Apply button
+  test("selecting WebTransport (default) hides Apply button when matching active", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_proto_default_hide_${Date.now()}`;
     await joinMeeting(page, meetingId, "proto-user-3");
 
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Initially Auto is selected, no pending change -> Apply hidden
+    // Initially WebTransport (default) is selected, no pending change -> Apply hidden
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
 
     // Pick WebSocket -> Apply appears
     await page.locator('[data-testid="transport-radio-websocket"]').click();
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
 
-    // Pick Auto again -> Apply disappears (matches current active)
-    await page.locator('[data-testid="transport-radio-auto"]').click();
+    // Pick WebTransport again -> Apply disappears (matches current active default)
+    await page.locator('[data-testid="transport-radio-webtransport"]').click();
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
   });
 
-  // 4. Sticky toggle not visible when Auto is selected
-  test("sticky toggle not visible when Auto is selected", async ({ page }) => {
+  // 4. Sticky toggle not visible when default (WebTransport) is selected
+  test("sticky toggle not visible when WebTransport (default) is selected", async ({ page }) => {
     const meetingId = `e2e_proto_sticky_hidden_${Date.now()}`;
     await joinMeeting(page, meetingId, "proto-user-4");
 
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // Auto should already be selected; clicking it again should be a no-op.
-    await page.locator('[data-testid="transport-radio-auto"]').click();
+    // WebTransport (default) should already be selected; clicking it again is a no-op.
+    await page.locator('[data-testid="transport-radio-webtransport"]').click();
 
     await expect(page.locator("#sticky-transport-checkbox")).not.toBeVisible();
   });
@@ -305,9 +311,11 @@ test.describe("Protocol selection (transport preference)", () => {
     });
   });
 
-  // 9. Selecting Auto and applying clears all storage
-  test("selecting Auto and applying clears all storage", async ({ page }) => {
-    const meetingId = `e2e_proto_auto_clear_${Date.now()}`;
+  // 9. Selecting WebTransport (default) without sticky and applying clears all storage
+  test("selecting WebTransport (default) without sticky and applying clears all storage", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_proto_default_clear_${Date.now()}`;
 
     // Pre-seed all three keys so the page boots into the websocket transport.
     await page.goto("/");
@@ -324,11 +332,11 @@ test.describe("Protocol selection (transport preference)", () => {
     await openSettingsModal(page);
     await switchToNetworkTab(page);
 
-    // The current active protocol is websocket. To make Apply appear after
-    // selecting Auto we first nudge the pending selection to websocket so
-    // the picker has a clean state, then switch to Auto -> Apply appears.
-    await page.locator('[data-testid="transport-radio-websocket"]').click();
-    await page.locator('[data-testid="transport-radio-auto"]').click();
+    // Active protocol is websocket. We need Apply to appear when we switch
+    // back to the default — first un-tick sticky so the apply logic clears
+    // storage instead of writing a fresh sticky=true.
+    await page.locator("#sticky-transport-checkbox").uncheck({ force: true });
+    await page.locator('[data-testid="transport-radio-webtransport"]').click();
 
     await expect(page.locator('[data-testid="transport-apply-button"]')).toBeVisible();
     await page.locator('[data-testid="transport-apply-button"]').click();
@@ -347,6 +355,42 @@ test.describe("Protocol selection (transport preference)", () => {
     expect(storage.session).toBeNull();
   });
 
+  // 9b. Legacy "auto" persisted value migrates to WebTransport on load
+  test('legacy persisted "auto" value migrates to WebTransport on load', async ({ page }) => {
+    const meetingId = `e2e_proto_legacy_auto_${Date.now()}`;
+
+    // Plant the legacy sticky+auto pair an older release would have written.
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => {
+      localStorage.setItem("vc_transport_preference", "auto");
+      localStorage.setItem("vc_transport_sticky", "true");
+    });
+    await page.reload();
+
+    await joinMeeting(page, meetingId, "proto-user-9b");
+
+    await openSettingsModal(page);
+    await switchToNetworkTab(page);
+
+    // Migrated value: WebTransport pill must be selected, NOT the (gone) Auto.
+    await expect(page.locator('[data-testid="transport-radio-webtransport"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await expect(page.locator('[data-testid="transport-radio-auto"]')).toHaveCount(0);
+
+    // Storage must be canonicalised from "auto" -> "webtransport" on load.
+    const stored = await page.evaluate(() => localStorage.getItem("vc_transport_preference"));
+    expect(stored).toBe("webtransport");
+
+    // Cleanup
+    await page.evaluate(() => {
+      localStorage.removeItem("vc_transport_preference");
+      localStorage.removeItem("vc_transport_sticky");
+    });
+  });
+
   // 10. Diagnostics panel shows transport preference dropdown
   test("diagnostics panel shows transport preference dropdown", async ({ page }) => {
     const meetingId = `e2e_proto_diag_${Date.now()}`;
@@ -358,8 +402,13 @@ test.describe("Protocol selection (transport preference)", () => {
     const diagSelect = diagnosticsTransportSelect(page);
     await expect(diagSelect).toBeVisible();
 
-    // Default value should be "auto" (Auto)
-    await expect(diagSelect).toHaveValue("auto");
+    // Default value should be "webtransport" (was "auto" before simplification)
+    await expect(diagSelect).toHaveValue("webtransport");
+
+    // Exactly two options must be present (no Auto)
+    const options = diagSelect.locator("option");
+    await expect(options).toHaveCount(2);
+    await expect(diagSelect.locator('option[value="auto"]')).toHaveCount(0);
   });
 
   // 11. Diagnostics panel protocol change still shows confirm dialog
@@ -376,7 +425,8 @@ test.describe("Protocol selection (transport preference)", () => {
     });
 
     const diagSelect = diagnosticsTransportSelect(page);
-    await diagSelect.selectOption("webtransport");
+    // Default is now webtransport — switch to websocket to trigger the dialog.
+    await diagSelect.selectOption("websocket");
     await page.waitForTimeout(500);
 
     expect(dialogMessage).toContain(

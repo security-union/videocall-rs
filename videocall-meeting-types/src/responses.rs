@@ -230,6 +230,13 @@ pub struct MeetingFeedSummary {
     /// any ownership-based authorization decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The cached host display name captured on first participant join.
+    /// `None` until any participant (typically the host) has joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
+    /// The host's `user_id` (i.e. `creator_id`). Canonical alias of `host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_user_id: Option<String>,
     /// `true` when `creator_id == authenticated_user_id`.
     ///
     /// **Server-computed.** This is the authoritative trust signal the UI
@@ -244,6 +251,19 @@ pub struct MeetingFeedSummary {
     pub waiting_room_enabled: bool,
     pub admitted_can_admit: bool,
     pub end_on_host_leave: bool,
+    /// Unix timestamp in milliseconds of the **authenticated user's** most
+    /// recent admission to this meeting — the MAX `admitted_at` across the
+    /// requesting user's `meeting_participants` rows.
+    ///
+    /// Strictly user-scoped: it is THIS user's last-attended time, never any
+    /// other participant's. Distinct from `last_active_at`, which falls back
+    /// to meeting-level `started_at`/`created_at` and is therefore not
+    /// user-scoped. `None` when the user has never been admitted (e.g. they
+    /// own the meeting but never joined). Used client-side for the "sort by
+    /// last attended" option and the "attended within last 7d / 30d / 6mo"
+    /// filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_last_attended_at: Option<i64>,
 }
 
 /// Single meeting entry inside [`ListMeetingsResponse`].

@@ -32,7 +32,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub struct VideoProducer {
@@ -375,6 +375,10 @@ impl VideoProducer {
                     packet_type: PacketType::MEDIA.into(),
                     user_id: user_id_bytes.clone(),
                     data: media_packet.write_to_bytes()?,
+                    // Cleartext discriminator so the relay can apply viewport-aware
+                    // VIDEO filtering without decrypting the inner MediaPacket
+                    // (HCL issue #988). Matches the real client (transform.rs).
+                    media_kind: MediaKind::VIDEO.into(),
                     ..Default::default()
                 };
 
@@ -685,6 +689,10 @@ impl VideoProducer {
                     packet_type: PacketType::MEDIA.into(),
                     user_id: user_id_bytes.clone(),
                     data: media_packet.write_to_bytes()?,
+                    // Cleartext discriminator so the relay can apply viewport-aware
+                    // VIDEO filtering without decrypting the inner MediaPacket
+                    // (HCL issue #988). Matches the real client (transform.rs).
+                    media_kind: MediaKind::VIDEO.into(),
                     ..Default::default()
                 };
 

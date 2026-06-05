@@ -67,6 +67,19 @@ message PeerStats {
 
   // Screen share video stats (separate from camera video_stats field 6)
   VideoStats screen_video_stats = 14;
+
+  // Freeze-detection metrics (issue #1013). videocall_video_fps counts decode
+  // calls, not visually distinct frames, so it reads ~30fps while video is
+  // frozen. These surface the loss signal that actually proves a freeze.
+  // Per-peer sequence loss rate (lost packets/sec, windowed) observed for this
+  // peer's video stream. Sustained loss => frozen/glitched video even when
+  // fps_received looks healthy.
+  optional double video_seq_loss_per_sec = 15;
+  // Per-peer keyframe (PLI) requests/sec this client sent TO this peer
+  // (windowed). A sustained nonzero rate is the direct symptom of a stream
+  // that cannot recover — feeds video_quality_score so it can't read 100/100
+  // during a keyframe storm.
+  optional double keyframe_requests_per_sec = 16;
 }
 
 message HealthPacket {
@@ -110,7 +123,8 @@ message HealthPacket {
 
   // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
   optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
-  optional double encoder_worst_peer_fps = 26;     // Deprecated compatibility field; now carries the p75 peer FPS.
+  reserved 26;                                     // Was: encoder_worst_peer_fps. Replaced by encoder_p75_peer_fps (field 67) in PR #658; legacy emitters/readers removed in #366.
+  reserved "encoder_worst_peer_fps";
   optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
   optional bool screen_sharing_active = 28;        // Whether screen share is currently active
 
@@ -171,6 +185,68 @@ message HealthPacket {
 
   // Compatibility field added after TELEM-7/8/9 consumed 56-66.
   optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
+
+  // Adaptive decode-budget controller state (#987). Surfaces the receiver-side
+  // tile-cap decision so population-scale dashboards can see the adaptive loop's
+  // reasoning server-side instead of only in client console logs. Absent when
+  // the controller has not produced a snapshot yet (no peers / pre-warmup).
+  optional DecodeBudget decode_budget = 68;
+
+  // Non-heap / total-process memory telemetry (#1032). `memory_used_bytes`
+  // (field 12) is JS-heap only and stays single-digit MB during the freezes we
+  // care about; the multi-GB pressure lives OUTSIDE the JS heap (WASM linear
+  // memory, decoded VideoFrame GPU buffers, canvas/GPU textures).
+  //
+  // WASM linear-memory size in bytes — WebAssembly.Memory.buffer.byteLength.
+  // Always available (sync, O(1)); distinct from the JS heap in field 12.
+  optional uint64 wasm_memory_bytes = 69;
+  // Total agent memory in bytes from performance.measureUserAgentSpecificMemory()
+  // — includes GPU-backed and worker allocations. Chrome-only and gated on
+  // crossOriginIsolated; sampled in the background and absent when the API is
+  // unavailable or has not yet resolved its first reading.
+  optional uint64 agent_memory_bytes = 70;
+
+  // Transport re-election outcome counters (dashboard audit Tier B #2/#4;
+  // discussion #562). All cumulative since the connection manager was created,
+  // re-sent every health packet (same convention as the connection-loss
+  // counters in fields 54-55). The relay's metrics_server expands these into a
+  // single labeled counter `videocall_client_reelection_total{result=...}` so
+  // Grafana can chart re-election rate AND outcome without console logs.
+  //
+  // Buckets mirror the four terminal branches of
+  // ConnectionManager::complete_election:
+  //   * proceeded:  a (re-)election switched to a new winning connection.
+  //   * aborted:    re-election ran but the winner was not meaningfully better
+  //                 (hysteresis), so the existing connection was kept.
+  //   * preserved:  all candidates failed but the old connection was still
+  //                 fresh, so it was preserved (candidate-failure path, #539).
+  //   * failed:     election failed with no usable connection
+  //                 ("Election failed: No valid connections") — the on-call
+  //                 signal for a participant who has dropped off the call.
+  optional uint64 reelection_proceeded_total = 71;
+  optional uint64 reelection_aborted_total = 72;
+  optional uint64 reelection_preserved_total = 73;
+  optional uint64 reelection_failed_total = 74;
+}
+
+// Receiver-side adaptive decode-budget state (#987). Mirrors the
+// AdaptiveQuality tier fields on HealthPacket: a periodic snapshot of the
+// current decision the local controller has reached for how many video tiles
+// to decode.
+message DecodeBudget {
+  uint32 effective_cap = 1;        // Current effective cap on simultaneously decoded tiles
+  uint32 natural = 2;              // Natural/unconstrained tile count the layout would show
+  bool pressured = 3;              // Pressured latch engaged (loop owns the cap)
+  OverrideMode override_mode = 4;  // Auto vs Fixed
+  // Set only when override_mode == OVERRIDE_MODE_FIXED: the user's hard tile cap.
+  uint32 override_fixed_n = 5;
+
+  // Manual override mode for the controller.
+  enum OverrideMode {
+    OVERRIDE_MODE_UNSPECIFIED = 0; // Treated as Auto by readers
+    OVERRIDE_MODE_AUTO = 1;        // Adaptive loop decides the cap
+    OVERRIDE_MODE_FIXED = 2;       // User hard-pinned the cap (see override_fixed_n)
+  }
 }
 
 message TierTransition {

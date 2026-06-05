@@ -2,6 +2,10 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
+use crate::components::performance_settings::{
+    KindReceivePref, PerformancePreference, PerformanceSettingsPanel, ReceivePreference,
+    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+};
 use crate::context::{
     clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
     save_transport_preference_session, save_transport_sticky, TransportPreference,
@@ -9,6 +13,7 @@ use crate::context::{
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
+use videocall_client::PrefMediaKind;
 use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
@@ -219,6 +224,7 @@ fn SettingsGlassSelect(
 enum SettingsSection {
     Audio,
     Video,
+    Performance,
     Network,
     Appearance,
 }
@@ -228,6 +234,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "Audio",
             SettingsSection::Video => "Video",
+            SettingsSection::Performance => "Performance",
             SettingsSection::Network => "Network",
             SettingsSection::Appearance => "Appearance",
         }
@@ -237,6 +244,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-tab-audio",
             SettingsSection::Video => "settings-tab-video",
+            SettingsSection::Performance => "settings-tab-performance",
             SettingsSection::Network => "settings-tab-network",
             SettingsSection::Appearance => "settings-tab-appearance",
         }
@@ -246,6 +254,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-panel-audio",
             SettingsSection::Video => "settings-panel-video",
+            SettingsSection::Performance => "settings-panel-performance",
             SettingsSection::Network => "settings-panel-network",
             SettingsSection::Appearance => "settings-panel-appearance",
         }
@@ -255,15 +264,17 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-nav-audio",
             SettingsSection::Video => "settings-nav-video",
+            SettingsSection::Performance => "settings-nav-performance",
             SettingsSection::Network => "settings-nav-network",
             SettingsSection::Appearance => "settings-nav-appearance",
         }
     }
 
-    fn all() -> [SettingsSection; 4] {
+    fn all() -> [SettingsSection; 5] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
+            SettingsSection::Performance,
             SettingsSection::Network,
             SettingsSection::Appearance,
         ]
@@ -272,7 +283,8 @@ impl SettingsSection {
     fn next(self) -> Self {
         match self {
             SettingsSection::Audio => SettingsSection::Video,
-            SettingsSection::Video => SettingsSection::Network,
+            SettingsSection::Video => SettingsSection::Performance,
+            SettingsSection::Performance => SettingsSection::Network,
             SettingsSection::Network => SettingsSection::Appearance,
             SettingsSection::Appearance => SettingsSection::Audio,
         }
@@ -282,7 +294,8 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => SettingsSection::Appearance,
             SettingsSection::Video => SettingsSection::Audio,
-            SettingsSection::Network => SettingsSection::Video,
+            SettingsSection::Performance => SettingsSection::Video,
+            SettingsSection::Network => SettingsSection::Performance,
             SettingsSection::Appearance => SettingsSection::Network,
         }
     }
@@ -303,18 +316,59 @@ pub fn DeviceSettingsModal(
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
     #[props(default)] initial_section: Option<String>,
+    // ── SEND side (#961): quality-bound preference, change callback, live needles.
+    /// Current persisted performance (send quality-bounds) preference. (#961)
+    #[props(default)]
+    performance_preference: PerformancePreference,
+    /// Called when the user changes any SEND quality bound. The parent persists
+    /// the new preference and pushes it to the encoders via
+    /// `CameraEncoder` / `ScreenEncoder::set_quality_tier_bounds`. (#961)
+    #[props(default)]
+    on_performance_change: EventHandler<PerformancePreference>,
+    /// Reads the encoder's live quality snapshot for the "Sending" needles.
+    /// Defaults to a reader that always yields `None` (encoder unavailable). (#961)
+    #[props(default = SnapshotReader::none())]
+    read_quality_snapshot: SnapshotReader,
+    /// Reads the screen encoder's live snapshot for the screen "Sending" needle.
+    /// Defaults to `None` (not sharing). (#961)
+    #[props(default = ScreenSnapshotReader::none())]
+    read_screen_snapshot: ScreenSnapshotReader,
+    // ── RECEIVE side (#989 simulcast): layer-bound preference, change callback, needles.
+    /// Current persisted RECEIVE-side layer-bounds preference (simulcast P4). (#989)
+    #[props(default)]
+    receive_preference: ReceivePreference,
+    /// Called when the user changes a kind's receive bounds. The parent persists
+    /// the new preference and pushes it to the client via
+    /// `set_receive_layer_bounds`. (#989)
+    #[props(default)]
+    on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
+    /// Reads the client's per-kind received-layer snapshot for the "Receiving"
+    /// needles. Defaults to `None` (nothing received). (#989)
+    #[props(default = ReceivedReader::none())]
+    received_reader: ReceivedReader,
 ) -> Element {
     let is_ios_safari = is_ios();
-    // The parent uses a `key` (generation counter) to recreate this component
-    // each time the modal opens, so `use_signal`'s initializer runs fresh with
-    // the correct starting section.  No render-body signal mutations needed.
-    let initial = match initial_section.as_deref() {
+    // Map the parent's requested section string to the enum.
+    let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
         Some("network") => SettingsSection::Network,
+        Some("performance") => SettingsSection::Performance,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
     };
-    let mut active_section = use_signal(move || initial);
+    // The parent uses a `key` (generation counter) to recreate this component
+    // when the modal first opens, so `use_signal`'s initializer runs fresh.
+    let mut active_section = use_signal(move || requested);
+    // Defensive: detect parent-driven section switches while the modal stays
+    // mounted. Currently unreachable (the fullscreen overlay prevents clicking
+    // "Dock Settings…" while open), but guards against future callers that may
+    // change `initial_section` without a key remount.
+    let initial_section_clone = initial_section.clone();
+    let mut prev_section_prop = use_signal(move || initial_section_clone);
+    if *prev_section_prop.read() != initial_section {
+        prev_section_prop.set(initial_section);
+        active_section.set(requested);
+    }
     let mut open_dropdown: Signal<Option<&'static str>> = use_signal(|| None);
     let mut sticky_transport = use_signal(load_transport_sticky);
     let mut pending_protocol = use_signal(|| transport_preference);
@@ -526,6 +580,30 @@ pub fn DeviceSettingsModal(
                                     }
                                 }
                             },
+                            SettingsSection::Performance => rsx! {
+                                div {
+                                    id: SettingsSection::Performance.panel_id(),
+                                    class: "settings-section",
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Performance.tab_id(),
+
+                                    PerformanceSettingsPanel {
+                                        // SEND (#961).
+                                        pref: performance_preference,
+                                        on_change: move |p: PerformancePreference| {
+                                            on_performance_change.call(p);
+                                        },
+                                        read_snapshot: read_quality_snapshot.clone(),
+                                        read_screen_snapshot: read_screen_snapshot.clone(),
+                                        // RECEIVE (#989 simulcast).
+                                        receive_pref: receive_preference,
+                                        on_receive_change: move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+                                            on_receive_change.call((kind, sub));
+                                        },
+                                        received_reader: received_reader.clone(),
+                                    }
+                                }
+                            },
                             SettingsSection::Network => rsx! {
                                 div {
                                     id: SettingsSection::Network.panel_id(),
@@ -552,15 +630,9 @@ pub fn DeviceSettingsModal(
                                             role: "radiogroup",
                                             "aria-labelledby": "transport-segmented-label",
                                             for option in [
-                                                (TransportPreference::Auto, "Auto", "transport-radio-auto"),
-                                                (
-                                                    TransportPreference::WebTransportOnly,
-                                                    "WebTransport",
-                                                    "transport-radio-webtransport",
-                                                ),
-                                                (TransportPreference::WebSocketOnly, "WebSocket", "transport-radio-websocket"),
-                                            ]
-                                            {
+                                                (TransportPreference::WebTransport, "WebTransport (default)", "transport-radio-webtransport"),
+                                                (TransportPreference::WebSocket, "WebSocket", "transport-radio-websocket"),
+                                            ] {
                                                 {
                                                     let (value, label, test_id) = option;
                                                     let is_selected = pending_protocol() == value;
@@ -583,8 +655,9 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Hidden for Auto since pinning Auto is a no-op.
-                                    if pending_protocol() != TransportPreference::Auto {
+                                    // Hidden for the default (WebTransport) since pinning the
+                                    // implicit default is a no-op.
+                                    if pending_protocol() != TransportPreference::default() {
                                         div { class: "device-setting-group sticky-protocol-row",
                                             div { class: "sticky-protocol-row-inner",
                                                 div { class: "sticky-protocol-text",
@@ -620,9 +693,11 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Auto+sticky is a silent no-op, so suppress the advisory there.
-                                    if sticky_transport() && pending_protocol() != TransportPreference::Auto {
-                                        div { class: "settings-info-panel", role: "note",
+                                    // Default+sticky is a silent no-op, so suppress the advisory there.
+                                    if sticky_transport() && pending_protocol() != TransportPreference::default() {
+                                        div {
+                                            class: "settings-info-panel",
+                                            role: "note",
                                             div { class: "settings-info-panel-icon",
                                                 svg {
                                                     view_box: "0 0 24 24",
@@ -654,7 +729,7 @@ pub fn DeviceSettingsModal(
                                             div { class: "settings-info-panel-body",
                                                 p { class: "settings-info-panel-title", "Protocol pinned" }
                                                 p { class: "settings-info-panel-text",
-                                                    "This protocol will be used on every future page load. To clear it, switch to Auto. Picking a different explicit protocol replaces the saved choice."
+                                                    "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
                                                 }
                                             }
                                         }
@@ -670,15 +745,18 @@ pub fn DeviceSettingsModal(
                                                 "data-testid": "transport-apply-button",
                                                 onclick: move |_| {
                                                     let pref = pending_protocol();
-                                                    match (pref, sticky_transport()) {
-                                                        (TransportPreference::Auto, _) => {
+                                                    let is_default = pref == TransportPreference::default();
+                                                    match (is_default, sticky_transport()) {
+                                                        // Default + not sticky: clear all storage so the
+                                                        // implicit default takes over on reload.
+                                                        (true, false) => {
                                                             clear_transport_sticky_and_pref();
                                                         }
                                                         (_, true) => {
                                                             save_transport_preference(pref);
                                                             save_transport_sticky(true);
                                                         }
-                                                        (_, false) => {
+                                                        (false, false) => {
                                                             // Session-scoped: survives the reload only.
                                                             save_transport_preference_session(pref);
                                                         }
@@ -782,6 +860,24 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                     rx: "2",
                 }
                 path { d: "M16 10l5-3v10l-5-3z" }
+            }
+        },
+        SettingsSection::Performance => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                // Gauge: an arc with a needle, echoing the VU meters.
+                path { d: "M4 16a8 8 0 0 1 16 0" }
+                path { d: "M12 16l4-4" }
+                circle { cx: "12", cy: "16", r: "1.2", fill: "currentColor", stroke: "none" }
             }
         },
         SettingsSection::Network => rsx! {

@@ -241,6 +241,107 @@ async fn test_admit_all_participants() {
     cleanup_test_data(&pool, room_id).await;
 }
 
+// ── Admit re-activates an idle meeting (idle -> active) ────────────────────
+
+/// Read the current `state` column for a meeting directly from the DB.
+async fn meeting_state(pool: &sqlx::PgPool, room_id: &str) -> String {
+    sqlx::query_as::<_, (String,)>("SELECT state FROM meetings WHERE room_id = $1")
+        .bind(room_id)
+        .fetch_one(pool)
+        .await
+        .expect("meeting row must exist")
+        .0
+}
+
+/// Admitting a waiting participant must re-activate a meeting that has gone
+/// `idle` (everyone-left → idle). This guards the `db_meetings::activate` call
+/// added to the `admit` handler so a participant admitted into a briefly-idle
+/// meeting reliably lands in an `active` meeting.
+#[tokio::test]
+#[serial]
+async fn test_admit_reactivates_idle_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "test-admit-reactivates-idle";
+    setup_with_waiting_attendee(&pool, room_id).await;
+
+    // Precondition: meeting is active with one waiting attendee.
+    assert_eq!(meeting_state(&pool, room_id).await, "active");
+
+    // Simulate the presence-driven empty->idle transition (as if everyone left
+    // and the became-empty consumer fired).
+    let meeting = meeting_api::db::meetings::get_by_room_id(&pool, room_id)
+        .await
+        .unwrap()
+        .unwrap();
+    meeting_api::db::meetings::set_idle(&pool, meeting.id)
+        .await
+        .expect("set_idle must succeed");
+    assert_eq!(meeting_state(&pool, room_id).await, "idle");
+
+    // Host admits the waiting attendee — this must flip the meeting back to
+    // active.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/admit"),
+        "host@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"user_id":"attendee@example.com"}"#))
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        meeting_state(&pool, room_id).await,
+        "active",
+        "admitting a participant into an idle meeting must re-activate it"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+/// `admit-all` must likewise re-activate an idle meeting when it admits at
+/// least one participant.
+#[tokio::test]
+#[serial]
+async fn test_admit_all_reactivates_idle_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "test-admit-all-reactivates-idle";
+    setup_with_waiting_attendee(&pool, room_id).await;
+
+    let meeting = meeting_api::db::meetings::get_by_room_id(&pool, room_id)
+        .await
+        .unwrap()
+        .unwrap();
+    meeting_api::db::meetings::set_idle(&pool, meeting.id)
+        .await
+        .expect("set_idle must succeed");
+    assert_eq!(meeting_state(&pool, room_id).await, "idle");
+
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/admit-all"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: APIResponse<AdmitAllResponse> = response_json(resp).await;
+    assert!(body.result.admitted_count >= 1);
+
+    assert_eq!(
+        meeting_state(&pool, room_id).await,
+        "active",
+        "admit-all must re-activate an idle meeting when it admits anyone"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
 // ── Reject participant ───────────────────────────────────────────────────
 
 #[tokio::test]

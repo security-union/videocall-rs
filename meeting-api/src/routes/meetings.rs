@@ -321,6 +321,8 @@ pub async fn list_feed(
                 started_at,
                 ended_at: row.ended_at.map(|t| t.timestamp_millis()),
                 host: row.creator_id.clone(),
+                host_display_name: row.host_display_name,
+                host_user_id: row.creator_id.clone(),
                 is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
                 participant_count: row.participant_count,
                 waiting_count: row.waiting_count,
@@ -329,6 +331,11 @@ pub async fn list_feed(
                 waiting_room_enabled: row.waiting_room_enabled,
                 admitted_can_admit: row.admitted_can_admit,
                 end_on_host_leave: row.end_on_host_leave,
+                // Strictly the REQUESTING user's last admission (raw
+                // `p.last_admit`, user-scoped MAX(admitted_at)); `None` when
+                // they were never admitted. Not `last_active_at`, which is
+                // COALESCE'd with meeting-level fallbacks.
+                user_last_attended_at: row.last_admit.map(|t| t.timestamp_millis()),
             }
         })
         .collect();

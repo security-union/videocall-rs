@@ -154,10 +154,6 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
         await expect(guestGrid).toBeVisible({ timeout: 15_000 });
       }
 
-      // Wait for mesh to settle — peer discovery + HeartbeatMetadata cycle
-      // so `peer_transport` flows through to the signal-quality popup state.
-      await members[0].page.waitForTimeout(15000);
-
       // Host should see exactly one remote peer tile in the grid.
       const hostPage = members[0].page;
       await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {

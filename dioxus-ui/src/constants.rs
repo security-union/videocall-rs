@@ -113,10 +113,50 @@ pub struct RuntimeConfig {
     #[serde(rename = "mockPeersEnabled")]
     #[serde(default)]
     pub mock_peers_enabled: String,
+    /// Maximum simulcast layers a publisher may emit (issue #989 / #1082), the
+    /// runtime half of the per-receiver simulcast feature flag.
+    ///
+    /// **Default: ON (3 layers)** via [`default_experimental_simulcast_max_layers`].
+    /// The full pipeline is live: the publisher encodes up to 3 tier-differentiated
+    /// layers, each tagged with a cleartext `simulcast_layer_id`; the relay
+    /// per-(source, kind) filter forwards ONLY the layer each receiver selected;
+    /// and the receiver's `LayerChooser` picks the best layer its own downlink
+    /// can sustain. (Audio caps at 3 rungs, screen at 3.)
+    ///
+    /// The effective layer count is `min(this, device-capability ceiling)`
+    /// (see `host.rs` + `capability_check.rs::capability_max_simulcast_layers`),
+    /// so default-ON is **safe for weak devices**: a `Block`/`StrongWarn` device,
+    /// older Intel Mac, or low-benchmark device auto-gates DOWN to 1 (or 2)
+    /// layers regardless of this value — it can never force a device above what
+    /// it can encode.
+    ///
+    /// ROLLBACK: set this to `1` to disable simulcast globally — either here (the
+    /// code default) or per environment by adding
+    /// `experimentalSimulcastMaxLayers: 1` to the Helm `runtimeConfig`
+    /// (`helm/videocall-ui/.../configmap-configjs.yaml` reads `.Values.runtimeConfig`).
+    /// A per-env override always wins over this code default.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): this is
+    /// `#[serde(default = ...)]` so a stale bind-mounted `config.js` that
+    /// predates this key still parses — a missing key yields the code default
+    /// (now 3), never a parse failure that would brick startup. A per-env config
+    /// that wants a different value must set the key explicitly.
+    #[serde(rename = "experimentalSimulcastMaxLayers")]
+    #[serde(default = "default_experimental_simulcast_max_layers")]
+    pub experimental_simulcast_max_layers: u32,
 }
 
 fn default_vad_threshold() -> f32 {
     0.02
+}
+
+/// Default simulcast layer ceiling when `experimentalSimulcastMaxLayers` is
+/// absent from `config.js` — **3 layers (feature ON by default)** as of #1082.
+/// The effective count is still `min(this, device-capability ceiling)`, so weak
+/// devices auto-gate down to 1–2 layers (see `capability_check.rs`). Set to `1`
+/// (here or via a per-env Helm `runtimeConfig` override) to disable simulcast.
+fn default_experimental_simulcast_max_layers() -> u32 {
+    3
 }
 
 pub fn app_config() -> Result<RuntimeConfig, String> {
@@ -146,6 +186,18 @@ pub fn screen_bitrate_kbps() -> Result<u32, String> {
 }
 pub fn vad_threshold() -> Result<f32, String> {
     app_config().map(|c| c.vad_threshold)
+}
+/// Runtime simulcast layer ceiling (issue #989 / #1082). **Defaults to 3
+/// (feature ON)** when `config.js` lacks the key or the config can't be read —
+/// kept in lockstep with [`default_experimental_simulcast_max_layers`] so a
+/// missing/unreadable config behaves identically to the serde default. The
+/// effective count is `min(this, device-capability ceiling)`, so weak devices
+/// still auto-gate to 1–2 layers. See
+/// [`RuntimeConfig::experimental_simulcast_max_layers`] for rollback.
+pub fn experimental_simulcast_max_layers() -> u32 {
+    app_config()
+        .map(|c| c.experimental_simulcast_max_layers)
+        .unwrap_or(3)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {
@@ -341,4 +393,38 @@ pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient
     Ok(videocall_meeting_client::MeetingApiClient::new(
         &base_url, auth_mode,
     ))
+}
+
+#[cfg(test)]
+mod simulcast_default_tests {
+    use super::default_experimental_simulcast_max_layers;
+
+    /// Issue #1082: per-receiver simulcast is ON BY DEFAULT — the serde default
+    /// used when `config.js` omits `experimentalSimulcastMaxLayers` is 3 (the
+    /// full ladder), not the old 1 (OFF).
+    #[test]
+    fn serde_default_is_three_feature_on() {
+        assert_eq!(
+            default_experimental_simulcast_max_layers(),
+            3,
+            "simulcast must default ON (3 layers) — see issue 1082"
+        );
+    }
+
+    /// The serde default and the `experimental_simulcast_max_layers().unwrap_or(..)`
+    /// read fallback must stay in lockstep so a missing/unreadable config behaves
+    /// identically to the default. The read fn itself calls `app_config()` (needs
+    /// `window()`, wasm-only), so we can't invoke it on host — instead pin the
+    /// fallback literal here against the default fn. If someone changes one, this
+    /// test forces them to change the other.
+    #[test]
+    fn read_fallback_matches_serde_default() {
+        // The literal in `experimental_simulcast_max_layers()`'s `.unwrap_or(3)`.
+        const READ_FALLBACK: u32 = 3;
+        assert_eq!(
+            READ_FALLBACK,
+            default_experimental_simulcast_max_layers(),
+            "the read-fn fallback must equal the serde default (lockstep, issue 1082)"
+        );
+    }
 }

@@ -469,7 +469,6 @@ test.describe("Display name live update", () => {
 
       // Navigate guest back to home page
       await guestPage.goto("/");
-      await guestPage.waitForTimeout(2000);
 
       // The username input should be pre-filled with the persisted new name
       const usernameInput = guestPage.locator("#username");

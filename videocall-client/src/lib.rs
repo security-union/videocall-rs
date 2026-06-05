@@ -82,6 +82,7 @@
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
 //!     on_participant_kicked: None,
+//!     on_peer_event: None,
 //!     decode_media: true,
 //!     is_guest: false,
 //!     allow_post_rebase_retry: true,
@@ -124,6 +125,7 @@
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
 //! #     on_participant_kicked: None,
+//! #     on_peer_event: None,
 //! #     decode_media: true,
 //! #     is_guest: false,
 //! #     allow_post_rebase_retry: true,
@@ -135,7 +137,8 @@
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
 //!     Callback::noop(),
-//!     Callback::noop() // on_error callback for camera errors
+//!     Callback::noop(), // on_error callback for camera errors
+//!     1,                // max simulcast layers (1 = single stream / off)
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -145,6 +148,7 @@
 //!     None, // vad_threshold
 //!     Some(camera.shared_audio_tier_bitrate()),
 //!     Some(camera.shared_audio_tier_fec()),
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //! use std::sync::atomic::AtomicBool;
 //! use std::rc::Rc;
@@ -155,6 +159,7 @@
 //!     Callback::noop(),
 //!     Callback::noop(), // on_state_change callback for screen share events
 //!     screen_sharing_active,
+//!     1, // max simulcast layers (1 = single stream / off)
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -240,14 +245,16 @@ pub use client::{
 };
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
-    create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
+    create_audio_peer_decoder, max_layers_for_kind, AudioPeerDecoderTrait, KindLayerBounds,
+    PeerDecodeManager, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
 };
 pub use encode::{
-    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,
+    QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot, ScreenQualityTierBounds,
     ScreenShareEvent,
 };
 pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
     MediaPermissionsErrorState, PermissionState, SelectableDevices,
 };
-pub use videocall_types::Callback;
+pub use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};

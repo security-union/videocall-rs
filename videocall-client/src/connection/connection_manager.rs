@@ -205,6 +205,57 @@ pub fn connection_session_drops() -> u64 {
     CONNECTION_SESSION_DROPS.load(Ordering::Relaxed)
 }
 
+// Transport re-election outcome counters (dashboard audit Tier B #3;
+// discussion #562). Module-level `AtomicU64`s mirroring the
+// handshake-failure / session-drop counters above: incremented from the four
+// terminal branches of `complete_election`, read by the health reporter at
+// packet-build time, and expanded by the relay's metrics_server into
+// `videocall_client_reelection_total{result=...}` so Grafana can chart
+// re-election rate AND outcome without console logs. Process-global (not
+// per-manager) for the same reason as the sibling counters: a reconnect builds
+// a fresh `ConnectionManager`, and we want the cumulative total across the
+// whole page session, which is exactly what `rate()`/`increase()` expects.
+//
+// Statics (not struct fields) also sidestep the borrow dance: they are bumped
+// from `&mut self` `complete_election` and read from the `&self` health-report
+// path with no interior mutability.
+
+/// Cumulative re-elections that switched to a NEW winning connection
+/// (excludes the cold-start initial election).
+static REELECTION_PROCEEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that ran but KEPT the existing connection because
+/// the winner was not meaningfully better (hysteresis abort).
+static REELECTION_ABORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections where all candidates failed but the old connection
+/// was still fresh and was PRESERVED (candidate-failure path, #539).
+static REELECTION_PRESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that FAILED with no usable connection
+/// ("Election failed: No valid connections") — the participant dropped off.
+static REELECTION_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative re-elections that switched to a new winner since process start.
+pub fn reelection_proceeded_total() -> u64 {
+    REELECTION_PROCEEDED.load(Ordering::Relaxed)
+}
+
+/// Cumulative re-elections aborted by hysteresis since process start.
+pub fn reelection_aborted_total() -> u64 {
+    REELECTION_ABORTED.load(Ordering::Relaxed)
+}
+
+/// Cumulative re-elections that preserved the old connection since process start.
+pub fn reelection_preserved_total() -> u64 {
+    REELECTION_PRESERVED.load(Ordering::Relaxed)
+}
+
+/// Cumulative failed re-elections (no valid connection) since process start.
+pub fn reelection_failed_total() -> u64 {
+    REELECTION_FAILED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Testing {
@@ -296,10 +347,10 @@ pub struct ConnectionManagerOptions {
     ///
     /// The dioxus-ui passes `true` only when the user's
     /// [`TransportPreference`](https://github01.hclpnp.com/labs-projects/videocall)
-    /// is `Auto` — i.e. the single-candidate state is system-side, not a
-    /// deliberate user choice. Manual `WebTransportOnly` / `WebSocketOnly`
-    /// selections set this to `false` so the retry never fires and the user's
-    /// transport choice is respected.
+    /// is the default `WebTransport` (WT-with-WS-fallback) mode — i.e. the
+    /// single-candidate state is system-side, not a deliberate user choice.
+    /// A manual `WebSocket` selection sets this to `false` so the retry
+    /// never fires and the user's transport choice is respected.
     pub allow_post_rebase_retry: bool,
 
     /// Optional async callback that refreshes the room token before the
@@ -524,6 +575,22 @@ pub struct ConnectionManager {
     /// the stall lasted. Cleared back to `None` on the falling edge.
     /// Single-threaded access — no atomic needed.
     suppression_started_at_ms: Option<f64>,
+}
+
+fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
+    let Some(own_id) = own_session_id else {
+        return false;
+    };
+
+    if packet.session_id == 0 || packet.session_id != own_id {
+        return false;
+    }
+
+    // CONGESTION packets are deliberately self-addressed: the server stamps
+    // the throttled sender's session_id so that sender can step down quality.
+    // They must pass this transport-level self-filter and be handled by
+    // VideoCallClient, which still ignores cross-session CONGESTION.
+    packet.packet_type != PacketType::CONGESTION.into()
 }
 
 impl ConnectionManager {
@@ -951,15 +1018,15 @@ impl ConnectionManager {
                 }
             }
 
-            // Filter self-packets using session_id
-            if let Some(own_id) = *own_session_id.borrow() {
-                if packet.session_id != 0 && packet.session_id == own_id {
-                    debug!(
-                        "Rejecting packet from same session_id: {}",
-                        packet.session_id
-                    );
-                    return;
-                }
+            // Filter self-packets using session_id. Self-targeted CONGESTION is
+            // exempt because it is the server's feedback path telling this
+            // sender to step down quality under relay backpressure.
+            if should_filter_self_packet(&packet, *own_session_id.borrow()) {
+                debug!(
+                    "Rejecting packet from same session_id: {}",
+                    packet.session_id
+                );
+                return;
             }
 
             // Only forward packets from the elected connection.
@@ -1336,6 +1403,11 @@ impl ConnectionManager {
                             self.baseline_rtt = Some(comparison_rtt);
                             self.degradation_counter = 0;
                             self.reelection_in_progress = false;
+                            // Tier B #3: re-election ran but the winner was not
+                            // meaningfully better, so we kept the existing
+                            // connection. This `aborted` outcome is only ever
+                            // reached inside `if self.reelection_in_progress`.
+                            REELECTION_ABORTED.fetch_add(1, Ordering::Relaxed);
                             self.old_active_rtt = None;
                             self.old_active_rtt_measurement = None;
                             // The cycle reached an orderly conclusion — clear
@@ -1455,6 +1527,15 @@ impl ConnectionManager {
                 // Store baseline RTT for re-election quality monitoring.
                 self.baseline_rtt = measurement.average_rtt;
                 self.degradation_counter = 0;
+                // Tier B #3: count a `proceeded` outcome ONLY when this was a
+                // re-election (a switch away from a prior active connection),
+                // not the initial election — the dashboard story is "how often
+                // do we re-elect", so the cold-start election must not inflate
+                // the rate. `reelection_in_progress` is still true here; it is
+                // reset on the next line.
+                if self.reelection_in_progress {
+                    REELECTION_PROCEEDED.fetch_add(1, Ordering::Relaxed);
+                }
                 self.reelection_in_progress = false;
                 // Successful election — restore the full post-rebase retry budget.
                 self.post_rebase_retry_count = 0;
@@ -1516,6 +1597,10 @@ impl ConnectionManager {
                 // existing disconnect path so a genuinely dead session does
                 // not get pinned to a ghost connection forever.
                 if self.try_preserve_old_connection_on_candidate_failure(&e.to_string()) {
+                    // Tier B #3: all candidates failed but the old connection
+                    // was still fresh, so it was preserved (the call has NOT
+                    // dropped — distinct from the `failed` outcome below).
+                    REELECTION_PRESERVED.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
 
@@ -1523,6 +1608,23 @@ impl ConnectionManager {
                     reason: e.to_string(),
                     failed_at: monotonic_now_ms(),
                 };
+                // Tier B #3: terminal RE-ELECTION failure — no usable
+                // connection ("Election failed: No valid connections") for a
+                // participant who WAS already on a call and lost it. Gated on
+                // `reelection_in_progress` (same as `proceeded`/`aborted`) so
+                // the four buckets share one denominator: re-election outcomes
+                // only. `complete_election` also runs for the cold-start
+                // election (via `check_and_complete_election`); a first-connect
+                // that fails here must NOT bump this metric — that case is the
+                // initial-connect failure, already covered by the connection-
+                // failure counters, not a re-election. (`preserved` above is
+                // naturally re-election-only: it needs an `old_active_connection`
+                // that exists only during a re-election.) This matches the
+                // documented contract "buckets mirror the four terminal
+                // branches of re-election."
+                if self.reelection_in_progress {
+                    REELECTION_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
                 self.old_active_rtt = None;
                 self.old_active_rtt_measurement = None;
                 self.reelection_preserved_once = false;
@@ -2729,10 +2831,10 @@ impl ConnectionManager {
     //
     // The retry only fires when `options.allow_post_rebase_retry == true`.
     // The dioxus-ui sets this to `true` only when the user's
-    // `TransportPreference` is `Auto` (i.e. the single-candidate state is
-    // system-side, not the user's deliberate choice). Manual `WebTransportOnly`
-    // / `WebSocketOnly` selections set this to `false` so the retry never
-    // overrides an explicit user choice.
+    // `TransportPreference` is the default `WebTransport` (WT-with-WS-fallback)
+    // mode — i.e. the single-candidate state is system-side, not the user's
+    // deliberate choice. A manual `WebSocket` selection sets this to `false`
+    // so the retry never overrides an explicit user choice.
     // -----------------------------------------------------------------------
 
     /// Schedules the post-rebase re-election retry timer if and only if the
@@ -2745,9 +2847,9 @@ impl ConnectionManager {
     /// counter is below the cap actually spawns a timer.
     fn maybe_schedule_post_rebase_retry(&mut self) {
         if !self.options.allow_post_rebase_retry {
-            // The user explicitly chose a single transport (WebTransportOnly /
-            // WebSocketOnly). Respect that choice — single-candidate state is
-            // intentional, not a recoverable system condition.
+            // The user explicitly chose `WebSocket`. Respect that choice —
+            // single-candidate state is intentional, not a recoverable
+            // system condition.
             debug!(
                 "Post-rebase retry suppressed: user transport preference forbids it \
                  (allow_post_rebase_retry=false)"
@@ -3783,6 +3885,186 @@ mod tests {
         );
     }
 
+    fn packet(packet_type: PacketType, session_id: u64) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: packet_type.into(),
+            session_id,
+            ..Default::default()
+        }
+    }
+
+    fn forwarded_packets_for(
+        packet: PacketWrapper,
+        own_session_id: Option<u64>,
+    ) -> Vec<PacketWrapper> {
+        let forwarded = Rc::new(RefCell::new(Vec::<PacketWrapper>::new()));
+        let sink = forwarded.clone();
+        let mut mgr = make_test_manager();
+        mgr.options.on_inbound_media = Callback::from(move |packet: PacketWrapper| {
+            sink.borrow_mut().push(packet);
+        });
+        *mgr.own_session_id.borrow_mut() = own_session_id;
+        *mgr.active_connection_id.borrow_mut() = Some("conn".to_string());
+
+        let callback = mgr.create_inbound_media_callback("conn".to_string());
+        callback.emit(packet);
+
+        let packets = forwarded.borrow().clone();
+        packets
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier B #3: re-election outcome counters (REELECTION_FAILED gating).
+    //
+    // `complete_election` runs for BOTH the cold-start election and re-elections
+    // (it is reached via `check_and_complete_election`). The fix gates the
+    // `REELECTION_FAILED` increment on `self.reelection_in_progress` so the four
+    // outcome buckets share one denominator (re-election only) and a first-
+    // connect failure does NOT pollute the `failed` bucket. These tests pin both
+    // halves of that contract.
+    //
+    // The counter is a process-global `AtomicU64`. These two tests are the ONLY
+    // callers of `complete_election` in the suite, but they could still race
+    // each other under the default parallel test runner, so they serialize on a
+    // shared mutex and assert on the DELTA (load before/after) rather than an
+    // absolute value — robust to any residual cross-test increment.
+    static REELECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drive `complete_election` into its terminal `Err` ("No valid
+    /// connections") branch: `rtt_measurements` is empty, so
+    /// `find_best_connection` returns `Err` and no preservation is possible.
+    /// Returns the increase in `REELECTION_FAILED` caused by this one call.
+    fn failed_delta_for_election(reelection_in_progress: bool) -> u64 {
+        let mut mgr = make_test_manager();
+        // No measurements => find_best_connection() fails => Err arm.
+        assert!(mgr.rtt_measurements.is_empty());
+        // No old_active_connection => try_preserve returns false => we reach
+        // the REELECTION_FAILED site.
+        assert!(mgr.old_active_connection.is_none());
+        mgr.reelection_in_progress = reelection_in_progress;
+
+        let before = REELECTION_FAILED.load(Ordering::Relaxed);
+        mgr.complete_election();
+        let after = REELECTION_FAILED.load(Ordering::Relaxed);
+        // Sanity: we actually landed in the Failed terminal state.
+        assert!(
+            matches!(mgr.election_state, ElectionState::Failed { .. }),
+            "expected ElectionState::Failed after a no-candidate election"
+        );
+        after - before
+    }
+
+    #[test]
+    fn cold_start_election_failure_does_not_bump_reelection_failed() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // reelection_in_progress == false models the initial cold-start
+        // election. Its failure is an initial-connect failure (covered by the
+        // connection-failure counters), NOT a re-election outcome.
+        let delta = failed_delta_for_election(/* reelection_in_progress = */ false);
+        assert_eq!(
+            delta, 0,
+            "cold-start election failure must NOT increment REELECTION_FAILED \
+             (it is not a re-election; gate on reelection_in_progress)"
+        );
+    }
+
+    #[test]
+    fn reelection_failure_bumps_reelection_failed() {
+        let _guard = REELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // reelection_in_progress == true models a participant already on a call
+        // whose re-election found no usable connection ("No valid connections").
+        let delta = failed_delta_for_election(/* reelection_in_progress = */ true);
+        assert_eq!(
+            delta, 1,
+            "a re-election that hits 'No valid connections' MUST increment \
+             REELECTION_FAILED exactly once"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_exempts_self_targeted_congestion() {
+        let pkt = packet(PacketType::CONGESTION, 42);
+        assert!(
+            !should_filter_self_packet(&pkt, Some(42)),
+            "self-targeted CONGESTION must reach VideoCallClient so AQ can step down"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_still_drops_non_congestion_self_packets() {
+        let pkt = packet(PacketType::MEDIA, 42);
+        assert!(
+            should_filter_self_packet(&pkt, Some(42)),
+            "non-CONGESTION self packets must still be filtered"
+        );
+    }
+
+    #[test]
+    fn self_packet_filter_never_filters_without_own_session_id() {
+        // Before SESSION_ASSIGNED arrives there is no own_session_id, so nothing
+        // is self-filtered — CONGESTION (and everything else) must forward. Locks
+        // in that the None early-return precedes the CONGESTION type check.
+        let pkt = packet(PacketType::CONGESTION, 42);
+        assert!(!should_filter_self_packet(&pkt, None));
+    }
+
+    #[test]
+    fn self_packet_filter_never_filters_zero_session_id() {
+        // session_id == 0 is the unstamped sentinel and is never treated as a
+        // self-match. Asserted with CONGESTION to lock in that the sentinel
+        // early-return precedes the CONGESTION type check.
+        let pkt = packet(PacketType::CONGESTION, 0);
+        assert!(!should_filter_self_packet(&pkt, Some(0)));
+    }
+
+    #[test]
+    fn inbound_callback_forwards_self_targeted_congestion() {
+        let forwarded = forwarded_packets_for(packet(PacketType::CONGESTION, 42), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].packet_type, PacketType::CONGESTION.into());
+        assert_eq!(forwarded[0].session_id, 42);
+    }
+
+    #[test]
+    fn inbound_callback_filters_non_congestion_self_packets() {
+        let forwarded = forwarded_packets_for(packet(PacketType::MEDIA, 42), Some(42));
+
+        assert!(
+            forwarded.is_empty(),
+            "self MEDIA echo should remain filtered"
+        );
+    }
+
+    #[test]
+    fn inbound_callback_leaves_cross_session_congestion_to_client_handler() {
+        let forwarded = forwarded_packets_for(packet(PacketType::CONGESTION, 77), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].packet_type, PacketType::CONGESTION.into());
+        assert_eq!(forwarded[0].session_id, 77);
+    }
+
+    #[test]
+    fn inbound_callback_forwards_self_session_assigned_via_early_intercept() {
+        // SESSION_ASSIGNED is intercepted and forwarded upstream of the
+        // self-packet filter, so a self-matching session_id never reaches the
+        // filter and the packet still forwards. (Not a self-filter ordering
+        // test — it asserts the early-intercept path.)
+        let forwarded = forwarded_packets_for(packet(PacketType::SESSION_ASSIGNED, 42), Some(42));
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded[0].packet_type,
+            PacketType::SESSION_ASSIGNED.into()
+        );
+        assert_eq!(forwarded[0].session_id, 42);
+    }
+
     // ===================================================================
     // 1. ReconnectionPhase state machine
     // ===================================================================
@@ -4269,10 +4551,9 @@ mod tests {
 
     #[test]
     fn post_rebase_retry_not_scheduled_when_user_pref_forbids() {
-        // User explicitly chose WebSocketOnly (or WebTransportOnly) — the
-        // single-candidate state is intentional. The rebase path must NOT
-        // bump the retry counter, because the spawn_local schedule path is
-        // gated on the preference.
+        // User explicitly chose `WebSocket` — the single-candidate state is
+        // intentional. The rebase path must NOT bump the retry counter,
+        // because the spawn_local schedule path is gated on the preference.
         let mut mgr = make_test_manager();
         mgr.options.webtransport_urls = vec!["https://only-server".into()];
         mgr.options.allow_post_rebase_retry = false;

@@ -21,6 +21,13 @@
 #                   session to the peer map from console logs. Useful for
 #                   identifying memory-pressured / slow clients (see
 #                   discussion #562, RELAY-2 pattern).
+#   --relay-ws=P    optional: path to a videocall-websocket relay pod log
+#                   file. When provided, emits a "WS Mailbox-Full Drops"
+#                   section joining "Dropping inbound message ... (mailbox
+#                   full)" drops per session to the peer map. This is the
+#                   actor-mailbox overflow that causes room-wide freezes
+#                   (issue #1057); often bursty fan-out storms, not slow
+#                   receivers.
 #   -h | --help     show full usage and exit
 #
 # Dependencies: jq, zcat, date (GNU coreutils)
@@ -57,10 +64,19 @@
 # | audio health (buffer: Nms) for peer: X      | audio_buffer_median_ms per peer   | videocall-client/src/health_reporter.rs |
 # | "level":"preamble"                          | cores / memory / platform / etc. | videocall-client console-logger initialization |
 #
+# | KEYFRAME_REQUEST                            | keyframe_req_count  | videocall-client/src/decode/peer_decode_manager.rs     |
+# | CameraEncoder: forcing keyframe             | pli_received_count  | videocall-client/src/encode/camera_encoder.rs          |
+# | AdaptiveQuality: video stepped DOWN         | aq_step_down_count  | videocall-aq/src/controller.rs                         |
+# | FPS: target=N received=N                    | pid_received_fps    | videocall-aq/src/controller.rs                         |
+# | network=                                    | net_downlink, net_rtt | preamble (Navigator.connection API)                  |
+# | battery=                                    | battery_state       | preamble (Navigator.getBattery API)                    |
+#
 # RELAY-POD patterns (when --relay-wt=PATH is provided):
 # | Phrase matched                              | Extracts                         | Emitter                                         |
 # |---------------------------------------------|----------------------------------|-------------------------------------------------|
 # | Outbound channel full for session <ID>      | drops_per_session (slow-drain)  | actix-api/src/actors/transports/wt_chat_session.rs |
+# RELAY-POD patterns (when --relay-ws=PATH is provided):
+# | Dropping inbound message for session <ID> ... (mailbox full) | mailbox_full drops_per_session (issue #1057) | actix-api/src/actors/chat_server.rs |
 # ===========================================================================
 
 set -e
@@ -68,7 +84,7 @@ set -e
 # -h / --help — print usage and exit 0
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<EOF
-Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]
+Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]
        $(basename "$0") -h | --help
 
 Produces a structured summary of a pulled console-log directory.
@@ -92,6 +108,13 @@ Modes:
                   counts joined to the peer map. Useful for spotting
                   memory-pressured / slow clients (RELAY-2 pattern,
                   see discussion #562).
+  --relay-ws=P    Optional path to a videocall-websocket relay pod log
+                  file. When provided, emits a "WS Mailbox-Full Drops"
+                  section showing per-session "Dropping inbound message
+                  ... (mailbox full)" drop counts joined to the peer
+                  map. This is the 16-slot actor-mailbox overflow that
+                  causes room-wide freezes (issue #1057) — usually
+                  bursty fan-out storms, not slow receivers.
   -h, --help      Show this help.
 
 Examples:
@@ -105,9 +128,10 @@ Examples:
   # Verify parser matches the current client's log format
   $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) --verify
 
-  # Cross-reference with relay pod backpressure
+  # Cross-reference with relay pod backpressure (both transports)
   $(basename "$0") /tmp/console-logs/infra/\$(date -u +%F) \\
-    --relay-wt=/tmp/relay-webtransport.log
+    --relay-wt=/tmp/relay-webtransport.log \\
+    --relay-ws=/tmp/relay-websocket.log
 
 See scripts/parse_meeting_console_logs.README.md for the full workflow
 (pulling logs from the pod, column reference, sample output).
@@ -118,6 +142,7 @@ fi
 LOG_DIR="${1:-}"
 OUTPUT_FORMAT="markdown"
 RELAY_WT=""
+RELAY_WS=""
 # Parse remaining args: $2..$N. --json / --verify set format; --relay-wt=PATH sets relay path.
 shift  # drop $1 (LOG_DIR)
 for arg in "$@"; do
@@ -133,20 +158,26 @@ for arg in "$@"; do
       fi
       OUTPUT_FORMAT="verify" ;;
     --relay-wt=*)    RELAY_WT="${arg#--relay-wt=}" ;;
+    --relay-ws=*)    RELAY_WS="${arg#--relay-ws=}" ;;
     "")              ;;  # skip empty
     *)               echo "Unknown option: $arg" >&2
-                     echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+                     echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]" >&2
                      exit 1 ;;
   esac
 done
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH]" >&2
+  echo "Usage: $(basename "$0") <log_dir> [--json|--verify] [--relay-wt=PATH] [--relay-ws=PATH]" >&2
   exit 1
 fi
 
 if [[ -n "$RELAY_WT" && ! -f "$RELAY_WT" ]]; then
   echo "--relay-wt: file not found: $RELAY_WT" >&2
+  exit 1
+fi
+
+if [[ -n "$RELAY_WS" && ! -f "$RELAY_WS" ]]; then
+  echo "--relay-ws: file not found: $RELAY_WS" >&2
   exit 1
 fi
 
@@ -278,6 +309,30 @@ for key in "${ALL_KEYS[@]}"; do
       }
     }' 2>/dev/null || echo '{"n":0,"median_ms":null,"n_nonzero":0,"median_nonzero_ms":null}')
 
+  # Pass 5: Keyframe requests sent, PLIs received, AQ step-downs, PID received FPS
+  # Single zcat pass to avoid decompressing 150+ files multiple times
+  read -r keyframe_requests pli_received aq_step_downs pid_received_median < <(
+    zcat "${files[@]}" 2>/dev/null | \
+    $AWK '
+      /KEYFRAME_REQUEST/ { kf++ }
+      /CameraEncoder: forcing keyframe/ { pli++ }
+      /stepped DOWN/ { aq++ }
+      /received=[0-9.]/ {
+        match($0, /received=([0-9.]+)/, m)
+        if (m[1] != "") { fps[++nfps] = m[1]+0 }
+      }
+      END {
+        if (nfps > 0) { asort(fps); med = int(fps[int(nfps/2)+1]) } else { med = "" }
+        printf "%d %d %d %s\n", kf+0, pli+0, aq+0, (med == "" ? "\"\"" : med)
+      }
+    ' 2>/dev/null || echo "0 0 0 \"\""
+  )
+  # Ensure valid integers for jq
+  keyframe_requests=${keyframe_requests:-0}
+  pli_received=${pli_received:-0}
+  aq_step_downs=${aq_step_downs:-0}
+  pid_received_median=${pid_received_median:-""}
+
   # Pass 4: preamble (client machine specs) — first chunk only, emits one
   # "level":"preamble" line near the top. Extract cores / memory / platform /
   # architecture / gpu. All fields are semicolon-delimited key=value pairs in
@@ -292,6 +347,12 @@ for key in "${ALL_KEYS[@]}"; do
   pre_gpu=$(echo "$preamble_msg" | grep -oE 'gpu=[^;]+' | head -1 | cut -d= -f2-)
   pre_screen=$(echo "$preamble_msg" | grep -oE 'screen=[^;]+' | head -1 | cut -d= -f2-)
   pre_app_version=$(echo "$preamble_msg" | grep -oE 'appVersion=[^;]+' | head -1 | cut -d= -f2-)
+  pre_network=$(echo "$preamble_msg" | grep -oE 'network=[^;]+' | head -1 | cut -d= -f2-)
+  pre_battery=$(echo "$preamble_msg" | grep -oE 'battery=[^;]+' | head -1 | cut -d= -f2-)
+
+  # Parse network into components (format: "4g/5.8Mbps/rtt100ms")
+  pre_net_downlink=$(echo "$pre_network" | grep -oE '[0-9.]+Mbps' | head -1 | sed 's/Mbps//')
+  pre_net_rtt=$(echo "$pre_network" | grep -oE 'rtt[0-9]+ms' | head -1 | sed 's/rtt//;s/ms//')
 
   # Flag underpowered client (discussion #562): cores < 6, or older Intel Mac
   # (macOS 14/15 AND cores <= 8). Emitted as simple bool so markdown can add ⚠.
@@ -301,6 +362,17 @@ for key in "${ALL_KEYS[@]}"; do
   elif [[ "$pre_platform" == "macOS 14"* || "$pre_platform" == "macOS 15"* ]] \
        && [[ -n "$pre_cores" && "$pre_cores" -le 8 ]]; then
     underpowered=true
+  fi
+
+  # Flag bandwidth-constrained: reported downlink < 8 Mbps
+  bandwidth_constrained=false
+  if [[ -n "$pre_net_downlink" ]]; then
+    bandwidth_constrained=$($AWK "BEGIN { print ($pre_net_downlink < 8) ? \"true\" : \"false\" }")
+  fi
+  # Flag on-battery
+  on_battery=false
+  if [[ "$pre_battery" == discharging* ]]; then
+    on_battery=true
   fi
 
   # First/last timestamps from filename sort (filename IS the session_ts, last chunk = most recent)
@@ -325,6 +397,10 @@ for key in "${ALL_KEYS[@]}"; do
     --argjson error_count "$error_count" \
     --argjson speaking_transitions "$speaking_transitions" \
     --argjson audio_buffer "$audio_buffer_stats" \
+    --argjson keyframe_requests "$keyframe_requests" \
+    --argjson pli_received "$pli_received" \
+    --argjson aq_step_downs "$aq_step_downs" \
+    --arg pid_received_median "$pid_received_median" \
     --arg pre_cores "$pre_cores" \
     --arg pre_memory "$pre_memory" \
     --arg pre_platform "$pre_platform" \
@@ -332,7 +408,13 @@ for key in "${ALL_KEYS[@]}"; do
     --arg pre_gpu "$pre_gpu" \
     --arg pre_screen "$pre_screen" \
     --arg pre_app_version "$pre_app_version" \
+    --arg pre_network "$pre_network" \
+    --arg pre_net_downlink "$pre_net_downlink" \
+    --arg pre_net_rtt "$pre_net_rtt" \
+    --arg pre_battery "$pre_battery" \
     --argjson underpowered "$underpowered" \
+    --argjson bandwidth_constrained "$bandwidth_constrained" \
+    --argjson on_battery "$on_battery" \
     '{
       email: $email,
       session_ts: $session_ts,
@@ -353,6 +435,10 @@ for key in "${ALL_KEYS[@]}"; do
       error_count: $error_count,
       speaking_transitions: $speaking_transitions,
       audio_buffer: $audio_buffer,
+      keyframe_requests: $keyframe_requests,
+      pli_received: $pli_received,
+      aq_step_downs: $aq_step_downs,
+      pid_received_median: $pid_received_median,
       first_ts: $first_ts,
       last_ts: $last_ts,
       preamble: {
@@ -363,7 +449,13 @@ for key in "${ALL_KEYS[@]}"; do
         gpu: $pre_gpu,
         screen: $pre_screen,
         app_version: $pre_app_version,
-        underpowered: $underpowered
+        network: $pre_network,
+        net_downlink_mbps: $pre_net_downlink,
+        net_rtt_ms: $pre_net_rtt,
+        battery: $pre_battery,
+        underpowered: $underpowered,
+        bandwidth_constrained: $bandwidth_constrained,
+        on_battery: $on_battery
       }
     }' > "$TMPDIR_WORK/${key//[: @]/_}.json" 2>/dev/null || true
 done
@@ -488,6 +580,40 @@ if [[ -n "$RELAY_WT" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 4d: Relay-WS log ingest (--relay-ws=PATH)
+# ---------------------------------------------------------------------------
+# Count "Dropping inbound message for session <id>: ... (mailbox full ...)"
+# drops per session. This is the WEBSOCKET-path equivalent of the WT
+# "Outbound channel full" slow-drain, but it fires at the 16-slot actix
+# ACTOR MAILBOX in front of the 128 outbound channel — see issue #1057 and
+# ~/work/notebook/.../2026-06-03-ws-mailbox-overflow-freeze.md. Unlike the WT
+# pattern this is NOT necessarily a slow receiver: drops are frequently BURSTY
+# fan-out storms (keyframe spike / join / screen-share start) that overflow the
+# tiny mailbox for ALL receivers at once, including fast ones. The matching
+# Prometheus signal is relay_packet_drops_total{drop_reason="mailbox_full"}.
+declare -A WS_MAILBOX_DROPS  # session_id → drop count
+WS_MAILBOX_DROPS_TOTAL=0
+if [[ -n "$RELAY_WS" ]]; then
+  declare -A IN_MEETING_SIDS_WS
+  for s in "${session_jsons[@]}"; do
+    sid=$(echo "$s" | jq -r '.session_id')
+    [[ -n "$sid" && "$sid" != "null" ]] && IN_MEETING_SIDS_WS["$sid"]=1
+  done
+  # Format: WARN ... Dropping inbound message for session 1057...: ... (mailbox full ...)
+  while read -r count sid; do
+    [[ -z "$sid" ]] && continue
+    if [[ -n "${IN_MEETING_SIDS_WS[$sid]:-}" ]]; then
+      WS_MAILBOX_DROPS["$sid"]="$count"
+      WS_MAILBOX_DROPS_TOTAL=$((WS_MAILBOX_DROPS_TOTAL + count))
+    fi
+  done < <(grep -oE 'Dropping inbound message for session [0-9]+' "$RELAY_WS" 2>/dev/null \
+           | grep -oE '[0-9]+$' \
+           | sort \
+           | uniq -c \
+           | $AWK '{print $1, $2}')
+fi
+
+# ---------------------------------------------------------------------------
 # Step 5: Output
 # ---------------------------------------------------------------------------
 
@@ -521,6 +647,9 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "handshake failed"
     "Speaking changed: false -> true"
     "audio health (buffer:"
+    "KEYFRAME_REQUEST"
+    "CameraEncoder: forcing keyframe"
+    "stepped DOWN"
   )
 
   verify_failed=0
@@ -610,8 +739,8 @@ echo "### Sessions"
 echo ""
 echo "_Cores/Platform sourced from \`\"level\":\"preamble\"\` in first chunk. ⚠ flags clients likely to struggle in meetings ≥ 10 peers (underpowered) or with concurrent duplicate sessions (NetEQ duplication — NETEQ-1) — see [discussion #562](https://github01.hclpnp.com/labs-projects/videocall/discussions/562)._"
 echo ""
-echo "| Email | Name | Start (UTC) | Transport | RTT Base | Reelect | Chunks | Implaus RTT | Speak | Buf med | Errors | End | Cores | Platform | Concurrent |"
-echo "|-------|------|-------------|-----------|----------|---------|--------|-------------|-------|---------|--------|-----|-------|----------|------------|"
+echo "| Email | Name | Start (UTC) | Transport | RTT Base | Net dl | Battery | Reelect | Chunks | KF Req | PLI Rx | AQ dwn | PID fps | Speak | Buf med | Errors | End | Cores | Platform | Concurrent |"
+echo "|-------|------|-------------|-----------|----------|--------|---------|---------|--------|--------|--------|--------|---------|-------|---------|--------|-----|-------|----------|------------|"
 
 for s in "${session_jsons[@]}"; do
   email=$(echo "$s" | jq -r '.email')
@@ -640,6 +769,40 @@ for s in "${session_jsons[@]}"; do
   [[ -z "$platform" ]] && platform="?"
   cores_flag=""
   [[ "$underpowered" == "true" ]] && cores_flag=" ⚠"
+  # Network/battery columns
+  net_dl=$(echo "$s" | jq -r '.preamble.net_downlink_mbps // ""')
+  battery=$(echo "$s" | jq -r '.preamble.battery // ""')
+  bw_flag=$(echo "$s" | jq -r '.preamble.bandwidth_constrained')
+  bat_flag=$(echo "$s" | jq -r '.preamble.on_battery')
+  # Keyframe/PLI/AQ/PID columns
+  kf_req=$(echo "$s" | jq -r '.keyframe_requests // 0')
+  pli_rx=$(echo "$s" | jq -r '.pli_received // 0')
+  aq_downs=$(echo "$s" | jq -r '.aq_step_downs // 0')
+  pid_p75=$(echo "$s" | jq -r '.pid_received_median // ""')
+  # Format net display
+  if [[ -n "$net_dl" && "$net_dl" != "null" && "$net_dl" != "" ]]; then
+    net_display="${net_dl}M"
+    [[ "$bw_flag" == "true" ]] && net_display="${net_display} ⚠"
+  else
+    net_display="?"
+  fi
+  # Format battery display (bat = on battery, ac = plugged in)
+  if [[ "$bat_flag" == "true" ]]; then
+    bat_display="bat"
+  elif [[ -n "$battery" && "$battery" != "null" && "$battery" != "" ]]; then
+    bat_display="ac"
+  else
+    bat_display="?"
+  fi
+  # Format PID fps display
+  if [[ -n "$pid_p75" && "$pid_p75" != "null" && "$pid_p75" != "" && "$pid_p75" != "\"\"" ]]; then
+    pid_display="${pid_p75}fps"
+  else
+    pid_display="--"
+  fi
+  # AQ step-downs: flag if >3
+  aq_display="$aq_downs"
+  [[ "$aq_downs" -gt 3 ]] 2>/dev/null && aq_display="${aq_downs} ⚠"
   # Concurrent sessions (overlap with other sessions for same email)
   session_ts=$(echo "$s" | jq -r '.session_ts')
   concurrent="${CONCURRENT_MAP[${email}::${session_ts}]:-1}"
@@ -650,11 +813,11 @@ for s in "${session_jsons[@]}"; do
   # the overall median. Meaningful signal is the buffer depth while
   # audio was actually arriving.
   if [[ "$buf_n_nonzero" == "0" || "$buf_n_nonzero" == "null" ]]; then
-    buf_display="—"
+    buf_display="--"
   else
     buf_display="${buf_median_nz}ms"
   fi
-  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${reelect} | ${chunks} | ${impl} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
+  echo "| ${email} | ${name} | ${start} | ${ttype}(${tid}) | ${rtt}ms | ${net_display} | ${bat_display} | ${reelect} | ${chunks} | ${kf_req} | ${pli_rx} | ${aq_display} | ${pid_display} | ${speak} | ${buf_display} | ${errs} | ${end_status} | ${cores}${cores_flag} | ${platform} | ${concurrent}${concurrent_flag} |"
 done
 
 echo ""
@@ -718,6 +881,35 @@ for s in "${session_jsons[@]}"; do
   echo "- **${name} (${email})**: cores=${cores}, memory=${memory}, platform=${platform}"
 done
 [[ $has_uw -eq 0 ]] && echo "_None._"
+echo ""
+
+echo "### Capacity Warnings"
+echo ""
+echo "_Flagged by preamble network/battery fields. ⚠ on Net dl = downlink < 8 Mbps. bat = on battery (potential WiFi/CPU throttling). Deduplicated per email._"
+echo ""
+echo "_**CAVEAT — \`Net dl\` and the \`4g\` tag are UNRELIABLE.** They come from \`navigator.connection\` (\`downlink\`/\`effectiveType\`), which is a coarse Chrome ESTIMATE, **not a measurement**: \`downlink\` is capped ~10 Mbps and rounded for anti-fingerprinting; \`effectiveType=\"4g\"\` is the TOP bucket (≥~10 Mbps effective) and does NOT mean cellular — a 10GbE fiber link reports \`4g\`. A low \`Net dl\` may just reflect a tab that had pulled few bytes, or a SASE/proxy (e.g. Cato) shaping throughput. **Do NOT attribute freezes to a participant's bandwidth from this field alone** — corroborate with client-measured \`active_server_rtt\`, downstream packet-arrival gaps, and a real speed test before claiming a participant is bandwidth-constrained._"
+echo ""
+
+has_capacity_warn=0
+declare -A CAPACITY_SEEN
+for s in "${session_jsons[@]}"; do
+  email=$(echo "$s" | jq -r '.email')
+  [[ -n "${CAPACITY_SEEN[$email]:-}" ]] && continue
+  bw_flag=$(echo "$s" | jq -r '.preamble.bandwidth_constrained')
+  bat_flag=$(echo "$s" | jq -r '.preamble.on_battery')
+  [[ "$bw_flag" != "true" && "$bat_flag" != "true" ]] && continue
+  CAPACITY_SEEN[$email]=1
+  has_capacity_warn=1
+  name=$(echo "$s" | jq -r '.display_name')
+  net=$(echo "$s" | jq -r '.preamble.network // "?"')
+  battery=$(echo "$s" | jq -r '.preamble.battery // "?"')
+  cores=$(echo "$s" | jq -r '.preamble.cores // "?"')
+  flags=""
+  [[ "$bw_flag" == "true" ]] && flags="${flags}low-estimated-downlink(navigator.connection,unreliable) "
+  [[ "$bat_flag" == "true" ]] && flags="${flags}on-battery "
+  echo "- **${name}** (${email}): ${flags}-- network=${net}, battery=${battery}, cores=${cores}"
+done
+[[ $has_capacity_warn -eq 0 ]] && echo "_None._"
 echo ""
 
 echo "### Concurrent Session Overlaps (NetEQ duplication risk)"
@@ -786,6 +978,37 @@ if [[ -n "$RELAY_WT" ]]; then
   echo ""
 fi
 
+if [[ -n "$RELAY_WS" ]]; then
+  echo "### WS Mailbox-Full Drops (server-side, from \`${RELAY_WS}\`)"
+  echo ""
+  echo "_Count of \`Dropping inbound message for session X ... (mailbox full)\` drops per session — the WebSocket-path overflow at the 16-slot actix actor mailbox in front of the 128 outbound channel. See **issue #1057**. Prometheus equivalent: \`relay_packet_drops_total{drop_reason=\"mailbox_full\"}\`._"
+  echo ""
+  echo "_**NOT necessarily a slow receiver.** These are often BURSTY fan-out storms (keyframe spike / peer join / screen-share start) that overflow the tiny mailbox for ALL receivers at once — including fast, well-connected ones. To distinguish a genuine slow receiver from a burst storm: bucket the drop timestamps per second and count distinct sessions hit. Many sessions in one second = burst; one session sustained = slow drain._"
+  echo ""
+  if [[ $WS_MAILBOX_DROPS_TOTAL -eq 0 ]]; then
+    echo "_No mailbox-full drops recorded for any in-meeting session._"
+  else
+    echo "| Session ID | Drops | Email | Display Name |"
+    echo "|------------|------:|-------|--------------|"
+    declare -A SID_EMAIL_WS SID_NAME_WS
+    for s in "${session_jsons[@]}"; do
+      sid=$(echo "$s" | jq -r '.session_id')
+      [[ -z "$sid" || "$sid" == "null" ]] && continue
+      SID_EMAIL_WS[$sid]=$(echo "$s" | jq -r '.email')
+      SID_NAME_WS[$sid]=$(echo "$s" | jq -r '.display_name')
+    done
+    for sid in $(for k in "${!WS_MAILBOX_DROPS[@]}"; do echo "${WS_MAILBOX_DROPS[$k]} $k"; done | sort -rn | $AWK '{print $2}'); do
+      count="${WS_MAILBOX_DROPS[$sid]}"
+      email="${SID_EMAIL_WS[$sid]:-?}"
+      name="${SID_NAME_WS[$sid]:-?}"
+      echo "| \`${sid}\` | ${count} | ${email} | ${name} |"
+    done
+    echo ""
+    echo "**Total mailbox-full drops across in-meeting sessions:** ${WS_MAILBOX_DROPS_TOTAL}"
+  fi
+  echo ""
+fi
+
 echo "### Peer ID → Email Map (for Prometheus)"
 echo ""
 echo "| Session ID (uint64) | Email | Display Name |"
@@ -816,4 +1039,10 @@ echo "# Audio concealment:"
 echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
 echo "  --data-urlencode \"query=videocall_audio_concealment_pct{meeting_id=\\\"\$MEETING_ID\\\"}\" \\"
 echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=15s\""
+echo ""
+echo "# Relay mailbox-overflow drops (issue #1057) — room label is the meeting NAME:"
+echo "# Any nonzero increase here = the freeze-causing actor-mailbox overflow."
+echo "curl -sk \"\$PROM/api/v1/query_range\" \\"
+echo "  --data-urlencode \"query=increase(relay_packet_drops_total{room=\\\"<ROOM_NAME>\\\",drop_reason=\\\"mailbox_full\\\"}[1m])\" \\"
+echo "  --data-urlencode \"start=\$START\" --data-urlencode \"end=\$END\" --data-urlencode \"step=30s\""
 echo "\`\`\`"

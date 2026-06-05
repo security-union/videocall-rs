@@ -110,11 +110,11 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
 
     const uiURL = baseURL || "http://localhost:3001";
     const ts = Date.now();
-    const meetingId = `e2e_ownership_${ts}`;
-    const userAEmail = `ownership-a-${ts}@videocall.rs`;
-    const userAName = "OwnershipUserA";
-    const userBEmail = `ownership-b-${ts}@videocall.rs`;
-    const userBName = "OwnershipUserB";
+    const meetingId = `e2e_owngate_${ts}`;
+    const userAEmail = `owngate-a-${ts}@videocall.rs`;
+    const userAName = "PropUserA";
+    const userBEmail = `owngate-b-${ts}@videocall.rs`;
+    const userBName = "PropUserB";
 
     const browserA = await chromium.launch({ args: BROWSER_ARGS });
     const browserB = await chromium.launch({ args: BROWSER_ARGS });
@@ -137,6 +137,9 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       expect(userBJoin.status, "User B must auto-admit on join (waiting room is off)").toBe(
         "admitted",
       );
+
+      // Allow the DB writes to settle before querying the feed
+      await new Promise((r) => setTimeout(r, 2000));
 
       // ── User A: should see the row with owner-only affordances ────────
       const ctxA = await createAuthenticatedContext(browserA, userAEmail, userAName, uiURL);
@@ -162,6 +165,13 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       await rowA.locator(".meeting-item-content").first().hover();
       await expect(pageA.locator(TOOLTIP_VISIBLE)).toBeVisible({ timeout: 2_000 });
       await expect(pageA.locator(TOOLTIP)).toContainText("Owner");
+      // Issue 579: an owner row already conveys identity via the Owner pill
+      // and the user's own session — the explicit "Host" / "Host ID" rows
+      // must be suppressed so the tooltip doesn't repeat what the row
+      // already says.
+      const tooltipAText = (await pageA.locator(TOOLTIP).textContent()) ?? "";
+      expect(tooltipAText).not.toMatch(/^Host$|\bHost\b(?!\s*ID)/);
+      expect(tooltipAText).not.toMatch(/Host ID/);
       // Move the pointer off the row so the tooltip is hidden again before
       // we navigate away — keeps the page state predictable for cleanup.
       await pageA.mouse.move(0, 0);
@@ -198,6 +208,18 @@ test.describe("Meeting list ownership gating (two-browser regression)", () => {
       // ownership lines are absent, not the whole tooltip.
       expect(tooltipBText).toMatch(/Started on|Last active on/);
       expect(tooltipBText).toMatch(/Duration/);
+      // Issue 579: non-owner tooltip must surface the host's identity so
+      // the user knows who created the meeting. Both the display name and
+      // the host's user_id must be present. The user_id is rendered in
+      // full (no 12-char ellipsis truncation) so it is selectable and
+      // identifiable end-to-end.
+      expect(tooltipBText).toMatch(/Host/);
+      expect(tooltipBText).toMatch(/Host ID/);
+      expect(tooltipBText).toContain(userAName);
+      expect(tooltipBText).toContain(userAEmail);
+      // Regression guard for the truncation drop — there must be no
+      // horizontal-ellipsis character anywhere in the tooltip text.
+      expect(tooltipBText).not.toContain("…");
     } finally {
       // Best-effort cleanup so seeded state doesn't bleed into future
       // runs. Failures here are tolerated by the helper.

@@ -21,8 +21,11 @@ use super::super::connection::{
     MediaStreamKey,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::layer_preference_sender::LayerPreferenceSender;
+use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -30,6 +33,7 @@ use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::LocalBoxFuture;
+use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, warn};
@@ -49,9 +53,14 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use videocall_types::protos::layer_preference_packet::{
+    layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
+};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::protos::viewport_packet::ViewportPacket;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
@@ -242,6 +251,15 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host removes this client from the meeting.
     pub on_participant_kicked: Option<Callback<()>>,
 
+    /// Callback triggered when a peer publishes a `PEER_EVENT` that targets
+    /// this client. Emits `(source_user_id, event_type, stream_id)`.
+    ///
+    /// Currently used to deliver `screen_decode_started` acknowledgements
+    /// from peers that have begun rendering this client's shared screen
+    /// (HCL issue #893). The shape is intentionally generic so additional
+    /// event_types can be added without changing the callback signature.
+    pub on_peer_event: Option<Callback<(String, String, String)>>,
+
     /// Callback triggered when a remote participant leaves the meeting.
     /// Emits `(display_name, user_id, session_id)` from the PARTICIPANT_LEFT
     /// meeting event. `session_id` is the server-assigned session_id as a
@@ -286,13 +304,14 @@ pub struct VideoCallClientOptions {
     /// post-rebase re-election retry when the RTT-degradation watchdog hits a
     /// "only 1 server configured" rebase.
     ///
-    /// Set to `true` for users on the default `Auto` transport preference —
-    /// the single-candidate state is system-side (e.g. relay-availability
-    /// blip) and recovery via re-evaluation is desirable.
+    /// Set to `true` for users on the default `WebTransport` transport
+    /// preference (the WT-with-WS-fallback mode) — the single-candidate
+    /// state is system-side (e.g. relay-availability blip) and recovery via
+    /// re-evaluation is desirable.
     ///
-    /// Set to `false` for users who explicitly chose `WebTransportOnly` or
-    /// `WebSocketOnly` — the single-candidate state is the user's deliberate
-    /// choice and the retry must not override it.
+    /// Set to `false` for users who explicitly chose `WebSocket` — the
+    /// single-candidate state is the user's deliberate choice and the
+    /// retry must not override it.
     ///
     /// Defaults to `true`. The dioxus-ui derives the value from the user's
     /// `TransportPreference` context signal.
@@ -334,6 +353,7 @@ struct InnerOptions {
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
     on_participant_kicked: Option<Callback<()>>,
+    on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
@@ -348,6 +368,17 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
+    /// Send-side state machine for the simulcast `LAYER_PREFERENCE` control
+    /// packet (issue #989, Phase 2). Holds the last-sent desired-layer map +
+    /// rate-limit clock so a `LAYER_PREFERENCE` packet is emitted only when the
+    /// receiver-driven chooser's per-peer desired layers actually change. See
+    /// [`LayerPreferenceSender`].
+    layer_preference_sender: LayerPreferenceSender,
+    /// User-configured RECEIVE-side simulcast layer bounds per kind (issue #989,
+    /// Phase 4). Default fully-open = pure auto. Applied to every per-(peer,kind)
+    /// chooser's desired layer at the monitor tick, so the requested + decoded
+    /// layer is bounded. Set via [`VideoCallClient::set_receive_layer_bounds`].
+    receive_layer_bounds: ReceiveLayerBounds,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
@@ -409,13 +440,33 @@ struct Inner {
 /// `VideoCallClient` is cheaply cloneable (`Rc`-based interior mutability)
 /// and is passed to encoders and other subsystems so they can send packets
 /// and query connection state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     connection_controller: Rc<RefCell<Option<Rc<ConnectionController>>>>,
     aes: Rc<Aes128State>,
     _diagnostics: Option<Rc<DiagnosticManager>>,
+    /// Send-side state machine for the viewport control packet (HCL issue
+    /// #988). Tracks the last-sent vs. pending active-decode-set so we only
+    /// emit a `VIEWPORT` packet on an actual change. See [`ViewportSender`].
+    viewport_sender: Rc<RefCell<ViewportSender>>,
+    /// Debounce timer that coalesces a burst of active-decode-set changes
+    /// (scroll / relayout) into a single `VIEWPORT` send. Holding the
+    /// [`Timeout`] keeps it armed; dropping/replacing it cancels the pending
+    /// fire. `None` when no flush is scheduled.
+    viewport_debounce_timer: Rc<RefCell<Option<Timeout>>>,
+}
+
+// `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
+// non-Debug fields so `VideoCallClient` stays printable for logging.
+impl std::fmt::Debug for VideoCallClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoCallClient")
+            .field("options", &self.options)
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for VideoCallClient {
@@ -423,6 +474,136 @@ impl PartialEq for VideoCallClient {
         Rc::ptr_eq(&self.inner, &other.inner)
             && Rc::ptr_eq(&self.connection_controller, &other.connection_controller)
             && self.options == other.options
+    }
+}
+
+/// Build a cleartext `VIEWPORT` control packet for `session_ids` and dispatch
+/// it on the reliable Control stream (HCL issue #988).
+///
+/// Free function taking the shared `connection_controller` cell directly so
+/// both the debounce-flush path (which holds a `VideoCallClient`) and the
+/// reconnect re-send closure (which only holds a `Weak<RefCell<Inner>>`, to
+/// avoid an `Rc` cycle through the connection callback) can share one
+/// serialization + send implementation. The cell is the same `Rc` held by both
+/// `VideoCallClient` and `Inner`.
+///
+/// The `ViewportPacket` is NOT E2EE-sealed — it is pure relay routing metadata
+/// that the relay consumes and never forwards to peers. The `session_ids` are
+/// the relay/peer session_ids (u64) the relay indexes on, sent unchanged.
+fn send_viewport_via(
+    connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    user_id: &str,
+    session_ids: Vec<u64>,
+) {
+    // Log the actual contents (capped) so a "froze my video" / wrongly-filtered
+    // support log shows exactly which streams the client asked the relay to keep
+    // (HCL issue #988). The list is unbounded in principle, so cap the logged
+    // sample; the `log::debug!` args are only evaluated when DEBUG is enabled, so
+    // the slice + format costs nothing at higher log levels.
+    const VIEWPORT_LOG_SAMPLE: usize = 8;
+    debug!(
+        "Sending VIEWPORT packet: first {} of {} session_id(s): {:?}",
+        session_ids.len().min(VIEWPORT_LOG_SAMPLE),
+        session_ids.len(),
+        &session_ids[..session_ids.len().min(VIEWPORT_LOG_SAMPLE)]
+    );
+    let viewport = ViewportPacket {
+        session_ids,
+        ..Default::default()
+    };
+    let data = match viewport.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize ViewportPacket: {e}");
+            return;
+        }
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::VIEWPORT.into(),
+        user_id: user_id.as_bytes().to_vec(),
+        data,
+        ..Default::default()
+    };
+    // VIEWPORT rides the reliable Control stream, like other signaling, so it
+    // is never stalled behind a large video keyframe write.
+    match connection_controller.try_borrow() {
+        Ok(cc) => match cc.as_ref() {
+            Some(controller) => {
+                if let Err(e) = controller.send_packet(wrapper, MediaStreamKey::Control) {
+                    debug!("Failed to send VIEWPORT packet: {e}");
+                }
+            }
+            None => debug!("No connection controller available; dropping VIEWPORT packet"),
+        },
+        Err(_) => warn!("connection_controller busy; dropping VIEWPORT packet"),
+    }
+}
+
+/// Build a cleartext `LAYER_PREFERENCE` control packet from `(session_id,
+/// desired_layer)` entries and dispatch it on the reliable Control stream
+/// (issue #989, Phase 2).
+///
+/// `entries` is the receiver-driven chooser's per-peer desired-layer map,
+/// already change-detected, rate-limited, capped and canonicalized by
+/// [`LayerPreferenceSender`]. Like `ViewportPacket`, the `LayerPreferencePacket`
+/// is NOT E2EE-sealed — it is pure relay routing metadata the relay consumes and
+/// never forwards to peers. The relay records it keyed by the RECEIVER's own
+/// NATS subject, so it can only subtract what THIS receiver gets; the
+/// `session_id`s here are the real relay session ids of the peers this client is
+/// receiving, never forged. It rides the Control stream so it is never stalled
+/// behind a large video keyframe write.
+fn send_layer_preference_via(
+    connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    user_id: &str,
+    entries: Vec<(u64, PrefMediaKind, u32)>,
+) {
+    const LAYER_PREF_LOG_SAMPLE: usize = 8;
+    debug!(
+        "Sending LAYER_PREFERENCE packet: first {} of {} entry(ies): {:?}",
+        entries.len().min(LAYER_PREF_LOG_SAMPLE),
+        entries.len(),
+        &entries[..entries.len().min(LAYER_PREF_LOG_SAMPLE)]
+    );
+    let packet = LayerPreferencePacket {
+        entries: entries
+            .into_iter()
+            .map(|(session_id, kind, desired_layer)| LayerPreferenceEntry {
+                session_id,
+                desired_layer,
+                // Map the chooser's PrefMediaKind to the proto EntryMediaKind.
+                // Both share the wire discriminant (VIDEO=1/AUDIO=2/SCREEN=3),
+                // so a from_i32 of `wire_value()` is exact and back-compatible.
+                media_kind: ::protobuf::EnumOrUnknown::from_i32(kind.wire_value()),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let data = match packet.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize LayerPreferencePacket: {e}");
+            return;
+        }
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::LAYER_PREFERENCE.into(),
+        user_id: user_id.as_bytes().to_vec(),
+        data,
+        ..Default::default()
+    };
+    match connection_controller.try_borrow() {
+        Ok(cc) => match cc.as_ref() {
+            Some(controller) => {
+                if let Err(e) = controller.send_packet(wrapper, MediaStreamKey::Control) {
+                    debug!("Failed to send LAYER_PREFERENCE packet: {e}");
+                }
+            }
+            None => {
+                debug!("No connection controller available; dropping LAYER_PREFERENCE packet")
+            }
+        },
+        Err(_) => warn!("connection_controller busy; dropping LAYER_PREFERENCE packet"),
     }
 }
 
@@ -550,6 +731,7 @@ impl VideoCallClient {
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
                     on_participant_kicked: options.on_participant_kicked.clone(),
+                    on_peer_event: options.on_peer_event.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
@@ -568,6 +750,8 @@ impl VideoCallClient {
                     &options,
                     diagnostics.clone(),
                 ),
+                layer_preference_sender: LayerPreferenceSender::new(),
+                receive_layer_bounds: ReceiveLayerBounds::default(),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
@@ -583,6 +767,8 @@ impl VideoCallClient {
             connection_controller,
             aes,
             _diagnostics: diagnostics.clone(),
+            viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
+            viewport_debounce_timer: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -699,6 +885,13 @@ impl VideoCallClient {
                 let on_connected = self.options.on_connected.clone();
                 let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
+                // VIEWPORT re-send on reconnect (HCL issue #988). Captured by
+                // strong Rc clones: `ViewportSender` does NOT reference the
+                // connection controller, so this forms no Rc cycle through the
+                // callback the controller holds. user_id is needed to stamp the
+                // outgoing PacketWrapper.
+                let viewport_sender = self.viewport_sender.clone();
+                let viewport_user_id = self.options.user_id.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -717,6 +910,71 @@ impl VideoCallClient {
                     match state {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
+
+                            // On (re)connect the relay also allocated a fresh
+                            // empty layer-preference map for the new session_id
+                            // (fail-open → every layer forwarded). Clear the
+                            // sender's last-sent memory so the NEXT peer-monitor
+                            // tick re-sends the current per-peer desired layers
+                            // unconditionally and downlink-aware filtering
+                            // resumes (issue #989, Phase 2). We reset here rather
+                            // than re-send inline because the desired map is
+                            // recomputed from live per-peer health on the tick.
+                            if let Some(inner) = Weak::upgrade(&inner) {
+                                if let Ok(mut inner) = inner.try_borrow_mut() {
+                                    inner.layer_preference_sender.reset_for_reconnect();
+                                } else {
+                                    warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
+                                }
+                            }
+
+                            // On (re)connect the session_id changed and the
+                            // relay allocated a fresh empty viewport (fail-open
+                            // → all streams). Re-send the current viewport so
+                            // filtering resumes; without this the user silently
+                            // gets every stream again after any re-election.
+                            // Sent directly (one event per reconnect — no
+                            // debounce needed) using the same path as the
+                            // debounced flush.
+                            let to_send = match viewport_sender.try_borrow_mut() {
+                                Ok(mut s) => {
+                                    if s.reset_for_reconnect() {
+                                        s.take_if_changed()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(_) => {
+                                    warn!("VIEWPORT reconnect re-send: sender busy, skipping");
+                                    None
+                                }
+                            };
+                            if let Some(session_ids) = to_send {
+                                if let Some(inner) = Weak::upgrade(&inner) {
+                                    if let Ok(inner) = inner.try_borrow() {
+                                        // `Inner` holds a clone of the same
+                                        // connection_controller cell; use it so
+                                        // the closure never strong-captures the
+                                        // controller (no Rc cycle).
+                                        let resent_count = session_ids.len();
+                                        send_viewport_via(
+                                            &inner.connection_controller,
+                                            &viewport_user_id,
+                                            session_ids,
+                                        );
+                                        // Log the recovery edge explicitly (HCL
+                                        // issue #988): only the failure paths were
+                                        // logged before, so a support log could not
+                                        // confirm the client re-subscribed its
+                                        // viewport after a transport flap / re-election.
+                                        info!(
+                                            "VIEWPORT reconnect re-send: re-sent viewport with {resent_count} session_id(s) after reconnect"
+                                        );
+                                    } else {
+                                        warn!("VIEWPORT reconnect re-send: inner busy, skipping");
+                                    }
+                                }
+                            }
                         }
                         ConnectionState::Failed { error, .. } => {
                             on_connection_lost.emit(ConnectionLostReason::HandshakeFailed(error));
@@ -740,6 +998,36 @@ impl VideoCallClient {
                                             }
                                         }
                                     }
+                                }
+
+                                // Phase 2 (#989): run the receiver-driven layer
+                                // chooser for every peer (updates each peer's
+                                // decode guard) and, if the desired per-peer
+                                // layer map changed AND the relay's rate-limit
+                                // allows, emit a LAYER_PREFERENCE packet so the
+                                // relay drops the layers this receiver's downlink
+                                // cannot sustain. When every source publishes
+                                // only the base layer (the default until the P1
+                                // send flag is raised), every chosen layer is 0
+                                // and the relay's fail-open already forwards base
+                                // — so this is a no-op on the wire (the empty /
+                                // all-zero map dedups after the first send).
+                                let now_ms = js_sys::Date::now() as u64;
+                                // Phase 4: pass the user's receive-layer bounds so
+                                // the chooser output is clamped per kind. `Copy`,
+                                // so snapshot it to avoid an aliasing borrow with
+                                // `&mut peer_decode_manager`.
+                                let bounds = inner.receive_layer_bounds;
+                                let desired = inner
+                                    .peer_decode_manager
+                                    .tick_layer_choosers(now_ms, &bounds);
+                                if let Some(entries) = inner
+                                    .layer_preference_sender
+                                    .take_if_changed(&desired, now_ms)
+                                {
+                                    let user_id = inner.options.user_id.clone();
+                                    let cc = inner.connection_controller.clone();
+                                    send_layer_preference_via(&cc, &user_id, entries);
                                 }
                             }
                             Err(_) => {
@@ -1164,6 +1452,85 @@ impl VideoCallClient {
         0.0
     }
 
+    /// Set (or clear) the user's RECEIVE-side simulcast layer bounds for one
+    /// media kind (issue #989, Phase 4).
+    ///
+    /// `kind` is `PrefMediaKind::{Video, Screen, Audio}`. `min`/`max` are
+    /// inclusive **LAYER indices**, where **0 = base = LOWEST quality** and a
+    /// HIGHER index = HIGHER quality (the OPPOSITE of the 8-tier SEND index
+    /// convention). Ladders: video/screen `0..=2`, audio `0..=1`. `None` =
+    /// "no bound" on that end; `(None, None)` (the default) = full range = pure
+    /// auto-adaptation.
+    ///
+    /// The bound is GLOBAL for the kind — it applies to EVERY incoming peer of
+    /// that kind ("never receive any peer's video below `min` or above `max`").
+    /// It clamps each per-(peer,kind) chooser's desired layer, so the client
+    /// never REQUESTS (and the relay never forwards) an out-of-bounds layer, and
+    /// the local decode selection is bounded to match.
+    ///
+    /// Applies IMMEDIATELY: this re-ticks the choosers and re-sends the
+    /// `LAYER_PREFERENCE` packet, so lowering `max` below the current selection
+    /// steps down at once rather than waiting for the next monitor tick.
+    pub fn set_receive_layer_bounds(
+        &self,
+        kind: PrefMediaKind,
+        min: Option<u32>,
+        max: Option<u32>,
+    ) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.receive_layer_bounds.set_kind(kind, min, max);
+            // Immediate enforcement: re-tick (clamps + updates decode guards) and
+            // re-send the (now-bounded) preference so the relay drops out-of-bounds
+            // layers without waiting ~1 monitor tick.
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            let desired = inner
+                .peer_decode_manager
+                .tick_layer_choosers(now_ms, &bounds);
+            if let Some(entries) = inner
+                .layer_preference_sender
+                .take_if_changed(&desired, now_ms)
+            {
+                let user_id = inner.options.user_id.clone();
+                let cc = inner.connection_controller.clone();
+                send_layer_preference_via(&cc, &user_id, entries);
+            }
+        } else {
+            warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
+        }
+    }
+
+    /// The user's current RECEIVE-side layer bounds (issue #989, Phase 4), for
+    /// the UI to render its current min/max selection. Default fully-open.
+    pub fn receive_layer_bounds(&self) -> ReceiveLayerBounds {
+        self.inner
+            .try_borrow()
+            .map(|inner| inner.receive_layer_bounds)
+            .unwrap_or_default()
+    }
+
+    /// Real-time snapshot of the simulcast layer this client is CURRENTLY
+    /// receiving for `kind`, for the P5 quality needles (issue #989, Phase 4).
+    ///
+    /// Returns `None` when nothing of that kind is being received. The reported
+    /// layer is POST-CLAMP (what is actually decoded), so it never exceeds the
+    /// user's `max` bound. Resolution/bitrate come from the per-kind layer
+    /// ladder. Per-kind aggregation (one needle per kind): active talker for
+    /// audio, active speaker for video, the screen-sharer for screen, each with
+    /// a highest-layer fallback — see
+    /// [`PeerDecodeManager::received_layer_snapshot`]. Panic-safe; cheap to poll
+    /// each render. The UI polls this like the other per-frame accessors.
+    ///
+    /// At the 1-layer default (flag off) this reports layer 0 / base — no error.
+    pub fn received_layer_snapshot(&self, kind: PrefMediaKind) -> Option<ReceivedLayerSnapshot> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner.try_borrow_mut().ok().and_then(|mut inner| {
+            inner
+                .peer_decode_manager
+                .received_layer_snapshot(kind, now_ms)
+        })
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -1443,6 +1810,77 @@ impl VideoCallClient {
             inner
                 .peer_decode_manager
                 .set_active_decode_set(active_session_ids);
+        }
+
+        // Relay the rendered set to the relay as a VIEWPORT control packet so
+        // it can drop VIDEO for peers we are not looking at (HCL issue #988).
+        // `active_session_ids` are the relay/peer session_ids (u64) — the exact
+        // keys `PeerDecodeManager` and the relay index on — so they go on the
+        // wire unchanged. We only (re)arm the debounce timer when the set
+        // actually changed, so repeated identical layout passes are free.
+        let changed = match self.viewport_sender.try_borrow_mut() {
+            Ok(mut sender) => sender.record(active_session_ids),
+            Err(_) => {
+                warn!("set_active_decode_set: viewport_sender busy, skipping viewport update");
+                return;
+            }
+        };
+        if changed {
+            self.schedule_viewport_flush();
+        }
+    }
+
+    /// Arm (or re-arm) the debounce timer that emits a single `VIEWPORT`
+    /// packet once the active-decode-set settles. Replacing the stored
+    /// [`Timeout`] cancels any previously-scheduled fire, so a burst of
+    /// changes coalesces into one send `VIEWPORT_DEBOUNCE_MS` after the last
+    /// change (HCL issue #988; see CLAUDE.md storm-avoidance policy).
+    fn schedule_viewport_flush(&self) {
+        // Capture WEAK refs to the shared cells (and an owned user_id) rather
+        // than a full `self.clone()`. A strong clone here would create a
+        // transient Rc cycle (client -> debounce_timer cell -> Timeout closure
+        // -> client) that leaks the whole client until the timer fires. Weak
+        // refs keep the closure from extending any lifetime; if the client is
+        // dropped before the timer fires, the upgrades simply fail and the
+        // flush is skipped.
+        let sender = Rc::downgrade(&self.viewport_sender);
+        let timer_slot = Rc::downgrade(&self.viewport_debounce_timer);
+        let controller = Rc::downgrade(&self.connection_controller);
+        let user_id = self.options.user_id.clone();
+
+        let timeout = Timeout::new(VIEWPORT_DEBOUNCE_MS, move || {
+            // Clear our own handle first so a re-arm doesn't observe a stale,
+            // already-fired timer.
+            if let Some(slot) = timer_slot.upgrade() {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = None;
+                }
+            }
+            let (Some(sender), Some(controller)) = (sender.upgrade(), controller.upgrade()) else {
+                // Client was dropped while the timer was armed; nothing to do.
+                return;
+            };
+            let session_ids = match sender.try_borrow_mut() {
+                Ok(mut sender) => sender.take_if_changed(),
+                Err(_) => {
+                    warn!("flush_viewport: viewport_sender busy, will retry on next change");
+                    return;
+                }
+            };
+            if let Some(session_ids) = session_ids {
+                send_viewport_via(&controller, &user_id, session_ids);
+            }
+        });
+
+        if let Ok(mut slot) = self.viewport_debounce_timer.try_borrow_mut() {
+            // Replacing the stored Timeout drops (cancels) any previously
+            // scheduled fire, coalescing a burst of changes into one send.
+            *slot = Some(timeout);
+        } else {
+            // Timer slot is busy (should not happen on the single-threaded
+            // wasm runtime); forget the timeout so it still fires rather than
+            // being dropped/cancelled.
+            timeout.forget();
         }
     }
 
@@ -2125,9 +2563,49 @@ impl Inner {
                                 is_mute_all,
                                 is_targeted_at_self
                             );
-                            if is_mute_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the mute-all fast path can exclude
+                            // the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
+                            // #1034 / #1036: reflect the muted state on every
+                            // affected peer's tile immediately instead of waiting
+                            // out the heartbeat freshness window (~5s freeze). A
+                            // host command is authoritative, so this bypasses
+                            // `apply_heartbeat_enabled_flag`. The self path
+                            // (below) still performs the target's own local mute
+                            // via `on_host_mute`.
+                            //
+                            // Three cases:
+                            //   * SPECIFIC target (non-empty target): force-mute
+                            //     just that peer via `force_peer_media_off`, a
+                            //     safe no-op on the target's and host's own
+                            //     clients (neither holds a peer entry for itself).
+                            //   * MUTE-ALL with a non-empty `creator_id`: #1036
+                            //     makes this a host-excluded fast path too —
+                            //     force-mute every peer EXCEPT the issuing host
+                            //     (whose user_id the server put in `creator_id`),
+                            //     so the host's tile is never force-muted on any
+                            //     participant's screen.
+                            //   * MUTE-ALL with an EMPTY `creator_id` (older
+                            //     server, or any edge case): do NOTHING new and
+                            //     fall back to the slow heartbeat path — the safe
+                            //     fallback that avoids the host-mute regression,
+                            //     since without the host id we cannot exclude it.
+                            if !is_mute_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    true,
+                                    false,
+                                );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, true, false);
+                            }
+
+                            if is_mute_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_mute", &target_str) {
                                     if let Some(cb) = &self.options.on_host_mute {
                                         cb.emit(());
@@ -2152,9 +2630,41 @@ impl Inner {
                                 is_disable_all,
                                 is_targeted_at_self
                             );
-                            if is_disable_all || is_targeted_at_self {
-                                let target_str = String::from_utf8_lossy(target).to_string();
+                            let target_str = String::from_utf8_lossy(target).to_string();
+                            // #1036: the issuing host's user_id rides on
+                            // `creator_id` so the disable-all fast path can
+                            // exclude the host's own tile.
+                            let host_id =
+                                String::from_utf8_lossy(&meeting_packet.creator_id).to_string();
 
+                            // #1034 / #1036: immediately flip every affected
+                            // peer's tile to video-off, clearing the frozen last
+                            // frame via the decoder flush, instead of waiting out
+                            // the heartbeat freshness window. Self/host local
+                            // paths are unaffected (no self peer entry). Mirrors
+                            // the HOST_MUTE_PARTICIPANT handler's three cases:
+                            //   * SPECIFIC target → `force_peer_media_off`.
+                            //   * DISABLE-ALL with non-empty `creator_id` (#1036)
+                            //     → host-excluded fast path: force video-off on
+                            //     every peer EXCEPT the issuing host (from
+                            //     `creator_id`), so the host's tile is never
+                            //     force-disabled on any participant's screen.
+                            //   * DISABLE-ALL with EMPTY `creator_id` → do nothing
+                            //     new, fall back to the slow heartbeat path (safe
+                            //     fallback; without the host id we cannot exclude
+                            //     it, so we must not iterate all peers).
+                            if !is_disable_all {
+                                self.peer_decode_manager.force_peer_media_off(
+                                    &target_str,
+                                    false,
+                                    true,
+                                );
+                            } else if !host_id.is_empty() {
+                                self.peer_decode_manager
+                                    .force_all_peers_media_off_except(&host_id, false, true);
+                            }
+
+                            if is_disable_all || is_targeted_at_self {
                                 if !self.is_duplicate_host_action("host_disable_video", &target_str)
                                 {
                                     if let Some(cb) = &self.options.on_host_disable_video {
@@ -2236,6 +2746,13 @@ impl Inner {
                                 debug!("on_display_name_changed callback returned");
                             }
                         }
+                        Ok(MeetingEventType::PARTICIPANT_LIST_REQUEST) => {
+                            // Server-internal event: a joiner asking existing
+                            // peers to re-announce themselves. The relay consumes
+                            // it and never forwards it to clients, so reaching the
+                            // client is unexpected — ignore it.
+                            debug!("Ignoring server-internal PARTICIPANT_LIST_REQUEST");
+                        }
                         Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
                             error!(
                                 "Received meeting packet with unknown event type: room={}",
@@ -2277,6 +2794,42 @@ impl Inner {
                         response.session_id, self.own_session_id,
                     );
                 }
+            }
+            Ok(PacketType::PEER_EVENT) => {
+                // Peer-to-peer application event. The relay has already
+                // verified `target_peer_id` matches our user_id before
+                // forwarding, but we double-check here as defense-in-depth
+                // in case a future packet path bypasses the relay filter.
+                match PeerEvent::parse_from_bytes(&response.data) {
+                    Ok(peer_event) => {
+                        if peer_event.target_peer_id.as_slice() != self.options.user_id.as_bytes() {
+                            debug!(
+                                "Dropping PEER_EVENT not addressed to us (target={})",
+                                String::from_utf8_lossy(&peer_event.target_peer_id)
+                            );
+                        } else if let Some(cb) = &self.options.on_peer_event {
+                            let source =
+                                String::from_utf8_lossy(&peer_event.source_peer_id).to_string();
+                            cb.emit((source, peer_event.event_type, peer_event.stream_id));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse PeerEvent: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::VIEWPORT) => {
+                // VIEWPORT is a client -> relay ONLY control packet (HCL issue
+                // #988): the relay consumes it for viewport-aware video
+                // filtering and never forwards it to peers. A client should
+                // never receive one; ignore it defensively if it ever appears.
+            }
+            Ok(PacketType::LAYER_PREFERENCE) => {
+                // LAYER_PREFERENCE is a client -> relay ONLY control packet
+                // (#989, Phase 1b): the relay consumes it to drop unselected
+                // simulcast layers and never forwards it to peers. Like
+                // VIEWPORT, a client should never receive one; ignore it
+                // defensively if it ever appears.
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
@@ -2433,6 +2986,7 @@ mod disconnect_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }
@@ -2597,6 +3151,7 @@ mod dedup_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
         }

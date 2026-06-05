@@ -16,12 +16,12 @@ use videocall_types::Callback;
 use wasm_bindgen_futures::JsFuture;
 
 use gloo_console::log;
-use js_sys::{Boolean, JsString, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Boolean, JsString, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
-    WebTransportDatagramDuplexStream, WebTransportReceiveStream, WritableStream,
-    WritableStreamDefaultWriter,
+    WebTransportDatagramDuplexStream, WebTransportHash, WebTransportOptions,
+    WebTransportReceiveStream, WritableStream, WritableStreamDefaultWriter,
 };
 
 /// Cumulative count of datagrams dropped because the writable stream was locked.
@@ -30,6 +30,102 @@ static DATAGRAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Returns the total number of datagrams dropped since process start.
 pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Name of the JS global that, when set to a non-empty array of base64
+/// strings BEFORE the wasm boots, opts the WebTransport constructor into the
+/// `serverCertificateHashes` path (W3C WebTransport spec).
+///
+/// Each string is the base64 encoding of the SHA-256 of the DER-encoded
+/// server certificate (NOT the SPKI). Used by the E2E harness so Playwright
+/// can talk to the local self-signed dev cert without `--ignore-certificate-
+/// errors-spki-list` (which Chromium 145 ignores for QUIC/HTTP-3).
+///
+/// If the global is unset, undefined, or empty, the WT client falls back to
+/// the standard CA path. Production builds never set this global.
+const WT_CERT_HASHES_GLOBAL: &str = "__VC_WT_CERT_HASHES__";
+
+/// Read the per-page WebTransport cert-hash override and, if present, build
+/// a `WebTransportOptions` dictionary suitable for `new_with_options`.
+///
+/// Returns `None` when:
+///   - There is no `window` (non-browser environment),
+///   - `window.__VC_WT_CERT_HASHES__` is undefined / null,
+///   - The value is not an array, or
+///   - The array is empty.
+///
+/// Malformed entries (non-strings, undecodable base64) are skipped with a
+/// console warning rather than aborting the whole connect — the caller may
+/// still succeed via subsequent valid hashes or fall through to the standard
+/// CA path. We intentionally do NOT panic / return Err here because the
+/// global is dev-only plumbing; a misconfigured E2E harness should still
+/// fail with a clear browser-side error rather than killing the wasm.
+fn read_wt_cert_hash_options() -> Option<WebTransportOptions> {
+    let window = web_sys::window()?;
+    let raw = Reflect::get(&window, &JsValue::from_str(WT_CERT_HASHES_GLOBAL)).ok()?;
+    if raw.is_undefined() || raw.is_null() {
+        return None;
+    }
+    let array: Array = raw.dyn_into().ok()?;
+    if array.length() == 0 {
+        return None;
+    }
+
+    let hashes = Array::new();
+    for entry in array.iter() {
+        let Some(b64) = entry.as_string() else {
+            log!("WT cert hash override: skipping non-string entry");
+            continue;
+        };
+        let bytes = match base64_decode(&b64) {
+            Some(b) => b,
+            None => {
+                log!("WT cert hash override: failed to base64-decode entry, skipping");
+                continue;
+            }
+        };
+        let value = Uint8Array::from(bytes.as_slice());
+        let hash = WebTransportHash::new();
+        hash.set_algorithm("sha-256");
+        // The setter takes `&js_sys::Object`; `Uint8Array` extends `Object`
+        // so we can pass it directly. The WebTransport spec accepts any
+        // BufferSource (TypedArray or ArrayBuffer) for `value`.
+        hash.set_value(value.unchecked_ref());
+        hashes.push(&hash);
+    }
+
+    if hashes.length() == 0 {
+        return None;
+    }
+
+    let options = WebTransportOptions::new();
+    options.set_server_certificate_hashes(&hashes);
+    log!(format!(
+        "WebTransport using serverCertificateHashes ({} entr{})",
+        hashes.length(),
+        if hashes.length() == 1 { "y" } else { "ies" }
+    ));
+    Some(options)
+}
+
+/// Decode a standard-alphabet base64 string into bytes via JS `atob`.
+///
+/// We cannot pull in the `base64` crate just for this one call (bundle bloat)
+/// and `atob` returns a binary-safe "latin-1" JS string — every UTF-16 code
+/// unit is in `0..=0xFF`. Going through Rust's `String` would re-encode as
+/// UTF-8 and corrupt bytes >= 0x80, so we read the UTF-16 code units directly
+/// from the `JsString` and truncate each to a `u8`.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let window = web_sys::window()?;
+    let atob = Reflect::get(&window, &JsValue::from_str("atob")).ok()?;
+    let atob_fn: js_sys::Function = atob.dyn_into().ok()?;
+    let decoded = atob_fn.call1(&JsValue::NULL, &JsValue::from_str(s)).ok()?;
+    let js_str: JsString = decoded.dyn_into().ok()?;
+    // `JsString::iter` yields UTF-16 code units (`u16`). For atob output
+    // every unit is guaranteed to be in 0..=0xFF, so the truncation to u8
+    // is safe; we still use `& 0xFF` defensively.
+    let bytes: Vec<u8> = js_str.iter().map(|c| (c & 0xFF) as u8).collect();
+    Some(bytes)
 }
 
 /// Maximum length-prefixed frame payload size on a persistent stream (4 MB).
@@ -479,7 +575,21 @@ impl WebTransportService {
         url: &str,
         notification: &Callback<WebTransportStatus>,
     ) -> Result<ConnectCommon, WebTransportError> {
-        let transport = WebTransport::new(url);
+        // Production path: bare `WebTransport::new(url)` so the browser uses
+        // the standard CA / system trust store. E2E and local-dev opt in to
+        // `serverCertificateHashes` by setting `window.__VC_WT_CERT_HASHES__`
+        // to an array of base64 strings BEFORE the wasm boots (Playwright
+        // does this via `addInitScript` in `e2e/helpers/auth-context.ts`).
+        // Each entry is the SHA-256 of the DER-encoded server cert, matching
+        // the W3C WebTransport `serverCertificateHashes` shape:
+        //   { algorithm: "sha-256", value: Uint8Array }
+        // If the global is unset, undefined, or not an array of strings, we
+        // fall back to bare construction — this MUST remain a no-op for
+        // production builds.
+        let transport = match read_wt_cert_hash_options() {
+            Some(options) => WebTransport::new_with_options(url, &options),
+            None => WebTransport::new(url),
+        };
         let transport = transport.map_err(|e| {
             WebTransportError::CreationError(format!("Failed to create WebTransport: {e:?}"))
         })?;

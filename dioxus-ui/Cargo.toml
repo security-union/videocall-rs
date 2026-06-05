@@ -51,7 +51,9 @@ getrandom = { version = "0.2", features = ["js"] }
 [dependencies.web-sys]
 version = "0.3.72"
 features = [
+    "AnalyserNode",
     "AudioContext",
+    "AudioContextState",
     "AudioDestinationNode",
     "AudioNode",
     "AudioParam",
@@ -81,7 +83,10 @@ features = [
     "DisplayMediaStreamConstraints",
     "MediaDevices",
     "MediaStream",
+    "MediaStreamAudioSourceNode",
     "MediaStreamConstraints",
+    "MediaStreamTrack",
+    "MediaTrackConstraints",
     "MouseEvent",
     "Navigator",
     "Node",
@@ -90,6 +95,8 @@ features = [
     "OscillatorType",
     "Performance",
     "PointerEvent",
+    "ResizeObserver",
+    "ResizeObserverEntry",
     "Storage",
     "MediaQueryList",
     "Window",

@@ -60,29 +60,36 @@ pub const CONGESTION_WINDOW: Duration = Duration::from_millis(1000);
 /// packets are dropped in quick succession.
 pub const CONGESTION_NOTIFY_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Default bounded channel capacity for WebTransport outbound relay queue.
+/// Default bounded channel capacity for WebTransport outbound **unistream**
+/// relay queue.
 ///
-/// Sized for MTU-limited datagrams (~1200 bytes) and small stream
-/// messages. The previous 256-slot bound was exceeded by ~1.6x during
-/// a 17-peer cc7tp meeting on 2026-05-06, producing ~38.5k
-/// `Outbound channel full` drops over the meeting (~480 inbound
-/// msg/sec/receiver into a 256-slot queue).
+/// **Fail-fast rationale (issue #979).** This queue exists to absorb
+/// short actor/writer scheduling bursts, NOT to buffer for a slow
+/// receiver. A deep queue is actively harmful for real-time video: once
+/// a receiver's link cannot drain the queue, every frame that sits in it
+/// arrives too late to be useful and only delays the frames behind it.
+/// At ~30 fps a video stream produces ~30 packets/sec, so the prior
+/// 4096-slot bound represented well over a minute of stale backlog per
+/// session — a 10-second-late video frame is already useless, never mind
+/// a 60-second-late one. Holding that much in memory simply defers the
+/// inevitable drop while inflating per-session memory and latency.
 ///
-/// 4096 codifies the value Jay applied manually via
-/// `WT_OUTBOUND_CHANNEL_CAPACITY` on the HCL daily deployment after a
-/// follow-up 2026-05-11 incident where the previous 1024 default still
-/// bottomed out under fan-out bursts. Setting it as the default removes
-/// the requirement for each cluster operator to know to override the
-/// env var. The value can still be raised further at deploy-time via
-/// `WT_OUTBOUND_CHANNEL_CAPACITY` for exceptionally large meetings.
+/// 512 caps the unistream backlog at ~16 seconds of single-stream video
+/// (512 / 30 fps), which is already generous for burst absorption, and
+/// deliberately aligns the unistream bound with the already-512 datagram
+/// bound ([`WT_DATAGRAM_CHANNEL_CAPACITY`]). Once the queue saturates,
+/// the priority-drop policy (see `priority_drop.rs`) sheds video before
+/// audio before control, and the per-sender CONGESTION feedback path
+/// tells fast senders to step their quality down — both of which are the
+/// *correct* response to a slow receiver, far better than hoarding stale
+/// frames in a 4096-deep buffer.
 ///
-/// **Stopgap, not the real fix.** Priority-aware dropping (Discussion
-/// #699 recommendation #1, tracked in Issue 1) is the proper solution
-/// — under load the queue should shed low-priority video before audio
-/// or media-info packets rather than rely on raw queue depth alone.
-/// Bumping the bound here trades a 4x worst-case per-session memory
-/// increase for fewer drops until that work lands.
-pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 4096;
+/// The previous 4096 default was a 2026-05-11 stopgap chosen before the
+/// priority-drop policy (discussion #699) and congestion feedback existed.
+/// With those landed, the large buffer is no longer needed and is lowered
+/// here per issue #979. Operators with an exceptional workload can still
+/// raise the bound at deploy-time via `WT_OUTBOUND_CHANNEL_CAPACITY`.
+pub const WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT: usize = 512;
 
 /// Resolve the WebTransport outbound channel capacity from the
 /// `WT_OUTBOUND_CHANNEL_CAPACITY` environment variable, falling back
@@ -151,9 +158,9 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// outbound channel is split into two: a unistream channel and a
 /// datagram channel. Splitting the channels is the architectural change;
 /// the unistream side keeps the env-tunable
-/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (currently 4096) since it
-/// continues to absorb video + screen + oversized control packets, while
-/// the datagram side is sized small on purpose:
+/// [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] (now 512, see issue #979)
+/// since it continues to absorb video + screen + oversized control
+/// packets, while the datagram side is sized small on purpose:
 ///
 /// * Datagram traffic is small (~80 audio packets/sec/sender at ~80B
 ///   each, plus heartbeats / RTT echoes / non-media control under MTU).
@@ -202,6 +209,41 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 32;
 /// only get keyframes for the first 2 of the 16 existing senders.
 pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER: u32 = 1;
 
+/// Relaxed per-`(receiver, target_sender)` KEYFRAME_REQUEST budget that
+/// applies while the requesting receiver is in **active congestion**
+/// (issue #979).
+///
+/// When the relay has recently had to drop inbound media destined for a
+/// receiver (i.e. its [`CongestionTracker`] crossed the drop threshold
+/// within [`KEYFRAME_CONGESTION_RELAX_WINDOW`]), that receiver's video is
+/// the most likely to be frozen and in genuine need of a fresh keyframe to
+/// recover. The normal steady-state per-pair budget of
+/// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] (1/sec) is too tight for
+/// recovery: a single dropped keyframe response leaves the receiver frozen
+/// for a full second before it may retry.
+///
+/// This raises the per-pair budget to 4/sec **only** for congested
+/// receivers. It deliberately does NOT uncap the limiter: the global
+/// per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`]) still applies
+/// unchanged, so the pre-existing PLI/keyframe-storm risk (OSS #814:
+/// WebTransport per-packet uni streams can amplify keyframe requests into a
+/// storm) remains bounded. 4/sec is enough to recover within a few hundred
+/// ms even if some requests are lost, while staying well under the global
+/// cap and far short of a storm.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED: u32 = 4;
+
+/// How recently the requesting receiver must have been flagged congested
+/// (its [`CongestionTracker`] crossed the drop threshold) for the relaxed
+/// keyframe budget [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`] to
+/// apply (issue #979).
+///
+/// 2 seconds: long enough to cover the recovery window after a congestion
+/// burst (during which the receiver is re-requesting keyframes to unfreeze)
+/// without leaving the relaxed budget armed indefinitely once the link has
+/// recovered. After this window the limiter reverts to the strict 1/sec
+/// steady-state budget.
+pub const KEYFRAME_CONGESTION_RELAX_WINDOW: Duration = Duration::from_secs(2);
+
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
 
@@ -210,6 +252,83 @@ pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
 /// Cleanup runs every N requests (where N = this value) to amortize the
 /// O(n) `retain()` cost. Mirrors the strategy used by `CongestionTracker`.
 pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
+
+/// Maximum number of `session_ids` the relay will accept from a single
+/// VIEWPORT control packet (HCL issue #988).
+///
+/// `ViewportPacket.session_ids` is an unbounded `repeated uint64`. Because the
+/// relay's NATS fan-out delivers every packet to every receiver, an attacker
+/// spamming huge VIEWPORT lists would impose O(list length) collect work per
+/// packet. This cap bounds that work. It is sized comfortably above the number
+/// of camera tiles realistically visible at once in our target 20-user rooms
+/// (a 20-tile grid leaves ample headroom), so legitimate clients are never
+/// truncated. Packets exceeding the cap have their list truncated to the first
+/// [`VIEWPORT_MAX_SESSION_IDS`] entries (fail-open on the excess rather than
+/// rejecting the whole update).
+pub const VIEWPORT_MAX_SESSION_IDS: usize = 64;
+
+/// Minimum interval between accepted VIEWPORT updates for a single session
+/// (HCL issue #988).
+///
+/// VIEWPORT packets are client-driven (viewport scroll / tile-visibility
+/// changes) and should be infrequent. This throttle bounds how often a session
+/// can mutate its desired-streams set, blunting a client that spams VIEWPORT
+/// updates to force repeated set rebuilds. Updates that arrive sooner than this
+/// after the last accepted one are dropped (the packet is still consumed and
+/// never re-broadcast). 200ms = up to 5 viewport updates/sec, well above any
+/// human-driven scroll cadence.
+pub const VIEWPORT_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Maximum number of per-source layer-preference entries the relay will accept
+/// from a single LAYER_PREFERENCE control packet (#989, Phase 1b).
+///
+/// `LayerPreferencePacket.entries` is an unbounded `repeated`. As with
+/// [`VIEWPORT_MAX_SESSION_IDS`] the relay's NATS fan-out delivers every packet
+/// to every receiver, so an attacker spamming a huge entries list would impose
+/// O(list length) work per packet. This cap bounds that work. It is sized to
+/// match the viewport cap (one layer preference per visible tile), so a
+/// legitimate client rendering up to a 64-tile grid is never truncated.
+/// Packets exceeding the cap have their list truncated to the first
+/// [`LAYER_PREFERENCE_MAX_ENTRIES`] entries (fail-open on the excess rather
+/// than rejecting the whole update).
+pub const LAYER_PREFERENCE_MAX_ENTRIES: usize = VIEWPORT_MAX_SESSION_IDS;
+
+/// Minimum interval between accepted LAYER_PREFERENCE updates for a single
+/// session (#989, Phase 1b).
+///
+/// Mirrors [`VIEWPORT_MIN_UPDATE_INTERVAL`]: layer-preference packets are
+/// client-driven (a receiver switching the layer it wants for a tile) and
+/// should be infrequent. This throttle bounds how often a session can mutate
+/// its layer-preference map, blunting a client that spams updates to force
+/// repeated map rebuilds. Updates that arrive sooner than this after the last
+/// accepted one are dropped (the packet is still consumed and never
+/// re-broadcast).
+pub const LAYER_PREFERENCE_MIN_UPDATE_INTERVAL: Duration = VIEWPORT_MIN_UPDATE_INTERVAL;
+
+/// Upper bound on the `desired_layer` id the relay will record from a single
+/// LAYER_PREFERENCE entry (#1082, defense-in-depth).
+///
+/// The relay is deliberately **layer-count-agnostic**: it never learns how many
+/// simulcast layers a source actually produces (see the "AVAILABILITY NOT
+/// VALIDATED" note on the forwarding path in `chat_server.rs`). It only compares
+/// the receiver's recorded `desired_layer` against the cleartext
+/// `simulcast_layer_id` on each media packet. That means a forged or garbage
+/// LAYER_PREFERENCE could otherwise stuff an arbitrary `u32` into the per-source
+/// layer map. Such an entry never matches any real packet, so the source's
+/// non-base layers all get dropped and the forger self-degrades to base — but it
+/// still consumes a map slot and represents nonsense state the relay should not
+/// retain.
+///
+/// This bound caps the *value range* of a recorded layer id. It is NOT the real
+/// layer count (which the relay does not and must not know): today every kind
+/// ships at most 3 layers (ids 0..=2; #1082 keeps video=3/audio=3/content=3),
+/// and even the assessed video=5 ceiling is ids 0..=4. `7` leaves comfortable
+/// headroom for near-future ladders while still rejecting obviously-forged ids.
+/// Entries whose `desired_layer` exceeds this bound are **skipped** (not
+/// recorded) — fail-open per source: the receiver simply self-degrades to base
+/// for that source, exactly as if no preference had been sent. The packet is
+/// never dropped wholesale and the connection is never errored.
+pub const LAYER_PREFERENCE_MAX_LAYER_ID: u32 = 7;
 
 #[cfg(test)]
 mod tests {
@@ -226,19 +345,19 @@ mod tests {
     #[test]
     fn resolve_wt_outbound_channel_capacity_valid_value_used_verbatim() {
         // Sample values intentionally chosen so neither equals
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` — otherwise the assertion
-        // would pass even if the env value were silently ignored.
-        assert_eq!(resolve_wt_outbound_channel_capacity(Some("512")), 512);
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (512) — otherwise the
+        // assertion would pass even if the env value were silently ignored.
+        assert_eq!(resolve_wt_outbound_channel_capacity(Some("1024")), 1024);
         assert_eq!(resolve_wt_outbound_channel_capacity(Some("8192")), 8192);
     }
 
     #[test]
-    fn wt_outbound_channel_capacity_default_is_4096() {
-        // Sentinel test pinning the documented stopgap value. If this needs
-        // to change, update the doc comment on
-        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays)
-        // first, then this assertion.
-        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 4096);
+    fn wt_outbound_channel_capacity_default_is_512() {
+        // Sentinel test pinning the documented fail-fast value (issue #979).
+        // If this needs to change, update the doc comment on
+        // `WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT` (and any helm overlays /
+        // operator docs) first, then this assertion.
+        assert_eq!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512);
     }
 
     #[test]

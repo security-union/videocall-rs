@@ -17,6 +17,7 @@
  */
 
 mod bridge;
+mod cert_preflight;
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::transports::wt_chat_session::WtChatSession;
@@ -163,7 +164,35 @@ pub async fn start(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
+    // Capture cert path for preflight diagnostics before `opt.certs` is moved
+    // into `get_key_and_cert_chain`. Used only to make error messages
+    // copy-pasteable; not load-bearing for the parse itself.
+    let cert_path_for_diagnostics = opt.certs.cert.display().to_string();
+
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
+
+    // Optional dev-only preflight: validates the leaf cert is shaped how
+    // Chromium's `serverCertificateHashes` API requires (ECDSA P-256,
+    // <=14d validity, SAN includes 127.0.0.1 + localhost). Gated behind
+    // WT_DEV_CERT_PREFLIGHT so production cert-manager-issued certs
+    // (RSA, multi-week validity) are not affected.
+    if cert_preflight::is_enabled() {
+        info!(
+            "{} is set; running WebTransport dev cert preflight on {}",
+            cert_preflight::PREFLIGHT_ENV_VAR,
+            cert_path_for_diagnostics,
+        );
+        if let Err(reason) = cert_preflight::validate_chain(&certs, &cert_path_for_diagnostics) {
+            cert_preflight::print_failure(&cert_path_for_diagnostics, &reason);
+            return Err(anyhow!(
+                "WT_DEV_CERT_PREFLIGHT rejected {}: {}",
+                cert_path_for_diagnostics,
+                reason
+            )
+            .into());
+        }
+        info!("WebTransport dev cert preflight passed");
+    }
 
     // Manually configure Quinn with custom transport settings for fast disconnect detection
     let provider = rustls::crypto::ring::default_provider();
@@ -387,8 +416,8 @@ async fn handle_webtransport_session(
     // channels are drained by independent writer tasks.
     //
     // * UniStream channel: env-tunable via `WT_OUTBOUND_CHANNEL_CAPACITY`,
-    //   currently defaults to 4096. Carries video / screen / oversized
-    //   audio/control. Where QUIC flow control surfaces.
+    //   defaults to 512 (fail-fast per issue #979). Carries video / screen /
+    //   oversized audio/control. Where QUIC flow control surfaces.
     // * Datagram channel: small, fixed `WT_DATAGRAM_CHANNEL_CAPACITY`.
     //   Carries small audio media + non-media control under MTU.
     let (unistream_tx, unistream_rx) =

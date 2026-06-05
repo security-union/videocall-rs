@@ -37,13 +37,13 @@ use crate::clock::{default_clock, Clock};
 use crate::constants::{
     AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
     AUDIO_TIER_RECOVER_FPS_RATIO, CLIMB_COOLDOWN_BACKOFF, CLIMB_COOLDOWN_BASE_MS,
-    CLIMB_COOLDOWN_MAX_MS, CRASH_MEMORY_RESET_MS, DEFAULT_SCREEN_TIER_INDEX,
-    DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS, MIN_TIER_TRANSITION_INTERVAL_MS,
-    RECOVERY_SLOWDOWN_DECAY_MS, RECOVERY_SLOWDOWN_FACTOR, REELECTION_CEILING_SUPPRESSION_MS,
-    SCREEN_QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
-    VIDEO_TIER_DEGRADE_BITRATE_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO,
-    VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT, VIDEO_TIER_RECOVER_BITRATE_RATIO,
-    VIDEO_TIER_RECOVER_FPS_RATIO, YOYO_DETECTION_WINDOW_MS,
+    CLIMB_COOLDOWN_MAX_MS, CONGESTION_CUT_TIERS, CONGESTION_HOLD_MS, CRASH_MEMORY_RESET_MS,
+    DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS,
+    MIN_TIER_TRANSITION_INTERVAL_MS, RECOVERY_SLOWDOWN_DECAY_MS, RECOVERY_SLOWDOWN_FACTOR,
+    REELECTION_CEILING_SUPPRESSION_MS, SCREEN_QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
+    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
+    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT,
+    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO, YOYO_DETECTION_WINDOW_MS,
 };
 
 /// Record of a single tier transition event, captured for health reporting.
@@ -102,6 +102,39 @@ pub struct AdaptiveQualityManager {
     /// `None` means no ceiling (default).
     quality_ceiling_index: Option<usize>,
 
+    // --- User-configurable quality bounds (issue #961) ---
+    //
+    // QUALITY IS THE INVERSE OF INDEX. Tier index 0 = BEST quality (highest
+    // resolution / bitrate); the last index = WORST quality. The user picks a
+    // "max quality" and a "min quality" per stream, which map to index bounds
+    // as follows:
+    //
+    //   user MAX quality  -> the BEST tier allowed  -> a FLOOR on the index.
+    //       The index may never go BELOW `user_*_best_index`; the system must
+    //       never step UP past it (no quality better than the user's max).
+    //
+    //   user MIN quality  -> the WORST tier allowed  -> a CAP on the index.
+    //       The index may never go ABOVE `user_*_worst_index`; the system must
+    //       never step DOWN past it (no quality worse than the user's min).
+    //
+    // Each end is independently optional: `None` = "Auto" (no user bound on
+    // that end). The default is `None`/`None` (fully automatic) so behaviour is
+    // unchanged unless the user opts in. DO NOT re-invert this: best == floor,
+    // worst == cap.
+    /// User-selected best (floor) video tier index. Step-up must not go below
+    /// this. `None` = Auto.
+    user_video_best_index: Option<usize>,
+
+    /// User-selected worst (cap) video tier index. Step-down must not go above
+    /// this. `None` = Auto.
+    user_video_worst_index: Option<usize>,
+
+    /// User-selected best (floor) audio tier index. `None` = Auto.
+    user_audio_best_index: Option<usize>,
+
+    /// User-selected worst (cap) audio tier index. `None` = Auto.
+    user_audio_worst_index: Option<usize>,
+
     // --- Climb-rate limiter state (PR-H) ---
     /// Crash ceiling: recovery cannot reach an index lower (better quality) than
     /// this. Armed when a yo-yo pattern is detected (two step-downs within
@@ -137,10 +170,48 @@ pub struct AdaptiveQualityManager {
     /// timestamp do not arm the crash ceiling.
     reelection_completed_at_ms: Option<f64>,
 
+    /// Timestamp (ms) until which a self-targeted CONGESTION cut pins the
+    /// effective bitrate ceiling to the post-cut tier's lower bound. While
+    /// `now_ms < congestion_hold_until_ms` the PID may not ramp bitrate back up
+    /// within the new tier and tier step-up is blocked, so the already-
+    /// overflowing relay buffer gets a chance to drain. Expires naturally by
+    /// timestamp comparison — see [`congestion_hold_active`](Self::congestion_hold_active).
+    /// `None` means no hold is active.
+    congestion_hold_until_ms: Option<f64>,
+
     /// Running count of video step-downs since session start. Included in
     /// climb-limiter log messages to correlate ceiling events with the
     /// overall degradation history.
     step_down_count: u32,
+
+    // --- Simulcast active-layer state (issue #989, PR B) — ADDITIVE ---
+    /// Number of simulcast layers in this session's ladder (the ceiling for
+    /// `active_layer_count`). `1` means single-stream (simulcast off / weak
+    /// device), in which case all the layer methods are inert and the manager
+    /// behaves exactly as before. Set once at construction via
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers); defaults to 1 so
+    /// existing callers (and the bot) are unaffected.
+    simulcast_layer_count: usize,
+
+    /// Number of simulcast layers currently being encoded+sent (the *top*
+    /// `simulcast_layer_count - active_layer_count` layers are shed). Floor 1,
+    /// ceiling `simulcast_layer_count`. Driven by the SAME degrade/recover
+    /// decisions that move `video_tier_index` (see the controller), reusing the
+    /// incident-hardened hysteresis/crash-ceiling/yo-yo timers. Starts at the
+    /// ladder max (all layers active) — the AQ controller sheds the top layer
+    /// under sustained congestion. When `simulcast_layer_count == 1` this stays
+    /// pinned at 1 and the field is never consulted.
+    active_layer_count: usize,
+
+    /// Issue #1077: set by the most recent `update()` when a video step-DOWN was
+    /// fully warranted (degrade conditions sustained past the reaction time, and
+    /// a transition was permitted) but could NOT move the tier index because it
+    /// was already at the floor. The controller reads this via
+    /// [`wanted_degrade_at_floor`](Self::wanted_degrade_at_floor) so the gradual
+    /// `update()`-path simulcast layer shed can fire at the floor too, instead of
+    /// silently stopping once the tier index saturates. Reset to `false` at the
+    /// top of every `update()`. Meaningless in single-stream mode.
+    degrade_floor_saturated: bool,
 
     // --- Telemetry ---
     /// Counter: step-ups blocked because the crash ceiling prevented recovery.
@@ -210,6 +281,13 @@ impl AdaptiveQualityManager {
             created_at_ms: now,
             warmup_ms,
             quality_ceiling_index: None,
+            // User-configurable quality bounds (issue #961). Default both ends
+            // to None on every stream so behaviour is unchanged until the user
+            // opts in via set_video_quality_bounds / set_audio_quality_bounds.
+            user_video_best_index: None,
+            user_video_worst_index: None,
+            user_audio_best_index: None,
+            user_audio_worst_index: None,
             // Climb-rate limiter
             crash_ceiling_index: None,
             ceiling_expires_at_ms: 0.0,
@@ -218,7 +296,13 @@ impl AdaptiveQualityManager {
             recovered_since_ceiling: false,
             slowdown_activated_at_ms: None,
             reelection_completed_at_ms: None,
+            congestion_hold_until_ms: None,
             step_down_count: 0,
+            // Simulcast active-layer state (issue #989) — additive, defaults to
+            // single-stream so existing callers behave exactly as before.
+            simulcast_layer_count: 1,
+            active_layer_count: 1,
+            degrade_floor_saturated: false,
             // Telemetry
             step_up_blocked_ceiling: 0,
             step_up_blocked_slowdown: 0,
@@ -314,6 +398,12 @@ impl AdaptiveQualityManager {
         now_ms: f64,
         effective_peer_count: usize,
     ) -> bool {
+        // Issue #1077: clear the floor-saturated degrade signal each tick; it is
+        // re-set below only if this tick warrants a step-down that the floor
+        // blocks. (Cleared before the warmup/guard early-returns so a stale
+        // signal can never leak across ticks.)
+        self.degrade_floor_saturated = false;
+
         // Warmup guard: during encoder startup, no frames have been produced yet
         // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
         // tier transitions until the encoder has had time to stabilize.
@@ -376,7 +466,39 @@ impl AdaptiveQualityManager {
         let should_degrade =
             fps_ratio < degrade_fps_threshold || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
 
-        if should_degrade && self.video_tier_index < max_video_index {
+        // Step-DOWN cap: never exceed the user's `worst` bound (issue #961),
+        // composed with the hard array bound — the more restrictive wins. This
+        // is the EFFECTIVE floor for the gradual step-down: once the tier index
+        // reaches it, no further tier step is possible (either because we hit
+        // the array bottom or because the user capped send quality there).
+        let step_down_cap = self.video_step_down_cap(max_video_index);
+
+        if should_degrade && self.video_tier_index >= step_down_cap {
+            // Issue #1077 (composed with #961): degrade conditions persist but
+            // the tier index is already at the effective floor (the user's
+            // `worst` cap and/or the hard array bound), so no tier step is
+            // possible. Track the degrade duration the same way and, once it
+            // crosses the reaction time AND a transition is permitted, raise the
+            // floor-saturated signal so the controller's gradual simulcast layer
+            // shed can still fire here (the simulcast layer axis is independent
+            // of the tier floor). We do not change the tier index, the
+            // transition timestamp, or the hysteresis thresholds — we only seed
+            // the existing degrade timer (`degrade_start_ms`) so the
+            // floor-saturated signal can latch (see the `else if !should_degrade`
+            // reset below, which deliberately keeps this timer running at the
+            // floor). Driving this off `step_down_cap` (not the raw array bound)
+            // means a user who caps send quality at a higher tier still gets
+            // layer-shedding once that cap is reached.
+            let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
+            let degrade_duration = now_ms - degrade_start;
+            if degrade_duration >= STEP_DOWN_REACTION_TIME_MS as f64 && can_transition {
+                self.degrade_floor_saturated = true;
+            }
+            // Fall through: no tier change at the floor, so `return false` below
+            // (via the step-up / no-op path) is unchanged.
+        }
+
+        if should_degrade && self.video_tier_index < step_down_cap {
             // Start or continue tracking degradation duration.
             let degrade_start = *self.degrade_start_ms.get_or_insert(now_ms);
             let degrade_duration = now_ms - degrade_start;
@@ -417,17 +539,33 @@ impl AdaptiveQualityManager {
                 self.last_step_down_ms = Some(now_ms);
                 return true;
             }
-        } else {
+        } else if !should_degrade {
             // Conditions are not in the degradation zone; reset the timer.
+            //
+            // NOTE (issue #1077): this reset is gated on `!should_degrade`
+            // specifically (not just "the step-down branch wasn't taken") so
+            // that a sustained degrade AT THE FLOOR keeps accumulating
+            // `degrade_start_ms`, letting the floor-saturated block above cross
+            // the reaction time. Before #1077 this was a bare `else`, which was
+            // correct only because the floor case never set the timer; now that
+            // the floor case relies on the timer, the reset must exclude it.
             self.degrade_start_ms = None;
         }
 
         // --- Step UP ---
-        let should_recover = fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
+        // Suppress step-up entirely while a self-targeted CONGESTION drain hold
+        // is active: the relay buffer is still draining and climbing tiers now
+        // would re-fill it. The hold expires by timestamp, after which recovery
+        // resumes normally.
+        let should_recover = !self.congestion_hold_active(now_ms)
+            && fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
             && bitrate_ratio > VIDEO_TIER_RECOVER_BITRATE_RATIO;
 
-        // Respect both the screen share coordination ceiling and crash ceiling.
-        let min_allowed_index = self.effective_ceiling();
+        // Respect the screen-share coordination ceiling, the crash ceiling, AND
+        // the user's `best` floor (issue #961). The effective step-up floor is
+        // the MOST restrictive (highest index) of these — the user `best` only
+        // adds a further floor; it can never loosen a safety ceiling.
+        let min_allowed_index = self.video_step_up_floor();
 
         if should_recover && self.video_tier_index > min_allowed_index {
             let recover_start = *self.recover_start_ms.get_or_insert(now_ms);
@@ -513,15 +651,23 @@ impl AdaptiveQualityManager {
     /// Audio only degrades when video is already at the lowest tier.
     /// Audio recovers first (before video steps up).
     fn update_audio_tier(&mut self, fps_ratio: f64, now_ms: f64, can_transition: bool) -> bool {
-        let max_video_index = self.video_tiers.len().saturating_sub(1);
         let max_audio_index = AUDIO_QUALITY_TIERS.len().saturating_sub(1);
-        let video_at_lowest = self.video_tier_index >= max_video_index;
+        let video_at_lowest = self.video_tier_index >= self.video_tiers.len().saturating_sub(1);
+
+        // User audio bounds (issue #961, inverse-of-index): `best` is a FLOOR on
+        // the audio index (step-up may not go below it), `worst` is a CAP (step-
+        // down may not go above it). The more restrictive bound wins over the
+        // hard array bounds.
+        let audio_step_down_cap = self
+            .user_audio_worst_index
+            .map_or(max_audio_index, |w| w.min(max_audio_index));
+        let audio_step_up_floor = self.user_audio_best_index.unwrap_or(0);
 
         // --- Audio step DOWN ---
         // Only degrade audio when video is already at the lowest tier.
         let should_degrade_audio = video_at_lowest && fps_ratio < AUDIO_TIER_DEGRADE_FPS_RATIO;
 
-        if should_degrade_audio && self.audio_tier_index < max_audio_index {
+        if should_degrade_audio && self.audio_tier_index < audio_step_down_cap {
             let degrade_start = *self.audio_degrade_start_ms.get_or_insert(now_ms);
             let degrade_duration = now_ms - degrade_start;
 
@@ -552,9 +698,19 @@ impl AdaptiveQualityManager {
         }
 
         // --- Audio step UP ---
+        // DELIBERATE ASYMMETRY (issue #702): unlike video step-up (see the
+        // `!self.congestion_hold_active(now_ms)` guard on `should_recover` ~line 440),
+        // audio recovery is intentionally NOT gated on the congestion-hold window.
+        // A self-targeted CONGESTION drain hold protects audio precisely by shedding
+        // video bandwidth (the ~350kbps video cut); audio is the priority stream and
+        // its recovery step is only ~15-30kbps, negligible against the freed video
+        // budget and far too small to refill the draining relay buffer. Suppressing
+        // audio recovery here would keep the priority stream degraded for the full
+        // ~2.5s hold for no meaningful buffer benefit, so we let it climb back
+        // immediately. Do not add a congestion-hold guard to this branch.
         let should_recover_audio = fps_ratio > AUDIO_TIER_RECOVER_FPS_RATIO;
 
-        if should_recover_audio && self.audio_tier_index > 0 {
+        if should_recover_audio && self.audio_tier_index > audio_step_up_floor {
             let recover_start = *self.audio_recover_start_ms.get_or_insert(now_ms);
             let recover_duration = now_ms - recover_start;
 
@@ -605,6 +761,18 @@ impl AdaptiveQualityManager {
     /// Get the current audio tier index.
     pub fn audio_tier_index(&self) -> usize {
         self.audio_tier_index
+    }
+
+    /// Current user video quality bounds as `(best/floor, worst/cap)` indices.
+    /// `None` on either end means "Auto". See [`Self::set_video_quality_bounds`]
+    /// for the inverse-of-index semantics.
+    pub fn user_video_quality_bounds(&self) -> (Option<usize>, Option<usize>) {
+        (self.user_video_best_index, self.user_video_worst_index)
+    }
+
+    /// Current user audio quality bounds as `(best/floor, worst/cap)` indices.
+    pub fn user_audio_quality_bounds(&self) -> (Option<usize>, Option<usize>) {
+        (self.user_audio_best_index, self.user_audio_worst_index)
     }
 
     /// Force an immediate step-down of the video quality tier.
@@ -663,6 +831,140 @@ impl AdaptiveQualityManager {
         true
     }
 
+    /// Aggressively cut video quality in response to a *self-targeted* server
+    /// CONGESTION signal — the relay is actively dropping our outbound packets.
+    ///
+    /// Unlike [`force_video_step_down`](Self::force_video_step_down) (a gentle
+    /// one-tier step used for WebSocket backpressure), this drops
+    /// [`CONGESTION_CUT_TIERS`] tiers at once (~50% bitrate on most of the
+    /// non-uniform ladder) and then pins the effective bitrate ceiling to the
+    /// post-cut tier for [`CONGESTION_HOLD_MS`] so the overflowing relay buffer
+    /// can drain before the PID ramps bitrate back up.
+    ///
+    /// Like `force_video_step_down`, this respects the warmup guard and the
+    /// minimum transition interval — those guards exist to avoid reacting to
+    /// startup noise and to avoid cascading transitions, and the user chose to
+    /// keep them rather than bypass them for congestion.
+    ///
+    /// # Crash-ceiling / yo-yo handling
+    ///
+    /// This deliberately does **not** call
+    /// [`maybe_arm_ceiling`](Self::maybe_arm_ceiling) and does **not** touch
+    /// `step_down_count` / `last_step_down_ms`. A self-targeted CONGESTION cut
+    /// is a response to an *external* relay signal, not to client-side quality
+    /// oscillation. Feeding it into yo-yo detection would let a single network
+    /// hiccup arm the crash ceiling (and its backoff up to
+    /// `CLIMB_COOLDOWN_MAX_MS`), capping recovery to a low tier for minutes
+    /// after the congestion has cleared — exactly the over-conservative
+    /// behaviour this aggressive cut is meant to avoid. The short
+    /// `CONGESTION_HOLD_MS` window already provides the necessary "let the
+    /// buffer drain" pause without the long-lived ceiling.
+    ///
+    /// # Return value
+    ///
+    /// Returns `true` if the tier actually changed. If we are already at (or
+    /// within one tier of) the lowest tier so no tier change occurs, this still
+    /// arms the hold window — a cut at the floor must still let the buffer
+    /// drain — but returns `false` to signal "no tier change to apply".
+    pub fn force_congestion_cut(&mut self, now_ms: f64) -> bool {
+        // Warmup guard: same as update()/force_video_step_down() — suppress
+        // forced cuts during encoder startup when zero-FPS readings would be
+        // misleading and no real media is flowing yet.
+        if now_ms - self.created_at_ms < self.warmup_ms {
+            return false;
+        }
+
+        // Min-interval guard: avoid cascading cuts from a burst of congestion
+        // signals. (Kept rather than bypassed — see method docs.)
+        let time_since_last = now_ms - self.last_transition_time_ms;
+        if time_since_last < MIN_TIER_TRANSITION_INTERVAL_MS as f64 {
+            log::debug!(
+                "AdaptiveQuality: congestion cut blocked by min transition interval ({:.0}ms < {}ms)",
+                time_since_last,
+                MIN_TIER_TRANSITION_INTERVAL_MS,
+            );
+            return false;
+        }
+
+        // Arm the drain hold regardless of whether the tier can move further —
+        // a cut while already at the floor must still pause the PID so the
+        // relay buffer drains.
+        self.congestion_hold_until_ms = Some(now_ms + CONGESTION_HOLD_MS);
+
+        let max_video_index = self.video_tiers.len().saturating_sub(1);
+        let target_index = (self.video_tier_index + CONGESTION_CUT_TIERS).min(max_video_index);
+        if target_index == self.video_tier_index {
+            // Already at the last tier: hold is armed (above) but there is no
+            // tier change for the caller to apply.
+            log::warn!(
+                "AdaptiveQuality: CONGESTION cut at floor tier '{}' (index {}); drain hold armed for {:.0}ms",
+                self.video_tiers[self.video_tier_index].label,
+                self.video_tier_index,
+                CONGESTION_HOLD_MS,
+            );
+            return false;
+        }
+
+        self.record_dwell(now_ms);
+        let from_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.video_tier_index = target_index;
+        self.last_transition_time_ms = now_ms;
+        self.degrade_start_ms = None;
+        self.recover_start_ms = None;
+        let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
+        self.transition_buffer.push(TierTransitionRecord {
+            direction: "down",
+            stream: "video",
+            from_tier,
+            to_tier: to_tier.clone(),
+            trigger: "congestion",
+        });
+        log::warn!(
+            "AdaptiveQuality: CONGESTION cut dropped {} tiers to '{}' (index {}); \
+             drain hold armed for {:.0}ms",
+            CONGESTION_CUT_TIERS,
+            to_tier,
+            self.video_tier_index,
+            CONGESTION_HOLD_MS,
+        );
+
+        // NB: intentionally do NOT arm the crash ceiling or update yo-yo state
+        // here — see the method docs for why an external relay signal must not
+        // feed client-side oscillation detection.
+        true
+    }
+
+    /// Whether a self-targeted CONGESTION drain hold is currently active.
+    ///
+    /// While active, the effective bitrate ceiling is pinned to the post-cut
+    /// tier's lower bound and tier step-up is blocked. Expires naturally when
+    /// `now_ms` passes `congestion_hold_until_ms`; no explicit clear is needed.
+    pub fn congestion_hold_active(&self, now_ms: f64) -> bool {
+        self.congestion_hold_until_ms
+            .is_some_and(|until| now_ms < until)
+    }
+
+    /// Whether the guards shared by the *forced* transition paths
+    /// ([`force_video_step_down`](Self::force_video_step_down) and
+    /// [`force_congestion_cut`](Self::force_congestion_cut)) are currently
+    /// clear — i.e. past the warmup window AND past the minimum transition
+    /// interval since the last transition.
+    ///
+    /// Additive read-only helper (issue #989, PR B). The simulcast layer axis
+    /// uses this to decide whether a forced congestion response should shed a
+    /// layer: a request blocked by these guards did not "happen" (no tier move,
+    /// no drain hold), so it must not shed a layer either. Unlike the forced
+    /// methods themselves, this is independent of the tier floor — letting the
+    /// layer axis respond to congestion even when `video_tier_index` is already
+    /// at its lowest tier. Does not mutate state and does not affect the
+    /// single-stream tier machinery.
+    pub fn forced_transition_guards_clear(&self, now_ms: f64) -> bool {
+        let past_warmup = now_ms - self.created_at_ms >= self.warmup_ms;
+        let past_min_interval =
+            now_ms - self.last_transition_time_ms >= MIN_TIER_TRANSITION_INTERVAL_MS as f64;
+        past_warmup && past_min_interval
+    }
+
     /// Set a quality ceiling that prevents step-up from going below (better
     /// quality than) the given index.
     ///
@@ -681,6 +983,138 @@ impl AdaptiveQualityManager {
         // When clearing (None), intentionally preserve recover_start_ms so
         // the camera can begin stepping up without re-waiting the full
         // STEP_UP_STABILIZATION_WINDOW_MS.
+    }
+
+    /// Clamp and normalize a `(best, worst)` index bound pair against a tier
+    /// array of length `tiers_len`.
+    ///
+    /// Recall (issue #961) that **quality is the inverse of index**: `best` is a
+    /// FLOOR on the index (the BEST tier allowed) and `worst` is a CAP on the
+    /// index (the WORST tier allowed), so a valid range requires
+    /// `best <= worst`.
+    ///
+    /// Normalization rules:
+    /// - Each bound is first clamped to `[0, tiers_len - 1]`.
+    /// - If both ends are set and the range is inverted (`best > worst`, i.e. an
+    ///   empty range), the two are **swapped** so the range is non-empty. This
+    ///   is the most forgiving rule: it preserves both user-chosen tiers and
+    ///   simply reinterprets the wider as the cap and the narrower as the floor,
+    ///   rather than silently dropping one end.
+    /// - `None` is passed through unchanged ("Auto" on that end).
+    fn normalize_bounds(
+        best: Option<usize>,
+        worst: Option<usize>,
+        tiers_len: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        let max_index = tiers_len.saturating_sub(1);
+        let best = best.map(|b| b.min(max_index));
+        let worst = worst.map(|w| w.min(max_index));
+        match (best, worst) {
+            (Some(b), Some(w)) if b > w => (Some(w), Some(b)),
+            other => other,
+        }
+    }
+
+    /// Set user-configurable quality bounds for the **video** tier (issue #961).
+    ///
+    /// QUALITY IS THE INVERSE OF INDEX — see the field docs on
+    /// `user_video_best_index`. `best` is the user's MAX quality = a FLOOR on the
+    /// index (never step UP past it); `worst` is the user's MIN quality = a CAP
+    /// on the index (never step DOWN past it). Each end is independently optional
+    /// (`None` = Auto).
+    ///
+    /// Behaviour:
+    /// - Both args are clamped to valid tier indices and, if inverted, swapped so
+    ///   the `[best, worst]` range is non-empty (see [`Self::normalize_bounds`]).
+    /// - If the current video tier index now falls outside the new range, it is
+    ///   moved into range **immediately** (not on the next adaptation tick) via
+    ///   [`Self::force_video_step_to`], so the constraint takes effect at once.
+    pub fn set_video_quality_bounds(
+        &mut self,
+        best: Option<usize>,
+        worst: Option<usize>,
+        now_ms: f64,
+    ) {
+        let (best, worst) = Self::normalize_bounds(best, worst, self.video_tiers.len());
+        self.user_video_best_index = best;
+        self.user_video_worst_index = worst;
+
+        // Snap the current tier into the new range immediately. Clamp against
+        // the floor first then the cap; with a normalized (non-inverted) range
+        // these can never conflict.
+        let mut target = self.video_tier_index;
+        if let Some(floor) = best {
+            target = target.max(floor);
+        }
+        if let Some(cap) = worst {
+            target = target.min(cap);
+        }
+        if target != self.video_tier_index {
+            self.force_video_step_to(target, now_ms);
+        }
+
+        log::info!(
+            "AdaptiveQuality: user video quality bounds set (best/floor={best:?}, worst/cap={worst:?}); \
+             current index now {}",
+            self.video_tier_index,
+        );
+    }
+
+    /// Set user-configurable quality bounds for the **audio** tier (issue #961).
+    ///
+    /// Same inverse-of-index semantics as [`Self::set_video_quality_bounds`]:
+    /// `best` is a FLOOR on the audio index, `worst` is a CAP. `None` = Auto.
+    /// Snaps the current audio tier into range immediately if it falls outside.
+    pub fn set_audio_quality_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let (best, worst) = Self::normalize_bounds(best, worst, AUDIO_QUALITY_TIERS.len());
+        self.user_audio_best_index = best;
+        self.user_audio_worst_index = worst;
+
+        // Snap the current audio tier into the new range immediately. Audio has
+        // no force-step helper, so set the index directly (audio adaptation does
+        // not participate in the crash-ceiling machinery).
+        let mut target = self.audio_tier_index;
+        if let Some(floor) = best {
+            target = target.max(floor);
+        }
+        if let Some(cap) = worst {
+            target = target.min(cap);
+        }
+        if target != self.audio_tier_index {
+            self.audio_tier_index = target;
+            self.audio_degrade_start_ms = None;
+            self.audio_recover_start_ms = None;
+        }
+
+        log::info!(
+            "AdaptiveQuality: user audio quality bounds set (best/floor={best:?}, worst/cap={worst:?}); \
+             current index now {}",
+            self.audio_tier_index,
+        );
+    }
+
+    /// Effective video step-DOWN cap: the highest index (worst quality) the tier
+    /// may be stepped down to. Composes the hard array bound with the user's
+    /// `worst` cap (issue #961) — the most restrictive (lowest) wins.
+    fn video_step_down_cap(&self, max_video_index: usize) -> usize {
+        match self.user_video_worst_index {
+            Some(user_worst) => user_worst.min(max_video_index),
+            None => max_video_index,
+        }
+    }
+
+    /// Effective video step-UP floor: the lowest index (best quality) the tier
+    /// may be stepped up to. Composes the internal safety ceilings
+    /// ([`Self::effective_ceiling`] — crash + screen-share coordination) with the
+    /// user's `best` floor (issue #961). The user `best` floor only ADDS a
+    /// further restriction; it can never loosen a safety ceiling, so the
+    /// effective floor is the MORE restrictive (higher index) of the two.
+    fn video_step_up_floor(&self) -> usize {
+        let internal = self.effective_ceiling();
+        match self.user_video_best_index {
+            Some(user_best) => user_best.max(internal),
+            None => internal,
+        }
     }
 
     /// Force the video tier to a specific index, bypassing the one-step-at-a-time
@@ -735,6 +1169,128 @@ impl AdaptiveQualityManager {
     /// Drain and return all tier transition records since the last drain.
     pub fn drain_transitions(&mut self) -> Vec<TierTransitionRecord> {
         std::mem::take(&mut self.transition_buffer)
+    }
+
+    // -----------------------------------------------------------------
+    // Simulcast active-layer control (issue #989, PR B) — ADDITIVE
+    // -----------------------------------------------------------------
+    //
+    // These methods exist alongside the tier machinery and never touch
+    // `video_tier_index` or any existing field. When `simulcast_layer_count`
+    // is 1 (the default, and the value the bot always sees) they are inert:
+    // `active_layer_count()` returns 1, `drop_top_layer`/`add_top_layer` cannot
+    // move off the floor/ceiling of 1, and the manager behaves exactly as it
+    // did before this PR.
+    //
+    // Why additive rather than repurposing `video_tier_index`: the load-test
+    // bot reads `video_tier_index()` as a *resolution-tier index* to choose its
+    // encode resolution. Simulcast layers are a different axis (fixed-resolution
+    // streams that get shed top-down). Conflating them would silently change the
+    // bot's encode resolution. See CLAUDE.md "Change Impact Policy".
+
+    /// Configure how many simulcast layers this session's ladder has.
+    ///
+    /// Call once after construction with the effective layer count
+    /// (`min(max_layers, ladder_len)` from the client). `n` is clamped to
+    /// `[1, SIMULCAST_MAX_LAYERS]`. `active_layer_count` is (re)initialized to
+    /// `n` (all layers active); the controller then sheds the top layer under
+    /// sustained congestion. Passing `1` (the default) keeps the manager in
+    /// single-stream mode where the layer methods are inert.
+    pub fn set_simulcast_layers(&mut self, n: usize) {
+        let clamped = n.clamp(1, crate::constants::SIMULCAST_MAX_LAYERS);
+        self.simulcast_layer_count = clamped;
+        self.active_layer_count = clamped;
+    }
+
+    /// Number of simulcast layers in this session's ladder (the ceiling for
+    /// [`active_layer_count`](Self::active_layer_count)).
+    pub fn simulcast_layer_count(&self) -> usize {
+        self.simulcast_layer_count
+    }
+
+    /// Whether the most recent [`update`](Self::update) warranted a video
+    /// step-DOWN that the tier floor blocked (issue #1077).
+    ///
+    /// The gradual `update()`-path simulcast layer shed in the controller keys
+    /// off tier-index movement, which saturates at the floor. This signal lets
+    /// the controller shed the top layer at the floor too — decoupling the layer
+    /// axis from the tier floor exactly as the explicit `force_*` paths already
+    /// do — so a deeper ladder (or a default tier near the floor) cannot leave
+    /// the gradual path unable to shed. `false` outside the degrade-at-floor
+    /// case and always `false` in single-stream mode (no layers to shed).
+    ///
+    /// THROTTLING (issue #1082 review): unlike the tier-coupled step-down (one
+    /// shed per `MIN_TIER_TRANSITION_INTERVAL_MS`), this signal is re-evaluated
+    /// every diagnostics tick (~1/sec), so the controller's floor shed it drives
+    /// can fire once per tick at the floor until `active_layer_count` reaches 1.
+    /// This is intentional and benign today: the shed is down-only, floors at 1,
+    /// and the current ladders need at most 2 sheds (the 3-layer screen ladder).
+    /// A future maintainer who DEEPENS the video ladder should revisit this and
+    /// reuse the min-interval throttle here (e.g. touch `last_transition_time_ms`
+    /// in the floor block) so a deep ladder cannot shed many layers in one burst.
+    pub fn wanted_degrade_at_floor(&self) -> bool {
+        self.degrade_floor_saturated
+    }
+
+    /// Number of simulcast layers currently being encoded+sent.
+    ///
+    /// `1` in single-stream mode. In simulcast mode this ranges over
+    /// `[1, simulcast_layer_count]`; the top
+    /// `simulcast_layer_count - active_layer_count` layers are shed (saving both
+    /// egress bandwidth and sender encode CPU).
+    pub fn active_layer_count(&self) -> usize {
+        self.active_layer_count
+    }
+
+    /// Whether this manager is operating in simulcast mode (`> 1` layers).
+    pub fn is_simulcast(&self) -> bool {
+        self.simulcast_layer_count > 1
+    }
+
+    /// Shed the top active simulcast layer (decrement `active_layer_count`,
+    /// floored at 1).
+    ///
+    /// Called by the controller when a sustained-congestion *step-down* decision
+    /// fires in simulcast mode (the same decision that would step a tier down in
+    /// single-stream mode). Dropping the top layer cuts both egress and sender
+    /// encode CPU. Returns `true` if the active count actually decreased.
+    ///
+    /// No-op (returns `false`) in single-stream mode or when already at the
+    /// floor — exactly mirroring how `video_tier_index` step-down is a no-op at
+    /// the lowest tier.
+    pub fn drop_top_layer(&mut self) -> bool {
+        if self.active_layer_count <= 1 {
+            return false;
+        }
+        let from = self.active_layer_count;
+        self.active_layer_count -= 1;
+        log::info!(
+            "AdaptiveQuality: simulcast dropped TOP layer ({from} -> {} active of {})",
+            self.active_layer_count,
+            self.simulcast_layer_count,
+        );
+        true
+    }
+
+    /// Restore the next top simulcast layer (increment `active_layer_count`,
+    /// capped at `simulcast_layer_count`).
+    ///
+    /// Called by the controller when a sustained-recovery *step-up* decision
+    /// fires in simulcast mode. Returns `true` if the active count actually
+    /// increased. No-op (returns `false`) in single-stream mode or when already
+    /// at the ceiling.
+    pub fn add_top_layer(&mut self) -> bool {
+        if self.active_layer_count >= self.simulcast_layer_count {
+            return false;
+        }
+        let from = self.active_layer_count;
+        self.active_layer_count += 1;
+        log::info!(
+            "AdaptiveQuality: simulcast restored TOP layer ({from} -> {} active of {})",
+            self.active_layer_count,
+            self.simulcast_layer_count,
+        );
+        true
     }
 
     // -----------------------------------------------------------------
@@ -2238,6 +2794,652 @@ mod tests {
             initial_decay / 1000.0,
             expected_decay / 1000.0,
             new_decay / 1000.0,
+        );
+    }
+
+    // =====================================================================
+    // Self-targeted CONGESTION cut tests (#702)
+    // =====================================================================
+
+    #[test]
+    fn test_congestion_cut_drops_two_tiers_and_halves_bitrate() {
+        // From the default start tier, a single congestion cut should drop
+        // CONGESTION_CUT_TIERS (>= 2) tiers and shed >= 50% of the ideal bitrate.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+        let start_index = mgr.video_tier_index();
+        let start_ideal = VIDEO_QUALITY_TIERS[start_index].ideal_bitrate_kbps as f64;
+
+        let changed = mgr.force_congestion_cut(10000.0);
+        assert!(changed, "Congestion cut should change the tier");
+
+        let dropped = mgr.video_tier_index() - start_index;
+        assert!(
+            dropped >= 2,
+            "Congestion cut should drop >= 2 tiers, dropped {dropped}"
+        );
+        assert_eq!(dropped, CONGESTION_CUT_TIERS);
+
+        let new_ideal = mgr.current_video_tier().ideal_bitrate_kbps as f64;
+        assert!(
+            new_ideal <= start_ideal * 0.5,
+            "Congestion cut should shed >= 50% of ideal bitrate: {start_ideal} -> {new_ideal}"
+        );
+
+        // The congestion cut records a transition tagged "congestion".
+        let transitions = mgr.drain_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].trigger, "congestion");
+        assert_eq!(transitions[0].direction, "down");
+    }
+
+    #[test]
+    fn test_congestion_cut_at_floor_arms_hold_but_returns_false() {
+        // A cut while already at the lowest tier cannot move the tier, but must
+        // still arm the drain hold and report "no tier change".
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+        let mut mgr = new_test_manager_at(VIDEO_QUALITY_TIERS, max_idx);
+
+        let now = 10000.0;
+        let changed = mgr.force_congestion_cut(now);
+        assert!(!changed, "Cut at floor should report no tier change");
+        assert_eq!(mgr.video_tier_index(), max_idx, "Tier should not move");
+        assert!(
+            mgr.congestion_hold_active(now + 1.0),
+            "Hold must be armed even at the floor so the buffer drains"
+        );
+    }
+
+    #[test]
+    fn test_congestion_hold_blocks_step_up_then_expires() {
+        // During the hold window, good conditions must NOT raise the tier.
+        // After CONGESTION_HOLD_MS elapses, recovery is allowed again.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        let cut_at = 10000.0;
+        let changed = mgr.force_congestion_cut(cut_at);
+        assert!(changed);
+        let post_cut_index = mgr.video_tier_index();
+
+        // Drive sustained good conditions during the hold. Step-up must stay blocked.
+        // (Use ideal_bitrate so bitrate_ratio = 1.0 > recover threshold.)
+        let ideal = mgr.current_video_tier().ideal_bitrate_kbps as f64;
+        let mut t = cut_at + 100.0;
+        while t < cut_at + CONGESTION_HOLD_MS {
+            assert!(
+                mgr.congestion_hold_active(t),
+                "Hold should be active at {t}"
+            );
+            mgr.update(29.0, 30.0, ideal, ideal, t, 5);
+            assert_eq!(
+                mgr.video_tier_index(),
+                post_cut_index,
+                "Step-up must be blocked during the congestion hold (t={t})"
+            );
+            t += 400.0;
+        }
+
+        // After the hold expires, sustained good conditions allow step-up again.
+        assert!(!mgr.congestion_hold_active(cut_at + CONGESTION_HOLD_MS + 1.0));
+        let base = cut_at + CONGESTION_HOLD_MS + 1000.0;
+        let mut stepped_up = false;
+        for i in 0..=12 {
+            let t = base + (i as f64 * 1000.0);
+            mgr.update(29.0, 30.0, ideal, ideal, t, 5);
+            if mgr.video_tier_index() < post_cut_index {
+                stepped_up = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_up,
+            "Recovery should resume after the congestion hold expires"
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_does_not_arm_crash_ceiling() {
+        // A self-targeted congestion cut is an external relay signal, not client
+        // oscillation: it must NOT arm the crash ceiling or feed yo-yo state.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        let step_down_count_before = mgr.step_down_count;
+
+        let changed = mgr.force_congestion_cut(10000.0);
+        assert!(changed);
+
+        assert!(
+            mgr.crash_ceiling_info().is_none(),
+            "Congestion cut must not arm the crash ceiling"
+        );
+        assert!(
+            mgr.last_step_down_ms.is_none(),
+            "Congestion cut must not feed yo-yo detection (last_step_down_ms)"
+        );
+        assert_eq!(
+            mgr.step_down_count, step_down_count_before,
+            "Congestion cut must not increment step_down_count"
+        );
+
+        // A second congestion cut shortly after (within YOYO window) must still
+        // not arm the ceiling.
+        let changed =
+            mgr.force_congestion_cut(10000.0 + MIN_TIER_TRANSITION_INTERVAL_MS as f64 + 1.0);
+        let _ = changed; // may be false if it hit the floor; either way:
+        assert!(
+            mgr.crash_ceiling_info().is_none(),
+            "Repeated congestion cuts must never arm the crash ceiling"
+        );
+    }
+
+    // =====================================================================
+    // Simulcast active-layer state tests (#989, PR B) — ADDITIVE
+    // =====================================================================
+
+    #[test]
+    fn test_simulcast_defaults_to_single_stream() {
+        let mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        assert_eq!(mgr.simulcast_layer_count(), 1);
+        assert_eq!(mgr.active_layer_count(), 1);
+        assert!(!mgr.is_simulcast());
+    }
+
+    #[test]
+    fn test_single_stream_layer_methods_are_inert() {
+        // In single-stream mode (the bot's mode), drop/add must be no-ops so the
+        // manager behaves exactly as before.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        assert!(!mgr.drop_top_layer(), "drop must be a no-op at 1 layer");
+        assert_eq!(mgr.active_layer_count(), 1);
+        assert!(
+            !mgr.add_top_layer(),
+            "add must be a no-op at the ceiling of 1"
+        );
+        assert_eq!(mgr.active_layer_count(), 1);
+    }
+
+    #[test]
+    fn test_set_simulcast_layers_clamps() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+
+        mgr.set_simulcast_layers(0);
+        assert_eq!(mgr.simulcast_layer_count(), 1, "0 clamps up to 1");
+        assert_eq!(mgr.active_layer_count(), 1);
+
+        mgr.set_simulcast_layers(3);
+        assert_eq!(mgr.simulcast_layer_count(), 3);
+        assert_eq!(mgr.active_layer_count(), 3, "starts with all layers active");
+        assert!(mgr.is_simulcast());
+
+        mgr.set_simulcast_layers(99);
+        assert_eq!(
+            mgr.simulcast_layer_count(),
+            crate::constants::SIMULCAST_MAX_LAYERS,
+            "over-large request clamps to ladder max"
+        );
+    }
+
+    #[test]
+    fn test_drop_and_add_top_layer_in_simulcast() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_layers(3);
+        assert_eq!(mgr.active_layer_count(), 3);
+
+        // Drop the top layer twice down to the floor.
+        assert!(mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 2);
+        assert!(mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 1);
+        // At the floor, further drops are no-ops (base layer always sent).
+        assert!(!mgr.drop_top_layer());
+        assert_eq!(mgr.active_layer_count(), 1);
+
+        // Restore layers back up to the ceiling.
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 2);
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 3);
+        // At the ceiling, further adds are no-ops.
+        assert!(!mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 3);
+    }
+
+    #[test]
+    fn test_simulcast_layer_state_does_not_touch_tier_index() {
+        // Dropping/adding layers must NOT move video_tier_index — the bot reads
+        // that field as a resolution-tier index and must be unaffected.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+        mgr.set_simulcast_layers(3);
+        let tier_before = mgr.video_tier_index();
+
+        mgr.drop_top_layer();
+        mgr.drop_top_layer();
+        mgr.add_top_layer();
+
+        assert_eq!(
+            mgr.video_tier_index(),
+            tier_before,
+            "layer add/drop must never move the resolution-tier index"
+        );
+    }
+
+    #[test]
+    fn test_congestion_cut_respects_warmup_and_min_interval() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        mgr.created_at_ms = 1000.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr.video_tier_index = DEFAULT_VIDEO_TIER_INDEX;
+
+        // During warmup: no cut, no hold.
+        let changed = mgr.force_congestion_cut(2000.0);
+        assert!(!changed, "Cut should be suppressed during warmup");
+        assert!(
+            !mgr.congestion_hold_active(2001.0),
+            "Hold must not arm during warmup"
+        );
+
+        // Past warmup, first cut succeeds.
+        let t = 1000.0 + DEFAULT_WARMUP_MS + 1000.0;
+        let changed = mgr.force_congestion_cut(t);
+        assert!(changed, "Cut should fire after warmup");
+
+        // Immediate second cut is blocked by the min transition interval.
+        let changed = mgr.force_congestion_cut(t + 100.0);
+        assert!(
+            !changed,
+            "Second cut within MIN_TIER_TRANSITION_INTERVAL_MS should be blocked"
+        );
+    }
+
+    // =====================================================================
+    // User-configurable quality bounds (issue #961)
+    //
+    // QUALITY IS THE INVERSE OF INDEX: best == FLOOR on index (user max
+    // quality), worst == CAP on index (user min quality).
+    // =====================================================================
+
+    /// Drive sustained terrible conditions for many ticks and return the final
+    /// video tier index. Bad FPS + bad bitrate forces step-downs.
+    fn drive_sustained_congestion(mgr: &mut AdaptiveQualityManager, start_ms: f64) -> usize {
+        let mut t = start_ms;
+        for _ in 0..60 {
+            // fps_ratio ~0.1, bitrate_ratio ~0.1 — well below degrade thresholds.
+            mgr.update(3.0, 30.0, 60.0, 600.0, t, 5);
+            t += 1600.0;
+        }
+        mgr.video_tier_index()
+    }
+
+    /// Drive sustained excellent conditions for many ticks and return the final
+    /// video tier index. Good FPS + good bitrate forces step-ups.
+    fn drive_sustained_good(mgr: &mut AdaptiveQualityManager, start_ms: f64) -> usize {
+        let mut t = start_ms;
+        for _ in 0..60 {
+            // fps_ratio ~0.97, bitrate_ratio ~0.95 — above recover thresholds.
+            mgr.update(29.0, 30.0, 570.0, 600.0, t, 5);
+            t += 6000.0;
+        }
+        mgr.video_tier_index()
+    }
+
+    #[test]
+    fn test_user_worst_cap_blocks_step_down_under_sustained_congestion() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        // User min quality => worst/cap at index 3 ("standard"). No floor.
+        mgr.set_video_quality_bounds(None, Some(3), 0.0);
+
+        let final_idx = drive_sustained_congestion(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 3,
+            "Index must never step DOWN past the user worst/cap (3); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_user_best_floor_blocks_step_up_under_sustained_good() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 7; // start at worst
+                                  // User max quality => best/floor at index 2 ("hd"). No cap.
+        mgr.set_video_quality_bounds(Some(2), None, 0.0);
+
+        let final_idx = drive_sustained_good(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 2,
+            "Index must never step UP below the user best/floor (2); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_user_best_equals_worst_pins_tier_both_directions() {
+        // Pin to index 5. Neither congestion nor good conditions may move it.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 5;
+        mgr.set_video_quality_bounds(Some(5), Some(5), 0.0);
+
+        let after_congestion = drive_sustained_congestion(&mut mgr, 10000.0);
+        assert_eq!(after_congestion, 5, "Pinned tier must not step DOWN");
+
+        let after_good = drive_sustained_good(&mut mgr, 500_000.0);
+        assert_eq!(after_good, 5, "Pinned tier must not step UP");
+    }
+
+    #[test]
+    fn test_default_none_none_adapts_exactly_as_before_down() {
+        // Regression: default construction (no bounds) must step all the way
+        // down under sustained congestion, identical to a manager that never
+        // had bounds touched.
+        let mut baseline = new_test_manager(VIDEO_QUALITY_TIERS);
+        baseline.video_tier_index = 0;
+        let baseline_idx = drive_sustained_congestion(&mut baseline, 10000.0);
+
+        let mut with_explicit_auto = new_test_manager(VIDEO_QUALITY_TIERS);
+        with_explicit_auto.video_tier_index = 0;
+        with_explicit_auto.set_video_quality_bounds(None, None, 0.0);
+        let auto_idx = drive_sustained_congestion(&mut with_explicit_auto, 10000.0);
+
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+        assert_eq!(baseline_idx, max_idx, "Default must reach worst tier");
+        assert_eq!(
+            auto_idx, baseline_idx,
+            "Explicit None/None must behave identically to default"
+        );
+    }
+
+    #[test]
+    fn test_default_none_none_adapts_exactly_as_before_up() {
+        // Regression: default (no bounds) must step all the way up under
+        // sustained good conditions.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 7;
+        let idx = drive_sustained_good(&mut mgr, 10000.0);
+        assert_eq!(idx, 0, "Default must reach best tier under good conditions");
+    }
+
+    #[test]
+    fn test_setting_bounds_snaps_current_index_into_range_immediately() {
+        // Current index 0 (best). Set worst/cap to 4 — index is below the cap so
+        // unaffected. Then set best/floor to 6 with cap 7: current 0 is above
+        // floor 6, must snap to 6 immediately.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+
+        // Floor 6 (worse-than-current) — must snap DOWN to 6 at once.
+        mgr.set_video_quality_bounds(Some(6), None, 100.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            6,
+            "Setting a floor worse than the current index must snap into range immediately"
+        );
+
+        // Now current is 6. Set cap 2 (which also forces floor<=cap). Current 6
+        // is above cap 2, must snap UP to 2 immediately.
+        mgr.set_video_quality_bounds(None, Some(2), 200.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            2,
+            "Setting a cap better than the current index must snap into range immediately"
+        );
+    }
+
+    #[test]
+    fn test_inverted_bounds_are_normalized_by_swap() {
+        // Pass best=5, worst=2 (inverted: floor index > cap index). Should be
+        // swapped to best=2, worst=5 so the range is non-empty.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 3;
+        mgr.set_video_quality_bounds(Some(5), Some(2), 0.0);
+        let (best, worst) = mgr.user_video_quality_bounds();
+        assert_eq!(best, Some(2), "Inverted floor should be swapped to the cap");
+        assert_eq!(
+            worst,
+            Some(5),
+            "Inverted cap should be swapped to the floor"
+        );
+    }
+
+    #[test]
+    fn test_bounds_clamped_to_valid_indices() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        let max = VIDEO_QUALITY_TIERS.len() - 1;
+        mgr.set_video_quality_bounds(Some(999), Some(999), 0.0);
+        let (best, worst) = mgr.user_video_quality_bounds();
+        assert_eq!(best, Some(max), "Out-of-range floor clamps to max index");
+        assert_eq!(worst, Some(max), "Out-of-range cap clamps to max index");
+    }
+
+    #[test]
+    fn test_user_best_floor_composes_with_crash_ceiling_most_restrictive_wins() {
+        // The internal crash ceiling must still cap step-up even when the user
+        // best floor is looser (lower index). The user bound never loosens a
+        // safety ceiling — the more restrictive (higher index) floor wins.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 6;
+        // Arm a crash ceiling at index 4 directly (simulating yo-yo protection).
+        mgr.crash_ceiling_index = Some(4);
+        mgr.ceiling_expires_at_ms = f64::MAX; // never decays during the test
+                                              // User best floor at index 1 (would allow climbing to 1) — looser than
+                                              // the crash ceiling.
+        mgr.set_video_quality_bounds(Some(1), None, 0.0);
+
+        let final_idx = drive_sustained_good(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 4,
+            "Crash ceiling (4) must win over the looser user floor (1); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_user_best_floor_more_restrictive_than_crash_ceiling_wins() {
+        // When the user best floor is MORE restrictive (higher index) than the
+        // crash ceiling, the user floor wins.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 7;
+        mgr.crash_ceiling_index = Some(2);
+        mgr.ceiling_expires_at_ms = f64::MAX;
+        // User floor at 5 — more restrictive than crash ceiling 2.
+        mgr.set_video_quality_bounds(Some(5), None, 0.0);
+
+        let final_idx = drive_sustained_good(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 5,
+            "User floor (5) more restrictive than crash ceiling (2) must win; got {final_idx}"
+        );
+    }
+
+    // ---- Audio bounds ----
+
+    /// Drive sustained terrible audio conditions with video pinned at lowest so
+    /// audio is allowed to degrade. Returns the final audio tier index.
+    fn drive_sustained_audio_congestion(mgr: &mut AdaptiveQualityManager, start_ms: f64) -> usize {
+        let max_video = VIDEO_QUALITY_TIERS.len() - 1;
+        mgr.video_tier_index = max_video;
+        let mut t = start_ms;
+        for _ in 0..60 {
+            // fps_ratio ~0.1 < AUDIO_TIER_DEGRADE_FPS_RATIO (0.30).
+            mgr.update(1.0, 10.0, 150.0, 150.0, t, 5);
+            t += 1600.0;
+        }
+        mgr.audio_tier_index()
+    }
+
+    #[test]
+    fn test_audio_user_worst_cap_blocks_step_down() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.audio_tier_index = 0;
+        // Audio worst/cap at index 1 ("medium").
+        mgr.set_audio_quality_bounds(None, Some(1));
+
+        let final_idx = drive_sustained_audio_congestion(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 1,
+            "Audio index must never step DOWN past the user worst/cap (1); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_audio_user_best_floor_blocks_step_up() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        // Start audio degraded.
+        mgr.audio_tier_index = 3;
+        mgr.video_tier_index = VIDEO_QUALITY_TIERS.len() - 1;
+        // Audio best/floor at index 1 — must not climb above (better than) 1.
+        mgr.set_audio_quality_bounds(Some(1), None);
+
+        let mut t = 10000.0;
+        for _ in 0..40 {
+            // fps_ratio ~0.9 > AUDIO_TIER_RECOVER_FPS_RATIO (0.60).
+            mgr.update(9.0, 10.0, 150.0, 150.0, t, 5);
+            t += 6000.0;
+        }
+        assert_eq!(
+            mgr.audio_tier_index(),
+            1,
+            "Audio index must never step UP below the user best/floor (1)"
+        );
+    }
+
+    #[test]
+    fn test_audio_best_equals_worst_pins_tier() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.audio_tier_index = 2;
+        mgr.set_audio_quality_bounds(Some(2), Some(2));
+
+        let after = drive_sustained_audio_congestion(&mut mgr, 10000.0);
+        assert_eq!(after, 2, "Pinned audio tier must not step DOWN");
+    }
+
+    #[test]
+    fn test_audio_setting_bounds_snaps_current_index_into_range() {
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.audio_tier_index = 0;
+        // Floor 2 worse than current 0 — snap down to 2 immediately.
+        mgr.set_audio_quality_bounds(Some(2), None);
+        assert_eq!(
+            mgr.audio_tier_index(),
+            2,
+            "Audio must snap to floor at once"
+        );
+        // Cap 1 better than current 2 — snap up to 1 immediately.
+        mgr.set_audio_quality_bounds(None, Some(1));
+        assert_eq!(mgr.audio_tier_index(), 1, "Audio must snap to cap at once");
+    }
+
+    // =====================================================================
+    // SCREEN-SHARE user quality bounds (issue #961 follow-up)
+    //
+    // Screen uses its own 3-tier ladder SCREEN_QUALITY_TIERS (index 0 = best /
+    // 1080p, 2 = worst / low). The generic video clamp logic must work over it
+    // exactly as over the 8-tier camera ladder. These tests construct the
+    // manager via `new_for_screen` to exercise the real screen path.
+    // =====================================================================
+
+    /// Screen-share manager with warmup/transition guards zeroed so small
+    /// `now_ms` test values are past the warmup window.
+    fn new_test_screen_manager() -> AdaptiveQualityManager {
+        let mut mgr = AdaptiveQualityManager::new_for_screen(SCREEN_QUALITY_TIERS);
+        mgr.created_at_ms = 0.0;
+        mgr.last_transition_time_ms = 0.0;
+        mgr
+    }
+
+    #[test]
+    fn test_screen_user_worst_cap_blocks_step_down_under_sustained_congestion() {
+        let mut mgr = new_test_screen_manager();
+        mgr.video_tier_index = 0; // best
+                                  // User min quality => worst/cap at index 1 ("medium"). No floor.
+        mgr.set_video_quality_bounds(None, Some(1), 0.0);
+
+        let final_idx = drive_sustained_congestion(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 1,
+            "Screen index must never step DOWN past the user worst/cap (1); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_screen_user_best_floor_blocks_step_up_under_sustained_good() {
+        let mut mgr = new_test_screen_manager();
+        mgr.video_tier_index = 2; // worst
+                                  // User max quality => best/floor at index 1 ("medium"). No cap.
+        mgr.set_video_quality_bounds(Some(1), None, 0.0);
+
+        let final_idx = drive_sustained_good(&mut mgr, 10000.0);
+        assert_eq!(
+            final_idx, 1,
+            "Screen index must never step UP below the user best/floor (1); got {final_idx}"
+        );
+    }
+
+    #[test]
+    fn test_screen_best_equals_worst_pins_tier_both_directions() {
+        // Pin screen to index 1 ("medium"). Neither congestion nor good
+        // conditions may move it.
+        let mut mgr = new_test_screen_manager();
+        mgr.video_tier_index = 1;
+        mgr.set_video_quality_bounds(Some(1), Some(1), 0.0);
+
+        let after_congestion = drive_sustained_congestion(&mut mgr, 10000.0);
+        assert_eq!(after_congestion, 1, "Pinned screen tier must not step DOWN");
+
+        let after_good = drive_sustained_good(&mut mgr, 500_000.0);
+        assert_eq!(after_good, 1, "Pinned screen tier must not step UP");
+    }
+
+    #[test]
+    fn test_screen_bounds_clamped_to_three_tier_ladder() {
+        // Out-of-range indices (valid for the 8-tier camera ladder but not the
+        // 3-tier screen ladder) must clamp to the screen max index (2).
+        let mut mgr = new_test_screen_manager();
+        let max = SCREEN_QUALITY_TIERS.len() - 1; // 2
+        mgr.set_video_quality_bounds(Some(7), Some(5), 0.0);
+        let (best, worst) = mgr.user_video_quality_bounds();
+        assert_eq!(
+            best,
+            Some(max),
+            "Screen floor clamps to max screen index (2)"
+        );
+        assert_eq!(
+            worst,
+            Some(max),
+            "Screen cap clamps to max screen index (2)"
+        );
+    }
+
+    #[test]
+    fn test_screen_setting_bounds_snaps_current_index_into_range_immediately() {
+        let mut mgr = new_test_screen_manager();
+        mgr.video_tier_index = 0; // best
+                                  // Floor 2 (worst) worse than current 0 — snap DOWN to 2 at once.
+        mgr.set_video_quality_bounds(Some(2), None, 100.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            2,
+            "Screen floor worse than current must snap into range immediately"
+        );
+        // Cap 1 better than current 2 — snap UP to 1 at once.
+        mgr.set_video_quality_bounds(None, Some(1), 200.0);
+        assert_eq!(
+            mgr.video_tier_index(),
+            1,
+            "Screen cap better than current must snap into range immediately"
+        );
+    }
+
+    #[test]
+    fn test_screen_default_none_none_adapts_full_range() {
+        // Regression: default screen manager (no bounds) steps all the way down
+        // to the worst screen tier under sustained congestion.
+        let mut mgr = new_test_screen_manager();
+        mgr.video_tier_index = 0;
+        let idx = drive_sustained_congestion(&mut mgr, 10000.0);
+        assert_eq!(
+            idx,
+            SCREEN_QUALITY_TIERS.len() - 1,
+            "Default screen bounds must reach the worst tier under congestion"
         );
     }
 }

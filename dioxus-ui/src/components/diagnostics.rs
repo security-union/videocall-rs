@@ -866,18 +866,13 @@ pub fn Diagnostics(
                                 );
                             },
                             option {
-                                value: "auto",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::Auto,
-                                "Auto"
-                            }
-                            option {
                                 value: "webtransport",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransportOnly,
-                                "WebTransport"
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
+                                "WebTransport (default)"
                             }
                             option {
                                 value: "websocket",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocketOnly,
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
                                 "WebSocket"
                             }
                         }

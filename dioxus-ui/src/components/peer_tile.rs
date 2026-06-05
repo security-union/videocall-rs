@@ -19,10 +19,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::components::canvas_generator::{generate_for_peer, AudioLevels, TileMode};
-use crate::components::signal_quality::{PeerSignalHistory, SampleData, SignalInfo};
+use crate::components::canvas_generator::{
+    generate_for_peer, AudioLevels, SignalPopupHandlers, TileMode,
+};
+use crate::components::signal_quality::{
+    PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
+    SignalPopupState,
+};
 use crate::context::{
-    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, VideoCallClientCtx,
+    AppearanceSettingsCtx, MeetingTimeCtx, PeerSignalHistoryMap, SignalPopupStateMap,
+    VideoCallClientCtx,
 };
 use dioxus::prelude::*;
 use futures::future::AbortHandle;
@@ -46,6 +52,32 @@ pub fn PeerTile(
     #[props(default)] pinned_peer_id: Option<String>,
     #[props(default)] room_id: Option<String>,
     #[props(default = false)] is_current_user_host: bool,
+    /// HCL bug #2: scope of the signal-meter popup this tile owns. The
+    /// LEFT-panel shared-content tile passes `ScreenOnly` (the popup
+    /// surfaces ONLY the screen-share metric). Every other tile leaves
+    /// this defaulted to `Full`, which renders whichever series the
+    /// sample history actually contains — the legend / tooltip are
+    /// already gated on `has_screen_data` (any sample with
+    /// `screen_enabled == true`) and per-sample `screen_enabled`, so a
+    /// peer who is NOT screen-sharing naturally hides the Screen row
+    /// without any mode-level suppression. Keeping the default at
+    /// `Full` ensures the peer-tile popup surfaces screen-share metrics
+    /// the moment the peer starts sharing, which is the contract the
+    /// `peer-screen-diagnostics` E2E spec asserts (a host opens the
+    /// guest's peer-tile signal popup and expects the Screen series to
+    /// appear once samples arrive). The dedicated LEFT-panel
+    /// `ScreenOnly` popup still coexists independently because the
+    /// popup-state map keys on `(peer_id, meter_mode)`.
+    #[props(default = SignalMeterMode::Full)]
+    meter_mode: SignalMeterMode,
+    /// Issue #987, task 1a.4: render this tile as an off-budget avatar tile.
+    /// When `true`, the adaptive decode-budget controller has excluded the peer
+    /// from `active_decode_set`, so the tile shows the avatar/initials
+    /// placeholder instead of a live video canvas (no decode pipeline is bound)
+    /// while keeping the peer's name, mic state and host controls. Defaults to
+    /// `false`, so existing call sites render exactly as before.
+    #[props(default = false)]
+    force_avatar: bool,
     on_toggle_pin: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
@@ -70,6 +102,22 @@ pub fn PeerTile(
     let mut screen_bitrate = use_signal(|| 0.0_f64);
     let mut latency_ms = use_signal(|| 0.0_f64);
     let mut video_resolution = use_signal(String::new);
+    let mut screen_resolution = use_signal(String::new);
+    // Publisher's native source resolution for the screen-share track,
+    // delivered via the `video_source_resolution` diag event the decoder
+    // emits when a `MediaPacket.video_metadata.source_*` field changes.
+    // Empty when the publisher is older / doesn't stamp the fields.
+    let mut screen_source_resolution = use_signal(String::new);
+    // Issue #903: publisher-side encoder state for the screen-share track, // @token-exempt: issue ref, not a color
+    // delivered via the `screen_encoder_state` diag event the decoder
+    // emits when any of the three values changes. Used by the
+    // SignalQualityPopup tooltip to render a `Cause:` sub-line below the
+    // Screen row explaining *why* the encoder downscaled in transit.
+    // All three default to 0 / empty so older publishers (and the
+    // unconstrained-tier path on newer publishers) skip the Cause line.
+    let mut screen_encoder_target_bitrate = use_signal(|| 0_u32);
+    let mut screen_adaptive_tier = use_signal(String::new);
+    let mut screen_cause_hint = use_signal(String::new);
     // Current transport for this peer ("webtransport" / "websocket" /
     // "unknown"), sourced from the `peer_status` diagnostics metric. Stored
     // as a per-tile signal because each `PeerTile` only renders its own
@@ -87,8 +135,74 @@ pub fn PeerTile(
             .or_insert_with(|| Rc::new(RefCell::new(PeerSignalHistory::new())))
             .clone()
     };
-    let show_signal_popup = use_signal(|| false);
+    // HCL bug #8 + #9: popup open state and drag position are owned by a
+    // context-wide map rather than a per-PeerTile signal. When a peer
+    // leaves the meeting, that peer's tile remounts under a different
+    // sub-tree (the parent re-runs its for-loop / switches between
+    // grid and split layouts). With per-tile state every popup on every
+    // OTHER peer would also unmount because Dioxus tears down the
+    // entire prior tree. The shared map survives the rebuild, so each
+    // popup is only torn down when its OWN anchored peer leaves.
+    //
+    // The map keys on `(peer_id, meter_mode)` so this tile's popup
+    // doesn't collide with the same peer's screen-share-only popup
+    // (rendered on the shared-content tile in split layout).
+    let mut popup_state_map = use_context::<SignalPopupStateMap>();
+    let popup_key = (peer_id.clone(), meter_mode);
+    let signal_popup_state: Option<SignalPopupState> =
+        popup_state_map.read().get(&popup_key).copied();
+    let show_signal_popup = signal_popup_state.is_some();
+    let signal_popup_free_position = match signal_popup_state {
+        Some(SignalPopupState {
+            position: SignalPopupPosition::Free { left, top },
+        }) => Some((left, top)),
+        _ => None,
+    };
     let show_tile_menu = use_signal(|| false);
+
+    // Closures for the popup-state map. Each one writes through the
+    // shared map so layout switches / peer leaves don't invalidate them.
+    let on_toggle_signal_popup: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            let mut map = popup_state_map.write();
+            if map.contains_key(&popup_key) {
+                map.remove(&popup_key);
+            } else {
+                map.insert(popup_key.clone(), SignalPopupState::default());
+            }
+        })
+    };
+    let on_close_signal_popup: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            popup_state_map.write().remove(&popup_key);
+        })
+    };
+    let on_signal_popup_drag_commit: EventHandler<(f64, f64)> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |(left, top): (f64, f64)| {
+            let mut map = popup_state_map.write();
+            map.insert(
+                popup_key.clone(),
+                SignalPopupState {
+                    position: SignalPopupPosition::Free { left, top },
+                },
+            );
+        })
+    };
+    let on_signal_popup_reanchor: EventHandler<()> = {
+        let popup_key = popup_key.clone();
+        EventHandler::new(move |_: ()| {
+            let mut map = popup_state_map.write();
+            map.insert(
+                popup_key.clone(),
+                SignalPopupState {
+                    position: SignalPopupPosition::Anchored,
+                },
+            );
+        })
+    };
 
     // Counter that increments each time a sample is pushed. Reading this
     // Dioxus Signal triggers re-renders, compensating for the fact that
@@ -96,6 +210,14 @@ pub fn PeerTile(
     let mut sample_counter = use_signal(|| 0u32);
     // Track last sample timestamp to throttle to ~1 sample/second
     let last_sample_ts: Rc<RefCell<f64>> = use_hook(|| Rc::new(RefCell::new(0.0)));
+    // Issue #906: timestamp (ms since epoch) of the most recent `peer_status` // @token-exempt: issue ref, not a color
+    // event seen for this peer. Used to compute the heartbeat-freshness
+    // window the screen-state classifier consults when deciding between
+    // `Static` and `NoFrames`. Initialised to 0.0; the first event sets
+    // it, and the sampling code translates `0.0` into `None` so we don't
+    // false-classify an idle session as having a stale heartbeat before any
+    // event has arrived.
+    let last_peer_status_ts: Rc<RefCell<f64>> = use_hook(|| Rc::new(RefCell::new(0.0)));
 
     // Initialize from client snapshot and subscribe to diagnostics
     let peer_id_owned = peer_id.clone();
@@ -103,6 +225,7 @@ pub fn PeerTile(
     let prev_abort_handle = use_hook(|| Rc::new(RefCell::new(None::<AbortHandle>)));
     let mic_hold_for_effect = mic_hold_timeout.clone();
     let last_sample_for_effect = last_sample_ts.clone();
+    let last_peer_status_for_effect = last_peer_status_ts.clone();
     let signal_history_for_effect = signal_history.clone();
     use_effect(move || {
         // Abort previous subscription
@@ -121,6 +244,7 @@ pub fn PeerTile(
         let peer_id_inner = peer_id_owned.clone();
         let mic_hold = mic_hold_for_effect.clone();
         let last_sample = last_sample_for_effect.clone();
+        let last_peer_status = last_peer_status_for_effect.clone();
         // Clone the Rc for the async block so the outer FnMut closure can be
         // called again without consuming the captured value.
         let signal_hist = signal_history_for_effect.clone();
@@ -150,7 +274,13 @@ pub fn PeerTile(
                     &mut screen_bitrate,
                     &mut latency_ms,
                     &mut video_resolution,
+                    &mut screen_resolution,
+                    &mut screen_source_resolution,
+                    &mut screen_encoder_target_bitrate,
+                    &mut screen_adaptive_tier,
+                    &mut screen_cause_hint,
                     &mut peer_transport,
+                    &last_peer_status,
                 );
                 // Push a signal quality sample at most once per second,
                 // piggybacking on the diagnostics event stream.
@@ -171,6 +301,19 @@ pub fn PeerTile(
                         }
                     }
                 }
+                // Issue #906: snapshot the heartbeat age at sample-record  // @token-exempt: issue ref, not a color
+                // time so the screen-state classifier can later distinguish
+                // a static publisher (fresh heartbeat) from a broken one
+                // (stale heartbeat). `0.0` means we have not yet observed
+                // a `peer_status` event for this peer — translate to `None`
+                // so the classifier doesn't conclude the heartbeat is
+                // ancient at start-of-meeting.
+                let last_status_ms = *last_peer_status.borrow();
+                let peer_status_age_ms = if last_status_ms > 0.0 {
+                    Some((js_sys::Date::now() - last_status_ms).max(0.0))
+                } else {
+                    None
+                };
                 let data = SampleData {
                     video_fps: *fps_received.peek(),
                     video_bitrate_kbps: *video_bitrate.peek(),
@@ -181,6 +324,12 @@ pub fn PeerTile(
                     screen_enabled: *screen_enabled.peek(),
                     screen_fps: *screen_fps.peek(),
                     screen_bitrate_kbps: *screen_bitrate.peek(),
+                    screen_resolution: screen_resolution.peek().clone(),
+                    screen_source_resolution: screen_source_resolution.peek().clone(),
+                    screen_encoder_target_bitrate_kbps: *screen_encoder_target_bitrate.peek(),
+                    screen_adaptive_tier: screen_adaptive_tier.peek().clone(),
+                    screen_cause_hint: screen_cause_hint.peek().clone(),
+                    peer_status_age_ms,
                     latency_ms: *latency_ms.peek(),
                     audio_enabled: *audio_enabled.peek(),
                     video_enabled: *video_enabled.peek(),
@@ -208,7 +357,7 @@ pub fn PeerTile(
     // copying ~3.4 MB/s of data when 20 peers update at ~2 Hz.
     let sig_history = signal_history.borrow();
     let sig_level = sig_history.current_level(audio_en, video_en, screen_en);
-    let sig_samples = if show_signal_popup() {
+    let sig_samples = if show_signal_popup {
         // Reading sample_counter subscribes this component to updates from the
         // diagnostics task, ensuring the chart re-renders when new samples arrive.
         let _ = sample_counter();
@@ -223,7 +372,7 @@ pub fn PeerTile(
     // popup is even open. The .set() call is already gated on actual
     // change in handle_diagnostics_event, so this is purely a
     // re-render-scope optimization.
-    let sig_transport = if show_signal_popup() {
+    let sig_transport = if show_signal_popup {
         peer_transport()
     } else {
         None
@@ -250,6 +399,8 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut audio_enabled = audio_enabled;
+                    audio_enabled.set(false);
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -257,9 +408,13 @@ pub fn PeerTile(
                                     api_client.mute_participant(&meeting_id, &peer_uid).await
                                 {
                                     log::warn!("mute_participant failed: {e}");
+                                    audio_enabled.set(true);
                                 }
                             }
-                            Err(e) => log::warn!("meeting_api_client error: {e}"),
+                            Err(e) => {
+                                log::warn!("meeting_api_client error: {e}");
+                                audio_enabled.set(true);
+                            }
                         }
                     });
                 }))
@@ -278,6 +433,8 @@ pub fn PeerTile(
                 Some(EventHandler::new(move |_: ()| {
                     let meeting_id = meeting_id.clone();
                     let peer_uid = peer_uid.clone();
+                    let mut video_enabled = video_enabled;
+                    video_enabled.set(false);
                     spawn(async move {
                         match crate::constants::meeting_api_client() {
                             Ok(api_client) => {
@@ -286,9 +443,13 @@ pub fn PeerTile(
                                     .await
                                 {
                                     log::warn!("disable_video_participant failed: {e}");
+                                    video_enabled.set(true);
                                 }
                             }
-                            Err(e) => log::warn!("meeting_api_client error: {e}"),
+                            Err(e) => {
+                                log::warn!("meeting_api_client error: {e}");
+                                video_enabled.set(true);
+                            }
                         }
                     });
                 }))
@@ -345,8 +506,16 @@ pub fn PeerTile(
                 mt().meeting_start_time.unwrap_or_else(js_sys::Date::now)
             },
             transport: sig_transport,
+            meter_mode,
         },
-        show_signal_popup,
+        SignalPopupHandlers {
+            show: show_signal_popup,
+            free_position: signal_popup_free_position,
+            on_toggle: on_toggle_signal_popup,
+            on_close: on_close_signal_popup,
+            on_drag_commit: on_signal_popup_drag_commit,
+            on_reanchor: on_signal_popup_reanchor,
+        },
         show_tile_menu,
         on_mute,
         on_disable_video,
@@ -354,6 +523,7 @@ pub fn PeerTile(
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,
+        force_avatar,
     )
 }
 
@@ -386,7 +556,13 @@ fn handle_diagnostics_event(
     screen_bitrate: &mut Signal<f64>,
     latency_ms: &mut Signal<f64>,
     video_resolution: &mut Signal<String>,
+    screen_resolution: &mut Signal<String>,
+    screen_source_resolution: &mut Signal<String>,
+    screen_encoder_target_bitrate: &mut Signal<u32>,
+    screen_adaptive_tier: &mut Signal<String>,
+    screen_cause_hint: &mut Signal<String>,
     peer_transport: &mut Signal<Option<String>>,
+    last_peer_status_ts: &Rc<RefCell<f64>>,
 ) {
     match evt.subsystem {
         "peer_status" => {
@@ -412,6 +588,12 @@ fn handle_diagnostics_event(
             if to_peer.as_deref() != Some(peer_id) {
                 return;
             }
+            // Issue #906: stamp the heartbeat timestamp the first time we   // @token-exempt: issue ref, not a color
+            // confirm this `peer_status` event is for our peer. The screen-
+            // state classifier consults this to decide between `Static` and
+            // `NoFrames` — fresh heartbeat means the publisher is alive,
+            // stale heartbeat means the connection is the problem.
+            *last_peer_status_ts.borrow_mut() = js_sys::Date::now();
             if let Some(a) = audio {
                 if a != *audio_enabled.peek() {
                     audio_enabled.set(a);
@@ -537,15 +719,19 @@ fn handle_diagnostics_event(
             }
         }
         "video_resolution" => {
-            // Track video resolution changes broadcast by the decoder.
+            // Track video resolution changes broadcast by the decoder. The
+            // `media_type` metric distinguishes the camera-video decoder
+            // ("VIDEO") from the screen-share decoder ("SCREEN").
             let mut to_peer: Option<String> = None;
             let mut res_w: Option<u64> = None;
             let mut res_h: Option<u64> = None;
+            let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
                     ("resolution_width", MetricValue::U64(w)) => res_w = Some(*w),
                     ("resolution_height", MetricValue::U64(h)) => res_h = Some(*h),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
                     _ => {}
                 }
             }
@@ -554,8 +740,98 @@ fn handle_diagnostics_event(
             }
             if let (Some(w), Some(h)) = (res_w, res_h) {
                 let res = format!("{w}x{h}");
-                if *video_resolution.peek() != res {
-                    video_resolution.set(res);
+                let is_screen = media_type_str.as_deref() == Some("SCREEN");
+                let target = if is_screen {
+                    &mut *screen_resolution
+                } else {
+                    &mut *video_resolution
+                };
+                if *target.peek() != res {
+                    target.set(res);
+                }
+            }
+        }
+        "video_source_resolution" => {
+            // Publisher's native capture dimensions, broadcast by the
+            // decoder when it sees a `MediaPacket.video_metadata.source_*`
+            // field change. We only track this for screen-share today; the
+            // camera-video branch carries `media_type=VIDEO` and we let the
+            // UI ignore it for now (no UI consumer requested it yet).
+            let mut to_peer: Option<String> = None;
+            let mut src_w: Option<u64> = None;
+            let mut src_h: Option<u64> = None;
+            let mut media_type_str: Option<String> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("source_width", MetricValue::U64(w)) => src_w = Some(*w),
+                    ("source_height", MetricValue::U64(h)) => src_h = Some(*h),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if media_type_str.as_deref() != Some("SCREEN") {
+                return;
+            }
+            if let (Some(w), Some(h)) = (src_w, src_h) {
+                let res = format!("{w}x{h}");
+                if *screen_source_resolution.peek() != res {
+                    screen_source_resolution.set(res);
+                }
+            }
+        }
+        "screen_encoder_state" => {
+            // Issue #903: publisher's encoder state for the screen-share // @token-exempt: issue ref, not a color
+            // track, dispatched by the decoder when any of the three
+            // fields changes. We filter strictly on `media_type=SCREEN`
+            // mirroring the `video_source_resolution` arm — the camera
+            // decoder doesn't emit this subsystem today, but the guard
+            // documents the contract and prevents a future spillover
+            // from corrupting the screen signal.
+            //
+            // .set() is gated on change to avoid waking PeerTile
+            // subscribers when the values are unchanged. The decoder
+            // already dedupes at the source so this is belt-and-braces
+            // but cheap.
+            let mut to_peer: Option<String> = None;
+            let mut bitrate: Option<u32> = None;
+            let mut tier: Option<String> = None;
+            let mut hint: Option<String> = None;
+            let mut media_type_str: Option<String> = None;
+            for m in &evt.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("encoder_target_bitrate_kbps", MetricValue::F64(v)) => {
+                        bitrate = Some(v.round().max(0.0) as u32);
+                    }
+                    ("adaptive_tier", MetricValue::Text(t)) => tier = Some(t.clone()),
+                    ("cause_hint", MetricValue::Text(t)) => hint = Some(t.clone()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    _ => {}
+                }
+            }
+            if to_peer.as_deref() != Some(peer_id) {
+                return;
+            }
+            if media_type_str.as_deref() != Some("SCREEN") {
+                return;
+            }
+            if let Some(b) = bitrate {
+                if *screen_encoder_target_bitrate.peek() != b {
+                    screen_encoder_target_bitrate.set(b);
+                }
+            }
+            if let Some(t) = tier {
+                if *screen_adaptive_tier.peek() != t {
+                    screen_adaptive_tier.set(t);
+                }
+            }
+            if let Some(h) = hint {
+                if *screen_cause_hint.peek() != h {
+                    screen_cause_hint.set(h);
                 }
             }
         }

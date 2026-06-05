@@ -27,6 +27,7 @@ use crate::actors::packet_handler::{classify_packet, KeyframeRequestLimiter, Pac
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
+    KEYFRAME_CONGESTION_RELAX_WINDOW,
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
@@ -100,6 +101,12 @@ pub struct CongestionTracker {
     /// Total drops since the last stale-entry cleanup. Cleanup runs every
     /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
     total_drops: u32,
+    /// Most recent instant at which this receiver crossed the drop threshold
+    /// for *any* sender (i.e. a CONGESTION notification was emitted). Used by
+    /// [`CongestionTracker::is_actively_congested`] to relax the
+    /// KEYFRAME_REQUEST rate limiter so a frozen receiver can recover
+    /// (issue #979).
+    last_congestion: Option<Instant>,
 }
 
 impl Default for CongestionTracker {
@@ -117,6 +124,7 @@ impl CongestionTracker {
         Self {
             senders: HashMap::new(),
             total_drops: 0,
+            last_congestion: None,
         }
     }
 
@@ -169,10 +177,28 @@ impl CongestionTracker {
             state.last_notify = Some(now);
             state.drop_count = 0;
             state.window_start = now;
+            // Record that this receiver is now actively congested so the
+            // KEYFRAME_REQUEST limiter can relax its per-pair budget and let
+            // a frozen receiver recover (issue #979).
+            self.last_congestion = Some(now);
             Some(sender_session_id)
         } else {
             None
         }
+    }
+
+    /// Whether this receiver crossed the congestion drop threshold recently
+    /// enough (within [`KEYFRAME_CONGESTION_RELAX_WINDOW`]) to be considered
+    /// in **active congestion** (issue #979).
+    ///
+    /// Used by the inbound KEYFRAME_REQUEST handler to decide whether to use
+    /// the relaxed per-pair keyframe budget. A receiver is "actively
+    /// congested" precisely when the relay has had to drop inbound media
+    /// destined for it — the scenario in which its decoder is most likely
+    /// frozen and genuinely needs fresh keyframes to recover.
+    pub fn is_actively_congested(&self) -> bool {
+        self.last_congestion
+            .is_some_and(|t| Instant::now().duration_since(t) <= KEYFRAME_CONGESTION_RELAX_WINDOW)
     }
 }
 
@@ -210,6 +236,15 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
+    /// Set of `kind` label values this session has incremented on
+    /// `relay_session_drops_total` (dashboard audit Tier B #1). Tracked so the
+    /// exact `(room, transport, session_id, kind)` series can be GC'd via
+    /// `remove_label_values` in [`on_stopping`], keeping that high-cardinality
+    /// counter bounded to live sessions. `RefCell` because `record_session_drop`
+    /// is reached from `&mut self` handlers while cleanup runs from `&self`
+    /// `on_stopping`; the per-actor event loop is single-threaded so there is no
+    /// cross-thread contention.
+    session_drop_kinds: std::cell::RefCell<std::collections::HashSet<&'static str>>,
 }
 
 impl SessionLogic {
@@ -253,7 +288,27 @@ impl SessionLogic {
             end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
+            session_drop_kinds: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Record a per-session outbound drop on `relay_session_drops_total`
+    /// (dashboard audit Tier B #1) and remember the `kind` so the series can be
+    /// removed on session teardown.
+    ///
+    /// Called from both transport actors' drop sites (priority-preempt and
+    /// real channel-full) with the same `kind` label they pass to the
+    /// protocol-wide `videocall_outbound_channel_drops_total` counter, so the
+    /// two stay in lock-step. `kind` MUST be a `'static` string from the bounded
+    /// drop-kind taxonomy (the actors only ever pass string literals / the
+    /// `priority_drop.rs` reason labels), which keeps the tracked set — and the
+    /// number of series GC'd on close — bounded to that small fixed taxonomy.
+    pub fn record_session_drop(&self, kind: &'static str) {
+        let session_id = self.id.to_string();
+        crate::metrics::RELAY_SESSION_DROPS_TOTAL
+            .with_label_values(&[&self.room, &self.transport, &session_id, kind])
+            .inc();
+        self.session_drop_kinds.borrow_mut().insert(kind);
     }
 
     // =========================================================================
@@ -312,6 +367,7 @@ impl SessionLogic {
             instance_id: self.instance_id.clone(),
             is_host: self.is_host,
             end_on_host_leave: self.end_on_host_leave,
+            transport: self.transport.clone(),
         }
     }
 
@@ -355,6 +411,22 @@ impl SessionLogic {
         RELAY_ACTIVE_SESSIONS_PER_ROOM
             .with_label_values(&[&self.room, &self.transport])
             .dec();
+
+        // GC the per-session drop series (Tier B #1). `relay_session_drops_total`
+        // carries an unbounded-over-time `session_id` label; removing every
+        // `(room, transport, session_id, kind)` tuple this session touched the
+        // moment it disconnects keeps the live series count bounded to active
+        // sessions. Mirrors the metrics-server `remove_label_values` cleanup
+        // pattern. No-op for sessions that never dropped (empty set).
+        let session_id = self.id.to_string();
+        for kind in self.session_drop_kinds.borrow().iter() {
+            let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+                &self.room,
+                &self.transport,
+                &session_id,
+                kind,
+            ]);
+        }
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,
@@ -416,7 +488,10 @@ impl SessionLogic {
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
                 InboundAction::Processed
             }
-            PacketKind::KeyframeRequest { target_user_id } => {
+            PacketKind::KeyframeRequest {
+                target_user_id,
+                layer,
+            } => {
                 if self.observer {
                     return InboundAction::Processed;
                 }
@@ -428,7 +503,20 @@ impl SessionLogic {
                 // fix for the frozen-video-on-join bug. A coarser global
                 // cap inside the limiter still bounds total fan-out as a
                 // defense against abuse.
-                if !self.keyframe_limiter.allow(&target_user_id) {
+                //
+                // Issue #979: if the relay has recently had to drop inbound
+                // media destined for this receiver (active congestion), its
+                // decoder is likely frozen and genuinely needs fresh
+                // keyframes to recover. In that case relax the per-pair
+                // budget so the strict 1/sec steady-state limit does not
+                // hold the receiver frozen. The global per-receiver ceiling
+                // is unchanged, so the keyframe-storm risk (OSS #814) stays
+                // bounded — the cap is relaxed, not removed.
+                let congested = self.congestion_tracker.is_actively_congested();
+                if !self
+                    .keyframe_limiter
+                    .allow_with_congestion(&target_user_id, layer, congested)
+                {
                     warn!(
                         "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting {}",
                         self.id,
@@ -590,6 +678,59 @@ mod tests {
         assert_eq!(tracker.senders.len(), 2);
         assert!(tracker.senders.contains_key(&100));
         assert!(tracker.senders.contains_key(&200));
+    }
+
+    // =====================================================================
+    // Active-congestion flag for relaxed keyframe budget (issue #979)
+    // =====================================================================
+
+    #[test]
+    fn test_is_actively_congested_false_before_any_threshold_cross() {
+        let mut tracker = CongestionTracker::new();
+        assert!(
+            !tracker.is_actively_congested(),
+            "a tracker with no drops must not report active congestion"
+        );
+        // A few drops below the threshold must not flip the flag.
+        for _ in 0..(CONGESTION_DROP_THRESHOLD - 1) {
+            tracker.record_drop(1);
+        }
+        assert!(
+            !tracker.is_actively_congested(),
+            "sub-threshold drops must not flag active congestion"
+        );
+    }
+
+    #[test]
+    fn test_is_actively_congested_true_after_threshold_cross() {
+        let mut tracker = CongestionTracker::new();
+        // Cross the threshold so a CONGESTION notification fires.
+        let mut notified = false;
+        for _ in 0..CONGESTION_DROP_THRESHOLD {
+            notified |= tracker.record_drop(1).is_some();
+        }
+        assert!(notified, "threshold cross must emit a notification");
+        assert!(
+            tracker.is_actively_congested(),
+            "tracker must report active congestion right after a threshold cross"
+        );
+    }
+
+    #[test]
+    fn test_is_actively_congested_expires_after_relax_window() {
+        let mut tracker = CongestionTracker::new();
+        for _ in 0..CONGESTION_DROP_THRESHOLD {
+            tracker.record_drop(1);
+        }
+        assert!(tracker.is_actively_congested());
+
+        // Rewind the last_congestion timestamp past the relax window.
+        tracker.last_congestion =
+            Some(Instant::now() - (KEYFRAME_CONGESTION_RELAX_WINDOW + Duration::from_millis(50)));
+        assert!(
+            !tracker.is_actively_congested(),
+            "active congestion must lapse once the relax window elapses"
+        );
     }
 
     // =====================================================================

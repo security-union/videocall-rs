@@ -5,7 +5,7 @@
   background: var(--overlay-backdrop);
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
-  z-index: 3000;
+  z-index: 9600;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -26,27 +26,26 @@
   box-shadow: var(--shadow-overlay);
   z-index: 10;
 }
-.change-name-fab:hover {
-  background: var(--surface-elevated);
-}
-.change-name-fab svg {
-  width: 18px;
-  height: 18px;
-}
-.top-bar a img {
-  filter: grayscale(20%);
-  opacity: 0.9;
-}
-.top-bar .w-8 svg {
-  opacity: 0.9;
-}
-/* Full-bleed single peer tile */
+.change-name-fab:hover { background: var(--surface-elevated); }
+.change-name-fab svg { width: 18px; height: 18px; }
+.top-bar a img { filter: grayscale(20%); opacity: 0.9; }
+.top-bar .w-8 svg { opacity: 0.9; }
+/* Full-bleed single peer tile.
+   Height-driven with `aspect-ratio: 3/2` cap (matches `.grid-item` in
+   style.css): on very wide viewports the tile letterboxes horizontally
+   against the page background instead of stretching edge-to-edge. The
+   `inset: 0; margin: auto` pair centers the fixed-position element when
+   `max-width: 100vw` is not binding (i.e., viewport wider than 1.5x its
+   height). */
 .grid-item.full-bleed {
   position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
+  inset: 0;
+  margin: auto;
+  width: auto;
   height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  aspect-ratio: 3 / 2;
   z-index: 0;
 
   /* No borders for full bleed */
@@ -55,6 +54,25 @@
 }
 .grid-item.full-bleed .canvas-container,
 .grid-item.full-bleed canvas {
+  width: 100%;
+  height: 100%;
+}
+/* 2-peer layout: each tile fills its half of the viewport.
+   Overrides the `aspect-ratio: 3 / 2` cap from `.grid-item` (style.css) and
+   the centering from `place-self: center`. Single-peer is handled by
+   `.grid-item.full-bleed` above; 3+ peers keep the 3:2 cap. Pure CSS
+   selector — the `participants-N` class is set by attendants.rs on
+   `#grid-container` based on the visible tile count. */
+#grid-container.participants-2 .grid-item {
+  aspect-ratio: auto;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  place-self: stretch;
+}
+#grid-container.participants-2 .grid-item .canvas-container,
+#grid-container.participants-2 .grid-item canvas {
   width: 100%;
   height: 100%;
 }
@@ -157,7 +175,10 @@ html[data-theme="dark"] {
   --overlay-opaque: rgba(0, 0, 0, 0.8);
   --field-bg: rgba(255, 255, 255, 0.05);
   --field-bg-hover: rgba(255, 255, 255, 0.07);
-  --grid-item-border: rgba(100, 100, 100, 0.3);
+  /* Tile border: softened from rgba(100,100,100,0.3) to a lighter,
+     lower-opacity gray for a more subtle separation against dark
+     surfaces (see PR refining peer-tile layout). */
+  --grid-item-border: rgba(140, 140, 140, 0.18);
   --signal-popup-bg: rgba(26, 26, 46, 0.97);
   --signal-popup-border: rgba(255, 255, 255, 0.12);
   --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
@@ -174,6 +195,9 @@ html[data-theme="dark"] {
   --shadow-overlay:
     0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
   --hairline: rgba(255, 255, 255, 0.14);
+  /* Generic interactive focus-ring outline color (keyboard focus-visible /
+     active control accents). Bright blue reads clearly over dark surfaces. */
+  --focus-ring: #6ea8fe;
 }
 
 html[data-theme="light"] {
@@ -209,7 +233,10 @@ html[data-theme="light"] {
   --overlay-opaque: rgba(0, 0, 0, 0.6);
   --field-bg: rgba(0, 0, 0, 0.04);
   --field-bg-hover: rgba(0, 0, 0, 0.06);
-  --grid-item-border: rgba(100, 100, 100, 0.15);
+  /* Tile border: softened from rgba(100,100,100,0.15) to a lighter,
+     lower-opacity gray for a more subtle separation against light
+     surfaces (see PR refining peer-tile layout). */
+  --grid-item-border: rgba(150, 150, 150, 0.10);
   --signal-popup-bg: rgba(250, 250, 252, 0.98);
   --signal-popup-border: rgba(200, 200, 220, 0.25);
   --signal-popup-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
@@ -226,6 +253,9 @@ html[data-theme="light"] {
   --shadow-overlay:
     0 8px 20px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.5);
   --hairline: rgba(100, 100, 120, 0.12);
+  /* Generic interactive focus-ring outline color. Deeper system blue keeps
+     contrast on the light theme's bright surfaces. */
+  --focus-ring: #0a84ff;
 }
 
 /* ============================================================
@@ -1275,6 +1305,9 @@ html[data-theme="light"] #invite-overlay p {
   --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
   --shadow-md: 0 8px 32px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+  /* Generic interactive focus-ring outline color — theme-agnostic baseline
+     (matches the default dark theme; light theme overrides above). */
+  --focus-ring: #6ea8fe;
   --motion-fast: 0.15s;
   --motion-base: 0.2s;
   --motion-emphasized: cubic-bezier(0.4, 0, 0.2, 1);
@@ -1867,6 +1900,11 @@ html[data-theme="light"] #invite-overlay p {
 .dock-bottom:hover .controls-secondary {
   max-width: 600px;
   opacity: 1;
+  /* Allow the dock-position dropdown menu (an absolutely-positioned child
+     of .dock-position-wrapper, which now lives inside .controls-secondary
+     so it sits next to the tile-layout / density button) to pop ABOVE the
+     action bar without being clipped by the collapse-time overflow:hidden. */
+  overflow: visible;
 }
 
 /* Vertical (left/right dock): collapse height */
@@ -1882,6 +1920,9 @@ html[data-theme="light"] #invite-overlay p {
 .dock-right:hover .controls-secondary {
   max-height: 500px;
   opacity: 1;
+  /* See note above — allow the dock dropdown to overflow sideways without
+     being clipped when the controls are fully expanded. */
+  overflow: visible;
 }
 
 /* Dock position dropdown — reuses glass-select design */
@@ -1998,6 +2039,22 @@ html[data-theme="light"] #invite-overlay p {
   width: 1.5rem;
   height: 1.5rem;
   transition: transform 0.2s ease;
+}
+
+.video-control-button.off {
+  background: rgba(255, 69, 58, 0.18);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: #FF6961;
+  box-shadow: 0 4px 12px -3px rgba(255, 69, 58, 0.25), inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.video-control-button.off:hover {
+  background: rgba(255, 69, 58, 0.28);
+  border-color: rgba(255, 69, 58, 0.45);
+  box-shadow:
+    0 8px 20px -3px rgba(255, 69, 58, 0.35),
+    0 0 0 1px rgba(255, 69, 58, 0.3),
+    inset 0 1px rgba(255, 255, 255, 0.06);
 }
 
 .video-control-button.active {
@@ -2793,13 +2850,71 @@ html[data-theme="light"] #invite-overlay p {
 .grid-item .canvas-container canvas.cropped,
 .split-screen-tile .canvas-container canvas.cropped,
 .split-peer-tile .canvas-container canvas.cropped {
+  width: auto !important;
+  height: 100% !important;
+  min-width: 100% !important;
   object-fit: cover !important;
+  object-position: center top !important;
 }
 
 .grid-item .canvas-container canvas.uncropped,
 .split-screen-tile .canvas-container canvas.uncropped,
 .split-peer-tile .canvas-container canvas.uncropped {
   object-fit: contain !important;
+  object-position: center center !important;
+}
+
+/* ============================================================
+   Screen-share consumer-side aspect ratio (HCL issue: screen-
+   share distortion).
+
+   Screen-share content (the publisher's window or full screen)
+   is a rectangular source whose proportions carry information
+   — UI panels, text columns, slide aspect ratios. Stretching
+   the frame to fill a tile of a different shape produces wrong
+   proportions on the consumer side, so the canvas MUST always
+   letterbox / pillarbox inside its container regardless of the
+   shared `.cropped` / `.uncropped` crop toggle (which is meant
+   for camera tiles, where some edge cropping is acceptable to
+   keep faces centered).
+
+   Targets the screen-share canvas by id-prefix (`screen-share-
+   {peer_id}`) so this override applies to both the regular grid
+   tile (`.grid-item .canvas-container`) and the split-layout
+   left panel (`.split-screen-tile .canvas-container`), and wins
+   over the class-based `object-fit: cover` rule above on
+   specificity grounds (attribute selector + class beats class
+   alone, and the !important here matches the surrounding
+   rules so the cascade stays deterministic).
+   ============================================================ */
+.grid-item .canvas-container canvas[id^="screen-share-"],
+.split-screen-tile .canvas-container canvas[id^="screen-share-"] {
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  object-fit: contain !important;
+  object-position: center center !important;
+}
+
+/* ============================================================
+   Clip peer-tile video feed to the tile's rounded corners.
+
+   `.grid-item` carries the tile's `border-radius` (var(--radius-lg)
+   in style.css) but intentionally keeps `overflow: visible` so the
+   outer speaking-glow box-shadow from `speak_style()` can extend
+   beyond the tile. The inner `.canvas-container` already has
+   `overflow: hidden` to clip video content, but lacks a matching
+   `border-radius`, so the underlying <canvas> renders past the
+   tile's rounded corners.
+
+   Mirror the established `.split-peer-tile .canvas-container`
+   pattern (style.css ~L2811): match the parent radius minus the
+   2px tile border so the inner clip aligns visually with the
+   outer rounded edge. Applies to both camera and screen-share
+   canvases inside grid tiles (both render inside `.canvas-container`).
+   ============================================================ */
+.grid-item .canvas-container {
+  border-radius: calc(var(--radius-lg) - 2px);
 }
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
@@ -3180,4 +3295,203 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------
+ * About modal — homepage footer + glass card surfacing client/server
+ * build info (issue 785).  All colors are tokens so the panel adapts
+ * to light/dark/system themes without further tweaks.
+ * ------------------------------------------------------------------ */
+
+.about-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.about-footer-link {
+  background: transparent;
+  border: 0;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+  letter-spacing: 0.01em;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  text-decoration: none;
+  border-radius: var(--radius-pill);
+  transition: color 0.18s ease, background 0.18s ease;
+}
+
+.about-footer-link:hover,
+.about-footer-link:focus-visible {
+  color: var(--text-primary);
+  background: var(--glass-bg-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.about-modal-card {
+  width: min(560px, 92vw);
+  max-height: min(85vh, 720px);
+  overflow-y: auto;
+  padding: 1.5rem;
+}
+
+.about-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.about-modal-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.about-modal-close {
+  flex-shrink: 0;
+}
+
+.about-modal-section {
+  margin-top: 1.25rem;
+}
+
+.about-modal-section-title {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+.about-modal-table {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--glass-border);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input);
+  overflow: hidden;
+}
+
+.about-modal-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.6fr) repeat(3, 1fr);
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--glass-bg);
+  align-items: baseline;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.about-modal-section:first-of-type .about-modal-row {
+  grid-template-columns: minmax(110px, 0.45fr) 1fr;
+}
+
+.about-modal-row--header {
+  background: var(--glass-bg-hover);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.about-modal-label {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.about-modal-value {
+  color: var(--text-primary);
+  word-break: break-word;
+  min-width: 0;
+}
+
+.about-modal-value--strong {
+  font-weight: 600;
+}
+
+.about-modal-value--mono {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.about-modal-status {
+  padding: 0.75rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-input);
+  text-align: center;
+}
+
+.about-modal-status--error {
+  color: var(--text-primary);
+  border-color: var(--glass-border-hover);
+}
+
+@media (max-width: 540px) {
+  .about-modal-card {
+    padding: 1.25rem;
+  }
+  .about-modal-row {
+    grid-template-columns: 1fr;
+    gap: 0.125rem;
+  }
+  .about-modal-section:first-of-type .about-modal-row {
+    grid-template-columns: 1fr;
+  }
+  .about-modal-row--header {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------
+   Meetings-list tooltip — long-value wrapping
+
+   The body-portaled tooltip in `style.css` defaults to
+   `white-space: nowrap` so short label/value pairs render on a
+   single line. The non-owner "Host ID" row can carry a full
+   user_id (often a 36-char UUID or a long email), which would
+   stretch the tooltip past the viewport. These overrides:
+     1. bound the tooltip width so it can't run off-screen on
+        narrow viewports;
+     2. let rows that opt in via `--breakable` wrap their value
+        onto additional lines using `overflow-wrap: anywhere` so
+        even unbroken strings (UUIDs, emails) wrap cleanly.
+   ------------------------------------------------------------ */
+.meeting-info-tooltip-portal {
+  max-width: min(420px, calc(100vw - 32px));
+}
+
+.meeting-info-tooltip-row:has(.meeting-info-tooltip-value--breakable) {
+  /* Stack label above value so the breakable column has full row
+     width to wrap into instead of competing with the label. */
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.0625rem;
+}
+
+.meeting-info-tooltip-value--breakable {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  /* Mild monospace nudge so wrapped IDs read as a single token. */
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.65rem;
 }

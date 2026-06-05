@@ -6,9 +6,10 @@
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
 use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
-    load_custom_colors_from_storage, save_custom_colors_to_storage, save_density_mode,
-    save_dock_autohide, save_dock_position, AppearanceSettings, AppearanceSettingsCtx, AutohideCtx,
-    DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
+    load_custom_colors_from_storage, save_custom_colors_to_storage, save_decode_budget_override,
+    save_density_mode, save_dock_autohide, save_dock_position, AppearanceSettings,
+    AppearanceSettingsCtx, AutohideCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
+    DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
@@ -34,12 +35,15 @@ pub fn AppearanceSettingsPanel() -> Element {
     let fallback_dock = use_signal(|| DockPosition::Bottom);
     let fallback_autohide = use_signal(|| true);
     let fallback_density = use_signal(|| DensityMode::Auto);
+    let fallback_decode_budget = use_signal(DecodeBudgetOverride::default);
     let mut dock_position_ctx =
         try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
     let mut autohide_ctx =
         try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
     let mut density_ctx =
         try_use_context::<DensityModeCtx>().unwrap_or(DensityModeCtx(fallback_density));
+    let mut decode_budget_ctx =
+        try_use_context::<DecodeBudgetCtx>().unwrap_or(DecodeBudgetCtx(fallback_decode_budget));
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style = slider_fill_style(appearance.glow_brightness);
@@ -662,6 +666,112 @@ pub fn AppearanceSettingsPanel() -> Element {
                         }
                     }
                 }
+
+                // Video-tiles (decode-budget) override — sits directly under
+                // Density and reuses the same segmented control vocabulary.
+                div { class: "device-setting-group",
+                    span { class: "transport-segmented-label", "Video tiles" }
+                    div {
+                        id: "decode-budget-override",
+                        class: "transport-segmented",
+                        role: "radiogroup",
+                        "aria-label": "Number of video tiles to decode",
+                        for option in DECODE_BUDGET_OPTIONS {
+                            {
+                                let is_selected = decode_budget_ctx.0() == option;
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        role: "radio",
+                                        "data-testid": decode_budget_testid(option),
+                                        "aria-checked": if is_selected { "true" } else { "false" },
+                                        "aria-label": decode_budget_aria_label(option),
+                                        class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
+                                        onclick: move |_| {
+                                            decode_budget_ctx.0.set(option);
+                                            save_decode_budget_override(option);
+                                        },
+                                        "{decode_budget_label(option)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p { class: "appearance-section-helper",
+                        "Auto reduces video tiles on slower devices to keep playback smooth — off-budget participants stay audible and appear as avatars. A fixed number always shows that many video tiles."
+                    }
+                }
+            }
+
+            hr { class: "appearance-section-divider" }
+
+            // ── Section 5: Preferences ───────────────────────────────────────
+            section { class: "appearance-section",
+                div { class: "appearance-section-header",
+                    h3 { class: "appearance-section-title", "Preferences" }
+                }
+
+                // Entry/exit notifications toggle
+                div { class: "appearance-section-header dock-autohide-row",
+                    div { class: "appearance-section-heading-stack",
+                        label {
+                            class: "appearance-section-title appearance-section-title--sm",
+                            r#for: "join-leave-notifications-toggle",
+                            "Entry/exit notifications"
+                        }
+                        p { class: "appearance-section-helper",
+                            "Show a message when participants join or leave."
+                        }
+                    }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle entry and exit notifications",
+                        input {
+                            id: "join-leave-notifications-toggle",
+                            r#type: "checkbox",
+                            checked: appearance.show_join_leave_notifications,
+                            onchange: move |evt: Event<FormData>| {
+                                let enabled = evt.checked();
+                                appearance_ctx.0.set(AppearanceSettings {
+                                    show_join_leave_notifications: enabled,
+                                    ..appearance_ctx.0()
+                                });
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
+
+                // Entry/exit sounds toggle
+                div { class: "appearance-section-header dock-autohide-row",
+                    div { class: "appearance-section-heading-stack",
+                        label {
+                            class: "appearance-section-title appearance-section-title--sm",
+                            r#for: "join-leave-sounds-toggle",
+                            "Entry/exit sounds"
+                        }
+                        p { class: "appearance-section-helper",
+                            "Play a sound when participants join or leave."
+                        }
+                    }
+                    label {
+                        class: "glow-switch",
+                        "aria-label": "Toggle entry and exit sounds",
+                        input {
+                            id: "join-leave-sounds-toggle",
+                            r#type: "checkbox",
+                            checked: appearance.play_join_leave_sounds,
+                            onchange: move |evt: Event<FormData>| {
+                                let enabled = evt.checked();
+                                appearance_ctx.0.set(AppearanceSettings {
+                                    play_join_leave_sounds: enabled,
+                                    ..appearance_ctx.0()
+                                });
+                            },
+                        }
+                        span { class: "glow-switch-track" }
+                    }
+                }
             }
                 }
             }
@@ -680,6 +790,48 @@ fn is_light_theme() -> bool {
         .and_then(|e| e.get_attribute("data-theme"))
         .map(|t| t == "light")
         .unwrap_or(false)
+}
+
+/// Manual decode-budget choices offered in the "Video tiles" control.
+///
+/// `Auto` (the default) hands the tile count to the adaptive control loop in
+/// `attendants.rs`. The fixed values are a short, sensible progression bounded
+/// by the layout caps: every value is `<= CANVAS_LIMIT` (30) and the control
+/// loop further clamps each choice to the natural tile count for the current
+/// viewport, so picking a number larger than the grid can show is harmless. The
+/// chosen counts (4 / 6 / 9 / 16) mirror the tile-count vocabulary the density
+/// modes already describe (Standard ~4/~9, Auto ~6/~12, Dense ~16).
+const DECODE_BUDGET_OPTIONS: [DecodeBudgetOverride; 5] = [
+    DecodeBudgetOverride::Auto,
+    DecodeBudgetOverride::Fixed(4),
+    DecodeBudgetOverride::Fixed(6),
+    DecodeBudgetOverride::Fixed(9),
+    DecodeBudgetOverride::Fixed(16),
+];
+
+/// Short button label for a decode-budget option.
+fn decode_budget_label(option: DecodeBudgetOverride) -> String {
+    match option {
+        DecodeBudgetOverride::Auto => "Auto".to_string(),
+        DecodeBudgetOverride::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Descriptive `aria-label` for a decode-budget option so screen readers
+/// announce the bare numbers meaningfully.
+fn decode_budget_aria_label(option: DecodeBudgetOverride) -> String {
+    match option {
+        DecodeBudgetOverride::Auto => "Automatic video tile count".to_string(),
+        DecodeBudgetOverride::Fixed(n) => format!("Show {n} video tiles"),
+    }
+}
+
+/// Stable `data-testid` for a decode-budget option (consumed by 1a.6 E2E).
+fn decode_budget_testid(option: DecodeBudgetOverride) -> String {
+    match option {
+        DecodeBudgetOverride::Auto => "decode-budget-auto".to_string(),
+        DecodeBudgetOverride::Fixed(n) => format!("decode-budget-{n}"),
+    }
 }
 
 /// Compute a static glow style for the appearance preview tile.

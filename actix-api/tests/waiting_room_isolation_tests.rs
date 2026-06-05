@@ -27,6 +27,25 @@
 //! Each test starts a real `ChatServer` + NATS + HTTP server, connects via
 //! WebSocket using real JWT tokens (observer vs admitted), and asserts on the
 //! actual protobuf packets received (or not received) over the wire.
+//!
+//! ## Transport parity (WebSocket vs WebTransport)
+//!
+//! These tests use WebSocket exclusively, but the isolation guarantees are
+//! **transport-agnostic by construction**:
+//!
+//! * The **outbound observer allowlist** lives in the shared `ChatServer` actor
+//!   (`chat_server.rs` → `handle_msg`), a fail-closed positive allowlist that
+//!   runs in the single NATS subscriber loop reached by the common `JoinRoom`
+//!   path — not in any transport adapter.
+//! * The **inbound observer publish-block** lives in `session_logic.rs` →
+//!   `handle_inbound`, called identically from both `ws_chat_session.rs` and
+//!   `wt_chat_session.rs`.
+//! * Both transport adapters are thin: they delegate to
+//!   `self.logic.handle_inbound(...)` and contain no observer/allowlist logic.
+//!
+//! A refactor that moves filtering into a transport-specific path would need to
+//! verify (or add) a WT-path test here.  Until then, WS coverage exercises the
+//! same enforcement code that a WT observer hits.
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};
@@ -214,12 +233,12 @@ async fn wait_for_meeting_started(
     panic!("Timeout waiting for MEETING_STARTED");
 }
 
-/// Build a MEDIA PacketWrapper with AUDIO media type, ready to send over the wire.
-fn make_media_packet(sender_user_id: &str) -> Vec<u8> {
+/// Build a MEDIA PacketWrapper with the given media type, ready to send over the wire.
+fn make_media_packet_typed(sender_user_id: &str, media_type: MediaType) -> Vec<u8> {
     let mut media = MediaPacket::new();
-    media.media_type = MediaType::AUDIO.into();
+    media.media_type = media_type.into();
     media.user_id = sender_user_id.as_bytes().to_vec();
-    media.data = vec![0xDE, 0xAD, 0xBE, 0xEF]; // dummy audio payload
+    media.data = vec![0xDE, 0xAD, 0xBE, 0xEF]; // dummy payload
 
     let mut wrapper = PacketWrapper::new();
     wrapper.packet_type = PacketType::MEDIA.into();
@@ -227,6 +246,23 @@ fn make_media_packet(sender_user_id: &str) -> Vec<u8> {
     wrapper.data = media
         .write_to_bytes()
         .expect("MediaPacket serialization should succeed");
+
+    wrapper
+        .write_to_bytes()
+        .expect("PacketWrapper serialization should succeed")
+}
+
+/// Build a MEDIA PacketWrapper with AUDIO media type (convenience wrapper).
+fn make_media_packet(sender_user_id: &str) -> Vec<u8> {
+    make_media_packet_typed(sender_user_id, MediaType::AUDIO)
+}
+
+/// Build a non-MEDIA PacketWrapper of the given type, ready to send over the wire.
+fn make_packet_of_type(sender_user_id: &str, packet_type: PacketType) -> Vec<u8> {
+    let mut wrapper = PacketWrapper::new();
+    wrapper.packet_type = packet_type.into();
+    wrapper.user_id = sender_user_id.as_bytes().to_vec();
+    wrapper.data = vec![0xCA, 0xFE]; // dummy payload
 
     wrapper
         .write_to_bytes()
@@ -456,4 +492,279 @@ async fn test_observer_receives_session_assigned() {
     );
 
     drop(ws_observer);
+}
+
+/// An observer sends a MEDIA PacketWrapper where `user_id` is spoofed to match
+/// an admitted peer (Alice). The server MUST drop this packet based on the
+/// sender's session role (observer), not the packet-asserted identity. Alice
+/// must NOT receive the spoofed packet.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_spoofed_user_id_still_dropped() {
+    let port = WR_PORT_BASE + 4;
+    setup(port).await;
+    let room = "wr-spoofed-user-id";
+
+    // Connect admitted Alice
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    // Connect observer
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Observer sends MEDIA with alice's user_id (spoofed)
+    let spoofed = make_media_packet("alice@test.com");
+    ws_obs
+        .send(Message::Binary(spoofed))
+        .await
+        .expect("send should succeed");
+
+    // Alice must NOT receive it
+    let packets = collect_packets_for(&mut ws_a, Duration::from_secs(2)).await;
+    let media: Vec<_> = packets
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+    assert!(
+        media.is_empty(),
+        "Spoofed user_id from observer MUST be dropped by inbound filter. Got {} MEDIA packets.",
+        media.len()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
+}
+
+/// An observer sends a MEDIA packet with `session_id` spoofed to match admitted
+/// Alice's session. This probes the `inner_session_self` self-echo suppression
+/// path: if the packet reached Alice, it would be dropped as a self-echo —
+/// giving the observer a per-recipient censorship primitive. The server's inbound
+/// filter blocks this packet before it ever reaches NATS, so neither Alice nor
+/// Bob should receive it.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_spoofed_session_id_still_dropped() {
+    let port = WR_PORT_BASE + 5;
+    setup(port).await;
+    let room = "wr-spoofed-session-id";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_b = make_admitted_token("bob@test.com", room, "Bob");
+    let mut ws_b = connect_with_token(port, &token_b).await;
+    let _sid_b = wait_for_session_assigned(&mut ws_b).await;
+    wait_for_meeting_started(&mut ws_b).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Build packet with spoofed session_id = Alice's session
+    let mut media = MediaPacket::new();
+    media.media_type = MediaType::AUDIO.into();
+    media.user_id = b"observer@test.com".to_vec();
+    media.data = vec![0xDE, 0xAD];
+
+    let mut wrapper = PacketWrapper::new();
+    wrapper.packet_type = PacketType::MEDIA.into();
+    wrapper.user_id = b"observer@test.com".to_vec();
+    wrapper.session_id = sid_a; // spoof Alice's session_id
+    wrapper.data = media
+        .write_to_bytes()
+        .expect("MediaPacket serialization should succeed");
+    let bytes = wrapper
+        .write_to_bytes()
+        .expect("PacketWrapper serialization should succeed");
+
+    ws_obs
+        .send(Message::Binary(bytes))
+        .await
+        .expect("send should succeed");
+
+    // Neither Alice nor Bob should receive it
+    let packets_b = collect_packets_for(&mut ws_b, Duration::from_secs(2)).await;
+    let media_b: Vec<_> = packets_b
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+    assert!(
+        media_b.is_empty(),
+        "Spoofed session_id from observer MUST be dropped. Bob got {} MEDIA packets.",
+        media_b.len()
+    );
+
+    drop(ws_a);
+    drop(ws_b);
+    drop(ws_obs);
+}
+
+/// An observer sends raw garbage bytes that cannot be parsed as a valid
+/// PacketWrapper. This verifies the fail-closed default (`.unwrap_or(false)`)
+/// drops malformed inputs even if they somehow bypass the inbound filter.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_unparseable_packet_dropped() {
+    let port = WR_PORT_BASE + 6;
+    setup(port).await;
+    let room = "wr-unparseable";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send garbage bytes
+    let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x00, 0x01];
+    ws_obs
+        .send(Message::Binary(garbage))
+        .await
+        .expect("send should succeed");
+
+    // Alice should not receive anything from this
+    let packets = collect_packets_for(&mut ws_a, Duration::from_secs(2)).await;
+    let non_meeting: Vec<_> = packets
+        .iter()
+        .filter(|p| {
+            p.packet_type != PacketType::MEETING.into()
+                && p.packet_type != PacketType::SESSION_ASSIGNED.into()
+        })
+        .collect();
+    assert!(
+        non_meeting.is_empty(),
+        "Unparseable packet from observer MUST be dropped. Got {} unexpected packets.",
+        non_meeting.len()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
+}
+
+/// An observer MUST NOT receive MEDIA packets regardless of the inner MediaType.
+/// The base test (`test_observer_does_not_receive_media_from_admitted_peer`) only
+/// checks AUDIO. This test sends every other MediaType variant (VIDEO, SCREEN,
+/// HEARTBEAT, RTT, KEYFRAME_REQUEST) to confirm the outbound filter blocks all
+/// media variants, not just one.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_blocked_for_all_media_types() {
+    let port = WR_PORT_BASE + 7;
+    setup(port).await;
+    let room = "wr-all-media-types";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send MEDIA packets with every non-AUDIO MediaType variant
+    for media_type in [
+        MediaType::VIDEO,
+        MediaType::SCREEN,
+        MediaType::HEARTBEAT,
+        MediaType::RTT,
+        MediaType::KEYFRAME_REQUEST,
+    ] {
+        let bytes = make_media_packet_typed("alice@test.com", media_type);
+        ws_a.send(Message::Binary(bytes))
+            .await
+            .expect("Alice should be able to send media");
+    }
+
+    // Observer should receive nothing beyond MEETING/SESSION_ASSIGNED control packets
+    let packets = collect_packets_for(&mut ws_obs, Duration::from_secs(2)).await;
+    let media: Vec<_> = packets
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+    assert!(
+        media.is_empty(),
+        "Observer MUST NOT receive MEDIA packets of any MediaType. Got {} MEDIA packets.",
+        media.len()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
+}
+
+/// Non-MEDIA packet types that carry sensitive session data (encryption keys,
+/// diagnostics, connection state, peer events, viewport) MUST also be blocked
+/// from reaching observers. This is the negative allowlist: every PacketType
+/// except MEDIA (tested separately), MEETING, and SESSION_ASSIGNED should be
+/// dropped for observer sessions.
+#[actix_rt::test]
+#[serial]
+async fn test_observer_blocked_for_non_media_packet_types() {
+    let port = WR_PORT_BASE + 8;
+    setup(port).await;
+    let room = "wr-negative-allowlist";
+
+    let token_a = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws_a = connect_with_token(port, &token_a).await;
+    let _sid_a = wait_for_session_assigned(&mut ws_a).await;
+    wait_for_meeting_started(&mut ws_a).await;
+
+    let token_obs = make_observer_token("observer@test.com", room, "Observer");
+    let mut ws_obs = connect_with_token(port, &token_obs).await;
+    let _sid_obs = wait_for_session_assigned(&mut ws_obs).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send every sensitive non-MEDIA packet type from the admitted peer
+    let blocked_types = [
+        PacketType::AES_KEY,
+        PacketType::RSA_PUB_KEY,
+        PacketType::DIAGNOSTICS,
+        PacketType::CONNECTION,
+        PacketType::CONGESTION,
+        PacketType::HEALTH,
+        PacketType::PEER_EVENT,
+        PacketType::VIEWPORT,
+    ];
+    for ptype in blocked_types {
+        let bytes = make_packet_of_type("alice@test.com", ptype);
+        ws_a.send(Message::Binary(bytes))
+            .await
+            .expect("Alice should be able to send packet");
+    }
+
+    // Observer should only see control packets (MEETING, SESSION_ASSIGNED)
+    let packets = collect_packets_for(&mut ws_obs, Duration::from_secs(2)).await;
+    let leaked: Vec<_> = packets
+        .iter()
+        .filter(|p| {
+            p.packet_type != PacketType::MEETING.into()
+                && p.packet_type != PacketType::SESSION_ASSIGNED.into()
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "Observer MUST NOT receive non-MEDIA sensitive packets. \
+         Got {} leaked packets with types: {:?}",
+        leaked.len(),
+        leaked
+            .iter()
+            .map(|p| p.packet_type.enum_value())
+            .collect::<Vec<_>>()
+    );
+
+    drop(ws_a);
+    drop(ws_obs);
 }

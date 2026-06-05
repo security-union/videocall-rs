@@ -18,8 +18,16 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::performance_settings::{
+    load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
+    save_performance_preference, save_receive_preference, KindReceivePref, PerformancePreference,
+    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+};
 use crate::constants::*;
-use crate::context::{TransportPreferenceCtx, VideoCallClientCtx};
+use crate::context::{
+    load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
+    save_preferred_speaker_id, TransportPreferenceCtx, VideoCallClientCtx,
+};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use futures::channel::mpsc;
@@ -27,7 +35,8 @@ use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{
-    initial_screen_tier, CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent,
+    initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
+    ScreenShareEvent,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -100,6 +109,48 @@ pub fn Host(
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
 
+        // Simulcast layer ceiling (issue #989 / #1082): the lesser of the runtime
+        // flag (`experimentalSimulcastMaxLayers`, defaults to 3 = ON) and what
+        // this device can actually encode without stalling. A weak device's
+        // capability ceiling auto-gates this DOWN to 1–2 layers even with the
+        // flag at its default 3, so default-ON is safe.
+        //
+        // This `use_hook` closure runs once per Host component mount, so the
+        // INFO below fires once per session — never per frame.
+        //
+        // VIDEO/SCREEN share the CPU-derived capability ceiling because each
+        // extra WebCodecs VIDEO encoder is ~N× main-thread encode cost (the
+        // 2-core Intel Mac stall mode, discussion #562/#890).
+        let flag_max_layers = experimental_simulcast_max_layers();
+        let effective_max_layers = flag_max_layers
+            .min(crate::components::capability_check::capability_max_simulcast_layers());
+        log::info!("CameraEncoder: effective simulcast layers = {effective_max_layers}");
+
+        // AUDIO is decoupled from the VIDEO capability ceiling (issue #1082):
+        // Opus encoders run on the AudioWorklet thread (off the main thread) and
+        // cost ~1-3% of call bandwidth, so a device that is correctly capped to
+        // 1 VIDEO layer can still run the full audio ladder. Audio's ceiling is
+        // the audio ladder size itself (`max_layers_for_kind(Audio)`), still
+        // gated by the SAME runtime flag — so setting the flag to 1 disables
+        // audio simulcast too (it now defaults to 3 = ON).
+        let audio_capability_ceiling = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+        let audio_effective_max_layers = flag_max_layers.min(audio_capability_ceiling);
+        log::info!(
+            "MicrophoneEncoder: effective audio simulcast layers = {audio_effective_max_layers} \
+             (flag={flag_max_layers}, audio_ceiling={audio_capability_ceiling})"
+        );
+        if effective_max_layers > 1 {
+            log::info!(
+                "SIMULCAST: publishing {effective_max_layers} video layers (default ON). \
+                 Receiver-driven per-peer layer selection is live — each receiver \
+                 automatically pulls the best layer its own downlink can sustain (and the \
+                 relay drops the layers it did not select per source+kind). This increases \
+                 this sender's encode CPU and uplink/relay egress; weak devices auto-gate \
+                 to fewer layers via the capability ceiling. To disable, set \
+                 experimentalSimulcastMaxLayers=1."
+            );
+        }
+
         let cam_settings_cell = camera_settings_handler.clone();
         let camera_settings_cb = VcCallback::from(move |settings: String| {
             if let Some(handler) = cam_settings_cell.borrow().as_ref() {
@@ -118,6 +169,7 @@ pub fn Host(
             video_bitrate,
             camera_settings_cb,
             camera_error_cb,
+            effective_max_layers,
         );
 
         let mic_settings_cell = mic_settings_handler.clone();
@@ -142,6 +194,12 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
+            // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
+            // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
+            // and is cheap), but still gated by the SAME runtime flag so it stays
+            // OFF by default (single audio layer, byte-identical to the
+            // pre-simulcast mic path).
+            audio_effective_max_layers,
         );
 
         let screen_settings_cell = screen_settings_handler.clone();
@@ -170,6 +228,10 @@ pub fn Host(
             screen_settings_cb,
             screen_state_cb,
             camera.screen_sharing_flag(),
+            // Screen simulcast layer ceiling (issue #989, Phase 3b) — same
+            // flag + capability gating as the camera, so it's OFF by default
+            // (single layer, byte-identical to the pre-simulcast screen path).
+            effective_max_layers,
         );
 
         // Wire up congestion step-down, PLI keyframe, and re-election flags
@@ -211,6 +273,22 @@ pub fn Host(
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
         screen.set_encoder_control(rx);
 
+        // Apply the user's persisted performance (quality-bounds) preference
+        // (issue #961) before the encoder starts, so the very first encode honors
+        // the bounds. All-Auto (the default) is a no-op. The bounds are also
+        // stored inside the encoder and re-applied on every (re)start, so this
+        // single call survives camera restarts.
+        let perf_pref = load_performance_preference();
+        let bounds = preference_to_encoder_bounds(&perf_pref);
+        camera.set_quality_tier_bounds(
+            bounds.video_best,
+            bounds.video_worst,
+            bounds.audio_best,
+            bounds.audio_worst,
+        );
+        // Screen share bounds live on the separate ScreenEncoder (issue #961).
+        screen.set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();
 
@@ -248,10 +326,60 @@ pub fn Host(
         let value = client.clone();
         use_effect(move || {
             let state_for_loaded = state.clone();
+            let client_for_loaded = value.clone();
             let mut s = state.borrow_mut();
             if !s.initialized {
                 s.media_devices.on_loaded = VcCallback::from(move |_| {
                     let mut s = state_for_loaded.borrow_mut();
+
+                    // Honor the pre-join device selection (issue #959): resolve
+                    // the persisted device ids against the live device lists,
+                    // falling back to the first device when a stored id no
+                    // longer exists. This is what makes the camera/mic/speaker
+                    // chosen on the pre-join screen the ones actually used when
+                    // capture starts.
+                    let (stored_cam, stored_mic, stored_spk) = load_preferred_device_ids();
+                    let cam_ids: Vec<String> = s
+                        .media_devices
+                        .video_inputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    let mic_ids: Vec<String> = s
+                        .media_devices
+                        .audio_inputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    let spk_ids: Vec<String> = s
+                        .media_devices
+                        .audio_outputs
+                        .devices()
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    if let Some(id) = restore_device_id(stored_cam.as_deref(), &cam_ids) {
+                        s.media_devices.video_inputs.select(&id);
+                        save_preferred_camera_id(&id);
+                    }
+                    if let Some(id) = restore_device_id(stored_mic.as_deref(), &mic_ids) {
+                        s.media_devices.audio_inputs.select(&id);
+                        save_preferred_mic_id(&id);
+                    }
+                    if let Some(id) = restore_device_id(stored_spk.as_deref(), &spk_ids) {
+                        s.media_devices.audio_outputs.select(&id);
+                        save_preferred_speaker_id(&id);
+                        // Apply the persisted speaker to the shared audio sink so
+                        // the pre-join speaker choice is honored in-meeting.
+                        // No-op where setSinkId is unsupported (handled inside
+                        // SharedAudioContext::update_speaker_device). (issue #959)
+                        if let Err(e) = client_for_loaded.update_speaker_device(Some(id.clone())) {
+                            log::warn!("Failed to apply pre-join speaker selection: {e:?}");
+                        }
+                    }
+
                     let video_id = s.media_devices.video_inputs.selected();
                     let audio_id = s.media_devices.audio_inputs.selected();
                     let num_cameras = s.media_devices.video_inputs.devices().len();
@@ -526,6 +654,8 @@ pub fn Host(
         Rc::new(move |audio: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_inputs.select(&audio.device_id);
+            // Persist so the next pre-join screen restores this mic. (issue #959)
+            save_preferred_mic_id(&audio.device_id);
             if s.microphone.select(audio.device_id.clone()) {
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
@@ -541,6 +671,8 @@ pub fn Host(
         Rc::new(move |video: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.video_inputs.select(&video.device_id);
+            // Persist so the next pre-join screen restores this camera. (issue #959)
+            save_preferred_camera_id(&video.device_id);
             if s.camera.select(video.device_id.clone()) {
                 let state_clone = state.clone();
                 Timeout::new(1000, move || {
@@ -551,15 +683,124 @@ pub fn Host(
         })
     };
 
+    // Performance (quality-bounds) preference, restored from localStorage and
+    // surfaced to the settings modal (issue #961). The encoder already had the
+    // restored bounds applied at construction time above; this signal is the
+    // UI's source of truth for the selector positions.
+    let performance_preference = use_signal(load_performance_preference);
+
+    // Apply a changed performance preference: persist it and push the inverted
+    // best/worst bounds to the live encoder. The encoder stores them and
+    // re-applies on every (re)start, so this works whether or not the camera is
+    // currently running.
+    let on_performance_change: Rc<dyn Fn(PerformancePreference)> = {
+        let state = state.clone();
+        Rc::new(move |pref: PerformancePreference| {
+            save_performance_preference(&pref);
+            let mut performance_preference = performance_preference;
+            performance_preference.set(pref);
+            let bounds = preference_to_encoder_bounds(&pref);
+            let mut s = state.borrow_mut();
+            s.camera.set_quality_tier_bounds(
+                bounds.video_best,
+                bounds.video_worst,
+                bounds.audio_best,
+                bounds.audio_worst,
+            );
+            // Screen share is a separate encoder object (issue #961).
+            s.screen
+                .set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+        })
+    };
+
+    // Live snapshot reader for the VU meters. Returns `None` while the camera is
+    // off so the meters show placeholders rather than a stale pinned tier.
+    // Built once per mount (via `use_hook`) so its `Rc` identity is stable and
+    // the meter component doesn't see a "changed" prop every render.
+    let read_quality_snapshot: SnapshotReader = {
+        let state = state.clone();
+        use_hook(move || {
+            SnapshotReader(Rc::new(move || {
+                let s = state.borrow();
+                if s.prev_video_enabled {
+                    Some(s.camera.live_quality_snapshot())
+                } else {
+                    None
+                }
+            }))
+        })
+    };
+
+    // Live screen-share snapshot reader for the third VU meter. The encoder
+    // already returns `None` while not sharing, so no extra gate is needed.
+    let read_screen_snapshot: ScreenSnapshotReader = {
+        let state = state.clone();
+        use_hook(move || {
+            ScreenSnapshotReader(Rc::new(move || {
+                state.borrow().screen.live_screen_snapshot()
+            }))
+        })
+    };
+
     let on_speaker_change: Rc<dyn Fn(DeviceInfo)> = {
         let state = state.clone();
         let client = client.clone();
         Rc::new(move |speaker: DeviceInfo| {
             let mut s = state.borrow_mut();
             s.media_devices.audio_outputs.select(&speaker.device_id);
+            // Persist so the next pre-join screen restores this speaker. (issue #959)
+            save_preferred_speaker_id(&speaker.device_id);
             if let Err(e) = client.update_speaker_device(Some(speaker.device_id.clone())) {
                 log::error!("Failed to update speaker device: {e:?}");
             }
+        })
+    };
+
+    // RECEIVE-side layer-bounds preference (simulcast P4/P5), restored from
+    // localStorage and surfaced to the settings modal. The signal is the UI's
+    // source of truth for the slider positions.
+    let receive_preference = use_signal(load_receive_preference);
+
+    // Apply the persisted receive bounds to the client once on mount, so the
+    // restored caps take effect immediately (each kind's effective bounds, with
+    // Auto → (None, None)). Re-applying is idempotent.
+    {
+        let client = client.clone();
+        use_hook(move || {
+            let pref = load_receive_preference();
+            for kind in [
+                PrefMediaKind::Video,
+                PrefMediaKind::Audio,
+                PrefMediaKind::Screen,
+            ] {
+                let (min, max) = pref.effective_bounds(kind);
+                client.set_receive_layer_bounds(kind, min, max);
+            }
+        });
+    }
+
+    // Apply a changed receive bound: persist it and push the effective bounds for
+    // the changed kind to the client (immediate downlink effect).
+    let on_receive_change: Rc<dyn Fn((PrefMediaKind, KindReceivePref))> = {
+        let client = client.clone();
+        Rc::new(move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
+            let mut receive_preference = receive_preference;
+            let next = receive_preference().with_kind(kind, sub);
+            save_receive_preference(&next);
+            receive_preference.set(next);
+            let (min, max) = next.effective_bounds(kind);
+            client.set_receive_layer_bounds(kind, min, max);
+        })
+    };
+
+    // Per-kind received-layer snapshot reader for the P5 needles. Built once per
+    // mount (stable `Rc`) so the meter component doesn't see a "changed" prop.
+    let received_reader: ReceivedReader = {
+        let client = client.clone();
+        use_hook(move || {
+            ReceivedReader(Rc::new(move |kind: PrefMediaKind| {
+                client.received_layer_snapshot(kind)
+            }))
         })
     };
 
@@ -629,6 +870,11 @@ pub fn Host(
             let on_mic = on_mic_change.clone();
             let on_cam = on_cam_change.clone();
             let on_spk = on_speaker_change.clone();
+            let on_perf = on_performance_change.clone();
+            let read_snap = read_quality_snapshot.clone();
+            let read_screen_snap = read_screen_snapshot.clone();
+            let on_recv = on_receive_change.clone();
+            let recv_reader = received_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -645,6 +891,13 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
+                    performance_preference: performance_preference(),
+                    on_performance_change: move |p: PerformancePreference| on_perf(p),
+                    read_quality_snapshot: read_snap.clone(),
+                    read_screen_snapshot: read_screen_snap.clone(),
+                    receive_preference: receive_preference(),
+                    on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
+                    received_reader: recv_reader.clone(),
                 }
             }
         }

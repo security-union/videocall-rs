@@ -34,7 +34,8 @@ canvas {
   max-height: 100%;
   width: auto;
   height: auto;
-  object-fit: contain;
+  object-fit: cover;
+  object-position: center top;
 }
 
 #main-container {
@@ -421,8 +422,18 @@ h3 {
 }
 
 .grid-item {
-  width: 100%;
+  /* Height-driven sizing so wide grid cells letterbox horizontally instead
+     of stretching the tile into a very wide rectangle. The tile fills the
+     grid cell height, derives its width from `aspect-ratio: 3/2` (the max
+     ratio we accept), and is clamped by `max-width: 100%` so narrow cells
+     (3+ peers per row) still fill their full width. `place-self: center`
+     centers the tile in its grid cell when the cap is binding. */
+  width: auto;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: center;
   min-width: 0;
   min-height: 0;
 
@@ -435,6 +446,26 @@ h3 {
   border: 2px solid var(--grid-item-border);
   border-radius: var(--radius-lg);
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
+}
+
+/* HCL issue #7: 2-peer meeting (host + 1 remote, no screen share) → the
+   container carries the `participants-1` modifier because only ONE tile
+   sits in the grid (the host's self-view lives in the floating `.host`
+   element). Drop the 3:2 cap on that lone tile so the remote peer fills
+   the entire viewport area allocated to the grid. The `.host` corner-tile
+   continues to overlay on top via its own positioning, so the visual is
+   a maximized remote peer with a small host self-view in the corner —
+   matching the user expectation for "1-on-1" meetings.
+   `width:100%` + `height:100%` + no `aspect-ratio` lets the tile fill
+   the entire `1fr` cell. `place-self: stretch` overrides the default
+   `center` so the tile actually expands to the cell bounds. */
+.participants-1 .grid-item.full-bleed {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: auto;
+  place-self: stretch;
 }
 
 /* Overflow badge: "+N more" tile */
@@ -460,6 +491,19 @@ h3 {
   font-size: 0.8rem;
   font-weight: 400;
   opacity: 0.7;
+}
+
+/* Issue #987, task 1a.4: off-budget avatar tiles. These peers are present and
+   audible but their video is not being decoded (the adaptive decode-budget
+   controller capped how many tiles decode to protect CPU). A dashed border and
+   slightly muted surface distinguishes "I'm not decoding your video" from a
+   normal camera-off tile, without hiding who is in the meeting. The tile reuses
+   the standard `.grid-item` + `.placeholder-content` markup; only the framing
+   differs. E2E queries `.grid-item.off-budget-tile` / `[data-off-budget=true]`. */
+.grid-item.off-budget-tile {
+  border-style: dashed;
+  border-color: var(--color-border-emphasis);
+  background-color: var(--surface);
 }
 
 /* ============================================================
@@ -586,12 +630,15 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 canvas {
-  width: 100%;
+  width: auto;
   height: 100%;
-  object-fit: contain;
+  min-width: 100%;
+  object-fit: cover;
+  object-position: center center;
 }
 
 /* ============================================================
@@ -1857,11 +1904,28 @@ select {
     rgba(255, 255, 255, 0.03)
   ); /* @token-exempt: legacy var() fallback for very-faint glass */
   border-radius: var(--radius-card, 16px);
-  overflow: hidden;
+  /* NOTE: no `overflow: hidden` here — it was clipping the filter/sort
+     popovers. The inner `.meetings-list-content` owns the scroll region and
+     re-rounds the bottom corners to keep the card silhouette intact. */
+}
+
+/* Header row: collapsible title (left) + filter/sort controls (right).
+   Must NOT be positioned or clip its overflow — the popovers anchor to the
+   `.meetings-toolbar-group` wrappers inside it, so a clip/containing-block
+   here would re-clip or mis-anchor them. */
+.meetings-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  overflow: visible;
 }
 
 .meetings-list-toggle {
-  width: 100%;
+  /* Grow to fill the row so the controls sit flush right; the meeting-count's
+     `margin-left:auto` no longer needs full width to push right. */
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -1892,6 +1956,8 @@ select {
   border-top: 1px solid var(--glass-bg);
   max-height: 260px;
   overflow-y: auto;
+  border-bottom-left-radius: var(--radius-card, 16px);
+  border-bottom-right-radius: var(--radius-card, 16px);
 }
 
 .meetings-loading,
@@ -1963,11 +2029,284 @@ select {
   background: var(--glass-bg-hover);
 }
 
-.meetings-list {
-  list-style: none;
+/* ---- Meetings filter + sort toolbar (issue #1056) -------------------- */
+/* Sits on the right of the .meetings-list-header row (no longer its own row). */
+.meetings-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+  padding-right: 0.75rem;
+}
+
+.meetings-toolbar-group {
+  /* Positioning context for the absolutely-anchored popover. NOTE: no
+     `z-index` here on purpose — a stacking context on the group would make the
+     trigger-vs-backdrop ordering depend on DOM order between the two groups
+     (so the fix would only work for one direction of the switch). Instead the
+     trigger BUTTONS are lifted above the backdrop globally (below), which is
+     symmetric regardless of which popover is open. */
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+/* Lift the trigger buttons above the popover backdrop (z 9290) GLOBALLY, so a
+   click on either trigger reaches the button directly rather than being
+   swallowed by the open popover's backdrop. Result: clicking the OTHER trigger
+   is a one-click direct switch (its onclick closes the open popover and opens
+   its own); clicking the SAME trigger toggles it closed; clicking anywhere
+   ELSE hits the backdrop and closes the popover. The popover (z 9300) still
+   paints above the triggers. */
+.meetings-toolbar-group > .meetings-icon-btn,
+.meetings-toolbar-group > .meetings-sort-btn {
+  position: relative;
+  z-index: 9291;
+}
+
+.meetings-icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-icon-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+.meetings-icon-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.meetings-icon-btn.is-active {
+  color: var(--text-primary);
+  border-color: var(--focus-ring);
+}
+
+/* "N active" count badge on the filter icon (replaces the easily-missed dot).
+   Hidden entirely when no filters are active. */
+.meetings-filter-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--focus-ring);
+  color: #fff /* @token-exempt: badge text on accent fill */;
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.meetings-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 32px;
+  padding: 0 0.625rem;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-sort-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+.meetings-sort-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.meetings-sort-label { white-space: nowrap; }
+
+.meetings-sort-dir-icon { transition: transform 0.2s ease; }
+.meetings-sort-dir-icon.is-desc { transform: rotate(0deg); }
+/* Ascending flips the down-arrow glyph to point up. */
+.meetings-sort-dir-icon:not(.is-desc) { transform: rotate(180deg); }
+
+/* Transparent click-catcher behind a popover for outside-click dismissal. */
+.meetings-popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9290;
+  background: transparent;
+}
+
+/* Pure-CSS absolute anchoring relative to the enclosing `.meetings-toolbar-group`
+   (which is `position: relative`). `position: absolute` is used instead of
+   `position: fixed` because an ancestor `.card-apple` / `.hero-content` applies
+   `backdrop-filter`, which makes it the containing block for fixed descendants —
+   so fixed coords resolved against the card, not the viewport, dumping the panel
+   in the corner. Absolute + `top: 100%; right: 0` drops the panel directly under
+   its trigger cluster, right-aligned, and the card no longer clips it
+   (`.meetings-list-container` overflow removed; header is overflow:visible). */
+.meetings-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: auto;
+  z-index: 9300;
+  min-width: 200px;
+  max-width: min(280px, calc(100vw - 24px));
+  max-height: min(360px, calc(100vh - 120px));
+  overflow-y: auto;
+  padding: 0.5rem;
+  background: var(--surface-elevated);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card, 12px);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  animation: meetings-popover-in 0.14s cubic-bezier(0.4, 0, 0.2, 1);
+}
+@keyframes meetings-popover-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) { .meetings-popover { animation: none; } }
+/* Per-popover min-widths are CSS-only now (no JS anchoring); tune freely. */
+.meetings-filter-popover { min-width: 220px; }
+
+.meetings-filter-group {
+  /* Reset the fieldset so legend + options form a tidy left-aligned column. */
+  border: none;
   margin: 0;
   padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  gap: 0.25rem;
 }
+
+.meetings-filter-legend {
+  /* `display: block` + `float: none` avoids the browser's default legend
+     positioning so the group title is flush left like the options below it. */
+  display: block;
+  float: none;
+  width: 100%;
+  padding: 0;
+  margin-bottom: 0.125rem;
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-quaternary);
+}
+
+.meetings-filter-option {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.25rem;
+  text-align: left;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-button, 8px);
+}
+.meetings-filter-option:hover { background: var(--field-bg); color: var(--text-primary); }
+.meetings-filter-option input {
+  flex: 0 0 auto;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--focus-ring);
+}
+.meetings-filter-option span { flex: 1 1 auto; text-align: left; }
+
+.meetings-sort-popover { min-width: 180px; padding: 0.25rem; gap: 0; }
+.meetings-sort-option {
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.625rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-button, 8px);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.meetings-sort-option:hover { background: var(--field-bg); color: var(--text-primary); }
+.meetings-sort-option:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.meetings-sort-option.is-selected {
+  background: var(--field-bg);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Filtered-empty state: distinct from the generic "No meetings yet". */
+.meetings-empty-filtered {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.625rem;
+}
+.meetings-clear-filters-btn {
+  height: 32px;
+  padding: 0 0.875rem;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.meetings-clear-filters-btn:hover { background: var(--glass-bg-hover); }
+.meetings-clear-filters-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Touch targets: bump all interactive controls in the toolbar / popovers to
+   the 44px minimum on coarse pointers (phones, tablets). */
+@media (pointer: coarse) {
+  .meetings-icon-btn { width: 44px; height: 44px; }
+  .meetings-sort-btn,
+  .meetings-clear-filters-btn { min-height: 44px; }
+  .meetings-filter-option { min-height: 44px; padding: 0.5rem; }
+  .meetings-filter-option input { width: 20px; height: 20px; }
+  .meetings-sort-option { min-height: 44px; }
+}
+
+/* Honour the user's reduced-motion preference: drop the toolbar/popover
+   hover transitions and the sort-direction icon rotation animation. */
+@media (prefers-reduced-motion: reduce) {
+  .meetings-icon-btn,
+  .meetings-sort-btn,
+  .meetings-clear-filters-btn,
+  .meetings-sort-dir-icon {
+    transition: none;
+  }
+}
+
+.meetings-list { list-style: none; margin: 0; padding: 0; }
 
 .meeting-item {
   padding: 0.625rem 1rem;
@@ -2843,6 +3182,209 @@ select {
 }
 
 /* ----------------------------------------------------------------
+   Pre-join device preview (issue #959)
+   ---------------------------------------------------------------- */
+.prejoin-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.prejoin-video-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  /* Theme-aware video letterbox — matches the in-meeting self-view
+     (.self-camera uses var(--bg)). */
+  background: var(--bg);
+  border-radius: var(--radius-input, 12px);
+  overflow: hidden;
+  border: 1px solid var(--settings-card-border);
+}
+
+.prejoin-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* No horizontal mirror: matches the in-meeting self-view (.self-camera),
+     which is not mirrored, so the preview is consistent with the call. */
+}
+
+.prejoin-video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-video-placeholder-text {
+  font-size: 0.85rem;
+}
+
+.prejoin-permission-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  text-align: center;
+  padding: 0.5rem 0;
+}
+
+.prejoin-permission-text {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.prejoin-controls-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.prejoin-toggle {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.prejoin-toggle-icon {
+  flex-shrink: 0;
+}
+
+/* ON: unmistakable green "active" treatment (independent of --accent, which is
+   Apple blue on this app). Uses the semantic --success token. */
+.prejoin-toggle.on {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--text-primary);
+}
+
+/* OFF: red-tinted danger treatment — joining muted/dark is the attention
+   state, so make it obvious rather than a faint border. Uses --error. */
+.prejoin-toggle.off.danger {
+  border-color: color-mix(in srgb, var(--error) 60%, var(--settings-card-border));
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  color: color-mix(in srgb, var(--error) 85%, var(--text-primary));
+}
+
+.prejoin-meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  transition: opacity 0.2s;
+}
+
+.prejoin-meter-row.muted {
+  opacity: 0.5;
+}
+
+.prejoin-meter-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+.prejoin-meter-glyph {
+  flex-shrink: 0;
+}
+
+.prejoin-meter {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--settings-card-border);
+  overflow: hidden;
+}
+
+.prejoin-meter-fill {
+  height: 100%;
+  /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping), all
+     semantic tokens. */
+  background: linear-gradient(
+    90deg,
+    var(--success) 0%,
+    var(--warning) 65%,
+    var(--error) 100%
+  );
+  border-radius: 4px;
+  /* Light smoothing between the engine's per-frame width writes. */
+  transition: width 0.06s linear;
+}
+
+.prejoin-selectors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.prejoin-select-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.prejoin-select-group label {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prejoin-select {
+  width: 100%;
+  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-input, 12px);
+  border: 1px solid var(--settings-card-border);
+  background: var(--settings-card-bg);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.prejoin-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.prejoin-select-note {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+}
+
+/* Focus-visible rings (WCAG 2.4.7) — keyboard only; mouse clicks stay clean. */
+.prejoin-toggle:focus-visible,
+.prejoin-select:focus-visible,
+.prejoin-permission-allow:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.prejoin-toggle:focus:not(:focus-visible),
+.prejoin-select:focus:not(:focus-visible),
+.prejoin-permission-allow:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ----------------------------------------------------------------
    Join Meeting header (non-owner pre-join card)
    Distinct from .settings-card-title — this is a prominent prompt,
    not an uppercase section label.
@@ -3073,10 +3615,27 @@ select {
   background: var(--resize-handle-bg-active);
 }
 
-/* Screen share split-layout — right-panel peer video tile */
+/* Screen share split-layout — right-panel peer video tile.
+   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
+   height set by the parent right-panel, derives its width from
+   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
+   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
+   full width.
+   HCL issues #3 + #4: the parent right-panel now sizes columns to
+   `ss_tile_h * 1.5` px instead of `1fr`, so each grid cell is exactly the
+   tile's natural 3:2 footprint. With `place-self: stretch` (not the prior
+   `center`) the tile fills its cell edge-to-edge, leaving the inter-tile
+   gap exactly `8px` and packing all tiles to the left edge of the panel.
+   The dominant shared-content tile (`.split-screen-tile`) intentionally
+   does NOT get this cap — it stays as a large, dominant display. */
 .split-peer-tile {
   width: 100%;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 3 / 2;
+  place-self: stretch;
+  min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
@@ -3441,6 +4000,59 @@ select {
 .peer-toast.toast-left .toast-action {
   color: var(--text-on-glass-faint);
   font-weight: 400;
+}
+
+/* ------------------------------------------------------------------
+   Screen-share visibility toast (HCL issue 893). @token-exempt
+   Three visual variants share the same outer layout as peer-toasts
+   but use distinct icon-tint tokens to communicate state. They do
+   not auto-dismiss via animation — the state machine in `attendants.rs`
+   transitions or clears them — so we override the inherited
+   `toast-exit` animation back to the enter-only animation.
+   ------------------------------------------------------------------ */
+
+.peer-toast.screen-share-toast {
+    animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.peer-toast.toast-loading .toast-icon {
+    background: var(--toast-icon-neutral-bg);
+}
+
+.peer-toast.toast-loading .toast-icon svg {
+    color: var(--toast-action-neutral);
+    animation: screen-share-spin 1s linear infinite;
+}
+
+.peer-toast.toast-success .toast-icon {
+    background: var(--success-icon-bg);
+}
+
+.peer-toast.toast-success .toast-icon svg {
+    color: var(--success);
+}
+
+.peer-toast.toast-error .toast-icon {
+    background: var(--danger-icon-bg, var(--toast-icon-neutral-bg));
+}
+
+.peer-toast.toast-error .toast-icon svg {
+    color: var(--danger, var(--toast-action-neutral));
+}
+
+@keyframes screen-share-spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .peer-toast.toast-loading .toast-icon svg {
+        animation: none;
+    }
 }
 
 @keyframes toast-enter {
@@ -5590,24 +6202,53 @@ html[data-theme="light"]
 
 /* Signal quality popup -- inline overlay positioned within each tile */
 .signal-quality-popup {
-  position: absolute;
-  top: 44px; /* 8px top padding + 32px icon row + 4px gap */
-  right: 0;
-  width: min(420px, calc(100% - 8px));
+  /* Base visual style.  Positioning is supplied by
+     `.signal-quality-popup-portal` (the portal mode that anchors via
+     `getBoundingClientRect`) so the popup escapes the tile's
+     `overflow: hidden` border-radius clip from PR #923 and dense grids /* @token-exempt: PR ref, not a color */
+     can no longer crop it. */
+  width: min(420px, calc(100vw - 16px));
   max-height: calc(100vh - 100px);
   overflow-y: auto;
   background: var(--signal-popup-bg);
   border: 1px solid var(--signal-popup-border);
   border-radius: var(--radius-lg);
   padding: 16px;
-  z-index: 10;
   box-shadow: var(--signal-popup-shadow);
   color: var(--text-primary);
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-/* Allow the popup to overflow tile boundaries on small tiles */
+/* Portal mode — popup rendered as a sibling of `.canvas-container`,
+   positioned by JS from the source tile's getBoundingClientRect().
+   `position: fixed` so the popup escapes the tile's `overflow: hidden`
+   clip on every browser, regardless of any later refactor that adds
+   intermediate scroll containers.
+
+   z-index ladder (see global.css custom-color modal comment for the
+   full hierarchy):
+     - peer list backdrop          : 9300
+     - signal-quality popup        : 9400  ← here
+     - device-settings modal       : 9500
+     - custom-color picker modal   : 9700
+     - meeting-ended overlay       : 9999
+   We sit above the peer list but below all real modal dialogs so
+   opening any modal naturally renders above this popup. */
+.signal-quality-popup-portal {
+  position: fixed;
+  /* JS supplies `top` and `left` inline; these fallbacks position the
+     popup somewhere sane before the first reposition tick lands. */
+  top: 16px;
+  left: 16px;
+  z-index: 9400;
+}
+
+/* Legacy `.signal-popup-open` overflow-visible escape was needed when
+   the popup was an absolutely-positioned child of `.canvas-container`.
+   In portal mode it is no longer required, but we keep the rule (with
+   the same effect) so any third-party theme that still relies on it
+   keeps working. */
 .grid-item.signal-popup-open,
 .split-peer-tile.signal-popup-open {
   overflow: visible;
@@ -5676,6 +6317,64 @@ html[data-theme="light"]
 .signal-quality-popup .popup-close:hover {
   background-color: var(--field-bg-hover);
   color: var(--text-primary);
+}
+/* HCL bug #9: reanchor button visually mirrors the close button so the
+   header's right cluster reads as a uniform row of icon controls. The
+   button only renders when the popup is in `Free` mode (the user dragged
+   it). Clicking snaps the popup back to its tile anchor. */
+.signal-quality-popup .popup-reanchor {
+  background: none;
+  border: none;
+  color: var(--signal-popup-close-text);
+  cursor: pointer;
+  font-size: 14px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  padding: 0;
+}
+.signal-quality-popup .popup-reanchor:hover {
+  background-color: var(--field-bg-hover);
+  color: var(--text-primary);
+}
+/* HCL bug #9: header doubles as the drag handle, so the cursor signals
+   the affordance to the user. Inputs / buttons inside the header carry
+   `data-no-drag` and their default cursors win via CSS specificity. */
+.signal-quality-popup .popup-header[data-drag-handle="true"] {
+  cursor: grab;
+  user-select: none;
+}
+.signal-quality-popup[data-anchor-mode="dragging"] .popup-header[data-drag-handle="true"] {
+  cursor: grabbing;
+}
+.signal-quality-popup .popup-header [data-no-drag] {
+  cursor: pointer;
+}
+/* HCL follow-up 952: visual grip affordance at the leading edge of the
+   popup header so users discover the popup is draggable. The grip
+   inherits `cursor: grab` from the header rule above (it sits inside
+   `.popup-header[data-drag-handle="true"]`); the explicit `grab` /
+   `grabbing` declarations here are belt-and-braces in case a future
+   refactor splits the handle out of the header. The SVG uses
+   `currentColor` and the muted text token so the grip reads as
+   secondary chrome rather than competing with the popup title. */
+.signal-quality-popup .signal-popup-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 22px;
+  margin-right: 6px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  cursor: grab;
+}
+.signal-quality-popup[data-anchor-mode="dragging"] .signal-popup-drag-handle {
+  cursor: grabbing;
 }
 .signal-chart-wrapper {
   display: flex;
@@ -6546,4 +7245,430 @@ html[data-theme="light"] .settings-divider {
   margin-right: 4px;
   color: currentColor;
   flex-shrink: 0;
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   Unified Performance settings panel — SEND quality bounds (#961) AND
+   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
+   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
+   VU needles, Auto toggle + "?" help. All colors are design tokens
+   (see global.css) — no literals.
+   ────────────────────────────────────────────────────────────────── */
+
+/* Segmented Receive | Send direction toggle (top of the panel). Only the
+   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
+   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
+.perf-direction-toggle {
+  display: flex;
+  gap: 2px;
+  margin: 14px 0 16px;
+  padding: 3px;
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+}
+
+.perf-direction-segment {
+  flex: 1 1 0;
+  min-height: 34px;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-direction-segment:hover {
+  color: var(--text-primary);
+  background: var(--field-bg-hover);
+}
+
+.perf-direction-segment:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Active segment: filled with the accent surface. aria-checked also conveys
+   selection to AT, so color is not the sole signal. */
+.perf-direction-segment.is-active {
+  color: var(--accent);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Inline "your download" / "your upload" consequence beside each row title, so
+   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+.perf-stream-consequence {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* Receive / Send emphasis in the intro paragraph — bold + direction accent
+   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
+.perf-emph-recv,
+.perf-emph-send {
+  font-weight: 700;
+}
+
+.perf-emph-recv {
+  color: var(--accent);
+}
+
+.perf-emph-send {
+  color: var(--success);
+}
+
+.perf-stream-group {
+  margin: 18px 0;
+  padding: 14px 16px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+/* Subtle left accent to distinguish the two directions at a glance (color is
+   not the sole cue — each row is labelled "Receive" / "Send"). */
+.perf-recv-row {
+  border-left: 3px solid var(--accent);
+}
+
+.perf-send-row {
+  border-left: 3px solid var(--success-border-vivid);
+}
+
+.perf-stream-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.perf-stream-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* "?" help button + its popover, anchored next to the section title. */
+.perf-help {
+  position: relative;
+  display: inline-flex;
+}
+
+.perf-help-button {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-help-button:hover {
+  background: var(--field-bg-hover);
+  color: var(--text-primary);
+}
+
+.perf-help-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Transparent outside-click catcher behind the popover. */
+.perf-help-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: transparent;
+}
+
+.perf-help-popover {
+  position: absolute;
+  z-index: 1001;
+  top: calc(100% + 8px);
+  left: 0;
+  width: 260px;
+  max-width: 80vw;
+  padding: 12px 14px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.perf-help-popover-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.perf-fixed-badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+}
+
+/* "Auto" toggle, pinned to the right of the stream header. */
+.perf-auto-button {
+  margin-left: auto;
+  min-height: 32px;
+  padding: 4px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-auto-button:hover {
+  background: var(--field-bg-hover);
+}
+
+.perf-auto-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Auto ACTIVE (toggle pressed): green/active. The aria-pressed state + label
+   convey this to AT, so color is not the sole signal. */
+.perf-auto-button.is-active {
+  color: var(--success);
+  background: var(--success-bg-soft);
+  border-color: var(--success-border-vivid);
+}
+
+.perf-auto-button.is-active:hover {
+  background: var(--success-bg-soft-hover);
+}
+
+/* Per-section body: the VU needle gauge beside the slider + range text. */
+.perf-stream-body {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.perf-stream-controls {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── Dual-thumb range slider ── */
+
+.perf-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.perf-range-end-label {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: center;
+}
+
+/* The two range inputs are absolutely stacked over a shared track. */
+.perf-range-track-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  height: 44px; /* >=44px touch target for the thumbs */
+}
+
+.perf-range-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 6px;
+  transform: translateY(-50%);
+  background: var(--border);
+  border-radius: var(--radius-pill);
+}
+
+.perf-range-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+  transition: left 0.3s ease, right 0.3s ease;
+}
+
+.perf-range-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  /* Let pointer events fall through the track area to whichever thumb is under
+     the cursor; thumbs re-enable pointer events below. */
+  pointer-events: none;
+}
+
+.perf-range-input:focus-visible {
+  outline: none;
+}
+
+/* N3 fix: when both thumbs collapse to one position (Fixed state), the max
+   input (later in the DOM) would otherwise sit on top and swallow pointer
+   drags meant for the min thumb. Raise the min input above the max input so its
+   thumb stays grabbable by mouse; the max thumb remains reachable (it is to the
+   right of, or coincident with, the min thumb). A focused input always wins so
+   keyboard control is unaffected. */
+.perf-range-input-min {
+  z-index: 2;
+}
+
+.perf-range-input-max {
+  z-index: 1;
+}
+
+.perf-range-input:focus-visible {
+  z-index: 3;
+}
+
+/* WebKit thumb */
+.perf-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Firefox thumb */
+.perf-range-input::-moz-range-thumb {
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-moz-range-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.perf-range-value {
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-range-fill {
+    transition: none;
+  }
+}
+
+/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
+
+.perf-vu-gauge {
+  flex: 0 0 auto;
+  width: 150px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 10px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.perf-vu-svg {
+  width: 120px;
+  height: 78px;
+}
+
+.perf-vu-arc {
+  stroke: var(--border-emphasis);
+}
+
+.perf-vu-tick {
+  stroke: var(--text-quaternary);
+}
+
+.perf-vu-needle {
+  stroke: var(--accent);
+  /* Pivot at the hub so rotation looks like an analog needle. */
+  transform-origin: 60px 64px;
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.perf-vu-hub {
+  fill: var(--accent);
+}
+
+.perf-vu-label {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-vu-readout {
+  margin-top: 2px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-vu-needle {
+    transition: none;
+  }
+}
+
+/* On narrow widths stack the needle above the slider instead of beside it. */
+@media (max-width: 540px) {
+  .perf-stream-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .perf-vu-gauge {
+    width: 100%;
+  }
 }

@@ -97,7 +97,7 @@ test.describe("Two users in a meeting", () => {
     await waitForServices();
   });
 
-  test("host starts meeting, guest joins, both see each other", async ({ baseURL }) => {
+  test("host starts meeting, guest joins, both see each other @bvt1", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_two_user_${Date.now()}`;
 
@@ -195,9 +195,6 @@ test.describe("Two users in a meeting", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
       await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
 
-      // Give time for WebSocket/WebTransport peer discovery
-      await hostPage.waitForTimeout(5000);
-
       // Once a peer connects, the invite overlay ("Your meeting is ready!") disappears.
       // Verify each side sees at least one remote peer's canvas-container.
       const hostPeer = hostPage.locator("#grid-container .canvas-container");
@@ -293,9 +290,6 @@ test.describe("Two users in a meeting", () => {
         await expect(toast.locator(".toast-name")).toContainText("HostUser");
         await expect(toast.locator(".toast-action")).toContainText("joined the meeting");
       }
-
-      // Pause so you can watch both browsers
-      await hostPage.waitForTimeout(5000);
     } finally {
       await browser1.close();
       await browser2.close();

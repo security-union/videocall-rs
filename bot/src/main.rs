@@ -30,12 +30,14 @@ use bot::ekg_renderer::{self, EkgRenderer};
 use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use bot::inbound_stats::InboundStats;
 use bot::keyframe_requester::KeyframeRequester;
+use bot::layer_preference_sender::LayerPreferenceSender;
 #[cfg(feature = "metrics")]
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
 use bot::rtt_probe::spawn_rtt_probe;
 use bot::transport::{self, OutboundFrame, TransportClient};
 use bot::video_producer::VideoProducer;
+use bot::viewport_sender::ViewportSender;
 use bot::websocket_client::spawn_heartbeat_producer;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -675,6 +677,55 @@ async fn run_client(
         }
         counter
     };
+
+    // --- Viewport sender (HCL issue #988) ---
+    // Mimic a real browser that only renders its on-screen tiles: emit a
+    // VIEWPORT control packet listing the first N discovered peers (sorted for
+    // reproducibility). A #988-enabled relay then stops forwarding VIDEO from
+    // off-screen peers, so the load test measures realistic relay fan-out.
+    // `None` keeps legacy behaviour (no VIEWPORT — relay forwards everything).
+    {
+        let vs = ViewportSender::new(
+            user_id.clone(),
+            bot_config.viewport_visible_count,
+            packet_tx.clone(),
+        );
+        if vs.is_enabled() {
+            info!(
+                "[{}] VIEWPORT fidelity enabled: rendering up to {:?} peer(s)",
+                user_id, bot_config.viewport_visible_count
+            );
+        }
+        let mut s = stats.lock().unwrap();
+        s.set_viewport_sender(vs);
+    }
+
+    // --- Layer-preference sender (HCL follow-up #1083-A2) ---
+    // Per-receiver simulcast: a browser receiver tells the relay which simulcast
+    // layer it wants per source via a LAYER_PREFERENCE control packet. The bot
+    // has no receiver chooser, so this "pin to layer N" mode is the only way it
+    // expresses a preference: when `pin_layer` is set it emits a LAYER_PREFERENCE
+    // pinning every discovered source to that fixed layer (0 = base only). This
+    // validates the relay's per-receiver layer filter from the bot side. `None`
+    // keeps legacy behaviour (no LAYER_PREFERENCE — relay forwards every layer).
+    {
+        let lps = LayerPreferenceSender::new(
+            user_id.clone(),
+            bot_config.pin_layer,
+            bot_config.pin_media_kind(),
+            packet_tx.clone(),
+        );
+        if lps.is_enabled() {
+            info!(
+                "[{}] LAYER_PREFERENCE pin enabled: pinning every source to layer {:?} ({:?})",
+                user_id,
+                bot_config.pin_layer,
+                bot_config.pin_media_kind()
+            );
+        }
+        let mut s = stats.lock().unwrap();
+        s.set_layer_preference_sender(lps);
+    }
 
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
     // observe this bot's received FPS and adjust their encoding tiers.

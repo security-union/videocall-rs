@@ -72,13 +72,25 @@ pub fn load_dock_position() -> DockPosition {
         .unwrap_or(DockPosition::Bottom)
 }
 
-/// Load dock autohide from localStorage. Defaults to true.
+/// Resolve a raw localStorage value (e.g. `Some("true")`, `Some("false")`, or
+/// `None` when no preference has been persisted) into the initial autohide
+/// signal value. When no preference is stored, default to `false` (always
+/// visible) so first-time users see the action bar without learning the
+/// dock menu first.
+pub fn resolve_dock_autohide(stored: Option<&str>) -> bool {
+    match stored {
+        Some(v) => v != "false",
+        None => false,
+    }
+}
+
+/// Load dock autohide from localStorage. Defaults to `false` (no hiding)
+/// when no preference has been persisted yet.
 pub fn load_dock_autohide() -> bool {
-    web_sys::window()
+    let stored = web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten())
-        .map(|v| v != "false")
-        .unwrap_or(true)
+        .and_then(|s| s.get_item(DOCK_AUTOHIDE_KEY).ok().flatten());
+    resolve_dock_autohide(stored.as_deref())
 }
 
 /// Persist dock position to localStorage.
@@ -136,6 +148,83 @@ pub fn save_density_mode(mode: DensityMode) {
             DensityMode::Maximum => "maximum",
         };
         let _ = storage.set_item(DENSITY_MODE_KEY, val);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode-budget override persistence
+// ---------------------------------------------------------------------------
+
+/// Manual override for the adaptive decode-budget controller.
+///
+/// `Auto` (the default) lets the adaptive control loop in `attendants.rs`
+/// decide how many tiles to decode. `Fixed(n)` is a **hard override**: it
+/// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
+/// type is purely the persisted/shared state — the bypass behavior lives in
+/// the control loop (task 1a.3), not here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DecodeBudgetOverride {
+    #[default]
+    Auto,
+    Fixed(usize),
+}
+
+/// Context for the decode-budget override.
+#[derive(Clone, Copy)]
+pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
+
+/// Parse a persisted decode-budget override string. Mirrors the density-mode
+/// manual-match style: `"auto"` (or any unparseable value) yields the default
+/// `Auto`; a positive integer string yields `Fixed(n)`. A stored `Fixed(0)`
+/// (or any value that fails to parse as a non-zero `usize`) collapses to
+/// `Auto`, since a zero-tile hard override is meaningless.
+fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
+    match raw {
+        "auto" => DecodeBudgetOverride::Auto,
+        other => match other.parse::<usize>() {
+            Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
+            _ => DecodeBudgetOverride::Auto,
+        },
+    }
+}
+
+/// Serialize a decode-budget override to its compact storage string: `"auto"`
+/// for `Auto`, or the bare integer for `Fixed(n)`.
+fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
+    match value {
+        DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::Fixed(n) => n.to_string(),
+    }
+}
+
+/// Load the decode-budget override from localStorage. Defaults to `Auto`.
+pub fn load_decode_budget_override() -> DecodeBudgetOverride {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(DECODE_BUDGET_OVERRIDE_KEY).ok().flatten())
+        .map(|v| parse_decode_budget_override(&v))
+        .unwrap_or_default()
+}
+
+/// Persist the decode-budget override to localStorage.
+pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
+    // User override engaging: log the user's explicit choice (Fixed cap vs Auto
+    // resume) so support can distinguish a user-chosen cap from an auto-shed.
+    match value {
+        DecodeBudgetOverride::Fixed(n) => {
+            log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::Auto => {
+            log::info!("DecodeBudget: override=auto source=user_setting")
+        }
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(
+            DECODE_BUDGET_OVERRIDE_KEY,
+            &serialize_decode_budget_override(value),
+        );
     }
 }
 
@@ -261,6 +350,8 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+    pub show_join_leave_notifications: bool,
+    pub play_join_leave_sounds: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -270,6 +361,8 @@ impl Default for AppearanceSettings {
             glow_color: GlowColor::MintGreen,
             glow_brightness: 1.0,
             inner_glow_strength: 1.0,
+            show_join_leave_notifications: true,
+            play_join_leave_sounds: true,
         }
     }
 }
@@ -282,6 +375,8 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY: &str = "vc_appearance_join_leave_notifications";
+const APPEARANCE_JOIN_LEAVE_SOUNDS_KEY: &str = "vc_appearance_join_leave_sounds";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -312,6 +407,17 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
+    if let Some(value) =
+        LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string())
+    {
+        settings.show_join_leave_notifications = value != "false";
+    }
+
+    if let Some(value) = LocalStorage::get::<String>(&APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string())
+    {
+        settings.play_join_leave_sounds = value != "false";
+    }
+
     settings
 }
 
@@ -332,6 +438,14 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     LocalStorage::set(
         APPEARANCE_INNER_STORAGE_KEY.to_string(),
         &settings.inner_glow_strength.clamp(0.0, 1.0),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY.to_string(),
+        &settings.show_join_leave_notifications.to_string(),
+    );
+    LocalStorage::set(
+        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY.to_string(),
+        &settings.play_join_leave_sounds.to_string(),
     );
 }
 
@@ -414,6 +528,22 @@ pub type PeerSignalHistoryMap = Signal<
     >,
 >;
 
+/// HCL bug #8 / #9: per-(peer, mode) signal-quality popup state, lifted out
+/// of `PeerTile`'s per-component lifecycle so a peer leaving the meeting (or
+/// a layout switch between grid / split / full-bleed) does not unmount every
+/// open popup. Only the popup whose anchored peer left is dropped; all other
+/// open popups survive untouched.
+///
+/// Bug #9 also stores the user's drag-and-drop position here so that
+/// switching layouts (grid → split when a peer starts screen sharing, etc.)
+/// keeps the popup pinned to wherever the user dragged it.
+pub type SignalPopupStateMap = Signal<
+    std::collections::HashMap<
+        (String, crate::components::signal_quality::SignalMeterMode),
+        crate::components::signal_quality::SignalPopupState,
+    >,
+>;
+
 /// Holds meeting host information shared via context.
 #[derive(Clone, PartialEq, Default)]
 #[allow(dead_code)]
@@ -456,6 +586,162 @@ pub fn save_display_name_to_storage(display_name: &str) {
 /// Remove the display name from local storage entirely (e.g. on logout).
 pub fn clear_display_name_from_storage() {
     LocalStorage::set(STORAGE_KEY.to_string(), &None::<String>);
+}
+
+// ---------------------------------------------------------------------------
+// Pre-join device preference persistence (issue #959)
+// ---------------------------------------------------------------------------
+//
+// The pre-join device-preview screen lets the user pick which camera, mic, and
+// speaker to use and whether to start with the camera/mic on, BEFORE joining.
+// We persist those choices in `localStorage` (mirroring the display-name /
+// transport-preference pattern above) and restore them on the next visit. The
+// in-meeting `Host` reads the stored device IDs on first device enumeration so
+// the pre-join selection is the one actually used when capture starts.
+
+const DEVICE_PREF_CAMERA_KEY: &str = "vc_prejoin_camera_id";
+const DEVICE_PREF_MIC_KEY: &str = "vc_prejoin_mic_id";
+const DEVICE_PREF_SPEAKER_KEY: &str = "vc_prejoin_speaker_id";
+const DEVICE_PREF_CAMERA_ON_KEY: &str = "vc_prejoin_camera_on";
+const DEVICE_PREF_MIC_ON_KEY: &str = "vc_prejoin_mic_on";
+
+fn read_local_storage(key: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .filter(|v| !v.is_empty())
+}
+
+fn write_local_storage(key: &str, value: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, value);
+    }
+}
+
+/// Resolve which device ID to actually use given the user's stored preference
+/// and the list of currently-available device IDs.
+///
+/// Resolution rules (pure; no DOM access so it is host-testable):
+///
+/// 1. If a `stored` ID is present AND still exists in `available`, use it.
+/// 2. Otherwise fall back to the first available device ID (the same
+///    "default = device 0" semantics `SelectableDevices::selected()` uses).
+/// 3. If `available` is empty, return `None`.
+///
+/// This makes us resilient to a persisted device that was unplugged between
+/// visits — we never select a phantom device, we just fall back to the default.
+pub fn restore_device_id(stored: Option<&str>, available: &[String]) -> Option<String> {
+    if let Some(id) = stored {
+        if !id.is_empty() && available.iter().any(|a| a == id) {
+            return Some(id.to_string());
+        }
+    }
+    available.first().cloned()
+}
+
+/// Resolve the initial on/off state to apply for a track when joining.
+///
+/// Pure decision function (host-testable). The user's stored preference only
+/// takes effect when the corresponding permission was granted AND a device of
+/// that kind actually exists. If permission was denied or no device is present,
+/// the track must start OFF regardless of the stored preference — we never try
+/// to enable capture we cannot perform.
+pub fn resolve_initial_enabled(
+    stored_on: bool,
+    permission_granted: bool,
+    has_device: bool,
+) -> bool {
+    stored_on && permission_granted && has_device
+}
+
+/// Feature-detect `HTMLMediaElement.prototype.setSinkId` support, given a
+/// capability flag. Pulled out as a pure function so the decision logic is
+/// host-testable; the actual JS feature probe lives in
+/// [`html_media_set_sink_id_supported`].
+///
+/// Chromium-based browsers expose `setSinkId`, allowing programmatic audio
+/// output (speaker) selection. Firefox and Safari do not, so the speaker
+/// dropdown must be rendered read-only there with an explanatory note.
+///
+/// The only non-test caller is the wasm-gated [`html_media_set_sink_id_supported`],
+/// so on the native build (which `cargo clippy --all` compiles) this has no
+/// caller outside `#[cfg(test)]`. Suppress dead_code only there — on wasm it is
+/// genuinely used, and the host test still exercises it under `cargo test`.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub fn speaker_selection_supported(set_sink_id_present: bool) -> bool {
+    set_sink_id_present
+}
+
+/// Probe the live browser for `HTMLMediaElement.prototype.setSinkId` support.
+///
+/// Returns `false` on non-web targets or when the prototype is unreachable.
+#[cfg(target_family = "wasm")]
+pub fn html_media_set_sink_id_supported() -> bool {
+    use wasm_bindgen::JsValue;
+    let present = web_sys::window()
+        .and_then(|w| js_sys::Reflect::get(&w, &JsValue::from_str("HTMLMediaElement")).ok())
+        .and_then(|ctor| js_sys::Reflect::get(&ctor, &JsValue::from_str("prototype")).ok())
+        .map(|proto| js_sys::Reflect::has(&proto, &JsValue::from_str("setSinkId")).unwrap_or(false))
+        .unwrap_or(false);
+    speaker_selection_supported(present)
+}
+
+/// Non-web fallback: no media element, so speaker selection is unsupported.
+#[cfg(not(target_family = "wasm"))]
+pub fn html_media_set_sink_id_supported() -> bool {
+    false
+}
+
+/// Load the persisted camera/mic/speaker device IDs. Any unset key yields
+/// `None`. The caller is responsible for validating these against the live
+/// device list via [`restore_device_id`].
+pub fn load_preferred_device_ids() -> (Option<String>, Option<String>, Option<String>) {
+    (
+        read_local_storage(DEVICE_PREF_CAMERA_KEY),
+        read_local_storage(DEVICE_PREF_MIC_KEY),
+        read_local_storage(DEVICE_PREF_SPEAKER_KEY),
+    )
+}
+
+/// Persist the selected camera device ID.
+pub fn save_preferred_camera_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_CAMERA_KEY, device_id);
+}
+
+/// Persist the selected microphone device ID.
+pub fn save_preferred_mic_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_MIC_KEY, device_id);
+}
+
+/// Persist the selected speaker (audio-output) device ID.
+pub fn save_preferred_speaker_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_SPEAKER_KEY, device_id);
+}
+
+/// Load the persisted camera on/off preference. Defaults to `false`
+/// (camera off) when no preference has been stored — matching the current
+/// pre-join default where camera starts off.
+pub fn load_preferred_camera_on() -> bool {
+    read_local_storage(DEVICE_PREF_CAMERA_ON_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Load the persisted mic on/off preference. Defaults to `false` (mic off).
+pub fn load_preferred_mic_on() -> bool {
+    read_local_storage(DEVICE_PREF_MIC_ON_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Persist the camera on/off preference.
+pub fn save_preferred_camera_on(on: bool) {
+    write_local_storage(DEVICE_PREF_CAMERA_ON_KEY, if on { "true" } else { "false" });
+}
+
+/// Persist the mic on/off preference.
+pub fn save_preferred_mic_on(on: bool) {
+    write_local_storage(DEVICE_PREF_MIC_ON_KEY, if on { "true" } else { "false" });
 }
 
 // ---------------------------------------------------------------------------
@@ -567,23 +853,39 @@ pub fn migrate_legacy_storage() {
 ///
 /// Stored in `localStorage` under `vc_transport_preference` and read at
 /// connection time to override the server-provided WebTransport flag.
+///
+/// **Semantics:**
+///
+/// - `WebTransport` (default): attempt WebTransport first; if WebTransport is
+///   unavailable, blocked by a firewall, or fails its handshake, automatically
+///   fall back to WebSocket. This is what the legacy `Auto` variant did and is
+///   the recommended setting for nearly all users.
+/// - `WebSocket`: use WebSocket only — no WebTransport attempt is made.
+///
+/// **Migration**: a persisted value of `"auto"` (the legacy default) is
+/// transparently coerced to `WebTransport` by [`FromStr`]. The first time
+/// [`load_transport_preference`] sees such a value it logs the migration so
+/// operators can verify the upgrade path. The migration is one-shot — on the
+/// next storage write the value is canonical.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TransportPreference {
-    /// Honour the server-side `webTransportEnabled` flag (default behaviour).
+    /// Attempt WebTransport with automatic WebSocket fallback.
+    ///
+    /// Both URL lists are advertised to the connection manager, which runs
+    /// an election preferring WebTransport candidates. When WebTransport is
+    /// unavailable (browser support, UDP blocked, server returns non-2xx,
+    /// handshake timeout) the manager falls back to the WebSocket candidates.
     #[default]
-    Auto,
-    /// Force WebTransport — WebSocket URLs are cleared.
-    WebTransportOnly,
-    /// Force WebSocket — WebTransport is disabled.
-    WebSocketOnly,
+    WebTransport,
+    /// Use WebSocket exclusively — no WebTransport attempt.
+    WebSocket,
 }
 
 impl std::fmt::Display for TransportPreference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            TransportPreference::Auto => "auto",
-            TransportPreference::WebTransportOnly => "webtransport",
-            TransportPreference::WebSocketOnly => "websocket",
+            TransportPreference::WebTransport => "webtransport",
+            TransportPreference::WebSocket => "websocket",
         };
         f.write_str(s)
     }
@@ -594,9 +896,11 @@ impl std::str::FromStr for TransportPreference {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Ok(TransportPreference::Auto),
-            "webtransport" => Ok(TransportPreference::WebTransportOnly),
-            "websocket" => Ok(TransportPreference::WebSocketOnly),
+            // Legacy "auto" value — migrate to WebTransport. The new
+            // WebTransport variant carries the WT-with-WS-fallback semantics
+            // that "auto" used to mean.
+            "auto" | "webtransport" => Ok(TransportPreference::WebTransport),
+            "websocket" => Ok(TransportPreference::WebSocket),
             _ => Err(()),
         }
     }
@@ -623,7 +927,14 @@ const TRANSPORT_SESSION_KEY: &str = "vc_transport_session";
 ///    session value is set when the user changes the protocol without ticking
 ///    "remember", so the change survives the page reload triggered by the
 ///    select but is forgotten on tab close.
-/// 3. Otherwise: `Auto`.
+/// 3. Otherwise: `WebTransport` (the new default — was `Auto` before the
+///    protocol-settings simplification).
+///
+/// **Legacy "auto" migration**: when this function reads `"auto"` from
+/// storage (the previous default value), it logs the migration once and
+/// canonicalises the stored value to `"webtransport"`. The new
+/// `WebTransport` variant carries the WT-with-WS-fallback semantics that
+/// `Auto` used to mean, so user behaviour is unchanged.
 pub fn load_transport_preference() -> TransportPreference {
     let local_storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
     let session_storage = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
@@ -635,11 +946,24 @@ pub fn load_transport_preference() -> TransportPreference {
         .unwrap_or(false);
 
     if sticky {
-        return local_storage
-            .as_ref()
-            .and_then(|s| s.get_item(TRANSPORT_PREF_KEY).ok().flatten())
-            .and_then(|val| val.parse::<TransportPreference>().ok())
-            .unwrap_or_default();
+        if let Some(storage) = local_storage.as_ref() {
+            if let Ok(Some(raw)) = storage.get_item(TRANSPORT_PREF_KEY) {
+                let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+                // Canonicalise the persisted value if it came in as legacy
+                // "auto" — the variant is gone, but the stored string would
+                // linger otherwise.
+                if raw == "auto" {
+                    log::info!(
+                        "Migrating persisted transport preference \"auto\" -> \"{}\" \
+                         (Auto removed in favour of WebTransport-with-WS-fallback)",
+                        parsed
+                    );
+                    let _ = storage.set_item(TRANSPORT_PREF_KEY, &parsed.to_string());
+                }
+                return parsed;
+            }
+        }
+        return TransportPreference::default();
     }
 
     // Backward-compat: silently drop a stale persistent preference left over
@@ -649,10 +973,21 @@ pub fn load_transport_preference() -> TransportPreference {
         let _ = storage.remove_item(TRANSPORT_PREF_KEY);
     }
 
-    session_storage
-        .and_then(|s| s.get_item(TRANSPORT_SESSION_KEY).ok().flatten())
-        .and_then(|val| val.parse::<TransportPreference>().ok())
-        .unwrap_or_default()
+    if let Some(storage) = session_storage.as_ref() {
+        if let Ok(Some(raw)) = storage.get_item(TRANSPORT_SESSION_KEY) {
+            let parsed = raw.parse::<TransportPreference>().ok().unwrap_or_default();
+            if raw == "auto" {
+                log::info!(
+                    "Migrating session transport preference \"auto\" -> \"{}\" \
+                     (Auto removed in favour of WebTransport-with-WS-fallback)",
+                    parsed
+                );
+                let _ = storage.set_item(TRANSPORT_SESSION_KEY, &parsed.to_string());
+            }
+            return parsed;
+        }
+    }
+    TransportPreference::default()
 }
 
 /// Persist the transport preference to `localStorage` (the sticky path).
@@ -691,9 +1026,9 @@ pub fn save_transport_sticky(sticky: bool) {
 
 /// Reset all transport-preference storage entries — both the persistent
 /// (`localStorage`) keys and the per-session (`sessionStorage`) value — so
-/// the next page load resolves to `Auto`.
+/// the next page load resolves to the default (`WebTransport`).
 ///
-/// This is the single source of truth for "go back to Auto" so callers
+/// This is the single source of truth for "go back to default" so callers
 /// don't have to know about the three keys involved.
 pub fn clear_transport_sticky_and_pref() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
@@ -709,6 +1044,19 @@ pub fn clear_transport_sticky_and_pref() {
 /// the server-provided WebTransport flag.
 ///
 /// Returns `(enable_webtransport, websocket_urls, webtransport_urls)`.
+///
+/// **WebTransport-with-WS-fallback**: when the user has selected
+/// `WebTransport` (the default), BOTH URL lists are returned. The
+/// connection manager creates candidates for every URL and runs an election
+/// — if any WebTransport candidate completes its handshake it wins, but if
+/// every WT candidate fails (browser support missing, UDP blocked, server
+/// rejected the handshake) the WS candidates become the only ones that can
+/// be elected and the client automatically uses WebSocket. The fallback is
+/// thus structural, not a separate retry: see
+/// `videocall-client/src/connection/connection_manager.rs::create_all_connections`.
+///
+/// `WebSocket` forces a single-transport configuration with the WT list
+/// emptied — there is no fallback in that mode by design.
 pub fn resolve_transport_config(
     pref: TransportPreference,
     server_wt_enabled: bool,
@@ -716,9 +1064,13 @@ pub fn resolve_transport_config(
     wt_urls: Vec<String>,
 ) -> (bool, Vec<String>, Vec<String>) {
     match pref {
-        TransportPreference::Auto => (server_wt_enabled, ws_urls, wt_urls),
-        TransportPreference::WebTransportOnly => (true, vec![], wt_urls),
-        TransportPreference::WebSocketOnly => (false, ws_urls, vec![]),
+        // WebTransport selection ≡ legacy Auto: surface BOTH URL lists so
+        // the manager's election can fall back to WebSocket if every WT
+        // candidate fails. The `server_wt_enabled` flag still gates whether
+        // the manager will attempt the WT URLs at all (e.g. when runtime
+        // config hasn't loaded yet) — this is unchanged from Auto behaviour.
+        TransportPreference::WebTransport => (server_wt_enabled, ws_urls, wt_urls),
+        TransportPreference::WebSocket => (false, ws_urls, vec![]),
     }
 }
 
@@ -731,12 +1083,14 @@ pub fn resolve_transport_config(
 ///
 /// Routing rules:
 ///
-/// - `Auto` selected: clear every transport-preference storage key. Auto is
-///   the implicit default and never needs to be remembered.
-/// - Non-Auto, `sticky == true`: write to `localStorage` so the choice
-///   persists across browser sessions.
-/// - Non-Auto, `sticky == false`: write to `sessionStorage` so the choice
-///   survives the imminent page reload but evaporates when the tab closes.
+/// - The default (`WebTransport`) selected with `sticky == false`: clear every
+///   transport-preference storage key so the next load resolves to the default
+///   without needing a remembered choice.
+/// - Selecting any value with `sticky == true`: write to `localStorage` so the
+///   choice persists across browser sessions.
+/// - Non-default selection with `sticky == false`: write to `sessionStorage`
+///   so the choice survives the imminent page reload but evaporates when the
+///   tab closes.
 ///
 /// Custom controls (like the settings modal glass dropdown) are state-driven
 /// and naturally re-render with the current value when the user cancels.
@@ -762,13 +1116,16 @@ pub fn confirm_transport_change(
         })
         .unwrap_or(false);
     if confirmed {
-        match pref {
-            TransportPreference::Auto => clear_transport_sticky_and_pref(),
-            _ if sticky => {
+        let is_default = pref == TransportPreference::default();
+        match (is_default, sticky) {
+            // Default + not sticky: clear all storage — implicit default
+            // doesn't need to be remembered.
+            (true, false) => clear_transport_sticky_and_pref(),
+            (_, true) => {
                 save_transport_preference(pref);
                 save_transport_sticky(true);
             }
-            _ => save_transport_preference_session(pref),
+            (false, false) => save_transport_preference_session(pref),
         }
         if let Some(w) = web_sys::window() {
             let _ = w.location().reload();
@@ -987,5 +1344,192 @@ mod tests {
         // Compile-time check that DensityModeCtx implements Clone.
         fn _assert_clone<T: Clone>() {}
         _assert_clone::<DensityModeCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_default_is_auto() {
+        assert_eq!(DecodeBudgetOverride::default(), DecodeBudgetOverride::Auto);
+    }
+
+    #[test]
+    fn decode_budget_override_debug_impl() {
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Auto), "Auto");
+        assert_eq!(format!("{:?}", DecodeBudgetOverride::Fixed(4)), "Fixed(4)");
+    }
+
+    #[test]
+    fn decode_budget_override_clone_and_eq() {
+        let original = DecodeBudgetOverride::Fixed(8);
+        let cloned = original;
+        assert_eq!(original, cloned);
+
+        assert_ne!(DecodeBudgetOverride::Auto, DecodeBudgetOverride::Fixed(1));
+        assert_ne!(
+            DecodeBudgetOverride::Fixed(2),
+            DecodeBudgetOverride::Fixed(3)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_ctx_clone() {
+        // Compile-time check that DecodeBudgetCtx implements Clone.
+        fn _assert_clone<T: Clone>() {}
+        _assert_clone::<DecodeBudgetCtx>();
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_auto() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Auto);
+        assert_eq!(serialized, "auto");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Auto
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_fixed() {
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::Fixed(12));
+        assert_eq!(serialized, "12");
+        assert_eq!(
+            parse_decode_budget_override(&serialized),
+            DecodeBudgetOverride::Fixed(12)
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_parse_invalid_falls_back_to_auto() {
+        // Garbage, empty, negative, and zero all collapse to the default Auto,
+        // mirroring the density-mode "_ => Auto" fallback semantics.
+        assert_eq!(
+            parse_decode_budget_override("garbage"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(parse_decode_budget_override(""), DecodeBudgetOverride::Auto);
+        assert_eq!(
+            parse_decode_budget_override("-5"),
+            DecodeBudgetOverride::Auto
+        );
+        assert_eq!(
+            parse_decode_budget_override("0"),
+            DecodeBudgetOverride::Auto
+        );
+    }
+
+    #[test]
+    fn resolve_dock_autohide_defaults_to_false_when_unset() {
+        // First-time users with no persisted preference should see the
+        // action bar always visible — autohide must default to false.
+        assert!(!resolve_dock_autohide(None));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_true() {
+        // Regression guard: a user who has explicitly enabled autohide must
+        // keep that preference after the default-off fix.
+        assert!(resolve_dock_autohide(Some("true")));
+    }
+
+    #[test]
+    fn resolve_dock_autohide_honors_stored_false() {
+        // Explicitly disabled autohide stays disabled.
+        assert!(!resolve_dock_autohide(Some("false")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-join device preference helpers (issue #959)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_device_id_uses_stored_when_present() {
+        let available = vec!["cam-a".to_string(), "cam-b".to_string()];
+        assert_eq!(
+            restore_device_id(Some("cam-b"), &available),
+            Some("cam-b".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_falls_back_when_stored_missing() {
+        // Stored device was unplugged between visits → fall back to first.
+        let available = vec!["cam-a".to_string(), "cam-b".to_string()];
+        assert_eq!(
+            restore_device_id(Some("cam-gone"), &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_falls_back_when_none_stored() {
+        let available = vec!["cam-a".to_string()];
+        assert_eq!(
+            restore_device_id(None, &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_stored_wins_over_default_first_entry() {
+        // Regression for the e2e restore-after-reload bug: Chrome's fake device
+        // set lists a pseudo "default" mic FIRST. A persisted non-default
+        // selection must win over that first "default" entry — restore must not
+        // collapse to the auto-selected first device.
+        let available = vec![
+            "default".to_string(),
+            "communications".to_string(),
+            "real-mic-id".to_string(),
+        ];
+        assert_eq!(
+            restore_device_id(Some("communications"), &available),
+            Some("communications".to_string())
+        );
+        assert_eq!(
+            restore_device_id(Some("real-mic-id"), &available),
+            Some("real-mic-id".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_empty_stored_falls_back() {
+        let available = vec!["cam-a".to_string()];
+        assert_eq!(
+            restore_device_id(Some(""), &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_no_devices_returns_none() {
+        let available: Vec<String> = vec![];
+        assert_eq!(restore_device_id(Some("cam-a"), &available), None);
+        assert_eq!(restore_device_id(None, &available), None);
+    }
+
+    #[test]
+    fn resolve_initial_enabled_requires_all_conditions() {
+        // The happy path: stored on + permission + device present → on.
+        assert!(resolve_initial_enabled(true, true, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_stored_off() {
+        assert!(!resolve_initial_enabled(false, true, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_permission_denied() {
+        // Never enable capture we are not allowed to perform.
+        assert!(!resolve_initial_enabled(true, false, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_no_device() {
+        assert!(!resolve_initial_enabled(true, true, false));
+    }
+
+    #[test]
+    fn speaker_selection_supported_tracks_capability_flag() {
+        assert!(speaker_selection_supported(true));
+        assert!(!speaker_selection_supported(false));
     }
 }

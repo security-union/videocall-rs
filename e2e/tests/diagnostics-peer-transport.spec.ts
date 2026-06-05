@@ -191,11 +191,6 @@ test.describe("Diagnostics popup — per-peer transport badge", () => {
         }
       }
 
-      // Wait for the three-way mesh to settle — peer discovery + at least
-      // one HeartbeatMetadata cycle so `peer_transport` flows through to the
-      // diagnostics subscriber.
-      await members[0].page.waitForTimeout(15000);
-
       // Each user should see two remote peer tiles in the grid.
       for (const m of members) {
         await expect(m.page.locator("#grid-container .canvas-container")).toHaveCount(2, {

@@ -321,6 +321,7 @@ pub struct FeedMeetingRow {
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub creator_id: Option<String>,
+    pub host_display_name: Option<String>,
     pub password_hash: Option<String>,
     pub allow_guests: bool,
     pub waiting_room_enabled: bool,
@@ -328,6 +329,13 @@ pub struct FeedMeetingRow {
     pub admitted_can_admit: bool,
     pub last_active_at: DateTime<Utc>,
     pub ever_admitted: bool,
+    /// The requesting user's most recent admission to this meeting: the raw
+    /// `p.last_admit` = `MAX(admitted_at)` over their own
+    /// `meeting_participants` rows, WITHOUT the `last_active_at` COALESCE
+    /// fallbacks. Strictly user-scoped (`user_id = $1`). `NULL` when the user
+    /// has never been admitted (e.g. they own the meeting but never joined).
+    /// Surfaced as `MeetingFeedSummary::user_last_attended_at`.
+    pub last_admit: Option<DateTime<Utc>>,
     pub participant_count: i64,
     pub waiting_count: i64,
 }
@@ -373,6 +381,7 @@ pub async fn list_feed_for_user(
                m.started_at,
                m.ended_at,
                m.creator_id,
+               m.host_display_name,
                m.password_hash,
                m.allow_guests,
                m.waiting_room_enabled,
@@ -380,6 +389,7 @@ pub async fn list_feed_for_user(
                m.admitted_can_admit,
                COALESCE(p.last_admit, m.started_at, m.created_at) AS last_active_at,
                (p.last_admit IS NOT NULL) AS ever_admitted,
+               p.last_admit AS last_admit,
                COALESCE(pc.admitted_count, 0) AS participant_count,
                COALESCE(wc.waiting_count, 0) AS waiting_count
         FROM meetings m
@@ -475,6 +485,64 @@ pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Err
     .bind(meeting_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Transition a meeting to `state='idle'` because every participant has left
+/// a meeting that has NOT ended (presence-driven empty→idle transition).
+///
+/// "Idle" means the meeting still exists and has not ended, but currently has
+/// no present participants — either everyone left, or it was created and no one
+/// has joined yet (the latter is handled by the `INSERT … state='idle'` at
+/// creation time). This function covers the everyone-left case, driven by the
+/// `actix-api` "room became empty" NATS event (see
+/// `MEETING_BECAME_EMPTY_SUBJECT`).
+///
+/// # Race / idempotency reasoning
+///
+/// The guard `state = 'active'` is load-bearing in three ways:
+///
+/// 1. **Never overwrites `ended` (terminal).** If the meeting already ended —
+///    e.g. the host left with `end_on_host_leave=true` and `end_meeting` landed
+///    first — `state` is `'ended'`, the `WHERE` matches zero rows, and this is a
+///    no-op. `ended` is terminal and must win the end-vs-idle race.
+/// 2. **Idempotent on repeat.** If the meeting is already `'idle'` (duplicate
+///    empty event from a NATS re-subscribe, or two replicas observing the same
+///    drain) the `WHERE` matches zero rows — a harmless no-op. Callers do not
+///    inspect rows-affected, so a no-op is indistinguishable from a fresh idle.
+/// 3. **Both race orders are safe.** If the empty event lands first we set
+///    `'idle'`; a later `end_meeting` (whose guard is `state <> 'ended'`) then
+///    overwrites `'idle'` with `'ended'`. If `end_meeting` lands first, this
+///    no-ops. Either ordering converges on the correct terminal/idle state.
+///
+/// We deliberately do NOT touch `started_at` / `ended_at`: an idle meeting that
+/// was previously active retains its original `started_at` so the "when did this
+/// meeting first start" signal is stable, and `activate()` is solely responsible
+/// for refreshing those timestamps on the idle→active re-activation.
+///
+/// ## Belt-and-suspenders participant re-check (intentionally omitted)
+///
+/// We considered an extra `AND NOT EXISTS (SELECT 1 FROM meeting_participants …
+/// WHERE status='admitted' AND left_at IS NULL)` guard to defend against a stale
+/// empty event racing a fast rejoin. We omit it because:
+///
+/// - The trigger in `actix-api` is the in-memory `room_members` count reaching
+///   zero, mutated synchronously in the single-threaded chat_server actor — the
+///   same authoritative presence source the host-leave→end detection uses. It is
+///   strictly fresher than the `meeting_participants` table (which is only
+///   written on REST join/admit/leave, not on transport disconnect — the very
+///   gap this feature closes).
+/// - The join path calls `activate()` on every admit, which is idempotent and
+///   flips `idle`→`active`. So even if a stale empty event briefly sets `idle`
+///   while a participant is mid-rejoin, the next join immediately re-activates.
+///   The worst case is a transient `active`→`idle`→`active` flicker that
+///   self-heals — acceptable, and not worth coupling this write to the
+///   participant table's write-skew.
+pub async fn set_idle(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE meetings SET state = 'idle' WHERE id = $1 AND state = 'active'")
+        .bind(meeting_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

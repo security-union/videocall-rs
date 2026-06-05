@@ -39,7 +39,28 @@ fn main() {
     // Must run after set_dir!() and before the component tree mounts.
     migrate_legacy_storage();
 
+    // Initialise the WASM logger to the operator-configured level
+    // (window.__APP_CONFIG.logLevel, default Info). `app_config()` reads
+    // `window.__APP_CONFIG`, which config.js installs via a <script> that loads
+    // before the wasm bundle, so it is reliably available here.
+    //
+    // ORDER MATTERS. We install the logger at Info FIRST, then read/validate the
+    // configured level, then apply the real ceiling — because reading the level
+    // (`constants::log_level()` → `log_level_explicit()`) may `warn!` on a typo'd
+    // `logLevel`, and the `log` facade DROPS any record while `max_level()` is
+    // its pre-init default of `Off` (`console_log` gates on `log::max_level()`).
+    // Computing the level before the logger exists would silently swallow that
+    // warning — the exact contract bug this ordering fixes. Installing at Info
+    // first makes the `Warn` record loggable; we then lower/raise to the
+    // configured filter, so an operator who set e.g. `error` still saw the typo
+    // warning emitted a moment earlier.
+    //
+    // `init_with_level` takes a `log::Level` (no `Off`); our dial is a
+    // `LevelFilter` (has `Off`). Init at Info, then `set_max_level` re-asserts the
+    // exact filter (including `Off`).
     console_log::init_with_level(log::Level::Info).expect("Failed to initialize logger");
+    let level_filter = constants::log_level();
+    log::set_max_level(level_filter);
 
     dioxus::launch(App);
 }

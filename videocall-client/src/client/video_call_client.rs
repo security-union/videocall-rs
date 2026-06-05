@@ -36,7 +36,7 @@ use futures::future::LocalBoxFuture;
 use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -2148,7 +2148,11 @@ impl Inner {
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
-        debug!(
+        // PER-PACKET hot path (#1 console-log offender, ~106 lines/sec; also a
+        // `String::from_utf8_lossy` alloc on every packet). Demoted debug!->trace!
+        // so it stays off even when console-log collection bumps to Debug. Not
+        // used by the meeting analyzer.
+        trace!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
             String::from_utf8_lossy(&response.user_id),
@@ -2289,7 +2293,10 @@ impl Inner {
             Ok(PacketType::DIAGNOSTICS) => {
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
-                    debug!("Received diagnostics packet: {diagnostics_packet:?}");
+                    // PER-DIAGNOSTICS-PACKET `{:?}` struct dump (~23K lines/session,
+                    // #2 console-log offender). Demoted debug!->trace! — stays off at
+                    // collection's Debug ceiling. Not used by the meeting analyzer.
+                    trace!("Received diagnostics packet: {diagnostics_packet:?}");
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
                     }

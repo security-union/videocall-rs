@@ -12,7 +12,7 @@
 ## Build Commands
 
 ```bash
-# Check framework-agnostic mode (no yew)
+# Check with default features disabled (no optional features, e.g. netsim)
 cargo check --target wasm32-unknown-unknown --no-default-features -p videocall-client
 
 # Check default mode
@@ -72,3 +72,17 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 - **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
 
 This is mandatory for every agent making code changes — not optional. CI will reject PRs that fail linting.
+
+## Adversarial Self-Review Rule (MANDATORY before "done")
+
+**Passing linters, `cargo check`, and CI does NOT mean a change is correct.** Lint/compile prove the code is well-formed; they do not prove it does what it claims. Before declaring any change complete — and before pushing or requesting review — run an explicit adversarial pass over the diff. Apply these three checks, by hand, to every new or changed piece:
+
+1. **Does this code path actually execute under real conditions?** Trace init order, guard conditions, lifetimes, and feature gates — not "it compiles." Ask: *under what runtime state does this line run, and is that state actually reached?* (Real miss: a `warn!` that could never fire because the level was read before the logger was installed, so the facade's `max_level()` was still `Off` and the record was dropped.)
+
+2. **Does each new test fail if you break the thing it names?** Mentally (or actually) mutate the source the test claims to protect; if the test would still pass, it is fake and must be rewritten to reference a real source of truth. A test asserting `X == X` (a literal against itself) pins nothing. (Real miss: a "lockstep pin" test that asserted `LevelFilter::Info == LevelFilter::Info`.)
+
+3. **Is every claim in a comment, doc, or PR description verified against the code — or merely asserted?** A comment that states a contract ("fires regardless of X", "guaranteed once") must be traced to the code that delivers it. If you can't trace it, the comment is wrong or the code is. (Real miss: a doc comment claiming behavior the code path disproved.)
+
+**Why this rule exists:** the recurring defect in this repo's PRs has not been missing knowledge — it is verification discipline. Plausible-looking artifacts (a warning, a test, a doc claim) get shipped without proving they do their job, and a reviewer catches them later. The `code-reviewer` agent must be run in genuinely adversarial mode — instruct it to perform checks 1–3 above, not just style/correctness at a glance. Author-mode optimism ("this looks right") is the bias to counteract. Treat a self-review that returns "PASS" while these checks were not actually performed as a review that did not happen.
+
+This applies to every agent and to direct edits. It is part of the definition of "complete," alongside passing linters and tests.

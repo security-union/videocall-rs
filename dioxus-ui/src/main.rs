@@ -40,7 +40,21 @@ fn main() {
     // Must run after set_dir!() and before the component tree mounts.
     migrate_legacy_storage();
 
-    console_log::init_with_level(log::Level::Info).expect("Failed to initialize logger");
+    // Initialise the WASM logger at the operator-configured level
+    // (window.__APP_CONFIG.logLevel, default "info"). `app_config()` reads
+    // `window.__APP_CONFIG`, which config.js installs via a <script> that loads
+    // before the wasm bundle, so it is reliably available here. We still guard
+    // defensively: `constants::log_level()` falls back to Info if the config is
+    // missing/unreadable, so init never panics on a bad/stale config.
+    //
+    // `console_log::init_with_level` takes a `log::Level` (no `Off` variant),
+    // while our config dial is a `log::LevelFilter` (which does include `Off`).
+    // Map LevelFilter -> Level for the initial logger, then re-assert the exact
+    // filter via `log::set_max_level` so a configured `Off` is honoured too.
+    let level_filter = constants::log_level();
+    let init_level = level_filter.to_level().unwrap_or(log::Level::Info);
+    console_log::init_with_level(init_level).expect("Failed to initialize logger");
+    log::set_max_level(level_filter);
 
     dioxus::launch(App);
 }

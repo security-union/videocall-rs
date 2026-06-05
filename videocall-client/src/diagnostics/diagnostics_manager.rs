@@ -25,7 +25,7 @@ use std::sync::Arc;
 use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
-use log::{debug, error};
+use log::{debug, error, trace};
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
@@ -481,7 +481,10 @@ impl DiagnosticWorker {
                             metric!("to_peer", peer_id.clone()),
                         ],
                     };
-                    debug!(
+                    // Fires per (peer x stream) on every diagnostics heartbeat —
+                    // O(peers) churn. Demoted debug!->trace!; not on the analyzer
+                    // keep-list.
+                    trace!(
                         "Broadcasting video event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps, DecodeErrors={:.1}/s",
                         peer_id, media_type, fps, bitrate, decode_errors
                     );
@@ -509,9 +512,15 @@ impl DiagnosticWorker {
                         packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                     }
 
-                    debug!(
+                    // Fires per (peer x stream) on every diagnostics heartbeat —
+                    // O(peers) churn. Demoted debug!->trace!; not on the analyzer
+                    // keep-list.
+                    trace!(
                         "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
-                        peer_id, media_type, fps, bitrate
+                        peer_id,
+                        media_type,
+                        fps,
+                        bitrate
                     );
                     handler.emit(packet);
                 }
@@ -799,7 +808,9 @@ impl SenderDiagnosticWorker {
                         metric!("packet_timestamp", packet.timestamp_ms),
                     ],
                 };
-                debug!(
+                // Fires for every received diagnostics packet (per-packet).
+                // Demoted debug!->trace!; not on the analyzer keep-list.
+                trace!(
                     "Broadcasting sender event for target {target_id}: sender={sender_id}, media_type={media_type:?}"
                 );
                 let _ = global_sender().try_broadcast(event);

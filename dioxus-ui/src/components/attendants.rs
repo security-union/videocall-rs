@@ -928,13 +928,27 @@ pub fn AttendantsComponent(
                     session_loaded.set(true);
                     // Activate console log collection if enabled in config.
                     if crate::constants::console_log_upload_enabled().unwrap_or(false) {
-                        // Raise the WASM log level to Debug so uploaded logs
-                        // capture detailed diagnostic output. We use Debug
-                        // rather than Trace (as ticket #307 mentions) because
-                        // Trace is prohibitively noisy in WASM — every
-                        // wasm-bindgen call and Dioxus re-render generates
-                        // trace spans that would overwhelm the upload buffer.
-                        log::set_max_level(log::LevelFilter::Debug);
+                        // Raise the WASM log level so uploaded logs capture
+                        // detailed diagnostic output.
+                        //
+                        // PRECEDENCE (console-log perf fix):
+                        //  - If the operator EXPLICITLY set `logLevel` in config.js
+                        //    (any value other than the "info" default), honour it
+                        //    as the ceiling — e.g. `logLevel: "warn"` deliberately
+                        //    REDUCES capture to cut per-packet log volume on a hot
+                        //    deployment, and `logLevel: "trace"` opts INTO the
+                        //    per-packet hot-path logs (which are emitted at trace!).
+                        //  - Otherwise (absent / default "info"), bump to Debug —
+                        //    the historical collection behaviour, preserved so
+                        //    existing meeting analysis keeps working unchanged.
+                        //
+                        // We use Debug rather than Trace by default (per ticket
+                        // #307) because Trace is prohibitively noisy in WASM and
+                        // the genuine per-packet spam now lives at trace!, off by
+                        // default even when collecting.
+                        let effective_level = crate::constants::log_level_explicit()
+                            .unwrap_or(log::LevelFilter::Debug);
+                        log::set_max_level(effective_level);
                         let dn = current_display_name();
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }

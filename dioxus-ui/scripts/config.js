@@ -37,6 +37,16 @@ window.__APP_CONFIG = ({
   searchApiBaseUrl: "http://localhost:3000/api/search/v2",
   consoleLogUploadEnabled: "false",
   mockPeersEnabled: "false",
+  // WASM logger max level. Valid values (case-insensitive): "trace", "debug",
+  // "info", "warn", "error". Defaults to "info" (and behaves as "info" if the
+  // key is absent). Operators can change this WITHOUT a code change to raise or
+  // lower client log verbosity.
+  // Interaction with consoleLogUploadEnabled: when collection is ON, the level
+  // is bumped to "debug" by default — UNLESS logLevel is explicitly set here to
+  // a non-"info" value, in which case that value wins (e.g. "warn" reduces
+  // capture to cut per-packet log volume; "trace" opts into the per-packet
+  // hot-path logs, which are emitted at trace! and otherwise stay off).
+  logLevel: "info",
   // EXPERIMENTAL, TEST-ONLY: max simulcast layers a publisher may emit
   // (issue #989). 1 = feature OFF (single stream, identical to pre-simulcast).
   // Effective layers = min(this, device-capability ceiling).

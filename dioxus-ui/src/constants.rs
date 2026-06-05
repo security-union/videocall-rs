@@ -144,10 +144,42 @@ pub struct RuntimeConfig {
     #[serde(rename = "experimentalSimulcastMaxLayers")]
     #[serde(default = "default_experimental_simulcast_max_layers")]
     pub experimental_simulcast_max_layers: u32,
+    /// Operator dial for the WASM logger's max level (issue: console-log perf).
+    /// Valid values (case-insensitive): `trace` / `debug` / `info` / `warn` /
+    /// `error`. **Default: `"info"`** via [`default_log_level`] so behaviour is
+    /// unchanged when the key is absent (matches the historical hardcoded init
+    /// level in `main.rs`).
+    ///
+    /// This lets operators raise or lower client log verbosity from the Helm
+    /// `runtimeConfig` (`config.js`) WITHOUT a code change or rebuild — useful
+    /// for cutting per-packet log volume on a hot deployment, or temporarily
+    /// raising verbosity for a debugging session.
+    ///
+    /// Interaction with console-log collection (see `attendants.rs`): when
+    /// collection is on, the level is bumped to Debug by default — UNLESS the
+    /// operator explicitly set `logLevel` to a non-default value, in which case
+    /// the explicit value wins (acts as a ceiling). Per-packet hot-path logs are
+    /// emitted at `trace!`, so they stay off at the Debug collection ceiling and
+    /// only appear if an operator explicitly opts into `logLevel: "trace"`.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): this is
+    /// `#[serde(default = ...)]` so a stale bind-mounted `config.js` predating
+    /// the key still parses to the code default (`"info"`), never a startup-
+    /// bricking parse failure.
+    #[serde(rename = "logLevel")]
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 fn default_vad_threshold() -> f32 {
     0.02
+}
+
+/// Default `logLevel` when the key is absent from `config.js` — `"info"`, which
+/// matches the historical hardcoded `console_log::init_with_level(Level::Info)`
+/// so behaviour is unchanged unless an operator opts in.
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 /// Default simulcast layer ceiling when `experimentalSimulcastMaxLayers` is
@@ -198,6 +230,45 @@ pub fn experimental_simulcast_max_layers() -> u32 {
     app_config()
         .map(|c| c.experimental_simulcast_max_layers)
         .unwrap_or(3)
+}
+
+/// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/
+/// `error`) into a [`log::LevelFilter`]. Returns `None` for an empty or
+/// unrecognised string so callers can apply their own fallback.
+fn parse_log_level(s: &str) -> Option<log::LevelFilter> {
+    use std::str::FromStr;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `LevelFilter::from_str` is already case-insensitive and also accepts
+    // "off"; we normalise via it and only return recognised values.
+    log::LevelFilter::from_str(trimmed).ok()
+}
+
+/// Configured WASM logger max level, read from `window.__APP_CONFIG.logLevel`.
+/// Falls back to [`log::LevelFilter::Info`] when the key is absent, empty,
+/// unparseable, or the config can't be read — preserving the historical
+/// hardcoded init level so a missing/stale config behaves as before.
+pub fn log_level() -> log::LevelFilter {
+    app_config()
+        .ok()
+        .and_then(|c| parse_log_level(&c.log_level))
+        .unwrap_or(log::LevelFilter::Info)
+}
+
+/// The operator's EXPLICIT `logLevel`, or `None` when it is absent / empty /
+/// left at the `"info"` default. serde cannot distinguish "key absent" from
+/// "key explicitly set to info", so we treat the default value `"info"` as
+/// "not explicitly overridden" — this is what lets the console-log collection
+/// bump fall back to Debug (its historical behaviour) unless an operator opted
+/// into a different level. See [`RuntimeConfig::log_level`] for the precedence.
+pub fn log_level_explicit() -> Option<log::LevelFilter> {
+    let raw = app_config().ok()?.log_level;
+    if raw.trim().eq_ignore_ascii_case("info") {
+        return None;
+    }
+    parse_log_level(&raw)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

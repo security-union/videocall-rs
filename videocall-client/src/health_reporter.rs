@@ -30,7 +30,7 @@ use crate::encode::{
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -717,7 +717,11 @@ impl HealthReporter {
                             if let MetricValue::Text(json_str) = &metric.value {
                                 if let Ok(neteq_json) = serde_json::from_str::<Value>(json_str) {
                                     peer_data.update_audio_stats(neteq_json);
-                                    debug!(
+                                    // Per-NetEQ-event (continuous audio-stats stream).
+                                    // Demoted debug!->trace!; not on the analyzer keep-list
+                                    // (the analyzer greps "audio health (buffer: Nms)" below,
+                                    // NOT this line).
+                                    trace!(
                                      "Updated NetEQ stats for peer: {target_peer} (from {reporting_peer})"
                                     );
                                 }
@@ -732,7 +736,9 @@ impl HealthReporter {
                         }
                         "packets_awaiting_decode" => {
                             if let MetricValue::U64(packets) = &metric.value {
-                                debug!(
+                                // Per-NetEQ-event. Demoted debug!->trace!; not on the
+                                // analyzer keep-list.
+                                trace!(
                                     "Updated packets awaiting decode: {packets} for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
@@ -744,9 +750,12 @@ impl HealthReporter {
         }
         // Handle sender events (from local SenderDiagnosticManager)
         else if event.subsystem == "sender" {
-            debug!(
+            // Per-sender-event (fires for every received diagnostics packet).
+            // Demoted debug!->trace!; not on the analyzer keep-list.
+            trace!(
                 "Received sender event for peer: {} at {}",
-                target_peer, event.ts_ms
+                target_peer,
+                event.ts_ms
             );
             // Sender events are mainly for server reporting, less impact on health status
         }
@@ -861,10 +870,14 @@ impl HealthReporter {
 
                 if is_screen {
                     peer_data.update_screen_stats(video_stats);
-                    debug!("Updated screen health for peer: {target_peer}");
+                    // Per-video-event (continuous per-stream stats). Demoted
+                    // debug!->trace!; not on the analyzer keep-list.
+                    trace!("Updated screen health for peer: {target_peer}");
                 } else {
                     peer_data.update_camera_stats(video_stats);
-                    debug!("Updated camera health for peer: {target_peer}");
+                    // Per-video-event. Demoted debug!->trace!; not on the analyzer
+                    // keep-list.
+                    trace!("Updated camera health for peer: {target_peer}");
                 }
             }
         }

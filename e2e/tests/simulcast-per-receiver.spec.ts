@@ -1,6 +1,25 @@
 /**
  * E2E: per-receiver simulcast (PR #1079, issue #989 P1–P5).
  *
+ * ## #1108 — "one bad receiver must not degrade the others" (Phase B)
+ *
+ * Phase B (issue #1108) DECOUPLED the sender's adaptive-quality from receiver
+ * feedback. BEFORE: a publisher would shed simulcast layers / step its tier DOWN
+ * when REMOTE RECEIVERS reported low FPS, so one struggling receiver dragged the
+ * stream down for the WHOLE room. AFTER: the publisher adapts ONLY to its OWN
+ * signals (encoder-CPU backpressure, server CONGESTION, WS send-buffer pressure);
+ * receiver feedback now influences ONLY each receiver's OWN per-receiver layer
+ * pull (the simulcast chooser, already wired). The end-to-end proof of #1108 is
+ * therefore identical to the per-receiver DIVERGENCE this spec already exercises:
+ * throttle ONE receiver and assert ITS layer drops while the OTHER receivers KEEP
+ * the higher layer(s) — i.e. the publisher's ladder did NOT shrink for everyone.
+ * The `@impair` WS divergence test below carries that #1108 assertion explicitly
+ * (it captures the healthy peer's layer BEFORE the impairment and proves it does
+ * not regress AFTER). The unit/integration layer locks the inverse direction —
+ * the sender no longer even HAS an input path for receiver FPS — in
+ * `bot/tests/aq_degradation.rs` (`bot_does_not_degrade_on_receiver_fps`,
+ * `bot_degrades_on_synthetic_backpressure`, `bot_degrades_on_congestion_cut`).
+ *
  * The feature is FLAG-GATED OFF in production (`experimentalSimulcastMaxLayers`
  * defaults to 1 = single layer; effective layers =
  * `min(flag, device-capability-ceiling)`). This spec ENABLES the flag for the
@@ -60,14 +79,17 @@
  *       machinery went N-generic but the single-layer behavior
  *       must be unchanged).
  *
- *   - RUNS UNDER THE `@impair` PROJECT ONLY (issue #1080):
+ *   - RUNS UNDER THE `@impair` PROJECT ONLY (issues #1080 + #1108):
  *       2. Per-receiver congestion DIVERGENCE (WS path) — one of two
  *          co-receivers has its WS downlink bandwidth-clamped via toxiproxy,
  *          which overflows the relay's bounded per-receiver outbound channel;
  *          the relay sheds that receiver's video frames, the resulting sequence
  *          gaps push its `loss_per_sec` over the chooser's step-down threshold,
  *          and ONLY that receiver drops to a lower layer (sender + healthy peer
- *          unaffected). See `helpers/downlink-impair.ts` for the full verified
+ *          unaffected). This is ALSO the #1108 headline proof: the healthy peer's
+ *          layer is captured BEFORE the impairment and asserted NOT to regress
+ *          AFTER — the one bad receiver did not shrink the publisher's ladder for
+ *          everyone. See `helpers/downlink-impair.ts` for the full verified
  *          mechanism — the relay-side overflow is what manufactures the loss a
  *          raw bandwidth throttle alone could not. This test is TAGGED `@impair`
  *          and is grep-inverted OUT of the default `dioxus` suite + bvt0/bvt1
@@ -783,7 +805,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2. Per-receiver congestion DIVERGENCE over WebSocket (issue #1080).
+  // 2. Per-receiver congestion DIVERGENCE over WebSocket (issues #1080 + #1108).
   //
   //    Now EXERCISED via the per-client downlink-impairment infra
   //    (`helpers/downlink-impair.ts` + the toxiproxy `impair` compose profile).
@@ -794,6 +816,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    a lower layer. The sender and the healthy receiver share neither the
   //    proxy nor the relay channel, so they are unaffected. See the helper's
   //    header for the full verified mechanism.
+  //
+  //    #1108 HEADLINE PROOF ("one bad receiver doesn't degrade others"): after
+  //    Phase B the publisher's ladder NO LONGER shrinks in response to a
+  //    receiver's poor stats — receiver feedback drives ONLY that receiver's own
+  //    per-receiver layer pull. This test makes that literal: it records the
+  //    healthy peer's layer index BEFORE impairing the other receiver and, once
+  //    the degraded receiver has stepped down, asserts the healthy peer's layer
+  //    index has NOT regressed (it stays >= its pre-impairment value and strictly
+  //    above the degraded peer). A regression here would mean the bad receiver
+  //    dragged the whole room down — exactly the pre-#1108 behavior that was
+  //    removed (and is locked at the controller layer by
+  //    `bot/tests/aq_degradation.rs::bot_does_not_degrade_on_receiver_fps`).
   //
   //    NOTE: like the other multi-party tests it joins 3 contexts and is subject
   //    to the same headless-CI renderer-crash + capability limits — see #1093;
@@ -820,7 +854,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    for toxiproxy's control API on :8474, and (c) run
   //    `npx playwright test --project=impair`. Locally: `make e2e-impair`.
   // -------------------------------------------------------------------------
-  test("congested receiver pulls a LOWER video layer than the healthy peer (WS) @impair", async ({
+  test("one bad receiver does not degrade the others: congested receiver drops a layer, healthy peer holds (WS, #1108) @impair", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -908,6 +942,17 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         })
         .toBeGreaterThan(0);
 
+      // Capture the healthy peer's layer index at the LAST moment before we
+      // impair the other receiver. This is the #1108 baseline: the publisher's
+      // ladder for THIS healthy peer must not shrink merely because the OTHER
+      // receiver is about to go bad. (Read just before PHASE 2 so it reflects
+      // the steady state immediately preceding the impairment.)
+      const healthyBeforeImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyBeforeImpair,
+        "healthy receiver must be decoding before we impair the other receiver",
+      ).not.toBeNull();
+
       // PHASE 2 — clamp ONLY the degraded receiver's downlink hard enough to
       // overflow the relay's 128-slot outbound channel (sheds video → loss →
       // step down). ~120 kbps is far below one HD layer's byte rate.
@@ -941,6 +986,20 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "healthy receiver must stay above the base layer (unaffected by peer congestion)",
       ).toBeGreaterThan(0);
 
+      // #1108 NON-REGRESSION (the literal "one bad receiver doesn't degrade the
+      // others" proof): the healthy peer's layer must not have dropped relative
+      // to its pre-impairment baseline. Before Phase B the publisher would shed
+      // layers / step its tier down on the degraded receiver's feedback, shrinking
+      // the ladder for EVERY receiver — the healthy peer's index would fall here.
+      // After Phase B the publisher adapts only to its OWN signals, so the healthy
+      // peer holds (or climbs). Allow >= (a healthy peer may even climb into freed
+      // capacity); a strict drop is the forbidden pre-#1108 behavior.
+      expect(
+        healthyFinal!.layerIndex,
+        "#1108: the healthy peer's layer must NOT shrink because the OTHER receiver " +
+          `went bad (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
+      ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
+
       // PHASE 4 — heal the downlink and prove the degraded receiver climbs back
       // up (recovery), confirming the divergence was the impairment, not a
       // permanent failure. Climb-back is conservative (hysteresis), so allow a
@@ -964,11 +1023,13 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented).
+  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented). #1108 +
+  //     #1080 (WT path), tracked under #1093 for the harness work.
   //
-  // The same relay-side overflow → loss → step-down mechanism applies on the
-  // WebTransport path, but we cannot impair ONE WT client from this Playwright
-  // harness:
+  // The same relay-side overflow → loss → step-down mechanism (and therefore the
+  // same #1108 "one bad receiver doesn't degrade the others" proof) applies on
+  // the WebTransport path, but we cannot impair ONE WT client from this
+  // Playwright harness:
   //   - WebTransport is QUIC over UDP. toxiproxy (used by the WS case above) is
   //     TCP-only, and Playwright's `newContext({ proxy })` only carries the
   //     browser's TCP/HTTP(S) traffic — neither can shape QUIC/UDP datagrams.
@@ -976,15 +1037,154 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //     client's 5-tuple in an ISOLATED netns/veth. Playwright runs Chromium on
   //     the host in a SHARED netns, so a netem qdisc there degrades EVERY
   //     context (sender + both receivers), not just the degraded one.
-  // When the bots-app netsim orchestrator can drive a per-client veth, this can
-  // reuse the WS case's identical assertion against a UDP netem hook.
-  // (Multi-party renderer-crash + capability concerns also apply here — see #1093.)
+  // When the bots-app netsim orchestrator can drive a per-client veth (the #1093
+  // harness work), this can reuse the WS case's identical assertion against a UDP
+  // netem hook. (Multi-party renderer-crash + capability concerns also apply
+  // here — see #1093.)
+  //
+  // The body below is written out (but `fixme`d) so it is READY the moment a
+  // per-client UDP downlink-impairment helper exists. It mirrors the WS test
+  // exactly, INCLUDING the #1108 non-regression assertion (the healthy peer's
+  // layer must not shrink when the OTHER receiver goes bad). The only missing
+  // piece is the impairment hook — sketched here as `impairDownlinkUdp` /
+  // `healDownlinkUdp` (NOT YET IMPLEMENTED; see #1093). Until that helper lands,
+  // referencing it would not type-check, so the impairment + heal calls are left
+  // as TODO markers rather than live calls.
   // -------------------------------------------------------------------------
-  test.fixme("congested receiver pulls a LOWER video layer than the healthy peer (WT) — needs per-client UDP netem", async () => {
-    // Intentionally empty: the assertion is identical to the WS case above;
-    // only the per-client WT/QUIC downlink-impairment hook is missing (see the
-    // block comment for the concrete blocker). Kept as `fixme` so the gap is
-    // visible in the test report rather than silently absent.
+  test.fixme("one bad receiver does not degrade the others over WebTransport (WT, #1108) — needs per-client UDP netem", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_diverge_wt_${Date.now()}`;
+
+    // 1 publisher + 2 receivers, ALL on WebTransport (the production-primary
+    // transport). Unlike the WS case we do NOT pin the degraded receiver to WS —
+    // the whole point of this case is to prove the #1108 isolation holds on the
+    // QUIC path too.
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-dwt@videocall.rs",
+        "SimPublisherDWT",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-healthy-wt@videocall.rs",
+        "SimHealthyWT",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-degraded-wt@videocall.rs",
+        "SimDegradedWT",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3);
+      await enableSimulcastFlag(healthyCtx, 3);
+      await enableSimulcastFlag(degradedCtx, 3);
+
+      // TODO(#1093): route ONLY the degraded receiver's QUIC/UDP downlink
+      // through a per-client netem veth here, e.g.:
+      //   await routeDownlinkThroughUdpNetem(degradedCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      const degradedPage = await degradedCtx.newPage();
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherDWT");
+      await joinMeeting(healthyPage, meetingId, "SimHealthyWT");
+      await joinMeeting(degradedPage, meetingId, "SimDegradedWT");
+
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above the base layer on a healthy
+      // (un-impaired) downlink. Capability ceiling can clamp to a single layer
+      // on a weak runner; SKIP rather than assert a false negative.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped the publisher to a single layer; there is no " +
+          "ladder headroom to diverge on this runner (see helpers/simulcast-config.ts)",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // #1108 baseline: the healthy peer's layer just before impairment.
+      const healthyBeforeImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyBeforeImpair,
+        "healthy receiver must be decoding before we impair the other receiver",
+      ).not.toBeNull();
+
+      // PHASE 2 — clamp ONLY the degraded receiver's QUIC downlink.
+      // TODO(#1093): await impairDownlinkUdp({ rateKb: 15 });
+
+      // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
+      // the healthy receiver's.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            const degradedIdx = degraded?.layerIndex ?? 0;
+            if (!healthy) return false;
+            return degradedIdx < healthy.layerIndex;
+          },
+          { timeout: 90_000, intervals: [2000, 3000, 5000] },
+        )
+        .toBe(true);
+
+      // Healthy receiver unaffected, and #1108 non-regression: its layer must
+      // not have shrunk relative to the pre-impairment baseline.
+      const healthyFinal = await readVideoLayer(healthyPage);
+      expect(healthyFinal, "healthy receiver must still be decoding").not.toBeNull();
+      expect(
+        healthyFinal!.layerIndex,
+        "healthy receiver must stay above the base layer (unaffected by peer congestion)",
+      ).toBeGreaterThan(0);
+      expect(
+        healthyFinal!.layerIndex,
+        "#1108: the healthy peer's layer must NOT shrink because the OTHER receiver " +
+          `went bad over WT (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
+      ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
+
+      // PHASE 4 — heal and prove climb-back.
+      // TODO(#1093): await healDownlinkUdp();
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      // TODO(#1093): await healDownlinkUdp();
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
   });
 });
 

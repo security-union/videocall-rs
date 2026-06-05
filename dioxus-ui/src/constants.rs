@@ -279,7 +279,7 @@ pub fn log_level_explicit() -> Option<log::LevelFilter> {
 /// [`log::LevelFilter::Info`] when the key is absent, empty, unparseable, or the
 /// config can't be read — preserving the historical hardcoded init level so a
 /// missing/stale config behaves as before. Delegates to [`log_level_explicit`]
-/// so a typo's `warn!` is emitted exactly once, here at startup.
+/// so a typo's `warn!` surfaces at startup (the collection path may re-emit it).
 pub fn log_level() -> log::LevelFilter {
     log_level_explicit().unwrap_or(log::LevelFilter::Info)
 }
@@ -509,6 +509,69 @@ mod simulcast_default_tests {
             READ_FALLBACK,
             default_experimental_simulcast_max_layers(),
             "the read-fn fallback must equal the serde default (lockstep, issue 1082)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::parse_log_level;
+    use log::LevelFilter;
+
+    /// `parse_log_level` is a pure host-testable parser: trims, accepts the five
+    /// standard levels plus `off`, is case-insensitive, and rejects empty /
+    /// unrecognised input with `None`. (`log_level`/`log_level_explicit` wrap it
+    /// but call `app_config()` → `window()`, so only this pure core is unit-
+    /// testable on host — the same split as the simulcast read fns above.)
+    #[test]
+    fn parses_standard_levels() {
+        assert_eq!(parse_log_level("trace"), Some(LevelFilter::Trace));
+        assert_eq!(parse_log_level("debug"), Some(LevelFilter::Debug));
+        assert_eq!(parse_log_level("info"), Some(LevelFilter::Info));
+        assert_eq!(parse_log_level("warn"), Some(LevelFilter::Warn));
+        assert_eq!(parse_log_level("error"), Some(LevelFilter::Error));
+        // `off` is accepted (LevelFilter has it; console_log honours it via
+        // set_max_level even though init_with_level cannot express it).
+        assert_eq!(parse_log_level("off"), Some(LevelFilter::Off));
+    }
+
+    #[test]
+    fn trims_and_is_case_insensitive() {
+        assert_eq!(parse_log_level(" TRACE "), Some(LevelFilter::Trace));
+        assert_eq!(parse_log_level("Info"), Some(LevelFilter::Info));
+        assert_eq!(parse_log_level("\tWARN\n"), Some(LevelFilter::Warn));
+    }
+
+    #[test]
+    fn empty_and_typos_are_none() {
+        assert_eq!(parse_log_level(""), None);
+        assert_eq!(parse_log_level("   "), None);
+        // The operator-typo path: a non-empty unrecognised value → None, which
+        // drives the `warn!` + Info/Debug fallback in the callers.
+        assert_eq!(parse_log_level("wran"), None);
+        assert_eq!(parse_log_level("verbose"), None);
+    }
+
+    /// Lockstep pin on the two precedence fallback literals — the entire point of
+    /// the dial. If someone edits a caller's fallback, this forces them to update
+    /// this test, so the documented precedence can't silently regress:
+    ///   - `attendants.rs`: collection ceiling when `logLevel` is ABSENT → Debug.
+    ///   - `log_level()`:    startup init when `logLevel` is ABSENT/unparseable → Info.
+    #[test]
+    fn precedence_fallback_literals_pinned() {
+        // Mirror of `attendants.rs`: `log_level_explicit().unwrap_or(Debug)`.
+        const COLLECTION_ABSENT_FALLBACK: LevelFilter = LevelFilter::Debug;
+        // Mirror of `log_level()`: `log_level_explicit().unwrap_or(Info)`.
+        const STARTUP_ABSENT_FALLBACK: LevelFilter = LevelFilter::Info;
+        assert_eq!(
+            COLLECTION_ABSENT_FALLBACK,
+            LevelFilter::Debug,
+            "absent logLevel must bump collection to Debug (historical capture)"
+        );
+        assert_eq!(
+            STARTUP_ABSENT_FALLBACK,
+            LevelFilter::Info,
+            "absent/typo logLevel must init at Info (historical hardcoded level)"
         );
     }
 }

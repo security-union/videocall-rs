@@ -3695,6 +3695,29 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
+                        if show_video_off_toast() {
+                            div { class: "peer-toast toast-left",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
+                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Host turned off your camera" }
+                                    br {}
+                                    span { class: "toast-action", "Click the camera button to turn it back on." }
+                                }
+                            }
+                        }
                         for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
@@ -4480,9 +4503,16 @@ pub fn AttendantsComponent(
                                                                 &room_token,
                                                             )
                                                             .await;
+                                                        } else if let Err(e) =
+                                                            crate::meeting_api::leave_meeting(
+                                                                &meeting_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::error!(
+                                                                "Error leaving meeting: {e}"
+                                                            );
                                                         }
-                                                        // If you want to log an error, you need to have an error to log. If not, remove this line or handle errors properly.
-                                                        // log::error!("Error leaving meeting: {e}");
                                                         let _ = window().location().set_href("/");
                                                     });
                                                 },

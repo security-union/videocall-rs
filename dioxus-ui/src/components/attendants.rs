@@ -125,7 +125,6 @@ pub enum MediaErrorState {
 }
 
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
-const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
@@ -3259,14 +3258,13 @@ pub fn AttendantsComponent(
                             // Hard-block: render an error card in place of the
                             // join card. The user has to switch to a different
                             // device — there is no override for this verdict.
-                            div { class: "settings-card",
+                            div {
+                                class: "settings-card",
                                 role: "alert",
                                 "aria-live": "assertive",
                                 div { class: "join-meeting-header",
                                     h2 { class: "join-meeting-title",
-                                        span { class: "join-meeting-title-text",
-                                            "Device not supported"
-                                        }
+                                        span { class: "join-meeting-title-text", "Device not supported" }
                                     }
                                 }
                                 p { class: "toggle-error", "{msg}" }
@@ -3275,7 +3273,11 @@ pub fn AttendantsComponent(
                                         class: "btn-apple btn-primary settings-action-btn",
                                         disabled: true,
                                         "aria-disabled": "true",
-                                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                                        if is_owner {
+                                            "Start Meeting"
+                                        } else {
+                                            "Join Meeting"
+                                        }
                                     }
                                 }
                                 p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
@@ -3369,23 +3371,11 @@ pub fn AttendantsComponent(
                                     let has_strong_warn = strong_warn_msg.is_some();
                                     move |_| {
                                         if is_blocked {
-                                            // Defensive: the card should not be
-                                            // rendered when blocked, but in case
-                                            // it ever is, ignore the click.
-                                            log::warn!(
-                                                "capability-check: join click ignored — Block verdict"
-                                            );
+                                            log::warn!("capability-check: join click ignored — Block verdict");
                                             return;
                                         }
                                         if has_strong_warn && !capability_acknowledged() {
-                                            // Bring up the strong-warn modal
-                                            // instead of immediately requesting
-                                            // media. The modal's CTAs will set
-                                            // `capability_acknowledged` and
-                                            // re-fire the request.
-                                            log::info!(
-                                                "capability-check: showing StrongWarn modal"
-                                            );
+                                            log::info!("capability-check: showing StrongWarn modal");
                                             return;
                                         }
                                         // Mark this as a real join so the permission
@@ -3416,16 +3406,7 @@ pub fn AttendantsComponent(
                                         button {
                                             class: "btn-apple btn-secondary",
                                             onclick: move |_| {
-                                                // Audio-only: camera defaults to
-                                                // off in this lobby, so we just
-                                                // acknowledge and request media.
-                                                // Mic/camera buttons in the
-                                                // post-join controls remain
-                                                // available if the user changes
-                                                // their mind.
-                                                log::info!(
-                                                    "capability-check: user chose Audio-only"
-                                                );
+                                                log::info!("capability-check: user chose Audio-only");
                                                 capability_acknowledged.set(true);
                                                 join_requested.set(true);
                                                 mda_audio.borrow().request();
@@ -3435,9 +3416,7 @@ pub fn AttendantsComponent(
                                         button {
                                             class: "btn-apple btn-primary",
                                             onclick: move |_| {
-                                                log::info!(
-                                                    "capability-check: user chose Continue anyway"
-                                                );
+                                                log::info!("capability-check: user chose Continue anyway");
                                                 capability_acknowledged.set(true);
                                                 join_requested.set(true);
                                                 mda_continue.borrow().request();
@@ -3687,11 +3666,26 @@ pub fn AttendantsComponent(
                                         stroke_width: "2",
                                         stroke_linecap: "round",
                                         stroke_linejoin: "round",
-                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        line {
+                                            x1: "1",
+                                            y1: "1",
+                                            x2: "23",
+                                            y2: "23",
+                                        }
                                         path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
                                         path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
-                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                        line {
+                                            x1: "12",
+                                            y1: "19",
+                                            x2: "12",
+                                            y2: "23",
+                                        }
+                                        line {
+                                            x1: "8",
+                                            y1: "23",
+                                            x2: "16",
+                                            y2: "23",
+                                        }
                                     }
                                 }
                                 span { class: "toast-text",
@@ -3724,7 +3718,7 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
-                        for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
                                     "peer-toast toast-joined"
@@ -3841,7 +3835,7 @@ pub fn AttendantsComponent(
                             rsx! {
                                 // Left panel — ONLY the most recent (active) screen sharer
                                 div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                            align-items: center; justify-content: center; overflow: hidden;",
+                                                                            align-items: center; justify-content: center; overflow: hidden;",
                                     if let Some(ref active_peer) = active_screen_sharer {
                                         PeerTile {
                                             key: "ss-active-{active_peer}",
@@ -3930,8 +3924,7 @@ pub fn AttendantsComponent(
                                     }
 
                                     if ss_overflow_count > 0 {
-                                        div {
-                                            class: "grid-overflow-badge",
+                                        div { class: "grid-overflow-badge",
                                             "+{ss_overflow_count}"
                                             span { "more in meeting" }
                                         }
@@ -4021,8 +4014,7 @@ pub fn AttendantsComponent(
                         }
 
                         if overflow_count > 0 {
-                            div {
-                                class: "grid-overflow-badge",
+                            div { class: "grid-overflow-badge",
                                 "+{overflow_count}"
                                 span { "more in meeting" }
                             }
@@ -4032,65 +4024,47 @@ pub fn AttendantsComponent(
                         if visible_tiles.is_empty() {
                             div {
                                 id: "invite-overlay",
-                                class: "card-apple",
-                                style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                                h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
-                                    "Share this meeting link with others you want in the meeting"
-                                }
-                                div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                    input {
-                                        id: "meeting-link-input",
-                                        value: "{meeting_link}",
-                                        readonly: true,
-                                        class: "input-apple",
-                                        style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
-                                    }
-                                    button {
-                                        class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                        style: "margin-left: 0.5rem;",
-                                        onclick: {
-                                            let meeting_link = meeting_link.clone();
-                                            move |_| {
-                                                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
-                                                {
-                                                    let _ = clipboard.write_text(&meeting_link);
-                                                    show_copy_toast.set(true);
-                                                    Timeout::new(
-                                                            1640,
-                                                            move || {
-                                                                show_copy_toast.set(false);
-                                                            },
-                                                        )
-                                                        .forget();
-                                                }
-                                            }
-                                        },
-                                        "Copy"
-                                        if show_copy_toast() {
-                                            div {
-                                                class: "sparkles",
-                                                "aria-hidden": "true",
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
+                                class: "invite-glass-card",
+
+                                h4 { class: "invite-glass-title", "Your meeting is ready!" }
+
+                                button {
+                                    class: if show_copy_toast() { "invite-share-button copied" } else { "invite-share-button" },
+                                    r#type: "button",
+                                    onclick: {
+                                        let meeting_link = meeting_link.clone();
+                                        move |_| {
+                                            if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
+                                            {
+                                                let _ = clipboard.write_text(&meeting_link);
+                                                show_copy_toast.set(true);
+                                                Timeout::new(
+                                                        1640,
+                                                        move || {
+                                                            show_copy_toast.set(false);
+                                                        },
+                                                    )
+                                                    .forget();
                                             }
                                         }
+                                    },
+
+                                    span { class: "invite-share-icon", "↗" }
+                                    span {
+                                        if show_copy_toast() {
+                                            "LINK COPIED"
+                                        } else {
+                                            "SHARE THE LINK"
+                                        }
                                     }
+                                    span { class: "invite-copy-icon", "⧉" }
                                 }
-                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
-                                    "People who use this meeting link must get your permission before they can join."
-                                }
+
                                 div {
                                     class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
                                     role: "alert",
                                     "aria-live": "assertive",
-                                    "Link copied to clipboard"
+                                    "Link copied"
                                 }
                             }
                         }
@@ -4098,7 +4072,8 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { id: "host-controls-nav",
+                        nav {
+                            id: "host-controls-nav",
                             class: "host",
                             style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             onmounted: move |evt| {
@@ -4175,7 +4150,10 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
+                                                let is_disabled = matches!(
+                                                    screen_share_state(),
+                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
+                                                );
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
@@ -4216,6 +4194,9 @@ pub fn AttendantsComponent(
                                                                         &framerate_constraint,
                                                                         &JsValue::from_str("ideal"),
                                                                         &JsValue::from_f64(10.0),
+                                                                        // StreamReady causes is_sharing() to return true,
+                                                                        // which gives Host share_screen=true so it picks
+                                                                        // up the pre-acquired stream and starts encoding.
                                                                     );
                                                                     let video_constraints = js_sys::Object::new();
                                                                     let _ = js_sys::Reflect::set(
@@ -4240,33 +4221,30 @@ pub fn AttendantsComponent(
 
                                                                     // This call happens synchronously in the click handler --
                                                                     // the browser returns a Promise without rejecting.
-                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                    let promise = match media_devices
+                                                                        .get_display_media_with_constraints(&constraints)
+                                                                    {
                                                                         Ok(p) => p,
                                                                         Err(e) => {
                                                                             log::error!("getDisplayMedia failed synchronously: {e:?}");
                                                                             return;
                                                                         }
                                                                     };
-
-                                                                    // Mark as requesting immediately so the button shows disabled
                                                                     screen_share_state.set(ScreenShareState::Requesting);
-
-                                                                    // Now await the promise asynchronously -- this is fine,
-                                                                    // the gesture requirement was satisfied above.
-                                                                    let cell = stream_cell.clone();
+                                                                    let cell = stream_cell.clone(); // User cancelled or browser denied
                                                                     wasm_bindgen_futures::spawn_local(async move {
                                                                         match JsFuture::from(promise).await {
                                                                             Ok(stream) => {
-                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                let media_stream: web_sys::MediaStream = stream
+                                                                                    .unchecked_into();
                                                                                 cell.borrow_mut().replace(media_stream);
-                                                                                // StreamReady causes is_sharing() to return true,
-                                                                                // which gives Host share_screen=true so it picks
-                                                                                // up the pre-acquired stream and starts encoding.
                                                                                 screen_share_state.set(ScreenShareState::StreamReady);
                                                                             }
                                                                             Err(e) => {
-                                                                                // User cancelled or browser denied
-                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                let is_cancel = js_sys::Reflect::get(
+                                                                                        &e,
+                                                                                        &JsValue::from_str("name"),
+                                                                                    )
                                                                                     .ok()
                                                                                     .and_then(|v| v.as_string())
                                                                                     .map(|n| n == "NotAllowedError")
@@ -4520,9 +4498,20 @@ pub fn AttendantsComponent(
                                                     let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
                                                         if hangup_is_guest {
-                                                            let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &room_token).await;
-                                                        } else if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
-                                                            log::error!("Error leaving meeting: {e}");
+                                                            let _ = crate::meeting_api::leave_meeting_as_guest(
+                                                                &meeting_id,
+                                                                &room_token,
+                                                            )
+                                                            .await;
+                                                        } else if let Err(e) =
+                                                            crate::meeting_api::leave_meeting(
+                                                                &meeting_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::error!(
+                                                                "Error leaving meeting: {e}"
+                                                            );
                                                         }
                                                         let _ = window().location().set_href("/");
                                                     });
@@ -4670,9 +4659,11 @@ pub fn AttendantsComponent(
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
                             local_user_display_name: current_display_name(),
-                            on_edit_self_name: {move |_| {
-                                display_name_modal_open.set(true);
-                            }},
+                            on_edit_self_name: {
+                                move |_| {
+                                    display_name_modal_open.set(true);
+                                }
+                            },
                         }
                     }
                 }

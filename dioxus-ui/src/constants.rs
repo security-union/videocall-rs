@@ -265,10 +265,22 @@ pub fn log_level() -> log::LevelFilter {
 /// into a different level. See [`RuntimeConfig::log_level`] for the precedence.
 pub fn log_level_explicit() -> Option<log::LevelFilter> {
     let raw = app_config().ok()?.log_level;
-    if raw.trim().eq_ignore_ascii_case("info") {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("info") {
         return None;
     }
-    parse_log_level(&raw)
+    let parsed = parse_log_level(trimmed);
+    if parsed.is_none() {
+        // A non-empty, non-"info" value that fails to parse is almost certainly
+        // an operator typo (e.g. "wran"). Without this warning the caller
+        // silently falls back to the Debug collection bump, so the operator
+        // believes they set a ceiling they didn't — surface it once at load.
+        log::warn!(
+            "Ignoring unparseable logLevel {trimmed:?} (expected one of \
+             off/error/warn/info/debug/trace); using default collection behaviour"
+        );
+    }
+    parsed
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

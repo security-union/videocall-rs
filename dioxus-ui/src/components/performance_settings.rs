@@ -1813,9 +1813,12 @@ fn ReceiveDiagFooter(
                         for p in top.iter().cloned() {
                             {
                                 let meta = receive::format_readout(&p.snap);
-                                // Pips: fill to layer+1 of `layer_count` (clamped to 3 dots).
-                                let filled = (p.snap.layer_index + 1).min(3);
-                                let total_pips = p.snap.layer_count.clamp(1, 3);
+                                // Pips track the ACTUAL layer count so a future
+                                // >3-layer kind shows e.g. 4 dots next to an "L4/4"
+                                // label (no hard cap at 3). The flex pip row + small
+                                // dots accommodate 4+ (#1095 P3).
+                                let total_pips = p.snap.layer_count.max(1);
+                                let filled = (p.snap.layer_index + 1).min(total_pips);
                                 // Full screen-reader / title text: peer name + the
                                 // kind-aware line (e.g. "alice: video L2/3 · 1280×720").
                                 let kind_label = match p.snap.kind {

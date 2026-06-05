@@ -6355,7 +6355,9 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   flex-direction: column;
   align-items: center;
   gap: 1px;
-  padding: 4px 2px 6px;
+  /* Horizontal 4px (was 2px) so a 4-char res like "1080p" doesn't kiss the chip
+     edge at the 540px breakpoint with 3 chips at the 44px min-width (#1095). */
+  padding: 4px 4px 6px;
   position: relative;
   background: var(--field-bg);
   border: 1px solid var(--border);

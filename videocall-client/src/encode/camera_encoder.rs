@@ -226,9 +226,60 @@ pub struct SimulcastSendSnapshot {
     /// How many layers are CURRENTLY active (encoded + sent). The AQ controller
     /// sheds the top layer(s) under congestion, so this can be `< effective_layers`.
     pub active_layers: u32,
-    /// Per-ACTIVE-layer breakdown (lowest layer first). Empty in single-stream
-    /// mode; length == `active_layers` in simulcast mode.
+    /// Per-EFFECTIVE-layer breakdown (lowest layer first). Empty in single-stream
+    /// mode; otherwise length == `effective_layers`. The top
+    /// `effective_layers - active_layers` entries are SHED layers, carried with
+    /// `bitrate_kbps == 0` so the UI can render them ghosted/dashed (the
+    /// `layer_id < active_layers` boundary distinguishes active vs shed). Issue
+    /// #1095: shed rungs must stay visible rather than the ladder silently
+    /// shrinking when the AQ drops the top layer under congestion.
     pub layers: Vec<SimulcastLayerInfo>,
+}
+
+/// Build the per-EFFECTIVE-layer simulcast breakdown (issue #1095), lowest layer
+/// first. One [`SimulcastLayerInfo`] per layer in `0..effective`:
+///   * resolution from `resolutions[layer_id]` (resolvable for ALL effective
+///     layers, shed included, since each layer's tier is fixed),
+///   * `bitrate_kbps` = the live value from `active_bitrates_kbps[layer_id]` for
+///     ACTIVE layers (`layer_id < active`), or **`0` for SHED layers**
+///     (`layer_id >= active`) — the UI lights up the dashed shed styling off the
+///     `layer_id < active` boundary, so a zero bitrate is the shed marker.
+///
+/// Pure (no atomics / clock) so the shed-vs-active boundary is host-testable
+/// without a live encoder. `active` is clamped to `[0, effective]` defensively.
+///
+/// `pub(crate)` so the screen encoder reuses the exact same shed logic.
+pub(crate) fn build_simulcast_layers(
+    effective: u32,
+    active: u32,
+    resolutions: &[(u32, u32)],
+    active_bitrates_kbps: &[u32],
+) -> Vec<SimulcastLayerInfo> {
+    let active = active.min(effective);
+    (0..effective)
+        .map(|layer_id| {
+            let (width, height) = resolutions
+                .get(layer_id as usize)
+                .copied()
+                .unwrap_or((0, 0));
+            // Active layers report their real targeted bitrate; shed layers
+            // (layer_id >= active) report 0 — the shed marker for the UI.
+            let bitrate_kbps = if layer_id < active {
+                active_bitrates_kbps
+                    .get(layer_id as usize)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            SimulcastLayerInfo {
+                layer_id,
+                bitrate_kbps,
+                width,
+                height,
+            }
+        })
+        .collect()
 }
 
 /// One simulcast layer's encoder and its per-layer mutable encode state
@@ -836,9 +887,14 @@ impl CameraEncoder {
 
     /// Live SEND-side simulcast diagnostics for the camera (issue #1095
     /// observability). Reads the active-layer count + per-layer target-bitrate
-    /// atomics published by the AQ control loop, and resolves each active layer's
-    /// fixed resolution from the SIMULCAST ladder. Panic-safe (indices clamped);
-    /// cheap to poll at the needle cadence.
+    /// atomics published by the AQ control loop, and resolves EVERY effective
+    /// layer's fixed resolution from the SIMULCAST ladder. Panic-safe (indices
+    /// clamped); cheap to poll at the needle cadence.
+    ///
+    /// Emits one rung per EFFECTIVE layer (the configured ladder depth), not just
+    /// the active ones, so a layer the AQ has SHED under congestion stays visible
+    /// (with `bitrate_kbps == 0`) instead of the ladder silently shrinking. The
+    /// `active_layers` field is the active-vs-shed boundary.
     ///
     /// In single-stream mode (effective layers == 1) this returns
     /// `simulcast_active = false` with an empty `layers` Vec.
@@ -852,29 +908,30 @@ impl CameraEncoder {
                 layers: Vec::new(),
             };
         }
-        // Fixed per-layer resolutions for this ladder (lowest layer first).
-        let tiers = simulcast_layers(effective as usize);
+        // Fixed per-layer resolutions for the FULL ladder (lowest layer first) —
+        // resolvable for every effective layer, shed included.
+        let resolutions: Vec<(u32, u32)> = simulcast_layers(effective as usize)
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
         // Active layer count is shed-aware (the AQ loop drops the top layer under
         // congestion); clamp it to the ladder size defensively.
         let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
             .min(effective)
             .max(1);
-        let bitrate_atomics = self.shared_layer_bitrates_bps.borrow();
-        let layers = (0..active)
-            .map(|layer_id| {
-                let bitrate_kbps = bitrate_atomics
-                    .get(layer_id as usize)
-                    .map(|a| a.load(Ordering::Relaxed) / 1000) // bps -> kbps
-                    .unwrap_or(0);
-                let tier = tiers.get(layer_id as usize);
-                SimulcastLayerInfo {
-                    layer_id,
-                    bitrate_kbps,
-                    width: tier.map(|t| t.max_width).unwrap_or(0),
-                    height: tier.map(|t| t.max_height).unwrap_or(0),
-                }
-            })
-            .collect();
+        // Live targeted bitrates (kbps) for the active layers, from the atomics.
+        let active_bitrates_kbps: Vec<u32> = {
+            let bitrate_atomics = self.shared_layer_bitrates_bps.borrow();
+            (0..active)
+                .map(|layer_id| {
+                    bitrate_atomics
+                        .get(layer_id as usize)
+                        .map(|a| a.load(Ordering::Relaxed) / 1000) // bps -> kbps
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let layers = build_simulcast_layers(effective, active, &resolutions, &active_bitrates_kbps);
         SimulcastSendSnapshot {
             simulcast_active: true,
             effective_layers: effective,
@@ -1943,9 +2000,92 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_layer_count, frame_is_healthy, is_fatal_encoder_error_message,
-        SIMULCAST_MAX_SUPPORTED_LAYERS,
+        build_simulcast_layers, clamp_layer_count, frame_is_healthy,
+        is_fatal_encoder_error_message, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
+
+    #[test]
+    fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {
+        // Issue #1095: the ladder must carry one rung per EFFECTIVE layer, with
+        // the top (effective - active) shed rungs at bitrate 0, so the UI can draw
+        // the ghosted/dashed shed rungs instead of the ladder silently shrinking.
+        let resolutions = [(640, 360), (960, 540), (1280, 720)];
+        let active_bitrates = [400u32, 900]; // only 2 active; L2 is shed
+        let layers = build_simulcast_layers(3, 2, &resolutions, &active_bitrates);
+
+        // All 3 effective rungs present (not just the 2 active).
+        assert_eq!(layers.len(), 3, "must emit one rung per EFFECTIVE layer");
+        assert_eq!(
+            layers,
+            vec![
+                SimulcastLayerInfo {
+                    layer_id: 0,
+                    bitrate_kbps: 400,
+                    width: 640,
+                    height: 360,
+                },
+                SimulcastLayerInfo {
+                    layer_id: 1,
+                    bitrate_kbps: 900,
+                    width: 960,
+                    height: 540,
+                },
+                // SHED layer: resolution still resolved, bitrate 0 = shed marker.
+                SimulcastLayerInfo {
+                    layer_id: 2,
+                    bitrate_kbps: 0,
+                    width: 1280,
+                    height: 720,
+                },
+            ]
+        );
+        // The shed boundary: layers[i].bitrate_kbps == 0 exactly for i >= active.
+        for (i, l) in layers.iter().enumerate() {
+            if (i as u32) >= 2 {
+                assert_eq!(l.bitrate_kbps, 0, "layer {i} is shed → bitrate 0");
+            } else {
+                assert!(l.bitrate_kbps > 0, "layer {i} is active → real bitrate");
+            }
+        }
+    }
+
+    #[test]
+    fn simulcast_layers_all_active_have_no_shed() {
+        // active == effective → every rung carries a real bitrate, none shed.
+        let resolutions = [(640, 360), (960, 540), (1280, 720)];
+        let active_bitrates = [400u32, 900, 1500];
+        let layers = build_simulcast_layers(3, 3, &resolutions, &active_bitrates);
+        assert_eq!(layers.len(), 3);
+        assert!(layers.iter().all(|l| l.bitrate_kbps > 0));
+        assert_eq!(layers[2].bitrate_kbps, 1500);
+    }
+
+    #[test]
+    fn simulcast_layers_clamp_active_and_missing_inputs() {
+        // active > effective is clamped (no panic), and missing resolution /
+        // bitrate slots default to 0 rather than indexing out of bounds.
+        let layers = build_simulcast_layers(2, 99, &[(640, 360)], &[]);
+        assert_eq!(layers.len(), 2);
+        // Resolution for L1 is missing → (0,0); bitrate atomics empty → 0.
+        assert_eq!(
+            layers[0],
+            SimulcastLayerInfo {
+                layer_id: 0,
+                bitrate_kbps: 0,
+                width: 640,
+                height: 360,
+            }
+        );
+        assert_eq!(
+            layers[1],
+            SimulcastLayerInfo {
+                layer_id: 1,
+                bitrate_kbps: 0,
+                width: 0,
+                height: 0,
+            }
+        );
+    }
 
     #[test]
     fn fatal_encoder_errors_match_closed_codec_signatures() {

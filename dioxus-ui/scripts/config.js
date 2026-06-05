@@ -38,14 +38,18 @@ window.__APP_CONFIG = ({
   consoleLogUploadEnabled: "false",
   mockPeersEnabled: "false",
   // WASM logger max level. Valid values (case-insensitive): "trace", "debug",
-  // "info", "warn", "error". Defaults to "info" (and behaves as "info" if the
-  // key is absent). Operators can change this WITHOUT a code change to raise or
-  // lower client log verbosity.
-  // Interaction with consoleLogUploadEnabled: when collection is ON, the level
-  // is bumped to "debug" by default — UNLESS logLevel is explicitly set here to
-  // a non-"info" value, in which case that value wins (e.g. "warn" reduces
-  // capture to cut per-packet log volume; "trace" opts into the per-packet
-  // hot-path logs, which are emitted at trace! and otherwise stay off).
+  // "info", "warn", "error" (also "off"). Operators can change this WITHOUT a
+  // code change to raise or lower client log verbosity.
+  //
+  // Interaction with consoleLogUploadEnabled:
+  //   - Key PRESENT (any value, including "info"): that level is the CEILING,
+  //     even while collecting — e.g. "info"/"warn" cut per-packet log volume;
+  //     "trace" opts into the per-packet hot-path logs (emitted at trace!,
+  //     otherwise off). This is how you reduce capture on a hot deployment.
+  //   - Key ABSENT: when collection is ON the level bumps to "debug" (historical
+  //     capture behaviour, so meeting analysis keeps working). To get that
+  //     debug-on-collection default, OMIT this key — do not set it to "info".
+  // The explicit "info" below caps local dev at info (collection is off here).
   logLevel: "info",
   // EXPERIMENTAL, TEST-ONLY: max simulcast layers a publisher may emit
   // (issue #989). 1 = feature OFF (single stream, identical to pre-simulcast).

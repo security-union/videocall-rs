@@ -933,14 +933,16 @@ pub fn AttendantsComponent(
                         //
                         // PRECEDENCE (console-log perf fix):
                         //  - If the operator EXPLICITLY set `logLevel` in config.js
-                        //    (any value other than the "info" default), honour it
-                        //    as the ceiling — e.g. `logLevel: "warn"` deliberately
+                        //    (ANY value, INCLUDING "info"), honour it as the ceiling
+                        //    — e.g. `logLevel: "info"` or `"warn"` deliberately
                         //    REDUCES capture to cut per-packet log volume on a hot
                         //    deployment, and `logLevel: "trace"` opts INTO the
                         //    per-packet hot-path logs (which are emitted at trace!).
-                        //  - Otherwise (absent / default "info"), bump to Debug —
-                        //    the historical collection behaviour, preserved so
-                        //    existing meeting analysis keeps working unchanged.
+                        //  - Otherwise (key ABSENT → `log_level_explicit()` is None),
+                        //    bump to Debug — the historical collection behaviour,
+                        //    preserved so existing meeting analysis keeps working
+                        //    unchanged. `Option<String>` lets us tell "absent" apart
+                        //    from an explicit "info" (a defaulted String could not).
                         //
                         // We use Debug rather than Trace by default (per ticket
                         // #307) because Trace is prohibitively noisy in WASM and

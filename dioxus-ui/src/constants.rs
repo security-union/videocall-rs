@@ -146,9 +146,9 @@ pub struct RuntimeConfig {
     pub experimental_simulcast_max_layers: u32,
     /// Operator dial for the WASM logger's max level (issue: console-log perf).
     /// Valid values (case-insensitive): `trace` / `debug` / `info` / `warn` /
-    /// `error`. **Default: `"info"`** via [`default_log_level`] so behaviour is
-    /// unchanged when the key is absent (matches the historical hardcoded init
-    /// level in `main.rs`).
+    /// `error` (`off` is also accepted). When **absent** the logger initialises
+    /// at Info — matching the historical hardcoded init level in `main.rs` — so
+    /// behaviour is unchanged unless an operator opts in.
     ///
     /// This lets operators raise or lower client log verbosity from the Helm
     /// `runtimeConfig` (`config.js`) WITHOUT a code change or rebuild — useful
@@ -156,30 +156,28 @@ pub struct RuntimeConfig {
     /// raising verbosity for a debugging session.
     ///
     /// Interaction with console-log collection (see `attendants.rs`): when
-    /// collection is on, the level is bumped to Debug by default — UNLESS the
-    /// operator explicitly set `logLevel` to a non-default value, in which case
-    /// the explicit value wins (acts as a ceiling). Per-packet hot-path logs are
-    /// emitted at `trace!`, so they stay off at the Debug collection ceiling and
-    /// only appear if an operator explicitly opts into `logLevel: "trace"`.
+    /// collection is on and `logLevel` is **absent**, the level is bumped to
+    /// Debug (the historical capture behaviour). When `logLevel` is **explicitly
+    /// set** — INCLUDING `"info"` — that value wins and caps collection at it
+    /// (e.g. `"info"`/`"warn"` cut per-packet log volume; `"trace"` opts into the
+    /// per-packet hot-path logs, which are emitted at `trace!` and otherwise stay
+    /// off even at the Debug ceiling).
     ///
-    /// CRITICAL (config.js bind-mount trap, see project memory): this is
-    /// `#[serde(default = ...)]` so a stale bind-mounted `config.js` predating
-    /// the key still parses to the code default (`"info"`), never a startup-
-    /// bricking parse failure.
+    /// `Option<String>` (not a defaulted `String`) so we can distinguish "key
+    /// ABSENT" (`None` → Debug bump when collecting) from "explicitly `info`"
+    /// (`Some("info")` → caps collection at info). A defaulted `String` collapsed
+    /// those cases and made `info` unusable as a ceiling.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): `#[serde(default)]`
+    /// means a stale bind-mounted `config.js` predating the key parses to `None`,
+    /// never a startup-bricking parse failure.
     #[serde(rename = "logLevel")]
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 fn default_vad_threshold() -> f32 {
     0.02
-}
-
-/// Default `logLevel` when the key is absent from `config.js` — `"info"`, which
-/// matches the historical hardcoded `console_log::init_with_level(Level::Info)`
-/// so behaviour is unchanged unless an operator opts in.
-fn default_log_level() -> String {
-    "info".to_string()
 }
 
 /// Default simulcast layer ceiling when `experimentalSimulcastMaxLayers` is
@@ -233,8 +231,8 @@ pub fn experimental_simulcast_max_layers() -> u32 {
 }
 
 /// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/
-/// `error`) into a [`log::LevelFilter`]. Returns `None` for an empty or
-/// unrecognised string so callers can apply their own fallback.
+/// `error`, plus `off`) into a [`log::LevelFilter`]. Returns `None` for an empty
+/// or unrecognised string so callers can apply their own fallback.
 fn parse_log_level(s: &str) -> Option<log::LevelFilter> {
     use std::str::FromStr;
     let trimmed = s.trim();
@@ -246,41 +244,44 @@ fn parse_log_level(s: &str) -> Option<log::LevelFilter> {
     log::LevelFilter::from_str(trimmed).ok()
 }
 
-/// Configured WASM logger max level, read from `window.__APP_CONFIG.logLevel`.
-/// Falls back to [`log::LevelFilter::Info`] when the key is absent, empty,
-/// unparseable, or the config can't be read — preserving the historical
-/// hardcoded init level so a missing/stale config behaves as before.
-pub fn log_level() -> log::LevelFilter {
-    app_config()
-        .ok()
-        .and_then(|c| parse_log_level(&c.log_level))
-        .unwrap_or(log::LevelFilter::Info)
-}
-
-/// The operator's EXPLICIT `logLevel`, or `None` when it is absent / empty /
-/// left at the `"info"` default. serde cannot distinguish "key absent" from
-/// "key explicitly set to info", so we treat the default value `"info"` as
-/// "not explicitly overridden" — this is what lets the console-log collection
-/// bump fall back to Debug (its historical behaviour) unless an operator opted
-/// into a different level. See [`RuntimeConfig::log_level`] for the precedence.
+/// The operator's EXPLICITLY configured `logLevel`, or `None` when the key is
+/// absent / empty / the config can't be read.
+///
+/// This is the single source of truth for both startup init ([`log_level`]) and
+/// the console-log collection ceiling (`attendants.rs`). Unlike the prior
+/// design it does NOT treat `"info"` as "unset": an explicit `Some("info")` is
+/// returned and honoured, so `logLevel: "info"` works as a real ceiling that
+/// caps collection at info instead of letting it bump to Debug.
+///
+/// A non-empty value that fails to parse (operator typo, e.g. `"wran"`) returns
+/// `None` AND emits a `warn!` so the misconfiguration is visible rather than
+/// silently falling back. Because `main.rs` calls this at startup (via
+/// [`log_level`]) — not only the collection path — the warning fires regardless
+/// of whether console-log upload is enabled. (It may fire again when collection
+/// activates; a typo'd config warning twice is acceptable and still actionable.)
 pub fn log_level_explicit() -> Option<log::LevelFilter> {
-    let raw = app_config().ok()?.log_level;
+    let raw = app_config().ok()?.log_level?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("info") {
+    if trimmed.is_empty() {
         return None;
     }
     let parsed = parse_log_level(trimmed);
     if parsed.is_none() {
-        // A non-empty, non-"info" value that fails to parse is almost certainly
-        // an operator typo (e.g. "wran"). Without this warning the caller
-        // silently falls back to the Debug collection bump, so the operator
-        // believes they set a ceiling they didn't — surface it once at load.
         log::warn!(
             "Ignoring unparseable logLevel {trimmed:?} (expected one of \
-             off/error/warn/info/debug/trace); using default collection behaviour"
+             off/error/warn/info/debug/trace); falling back to Info"
         );
     }
     parsed
+}
+
+/// Configured WASM logger max level for startup init. Falls back to
+/// [`log::LevelFilter::Info`] when the key is absent, empty, unparseable, or the
+/// config can't be read — preserving the historical hardcoded init level so a
+/// missing/stale config behaves as before. Delegates to [`log_level_explicit`]
+/// so a typo's `warn!` is emitted exactly once, here at startup.
+pub fn log_level() -> log::LevelFilter {
+    log_level_explicit().unwrap_or(log::LevelFilter::Info)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {

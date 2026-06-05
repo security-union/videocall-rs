@@ -105,58 +105,111 @@ import { waitForServices } from "../helpers/wait-for-services";
 // ---------------------------------------------------------------------------
 
 /**
- * Drive a fresh page through the #1061 pre-join device-preview screen into the
- * meeting grid.
+ * Drive a fresh page from the HOME FORM into the meeting grid, navigating the
+ * #1061 pre-join device-preview screen on the way.
  *
- * The old home-form flow (type into #meeting-id/#username, press Enter) no
- * longer lands directly in the grid: every join now stops on the pre-join
- * device-preview card (issue #1061/#959), which this helper must navigate. We
- * use the canonical pattern proven by prejoin-device-preview.spec.ts:
- *   1. Seed `vc_display_name` (read by the meeting page) and
- *      `vc_prejoin_camera_on=true` (so the publisher's camera is ON and the
- *      encoder actually runs — REQUIRED for the receive-needle assertions; the
- *      pre-join camera defaults to OFF, which would leave the send encoder idle
- *      and nothing for peers to decode) via an init script BEFORE navigation.
- *   2. Navigate straight to `/meeting/{id}` (no home form) — the pre-join card
- *      renders with a "Start Meeting"/"Join Meeting" action button.
- *   3. Click that button to enter the meeting; resolve once `#grid-container`
- *      is visible.
+ * This mirrors the PROVEN 2-context flow in `two-users-meeting.spec.ts`
+ * (which also uses `createAuthenticatedContext`): go to the home page, type the
+ * meeting id + display name, press Enter, then race the pre-join Start/Join
+ * action button against the grid. A direct `goto('/meeting/{id}')` did NOT work
+ * for these contexts (it failed to surface the pre-join card / crashed) — the
+ * home-form path is what reliably establishes the display-name context the
+ * meeting page needs, so we replicate it exactly here.
+ *
+ * `vc_prejoin_camera_on=true` is seeded via an init script BEFORE the app boots
+ * so the publisher's camera is ON and the encoder actually emits video — the
+ * receive-side needle assertions need a real decoded stream, and the pre-join
+ * camera defaults to OFF. (`AttendantsComponent` reads `load_preferred_camera_on`
+ * at join, so this carries through both the Start-Meeting click and the
+ * auto-join effect.)
  *
  * Applies to BOTH publisher and receiver contexts.
  */
 async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
-  // Seed display name + camera-ON BEFORE the app boots. addInitScript runs on
-  // every navigation in this page prior to the page's own scripts.
-  await page.addInitScript((name: string) => {
+  // Pre-join camera defaults to OFF; force it ON before the app boots so the
+  // publisher emits video. addInitScript runs on every navigation in this page
+  // before the page's own scripts.
+  await page.addInitScript(() => {
     try {
-      window.localStorage.setItem("vc_display_name", name);
-      // Pre-join camera defaults to OFF; force it ON so the publisher emits
-      // video (the receive-side needles need a real decoded stream).
       window.localStorage.setItem("vc_prejoin_camera_on", "true");
     } catch {
-      /* storage may be unavailable pre-navigation; the meeting origin sets it */
+      /* storage may be unavailable pre-navigation; the app origin sets it */
     }
-  }, displayName);
+  });
 
-  await page.goto(`/meeting/${meetingId}`);
+  // ── Home form: enter the meeting id + display name, then submit (Enter). ──
+  await page.goto("/");
+  await page.waitForTimeout(1500);
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+
+  // Display name is a controlled input — clear before typing to handle pre-fill.
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(displayName, { delay: 50 });
+  await page.waitForTimeout(500);
+  await page.locator("#username").press("Enter");
+
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  await page.waitForTimeout(1500);
 
-  // The pre-join device-preview card presents the Start/Join action button.
+  // ── Pre-join card → grid. The meeting page may auto-join straight to the grid
+  //    once the display name is set, OR present the pre-join card with a
+  //    Start/Join action button. Race both. ──
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const grid = page.locator("#grid-container");
 
-  // Either the pre-join button appears (the normal path), or — defensively — a
-  // build that auto-joins lands straight in the grid. Race both.
   const result = await Promise.race([
     joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
     grid.waitFor({ timeout: 30_000 }).then(() => "auto" as const),
   ]);
 
   if (result === "join") {
-    // The button is not interactive the instant it renders; a brief settle
-    // mirrors the proven helper. Swallow click-after-detach in case the build
-    // auto-transitioned past the pre-join card.
-    await page.waitForTimeout(800);
+    // Deterministically start the camera on the pre-join card BEFORE joining so
+    // the publisher actually emits video (the receive-side needle assertions
+    // need a real decoded stream). The persisted camera-ON preference alone is
+    // NOT sufficient: `resolve_initial_enabled` (context.rs) only enables the
+    // camera at join when the pre-join device list is populated, which requires
+    // getUserMedia to have run. So grant media + ensure the camera toggle is ON
+    // + await a live preview track, then click the action button.
+    const allow = page.locator('[data-testid="prejoin-permission-allow"]');
+    if (await allow.isVisible().catch(() => false)) {
+      await allow.click();
+      await page
+        .locator('[data-testid="prejoin-permission-prompt"]')
+        .waitFor({ state: "hidden", timeout: 15_000 })
+        .catch(() => {
+          /* already granted / prompt absent */
+        });
+    }
+
+    const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
+    if (await cameraToggle.isVisible().catch(() => false)) {
+      if ((await cameraToggle.getAttribute("aria-pressed")) !== "true") {
+        await cameraToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+      // Best-effort wait for a live preview track so the device list is
+      // populated before join (this is what starts the in-meeting encoder).
+      await expect
+        .poll(
+          async () =>
+            page
+              .locator('[data-testid="prejoin-camera-preview"]')
+              .evaluate((el) => {
+                const v = el as HTMLVideoElement;
+                const s = v.srcObject as MediaStream | null;
+                return s ? s.getVideoTracks().filter((t) => t.readyState === "live").length : 0;
+              })
+              .catch(() => 0),
+          { timeout: 15_000 },
+        )
+        .toBeGreaterThan(0);
+    }
+
+    await page.waitForTimeout(500);
     await joinButton.click().catch(() => {
       /* auto-join already unmounted the pre-join button */
     });

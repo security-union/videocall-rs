@@ -103,13 +103,26 @@ interface PerformancePreference {
  * in-meeting flow used by `settings-modal.spec.ts`. Resolves once
  * `#grid-container` is visible (the marker that the in-meeting UI is up).
  */
-async function joinMeeting(page: Page, testLabel: string): Promise<void> {
+interface JoinOpts {
+  /**
+   * When true, deterministically drive the #1061 pre-join card to turn the
+   * camera ON before joining (grant media → toggle camera → await a live video
+   * track → join). Use this for tests that assert the live SEND video VU
+   * readout — the LS preference seed alone is NOT enough because
+   * `resolve_initial_enabled` (context.rs) only enables the camera at join when
+   * the pre-join device list is populated, which requires getUserMedia to have
+   * run first. Defaults to false (camera left at its persisted state).
+   */
+  ensureCameraOn?: boolean;
+}
+
+async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): Promise<void> {
   const meetingId = `e2e_perf_${testLabel}_${Date.now()}`;
 
-  // The #1061 pre-join card defaults the camera to OFF. Force it ON before the
-  // app boots so the SEND encoder actually runs — otherwise the live send video
-  // VU readout reads "Camera off" instead of `{w}x{h}…kbps`. addInitScript runs
-  // on every navigation (including the post-reload one) before the page scripts.
+  // Seed the persisted camera-ON preference before the app boots. This makes the
+  // pre-join camera toggle default ON; combined with `ensureCameraOn` (which
+  // drives the UI so the device list is populated) it guarantees the SEND
+  // encoder runs. addInitScript runs on every navigation (incl. post-reload).
   await page.addInitScript(() => {
     try {
       window.localStorage.setItem("vc_prejoin_camera_on", "true");
@@ -132,10 +145,61 @@ async function joinMeeting(page: Page, testLabel: string): Promise<void> {
 
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
 
-  // The meeting page may auto-join (grid appears directly) or present a
-  // Start/Join button. Race both so either path lands us in the grid.
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const grid = page.locator("#grid-container");
+
+  if (opts.ensureCameraOn) {
+    // Deterministic camera-on path (mirrors prejoin-device-preview.spec.ts
+    // "camera ON in pre-join carries into the meeting"). The pre-join card must
+    // be present (it coexists with the action button); grant media so the device
+    // list populates, ensure the camera toggle is ON and a live track is
+    // acquired, THEN click the action button. This guarantees the in-meeting
+    // SEND encoder actually starts (so the VU readout shows {w}x{h}…kbps).
+    await joinButton.waitFor({ timeout: 30_000 });
+
+    // Grant media if the permission prompt is showing (auto-granted by the
+    // --use-fake-ui-for-media-stream flag once clicked).
+    const allow = page.locator('[data-testid="prejoin-permission-allow"]');
+    if (await allow.isVisible().catch(() => false)) {
+      await allow.click();
+      await expect(page.locator('[data-testid="prejoin-permission-prompt"]')).toBeHidden({
+        timeout: 15_000,
+      });
+    }
+
+    // Ensure the camera toggle is ON (it defaults ON via the seeded preference,
+    // but click it on if it somehow reads off).
+    const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
+    await cameraToggle.waitFor({ timeout: 15_000 });
+    if ((await cameraToggle.getAttribute("aria-pressed")) !== "true") {
+      await cameraToggle.click();
+    }
+    await expect(cameraToggle).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
+
+    // Wait for a live preview video track so the device list is populated before
+    // join (this is what makes the in-meeting encoder start).
+    await expect
+      .poll(
+        async () =>
+          page
+            .locator('[data-testid="prejoin-camera-preview"]')
+            .evaluate((el) => {
+              const v = el as HTMLVideoElement;
+              const s = v.srcObject as MediaStream | null;
+              return s ? s.getVideoTracks().filter((t) => t.readyState === "live").length : 0;
+            })
+            .catch(() => 0),
+        { timeout: 15_000 },
+      )
+      .toBeGreaterThan(0);
+
+    await joinButton.click();
+    await expect(grid).toBeVisible({ timeout: 15_000 });
+    return;
+  }
+
+  // Default path: the meeting page may auto-join (grid appears directly) or
+  // present a Start/Join button. Race both so either path lands us in the grid.
   const which = await Promise.race([
     joinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
     grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
@@ -339,10 +403,17 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
     await expect(popover).toHaveCount(0);
 
-    // Re-open, then outside-click dismisses.
+    // Re-open, then outside-click dismisses. The outside-click is implemented as
+    // a transparent full-viewport scrim (`.perf-help-scrim`) rendered above the
+    // panel while the popover is open; clicking it is the dismiss mechanism.
+    // (Clicking a panel control like the range-value would be intercepted by the
+    // overlaying scrim, so target the scrim directly — that is what a real
+    // outside click hits.)
     await helpBtn.click();
     await expect(popover).toBeVisible();
-    await panel.locator('[data-testid="perf-video-range-value"]').click();
+    const scrim = page.locator(".perf-help-scrim");
+    await expect(scrim).toBeVisible();
+    await scrim.click();
     await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
     await expect(popover).toHaveCount(0);
   });
@@ -441,7 +512,11 @@ test.describe("Performance settings panel (#961)", () => {
   test("VU gauges are live: video readout shows a real value, screen shows 'Not sharing'", async ({
     page,
   }) => {
-    await joinMeeting(page, "vu_live");
+    // ensureCameraOn drives the pre-join card to actually start the camera (grant
+    // + toggle + live track) so the in-meeting SEND encoder runs — otherwise the
+    // video VU readout stays "Camera off" (the LS preference alone doesn't
+    // populate the pre-join device list that resolve_initial_enabled requires).
+    await joinMeeting(page, "vu_live", { ensureCameraOn: true });
     await openPerformanceTab(page);
     // The live SEND needles (encoder snapshot) only mount on the Send direction.
     await selectSendDirection(page);

@@ -45,7 +45,6 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use videocall_aq::constants::{AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, VIDEO_QUALITY_TIERS};
 use videocall_aq::{default_clock, Clock, EncoderBitrateController, TierTransitionRecord};
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -86,10 +85,13 @@ pub struct AudioEncodeSettings {
 ///   lets producers detect a tier change with a single Acquire load.
 pub struct BotAq {
     inner: Mutex<EncoderBitrateController>,
-    /// Target FPS shared with the inner PID controller. The bot currently
-    /// keeps this fixed after construction — changing the `target_fps` atomic
-    /// would also change the controller's setpoint.
+    /// Target FPS shared with the inner controller. The bot keeps this fixed
+    /// after construction.
     target_fps: Arc<AtomicU32>,
+    /// Clock used to timestamp `tick()` calls (issue #1108). The same clock
+    /// instance also lives inside the controller; the bot holds a clone so its
+    /// `tick()` wrapper can read `now_ms()` without locking the controller.
+    clock: Arc<dyn Clock>,
 
     // --- Video tier snapshot (mirrors `controller.current_video_tier()`) ---
     video_bitrate_kbps: AtomicU32,
@@ -122,9 +124,9 @@ pub struct BotAq {
 
     /// Optional Prometheus metrics handle + pre-built label pair.
     ///
-    /// When set, every [`Self::process_diagnostics`] call refreshes the
-    /// `bot_aq_*` gauges. Kept behind the `metrics` feature so non-metrics
-    /// builds do not pay the extra field or any storage for the labels.
+    /// When set, every [`Self::tick`] call refreshes the `bot_aq_*` gauges.
+    /// Kept behind the `metrics` feature so non-metrics builds do not pay the
+    /// extra field or any storage for the labels.
     #[cfg(feature = "metrics")]
     metrics: Mutex<Option<MetricsBinding>>,
 }
@@ -149,12 +151,11 @@ impl BotAq {
         let initial_video = &VIDEO_QUALITY_TIERS[DEFAULT_VIDEO_TIER_INDEX];
         let target_fps = Arc::new(AtomicU32::new(initial_video.target_fps));
 
-        // Use the initial tier's ideal bitrate as the PID's anchor so the
-        // first correction does not over- or under-shoot.
+        // Use the initial tier's ideal bitrate as the controller's anchor.
         let controller = EncoderBitrateController::with_clock(
             initial_video.ideal_bitrate_kbps,
             Arc::clone(&target_fps),
-            clock,
+            Arc::clone(&clock),
         );
 
         // Seed audio snapshot from the controller's current audio tier.
@@ -163,6 +164,7 @@ impl BotAq {
         let bot_aq = Self {
             inner: Mutex::new(controller),
             target_fps,
+            clock,
             video_bitrate_kbps: AtomicU32::new(initial_video.ideal_bitrate_kbps),
             video_max_width: AtomicU32::new(initial_video.max_width),
             video_max_height: AtomicU32::new(initial_video.max_height),
@@ -216,29 +218,69 @@ impl BotAq {
         Self::new(default_clock())
     }
 
-    /// Feed a diagnostics packet into the controller. If the tier changes as
-    /// a result, re-publish the new tier snapshot and bump the epoch.
-    pub fn process_diagnostics(&self, pkt: DiagnosticsPacket) {
-        let mut ctrl = match self.inner.lock() {
+    /// Inject the (simulated) encoder-queue backpressure depth (issue #1108).
+    ///
+    /// The native bot has no WebCodecs encoder, so in normal operation it feeds
+    /// `0` (no backpressure) and therefore never degrades on the gradual axis —
+    /// it only reacts to the explicit `force_*` signals. Tests use this to
+    /// synthesize backpressure and exercise the shed path.
+    pub fn inject_encoder_queue_depth(&self, depth: u32) {
+        let mut ctrl = self.lock_ctrl();
+        ctrl.observe_encoder_queue_depth(depth);
+    }
+
+    /// Aggressively cut quality on a self-targeted server CONGESTION signal
+    /// (issue #1108 thin wrapper over the controller's kept `force_congestion_cut`).
+    /// Republishes the tier snapshot if the tier changed.
+    pub fn force_congestion_cut(&self) {
+        let changed = {
+            let mut ctrl = self.lock_ctrl();
+            ctrl.force_congestion_cut()
+        };
+        if changed {
+            self.tick();
+        }
+    }
+
+    /// Step video quality down on WS/relay backpressure (issue #1108 thin
+    /// wrapper over the controller's kept `force_video_step_down`).
+    pub fn force_video_step_down(&self) {
+        let changed = {
+            let mut ctrl = self.lock_ctrl();
+            ctrl.force_video_step_down()
+        };
+        if changed {
+            self.tick();
+        }
+    }
+
+    /// Lock the inner controller, recovering from a poisoned mutex (AQ is
+    /// non-critical: log and continue rather than propagating the panic).
+    fn lock_ctrl(&self) -> std::sync::MutexGuard<'_, EncoderBitrateController> {
+        match self.inner.lock() {
             Ok(g) => g,
-            // Mutex is only poisoned on panic; AQ is non-critical, so log and
-            // continue rather than propagating the panic further.
             Err(e) => {
                 warn!("BotAq: controller mutex poisoned, recovering: {e}");
                 e.into_inner()
             }
-        };
+        }
+    }
 
-        // Sender encoder backpressure (issue #1108, Phase B). The bot has no
-        // WebCodecs encoder, so it has no encode-queue depth to report — feed 0
-        // (no backpressure). Keeps the native consumer compiling against the new
-        // target-agnostic API and stays behavior-neutral (Stage 1 stores only).
-        ctrl.observe_encoder_queue_depth(0);
+    /// Advance the AQ one tick (issue #1108): map the (bot-injected, normally 0)
+    /// encoder backpressure into a degrade/recover decision and apply it, then
+    /// publish telemetry and re-snapshot the tier if it changed. Replaces the
+    /// former `process_diagnostics` — the bot no longer feeds receiver FPS into
+    /// the AQ. Called on a periodic timer from `main`.
+    pub fn tick(&self) {
+        let now = self.clock.now_ms();
+        let mut ctrl = self.lock_ctrl();
 
-        let _ = ctrl.process_diagnostics_packet(pkt);
+        ctrl.tick(now);
 
-        // Always publish the latest PID-derived telemetry — these are useful
-        // for health reporting even when the tier has not changed.
+        // Always publish the latest telemetry — useful for health reporting even
+        // when the tier has not changed. NOTE(#1108): `last_fps_ratio` /
+        // `last_bitrate_ratio` are now NaN (receiver FPS removed), and
+        // `last_p75_peer_fps` is repointed to the encoder queue depth.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
         let p75_peer_fps = ctrl.last_p75_peer_fps() as f32;
         let fps_ratio = ctrl.last_fps_ratio() as f32;
@@ -252,9 +294,7 @@ impl BotAq {
         self.last_bitrate_ratio_bits
             .store(bitrate_ratio.to_bits(), Ordering::Relaxed);
 
-        // Refresh per-scrape Prometheus gauges. Done on every packet so that
-        // even without a tier change, the dashboard sees live fps_ratio /
-        // bitrate_ratio / target_bitrate values.
+        // Refresh per-scrape Prometheus gauges every tick.
         #[cfg(feature = "metrics")]
         self.publish_live_metrics(
             target_bitrate,
@@ -517,20 +557,6 @@ impl BotAq {
 mod tests {
     use super::*;
     use videocall_aq::TestClock;
-    use videocall_types::protos::diagnostics_packet::{DiagnosticsPacket, VideoMetrics};
-    use videocall_types::protos::media_packet::media_packet::MediaType;
-
-    fn make_packet(target_id: &str, fps: f32) -> DiagnosticsPacket {
-        let mut packet = DiagnosticsPacket::new();
-        packet.sender_id = "peer-sender".to_string();
-        packet.target_id = target_id.to_string();
-        packet.media_type = MediaType::VIDEO.into();
-        let mut video_metrics = VideoMetrics::new();
-        video_metrics.fps_received = fps;
-        video_metrics.bitrate_kbps = 500;
-        packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
-        packet
-    }
 
     #[test]
     fn initial_snapshot_matches_default_tier() {
@@ -546,20 +572,23 @@ mod tests {
         assert_eq!(aq.tier_epoch(), 0);
     }
 
+    /// Issue #1108: with no injected encoder backpressure (the bot's normal
+    /// state — no WebCodecs encoder), ticking must never change the tier.
     #[test]
-    fn good_fps_keeps_tier_stable() {
-        let aq = BotAq::new(Arc::new(TestClock::new(0)));
-        // A handful of good FPS packets should not trigger a tier change.
-        for i in 0..5 {
-            let mut p = make_packet("peer1", 25.0);
-            p.timestamp_ms = i as u64;
-            aq.process_diagnostics(p);
+    fn ticking_with_no_backpressure_keeps_tier_stable() {
+        let clock = Arc::new(TestClock::new(0));
+        let aq = BotAq::new(clock.clone() as Arc<dyn Clock>);
+        // Walk well past warmup and tick many times at the default (0) depth.
+        for i in 0..30 {
+            clock.set_ms(10_000 + i * 1_000);
+            aq.tick();
         }
         assert_eq!(
             aq.tier_epoch(),
             0,
-            "no tier change expected under good conditions"
+            "no tier change expected when the bot reports no backpressure"
         );
+        assert_eq!(aq.video_tier_index(), DEFAULT_VIDEO_TIER_INDEX as u32);
     }
 
     #[test]

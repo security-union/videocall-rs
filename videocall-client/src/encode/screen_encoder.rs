@@ -17,8 +17,6 @@
  */
 
 use crate::connection::MediaStreamKey;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
@@ -31,7 +29,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -512,10 +509,13 @@ impl ScreenEncoder {
         })
     }
 
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
+    /// Spawn the screen-encoder AQ control loop (issue #1108: now a self-timer).
+    ///
+    /// Mirrors `CameraEncoder::set_encoder_control`: receiver FPS no longer
+    /// drives the sender AQ, so this ticks at `AQ_TICK_INTERVAL_MS` off the
+    /// screen encoder's own backpressure (`shared_encoder_queue_depth`) plus the
+    /// re-election signal, instead of consuming a diagnostics channel.
+    pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
@@ -537,7 +537,7 @@ impl ScreenEncoder {
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the control loop
         // READS the depth the encode loop published and forwards it to the
-        // controller before each diagnostics packet.
+        // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
@@ -563,7 +563,14 @@ impl ScreenEncoder {
                     *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
                 }
             }
-            while let Some(event) = diagnostics_receiver.next().await {
+            // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
+            // instead of waiting on receiver diagnostics.
+            loop {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
+                ))
+                .await;
+                let now = js_sys::Date::now();
                 // Apply user screen-quality bounds if the UI changed them since
                 // we last applied. Cheap generation check; the controller snaps
                 // the current tier into range and surfaces it via
@@ -583,16 +590,15 @@ impl ScreenEncoder {
                     }
                 }
 
-                // Sender encoder backpressure (issue #1108, Phase B). Feed the
-                // depth the encode loop published into the screen controller
-                // BEFORE the diagnostics packet drives the rest of AQ. Stage 1:
-                // the controller only stores this — no shed/tier effect — so AQ
-                // behavior is byte-identical.
+                // Sender encoder backpressure (issue #1108). Feed the depth the
+                // encode loop published into the screen controller, then advance
+                // the AQ one tick. This is the SOLE gradual quality axis now:
+                // receiver FPS no longer reaches the sender AQ.
                 encoder_control.observe_encoder_queue_depth(
                     shared_encoder_queue_depth.load(Ordering::Relaxed),
                 );
-
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                encoder_control.tick(now);
+                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
                 // Screen simulcast (issue #989, Phase 3b): publish the active
                 // layer count + per-layer target bitrates to the encode loop

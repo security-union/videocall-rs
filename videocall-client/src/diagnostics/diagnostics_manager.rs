@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
+use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
@@ -607,7 +607,9 @@ pub enum SenderDiagnosticEvent {
     SetReportingInterval(u64),
     HeartbeatTick,
     AddEncoderCallback(Callback<DiagnosticsPacket>),
-    AddSenderChannel(UnboundedSender<DiagnosticsPacket>, MediaType),
+    // NOTE(#1108): `AddSenderChannel` (the encoder-AQ fan-in) was removed in
+    // Stage 2 — receiver FPS no longer feeds the sender AQ. Ingested peer
+    // diagnostics still drive the global broadcast + UI stats (sinks 1 & 2).
 }
 
 // Structure to track stats for a media stream we're sending
@@ -664,7 +666,7 @@ struct SenderDiagnosticWorker {
     stream_stats: HashMap<String, HashMap<MediaType, StreamStats>>, // peer_id -> media_type -> stats
     on_stats_update: Option<Callback<String>>,
     encoder_callbacks: Vec<Callback<DiagnosticsPacket>>,
-    sender_channels: Vec<(UnboundedSender<DiagnosticsPacket>, MediaType)>,
+    // NOTE(#1108): `sender_channels` (the encoder-AQ fan-in) removed in Stage 2.
     last_report_time: f64,
     report_interval_ms: u64,
     receiver: Receiver<SenderDiagnosticEvent>,
@@ -679,7 +681,6 @@ impl SenderDiagnosticManager {
             stream_stats: HashMap::new(),
             on_stats_update: None,
             encoder_callbacks: Vec::new(),
-            sender_channels: Vec::new(),
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
@@ -732,19 +733,8 @@ impl SenderDiagnosticManager {
         }
     }
 
-    pub fn add_sender_channel(
-        &self,
-        sender: UnboundedSender<DiagnosticsPacket>,
-        media_type: MediaType,
-    ) {
-        if let Err(e) = self
-            .sender
-            .clone()
-            .try_send(SenderDiagnosticEvent::AddSenderChannel(sender, media_type))
-        {
-            error!("Failed to set sender channel: {e}");
-        }
-    }
+    // NOTE(#1108): `add_sender_channel` (subscribed the encoder AQ to receiver
+    // diagnostics) was removed in Stage 2 along with the encoder-AQ fan-in.
 
     pub fn set_reporting_interval(&self, interval_ms: u64) {
         if let Err(e) = self
@@ -804,6 +794,9 @@ impl SenderDiagnosticWorker {
                 );
                 let _ = global_sender().try_broadcast(event);
 
+                // Sink 2: per-(peer,media) UI stats accounting (only our own
+                // outbound streams, sender_id == userid). Drives the UI stats
+                // string. KEPT (issue #1108).
                 if sender_id == self.userid {
                     let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();
                     let stats = peer_stats
@@ -811,14 +804,9 @@ impl SenderDiagnosticWorker {
                         .or_insert_with(|| StreamStats::new(target_id, media_type));
                     stats.update_from_packet(&packet, media_type);
                 }
-
-                for (sender, sender_media_type) in &self.sender_channels {
-                    if sender_media_type == &media_type {
-                        if let Err(e) = sender.unbounded_send(packet.clone()) {
-                            error!("Failed to send diagnostic packet to sender: {e}");
-                        }
-                    }
-                }
+                // NOTE(#1108): the encoder-AQ fan-in (sink 3) that forwarded
+                // these packets to the encoder control loops was removed here —
+                // the sender no longer adapts to receiver-reported FPS.
             }
             SenderDiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
@@ -832,9 +820,6 @@ impl SenderDiagnosticWorker {
             SenderDiagnosticEvent::AddEncoderCallback(callback) => {
                 // Add the callback to the list of callbacks
                 self.encoder_callbacks.push(callback);
-            }
-            SenderDiagnosticEvent::AddSenderChannel(sender, media_type) => {
-                self.sender_channels.push((sender, media_type));
             }
         }
     }

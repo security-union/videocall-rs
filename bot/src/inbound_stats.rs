@@ -17,22 +17,19 @@
 //! numbers, measures inter-arrival variability, and computes A/V sync drift.
 //! Reports a summary line at `INFO` level every 10 seconds.
 
-use protobuf::Message;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-use crate::aq_controller::BotAq;
 use crate::keyframe_requester::KeyframeRequester;
 use crate::layer_preference_sender::LayerPreferenceSender;
 use crate::rtt_probe::RttProbeState;
 use crate::viewport_sender::ViewportSender;
+use protobuf::Message;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, info};
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -80,11 +77,10 @@ pub struct InboundStats {
     last_seen: HashMap<String, Instant>,
     /// Intern map: raw user_id bytes → owned String to avoid per-packet allocation.
     sender_names: HashMap<Vec<u8>, String>,
-    /// Optional adaptive-quality controller. When set, inbound DIAGNOSTICS
-    /// packets are forwarded here so the bot's encoders can adapt.
-    aq: Option<Arc<BotAq>>,
-    /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
-    diagnostics_parse_errors: u64,
+    // NOTE(#1108): the `aq` controller handle and `diagnostics_parse_errors`
+    // counter were removed — inbound DIAGNOSTICS are no longer parsed or routed
+    // into the AQ (receiver FPS no longer feeds the sender AQ). The bot AQ ticks
+    // on a timer in `main`.
     /// Optional RTT probe state. When set, echoed RTT packets are routed here
     /// to compute real round-trip time instead of being counted as media.
     rtt_probe: Option<Arc<RttProbeState>>,
@@ -116,11 +112,8 @@ struct InboundMetrics {
 }
 
 impl InboundStats {
-    /// Attach an adaptive-quality controller. Once set, every inbound
-    /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
-    pub fn set_aq(&mut self, aq: Arc<BotAq>) {
-        self.aq = Some(aq);
-    }
+    // NOTE(#1108): `set_aq` was removed — inbound DIAGNOSTICS no longer feed the
+    // AQ. The bot AQ ticks on a timer in `main`.
 
     /// Attach an RTT probe state. When set, echoed RTT packets from the relay
     /// are routed to `RttProbeState::record_echo` instead of being counted as
@@ -185,7 +178,10 @@ impl InboundStats {
         }
     }
 
-    pub fn record_packet(&mut self, my_user_id: &str, data: &[u8]) {
+    // `_my_user_id` is retained in the signature (many callers pass it) but is
+    // no longer used: DIAGNOSTICS filtering-by-sender moved out with the AQ
+    // fan-in removal (issue #1108).
+    pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -200,38 +196,15 @@ impl InboundStats {
             return;
         };
 
-        // DIAGNOSTICS packets are fed to the AQ controller so the bot can
-        // react to downstream quality signals like a real browser client.
-        // We deliberately intercept this before the MEDIA early-return so the
-        // relay's diagnostic broadcasts stop being silently dropped.
+        // DIAGNOSTICS packets: counted for inbound-stats accounting only.
         //
-        // Only forward packets about *this bot's* own stream — match the
-        // browser's `SenderDiagnosticManager` which filters on
-        // `sender_id == self.userid` before feeding the encoder. Without this
-        // filter, unrelated peer→peer reports would be mixed into this bot's
-        // AQ controller's per-reporter window.
+        // NOTE(#1108): previously these were parsed and fed into the bot's AQ
+        // controller (`aq.process_diagnostics`) so the bot reacted to receiver-
+        // reported FPS like a browser. Stage 2 removed receiver FPS from the
+        // sender AQ entirely, so we no longer parse or route them — the bot's AQ
+        // is now a self-timer driven from `main` (see `BotAq::tick`). We still
+        // account for the packet here so inbound stats stay accurate.
         if wrapper.packet_type.enum_value() == Ok(PacketType::DIAGNOSTICS) {
-            match DiagnosticsPacket::parse_from_bytes(&wrapper.data) {
-                Ok(diag) => {
-                    if diag.sender_id == my_user_id {
-                        if let Some(ref aq) = self.aq {
-                            aq.process_diagnostics(diag);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.diagnostics_parse_errors += 1;
-                    #[cfg(feature = "metrics")]
-                    self.bump_parse_error("diagnostics");
-                    // Rate-limit so a malformed peer cannot spam the log.
-                    if self.diagnostics_parse_errors.is_multiple_of(100) {
-                        warn!(
-                            "Failed to parse DIAGNOSTICS packet (total: {}): {}",
-                            self.diagnostics_parse_errors, e
-                        );
-                    }
-                }
-            }
             self.other_packets += 1;
             #[cfg(feature = "metrics")]
             self.bump_received("diagnostics");
@@ -423,7 +396,6 @@ impl InboundStats {
         let max_audio_seq = std::mem::take(&mut self.max_audio_seq);
         let max_video_seq = std::mem::take(&mut self.max_video_seq);
         let sender_names = std::mem::take(&mut self.sender_names);
-        let aq = self.aq.take();
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
         let viewport_sender = self.viewport_sender.take();
@@ -438,7 +410,6 @@ impl InboundStats {
         self.max_audio_seq = max_audio_seq;
         self.max_video_seq = max_video_seq;
         self.sender_names = sender_names;
-        self.aq = aq;
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
         self.viewport_sender = viewport_sender;

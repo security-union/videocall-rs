@@ -60,7 +60,6 @@ pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -96,9 +95,6 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
 use videocall_aq::fit_within_preserving_aspect;
-
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -448,10 +444,14 @@ impl CameraEncoder {
         clamp_layer_count(self.max_layers)
     }
 
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
+    /// Spawn the encoder AQ control loop (issue #1108: now a self-timer).
+    ///
+    /// Receiver-reported FPS no longer drives the sender AQ, so this loop is no
+    /// longer fed by a diagnostics channel. It ticks at `AQ_TICK_INTERVAL_MS`,
+    /// reading the sender's own encoder-queue backpressure (published by the
+    /// encode loop into `shared_encoder_queue_depth`) plus the server-CONGESTION
+    /// and WS-send-buffer signals, and applies tier/layer/bitrate decisions.
+    pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
@@ -481,7 +481,7 @@ impl CameraEncoder {
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the control loop
         // READS the depth the encode loop published and forwards it to the
-        // controller before each diagnostics packet.
+        // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
@@ -515,7 +515,17 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
-            while let Some(event) = diagnostics_receiver.next().await {
+            // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
+            // instead of waiting on receiver diagnostics. Runs as long as the
+            // encoder is enabled OR until the camera encoder is dropped; we exit
+            // when `enabled` goes false AND stays false (the encoder was stopped)
+            // so a re-enable can re-arm via a fresh start()/set_encoder_control().
+            loop {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
+                ))
+                .await;
+                let now = js_sys::Date::now();
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
                 let screen_active = screen_sharing_active.load(Ordering::Acquire);
@@ -571,8 +581,7 @@ impl CameraEncoder {
                 // no-op.
                 {
                     let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
-                    let now_ms = js_sys::Date::now();
-                    let elapsed_ms = now_ms - ws_drop_window_start_ms;
+                    let elapsed_ms = now - ws_drop_window_start_ms;
 
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
@@ -589,23 +598,28 @@ impl CameraEncoder {
                             encoder_control.force_video_step_down();
                         }
                         last_ws_drop_snapshot = current_ws_drops;
-                        ws_drop_window_start_ms = now_ms;
+                        ws_drop_window_start_ms = now;
                     }
                 }
 
-                // Sender encoder backpressure (issue #1108, Phase B). Feed the
-                // depth the encode loop published into the controller BEFORE the
-                // diagnostics packet drives the rest of AQ. Stage 1: the
-                // controller only stores this — no shed/tier effect — so AQ
-                // behavior is byte-identical. The native bot feeds 0 in its own
-                // loop; here we forward the live WebCodecs queue depth.
+                // Sender encoder backpressure (issue #1108). Feed the depth the
+                // encode loop published into the controller, then advance the AQ
+                // one tick. This is the SOLE gradual quality axis now: receiver
+                // FPS no longer reaches the sender AQ. The native bot feeds 0 in
+                // its own loop; here we forward the live WebCodecs queue depth.
                 encoder_control.observe_encoder_queue_depth(
                     shared_encoder_queue_depth.load(Ordering::Relaxed),
                 );
+                encoder_control.tick(now);
+                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
-
-                // Write encoder decision inputs to shared atomics for health reporting.
+                // Write encoder decision inputs to shared atomics for health
+                // reporting. Issue #1108: the receiver-FPS-derived signals are
+                // gone — `last_fps_ratio()` / `last_bitrate_ratio()` now return
+                // NaN (the health reporter's is_finite() guard drops those proto
+                // fields), and `last_p75_peer_fps()` is REPOINTED to carry the new
+                // sender backpressure signal (encoder queue depth) so the existing
+                // host telemetry channel surfaces it with no proto/Grafana churn.
                 shared_encoder_fps_ratio.store(
                     (encoder_control.last_fps_ratio() as f32).to_bits(),
                     Ordering::Relaxed,

@@ -585,74 +585,19 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
 // Tier Transition Thresholds
 // ---------------------------------------------------------------------------
 
-/// Hysteresis configuration for automatic tier transitions.
-/// Step-down uses the "degrade" threshold; step-up uses the "recover" threshold.
-/// The gap between them prevents oscillation.
-///
-/// FPS ratio (received/target) below which we step DOWN one video tier.
-pub const VIDEO_TIER_DEGRADE_FPS_RATIO: f64 = 0.50;
-/// Lenient FPS degradation threshold used when `effective_peer_count < 3`.
-///
-/// With fewer than 3 peers, p75 aggregation degenerates (for 1 peer it's
-/// just that peer's value; for 2 peers it's the minimum). A single
-/// struggling peer has outsized influence, so we use a more permissive
-/// threshold to avoid false degradation in small meetings.
-///
-/// **Sender CPU tradeoff:** the lenient threshold keeps the sender encoding
-/// at a higher tier for longer in 1:1 and 2-person calls. On low-power
-/// devices (old Macs with VP9 software encode, budget Chromebooks) this
-/// means more CPU time spent on the encoder before a step-down occurs.
-/// If CPU-bound senders become a problem, tightening this value (toward
-/// the standard 0.50 threshold) trades call quality for sender CPU.
-pub const VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT: f64 = 0.30;
-/// FPS ratio above which we step UP one video tier (must be sustained).
-///
-/// Lowered from 0.85 to 0.70 for recovery parity with audio (0.60).
-/// At 0.85, video stayed stuck at minimal while audio recovered to high —
-/// the 0.35 gap between degrade (0.50) and recover (0.85) was too wide.
-/// At 0.70 the hysteresis gap is 0.20 (degrade 0.50, recover 0.70),
-/// which still prevents oscillation while allowing video to recover
-/// within a similar window as audio.
-pub const VIDEO_TIER_RECOVER_FPS_RATIO: f64 = 0.70;
-
-/// Fraction of `target_fps` at or above which a single peer is considered
-/// "healthy" for the small-peer-count outlier guard in
-/// `DiagnosticPackets::get_p75_fps` (issue #1012).
-///
-/// With 2 reporting peers the p75 aggregation degenerates to the minimum, so a
-/// single constrained receiver (e.g. a peer on a 5.8 Mbps link with a
-/// 640×480@15fps camera, per discussion #980) would otherwise define the PID
-/// setpoint and drag the sender's bitrate down for everyone. The guard only
-/// rescues the setpoint toward the *higher* reporter when at least one peer is
-/// genuinely healthy — i.e. at/above this fraction of target. If NO peer clears
-/// this bar, all peers are struggling: that is real congestion, and the
-/// conservative minimum is kept so the sender still steps down.
-///
-/// Defaults to the recover ratio (0.70) so "healthy enough to not be an
-/// outlier" is tied to "healthy enough for the tier to recover". First-guess
-/// value — pending a performance-reviewer pass. DO NOT treat as final.
-pub const AQ_OUTLIER_HEALTH_FPS_RATIO: f64 = VIDEO_TIER_RECOVER_FPS_RATIO;
-
-/// Maximum ratio of the lower peer's FPS to the higher peer's FPS for the lower
-/// one to count as a clear outlier in the small-peer-count guard (issue #1012).
-///
-/// At 2 peers `[a ≤ b]`, the guard treats `a` as an outlier only when
-/// `a < b * AQ_OUTLIER_GAP_FPS_RATIO` — i.e. `a` is more than ~40% below `b`.
-/// This prevents rescuing on ordinary jitter (two healthy peers a few fps
-/// apart) and fires only on the genuine "one fine, one badly degraded" split.
-///
-/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
-/// final.
-pub const AQ_OUTLIER_GAP_FPS_RATIO: f64 = 0.60;
-
-/// Bitrate ratio (actual/ideal) below which we step DOWN one video tier.
-pub const VIDEO_TIER_DEGRADE_BITRATE_RATIO: f64 = 0.40;
-/// Bitrate ratio above which we step UP one video tier (must be sustained).
-pub const VIDEO_TIER_RECOVER_BITRATE_RATIO: f64 = 0.75;
-
-/// Audio degrades only when video is already at lowest tier AND these thresholds hit.
-pub const AUDIO_TIER_DEGRADE_FPS_RATIO: f64 = 0.30;
-pub const AUDIO_TIER_RECOVER_FPS_RATIO: f64 = 0.60;
+// ---------------------------------------------------------------------------
+// REMOVED (issue #1108, Phase B / Stage 2): receiver-FPS / bitrate-ratio tier
+// hysteresis constants.
+//
+// `VIDEO_TIER_DEGRADE_FPS_RATIO[_LENIENT]`, `VIDEO_TIER_RECOVER_FPS_RATIO`,
+// `VIDEO_TIER_DEGRADE/RECOVER_BITRATE_RATIO`, `AUDIO_TIER_DEGRADE/RECOVER_FPS_RATIO`,
+// and `AQ_OUTLIER_HEALTH_FPS_RATIO` / `AQ_OUTLIER_GAP_FPS_RATIO` all gated tier
+// transitions on the FPS that *peers reported receiving*. The sender now adapts
+// only to its own signals, so the gradual degrade/recover decision is a boolean
+// from the encoder-backpressure timers (see the Sender Encoder Backpressure
+// constants below and `EncoderBitrateController::tick`). The step-DOWN reaction
+// time and step-UP stabilization WINDOW (timing, not thresholds) are unchanged.
+// ---------------------------------------------------------------------------
 
 /// How long conditions must remain "good" before stepping UP (milliseconds).
 /// Prevents rapid oscillation on unstable connections.
@@ -779,14 +724,12 @@ pub const PID_FPS_HISTORY_SIZE: usize = 10;
 // ---------------------------------------------------------------------------
 // Sender Encoder Backpressure (issue #1108, Phase B)
 // ---------------------------------------------------------------------------
-// The receiver-FPS-driven layer shed reacts to how peers *receive* our stream,
-// but it cannot see the *sender's own* encoder falling behind (a CPU-bound
-// laptop whose WebCodecs encode queue is backing up). These constants describe
-// the sender-side backstop: when the active encoders' `encode_queue_size()`
-// stays high for a sustained window, Stage 2 will shed a layer to relieve
-// encode CPU. Stage 1 only *samples and stores* the queue depth — these
-// thresholds are not yet read by any control path (see
-// `EncoderBitrateController::observe_encoder_queue_depth`).
+// The sender's gradual quality axis is now driven by its OWN encode
+// backpressure (issue #1108, Stage 2 removed receiver FPS from the sender AQ).
+// When the active encoders' `encode_queue_size()` stays high for a sustained
+// window the controller sheds a layer / steps a tier down to relieve encode
+// CPU; once it drains back to clear over the stabilization window it recovers.
+// Consumed by `EncoderBitrateController::tick`.
 
 /// Encoder queue depth (frames pending in the WebCodecs `VideoEncoder`) at or
 /// above which the sender is considered to be in encode backpressure. Sampled
@@ -796,27 +739,33 @@ pub const PID_FPS_HISTORY_SIZE: usize = 10;
 ///
 /// First-guess value — pending a performance-reviewer pass. DO NOT treat as
 /// final.
-#[allow(dead_code)]
 pub const ENCODER_QUEUE_BACKPRESSURE_HIGH: u32 = 3;
 
 /// Encoder queue depth at or below which sender encode backpressure is
 /// considered cleared (hysteresis floor against the HIGH threshold). Once the
-/// queue drains back to this depth the sustain timer resets.
+/// queue drains back to this depth the recover (step-up) timer can accumulate.
 ///
 /// First-guess value — pending a performance-reviewer pass. DO NOT treat as
 /// final.
-#[allow(dead_code)]
 pub const ENCODER_QUEUE_BACKPRESSURE_CLEAR: u32 = 1;
 
 /// How long (milliseconds) the encoder queue depth must stay at/above
-/// [`ENCODER_QUEUE_BACKPRESSURE_HIGH`] before Stage 2 acts on it. Sized in the
-/// same ballpark as `STEP_DOWN_REACTION_TIME_MS` so a brief encode hiccup (a
-/// single slow frame, a GC pause) does not trigger a shed.
+/// [`ENCODER_QUEUE_BACKPRESSURE_HIGH`] before the controller steps down. Sized
+/// in the same ballpark as `STEP_DOWN_REACTION_TIME_MS` so a brief encode hiccup
+/// (a single slow frame, a GC pause) does not trigger a shed.
 ///
 /// First-guess value — pending a performance-reviewer pass. DO NOT treat as
 /// final.
-#[allow(dead_code)]
 pub const ENCODER_BACKPRESSURE_SUSTAIN_MS: f64 = 1500.0;
+
+/// Cadence (milliseconds) at which the encoder control loop calls
+/// `EncoderBitrateController::tick` (issue #1108). Now that the sender AQ is a
+/// self-timer (receiver-FPS diagnostics no longer drive it), the browser encode
+/// control loops and the native bot both tick at this rate. Chosen at ~1 Hz to
+/// match the historical diagnostics cadence so the AQ timing constants
+/// (`MIN_TIER_TRANSITION_INTERVAL_MS`, the sustain/stabilization windows) keep
+/// their effective behavior.
+pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Bitrate Change Threshold
@@ -1744,29 +1693,20 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn test_hysteresis_gap_video() {
-        // Recovery threshold must be higher than degrade threshold to prevent oscillation.
+    fn test_encoder_backpressure_hysteresis() {
+        // Issue #1108: the receiver-FPS hysteresis was replaced by the sender's
+        // encoder-backpressure hysteresis. The CLEAR (recover) threshold must be
+        // strictly below the HIGH (degrade) threshold so there is a dead-band
+        // between them, preventing oscillation around a single depth.
         assert!(
-            VIDEO_TIER_RECOVER_FPS_RATIO > VIDEO_TIER_DEGRADE_FPS_RATIO,
-            "recover FPS ratio ({}) must be > degrade FPS ratio ({})",
-            VIDEO_TIER_RECOVER_FPS_RATIO,
-            VIDEO_TIER_DEGRADE_FPS_RATIO,
+            ENCODER_QUEUE_BACKPRESSURE_CLEAR < ENCODER_QUEUE_BACKPRESSURE_HIGH,
+            "backpressure CLEAR ({}) must be < HIGH ({}) to leave a hysteresis dead-band",
+            ENCODER_QUEUE_BACKPRESSURE_CLEAR,
+            ENCODER_QUEUE_BACKPRESSURE_HIGH,
         );
         assert!(
-            VIDEO_TIER_RECOVER_BITRATE_RATIO > VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-            "recover bitrate ratio ({}) must be > degrade bitrate ratio ({})",
-            VIDEO_TIER_RECOVER_BITRATE_RATIO,
-            VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-        );
-    }
-
-    #[test]
-    fn test_hysteresis_gap_audio() {
-        assert!(
-            AUDIO_TIER_RECOVER_FPS_RATIO > AUDIO_TIER_DEGRADE_FPS_RATIO,
-            "audio recover FPS ratio ({}) must be > degrade FPS ratio ({})",
-            AUDIO_TIER_RECOVER_FPS_RATIO,
-            AUDIO_TIER_DEGRADE_FPS_RATIO,
+            ENCODER_BACKPRESSURE_SUSTAIN_MS > 0.0,
+            "backpressure sustain window must be positive",
         );
     }
 

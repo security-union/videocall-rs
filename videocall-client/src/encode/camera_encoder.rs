@@ -188,6 +188,49 @@ pub struct LiveQualitySnapshot {
     pub target_bitrate_kbps: f32,
 }
 
+/// One active simulcast layer's live diagnostics: its layer id, the bitrate the
+/// AQ controller is currently targeting for it, and its fixed tier resolution
+/// (issue #1095 observability). Used by [`SimulcastSendSnapshot`].
+///
+/// Resolution comes from the per-layer SIMULCAST ladder rung (the layer's tier
+/// is fixed; only the bitrate adapts), so it is stable and panic-safely resolved
+/// at snapshot time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulcastLayerInfo {
+    /// This layer's simulcast id (0 = base / lowest quality).
+    pub layer_id: u32,
+    /// The bitrate (kbps) the AQ controller is currently targeting for this
+    /// layer. `0` until the control loop has published a value.
+    pub bitrate_kbps: u32,
+    /// Fixed tier width (px) for this layer.
+    pub width: u32,
+    /// Fixed tier height (px) for this layer.
+    pub height: u32,
+}
+
+/// A real-time snapshot of the SEND-side simulcast state for one media kind
+/// (issue #1095 observability — additive, no AQ behavior change).
+///
+/// Read from the live shared encoder atomics + the SIMULCAST ladder at call
+/// time, so the panel never indexes the AQ tables itself. In single-stream mode
+/// (`effective_layers == 1`) `simulcast_active` is `false` and `layers` is empty
+/// — the panel then just shows the single adaptive tier from
+/// [`LiveQualitySnapshot`]. Cheap enough to poll at the needle cadence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulcastSendSnapshot {
+    /// `true` when this encoder is publishing more than one layer.
+    pub simulcast_active: bool,
+    /// The effective layer count this session may emit
+    /// (`min(flag, capability)` ladder size). `1` in single-stream mode.
+    pub effective_layers: u32,
+    /// How many layers are CURRENTLY active (encoded + sent). The AQ controller
+    /// sheds the top layer(s) under congestion, so this can be `< effective_layers`.
+    pub active_layers: u32,
+    /// Per-ACTIVE-layer breakdown (lowest layer first). Empty in single-stream
+    /// mode; length == `active_layers` in simulcast mode.
+    pub layers: Vec<SimulcastLayerInfo>,
+}
+
 /// One simulcast layer's encoder and its per-layer mutable encode state
 /// (issue #989). Local to `CameraEncoder::start`'s encode task.
 ///
@@ -788,6 +831,55 @@ impl CameraEncoder {
             audio_tier_index: a_idx,
             audio_kbps: a.bitrate_kbps,
             target_bitrate_kbps,
+        }
+    }
+
+    /// Live SEND-side simulcast diagnostics for the camera (issue #1095
+    /// observability). Reads the active-layer count + per-layer target-bitrate
+    /// atomics published by the AQ control loop, and resolves each active layer's
+    /// fixed resolution from the SIMULCAST ladder. Panic-safe (indices clamped);
+    /// cheap to poll at the needle cadence.
+    ///
+    /// In single-stream mode (effective layers == 1) this returns
+    /// `simulcast_active = false` with an empty `layers` Vec.
+    pub fn live_simulcast_snapshot(&self) -> SimulcastSendSnapshot {
+        let effective = self.effective_layer_count();
+        if effective <= 1 {
+            return SimulcastSendSnapshot {
+                simulcast_active: false,
+                effective_layers: effective,
+                active_layers: 1,
+                layers: Vec::new(),
+            };
+        }
+        // Fixed per-layer resolutions for this ladder (lowest layer first).
+        let tiers = simulcast_layers(effective as usize);
+        // Active layer count is shed-aware (the AQ loop drops the top layer under
+        // congestion); clamp it to the ladder size defensively.
+        let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
+            .min(effective)
+            .max(1);
+        let bitrate_atomics = self.shared_layer_bitrates_bps.borrow();
+        let layers = (0..active)
+            .map(|layer_id| {
+                let bitrate_kbps = bitrate_atomics
+                    .get(layer_id as usize)
+                    .map(|a| a.load(Ordering::Relaxed) / 1000) // bps -> kbps
+                    .unwrap_or(0);
+                let tier = tiers.get(layer_id as usize);
+                SimulcastLayerInfo {
+                    layer_id,
+                    bitrate_kbps,
+                    width: tier.map(|t| t.max_width).unwrap_or(0),
+                    height: tier.map(|t| t.max_height).unwrap_or(0),
+                }
+            })
+            .collect();
+        SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: effective,
+            active_layers: active,
+            layers,
         }
     }
 

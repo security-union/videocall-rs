@@ -385,6 +385,26 @@ struct SeqTrackResult {
     rates: Option<(f64, f64)>,
 }
 
+/// Per-peer RECEIVE simulcast diagnostics for one connected peer (issue #1095
+/// observability — additive). Produced by
+/// [`PeerDecodeManager::per_peer_received_snapshots`] and shown in the panel's
+/// "Live diagnostics" disclosure. Each per-kind field is `Some` only when that
+/// kind is currently being received from the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReceiveDiag {
+    /// The peer's relay session id.
+    pub session_id: u64,
+    /// A human-friendly label: display name if known, else user id, else the
+    /// session id (so the row always has something to show).
+    pub label: String,
+    /// Decoded VIDEO layer snapshot, if video is being received.
+    pub video: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
+    /// Decoded SCREEN layer snapshot, if a screen share is being received.
+    pub screen: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
+    /// Decoded AUDIO layer snapshot, if audio is being received.
+    pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
+}
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -2029,6 +2049,59 @@ impl PeerDecodeManager {
             ),
         };
         Some(received_layer_snapshot(kind, layer, count))
+    }
+
+    /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability).
+    ///
+    /// Unlike [`received_layer_snapshot`](Self::received_layer_snapshot) (which
+    /// collapses to ONE representative stream per kind for the needles), this
+    /// returns one [`PeerReceiveDiag`] for EVERY connected peer that is receiving
+    /// at least one media kind, each carrying the per-kind decoded-layer snapshot.
+    /// Used by the panel's "Live diagnostics" disclosure to show what this
+    /// receiver is pulling from each peer. Panic-safe; iterates peers in their
+    /// stable ordered-key order.
+    pub fn per_peer_received_snapshots(&mut self, now_ms: u64) -> Vec<PeerReceiveDiag> {
+        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+        let keys = self.connected_peers.ordered_keys().clone();
+        let mut out = Vec::with_capacity(keys.len());
+        for sid in keys {
+            let Some(peer) = self.connected_peers.get_mut(&sid) else {
+                continue;
+            };
+            // Resolve each kind's snapshot only when that kind is enabled for the
+            // peer; otherwise the panel would show stale base-layer rows for
+            // streams that aren't flowing.
+            let video = peer.video_enabled.then(|| {
+                let count = peer.video_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Video, peer.selected_video_layer, count)
+            });
+            let screen = peer.screen_enabled.then(|| {
+                let count = peer.screen_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Screen, peer.selected_screen_layer, count)
+            });
+            let audio = peer.audio_enabled.then(|| {
+                let count = peer.audio_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Audio, peer.selected_audio_layer, count)
+            });
+            // Skip peers with nothing flowing so the list stays compact.
+            if video.is_none() && screen.is_none() && audio.is_none() {
+                continue;
+            }
+            out.push(PeerReceiveDiag {
+                session_id: sid,
+                label: peer.display_name.clone().unwrap_or_else(|| {
+                    if peer.user_id.is_empty() {
+                        sid.to_string()
+                    } else {
+                        peer.user_id.clone()
+                    }
+                }),
+                video,
+                screen,
+                audio,
+            });
+        }
+        out
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {

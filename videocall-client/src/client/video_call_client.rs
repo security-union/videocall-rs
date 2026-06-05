@@ -26,7 +26,7 @@ use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
-use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::decode::peer_decode_manager::{PeerDecodeError, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
@@ -1529,6 +1529,25 @@ impl VideoCallClient {
                 .peer_decode_manager
                 .received_layer_snapshot(kind, now_ms)
         })
+    }
+
+    /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability): one
+    /// [`PeerReceiveDiag`] per connected peer that is receiving at least one
+    /// media kind, each carrying the per-kind decoded-layer snapshot. The panel's
+    /// "Live diagnostics" disclosure polls this to show what this client is
+    /// pulling from every peer. Returns an empty Vec when nothing is being
+    /// received or the inner is transiently borrowed.
+    pub fn per_peer_received_snapshots(&self) -> Vec<PeerReceiveDiag> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner
+            .try_borrow_mut()
+            .ok()
+            .map(|mut inner| {
+                inner
+                    .peer_decode_manager
+                    .per_peer_received_snapshots(now_ms)
+            })
+            .unwrap_or_default()
     }
 
     /// Returns a shared reference to the camera force-keyframe flag.

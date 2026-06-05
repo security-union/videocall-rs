@@ -767,6 +767,97 @@ pub const ENCODER_BACKPRESSURE_SUSTAIN_MS: f64 = 1500.0;
 /// their effective behavior.
 pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 
+// --- Compile-time invariants (issue #1108) ---
+// These relationships are load-bearing for the backpressure hysteresis and the
+// degrade-faster-than-recover asymmetry; assert them at COMPILE time so a bad
+// edit fails the build (and stays clippy-clean — `assert!` on a constant in a
+// runtime test trips `assertions_on_constants`).
+
+/// The CLEAR (recover) threshold must be strictly below the HIGH (degrade)
+/// threshold so there is a hysteresis dead-band between them, preventing
+/// oscillation around a single encoder-queue depth.
+const _: () = assert!(
+    ENCODER_QUEUE_BACKPRESSURE_CLEAR < ENCODER_QUEUE_BACKPRESSURE_HIGH,
+    "backpressure CLEAR must be < HIGH to leave a hysteresis dead-band"
+);
+
+/// The backpressure sustain window must be positive (a non-positive window would
+/// make every transient spike fire a step-down immediately).
+const _: () = assert!(
+    ENCODER_BACKPRESSURE_SUSTAIN_MS > 0.0,
+    "backpressure sustain window must be positive"
+);
+
+/// Step-up must be slower than step-down (degradation reacts faster than
+/// recovery) to avoid tier flapping on unstable senders.
+const _: () = assert!(
+    STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
+    "step-up stabilization window must exceed step-down reaction time"
+);
+
+// --- Constant-relationship invariants (compile-time) ---
+// Previously runtime `assert!`s in the test module; moved here so they are
+// checked on every build and stay clippy-clean (`assertions_on_constants`).
+
+// PID gains must be non-negative.
+const _: () = assert!(PID_KP >= 0.0, "PID_KP must be non-negative");
+const _: () = assert!(PID_KI >= 0.0, "PID_KI must be non-negative");
+const _: () = assert!(PID_KD >= 0.0, "PID_KD must be non-negative");
+
+// PID output range must be a valid (non-empty) interval.
+const _: () = assert!(
+    PID_OUTPUT_MIN < PID_OUTPUT_MAX,
+    "PID output min must be < max"
+);
+
+// Climb-rate limiter relationships.
+const _: () = assert!(
+    CLIMB_COOLDOWN_BASE_MS > 0.0,
+    "base cooldown must be positive"
+);
+const _: () = assert!(
+    CLIMB_COOLDOWN_MAX_MS >= CLIMB_COOLDOWN_BASE_MS,
+    "max cooldown must be >= base cooldown"
+);
+const _: () = assert!(
+    CLIMB_COOLDOWN_BACKOFF > 1.0,
+    "backoff multiplier must be > 1.0"
+);
+const _: () = assert!(
+    RECOVERY_SLOWDOWN_FACTOR >= 1.0,
+    "slowdown factor must be >= 1.0"
+);
+const _: () = assert!(
+    RECOVERY_SLOWDOWN_DECAY_MS > 0.0,
+    "slowdown decay must be positive"
+);
+const _: () = assert!(
+    CRASH_MEMORY_RESET_MS >= CLIMB_COOLDOWN_MAX_MS,
+    "crash memory reset should be >= max cooldown so the ceiling decays before memory resets"
+);
+const _: () = assert!(
+    YOYO_DETECTION_WINDOW_MS > 0.0,
+    "yo-yo window must be positive"
+);
+const _: () = assert!(
+    REELECTION_CEILING_SUPPRESSION_MS > 0.0,
+    "re-election suppression must be positive"
+);
+
+// Congestion feedback thresholds must be positive.
+const _: () = assert!(
+    CONGESTION_DROP_THRESHOLD > 0,
+    "congestion drop threshold must be positive"
+);
+const _: () = assert!(
+    CONGESTION_WINDOW_MS > 0,
+    "congestion window must be positive"
+);
+const _: () = assert!(
+    CONGESTION_NOTIFY_MIN_INTERVAL_MS > 0,
+    "congestion notify interval must be positive"
+);
+
 // ---------------------------------------------------------------------------
 // Bitrate Change Threshold
 // ---------------------------------------------------------------------------
@@ -1120,6 +1211,66 @@ pub const AUDIO_RED_SEQ_HISTORY_SIZE: usize = 64;
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Server Congestion Feedback
+// ---------------------------------------------------------------------------
+
+/// Number of dropped packets within `CONGESTION_WINDOW_MS` that triggers a
+/// CONGESTION notification back to the sender.
+pub const CONGESTION_DROP_THRESHOLD: u32 = 5;
+
+/// Time window (milliseconds) over which drops are counted. Drop counters
+/// reset after this window elapses without new drops.
+pub const CONGESTION_WINDOW_MS: u64 = 1000;
+
+/// Minimum interval between CONGESTION notifications sent to the same sender
+/// (milliseconds). Prevents flooding the sender with congestion signals when
+/// many packets are dropped in quick succession.
+pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Number of quality tiers to drop in a single self-targeted CONGESTION cut.
+///
+/// A self-targeted CONGESTION signal means the relay is actively dropping *our*
+/// outbound packets — the buffer is already overflowing. A gentle one-tier
+/// step-down (as used for WebSocket backpressure) is too slow: it sheds only
+/// ~20-30% of bitrate per step and waits `MIN_TIER_TRANSITION_INTERVAL_MS`
+/// between steps, so the relay buffer keeps overflowing for several seconds.
+///
+/// Dropping two tiers at once maps to roughly a 50% bitrate cut across most of
+/// the (non-uniform) camera ladder — e.g. from the default "medium" tier
+/// (index 4, ideal 600 kbps) two tiers down to index 6 (ideal 250 kbps) is a
+/// ~58% reduction, and "hd" (index 2, ideal 1500) → index 4 (ideal 600) is a
+/// 60% reduction. This sheds enough bitrate immediately to let the relay buffer
+/// drain instead of bleeding it down one slow step at a time.
+pub const CONGESTION_CUT_TIERS: usize = 2;
+
+/// Duration (milliseconds) to pin the PID bitrate ceiling to the post-cut tier
+/// after a self-targeted CONGESTION cut.
+///
+/// After the cut we must keep the effective bitrate low long enough for the
+/// already-overflowing relay buffer to drain. Without a hold the PID — which
+/// fine-tunes bitrate *within* a tier — would immediately ramp back toward the
+/// new tier's max, re-filling the buffer before it has drained. Pinning the
+/// ceiling to the post-cut tier's lower bound for this window guarantees the
+/// buffer gets a real chance to recover. 2.5s comfortably covers a typical
+/// relay buffer drain even on high-latency links while remaining short enough
+/// that recovery is not penalized for long.
+pub const CONGESTION_HOLD_MS: f64 = 2500.0;
+
+// ---------------------------------------------------------------------------
+// Client-Side WebSocket Backpressure Self-Detection
+// ---------------------------------------------------------------------------
+
+/// Number of client-side WebSocket send-buffer drops within
+/// [`WS_SELF_CONGESTION_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// Lower than the server-side threshold (5) because client-side drops are a
+/// more direct signal — each drop means the browser TCP send buffer is full.
+pub const WS_SELF_CONGESTION_DROP_THRESHOLD: u64 = 3;
+
+/// Tumbling window (ms) for counting client-side WS drops.
+pub const WS_SELF_CONGESTION_WINDOW_MS: f64 = 1000.0;
 
 #[cfg(test)]
 mod tests {
@@ -1692,109 +1843,17 @@ mod tests {
     // Tier transition threshold validation
     // =====================================================================
 
-    #[test]
-    fn test_encoder_backpressure_hysteresis() {
-        // Issue #1108: the receiver-FPS hysteresis was replaced by the sender's
-        // encoder-backpressure hysteresis. The CLEAR (recover) threshold must be
-        // strictly below the HIGH (degrade) threshold so there is a dead-band
-        // between them, preventing oscillation around a single depth.
-        assert!(
-            ENCODER_QUEUE_BACKPRESSURE_CLEAR < ENCODER_QUEUE_BACKPRESSURE_HIGH,
-            "backpressure CLEAR ({}) must be < HIGH ({}) to leave a hysteresis dead-band",
-            ENCODER_QUEUE_BACKPRESSURE_CLEAR,
-            ENCODER_QUEUE_BACKPRESSURE_HIGH,
-        );
-        assert!(
-            ENCODER_BACKPRESSURE_SUSTAIN_MS > 0.0,
-            "backpressure sustain window must be positive",
-        );
-    }
+    // NOTE(#1108): the backpressure-hysteresis and step-up-slower-than-step-down
+    // invariants are now COMPILE-TIME `const _: () = assert!(…)` checks next to
+    // the constants themselves (a runtime `assert!` on a constant trips clippy's
+    // `assertions_on_constants`). See the "Compile-time invariants" block above.
 
-    #[test]
-    fn test_step_up_slower_than_step_down() {
-        assert!(
-            STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
-            "step-up window ({}) should be > step-down reaction time ({})",
-            STEP_UP_STABILIZATION_WINDOW_MS,
-            STEP_DOWN_REACTION_TIME_MS,
-        );
-    }
-
-    // =====================================================================
-    // PID controller constant validation
-    // =====================================================================
-
-    #[test]
-    fn test_pid_gains_non_negative() {
-        assert!(PID_KP >= 0.0, "PID_KP must be non-negative");
-        assert!(PID_KI >= 0.0, "PID_KI must be non-negative");
-        assert!(PID_KD >= 0.0, "PID_KD must be non-negative");
-    }
-
-    #[test]
-    fn test_pid_output_limits() {
-        assert!(
-            PID_OUTPUT_MIN < PID_OUTPUT_MAX,
-            "PID output min ({}) must be < max ({})",
-            PID_OUTPUT_MIN,
-            PID_OUTPUT_MAX,
-        );
-    }
-
-    // =====================================================================
-    // Climb-rate limiter constant validation
-    // =====================================================================
-
-    #[test]
-    fn test_climb_rate_limiter_constants() {
-        assert!(
-            CLIMB_COOLDOWN_BASE_MS > 0.0,
-            "base cooldown must be positive"
-        );
-        assert!(
-            CLIMB_COOLDOWN_MAX_MS >= CLIMB_COOLDOWN_BASE_MS,
-            "max cooldown ({}) must be >= base ({})",
-            CLIMB_COOLDOWN_MAX_MS,
-            CLIMB_COOLDOWN_BASE_MS,
-        );
-        assert!(
-            CLIMB_COOLDOWN_BACKOFF > 1.0,
-            "backoff multiplier must be > 1.0"
-        );
-        assert!(
-            RECOVERY_SLOWDOWN_FACTOR >= 1.0,
-            "slowdown factor must be >= 1.0"
-        );
-        assert!(
-            RECOVERY_SLOWDOWN_DECAY_MS > 0.0,
-            "slowdown decay must be positive"
-        );
-        assert!(
-            CRASH_MEMORY_RESET_MS >= CLIMB_COOLDOWN_MAX_MS,
-            "crash memory reset ({}) should be >= max cooldown ({}) so ceiling decays before memory resets",
-            CRASH_MEMORY_RESET_MS,
-            CLIMB_COOLDOWN_MAX_MS,
-        );
-        assert!(
-            YOYO_DETECTION_WINDOW_MS > 0.0,
-            "yo-yo window must be positive"
-        );
-        assert!(
-            REELECTION_CEILING_SUPPRESSION_MS > 0.0,
-            "re-election suppression must be positive"
-        );
-    }
-
-    // =====================================================================
-    // Congestion feedback constant validation
-    // =====================================================================
-
-    #[test]
-    fn test_congestion_constants_positive() {
-        assert!(CONGESTION_DROP_THRESHOLD > 0);
-        assert!(CONGESTION_WINDOW_MS > 0);
-        assert!(CONGESTION_NOTIFY_MIN_INTERVAL_MS > 0);
-    }
+    // NOTE: the PID / climb-rate-limiter / congestion constant-relationship
+    // invariants below were runtime `assert!`s in `#[test]` fns; they are now
+    // COMPILE-TIME `const _: () = assert!(…)` checks at module scope (see
+    // "Constant-relationship invariants" near the end of this file). A runtime
+    // `assert!` on a constant trips clippy's `assertions_on_constants` and only
+    // fires if the test is run; the const form is checked on every build.
 
     // =====================================================================
     // Tier index lookup
@@ -1908,63 +1967,3 @@ mod tests {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Server Congestion Feedback
-// ---------------------------------------------------------------------------
-
-/// Number of dropped packets within `CONGESTION_WINDOW_MS` that triggers a
-/// CONGESTION notification back to the sender.
-pub const CONGESTION_DROP_THRESHOLD: u32 = 5;
-
-/// Time window (milliseconds) over which drops are counted. Drop counters
-/// reset after this window elapses without new drops.
-pub const CONGESTION_WINDOW_MS: u64 = 1000;
-
-/// Minimum interval between CONGESTION notifications sent to the same sender
-/// (milliseconds). Prevents flooding the sender with congestion signals when
-/// many packets are dropped in quick succession.
-pub const CONGESTION_NOTIFY_MIN_INTERVAL_MS: u64 = 1000;
-
-/// Number of quality tiers to drop in a single self-targeted CONGESTION cut.
-///
-/// A self-targeted CONGESTION signal means the relay is actively dropping *our*
-/// outbound packets — the buffer is already overflowing. A gentle one-tier
-/// step-down (as used for WebSocket backpressure) is too slow: it sheds only
-/// ~20-30% of bitrate per step and waits `MIN_TIER_TRANSITION_INTERVAL_MS`
-/// between steps, so the relay buffer keeps overflowing for several seconds.
-///
-/// Dropping two tiers at once maps to roughly a 50% bitrate cut across most of
-/// the (non-uniform) camera ladder — e.g. from the default "medium" tier
-/// (index 4, ideal 600 kbps) two tiers down to index 6 (ideal 250 kbps) is a
-/// ~58% reduction, and "hd" (index 2, ideal 1500) → index 4 (ideal 600) is a
-/// 60% reduction. This sheds enough bitrate immediately to let the relay buffer
-/// drain instead of bleeding it down one slow step at a time.
-pub const CONGESTION_CUT_TIERS: usize = 2;
-
-/// Duration (milliseconds) to pin the PID bitrate ceiling to the post-cut tier
-/// after a self-targeted CONGESTION cut.
-///
-/// After the cut we must keep the effective bitrate low long enough for the
-/// already-overflowing relay buffer to drain. Without a hold the PID — which
-/// fine-tunes bitrate *within* a tier — would immediately ramp back toward the
-/// new tier's max, re-filling the buffer before it has drained. Pinning the
-/// ceiling to the post-cut tier's lower bound for this window guarantees the
-/// buffer gets a real chance to recover. 2.5s comfortably covers a typical
-/// relay buffer drain even on high-latency links while remaining short enough
-/// that recovery is not penalized for long.
-pub const CONGESTION_HOLD_MS: f64 = 2500.0;
-
-// ---------------------------------------------------------------------------
-// Client-Side WebSocket Backpressure Self-Detection
-// ---------------------------------------------------------------------------
-
-/// Number of client-side WebSocket send-buffer drops within
-/// [`WS_SELF_CONGESTION_WINDOW_MS`] that triggers a local AQ step-down.
-///
-/// Lower than the server-side threshold (5) because client-side drops are a
-/// more direct signal — each drop means the browser TCP send buffer is full.
-pub const WS_SELF_CONGESTION_DROP_THRESHOLD: u64 = 3;
-
-/// Tumbling window (ms) for counting client-side WS drops.
-pub const WS_SELF_CONGESTION_WINDOW_MS: f64 = 1000.0;

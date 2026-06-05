@@ -1890,7 +1890,7 @@ mod tests {
         // Force the tier BELOW baseline (worse quality) without touching the
         // baseline, simulating a prior backpressure shed.
         let below = DEFAULT_VIDEO_TIER_INDEX + 2;
-        assert!(below <= VIDEO_QUALITY_TIERS.len() - 1);
+        assert!(below < VIDEO_QUALITY_TIERS.len());
         mgr.video_tier_index = below;
 
         // Sustained-clear recover over many spaced ticks must climb back to —

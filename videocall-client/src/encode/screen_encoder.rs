@@ -358,6 +358,15 @@ pub struct ScreenEncoder {
     /// (owns the controller). **Stage 1: stored-only on the controller side, so
     /// it is observability with no behavior change.**
     shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
+    /// #1108). The encoder holds the only strong reference; `set_encoder_control`
+    /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
+    /// returns `None` (encoder dropped on Host unmount). The control loop runs on
+    /// `wasm_bindgen_futures::spawn_local` (NOT scope-bound), so without this it
+    /// would tick forever and leak one loop per remount. Bounds the CONTROL loop
+    /// only — the encode loop (`run_screen_encoding`) already exits on
+    /// `enabled == false`.
+    control_loop_liveness: Rc<()>,
 }
 
 impl ScreenEncoder {
@@ -413,6 +422,9 @@ impl ScreenEncoder {
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
             shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // AQ control-loop liveness token (issue #1108). Sole strong owner;
+            // the self-tick loop holds a Weak and exits when this drops.
+            control_loop_liveness: Rc::new(()),
         }
     }
 
@@ -539,6 +551,10 @@ impl ScreenEncoder {
         // READS the depth the encode loop published and forwards it to the
         // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
+        // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
+        // unmount), so the immortal `spawn_local` future doesn't leak per remount.
+        let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
@@ -564,12 +580,21 @@ impl ScreenEncoder {
                 }
             }
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
-            // instead of waiting on receiver diagnostics.
+            // instead of waiting on receiver diagnostics. Runs for the lifetime
+            // of the owning ScreenEncoder. This `spawn_local` future is NOT bound
+            // to the Dioxus component scope, so it must break itself when the
+            // encoder is torn down (Host unmount) via the liveness Weak —
+            // otherwise it ticks forever and leaks one loop per remount.
             loop {
                 gloo_timers::future::sleep(std::time::Duration::from_millis(
                     crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
                 ))
                 .await;
+                // Encoder torn down? Stop ticking and release the captured Rc graph.
+                if control_loop_liveness.upgrade().is_none() {
+                    log::debug!("ScreenEncoder: AQ control loop exiting (encoder dropped)");
+                    break;
+                }
                 let now = js_sys::Date::now();
                 // Apply user screen-quality bounds if the UI changed them since
                 // we last applied. Cheap generation check; the controller snaps

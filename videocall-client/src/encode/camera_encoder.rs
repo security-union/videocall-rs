@@ -323,6 +323,17 @@ pub struct CameraEncoder {
     /// the other's state. **Stage 1: the controller only stores this value (no
     /// shed/tier effect), so it is observability-only.**
     shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Liveness token whose sole purpose is to bound the lifetime of the AQ
+    /// control-loop `spawn_local` future (issue #1108). The encoder holds the
+    /// only strong reference; `set_encoder_control` captures a [`Weak`] and
+    /// breaks its 1 Hz `tick` loop as soon as `upgrade()` returns `None`. Because
+    /// the control loop runs on `wasm_bindgen_futures::spawn_local` (NOT bound to
+    /// the Dioxus component scope), it would otherwise run forever and pin its
+    /// cloned `Rc` graph + `on_encoder_settings_update` callback across `Host`
+    /// remounts. When this `CameraEncoder` is dropped on unmount, the strong
+    /// count hits 0 and the loop exits cleanly — restoring the pre-#1108 lifetime
+    /// where the loop ended when the diagnostics channel closed.
+    control_loop_liveness: Rc<()>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -430,6 +441,10 @@ impl CameraEncoder {
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
             shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // AQ control-loop liveness token (issue #1108). The encoder is the
+            // sole strong owner; the self-tick loop holds a Weak and exits when
+            // this drops (encoder torn down on Host unmount).
+            control_loop_liveness: Rc::new(()),
         }
     }
 
@@ -483,6 +498,11 @@ impl CameraEncoder {
         // READS the depth the encode loop published and forwards it to the
         // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Liveness sentinel (issue #1108): a Weak to the encoder-owned token.
+        // The loop below breaks as soon as this fails to upgrade, i.e. when the
+        // CameraEncoder is dropped (Host unmount). Without this, the
+        // `spawn_local` future is immortal and leaks per remount.
+        let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -516,15 +536,28 @@ impl CameraEncoder {
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
-            // instead of waiting on receiver diagnostics. Runs as long as the
-            // encoder is enabled OR until the camera encoder is dropped; we exit
-            // when `enabled` goes false AND stays false (the encoder was stopped)
-            // so a re-enable can re-arm via a fresh start()/set_encoder_control().
+            // instead of waiting on receiver diagnostics. Runs for the lifetime
+            // of the owning CameraEncoder: this `spawn_local` future is NOT bound
+            // to the Dioxus component scope, so it must break itself when the
+            // encoder is torn down (Host unmount) — otherwise it would tick
+            // forever, pinning its cloned Rc graph and firing into a stale
+            // `on_encoder_settings_update` callback, leaking one loop per remount.
+            // The `control_loop_liveness` Weak fails to upgrade once the encoder
+            // (sole strong owner of the token) is dropped, which is our exit. The
+            // `enabled` flag does NOT terminate the loop — it only gates the
+            // bitrate-vs-"Disabled" emit below, so a muted-then-unmuted camera
+            // keeps adapting without re-arming.
             loop {
                 gloo_timers::future::sleep(std::time::Duration::from_millis(
                     crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
                 ))
                 .await;
+                // Encoder torn down? Stop ticking and let the future complete so
+                // its captured Rc graph is released.
+                if control_loop_liveness.upgrade().is_none() {
+                    log::debug!("CameraEncoder: AQ control loop exiting (encoder dropped)");
+                    break;
+                }
                 let now = js_sys::Date::now();
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.

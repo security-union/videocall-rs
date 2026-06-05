@@ -1,0 +1,183 @@
+name: Mutation Test — videocall-aq (HCL)
+
+# ADVISORY mutation testing for the AQ / simulcast logic crate.
+#
+# Why this exists: passing tests proves they RUN; mutation testing proves they
+# would FAIL if the code under test were wrong. It mechanically catches the
+# "tautological / non-asserting test" class that CLAUDE.md's Adversarial
+# Self-Review Rule (check #2) calls out by hand. `videocall-aq` is the target
+# because it is pure host-testable arithmetic (p75 aggregation, hysteresis,
+# layer-shed, PID) — exactly the bug-prone numeric logic where a surviving
+# mutant means a test isn't actually pinning the behaviour it claims to.
+#
+# Scope: DIFF-ONLY (`--in-diff`) — mutates only the lines this PR changed, so
+# it stays fast and relevant instead of sweeping the whole crate.
+#
+# Enforcement: ADVISORY for now. The job NEVER fails the PR (`continue-on-error`
+# on the run step + an always-green summary). Surviving mutants are surfaced in
+# the job summary / artifact so we can read the signal and tune skip markers
+# before deciding whether to promote this to a hard gate. (See the PR that
+# introduced this file for the rationale.)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'videocall-aq/**'
+      # Include this workflow itself so a PR that adds/edits the mutation job is
+      # validated by the job it changes (matches pr-check-backend-hcl.yaml etc.).
+      - '.github/workflows/pr-check-mutation-aq-hcl.yaml'
+
+concurrency:
+  group: pr-check-mutation-aq-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  mutation-aq:
+    name: mutation test (videocall-aq, advisory)
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.2.0
+        with:
+          clean: false
+          path: mutation-repo
+          # Need the base branch to compute the diff for --in-diff.
+          fetch-depth: 0
+
+      # Install cargo-mutants if the runner doesn't already have it. Pinned so a
+      # new upstream release can't silently change behaviour mid-stream.
+      - name: Ensure cargo-mutants is installed
+        working-directory: mutation-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          if ! command -v cargo-mutants >/dev/null 2>&1; then
+            cargo install cargo-mutants --version 25.0.0 --locked
+          fi
+          cargo mutants --version
+
+      # Compute the diff of THIS PR against its base branch, restricted to the
+      # AQ crate, and feed it to --in-diff so only changed lines are mutated.
+      - name: Build PR diff (videocall-aq only)
+        working-directory: mutation-repo
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
+          # Diff base...HEAD limited to the crate; if empty, the run step no-ops.
+          git diff "${BASE}...HEAD" -- videocall-aq/ > /tmp/aq.diff || true
+          echo "Diff lines: $(wc -l < /tmp/aq.diff)"
+
+      # ADVISORY: never fail the PR. Surviving mutants are reported, not gated.
+      - name: Run cargo-mutants (diff-scoped, advisory)
+        id: mutants
+        continue-on-error: true
+        working-directory: mutation-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          if [ ! -s /tmp/aq.diff ]; then
+            echo "No videocall-aq changes in this PR diff — skipping mutation run."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # cargo-mutants writes results to <output>/mutants.out/. We pass
+          # --output /tmp/mut so the report lands at /tmp/mut/mutants.out/.
+          rm -rf /tmp/mut && mkdir -p /tmp/mut
+          set +e
+          cargo mutants \
+            --package videocall-aq \
+            --in-diff /tmp/aq.diff \
+            --no-shuffle \
+            --output /tmp/mut \
+            --timeout 120
+          code=$?
+          set -e
+          # cargo-mutants 25.0.0 exit codes (verified against the crate's
+          # src/exit_code.rs — do NOT guess these):
+          #   0 SUCCESS         — all mutants caught (or nothing to test)
+          #   1 USAGE           — bad invocation / CLI error  → tooling error
+          #   2 FOUND_PROBLEMS  — one or more mutants survived (a real finding)
+          #   3 TIMEOUT         — a mutant timed out (inconclusive, not a pass)
+          #   4 CLEAN_TESTS_FAILED — baseline tests fail unmutated → tooling error
+          # We never PROPAGATE a failure (advisory job), but classify so the
+          # summary can't false-green a broken or inconclusive run.
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          case "${code}" in
+            0|2)   echo "status=ran" >> "$GITHUB_OUTPUT" ;;        # trustworthy result
+            3)     echo "status=timeout" >> "$GITHUB_OUTPUT" ;;    # inconclusive
+            *)     echo "status=tooling_error" >> "$GITHUB_OUTPUT" ;; # 1, 4, or unknown
+          esac
+
+      # Report to BOTH the job log (always visible on GHES) and the step summary
+      # (if the runner supports it). No artifact upload — actions/upload-artifact
+      # is unsupported on this GHES 3.16 instance (see project notes), and no
+      # other workflow here uses it. The report is in the log; that's sufficient
+      # for an advisory check.
+      - name: Summarize surviving mutants
+        if: always()
+        working-directory: mutation-repo
+        run: |
+          STATUS="${{ steps.mutants.outputs.status }}"
+          CODE="${{ steps.mutants.outputs.exit_code }}"
+          OUT=/tmp/mut/mutants.out
+          report() {
+            echo "## Mutation test — videocall-aq (advisory)"
+            echo ""
+            if [ "$STATUS" = "skipped" ]; then
+              echo "No \`videocall-aq\` changes in this PR — nothing to mutate."
+              return 0
+            fi
+            # Tooling failure (exit 1 USAGE, 4 CLEAN_TESTS_FAILED, or unknown):
+            # do NOT claim "all caught" — the run produced no trustworthy result.
+            if [ "$STATUS" = "tooling_error" ]; then
+              echo "ERROR: cargo-mutants did not complete (exit ${CODE}: 1=usage,"
+              echo "4=baseline tests failed unmutated, other=infra). NO trustworthy"
+              echo "mutation result was produced; this is NOT a pass. Advisory job, so"
+              echo "the PR is not blocked, but treat coverage as UNKNOWN — check the log."
+              return 0
+            fi
+            if [ "$STATUS" = "timeout" ]; then
+              echo "INCONCLUSIVE: a mutant timed out (exit 3) — not a pass and not a"
+              echo "confirmed surviving mutant. Check the timed-out list below / the log."
+            fi
+            # Defensive: a result-producing run (exit 0/2/3) should have produced
+            # the output dir. If it's missing, that's inconclusive, not a pass.
+            if [ ! -d "$OUT" ]; then
+              echo "ERROR: cargo-mutants reported exit ${CODE} but produced no"
+              echo "${OUT} directory — inconclusive, NOT a pass. Check the job log."
+              return 0
+            fi
+            if [ -f "$OUT/missed.txt" ] && [ -s "$OUT/missed.txt" ]; then
+              echo "WARNING: Surviving mutants — a changed line was mutated and NO test"
+              echo "failed, so the test for that line may not actually assert its"
+              echo "behaviour (CLAUDE.md adversarial-review check #2). ADVISORY, not blocking:"
+              echo ""
+              cat "$OUT/missed.txt"
+            elif [ "$STATUS" = "ran" ]; then
+              echo "OK: No surviving mutants in the changed videocall-aq lines —"
+              echo "every mutated line was caught by a failing test. (A diff with no"
+              echo "mutable lines — e.g. comment-only — also lands here, also fine.)"
+            fi
+            if [ -f "$OUT/timeout.txt" ] && [ -s "$OUT/timeout.txt" ]; then
+              echo ""
+              echo "Timed-out mutants (inconclusive, not failures):"
+              cat "$OUT/timeout.txt"
+            fi
+          }
+          # Always to the job log.
+          report
+          # And to the step summary when the runner provides it.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            report >> "$GITHUB_STEP_SUMMARY"
+          fi

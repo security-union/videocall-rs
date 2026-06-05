@@ -18,6 +18,7 @@
 
 use crate::{
     constants::{
+        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_SUPPRESS_DEBOUNCE_MS,
         LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MAX_LAYER_ID,
         LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
         VIEWPORT_MIN_UPDATE_INTERVAL,
@@ -47,10 +48,12 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::metrics::{
     RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
-    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
-    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
-    RELAY_VIEWPORT_UPDATES_TOTAL,
+    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
+    RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
+    RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
 };
+use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
+use videocall_types::protos::layer_hint_packet::LayerHintPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -398,6 +401,298 @@ impl LayerPrefs {
     }
 }
 
+// ===========================================================================
+// Publish-side layer suppression (#1108, Stage 3 — LAYER_HINT)
+// ===========================================================================
+
+/// Fail-open sentinel for the per-source layer union: "some receiver wants the
+/// FULL ladder for this (source, kind), so suppress nothing".
+///
+/// A receiver that has NO recorded preference for a `(source, kind)` is treated
+/// as wanting everything (this is the LAYER_PREFERENCE fail-open contract: no
+/// entry = forward all layers). It therefore contributes this value to the
+/// union, and because the union is a MAX, the presence of even one such receiver
+/// pins the union here — i.e. the relay suppresses a layer only when EVERY
+/// receiver explicitly asked for less. `u32::MAX` is well above any real layer
+/// id, so when the publisher clamps the emitted hint against its own ladder this
+/// resolves to "encode the full ladder". A poisoned prefs lock also collapses to
+/// this value (fail-open), mirroring the forwarding filter's `unwrap_or`.
+const LAYER_HINT_FULL_LADDER_SENTINEL: u32 = u32::MAX;
+
+/// The media kinds the relay computes a layer union for, as the normalized
+/// preference-map discriminants (VIDEO=1, AUDIO=2, SCREEN=3 — see
+/// [`normalize_pref_media_kind`]). A publisher produces at most one ladder per
+/// kind, so a hint carries at most one [`LayerHintEntry`] per element here.
+const LAYER_HINT_MEDIA_KINDS: [i32; 3] = [1, 2, 3];
+
+/// Map a normalized preference-map media-kind discriminant (1/2/3) onto the
+/// `LayerHintPacket.MediaKind` wire enum used when emitting a hint. Anything
+/// outside `{1,2,3}` maps to UNSPECIFIED(0) (never produced on the happy path —
+/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1/2/3).
+fn layer_hint_media_kind(
+    kind: i32,
+) -> videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind {
+    use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind;
+    match kind {
+        1 => MediaKind::VIDEO,
+        2 => MediaKind::AUDIO,
+        3 => MediaKind::SCREEN,
+        _ => MediaKind::MEDIA_KIND_UNSPECIFIED,
+    }
+}
+
+/// Actor message asking the [`ChatServer`] to recompute per-source layer unions
+/// and emit LAYER_HINT packets where the publisher's encode set should change
+/// (#1108, Stage 3).
+///
+/// This MUST run in the actor: the per-source union is an INVERTED query over
+/// the receiver-keyed `session_layer_prefs` map, and only the actor can see
+/// across all receivers (each per-session NATS task holds just its own one prefs
+/// `Arc`). The interceptors / teardown paths therefore `do_send` this message
+/// rather than computing the union themselves.
+///
+/// * `source = Some(s)`: recompute ONLY source `s` (used when a single
+///   receiver's preference for `s` changed).
+/// * `source = None`: recompute EVERY current publisher in `room` (used on
+///   receiver join / leave, which can shift many sources' fail-open unions at
+///   once).
+///
+/// SECURITY: this message is constructed ONLY by trusted, subject-authoritative
+/// relay paths (the LAYER_PREFERENCE interceptor after it has recorded an update
+/// on the receiver's OWN subject, and the join/leave lifecycle). There is NO
+/// path that constructs it from an inbound, client-sent LAYER_HINT — the relay
+/// never ingests LAYER_HINT at all.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RecomputeLayerHints {
+    room: String,
+    source: Option<SessionId>,
+}
+
+/// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
+///
+/// Tracks what the relay last TOLD a publisher and, when the union has dropped
+/// below that, when the downgrade was first observed (so the suppress-lazy
+/// window can be honored even without further preference changes — a deferred
+/// `notify_later` re-check drives the eventual emit).
+#[derive(Clone, Copy, Debug)]
+struct LayerHintEmitState {
+    /// The `max_requested_layer` value most recently EMITTED to the publisher
+    /// for this `(room, source, kind)`. Initialized to the full-ladder sentinel
+    /// the first time a key is seen, so the publisher's assumed starting state is
+    /// "encoding everything" (matching the fail-open default before any hint).
+    last_emitted: u32,
+    /// When a union STRICTLY below `last_emitted` was first observed. `None` when
+    /// the current union is `>= last_emitted` (no pending downgrade). Used to
+    /// enforce [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`] before emitting the lower hint.
+    pending_lower_since: Option<std::time::Instant>,
+}
+
+/// The outcome of [`decide_layer_hint`]: what the actor should do for one
+/// `(room, source, kind)` given the freshly computed union.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerHintDecision {
+    /// Emit a hint now. `direction` labels the metric (`"suppress"` for a lower
+    /// union, `"restore"` for a higher one). `value` is the union to send.
+    Emit {
+        value: u32,
+        direction: LayerHintDirection,
+    },
+    /// Do nothing now, but a lower union is pending; re-check after the debounce
+    /// window elapses (the `Instant` is the deadline to schedule `notify_later`
+    /// for). Returned the FIRST time a downgrade is observed.
+    ScheduleRecheck { deadline: std::time::Instant },
+    /// Do nothing, and the union is NOT below what was last emitted — so any
+    /// previously-pending downgrade must be CLEARED. Returned when the union is
+    /// unchanged (`== last_emitted`): a downgrade that was counting down has been
+    /// cancelled by demand returning, and a future downgrade must start a FRESH
+    /// debounce window rather than inheriting the stale `pending_lower_since`.
+    SkipClearPending,
+    /// Do nothing, and a downgrade is still pending within its window — KEEP the
+    /// pending timestamp so the scheduled re-check continues counting down toward
+    /// the original deadline.
+    SkipKeepPending,
+}
+
+/// Direction of an emitted LAYER_HINT, used only for the metric label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerHintDirection {
+    /// Lower union than last emitted — publisher may drop an upper layer.
+    Suppress,
+    /// Higher union than last emitted — publisher should restore a layer.
+    Restore,
+}
+
+impl LayerHintDirection {
+    fn as_label(self) -> &'static str {
+        match self {
+            LayerHintDirection::Suppress => "suppress",
+            LayerHintDirection::Restore => "restore",
+        }
+    }
+}
+
+/// Pure debounce decision for one `(room, source, kind)` (#1108, Stage 3).
+///
+/// Given the previous emit state (`None` = never emitted; assumed full-ladder),
+/// the freshly computed `union`, the current time `now`, and the debounce
+/// `window`, decide whether to emit, schedule a deferred re-check, or skip.
+///
+/// Policy:
+/// * `union > last_emitted` → **restore-eager**: emit immediately (clears any
+///   pending downgrade via the fresh emit state).
+/// * `union == last_emitted` → **change-detect**: skip, and CLEAR any pending
+///   downgrade (`SkipClearPending`) — demand returned to the emitted level, so a
+///   later drop must start a fresh debounce window, not inherit a stale one.
+/// * `union < last_emitted` → **suppress-lazy**:
+///     * first observation (no pending timestamp) → schedule a re-check at
+///       `now + window`; do not emit yet.
+///     * pending and `now - pending_since >= window` → emit (the lower union has
+///       been stable for the whole window).
+///     * pending and still within the window → `SkipKeepPending` (keep waiting;
+///       the scheduled re-check re-evaluates the *then-current* union).
+///
+/// The split Skip variants exist so the caller can correctly reconcile
+/// `pending_lower_since`: WITHOUT clearing it on the `==` path, a downgrade that
+/// was cancelled by restored demand would leave a stale timestamp, letting a much
+/// later downgrade bypass its debounce window (emit a suppress immediately).
+///
+/// Extracted as a free function (no `&self`, no NATS) so it is unit-testable in
+/// isolation with synthetic `Instant`s, mirroring the pure-resolver pattern used
+/// for the channel-capacity constant.
+fn decide_layer_hint(
+    prev: Option<LayerHintEmitState>,
+    union: u32,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> LayerHintDecision {
+    let last_emitted = prev
+        .map(|s| s.last_emitted)
+        .unwrap_or(LAYER_HINT_FULL_LADDER_SENTINEL);
+
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match union.cmp(&last_emitted) {
+        Greater => LayerHintDecision::Emit {
+            value: union,
+            direction: LayerHintDirection::Restore,
+        },
+        // Union back at the emitted level: cancel any pending downgrade.
+        Equal => LayerHintDecision::SkipClearPending,
+        Less => match prev.and_then(|s| s.pending_lower_since) {
+            // Already counting down: emit once the window has fully elapsed.
+            Some(since) if now.duration_since(since) >= window => LayerHintDecision::Emit {
+                value: union,
+                direction: LayerHintDirection::Suppress,
+            },
+            // Still within the window — keep counting toward the original deadline.
+            Some(_) => LayerHintDecision::SkipKeepPending,
+            // First time we see a downgrade — start the timer.
+            None => LayerHintDecision::ScheduleRecheck {
+                deadline: now + window,
+            },
+        },
+    }
+}
+
+/// Compute the set of SOURCE session ids whose desired layer changed between an
+/// old and a new per-receiver preference map (#1108, Stage 3).
+///
+/// A source is "changed" if, for ANY media kind, `old.get((source, kind))`
+/// differs from `new.get((source, kind))` — this includes entries that were
+/// ADDED (no old value), REMOVED (no new value; the source reverts to fail-open
+/// full ladder, which can raise its union), or had their value altered. Used by
+/// the LAYER_PREFERENCE interceptor to trigger a per-source layer-hint recompute
+/// only for the sources that actually moved, instead of the whole room.
+///
+/// Returned as a deduplicated `Vec` (source ids are unique). Pure / no `&self`
+/// so it is unit-testable in isolation.
+fn changed_pref_sources(
+    old: &HashMap<(u64, i32), u32>,
+    new: &HashMap<(u64, i32), u32>,
+) -> Vec<SessionId> {
+    let mut changed: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+    // Any (source, kind) present in old whose new value differs.
+    for (&(src, kind), &old_val) in old.iter() {
+        if new.get(&(src, kind)).copied() != Some(old_val) {
+            changed.insert(src);
+        }
+    }
+    // Any (source, kind) present in new whose old value differs (catches ADDED
+    // entries the first loop could not see).
+    for (&(src, kind), &new_val) in new.iter() {
+        if old.get(&(src, kind)).copied() != Some(new_val) {
+            changed.insert(src);
+        }
+    }
+    changed.into_iter().collect()
+}
+
+/// Pure per-source union computation for one `(source, media_kind)` (#1108).
+///
+/// Enumerates every receiver in `members` (capped at
+/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] for DoS bounding), reads each receiver's
+/// recorded preference for `(source, kind)` from `prefs`, and returns the MAX
+/// (the union). FAIL-OPEN throughout:
+/// * A receiver with NO recorded entry for `(source, kind)` contributes the
+///   full-ladder sentinel ([`LAYER_HINT_FULL_LADDER_SENTINEL`]).
+/// * A receiver whose prefs `RwLock` is POISONED also contributes the sentinel
+///   (mirrors the forwarding filter's `unwrap_or` fail-open at the layer drop
+///   site).
+/// * Receivers beyond the scan cap are not inspected and are implicitly treated
+///   as wanting the full ladder (truncation can only ever suppress LESS).
+///
+/// The source itself is skipped (a publisher is not its own receiver). The
+/// result is the RAW max-requested-layer id: the relay is layer-count-agnostic
+/// (see the "AVAILABILITY NOT VALIDATED" note on the forwarding path) and never
+/// learns the source's real ladder depth, so the publisher clamps this against
+/// its own ladder.
+///
+/// Free function (takes the maps by reference, no `&self`) so it is unit-testable
+/// without constructing a NATS-backed actor.
+fn compute_max_requested_layer(
+    members: &[SessionId],
+    prefs: &HashMap<SessionId, LayerPrefs>,
+    source: SessionId,
+    kind: i32,
+) -> u32 {
+    let mut union: u32 = 0;
+    let mut scanned: usize = 0;
+    for &receiver in members {
+        // A publisher is not a receiver of itself.
+        if receiver == source {
+            continue;
+        }
+        if scanned >= LAYER_HINT_MAX_RECEIVERS_SCANNED {
+            // DoS bound: anything past the cap is treated as fail-open (wants
+            // the full ladder), so pin the union to the sentinel and stop.
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        }
+        scanned += 1;
+
+        let contribution = match prefs.get(&receiver) {
+            // No prefs map for this receiver at all = fail-open (full ladder).
+            None => LAYER_HINT_FULL_LADDER_SENTINEL,
+            Some(p) => match p.state.read() {
+                Ok(guard) => guard
+                    .layers
+                    .get(&(source, kind))
+                    .copied()
+                    // No recorded preference for this (source, kind) = fail-open.
+                    .unwrap_or(LAYER_HINT_FULL_LADDER_SENTINEL),
+                // Poisoned lock = fail-open (mirror the forward filter).
+                Err(_) => LAYER_HINT_FULL_LADDER_SENTINEL,
+            },
+        };
+
+        union = union.max(contribution);
+        // Once the union hits the sentinel it can never decrease — short-circuit.
+        if union == LAYER_HINT_FULL_LADDER_SENTINEL {
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        }
+    }
+    union
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -482,6 +777,16 @@ pub struct ChatServer {
     /// Populated for non-observer sessions at JoinRoom; removed at
     /// `leave_rooms` / `forget_session`.
     session_room: HashMap<SessionId, String>,
+    /// Per-`(room, source session, media_kind)` LAYER_HINT emit/debounce state
+    /// (#1108, Stage 3 — publish-side layer suppression).
+    ///
+    /// Records what `max_requested_layer` the relay last EMITTED to each
+    /// publisher, plus the pending-downgrade timestamp that powers the
+    /// suppress-lazy debounce ([`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]). Consulted
+    /// and updated only inside [`Handler<RecomputeLayerHints>`] (actor-owned, no
+    /// lock needed). Entries are reaped when the publisher leaves (its
+    /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
+    layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
 }
 
 impl ChatServer {
@@ -502,10 +807,11 @@ impl ChatServer {
             session_desired_streams: HashMap::new(),
             session_layer_prefs: HashMap::new(),
             session_room: HashMap::new(),
+            layer_hint_state: HashMap::new(),
         }
     }
 
-    pub fn leave_rooms(&mut self, ctx: LeaveContext<'_>) {
+    pub fn leave_rooms(&mut self, leave_ctx: LeaveContext<'_>, actor_ctx: &mut Context<Self>) {
         let LeaveContext {
             session_id,
             room,
@@ -514,7 +820,7 @@ impl ChatServer {
             observer,
             is_host,
             end_on_host_leave,
-        } = ctx;
+        } = leave_ctx;
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
@@ -587,6 +893,28 @@ impl ChatServer {
                 room_became_empty = members.is_empty();
             }
             self.forget_room_if_empty(room_id);
+
+            // Publish-side suppression teardown + restore (#1108, Stage 3).
+            // The departing session may have been BOTH a publisher (a source
+            // with its own debounce state) AND a constraining receiver (its
+            // recorded preference held some other publisher's union DOWN).
+            //   1. Reap the departing session's own per-source hint state so the
+            //      `layer_hint_state` map cannot leak entries for a left source.
+            //   2. If the room still has members, recompute room-wide: with this
+            //      receiver gone its constraint disappears, so a publisher whose
+            //      remaining receivers all now (or already) want the full ladder
+            //      must get a RESTORE-eager hint. We message the actor rather
+            //      than recomputing inline to avoid borrowing `room_members`
+            //      while the recompute mutates `layer_hint_state`. This is
+            //      already excluded from the union scan above (the member was
+            //      retained-out), so the recompute sees post-departure demand.
+            self.forget_layer_hint_state_for_source(room_id, *session_id);
+            if !room_became_empty {
+                actor_ctx.address().do_send(RecomputeLayerHints {
+                    room: room_id.to_string(),
+                    source: None,
+                });
+            }
         }
 
         // End session using SessionManager
@@ -896,6 +1224,7 @@ impl ChatServer {
         // so the lookup still finds this session's instance_id.
         let instance_key = self.pending_departure_instance_key(session_id);
 
+        let mut room_still_populated = false;
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
@@ -904,6 +1233,8 @@ impl ChatServer {
                 // set-size gauge series so the eviction teardown path also
                 // cannot leak a stale series for a drained room (HCL #988).
                 let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+            } else {
+                room_still_populated = true;
             }
         }
 
@@ -920,6 +1251,23 @@ impl ChatServer {
         // the `leave_rooms` cleanup; both teardown paths must release it.
         let _ = self.session_layer_prefs.remove(&session_id);
         let _ = self.session_room.remove(&session_id);
+
+        // Publish-side suppression teardown + restore (#1108, Stage 3) — the
+        // eviction analog of the `leave_rooms` trigger. An evicted session may
+        // have been a publisher (reap its own per-source hint state) and/or a
+        // constraining receiver (its departure can RAISE a remaining publisher's
+        // union → restore-eager). Recompute room-wide via the actor only while
+        // the room still has members. NOTE: in the common reconnection case the
+        // replacement session re-joins under a fresh session_id and re-sends its
+        // LAYER_PREFERENCE, which independently re-triggers a recompute; this
+        // path additionally covers a pure eviction with no replacement.
+        self.forget_layer_hint_state_for_source(room, session_id);
+        if room_still_populated {
+            ctx.address().do_send(RecomputeLayerHints {
+                room: room.to_string(),
+                source: None,
+            });
+        }
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
         // evict them while a departure is pending, we want the new session to
@@ -956,6 +1304,231 @@ impl ChatServer {
             Some(iid) => iid.clone(),
             None => format!("__session__:{session}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish-side layer suppression (#1108, Stage 3 — LAYER_HINT)
+    // -----------------------------------------------------------------------
+
+    /// Compute the per-source layer UNION for one `(source, media_kind)` over
+    /// every receiver currently in `room` (#1108, Stage 3).
+    ///
+    /// Thin `&self` wrapper that resolves the room's member session ids and
+    /// delegates the actual (pure, fail-open, DoS-bounded) max computation to
+    /// [`compute_max_requested_layer`]. Returns the full-ladder sentinel when the
+    /// room is unknown (fail-open: nothing to suppress).
+    fn max_requested_layer(&self, room: &str, source: SessionId, kind: i32) -> u32 {
+        let Some(members) = self.room_members.get(room) else {
+            // Unknown room → no actionable union; fail-open.
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        };
+        let receiver_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
+        compute_max_requested_layer(&receiver_ids, &self.session_layer_prefs, source, kind)
+    }
+
+    /// Recompute the layer union for a SINGLE source across all media kinds and
+    /// emit / schedule / skip a LAYER_HINT per the debounce policy (#1108).
+    ///
+    /// Collects every kind whose debounce decision is `Emit` into a single
+    /// `LayerHintPacket` and publishes it once to the publisher's self-subject.
+    /// Kinds that need the suppress-lazy window cause one deferred
+    /// `notify_later` re-check to be scheduled (idempotent — the re-check simply
+    /// recomputes the then-current union).
+    fn recompute_layer_hints_for_source(
+        &mut self,
+        room: &str,
+        source: SessionId,
+        ctx: &mut Context<Self>,
+    ) {
+        // Only emit hints for a source that is an actual current publisher in the
+        // room. If it has already left (no member row), there is nothing to hint
+        // and its debounce state was/will be reaped by the teardown path.
+        let is_member = self
+            .room_members
+            .get(room)
+            .is_some_and(|members| members.iter().any(|m| m.session == source));
+        if !is_member {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+
+        let mut entries: Vec<LayerHintEntry> = Vec::new();
+        let mut emit_directions: Vec<LayerHintDirection> = Vec::new();
+        let mut schedule_recheck = false;
+
+        for &kind in LAYER_HINT_MEDIA_KINDS.iter() {
+            let union = self.max_requested_layer(room, source, kind);
+            let key = (room.to_string(), source, kind);
+            let prev = self.layer_hint_state.get(&key).copied();
+
+            match decide_layer_hint(prev, union, now, window) {
+                LayerHintDecision::Emit { value, direction } => {
+                    // Record the emission: clear any pending downgrade and store
+                    // the value we are about to tell the publisher.
+                    self.layer_hint_state.insert(
+                        key,
+                        LayerHintEmitState {
+                            last_emitted: value,
+                            pending_lower_since: None,
+                        },
+                    );
+                    let mut entry = LayerHintEntry::new();
+                    entry.media_kind = layer_hint_media_kind(kind).into();
+                    entry.max_requested_layer = value;
+                    entries.push(entry);
+                    emit_directions.push(direction);
+                }
+                LayerHintDecision::ScheduleRecheck { .. } => {
+                    // Mark the pending downgrade so the (eventual) re-check knows
+                    // the window is already counting, and arrange exactly one
+                    // deferred recompute for this source.
+                    let entry = self
+                        .layer_hint_state
+                        .entry(key)
+                        .or_insert(LayerHintEmitState {
+                            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+                            pending_lower_since: None,
+                        });
+                    if entry.pending_lower_since.is_none() {
+                        entry.pending_lower_since = Some(now);
+                        schedule_recheck = true;
+                    }
+                }
+                LayerHintDecision::SkipClearPending => {
+                    // Demand returned to the last-emitted level: cancel a pending
+                    // downgrade so a future drop starts a fresh debounce window
+                    // (otherwise a stale `pending_lower_since` would let a much
+                    // later drop bypass the suppress-lazy delay).
+                    if let Some(state) = self.layer_hint_state.get_mut(&key) {
+                        state.pending_lower_since = None;
+                    }
+                }
+                LayerHintDecision::SkipKeepPending => {
+                    // Still counting down toward the original deadline — leave the
+                    // pending timestamp untouched.
+                }
+            }
+        }
+
+        if !entries.is_empty() {
+            self.emit_layer_hint(room, source, entries, &emit_directions);
+        }
+
+        if schedule_recheck {
+            // Deferred suppress-lazy re-check: re-evaluate this source's unions
+            // after the debounce window. Re-running is safe/idempotent — the
+            // decision is a pure function of persisted state + the then-current
+            // union, so a flapping receiver that has since restored demand simply
+            // yields a skip (or an eager restore) at the deadline instead of the
+            // suppress.
+            ctx.notify_later(
+                RecomputeLayerHints {
+                    room: room.to_string(),
+                    source: Some(source),
+                },
+                window,
+            );
+        }
+    }
+
+    /// Build a `LayerHintPacket` from `entries`, wrap it in a relay-authored
+    /// `PacketWrapper { packet_type: LAYER_HINT, .. }`, and publish it to the
+    /// publisher's OWN per-session NATS subject `room.{room}.{publisher}` — the
+    /// same self-subject delivery the CONGESTION self-packet uses (#1108).
+    ///
+    /// `directions` is parallel to `entries` and used only to attribute each
+    /// emission on the `relay_layer_hint_emitted_total` metric.
+    fn emit_layer_hint(
+        &self,
+        room: &str,
+        publisher: SessionId,
+        entries: Vec<LayerHintEntry>,
+        directions: &[LayerHintDirection],
+    ) {
+        // Resolve the publisher's user_id from room_members for the wrapper's
+        // `user_id` field (cosmetic / consistency with other self-packets; the
+        // delivery subject is what scopes the hint). Empty if unknown.
+        let user_id = self
+            .room_members
+            .get(room)
+            .and_then(|members| members.iter().find(|m| m.session == publisher))
+            .map(|m| m.user_id.clone())
+            .unwrap_or_default();
+
+        let mut inner = LayerHintPacket::new();
+        inner.entries = entries;
+
+        let data = match inner.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Failed to serialize LayerHintPacket for publisher {} in room {}: {}",
+                    publisher, room, e
+                );
+                return;
+            }
+        };
+
+        let mut wrapper = PacketWrapper::new();
+        wrapper.packet_type = PacketType::LAYER_HINT.into();
+        wrapper.session_id = publisher;
+        wrapper.user_id = user_id.into_bytes();
+        wrapper.data = data;
+
+        let bytes = match wrapper.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Failed to serialize LAYER_HINT PacketWrapper for publisher {} in room {}: {}",
+                    publisher, room, e
+                );
+                return;
+            }
+        };
+
+        // The publisher's own self-subject, sanitized identically to every other
+        // room subject (room ids match `^[a-zA-Z0-9_-]*$`, the session is a
+        // u64). This is exactly the subject the publisher subscribes to and the
+        // same one the server's CONGESTION/system self-packets are published on.
+        let subject = format!("room.{room}.{publisher}").replace(' ', "_");
+
+        // Account every emitted entry by its direction BEFORE the async publish
+        // so the metric reflects the decision even if the publish later fails.
+        let room_label = room.to_string();
+        for dir in directions {
+            RELAY_LAYER_HINT_EMITTED_TOTAL
+                .with_label_values(&[&room_label, dir.as_label()])
+                .inc();
+        }
+
+        debug!(
+            "Emitting LAYER_HINT to publisher {} in room {} on {} ({} entr{})",
+            publisher,
+            room,
+            subject,
+            directions.len(),
+            if directions.len() == 1 { "y" } else { "ies" }
+        );
+
+        let nc = self.nats_connection.clone();
+        tokio::spawn(async move {
+            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                warn!(
+                    "Failed to publish LAYER_HINT for publisher {} in room {}: {}",
+                    publisher, room_label, e
+                );
+            }
+        });
+    }
+
+    /// Drop all LAYER_HINT debounce state for a departed publisher `source` in
+    /// `room` (#1108). Called from the teardown paths so the
+    /// `layer_hint_state` map cannot leak entries for sessions that have left.
+    fn forget_layer_hint_state_for_source(&mut self, room: &str, source: SessionId) {
+        self.layer_hint_state
+            .retain(|(r, s, _kind), _| !(r == room && *s == source));
     }
 }
 
@@ -1104,15 +1677,18 @@ impl Handler<Disconnect> for ChatServer {
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
         if observer {
-            self.leave_rooms(LeaveContext {
-                session_id: &session,
-                room: Some(&room),
-                user_id: Some(&user_id),
-                display_name: Some(&display_name),
-                observer: true,
-                is_host: false,
-                end_on_host_leave: true,
-            });
+            self.leave_rooms(
+                LeaveContext {
+                    session_id: &session,
+                    room: Some(&room),
+                    user_id: Some(&user_id),
+                    display_name: Some(&display_name),
+                    observer: true,
+                    is_host: false,
+                    end_on_host_leave: true,
+                },
+                ctx,
+            );
             return;
         }
 
@@ -1204,7 +1780,7 @@ impl Handler<Leave> for ChatServer {
             room,
             user_id,
         }: Leave,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
         // Cancel any pending departure for THIS session's tab / client
         // instance (`(room, instance_key)`) to avoid a duplicate
@@ -1241,15 +1817,18 @@ impl Handler<Leave> for ChatServer {
             .unwrap_or((false, true, None));
 
         // Leave is always a real participant, never an observer.
-        self.leave_rooms(LeaveContext {
-            session_id: &session,
-            room: Some(&room),
-            user_id: Some(&user_id),
-            display_name: display_name.as_deref(),
-            observer: false,
-            is_host,
-            end_on_host_leave,
-        });
+        self.leave_rooms(
+            LeaveContext {
+                session_id: &session,
+                room: Some(&room),
+                user_id: Some(&user_id),
+                display_name: display_name.as_deref(),
+                observer: false,
+                is_host,
+                end_on_host_leave,
+            },
+            ctx,
+        );
     }
 }
 
@@ -1539,6 +2118,41 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
     }
 }
 
+/// Recompute per-source layer unions and emit LAYER_HINT packets (#1108,
+/// Stage 3 — publish-side layer suppression).
+///
+/// Runs entirely in the actor because the union is an inverted query over the
+/// receiver-keyed `session_layer_prefs` map (see [`RecomputeLayerHints`]). A
+/// `Some(source)` recompute targets a single publisher; a `None` recompute fans
+/// out over every current publisher in the room (used on join/leave, which can
+/// shift many sources' fail-open unions at once).
+///
+/// SECURITY: there is intentionally NO inbound LAYER_HINT path — this handler is
+/// the ONLY producer of LAYER_HINT, and it is driven exclusively by trusted
+/// relay lifecycle events (subject-authoritative LAYER_PREFERENCE recording, and
+/// join/leave). It never parses or trusts a client-sent LAYER_HINT.
+impl Handler<RecomputeLayerHints> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecomputeLayerHints, ctx: &mut Self::Context) -> Self::Result {
+        match msg.source {
+            Some(source) => self.recompute_layer_hints_for_source(&msg.room, source, ctx),
+            None => {
+                // Room-wide recompute: snapshot the current publisher sessions so
+                // we are not holding an immutable borrow of `room_members` while
+                // `recompute_layer_hints_for_source` mutates `layer_hint_state`.
+                let sources: Vec<SessionId> = match self.room_members.get(&msg.room) {
+                    Some(members) => members.iter().map(|m| m.session).collect(),
+                    None => return,
+                };
+                for source in sources {
+                    self.recompute_layer_hints_for_source(&msg.room, source, ctx);
+                }
+            }
+        }
+    }
+}
+
 /// Handle per-room policy updates fanned out by `meeting-api` over
 /// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
 ///
@@ -1665,7 +2279,7 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             is_host,
             end_on_host_leave,
         }: ExecutePendingDeparture,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
         // Use the instance_key captured at Disconnect time, NOT the user_id —
         // see the doc comment on `ChatServer::pending_departures` for why
@@ -1765,15 +2379,18 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             );
             // Observer sessions bypass the grace period entirely (handled
             // directly in Disconnect), so this path is always non-observer.
-            self.leave_rooms(LeaveContext {
-                session_id: &session,
-                room: Some(&room),
-                user_id: Some(&user_id),
-                display_name: Some(&display_name),
-                observer: false,
-                is_host,
-                end_on_host_leave,
-            });
+            self.leave_rooms(
+                LeaveContext {
+                    session_id: &session,
+                    room: Some(&room),
+                    user_id: Some(&user_id),
+                    display_name: Some(&display_name),
+                    observer: false,
+                    is_host,
+                    end_on_host_leave,
+                },
+                ctx,
+            );
         } else {
             info!(
                 "Pending departure for user {} in room {} already cancelled (reconnected)",
@@ -2075,6 +2692,25 @@ impl Handler<JoinRoom> for ChatServer {
                     waiting_room_enabled: true,
                     allow_guests: false,
                 });
+
+            // Publish-side suppression restore (#1108, Stage 3). A newly-joined
+            // receiver has NO recorded layer preference yet, so under the
+            // fail-open contract it wants the FULL ladder from EVERY existing
+            // publisher. That can RAISE one or more sources' per-source unions
+            // (e.g. a publisher previously suppressed to base because its only
+            // receiver wanted base must now restore full for the new viewer).
+            // Recompute room-wide so each publisher gets a restore-eager hint.
+            // Routed through the actor (`do_send`) rather than computed inline to
+            // avoid borrowing `room_members` while the recompute mutates
+            // `layer_hint_state`; the new joiner is already in `room_members`
+            // above, so the recompute sees its (fail-open) demand. The joiner's
+            // own session has no debounce state yet, and it is a publisher of
+            // nothing until it sends media, so a `None` (room-wide) recompute is
+            // correct and idempotent.
+            ctx.address().do_send(RecomputeLayerHints {
+                room: room.clone(),
+                source: None,
+            });
         }
 
         // Clone the recipient so we can send existing member info directly to the new joiner
@@ -2083,6 +2719,12 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
         let server_addr = ctx.address();
+        // Recipient for publish-side layer-hint recomputes (#1108, Stage 3). The
+        // LAYER_PREFERENCE interceptor in this session's NATS loop messages the
+        // ACTOR (it cannot compute the cross-receiver union itself); a typed
+        // `Recipient<RecomputeLayerHints>` keeps the interceptor decoupled from
+        // the full `ChatServer` address and trivially mockable in unit tests.
+        let recompute_recipient = server_addr.clone().recipient::<RecomputeLayerHints>();
         // Shared viewport set for this session's NATS loop (HCL issue #988).
         let desired_streams_for_loop = desired_streams.clone();
         // Shared layer-preference map for this session's NATS loop (#989).
@@ -2268,6 +2910,8 @@ impl Handler<JoinRoom> for ChatServer {
                             &self_subject,
                             &layer_prefs_for_loop,
                             &room_clone,
+                            &|m| recompute_recipient.do_send(m),
+                            session_clone,
                         ) {
                             continue;
                         }
@@ -2506,6 +3150,15 @@ fn try_intercept_layer_preference(
     self_subject: &str,
     layer_prefs: &LayerPrefs,
     room: &str,
+    // Sink for per-source recompute requests (#1108, Stage 3). The interceptor
+    // runs in a per-session NATS task and CANNOT compute the cross-receiver
+    // union itself, so it hands each affected source to this sink, which in
+    // production forwards to the actor via `do_send`. Taking a closure (rather
+    // than the actor `Addr`/`Recipient` directly) keeps the interceptor a pure,
+    // synchronously-unit-testable function: tests pass a recording/no-op closure
+    // and never need a running actix system.
+    on_recompute: &dyn Fn(RecomputeLayerHints),
+    receiver_session: SessionId,
 ) -> bool {
     // Unparseable payloads are not our concern; let `handle_msg` apply its own
     // fail-closed handling.
@@ -2606,6 +3259,17 @@ fn try_intercept_layer_preference(
                         .inc();
                 } else {
                     let now_non_empty = !next.is_empty();
+                    // Determine which SOURCE sessions had their desired layer
+                    // changed by this update, BEFORE the overwrite moves `next`
+                    // into the guard (#1108, Stage 3). A source "changed" if, for
+                    // ANY media kind, the recorded value differs between the old
+                    // and new maps — including a source whose entry was ADDED or
+                    // REMOVED (removal flips it back to the fail-open full ladder,
+                    // which can raise the per-source union, so a restore hint may
+                    // be owed). We only message the actor for sources that
+                    // actually changed, keeping the per-source recompute O(changed)
+                    // rather than O(room) on every preference packet.
+                    let changed_sources = changed_pref_sources(&guard.layers, &next);
                     guard.layers = next;
                     guard.last_update = Some(now);
                     drop(guard);
@@ -2625,6 +3289,28 @@ fn try_intercept_layer_preference(
                     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
                         .with_label_values(&[room, "accepted"])
                         .inc();
+
+                    // Publish-side suppression trigger (#1108, Stage 3): this
+                    // receiver's demand for one or more sources changed, so ask
+                    // the ACTOR to recompute each affected source's per-source
+                    // union and hint its publisher. This MUST go through the
+                    // actor — the union is an inverted query over ALL receivers'
+                    // prefs, and this interceptor runs in a per-session NATS task
+                    // that can see only this one receiver's map. `do_send`
+                    // mirrors the display-name-change trigger: low-priority,
+                    // never blocks the NATS loop; if the actor mailbox is full the
+                    // recompute is simply skipped (the next preference change, or
+                    // a join/leave, will re-trigger it).
+                    for src in changed_sources {
+                        on_recompute(RecomputeLayerHints {
+                            room: room.to_string(),
+                            source: Some(src),
+                        });
+                    }
+                    debug!(
+                        "Recorded LAYER_PREFERENCE for receiver session {} in room {}; triggered per-source layer-hint recompute",
+                        receiver_session, room
+                    );
                 }
             }
             Err(_) => {
@@ -10039,8 +10725,15 @@ mod tests {
             make_layer_preference_packet_bytes(100, &[(200, 1), (300, 2)]),
         );
         let parsed = parse_pw(&msg);
-        let intercepted =
-            try_intercept_layer_preference(&msg, parsed.as_ref(), &self_subject, &prefs, "r");
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        );
         assert!(
             intercepted,
             "LAYER_PREFERENCE packet must be intercepted (dropped)"
@@ -10082,7 +10775,9 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         let st = prefs.state.read().unwrap();
         assert_eq!(
@@ -10166,8 +10861,15 @@ mod tests {
             make_layer_preference_packet_bytes(100, &[(200, 9), (999, 3)]),
         );
         let parsed = parse_pw(&msg);
-        let intercepted =
-            try_intercept_layer_preference(&msg, parsed.as_ref(), &self_subject, &prefs, "r");
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        );
         assert!(intercepted, "LAYER_PREFERENCE must still be consumed");
         let st = prefs.state.read().unwrap();
         assert_eq!(
@@ -10193,7 +10895,15 @@ mod tests {
         );
         let parsed = parse_pw(&msg);
         assert!(
-            !try_intercept_layer_preference(&msg, parsed.as_ref(), &self_subject, &prefs, "r"),
+            !try_intercept_layer_preference(
+                &msg,
+                parsed.as_ref(),
+                &self_subject,
+                &prefs,
+                "r",
+                &|_| {},
+                100,
+            ),
             "non-LAYER_PREFERENCE packet must fall through (return false)"
         );
         assert!(prefs.state.read().unwrap().layers.is_empty());
@@ -10215,7 +10925,9 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         assert_eq!(
             prefs.state.read().unwrap().layers.len(),
@@ -10257,7 +10969,9 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         let st = prefs.state.read().unwrap();
         assert_eq!(
@@ -10313,7 +11027,9 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         assert!(
             prefs.state.read().unwrap().layers.is_empty(),
@@ -10347,7 +11063,9 @@ mod tests {
             parsed.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         assert!(
             prefs.state.read().unwrap().layers.is_empty(),
@@ -10372,7 +11090,9 @@ mod tests {
             parsed1.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         assert_eq!(prefs.state.read().unwrap().layers.get(&(200, 1)), Some(&1));
 
@@ -10387,12 +11107,577 @@ mod tests {
             parsed2.as_ref(),
             &self_subject,
             &prefs,
-            "r"
+            "r",
+            &|_| {},
+            100,
         ));
         assert_eq!(
             prefs.state.read().unwrap().layers.get(&(200, 1)),
             Some(&1),
             "rate-limited update must NOT mutate the map"
         );
+    }
+
+    // ======================================================================
+    // Publish-side layer suppression — per-source layer union + debounce
+    // (#1108, Stage 3 — LAYER_HINT)
+    // ======================================================================
+    //
+    // These exercise the relay-side union computation, the change-detection used
+    // to trigger recomputes, the suppress-lazy / restore-eager debounce state
+    // machine, and the forge-resistance guarantee (no inbound LAYER_HINT ingest).
+    // They test the PURE functions directly and therefore need neither NATS nor a
+    // running actor.
+
+    /// One `(source_session, media_kind, desired_layer)` preference entry, as
+    /// consumed by [`layer_prefs_with_kinds`]. Aliased to keep the union-test
+    /// helper signatures under clippy's type-complexity threshold.
+    type LayerEntrySpec = (u64, i32, u32);
+    /// One receiver's spec: its session id plus the entries it has recorded.
+    type ReceiverSpec<'a> = (SessionId, &'a [LayerEntrySpec]);
+
+    /// Build a receiver-keyed prefs map from `(receiver, &[(source, kind, layer)])`
+    /// specs, mirroring the real `session_layer_prefs` shape. A receiver listed
+    /// with an EMPTY slice has a `LayerPrefs` whose map is empty (still a recorded
+    /// session, but no preference for any source → fail-open per (source,kind)).
+    fn receivers_map(specs: &[ReceiverSpec<'_>]) -> HashMap<SessionId, LayerPrefs> {
+        specs
+            .iter()
+            .map(|&(receiver, entries)| (receiver, layer_prefs_with_kinds(entries)))
+            .collect()
+    }
+
+    const VIDEO_KIND: i32 = 1;
+
+    #[test]
+    fn test_union_max_over_receivers() {
+        // Three receivers want layers {2, 1, 2} of source 900's VIDEO. The union
+        // (max) is 2.
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 2)]),
+            (2, &[(900, VIDEO_KIND, 1)]),
+            (3, &[(900, VIDEO_KIND, 2)]),
+        ]);
+        let members = [900, 1, 2, 3];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(union, 2, "union of {{2,1,2}} must be 2");
+    }
+
+    #[test]
+    fn test_union_fail_open_on_absent_entry() {
+        // Receiver 1 wants base (0); receiver 2 has NO recorded entry for source
+        // 900 (fail-open = wants the full ladder). The union must be the
+        // full-ladder sentinel, i.e. "suppress nothing".
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 0)]),
+            (2, &[(901, VIDEO_KIND, 0)]), // a pref for a DIFFERENT source only
+        ]);
+        let members = [900, 1, 2];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a receiver with no entry for (source,kind) is fail-open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_union_fail_open_on_missing_prefs_map() {
+        // A member with NO LayerPrefs entry at all (never recorded a single
+        // preference packet) is fail-open too.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 0)])]);
+        // Member 2 is in the room but absent from the prefs map entirely.
+        let members = [900, 1, 2];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a member with no prefs map entry is fail-open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_union_all_base_is_zero() {
+        // Every receiver explicitly wants base (0) → union 0 (fully suppressible).
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 0)]),
+            (2, &[(900, VIDEO_KIND, 0)]),
+            (3, &[(900, VIDEO_KIND, 0)]),
+        ]);
+        let members = [900, 1, 2, 3];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(union, 0, "when every receiver wants base the union is 0");
+    }
+
+    #[test]
+    fn test_union_skips_source_itself() {
+        // The source is not its own receiver: even if a (bogus) self entry exists
+        // it must not be counted. Here only the source has any entry, so the union
+        // over the *other* members (none) is 0.
+        let prefs = receivers_map(&[(900, &[(900, VIDEO_KIND, 2)])]);
+        let members = [900];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, 0,
+            "the source's own entry must be skipped (a publisher is not its own receiver)"
+        );
+    }
+
+    #[test]
+    fn test_union_per_kind_independent() {
+        // The same source can carry distinct unions per media kind. Receivers
+        // want VIDEO {2,1} but SCREEN {0,0}; the VIDEO union is 2 while the
+        // SCREEN union is 0.
+        const SCREEN_KIND: i32 = 3;
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 2), (900, SCREEN_KIND, 0)]),
+            (2, &[(900, VIDEO_KIND, 1), (900, SCREEN_KIND, 0)]),
+        ]);
+        let members = [900, 1, 2];
+        assert_eq!(
+            compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND),
+            2,
+            "VIDEO union"
+        );
+        assert_eq!(
+            compute_max_requested_layer(&members, &prefs, 900, SCREEN_KIND),
+            0,
+            "SCREEN union is independent of VIDEO"
+        );
+    }
+
+    #[test]
+    fn test_union_disconnect_full_wanter_shrinks() {
+        // Before: receivers {1: layer 1, 2: full-ladder (no entry)} → union is the
+        // sentinel (fail-open). After receiver 2 (the full-ladder wanter) leaves,
+        // only receiver 1 remains and the union shrinks to 1.
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 1)]),
+            (2, &[(901, VIDEO_KIND, 0)]), // no entry for 900 → fail-open for 900
+        ]);
+        let before = compute_max_requested_layer(&[900, 1, 2], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            before, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "with a fail-open receiver present the union is the full-ladder sentinel"
+        );
+        // Receiver 2 has left → it is no longer in the member list.
+        let after = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            after, 1,
+            "after the full-ladder receiver leaves, the union shrinks to the remaining max (1)"
+        );
+    }
+
+    #[test]
+    fn test_union_disconnect_base_wanter_unchanged() {
+        // Before: receivers {1: layer 2, 2: base 0} → union 2. After receiver 2
+        // (the base wanter, which was NOT the constraining max) leaves, the union
+        // is still 2.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 2)]), (2, &[(900, VIDEO_KIND, 0)])]);
+        let before = compute_max_requested_layer(&[900, 1, 2], &prefs, 900, VIDEO_KIND);
+        assert_eq!(before, 2);
+        let after = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            after, 2,
+            "removing a non-max (base) receiver leaves the union unchanged"
+        );
+    }
+
+    #[test]
+    fn test_union_dos_cap_truncates_fail_open() {
+        // A room larger than the scan cap fails open on the remainder: even if
+        // every scanned receiver wants base, the un-scanned tail is treated as
+        // wanting the full ladder, so the union is the sentinel. Build cap+2
+        // base-wanting receivers (ids 1..=cap+2) plus the source.
+        let cap = LAYER_HINT_MAX_RECEIVERS_SCANNED;
+        let specs: Vec<(SessionId, Vec<LayerEntrySpec>)> = (1..=(cap as u64 + 2))
+            .map(|r| (r, vec![(900u64, VIDEO_KIND, 0u32)]))
+            .collect();
+        let prefs: HashMap<SessionId, LayerPrefs> = specs
+            .iter()
+            .map(|(r, e)| (*r, layer_prefs_with_kinds(e)))
+            .collect();
+        let mut members: Vec<SessionId> = vec![900];
+        members.extend(1..=(cap as u64 + 2));
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "scanning past the DoS cap must fail open (treat the tail as full-ladder)"
+        );
+    }
+
+    #[test]
+    fn test_union_poisoned_lock_fails_open() {
+        // A receiver whose prefs RwLock is POISONED contributes the full-ladder
+        // sentinel (fail-open), mirroring the forwarding filter's `unwrap_or`.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 0)])]);
+        // Poison receiver 1's lock by panicking while holding the write guard.
+        let target = prefs.get(&1).unwrap().clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = target.state.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        }));
+        assert!(
+            prefs.get(&1).unwrap().state.read().is_err(),
+            "precondition: receiver 1's lock is poisoned"
+        );
+        let union = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a poisoned receiver lock must fail open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_changed_pref_sources_detects_add_remove_change() {
+        let mut old: HashMap<(u64, i32), u32> = HashMap::new();
+        old.insert((900, VIDEO_KIND), 2);
+        old.insert((901, VIDEO_KIND), 1);
+        old.insert((902, VIDEO_KIND), 0);
+
+        let mut new = old.clone();
+        new.insert((900, VIDEO_KIND), 0); // changed value for 900
+        new.remove(&(901, VIDEO_KIND)); // removed 901 (reverts to fail-open)
+        new.insert((903, VIDEO_KIND), 1); // added 903
+                                          // 902 unchanged
+
+        let mut changed = changed_pref_sources(&old, &new);
+        changed.sort_unstable();
+        assert_eq!(
+            changed,
+            vec![900, 901, 903],
+            "changed set must include value-change (900), removal (901), and add (903) — not the unchanged 902"
+        );
+    }
+
+    #[test]
+    fn test_changed_pref_sources_no_change_is_empty() {
+        let mut map: HashMap<(u64, i32), u32> = HashMap::new();
+        map.insert((900, VIDEO_KIND), 2);
+        let changed = changed_pref_sources(&map, &map.clone());
+        assert!(
+            changed.is_empty(),
+            "identical maps yield no changed sources (change-detect skip)"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_restore_is_eager() {
+        // A higher union than last emitted is emitted IMMEDIATELY (restore-eager),
+        // even with a long debounce window and zero elapsed time.
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let prev = Some(LayerHintEmitState {
+            last_emitted: 1,
+            pending_lower_since: None,
+        });
+        let decision = decide_layer_hint(prev, 3, now, window);
+        assert_eq!(
+            decision,
+            LayerHintDecision::Emit {
+                value: 3,
+                direction: LayerHintDirection::Restore
+            },
+            "a higher union must emit immediately (restore-eager)"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_unchanged_is_skip() {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let prev = Some(LayerHintEmitState {
+            last_emitted: 2,
+            pending_lower_since: None,
+        });
+        assert_eq!(
+            decide_layer_hint(prev, 2, now, window),
+            LayerHintDecision::SkipClearPending,
+            "an unchanged union must be skipped (change-detect) and clear any pending downgrade"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_lower_schedules_then_emits_after_window() {
+        // Suppress-lazy: the FIRST observation of a lower union schedules a
+        // re-check (no emit). Once the window has fully elapsed, the lower hint is
+        // emitted as a suppress.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+
+        // No prior state → assumed full-ladder. A concrete lower union (1) is a
+        // downgrade and must first SCHEDULE.
+        let first = decide_layer_hint(None, 1, t0, window);
+        match first {
+            LayerHintDecision::ScheduleRecheck { deadline } => {
+                assert_eq!(deadline, t0 + window, "deadline is now + window");
+            }
+            other => panic!("first lower observation must ScheduleRecheck, got {other:?}"),
+        }
+
+        // Simulate the actor having recorded the pending timestamp at t0, then the
+        // re-check firing AFTER the window: it must now EMIT (suppress).
+        let pending = Some(LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        });
+        let after = decide_layer_hint(pending, 1, t0 + window, window);
+        assert_eq!(
+            after,
+            LayerHintDecision::Emit {
+                value: 1,
+                direction: LayerHintDirection::Suppress
+            },
+            "after the stability window the lower union emits as a suppress"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_lower_within_window_is_skip() {
+        // While a downgrade is pending but the window has NOT elapsed, decisions
+        // skip (keep waiting) — this is what collapses a rapid flap into a single
+        // eventual lower hint instead of one per change.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+        let pending = Some(LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        });
+        // Half a window later — still pending.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(pending, 1, mid, window),
+            LayerHintDecision::SkipKeepPending,
+            "a still-pending downgrade within the window must keep waiting (debounce)"
+        );
+        // A DIFFERENT lower value mid-window also keeps waiting (does not reset to
+        // a fresh schedule, does not emit early).
+        assert_eq!(
+            decide_layer_hint(pending, 0, mid, window),
+            LayerHintDecision::SkipKeepPending,
+            "a changed-but-still-lower value mid-window keeps waiting"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_flap_back_up_cancels_suppress() {
+        // Rapid flap: union drops (schedule), then RISES back to/above the last
+        // emitted before the window elapses. The rise emits eagerly as a restore,
+        // and there is no lingering suppress. This proves the eager-up path wins
+        // over a pending downgrade.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+        // Pending downgrade from full-ladder to 1, recorded at t0.
+        let pending = Some(LayerHintEmitState {
+            last_emitted: 2,
+            pending_lower_since: Some(t0),
+        });
+        // Mid-window the union jumps to 3 (> last_emitted 2): restore-eager.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(pending, 3, mid, window),
+            LayerHintDecision::Emit {
+                value: 3,
+                direction: LayerHintDirection::Restore
+            },
+            "a mid-window rise above last_emitted emits a restore immediately"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_first_full_ladder_is_skip() {
+        // No prior state and the union is ALREADY the full ladder (the fail-open
+        // default the publisher is assumed to be encoding): nothing to say → skip.
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        assert_eq!(
+            decide_layer_hint(None, LAYER_HINT_FULL_LADDER_SENTINEL, now, window),
+            LayerHintDecision::SkipClearPending,
+            "a first observation equal to the assumed full-ladder baseline is a no-op"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_cancelled_downgrade_re_debounces() {
+        // Regression guard for the stale-`pending_lower_since` bug: a downgrade
+        // that is CANCELLED by demand returning to the emitted level must reset
+        // the pending state, so a LATER downgrade starts a FRESH debounce window
+        // instead of emitting a suppress immediately.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+
+        // 1) Downgrade observed at t0 → schedule (pending set to t0 by the actor).
+        assert!(matches!(
+            decide_layer_hint(None, 1, t0, window),
+            LayerHintDecision::ScheduleRecheck { .. }
+        ));
+        let pending = LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        };
+
+        // 2) Mid-window the union returns to the full-ladder baseline (==
+        //    last_emitted): the decision is SkipClearPending, and the actor clears
+        //    `pending_lower_since`.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(Some(pending), LAYER_HINT_FULL_LADDER_SENTINEL, mid, window),
+            LayerHintDecision::SkipClearPending,
+            "demand returning to baseline must cancel the pending downgrade"
+        );
+        let cleared = LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: None,
+        };
+
+        // 3) Much LATER (well beyond the original window) the union drops again.
+        //    Because pending was cleared, this is a FIRST downgrade observation
+        //    again → ScheduleRecheck, NOT an immediate suppress emit. This is the
+        //    behaviour the bug would have broken.
+        let much_later = t0 + window * 5;
+        assert!(
+            matches!(
+                decide_layer_hint(Some(cleared), 1, much_later, window),
+                LayerHintDecision::ScheduleRecheck { .. }
+            ),
+            "a downgrade after a cancelled one must re-debounce (not bypass the window)"
+        );
+    }
+
+    #[test]
+    fn test_layer_hint_forge_resistance_no_inbound_ingest() {
+        // FORGE RESISTANCE (security): a LAYER_HINT packet arriving on a session
+        // subject MUST NOT be interpreted as a hint and MUST NOT mutate any
+        // union/preference state. The LAYER_PREFERENCE interceptor — the ONLY
+        // path that records union inputs — must FALL THROUGH (return false) for a
+        // LAYER_HINT, never recording anything, and never invoking the recompute
+        // sink. There is no try_intercept_layer_hint at all.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+
+        // Craft a LAYER_HINT wrapper (as a malicious client might) carrying a
+        // bogus payload, delivered on the receiver's OWN subject.
+        let mut inner = LayerHintPacket::new();
+        let mut entry = LayerHintEntry::new();
+        entry.media_kind =
+            videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind::VIDEO.into();
+        entry.max_requested_layer = 0; // "suppress everything" — must be ignored
+        inner.entries.push(entry);
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::LAYER_HINT.into();
+        pw.session_id = 100;
+        pw.data = inner.write_to_bytes().unwrap();
+        let bytes = pw.write_to_bytes().unwrap();
+        let msg = make_nats_message(&self_subject, bytes);
+        let parsed = parse_pw(&msg);
+
+        // Track whether the recompute sink is (wrongly) invoked.
+        let recompute_calls = std::cell::Cell::new(0u32);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| recompute_calls.set(recompute_calls.get() + 1),
+            100,
+        );
+
+        assert!(
+            !intercepted,
+            "a LAYER_HINT must FALL THROUGH the LAYER_PREFERENCE interceptor (return false) — \
+             it is not a preference and there is no inbound LAYER_HINT path"
+        );
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "a forged LAYER_HINT must NOT record any preference / union input"
+        );
+        assert!(
+            !prefs.has_any(),
+            "a forged LAYER_HINT must not raise the recorded-prefs hint"
+        );
+        assert_eq!(
+            recompute_calls.get(),
+            0,
+            "a forged LAYER_HINT must never trigger a layer-hint recompute"
+        );
+    }
+
+    #[test]
+    fn test_layer_preference_triggers_recompute_for_changed_source_only() {
+        // A genuine LAYER_PREFERENCE on the OWN subject records the map AND invokes
+        // the recompute sink once per CHANGED source — proving the per-source
+        // trigger (checklist item 5) fires with the right source set.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes(100, &[(200, 1), (300, 2)]),
+        );
+        let parsed = parse_pw(&msg);
+
+        let recomputed: std::cell::RefCell<Vec<Option<SessionId>>> =
+            std::cell::RefCell::new(Vec::new());
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|m: RecomputeLayerHints| recomputed.borrow_mut().push(m.source),
+            100,
+        );
+        assert!(intercepted, "a LAYER_PREFERENCE must be intercepted");
+
+        let mut sources: Vec<u64> = recomputed
+            .borrow()
+            .iter()
+            .map(|s| s.expect("per-source trigger must carry Some(source)"))
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            vec![200, 300],
+            "recording two new sources must trigger a per-source recompute for each"
+        );
+    }
+
+    #[test]
+    fn test_layer_preference_other_subject_does_not_trigger_recompute() {
+        // A LAYER_PREFERENCE on a DIFFERENT subject is dropped without mutating
+        // state AND without triggering any recompute (the union must never be
+        // built from a non-subject-authoritative packet).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            "room.r.555",
+            make_layer_preference_packet_bytes(100, &[(200, 1)]),
+        );
+        let parsed = parse_pw(&msg);
+        let recompute_calls = std::cell::Cell::new(0u32);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| recompute_calls.set(recompute_calls.get() + 1),
+            100,
+        );
+        assert!(intercepted, "still consumed");
+        assert_eq!(
+            recompute_calls.get(),
+            0,
+            "a foreign-subject LAYER_PREFERENCE must NOT trigger a recompute"
+        );
+        assert!(prefs.state.read().unwrap().layers.is_empty());
+    }
+
+    #[test]
+    fn test_layer_hint_media_kind_mapping() {
+        use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind as HintKind;
+        assert_eq!(layer_hint_media_kind(1), HintKind::VIDEO);
+        assert_eq!(layer_hint_media_kind(2), HintKind::AUDIO);
+        assert_eq!(layer_hint_media_kind(3), HintKind::SCREEN);
+        assert_eq!(layer_hint_media_kind(0), HintKind::MEDIA_KIND_UNSPECIFIED);
+        assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
     }
 }

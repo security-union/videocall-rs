@@ -1386,6 +1386,15 @@ impl CameraEncoder {
                 // In single-stream mode this is always 1 and gates nothing.
                 // Refreshed from the shared atomic at the top of every frame.
                 let mut local_active_layers: usize;
+                // Last active-layer count we logged a transition for. Seeded to
+                // `n_layers` because the encode loop starts with every layer
+                // active (the shared atomic is initialized to the clamped layer
+                // count). Holding it here — loop-local, persisting across frames
+                // within a restart cycle — lets us emit ONE log line only when
+                // the count actually changes (a layer is shed or restored),
+                // never per frame. Re-seeded per `'restart` because this binding
+                // lives inside the `'restart` loop body.
+                let mut prev_active_layers: usize = n_layers;
 
                 // Track whether we have successfully encoded at least one frame
                 // in this restart cycle. Used to reset restart_count on success.
@@ -1436,6 +1445,64 @@ impl CameraEncoder {
                     // Refresh the active-layer count each frame (simulcast only).
                     local_active_layers =
                         shared_active_layer_count.load(Ordering::Relaxed) as usize;
+
+                    // Event-driven simulcast layer-transition log (issue #989).
+                    //
+                    // Fires ONCE per change in the active-layer count — a layer
+                    // being shed (count drops) or restored (count rises). NOT a
+                    // periodic heartbeat: layer changes are heavily damped by the
+                    // AQ controller's hysteresis (≈1.5s to shed, ≈5s to restore),
+                    // so a per-tick snapshot would be near-silent noise. We log
+                    // the TRANSITION, not the steady state.
+                    //
+                    // Gated on `simulcast` (n_layers > 1) so single-stream
+                    // sessions — where this count is pinned at 1 — never emit it.
+                    // `info!` is safe here: this is per-transition, several
+                    // seconds apart at most, never per-frame or per-packet.
+                    if simulcast && local_active_layers != prev_active_layers {
+                        // Directional reason only. The richer cause (server
+                        // CONGESTION vs WS-backpressure force-cut vs gradual /
+                        // floor-saturated degrade vs recovery) lives in the
+                        // `EncoderBitrateController` in the separate diagnostics
+                        // loop and reaches the encode loop solely through the
+                        // `shared_active_layer_count` atomic — no reason flag is
+                        // plumbed across. We avoid adding heavy plumbing just for
+                        // this string.
+                        // TODO(#989): surface the precise shed reason
+                        // (congestion / degrade / recover) from the controller
+                        // via a small shared enum atomic so this can read e.g.
+                        // reason=congestion instead of the directional fallback.
+                        let reason = if local_active_layers < prev_active_layers {
+                            "shed-under-load"
+                        } else {
+                            "restore"
+                        };
+                        let detail = layers
+                            .iter()
+                            .map(|l| {
+                                if (l.layer_id as usize) < local_active_layers {
+                                    format!(
+                                        "[{}] {}x{} ~{}kbps ACTIVE",
+                                        l.layer_id,
+                                        l.current_w,
+                                        l.current_h,
+                                        l.local_bitrate / 1000
+                                    )
+                                } else {
+                                    format!("[{}] {}x{} SHED", l.layer_id, l.current_w, l.current_h)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        log::info!(
+                            "Simulcast layer change: active {}->{} (reason={}) | {}",
+                            prev_active_layers,
+                            local_active_layers,
+                            reason,
+                            detail
+                        );
+                        prev_active_layers = local_active_layers;
+                    }
 
                     // Single-stream tier dims + shared bitrate (only meaningful
                     // when NOT simulcast — the adaptive single-stream resolution

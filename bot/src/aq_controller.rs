@@ -229,6 +229,12 @@ impl BotAq {
             }
         };
 
+        // Sender encoder backpressure (issue #1108, Phase B). The bot has no
+        // WebCodecs encoder, so it has no encode-queue depth to report — feed 0
+        // (no backpressure). Keeps the native consumer compiling against the new
+        // target-agnostic API and stays behavior-neutral (Stage 1 stores only).
+        ctrl.observe_encoder_queue_depth(0);
+
         let _ = ctrl.process_diagnostics_packet(pkt);
 
         // Always publish the latest PID-derived telemetry — these are useful

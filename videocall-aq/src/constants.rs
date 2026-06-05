@@ -777,6 +777,48 @@ pub const PID_CORRECTION_THROTTLE_MS: f64 = 1000.0;
 pub const PID_FPS_HISTORY_SIZE: usize = 10;
 
 // ---------------------------------------------------------------------------
+// Sender Encoder Backpressure (issue #1108, Phase B)
+// ---------------------------------------------------------------------------
+// The receiver-FPS-driven layer shed reacts to how peers *receive* our stream,
+// but it cannot see the *sender's own* encoder falling behind (a CPU-bound
+// laptop whose WebCodecs encode queue is backing up). These constants describe
+// the sender-side backstop: when the active encoders' `encode_queue_size()`
+// stays high for a sustained window, Stage 2 will shed a layer to relieve
+// encode CPU. Stage 1 only *samples and stores* the queue depth — these
+// thresholds are not yet read by any control path (see
+// `EncoderBitrateController::observe_encoder_queue_depth`).
+
+/// Encoder queue depth (frames pending in the WebCodecs `VideoEncoder`) at or
+/// above which the sender is considered to be in encode backpressure. Sampled
+/// as the max `encode_queue_size()` across active simulcast layers. A healthy
+/// realtime encoder drains to ~0–1 each tick, so a sustained depth of 3 means
+/// the encoder is consistently a few frames behind capture.
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+#[allow(dead_code)]
+pub const ENCODER_QUEUE_BACKPRESSURE_HIGH: u32 = 3;
+
+/// Encoder queue depth at or below which sender encode backpressure is
+/// considered cleared (hysteresis floor against the HIGH threshold). Once the
+/// queue drains back to this depth the sustain timer resets.
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+#[allow(dead_code)]
+pub const ENCODER_QUEUE_BACKPRESSURE_CLEAR: u32 = 1;
+
+/// How long (milliseconds) the encoder queue depth must stay at/above
+/// [`ENCODER_QUEUE_BACKPRESSURE_HIGH`] before Stage 2 acts on it. Sized in the
+/// same ballpark as `STEP_DOWN_REACTION_TIME_MS` so a brief encode hiccup (a
+/// single slow frame, a GC pause) does not trigger a shed.
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+#[allow(dead_code)]
+pub const ENCODER_BACKPRESSURE_SUSTAIN_MS: f64 = 1500.0;
+
+// ---------------------------------------------------------------------------
 // Bitrate Change Threshold
 // ---------------------------------------------------------------------------
 

@@ -318,6 +318,15 @@ pub struct CameraEncoder {
     /// in single-stream mode (the legacy `current_bitrate` atomic is used
     /// instead). Sized to `SIMULCAST_MAX_SUPPORTED_LAYERS` lazily on first use.
     shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Sender-side encoder backpressure (issue #1108, Phase B): the max
+    /// `VideoEncoder::encode_queue_size()` across the ACTIVE layers, written by
+    /// the encode loop each frame and read by the AQ control loop to feed
+    /// [`EncoderBitrateController::observe_encoder_queue_depth`]. The encode loop
+    /// owns the `VideoEncoder`s and the control loop owns the controller, so this
+    /// atomic is the borrow-safe bridge between the two tasks — neither borrows
+    /// the other's state. **Stage 1: the controller only stores this value (no
+    /// shed/tier effect), so it is observability-only.**
+    shared_encoder_queue_depth: Rc<AtomicU32>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -422,6 +431,9 @@ impl CameraEncoder {
             // build; the control loop adjusts it down/up under congestion.
             shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
+            // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
+            // (no frames queued); the encode loop publishes the live depth.
+            shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
         }
     }
 
@@ -467,6 +479,10 @@ impl CameraEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the control loop
+        // READS the depth the encode loop published and forwards it to the
+        // controller before each diagnostics packet.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -576,6 +592,16 @@ impl CameraEncoder {
                         ws_drop_window_start_ms = now_ms;
                     }
                 }
+
+                // Sender encoder backpressure (issue #1108, Phase B). Feed the
+                // depth the encode loop published into the controller BEFORE the
+                // diagnostics packet drives the rest of AQ. Stage 1: the
+                // controller only stores this — no shed/tier effect — so AQ
+                // behavior is byte-identical. The native bot feeds 0 in its own
+                // loop; here we forward the live WebCodecs queue depth.
+                encoder_control.observe_encoder_queue_depth(
+                    shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
 
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
 
@@ -976,6 +1002,9 @@ impl CameraEncoder {
         let simulcast = n_layers > 1;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the encode loop
+        // WRITES the max active-layer encode_queue_size() here each frame.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -1791,6 +1820,27 @@ impl CameraEncoder {
                             // the frame data by here. Never double-close: the
                             // fatal path below also reaches this single close.
                             video_frame.close();
+
+                            // Sender encoder backpressure (issue #1108, Phase B).
+                            // After submitting this frame to every ACTIVE layer,
+                            // sample the max `encode_queue_size()` across those
+                            // layers and publish it for the AQ control loop. We
+                            // mirror the encode gate above (skip layers
+                            // `>= local_active_layers` in simulcast mode) so a
+                            // shed layer's stale queue can't keep the signal hot.
+                            // For N==1 this is just the sole base layer's depth.
+                            // Stage 1: stored-only on the controller side, so this
+                            // is observability with no behavior change.
+                            let max_active_queue_depth = layers
+                                .iter()
+                                .filter(|l| {
+                                    !simulcast || (l.layer_id as usize) < local_active_layers
+                                })
+                                .map(|l| l.encoder.encode_queue_size())
+                                .max()
+                                .unwrap_or(0);
+                            shared_encoder_queue_depth
+                                .store(max_active_queue_depth, Ordering::Relaxed);
 
                             // First healthy frame after a restart resets the restart
                             // counter so transient errors don't accumulate toward

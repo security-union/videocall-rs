@@ -426,6 +426,25 @@ pub struct EncoderBitrateController {
     /// per-layer PIDs from the SCREEN ladder (`simulcast_screen_layers`) rather
     /// than the camera ladder (`simulcast_layers`). Set by `new_for_screen`.
     is_screen: bool,
+
+    // --- Sender encoder backpressure (issue #1108, Phase B) — ADDITIVE ---
+    /// Last sampled max `encode_queue_size()` across the ACTIVE simulcast layers,
+    /// fed in by the encode loop via
+    /// [`observe_encoder_queue_depth`](Self::observe_encoder_queue_depth). This
+    /// is the sender's *own* encode backpressure (frames pending in WebCodecs),
+    /// independent of how peers receive the stream. **Stage 1 (additive): stored
+    /// only — no control path reads it.** Stage 2 will use it as the sender-CPU
+    /// backstop that replaces the receiver-FPS-driven layer shed. Native callers
+    /// (the load-test bot, no WebCodecs) feed `0`, so this stays `0` for them.
+    last_encoder_queue_depth: u32,
+    /// Timestamp (ms) when the encoder queue depth first rose to/above
+    /// `ENCODER_QUEUE_BACKPRESSURE_HIGH` and has stayed there since (the sustain
+    /// timer for the Stage-2 shed). **Unused in Stage 1** —
+    /// [`observe_encoder_queue_depth`](Self::observe_encoder_queue_depth) does
+    /// NOT start/clear it yet; Stage 2 owns that logic. Present now so the field
+    /// layout is stable across the two stages.
+    #[allow(dead_code)]
+    backpressure_high_since_ms: Option<f64>,
 }
 
 impl EncoderBitrateController {
@@ -542,6 +561,11 @@ impl EncoderBitrateController {
             layer_pids: Vec::new(),
             last_layer_target_bitrates_kbps: Vec::new(),
             is_screen,
+            // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
+            // (no backpressure); the encode loop overwrites it each tick via
+            // observe_encoder_queue_depth(). The sustain timer is unarmed.
+            last_encoder_queue_depth: 0,
+            backpressure_high_since_ms: None,
         }
     }
 
@@ -1112,6 +1136,44 @@ impl EncoderBitrateController {
         self.last_target_bitrate_kbps
     }
 
+    /// Feed the sender's own encoder backpressure into the controller (issue
+    /// #1108, Phase B).
+    ///
+    /// `depth` is the max WebCodecs `VideoEncoder::encode_queue_size()` across
+    /// the currently ACTIVE simulcast layers — i.e. how many frames the sender's
+    /// encoder is behind, *not* anything about how peers receive the stream.
+    /// The browser encode loop samples this each frame and the control loop
+    /// forwards it here; the native load-test bot (no WebCodecs) passes `0`.
+    ///
+    /// **Target-agnostic by design:** the parameter is a plain `u32` so this
+    /// crate stays free of any `web-sys`/WebCodecs dependency.
+    ///
+    /// **Stage 1 (additive, no behavior change): this ONLY stores the value.**
+    /// It does not start the sustain timer, change any tier, or shed any layer —
+    /// no control path reads `last_encoder_queue_depth` yet. Stage 2 will use
+    /// the stored depth (with [`ENCODER_QUEUE_BACKPRESSURE_HIGH`],
+    /// [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`], and
+    /// [`ENCODER_BACKPRESSURE_SUSTAIN_MS`]) as the sender-CPU backstop that
+    /// replaces the receiver-FPS-driven layer shed.
+    ///
+    /// [`ENCODER_QUEUE_BACKPRESSURE_HIGH`]: crate::constants::ENCODER_QUEUE_BACKPRESSURE_HIGH
+    /// [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`]: crate::constants::ENCODER_QUEUE_BACKPRESSURE_CLEAR
+    /// [`ENCODER_BACKPRESSURE_SUSTAIN_MS`]: crate::constants::ENCODER_BACKPRESSURE_SUSTAIN_MS
+    pub fn observe_encoder_queue_depth(&mut self, depth: u32) {
+        // Stage 1: store only. Intentionally does NOT touch
+        // `backpressure_high_since_ms` or any shed/tier state — that is Stage 2.
+        self.last_encoder_queue_depth = depth;
+    }
+
+    /// Last sampled encoder queue depth fed in via
+    /// [`observe_encoder_queue_depth`](Self::observe_encoder_queue_depth)
+    /// (issue #1108, Phase B). `0` when no backpressure has been reported (and
+    /// always `0` for the native bot). Read-only observability; in Stage 1
+    /// nothing inside the controller consumes it.
+    pub fn last_encoder_queue_depth(&self) -> u32 {
+        self.last_encoder_queue_depth
+    }
+
     /// Force an immediate video quality step-down due to server congestion.
     ///
     /// Delegates to [`AdaptiveQualityManager::force_video_step_down`].
@@ -1449,6 +1511,75 @@ mod tests {
              (floor-independent gradual shed, issue #1077)"
         );
     }
+    /// Issue #1108, Phase B, Stage 1 (additive, ZERO behavior removal): feeding
+    /// the sender's own encoder backpressure into the controller must (a) be
+    /// readable back via the accessor, and (b) change NOTHING else — not the
+    /// active simulcast layer count, not the video tier index. This is the
+    /// regression lock for "the signal drives nothing yet": it is stored only.
+    /// Stage 2 will add the shed logic and a separate test that exercises it.
+    #[test]
+    fn test_observe_encoder_queue_depth_is_store_only() {
+        use crate::clock::TestClock;
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(10));
+        // Use a 3-layer screen controller so active_layer_count() is meaningful
+        // (>1) and a shed, if one were wrongly triggered, would be observable.
+        let mut controller = EncoderBitrateController::new_for_screen_with_clock(
+            target_fps,
+            SCREEN_QUALITY_TIERS,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+
+        // Default before any observation: no backpressure reported.
+        assert_eq!(
+            controller.last_encoder_queue_depth(),
+            0,
+            "queue depth must start at 0 before any observation"
+        );
+
+        // Snapshot the two pieces of state Stage 1 must NOT perturb.
+        let layers_before = controller.active_layer_count();
+        let tier_before = controller.video_tier_index();
+        assert_eq!(layers_before, 3, "precondition: 3 active layers");
+
+        // (a) The setter stores the value and the accessor reads it back.
+        controller.observe_encoder_queue_depth(7);
+        assert_eq!(
+            controller.last_encoder_queue_depth(),
+            7,
+            "observe_encoder_queue_depth(N) must make the accessor return N"
+        );
+
+        // (b) Even a deliberately HIGH depth (well above
+        // ENCODER_QUEUE_BACKPRESSURE_HIGH) must not shed a layer or move the
+        // tier in Stage 1 — the signal drives nothing yet.
+        controller.observe_encoder_queue_depth(1000);
+        assert_eq!(
+            controller.last_encoder_queue_depth(),
+            1000,
+            "the latest observed depth must be stored (overwrites the prior value)"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            layers_before,
+            "observing encoder backpressure must NOT change the active layer count in Stage 1"
+        );
+        assert_eq!(
+            controller.video_tier_index(),
+            tier_before,
+            "observing encoder backpressure must NOT change the video tier index in Stage 1"
+        );
+        // It must also not flag a tier change for the encoder to pick up.
+        assert!(
+            !controller.take_tier_changed(),
+            "observing encoder backpressure must NOT raise tier_changed in Stage 1"
+        );
+    }
+
     use videocall_types::protos::diagnostics_packet::{
         AudioMetrics, DiagnosticsPacket, VideoMetrics,
     };

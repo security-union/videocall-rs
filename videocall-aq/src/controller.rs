@@ -434,9 +434,12 @@ impl EncoderBitrateController {
         // No second publisher-side debounce: the RELAY debounces the down
         // direction, so we apply the union cap eagerly each tick (suppress-lazy /
         // restore-eager). The restore reuses the SAME min-interval gate the
-        // explicit force_* layer-shed paths use (`forced_transition_guards_clear`)
-        // so it climbs at most one layer per `MIN_TIER_TRANSITION_INTERVAL_MS` —
-        // no parallel timer state.
+        // explicit force_* layer-shed paths use (`forced_transition_guards_clear`).
+        // Because `add_top_layer` does not arm `last_transition_time_ms`, a pure
+        // union restore (no tier movement) keeps that gate clear, so it climbs one
+        // layer per qualifying tick (~1 Hz) — not one per
+        // `MIN_TIER_TRANSITION_INTERVAL_MS` — matching the `wanted_degrade_at_floor`
+        // precedent (see the inline note below). No parallel timer state.
         let union_count = self.union_requested_layer_cap;
         if self.quality_manager.is_simulcast() && union_count != usize::MAX {
             // The backpressure ceiling this tick: when backpressure is actively

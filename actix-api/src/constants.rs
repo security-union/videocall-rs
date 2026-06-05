@@ -305,6 +305,31 @@ pub const LAYER_PREFERENCE_MAX_ENTRIES: usize = VIEWPORT_MAX_SESSION_IDS;
 /// re-broadcast).
 pub const LAYER_PREFERENCE_MIN_UPDATE_INTERVAL: Duration = VIEWPORT_MIN_UPDATE_INTERVAL;
 
+/// Upper bound on the `desired_layer` id the relay will record from a single
+/// LAYER_PREFERENCE entry (#1082, defense-in-depth).
+///
+/// The relay is deliberately **layer-count-agnostic**: it never learns how many
+/// simulcast layers a source actually produces (see the "AVAILABILITY NOT
+/// VALIDATED" note on the forwarding path in `chat_server.rs`). It only compares
+/// the receiver's recorded `desired_layer` against the cleartext
+/// `simulcast_layer_id` on each media packet. That means a forged or garbage
+/// LAYER_PREFERENCE could otherwise stuff an arbitrary `u32` into the per-source
+/// layer map. Such an entry never matches any real packet, so the source's
+/// non-base layers all get dropped and the forger self-degrades to base — but it
+/// still consumes a map slot and represents nonsense state the relay should not
+/// retain.
+///
+/// This bound caps the *value range* of a recorded layer id. It is NOT the real
+/// layer count (which the relay does not and must not know): today every kind
+/// ships at most 3 layers (ids 0..=2; #1082 keeps video=3/audio=3/content=3),
+/// and even the assessed video=5 ceiling is ids 0..=4. `7` leaves comfortable
+/// headroom for near-future ladders while still rejecting obviously-forged ids.
+/// Entries whose `desired_layer` exceeds this bound are **skipped** (not
+/// recorded) — fail-open per source: the receiver simply self-degrades to base
+/// for that source, exactly as if no preference had been sent. The packet is
+/// never dropped wholesale and the connection is never errored.
+pub const LAYER_PREFERENCE_MAX_LAYER_ID: u32 = 7;
+
 #[cfg(test)]
 mod tests {
     use super::*;

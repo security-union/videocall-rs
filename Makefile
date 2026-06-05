@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -110,9 +110,20 @@ e2e-build: e2e-cert
 e2e-up: e2e-cert
 	$(COMPOSE_E2E) up -d
 
-# Tear down the E2E stack and remove volumes
+# Start the E2E stack WITH the per-client downlink-impairment proxy (issue
+# #1080). Adds the `toxiproxy` service (compose profile `impair`) on top of the
+# normal stack so the per-receiver-simulcast divergence spec can degrade ONE
+# receiver's downlink via toxiproxy's HTTP control API (see
+# e2e/helpers/downlink-impair.ts). The proxy is OFF for every other target so
+# the standard suite is never slowed.
+e2e-up-impair: e2e-cert
+	COMPOSE_PROFILES=impair $(COMPOSE_E2E) up -d
+
+# Tear down the E2E stack and remove volumes. `--profile impair` ensures the
+# toxiproxy container is also removed when it was started by `e2e-up-impair`
+# (compose only stops profile services if the profile is named on `down`).
 e2e-down:
-	$(COMPOSE_E2E) down -v
+	$(COMPOSE_E2E) --profile impair down -v
 
 # Run e2e tests headless. Assumes the stack is already up — bring it up
 # with `make e2e-up`, which is also the only target that rotates the cert.
@@ -140,6 +151,14 @@ e2e-bvt0:
 # a faster alternative to the full suite.
 e2e-bvt1:
 	cd e2e && npx playwright test --project=bvt1
+
+# Run ONLY the per-client downlink-impairment suite (issue #1080): the
+# `@impair`-tagged simulcast divergence test. REQUIRES the toxiproxy `impair`
+# profile to be up — bring the stack up with `make e2e-up-impair` first. This
+# test is grep-inverted out of the default `dioxus`/bvt projects, so it never
+# runs in the standard suite; this is the only target that exercises it.
+e2e-impair:
+	cd e2e && npx playwright test --project=impair
 
 # Run e2e tests with visible browsers (assumes stack is already up; same
 # cert-rotation rule as `make e2e`)

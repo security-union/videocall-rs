@@ -22,10 +22,11 @@ use std::sync::Arc;
 
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
-    screen_share_camera_ceiling_index, simulcast_layers, AudioQualityTier, VideoQualityTier,
-    AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO, MAX_BITRATE_SLEW_KBPS_PER_SEC,
-    PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS, PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP,
-    PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX, PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
+    cap_layers_to_budget, screen_share_camera_ceiling_index, simulcast_layers, uplink_budget_kbps,
+    AudioQualityTier, VideoQualityTier, AQ_OUTLIER_GAP_FPS_RATIO, AQ_OUTLIER_HEALTH_FPS_RATIO,
+    MAX_BITRATE_SLEW_KBPS_PER_SEC, PID_CORRECTION_THROTTLE_MS, PID_DEADBAND_FPS,
+    PID_FPS_HISTORY_SIZE, PID_KD, PID_KI, PID_KP, PID_MAX_JITTER_PENALTY, PID_OUTPUT_MAX,
+    PID_OUTPUT_MIN, VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -420,6 +421,11 @@ pub struct EncoderBitrateController {
     /// rest are retained so a layer that is re-added resumes near its last
     /// target rather than jumping. Empty in single-stream mode.
     last_layer_target_bitrates_kbps: Vec<f64>,
+    /// Whether this controller drives SCREEN share (issue #989, Phase 3b). When
+    /// true, [`set_simulcast_layers`](Self::set_simulcast_layers) builds its
+    /// per-layer PIDs from the SCREEN ladder (`simulcast_screen_layers`) rather
+    /// than the camera ladder (`simulcast_layers`). Set by `new_for_screen`.
+    is_screen: bool,
 }
 
 impl EncoderBitrateController {
@@ -442,7 +448,14 @@ impl EncoderBitrateController {
     ) -> Self {
         let quality_manager =
             AdaptiveQualityManager::with_clock(VIDEO_QUALITY_TIERS, Arc::clone(&clock));
-        Self::build(ideal_bitrate_kbps, target_fps, quality_manager, clock)
+        // is_screen = false → camera simulcast ladder.
+        Self::build(
+            ideal_bitrate_kbps,
+            target_fps,
+            quality_manager,
+            clock,
+            false,
+        )
     }
 
     /// Create a new bitrate controller for screen share.
@@ -468,15 +481,21 @@ impl EncoderBitrateController {
         let quality_manager =
             AdaptiveQualityManager::new_for_screen_with_clock(video_tiers, Arc::clone(&clock));
         let tier_ideal = quality_manager.current_video_tier().ideal_bitrate_kbps;
-        Self::build(tier_ideal, target_fps, quality_manager, clock)
+        // is_screen = true so simulcast layer PIDs use the SCREEN ladder.
+        Self::build(tier_ideal, target_fps, quality_manager, clock, true)
     }
 
     /// Internal constructor shared by `new` and `new_for_screen`.
+    ///
+    /// `is_screen` selects which simulcast ladder
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers) builds per-layer PIDs
+    /// from: the SCREEN ladder when `true`, otherwise the camera ladder.
     fn build(
         ideal_bitrate_kbps: u32,
         target_fps: Arc<AtomicU32>,
         quality_manager: AdaptiveQualityManager,
         clock: Arc<dyn Clock>,
+        is_screen: bool,
     ) -> Self {
         let initial_target = target_fps.load(Ordering::Relaxed) as f64;
 
@@ -522,6 +541,7 @@ impl EncoderBitrateController {
             // set_simulcast_layers().
             layer_pids: Vec::new(),
             last_layer_target_bitrates_kbps: Vec::new(),
+            is_screen,
         }
     }
 
@@ -539,6 +559,7 @@ impl EncoderBitrateController {
         // Clamp + configure the manager (single source of truth for the count).
         self.quality_manager.set_simulcast_layers(n);
         let effective = self.quality_manager.simulcast_layer_count();
+
         if effective <= 1 {
             // Single-stream mode: nothing to build, behave exactly as before.
             self.layer_pids.clear();
@@ -546,13 +567,24 @@ impl EncoderBitrateController {
             return;
         }
         let initial_target = self.target_fps.load(Ordering::Relaxed) as f64;
-        let tiers = simulcast_layers(effective);
+        let tiers = self.simulcast_ladder(effective);
         self.layer_pids = tiers
             .iter()
             .map(|tier| LayerPidState::new(tier, initial_target))
             .collect();
         self.last_layer_target_bitrates_kbps =
             tiers.iter().map(|t| t.ideal_bitrate_kbps as f64).collect();
+    }
+
+    /// The simulcast layer ladder for this controller: SCREEN ladder when this
+    /// controller drives screen share, otherwise the camera ladder (issue #989,
+    /// Phase 3b). Both are `&'static` and lowest-layer-first.
+    fn simulcast_ladder(&self, n: usize) -> &'static [VideoQualityTier] {
+        if self.is_screen {
+            crate::constants::simulcast_screen_layers(n)
+        } else {
+            simulcast_layers(n)
+        }
     }
 
     // Calculate the standard deviation of FPS values to measure jitter
@@ -740,13 +772,38 @@ impl EncoderBitrateController {
         // top active layer; a step UP restores it. The single fps setpoint
         // (p75) that drove the tier decision drives this. No-op in single-stream
         // mode (is_simulcast() == false).
-        if self.quality_manager.is_simulcast() && tier_changed {
+        //
+        // FLOOR-INDEPENDENT SHED (issue #1077): a tier step DOWN sheds the top
+        // active layer; a step UP restores it. Previously this keyed ONLY off
+        // tier-index movement, so once the tier index reached the floor
+        // (`VIDEO_QUALITY_TIERS.len() - 1`) a further down-decision produced
+        // `tier_changed == false` and the gradual shed stopped — latent because
+        // the camera ladder happens to be deep enough today, but already real
+        // for the 3-layer SCREEN ladder (only 1 down-step from its default to
+        // its floor). We now ALSO shed when the manager reports a degrade that
+        // the floor blocked (`wanted_degrade_at_floor`), decoupling the layer
+        // axis from the tier floor exactly as the explicit `force_*` paths do.
+        // No-op in single-stream mode (is_simulcast() == false).
+        //
+        // NOTE (issue #1082 review): the floor-saturated shed below is NOT
+        // min-interval-throttled (unlike the tier-coupled down-step, which is
+        // gated to one shed per MIN_TIER_TRANSITION_INTERVAL_MS). It can fire
+        // once per diagnostics tick (~1/sec) at the floor until
+        // `active_layer_count` hits 1. Intentional + benign today (down-only,
+        // floors at 1, ≤2 sheds for the current ladders) — see the throttling
+        // note on `AdaptiveQualityManager::wanted_degrade_at_floor` for what to
+        // revisit if the video ladder is ever deepened.
+        if self.quality_manager.is_simulcast() {
             let tier_index_after = self.quality_manager.video_tier_index();
-            if tier_index_after > tier_index_before {
+            // Down-step shed (tier moved down) OR floor-saturated degrade shed.
+            let degrade_down = (tier_changed && tier_index_after > tier_index_before)
+                || self.quality_manager.wanted_degrade_at_floor();
+            let recover_up = tier_changed && tier_index_after < tier_index_before;
+            if degrade_down {
                 if self.quality_manager.drop_top_layer() {
                     self.tier_changed = true;
                 }
-            } else if tier_index_after < tier_index_before && self.quality_manager.add_top_layer() {
+            } else if recover_up && self.quality_manager.add_top_layer() {
                 self.tier_changed = true;
             }
         }
@@ -835,7 +892,15 @@ impl EncoderBitrateController {
             // Computed here (not inside the mutable layer loop) to avoid borrowing
             // `quality_manager` while `layer_pids` is mutably borrowed.
             let congestion_hold = self.quality_manager.congestion_hold_active(now);
-            self.compute_layer_bitrates(fps_received, target_fps, jitter, dt, congestion_hold);
+            let active = self.quality_manager.active_layer_count();
+            self.compute_layer_bitrates(
+                fps_received,
+                target_fps,
+                jitter,
+                dt,
+                congestion_hold,
+                active,
+            );
         }
 
         self.last_correction_time = now;
@@ -858,6 +923,7 @@ impl EncoderBitrateController {
         jitter: f64,
         dt: f64,
         congestion_hold: bool,
+        active: usize,
     ) {
         for i in 0..self.layer_pids.len() {
             // Keep each layer's setpoint synced to the (possibly changing) target.
@@ -916,6 +982,32 @@ impl EncoderBitrateController {
             };
             layer.last_target_bitrate_kbps = slewed;
             self.last_layer_target_bitrates_kbps[i] = slewed;
+        }
+
+        // --- Sender uplink budget cap (issue #989, Phase 1) ---
+        // The per-layer PIDs above each clamp to their OWN tier band, so their
+        // SUM can exceed what the sender's uplink can afford (e.g. 3 layers at
+        // their tier ideals = 2800 kbps). Publishing N layers costs the sum, so
+        // cap the ACTIVE layers' targets to the uplink budget (sum of active
+        // tier ideals), proportionally shedding bitrate above each layer's tier
+        // floor. This shrinks automatically as the AQ sheds the top layer under
+        // congestion (`active` drops → budget drops). Shed layers are untouched
+        // (not encoded/sent). The base layer keeps its floor so it stays
+        // viewable. No-op when the layers already fit (the common case at low
+        // tiers), so it never disturbs an already-affordable configuration.
+        let tiers = self.simulcast_ladder(self.layer_pids.len());
+        let budget = uplink_budget_kbps(tiers, active);
+        cap_layers_to_budget(
+            &mut self.last_layer_target_bitrates_kbps,
+            tiers,
+            active,
+            budget,
+        );
+        // Keep each layer's slew baseline in sync with the capped value so the
+        // next tick's slew limiter measures delta from what we actually emitted,
+        // not from the pre-cap PID target (which would let the cap "snap back").
+        for i in 0..active.min(self.layer_pids.len()) {
+            self.layer_pids[i].last_target_bitrate_kbps = self.last_layer_target_bitrates_kbps[i];
         }
     }
 
@@ -1176,6 +1268,52 @@ impl EncoderBitrateController {
         self.quality_manager.notify_reelection_completed(now);
     }
 
+    /// Set user-configurable VIDEO quality bounds (issue #961).
+    ///
+    /// QUALITY IS THE INVERSE OF INDEX: `best` is the user's MAX quality = a
+    /// FLOOR on the tier index (never step UP past it); `worst` is the user's MIN
+    /// quality = a CAP on the tier index (never step DOWN past it). Each end is
+    /// independently optional (`None` = Auto). Forwards to
+    /// [`AdaptiveQualityManager::set_video_quality_bounds`], which clamps,
+    /// normalizes an inverted range, and snaps the current tier into range
+    /// immediately. If the snap changes the tier, the new ideal bitrate is
+    /// applied and the PID is reset so the encoder picks it up at once.
+    pub fn set_video_quality_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let now = self.clock.now_ms();
+        let before = self.quality_manager.video_tier_index();
+        self.quality_manager
+            .set_video_quality_bounds(best, worst, now);
+        if self.quality_manager.video_tier_index() != before {
+            self.tier_changed = true;
+            let old_bitrate = self.ideal_bitrate_kbps;
+            let new_tier = self.quality_manager.current_video_tier();
+            self.ideal_bitrate_kbps = new_tier.ideal_bitrate_kbps;
+            self.pid.reset();
+            log::info!(
+                "AQ_BITRATE_CHANGE: base_bitrate {} -> {} kbps (tier: {}, index: {}, reason: user_quality_bounds)",
+                old_bitrate,
+                self.ideal_bitrate_kbps,
+                new_tier.label,
+                self.quality_manager.video_tier_index(),
+            );
+        }
+    }
+
+    /// Set user-configurable AUDIO quality bounds (issue #961).
+    ///
+    /// Same inverse-of-index semantics as [`Self::set_video_quality_bounds`]:
+    /// `best` is a FLOOR on the audio tier index, `worst` is a CAP. `None` =
+    /// Auto. Forwards to [`AdaptiveQualityManager::set_audio_quality_bounds`],
+    /// which snaps the current audio tier into range immediately. Flags a tier
+    /// change so the microphone encoder picks up the new audio settings.
+    pub fn set_audio_quality_bounds(&mut self, best: Option<usize>, worst: Option<usize>) {
+        let before = self.quality_manager.audio_tier_index();
+        self.quality_manager.set_audio_quality_bounds(best, worst);
+        if self.quality_manager.audio_tier_index() != before {
+            self.tier_changed = true;
+        }
+    }
+
     /// Return the current crash ceiling state, if active.
     /// `(ceiling_index, tier_label, current_decay_ms)`
     pub fn crash_ceiling_info(&self) -> Option<(usize, &'static str, f64)> {
@@ -1199,6 +1337,118 @@ mod tests {
     use crate::clock::default_clock;
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
+
+    /// Issue #1077 (manager level): a sustained video degrade while ALREADY at
+    /// the tier floor must raise `wanted_degrade_at_floor()` — the signal the
+    /// controller uses to keep shedding simulcast layers after the tier index
+    /// saturates. Driven directly on the manager for determinism (no slew/PID).
+    #[test]
+    fn test_manager_signals_degrade_at_floor() {
+        use crate::clock::TestClock;
+        use crate::constants::VIDEO_QUALITY_TIERS;
+        use crate::manager::AdaptiveQualityManager;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut mgr = AdaptiveQualityManager::with_clock(
+            VIDEO_QUALITY_TIERS,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+
+        // Drive the tier index to the floor with sustained bad fps. Use a clock
+        // well past warmup and step time forward generously each call so the
+        // reaction-time + min-transition-interval gates are satisfied.
+        let target_fps = 30.0;
+        let bad_fps = 1.0; // fps_ratio far below the degrade threshold
+        let ideal = VIDEO_QUALITY_TIERS[0].ideal_bitrate_kbps as f64;
+        let floor_index = VIDEO_QUALITY_TIERS.len() - 1;
+
+        let mut t = base_ms as f64 + 10_000.0;
+        for _ in 0..50 {
+            mgr.update(bad_fps, target_fps, 10.0, ideal, t, 3);
+            t += 6000.0; // > reaction time and > min transition interval
+            if mgr.video_tier_index() >= floor_index {
+                break;
+            }
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            floor_index,
+            "sustained bad fps must drive the tier to the floor"
+        );
+
+        // Now at the floor: the last real step-down reset `degrade_start_ms`, so
+        // degrade must re-accumulate past the reaction time before the signal
+        // fires. Feed a few more spaced bad ticks at the floor. (The combined
+        // `update()` return may still be true if the audio tier moves, so we
+        // assert on the video index, not the bool.)
+        let mut floor_signal = false;
+        for _ in 0..5 {
+            mgr.update(bad_fps, target_fps, 10.0, ideal, t, 3);
+            assert_eq!(
+                mgr.video_tier_index(),
+                floor_index,
+                "the video tier index must stay pinned at the floor"
+            );
+            if mgr.wanted_degrade_at_floor() {
+                floor_signal = true;
+                break;
+            }
+            t += 6000.0;
+        }
+        assert!(
+            floor_signal,
+            "a sustained degrade at the floor must raise the floor-saturated signal"
+        );
+
+        // A subsequent HEALTHY tick must clear the signal (no degrade wanted).
+        let healthy = mgr.update(target_fps, target_fps, ideal, ideal, t + 6000.0, 3);
+        let _ = healthy;
+        assert!(
+            !mgr.wanted_degrade_at_floor(),
+            "a healthy tick must clear the floor-saturated signal"
+        );
+    }
+
+    /// Issue #1077 (controller level): the gradual `update()`-path shed must fire
+    /// at the tier floor for the SCREEN ladder, which is only 1 down-step from
+    /// its default to its floor — the case that was already broken before the
+    /// floor-independent fix. Sustained bad conditions on a 3-layer screen
+    /// controller must shed BELOW what the tier-index-coupled path alone could.
+    #[test]
+    fn test_gradual_shed_fires_at_floor_for_screen_ladder() {
+        use crate::clock::TestClock;
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller = EncoderBitrateController::new_for_screen_with_clock(
+            target_fps,
+            SCREEN_QUALITY_TIERS,
+            Arc::clone(&clock) as Arc<dyn crate::clock::Clock>,
+        );
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        // Feed sustained bad fps over many spaced ticks. The screen default tier
+        // is 1 step from the floor, so the tier-index-coupled shed alone could
+        // drop at most ONE layer (3 -> 2). With the floor-independent shed,
+        // continued degrade at the floor must keep shedding down to the base.
+        let mut t = base_ms as f64 + 10_000.0;
+        for _ in 0..40 {
+            controller
+                .process_diagnostics_packet_with_time(create_test_packet("s", "peer1", 1.0, 50), t);
+            clock.set_ms(t as u64);
+            t += 6000.0;
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "sustained degrade must shed all the way to the base layer at the floor \
+             (floor-independent gradual shed, issue #1077)"
+        );
+    }
     use videocall_types::protos::diagnostics_packet::{
         AudioMetrics, DiagnosticsPacket, VideoMetrics,
     };
@@ -1944,6 +2194,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_screen_controller_set_quality_bounds_pins_and_clamps() {
+        use crate::constants::SCREEN_QUALITY_TIERS;
+
+        // The screen ScreenEncoder wires set_video_quality_bounds onto a
+        // new_for_screen controller (issue #961 follow-up). Confirm the generic
+        // clamp works over the 3-tier screen ladder: pinning to the worst tier
+        // snaps the current tier into range immediately and the controller
+        // reports the change.
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+        let max = SCREEN_QUALITY_TIERS.len() - 1; // 2
+
+        // Pin to the worst screen tier (best == worst == max). Starts at the
+        // midpoint (1), so this must snap DOWN to max immediately and flag the
+        // change for the encoder loop.
+        controller.set_video_quality_bounds(Some(max), Some(max));
+        assert_eq!(
+            controller.video_tier_index(),
+            max,
+            "Screen controller must snap to the pinned worst tier at once"
+        );
+        assert!(
+            controller.take_tier_changed(),
+            "Snapping the screen tier into range must flag tier_changed"
+        );
+
+        // Now floor at best (0) with no cap — must snap UP to 0 immediately.
+        controller.set_video_quality_bounds(Some(0), Some(0));
+        assert_eq!(
+            controller.video_tier_index(),
+            0,
+            "Re-pinning the screen controller to the best tier must snap UP at once"
+        );
+    }
+
     // =====================================================================
     // Screen sharing coordination (notify_screen_sharing)
     // =====================================================================
@@ -2636,6 +2923,31 @@ mod tests {
     }
 
     #[test]
+    fn test_screen_controller_uses_screen_simulcast_ladder() {
+        // Phase 3b: a SCREEN controller must build its per-layer PIDs from the
+        // SCREEN ladder (simulcast_screen_layers), NOT the camera ladder. The
+        // 3-layer screen ladder is [low 720p, medium 720p, high 1080p].
+        use crate::constants::{simulcast_screen_layers, SCREEN_QUALITY_TIERS};
+        let target_fps = Arc::new(AtomicU32::new(10));
+        let mut controller =
+            EncoderBitrateController::new_for_screen(target_fps, SCREEN_QUALITY_TIERS);
+        controller.set_simulcast_layers(3);
+        assert!(controller.is_simulcast());
+        let tiers = simulcast_screen_layers(3);
+        assert_eq!(
+            controller.layer_resolution(0),
+            Some((tiers[0].max_width, tiers[0].max_height))
+        );
+        assert_eq!(
+            controller.layer_resolution(2),
+            Some((tiers[2].max_width, tiers[2].max_height))
+        );
+        // The top screen layer must be 1080p (distinct from the camera ladder's
+        // 720p top), proving the screen ladder is in use.
+        assert_eq!(controller.layer_resolution(2), Some((1920, 1080)));
+    }
+
+    #[test]
     fn test_per_layer_bitrates_clamped_to_layer_tier_bounds() {
         use crate::constants::simulcast_layers;
 
@@ -2750,6 +3062,59 @@ mod tests {
         controller.force_video_step_down();
         assert_eq!(controller.active_layer_count(), 1);
         assert!(controller.layer_target_bitrates_kbps().is_empty());
+    }
+
+    #[test]
+    fn test_active_layer_sum_stays_within_uplink_budget() {
+        // After processing many diagnostics ticks in 3-layer simulcast, the SUM
+        // of the ACTIVE layers' target bitrates must never exceed the uplink
+        // budget (sum of active tier ideals), and each layer must stay at/above
+        // its tier floor. This is the core Phase-1 budget guarantee.
+        use crate::constants::{simulcast_layers, uplink_budget_kbps};
+
+        let target_fps = Arc::new(AtomicU32::new(30));
+        let mut controller = EncoderBitrateController::new(500, target_fps);
+        controller.set_simulcast_layers(3);
+
+        // Perfect conditions push every per-layer PID toward its tier ideal/max,
+        // which (un-capped) would sum to 2800+ kbps — exercising the cap.
+        let base = 1000.0;
+        for i in 0..30 {
+            controller.process_diagnostics_packet_with_time(
+                create_test_packet("s", "peer1", 30.0, 500),
+                base + (i as f64 * 1100.0),
+            );
+        }
+
+        let active = controller.active_layer_count();
+        let tiers = simulcast_layers(3);
+        let budget = uplink_budget_kbps(tiers, active);
+        let bitrates = controller.layer_target_bitrates_kbps();
+        let active_sum: f64 = bitrates[..active].iter().sum();
+        assert!(
+            active_sum <= budget + 1e-6,
+            "active sum {active_sum} (active={active}) must fit within budget {budget}"
+        );
+        for i in 0..active {
+            assert!(
+                bitrates[i] >= tiers[i].min_bitrate_kbps as f64 - 1e-6,
+                "layer {i} ({}) below its floor {}",
+                bitrates[i],
+                tiers[i].min_bitrate_kbps,
+            );
+        }
+    }
+
+    #[test]
+    fn test_budget_shrinks_as_top_layer_is_shed() {
+        // The budget is the sum of ACTIVE tier ideals, so shedding the top layer
+        // must lower the budget the active set is held to. 3 active = 2800,
+        // 2 active = 1300, 1 active = 400.
+        use crate::constants::{simulcast_layers, uplink_budget_kbps};
+        let tiers = simulcast_layers(3);
+        assert!(uplink_budget_kbps(tiers, 3) > uplink_budget_kbps(tiers, 2));
+        assert!(uplink_budget_kbps(tiers, 2) > uplink_budget_kbps(tiers, 1));
+        assert_eq!(uplink_budget_kbps(tiers, 1), 400.0);
     }
 
     #[test]

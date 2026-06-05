@@ -29,6 +29,7 @@ pub mod meetings_list;
 pub mod neteq_chart;
 pub mod okta_sign_in_button;
 pub mod peer_list_item;
+pub mod performance_settings;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;

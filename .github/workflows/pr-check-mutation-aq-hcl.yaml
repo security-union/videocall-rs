@@ -24,6 +24,9 @@ on:
     branches: [hcl-main, PR-staging]
     paths:
       - 'videocall-aq/**'
+      # Include this workflow itself so a PR that adds/edits the mutation job is
+      # validated by the job it changes (matches pr-check-backend-hcl.yaml etc.).
+      - '.github/workflows/pr-check-mutation-aq-hcl.yaml'
 
 concurrency:
   group: pr-check-mutation-aq-${{ github.event.pull_request.number }}
@@ -100,10 +103,21 @@ jobs:
             --timeout 120
           code=$?
           set -e
-          # cargo-mutants exit codes: 0 = all caught, 2 = some survived/missed,
-          # other = tooling error. We record but never propagate a failure.
+          # cargo-mutants 25.0.0 exit codes (verified against the crate's
+          # src/exit_code.rs — do NOT guess these):
+          #   0 SUCCESS         — all mutants caught (or nothing to test)
+          #   1 USAGE           — bad invocation / CLI error  → tooling error
+          #   2 FOUND_PROBLEMS  — one or more mutants survived (a real finding)
+          #   3 TIMEOUT         — a mutant timed out (inconclusive, not a pass)
+          #   4 CLEAN_TESTS_FAILED — baseline tests fail unmutated → tooling error
+          # We never PROPAGATE a failure (advisory job), but classify so the
+          # summary can't false-green a broken or inconclusive run.
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
-          echo "status=ran" >> "$GITHUB_OUTPUT"
+          case "${code}" in
+            0|2)   echo "status=ran" >> "$GITHUB_OUTPUT" ;;        # trustworthy result
+            3)     echo "status=timeout" >> "$GITHUB_OUTPUT" ;;    # inconclusive
+            *)     echo "status=tooling_error" >> "$GITHUB_OUTPUT" ;; # 1, 4, or unknown
+          esac
 
       # Report to BOTH the job log (always visible on GHES) and the step summary
       # (if the runner supports it). No artifact upload — actions/upload-artifact
@@ -114,23 +128,46 @@ jobs:
         if: always()
         working-directory: mutation-repo
         run: |
+          STATUS="${{ steps.mutants.outputs.status }}"
+          CODE="${{ steps.mutants.outputs.exit_code }}"
+          OUT=/tmp/mut/mutants.out
           report() {
             echo "## Mutation test — videocall-aq (advisory)"
             echo ""
-            if [ "${{ steps.mutants.outputs.status }}" = "skipped" ]; then
+            if [ "$STATUS" = "skipped" ]; then
               echo "No \`videocall-aq\` changes in this PR — nothing to mutate."
               return 0
             fi
-            OUT=/tmp/mut/mutants.out
+            # Tooling failure (exit 1 USAGE, 4 CLEAN_TESTS_FAILED, or unknown):
+            # do NOT claim "all caught" — the run produced no trustworthy result.
+            if [ "$STATUS" = "tooling_error" ]; then
+              echo "ERROR: cargo-mutants did not complete (exit ${CODE}: 1=usage,"
+              echo "4=baseline tests failed unmutated, other=infra). NO trustworthy"
+              echo "mutation result was produced; this is NOT a pass. Advisory job, so"
+              echo "the PR is not blocked, but treat coverage as UNKNOWN — check the log."
+              return 0
+            fi
+            if [ "$STATUS" = "timeout" ]; then
+              echo "INCONCLUSIVE: a mutant timed out (exit 3) — not a pass and not a"
+              echo "confirmed surviving mutant. Check the timed-out list below / the log."
+            fi
+            # Defensive: a result-producing run (exit 0/2/3) should have produced
+            # the output dir. If it's missing, that's inconclusive, not a pass.
+            if [ ! -d "$OUT" ]; then
+              echo "ERROR: cargo-mutants reported exit ${CODE} but produced no"
+              echo "${OUT} directory — inconclusive, NOT a pass. Check the job log."
+              return 0
+            fi
             if [ -f "$OUT/missed.txt" ] && [ -s "$OUT/missed.txt" ]; then
               echo "WARNING: Surviving mutants — a changed line was mutated and NO test"
               echo "failed, so the test for that line may not actually assert its"
               echo "behaviour (CLAUDE.md adversarial-review check #2). ADVISORY, not blocking:"
               echo ""
               cat "$OUT/missed.txt"
-            else
+            elif [ "$STATUS" = "ran" ]; then
               echo "OK: No surviving mutants in the changed videocall-aq lines —"
-              echo "every mutated line was caught by a failing test."
+              echo "every mutated line was caught by a failing test. (A diff with no"
+              echo "mutable lines — e.g. comment-only — also lands here, also fine.)"
             fi
             if [ -f "$OUT/timeout.txt" ] && [ -s "$OUT/timeout.txt" ]; then
               echo ""

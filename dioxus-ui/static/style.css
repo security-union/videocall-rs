@@ -6269,6 +6269,102 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   color: var(--success);
 }
 
+/* ── Live diagnostics disclosure (issue #1095) — collapsed by default so it
+   never adds to the panel's resting height. ── */
+.perf-diagnostics {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.perf-diagnostics-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.perf-diagnostics-toggle:hover {
+  color: var(--text-primary);
+}
+
+.perf-diagnostics-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.perf-diagnostics-chevron {
+  display: inline-block;
+  width: 1em;
+  color: var(--accent);
+}
+
+.perf-diagnostics-body {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.perf-diagnostics-summary {
+  margin: 0 0 10px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-diagnostics-group {
+  margin: 8px 0;
+}
+
+.perf-diagnostics-heading {
+  margin: 6px 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.perf-diagnostics-line {
+  margin: 2px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.perf-diagnostics-label {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-diagnostics-send-block {
+  margin: 4px 0;
+}
+
+.perf-diagnostics-layers {
+  margin: 2px 0 6px;
+  padding-left: 18px;
+  list-style: disc;
+}
+
+.perf-diagnostics-layer {
+  margin: 1px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.perf-diagnostics-empty {
+  margin: 2px 0;
+  font-style: italic;
+  opacity: 0.8;
+}
+
 .perf-stream-group {
   margin: 18px 0;
   padding: 14px 16px;

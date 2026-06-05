@@ -20,8 +20,8 @@ use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
-    save_performance_preference, save_receive_preference, KindReceivePref, PerformancePreference,
-    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+    save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
+    PerformancePreference, ReceivedReader, ScreenSnapshotReader, SimulcastSummary, SnapshotReader,
 };
 use crate::constants::*;
 use crate::context::{
@@ -804,6 +804,38 @@ pub fn Host(
         })
     };
 
+    // Live simulcast/AQ diagnostics reader for the Performance panel's "Live
+    // diagnostics" disclosure (#1095). Built once per mount (stable `Rc`s) so the
+    // panel prop is `PartialEq`-stable. The effective-setting summary is computed
+    // here (same `min(flag, capability)` rule the encoders are constructed with);
+    // the SEND/RECEIVE closures read the live encoder atomics / client per-peer
+    // state on each poll.
+    let diagnostics_reader: DiagnosticsReader = {
+        let state = state.clone();
+        let client = client.clone();
+        use_hook(move || {
+            let flag = experimental_simulcast_max_layers();
+            let video_capability =
+                crate::components::capability_check::capability_max_simulcast_layers();
+            let audio_capability = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+            let summary = SimulcastSummary {
+                flag,
+                video_capability,
+                audio_capability,
+                effective_video: flag.min(video_capability),
+                effective_audio: flag.min(audio_capability),
+            };
+            let state_v = state.clone();
+            let state_s = state.clone();
+            DiagnosticsReader {
+                summary,
+                send_video: Rc::new(move || state_v.borrow().camera.live_simulcast_snapshot()),
+                send_screen: Rc::new(move || state_s.borrow().screen.live_simulcast_snapshot()),
+                per_peer_receive: Rc::new(move || client.per_peer_received_snapshots()),
+            }
+        })
+    };
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -875,6 +907,7 @@ pub fn Host(
             let read_screen_snap = read_screen_snapshot.clone();
             let on_recv = on_receive_change.clone();
             let recv_reader = received_reader.clone();
+            let diag_reader = diagnostics_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -898,6 +931,7 @@ pub fn Host(
                     receive_preference: receive_preference(),
                     on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
                     received_reader: recv_reader.clone(),
+                    diagnostics_reader: diag_reader.clone(),
                 }
             }
         }

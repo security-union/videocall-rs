@@ -3,8 +3,8 @@
  * Licensed under MIT OR Apache-2.0
  */
 use crate::components::performance_settings::{
-    KindReceivePref, PerformancePreference, PerformanceSettingsPanel, ReceivePreference,
-    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+    DiagnosticsReader, KindReceivePref, PerformancePreference, PerformanceSettingsPanel,
+    ReceivePreference, ReceivedReader, ScreenSnapshotReader, SnapshotReader,
 };
 use crate::context::{
     clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
@@ -346,6 +346,10 @@ pub fn DeviceSettingsModal(
     /// needles. Defaults to `None` (nothing received). (#989)
     #[props(default = ReceivedReader::none())]
     received_reader: ReceivedReader,
+    /// Live simulcast/AQ diagnostics for the Performance panel's collapsible
+    /// "Live diagnostics" disclosure. Defaults to an inert reader. (#1095)
+    #[props(default = DiagnosticsReader::none())]
+    diagnostics_reader: DiagnosticsReader,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -579,6 +583,8 @@ pub fn DeviceSettingsModal(
                                             on_receive_change.call((kind, sub));
                                         },
                                         received_reader: received_reader.clone(),
+                                        // Live diagnostics (#1095).
+                                        diagnostics_reader: diagnostics_reader.clone(),
                                     }
                                 }
                             },

@@ -46,7 +46,10 @@
 
 use dioxus::prelude::*;
 use std::rc::Rc;
-use videocall_client::{LiveQualitySnapshot, PrefMediaKind, ScreenQualitySnapshot};
+use videocall_client::{
+    LiveQualitySnapshot, PeerReceiveDiag, PrefMediaKind, ReceivedLayerSnapshot,
+    ScreenQualitySnapshot, SimulcastSendSnapshot,
+};
 use wasm_bindgen::JsCast;
 
 // Re-export the receive-side public API so call sites can `use
@@ -142,6 +145,149 @@ impl Direction {
 pub const TESTID_DIRECTION_RECEIVE: &str = "perf-direction-receive";
 /// testid for the Send segment of the direction toggle.
 pub const TESTID_DIRECTION_SEND: &str = "perf-direction-send";
+
+// ── live diagnostics (issue #1095 observability) ───────────────────
+//
+// A collapsible "Live diagnostics" disclosure at the bottom of the panel surfaces
+// the real simulcast/AQ state: the effective layer setting, the layers being
+// SENT (+ per-layer bitrate/resolution), and what is being RECEIVED per peer.
+// All values come from the live encoder/client accessors via `DiagnosticsReader`;
+// the disclosure re-renders (throttled, only while open) so a variable-length
+// per-peer list can be shown without per-id DOM writes.
+
+/// The effective simulcast layer setting, for the diagnostics summary line.
+///
+/// `effective = min(flag, capability)`. Video/screen share the CPU capability
+/// ceiling; audio has its own. Pure data so the formatter is host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimulcastSummary {
+    /// `experimentalSimulcastMaxLayers` runtime flag value.
+    pub flag: u32,
+    /// Device CPU capability ceiling for video/screen.
+    pub video_capability: u32,
+    /// Device capability ceiling for audio (its own ladder size).
+    pub audio_capability: u32,
+    /// Effective video/screen layers = `min(flag, video_capability)`.
+    pub effective_video: u32,
+    /// Effective audio layers = `min(flag, audio_capability)`.
+    pub effective_audio: u32,
+}
+
+/// Format the simulcast effective-setting summary line, e.g.
+/// `"Video/Screen: 3 layers (flag 3 × device cap 3) · Audio: 3 layers"`. When a
+/// kind is effectively single-layer it reads "off (1 layer)". Pure / host-tested.
+pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
+    let kind_str = |effective: u32, cap: u32| -> String {
+        if effective <= 1 {
+            "off (1 layer)".to_string()
+        } else {
+            format!("{effective} layers (flag {} × device cap {})", s.flag, cap)
+        }
+    };
+    format!(
+        "Video/Screen: {} · Audio: {}",
+        kind_str(s.effective_video, s.video_capability),
+        kind_str(s.effective_audio, s.audio_capability),
+    )
+}
+
+/// Format one SEND simulcast layer line, e.g. `"L0 640×360 · 400 kbps"`. Pure.
+pub fn format_send_layer(layer_id: u32, width: u32, height: u32, bitrate_kbps: u32) -> String {
+    format!("L{layer_id} {width}×{height} · {bitrate_kbps} kbps")
+}
+
+/// Format the SEND simulcast header for a kind, e.g.
+/// `"3 of 3 layers active"` (active vs effective). For single-stream it reads
+/// `"single layer"`. Pure / host-tested.
+pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
+    if !snap.simulcast_active {
+        "single layer".to_string()
+    } else {
+        format!(
+            "{} of {} layers active",
+            snap.active_layers, snap.effective_layers
+        )
+    }
+}
+
+/// Format one RECEIVE per-kind line for a peer, e.g. `"video L2/3 · 1280×720"`
+/// or `"audio L1/3 · 24 kbps"`. Returns `None` when the kind is not flowing.
+/// Pure / host-tested.
+pub fn format_peer_kind_line(
+    kind_label: &str,
+    snap: Option<&ReceivedLayerSnapshot>,
+) -> Option<String> {
+    let s = snap?;
+    let layer = s.layer_index + 1;
+    let detail = if matches!(s.kind, PrefMediaKind::Audio) {
+        format!("{} kbps", s.kbps)
+    } else {
+        format!("{}×{}", s.width, s.height)
+    };
+    Some(format!(
+        "{kind_label} L{layer}/{} · {detail}",
+        s.layer_count
+    ))
+}
+
+/// A cloneable, `PartialEq`-able handle around the live diagnostics readers
+/// (issue #1095). Mirrors [`SnapshotReader`]: compared by `Rc` pointer identity,
+/// built once per `Host` mount, so it never spuriously re-renders the panel.
+///
+/// Bundles the four reads the diagnostics disclosure needs: the effective-setting
+/// summary, the SEND simulcast snapshot for video and (optional) screen, and the
+/// per-peer RECEIVE diagnostics.
+#[derive(Clone)]
+pub struct DiagnosticsReader {
+    /// The effective simulcast setting (flag × capability), captured at mount.
+    pub summary: SimulcastSummary,
+    /// Reads the camera's live SEND simulcast snapshot.
+    pub send_video: Rc<dyn Fn() -> SimulcastSendSnapshot>,
+    /// Reads the screen's live SEND simulcast snapshot (`None` while not sharing).
+    pub send_screen: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
+    /// Reads the per-peer RECEIVE diagnostics.
+    pub per_peer_receive: Rc<dyn Fn() -> Vec<PeerReceiveDiag>>,
+}
+
+impl DiagnosticsReader {
+    /// An inert reader (single-layer summary, empty snapshots) for tests / when
+    /// diagnostics aren't wired.
+    pub fn none() -> Self {
+        DiagnosticsReader {
+            summary: SimulcastSummary::default(),
+            send_video: Rc::new(|| SimulcastSendSnapshot {
+                simulcast_active: false,
+                effective_layers: 1,
+                active_layers: 1,
+                layers: Vec::new(),
+            }),
+            send_screen: Rc::new(|| None),
+            per_peer_receive: Rc::new(Vec::new),
+        }
+    }
+}
+
+impl PartialEq for DiagnosticsReader {
+    fn eq(&self, other: &Self) -> bool {
+        // Summary is `Copy`/`Eq`; the closures are compared by allocation
+        // identity (one stable set per Host mount).
+        self.summary == other.summary
+            && Rc::ptr_eq(&self.send_video, &other.send_video)
+            && Rc::ptr_eq(&self.send_screen, &other.send_screen)
+            && Rc::ptr_eq(&self.per_peer_receive, &other.per_peer_receive)
+    }
+}
+
+/// testid for the "Live diagnostics" disclosure toggle button.
+pub const TESTID_DIAGNOSTICS_TOGGLE: &str = "perf-diagnostics-toggle";
+/// testid for the diagnostics body (present only when expanded).
+pub const TESTID_DIAGNOSTICS_BODY: &str = "perf-diagnostics-body";
+/// testid for the effective-setting summary line.
+pub const TESTID_DIAGNOSTICS_SUMMARY: &str = "perf-diagnostics-summary";
+/// testid for the SEND layer-breakdown region.
+pub const TESTID_DIAGNOSTICS_SEND: &str = "perf-diagnostics-send";
+/// testid for the RECEIVE per-peer region.
+pub const TESTID_DIAGNOSTICS_RECEIVE: &str = "perf-diagnostics-receive";
 
 // ── localStorage key + persisted shape (SEND) ─────────────────────
 
@@ -1281,6 +1427,203 @@ fn DirectionToggle(active: Direction, on_change: EventHandler<Direction>) -> Ele
     }
 }
 
+/// Collapsible "Live diagnostics" disclosure (issue #1095) at the bottom of the
+/// panel — DEFAULT COLLAPSED so it never adds to the panel's resting height (the
+/// panel was carefully fit without scroll). When expanded it shows: the effective
+/// simulcast setting, the SEND layer breakdown (per active layer: bitrate +
+/// resolution) for camera + screen, and the per-peer RECEIVE state.
+///
+/// While expanded, a `requestAnimationFrame`-throttled (~4 Hz) tick signal forces
+/// this subtree to re-render so the live values + the variable-length per-peer
+/// list stay current. The loop only runs while open and self-cancels on collapse
+/// / unmount, so it costs nothing when closed or when the Performance tab isn't
+/// mounted.
+#[component]
+fn LiveDiagnostics(reader: DiagnosticsReader) -> Element {
+    let mut open = use_signal(|| false);
+    // Bumped ~4 Hz by the rAF loop below (only while open) to refresh the body.
+    let mut tick = use_signal(|| 0u64);
+
+    // rAF refresh loop, gated to the open state. Started/stopped via a cell that
+    // the loop checks and `use_drop` clears, mirroring the needle drivers.
+    type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
+    let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+    let is_open = open();
+
+    {
+        let cb = cb.clone();
+        use_effect(move || {
+            let want_running = open();
+            if want_running && cb.borrow().is_none() {
+                // Start the throttled refresh loop.
+                let cb_inner = cb.clone();
+                let last_ms = Rc::new(std::cell::Cell::new(0.0_f64));
+                let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                    let now = web_sys::window()
+                        .and_then(|w| w.performance())
+                        .map(|p| p.now())
+                        .unwrap_or(0.0);
+                    if now - last_ms.get() >= 250.0 {
+                        last_ms.set(now);
+                        // Bump the tick → re-render the disclosure body. Read into
+                        // a temp first to avoid overlapping borrows of the signal.
+                        let next = tick.peek().wrapping_add(1);
+                        tick.set(next);
+                    }
+                    if let (Some(win), Some(c)) = (web_sys::window(), cb_inner.borrow().as_ref()) {
+                        let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
+                    }
+                })
+                    as Box<dyn FnMut()>);
+                *cb.borrow_mut() = Some(closure);
+                if let (Some(win), Some(c)) = (web_sys::window(), cb.borrow().as_ref()) {
+                    let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
+                }
+            } else if !want_running {
+                // Stop the loop on collapse.
+                *cb.borrow_mut() = None;
+            }
+        });
+    }
+    {
+        let cb = cb.clone();
+        use_drop(move || {
+            *cb.borrow_mut() = None;
+        });
+    }
+
+    // Read `tick` so this subtree is subscribed to the throttled refresh.
+    let _ = tick();
+    let summary_line = format_simulcast_summary(&reader.summary);
+
+    rsx! {
+        div { class: "perf-diagnostics",
+            button {
+                r#type: "button",
+                class: "perf-diagnostics-toggle",
+                "data-testid": TESTID_DIAGNOSTICS_TOGGLE,
+                "aria-expanded": if is_open { "true" } else { "false" },
+                "aria-controls": TESTID_DIAGNOSTICS_BODY,
+                onclick: move |_| {
+                    let next = !open();
+                    open.set(next);
+                },
+                span { class: "perf-diagnostics-chevron", if is_open { "▾" } else { "▸" } }
+                "Live diagnostics"
+            }
+            if is_open {
+                div {
+                    class: "perf-diagnostics-body",
+                    id: TESTID_DIAGNOSTICS_BODY,
+                    "data-testid": TESTID_DIAGNOSTICS_BODY,
+
+                    // Effective simulcast setting.
+                    p {
+                        class: "perf-diagnostics-summary",
+                        "data-testid": TESTID_DIAGNOSTICS_SUMMARY,
+                        "Simulcast — {summary_line}"
+                    }
+
+                    // SEND layer breakdown (camera + screen).
+                    div {
+                        class: "perf-diagnostics-group",
+                        "data-testid": TESTID_DIAGNOSTICS_SEND,
+                        h4 { class: "perf-diagnostics-heading", "Sending" }
+                        {
+                            let video = (reader.send_video)();
+                            rsx! { SendLayerBreakdown { title: "Camera", snap: video } }
+                        }
+                        {
+                            match (reader.send_screen)() {
+                                Some(screen) => rsx! {
+                                    SendLayerBreakdown { title: "Screen", snap: screen }
+                                },
+                                None => rsx! {
+                                    p { class: "perf-diagnostics-empty", "Screen: not sharing" }
+                                },
+                            }
+                        }
+                    }
+
+                    // RECEIVE per-peer breakdown.
+                    div {
+                        class: "perf-diagnostics-group",
+                        "data-testid": TESTID_DIAGNOSTICS_RECEIVE,
+                        {
+                            let peers = (reader.per_peer_receive)();
+                            if peers.is_empty() {
+                                rsx! {
+                                    h4 { class: "perf-diagnostics-heading", "Receiving" }
+                                    p { class: "perf-diagnostics-empty", "No peers" }
+                                }
+                            } else {
+                                let n = peers.len();
+                                rsx! {
+                                    h4 { class: "perf-diagnostics-heading", "Receiving from {n} peer(s)" }
+                                    for peer in peers {
+                                        PeerReceiveLine { peer }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One SEND simulcast breakdown block (camera or screen): a header line
+/// (active/effective) plus one line per active layer (bitrate + resolution).
+#[component]
+fn SendLayerBreakdown(title: &'static str, snap: SimulcastSendSnapshot) -> Element {
+    let header = format_send_header(&snap);
+    rsx! {
+        div { class: "perf-diagnostics-send-block",
+            p { class: "perf-diagnostics-line",
+                span { class: "perf-diagnostics-label", "{title}: " }
+                "{header}"
+            }
+            if snap.simulcast_active {
+                ul { class: "perf-diagnostics-layers",
+                    for layer in snap.layers {
+                        li { class: "perf-diagnostics-layer",
+                            "{format_send_layer(layer.layer_id, layer.width, layer.height, layer.bitrate_kbps)}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One peer's RECEIVE line: the peer label plus each flowing kind's L{i}/{N} +
+/// resolution/bitrate.
+#[component]
+fn PeerReceiveLine(peer: PeerReceiveDiag) -> Element {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(line) = format_peer_kind_line("video", peer.video.as_ref()) {
+        parts.push(line);
+    }
+    if let Some(line) = format_peer_kind_line("screen", peer.screen.as_ref()) {
+        parts.push(line);
+    }
+    if let Some(line) = format_peer_kind_line("audio", peer.audio.as_ref()) {
+        parts.push(line);
+    }
+    let detail = if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join("  ·  ")
+    };
+    rsx! {
+        p { class: "perf-diagnostics-line",
+            span { class: "perf-diagnostics-label", "{peer.label}: " }
+            "{detail}"
+        }
+    }
+}
+
 /// The unified Performance settings panel body. A `Receive | Send` segmented
 /// toggle (default Receive) at the top selects the direction; the panel then
 /// renders only that direction's three rows (Video, Audio, Screen), each with
@@ -1303,6 +1646,9 @@ pub fn PerformanceSettingsPanel(
     receive_pref: ReceivePreference,
     on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
     received_reader: ReceivedReader,
+    // Live simulcast/AQ diagnostics (#1095 observability). Defaults to an inert
+    // reader so existing call sites / tests that don't wire it still compile.
+    #[props(default = DiagnosticsReader::none())] diagnostics_reader: DiagnosticsReader,
 ) -> Element {
     let video_fixed = pref.video_is_fixed();
     let audio_fixed = pref.audio_is_fixed();
@@ -1468,6 +1814,11 @@ pub fn PerformanceSettingsPanel(
                 on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
             }
         }
+
+        // Collapsible live diagnostics (default collapsed) — always at the bottom,
+        // independent of the Receive|Send direction toggle, so the user can watch
+        // what adaptation is actually doing on both sides without scroll bloat.
+        LiveDiagnostics { reader: diagnostics_reader }
     }
 }
 
@@ -2460,6 +2811,249 @@ mod tests {
         // failure rather than a silently-broken selector.
         assert_eq!(TESTID_DIRECTION_RECEIVE, "perf-direction-receive");
         assert_eq!(TESTID_DIRECTION_SEND, "perf-direction-send");
+    }
+
+    // ── Live diagnostics formatters (issue #1095) ──────────────────────
+
+    #[test]
+    fn simulcast_summary_formats_layers_and_off() {
+        // Multi-layer: shows effective count + flag × cap breakdown per kind.
+        let s = SimulcastSummary {
+            flag: 3,
+            video_capability: 3,
+            audio_capability: 3,
+            effective_video: 3,
+            effective_audio: 3,
+        };
+        assert_eq!(
+            format_simulcast_summary(&s),
+            "Video/Screen: 3 layers (flag 3 × device cap 3) · Audio: 3 layers (flag 3 × device cap 3)"
+        );
+        // A weak device gated to 1 video layer reads "off"; audio independent.
+        let weak = SimulcastSummary {
+            flag: 3,
+            video_capability: 1,
+            audio_capability: 3,
+            effective_video: 1,
+            effective_audio: 3,
+        };
+        assert_eq!(
+            format_simulcast_summary(&weak),
+            "Video/Screen: off (1 layer) · Audio: 3 layers (flag 3 × device cap 3)"
+        );
+        // Flag off entirely → both off.
+        let off = SimulcastSummary {
+            flag: 1,
+            video_capability: 3,
+            audio_capability: 3,
+            effective_video: 1,
+            effective_audio: 1,
+        };
+        assert_eq!(
+            format_simulcast_summary(&off),
+            "Video/Screen: off (1 layer) · Audio: off (1 layer)"
+        );
+    }
+
+    #[test]
+    fn send_layer_and_header_formatting() {
+        assert_eq!(format_send_layer(0, 640, 360, 400), "L0 640×360 · 400 kbps");
+        assert_eq!(
+            format_send_layer(2, 1280, 720, 1500),
+            "L2 1280×720 · 1500 kbps"
+        );
+        // Header: active/effective vs single-stream.
+        let multi = SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: 3,
+            active_layers: 2,
+            layers: Vec::new(),
+        };
+        assert_eq!(format_send_header(&multi), "2 of 3 layers active");
+        let single = SimulcastSendSnapshot {
+            simulcast_active: false,
+            effective_layers: 1,
+            active_layers: 1,
+            layers: Vec::new(),
+        };
+        assert_eq!(format_send_header(&single), "single layer");
+    }
+
+    #[test]
+    fn peer_kind_line_formats_video_audio_and_none() {
+        // Video → resolution; layer is 1-indexed for display.
+        let v = ReceivedLayerSnapshot {
+            kind: PrefMediaKind::Video,
+            layer_index: 2,
+            layer_count: 3,
+            width: 1280,
+            height: 720,
+            kbps: 1500,
+        };
+        assert_eq!(
+            format_peer_kind_line("video", Some(&v)),
+            Some("video L3/3 · 1280×720".to_string())
+        );
+        // Audio → kbps detail.
+        let a = ReceivedLayerSnapshot {
+            kind: PrefMediaKind::Audio,
+            layer_index: 0,
+            layer_count: 3,
+            width: 0,
+            height: 0,
+            kbps: 24,
+        };
+        assert_eq!(
+            format_peer_kind_line("audio", Some(&a)),
+            Some("audio L1/3 · 24 kbps".to_string())
+        );
+        // None → no line.
+        assert_eq!(format_peer_kind_line("screen", None), None);
+    }
+
+    #[test]
+    fn diagnostics_reader_none_is_inert() {
+        // The default reader yields a single-layer send snapshot, no screen, and
+        // no peers — so a panel without diagnostics wired renders an empty,
+        // harmless disclosure body.
+        let r = DiagnosticsReader::none();
+        let v = (r.send_video)();
+        assert!(!v.simulcast_active);
+        assert!(v.layers.is_empty());
+        assert!((r.send_screen)().is_none());
+        assert!((r.per_peer_receive)().is_empty());
+        assert_eq!(r.summary, SimulcastSummary::default());
+    }
+
+    #[test]
+    fn diagnostics_testids_are_stable() {
+        assert_eq!(TESTID_DIAGNOSTICS_TOGGLE, "perf-diagnostics-toggle");
+        assert_eq!(TESTID_DIAGNOSTICS_BODY, "perf-diagnostics-body");
+        assert_eq!(TESTID_DIAGNOSTICS_SUMMARY, "perf-diagnostics-summary");
+        assert_eq!(TESTID_DIAGNOSTICS_SEND, "perf-diagnostics-send");
+        assert_eq!(TESTID_DIAGNOSTICS_RECEIVE, "perf-diagnostics-receive");
+    }
+
+    /// When simulcast is ON, the diagnostics disclosure has real content to show.
+    /// This exercises the exact reader → formatter pipeline the `LiveDiagnostics`
+    /// component's rsx interpolates (the rsx itself is a thin wrapper over these
+    /// pure formatters), so it asserts "diagnostics render when simulcast is on"
+    /// without a browser/SSR harness.
+    #[test]
+    fn diagnostics_render_content_when_simulcast_on() {
+        // A 3-layer reader: video sending 3 active layers, screen sharing 2,
+        // one peer receiving video L3/3 + audio L1/3.
+        let reader = DiagnosticsReader {
+            summary: SimulcastSummary {
+                flag: 3,
+                video_capability: 3,
+                audio_capability: 3,
+                effective_video: 3,
+                effective_audio: 3,
+            },
+            send_video: Rc::new(|| SimulcastSendSnapshot {
+                simulcast_active: true,
+                effective_layers: 3,
+                active_layers: 3,
+                layers: vec![
+                    videocall_client::SimulcastLayerInfo {
+                        layer_id: 0,
+                        bitrate_kbps: 400,
+                        width: 640,
+                        height: 360,
+                    },
+                    videocall_client::SimulcastLayerInfo {
+                        layer_id: 1,
+                        bitrate_kbps: 900,
+                        width: 960,
+                        height: 540,
+                    },
+                    videocall_client::SimulcastLayerInfo {
+                        layer_id: 2,
+                        bitrate_kbps: 1500,
+                        width: 1280,
+                        height: 720,
+                    },
+                ],
+            }),
+            send_screen: Rc::new(|| {
+                Some(SimulcastSendSnapshot {
+                    simulcast_active: true,
+                    effective_layers: 3,
+                    active_layers: 2,
+                    layers: vec![videocall_client::SimulcastLayerInfo {
+                        layer_id: 0,
+                        bitrate_kbps: 500,
+                        width: 1280,
+                        height: 720,
+                    }],
+                })
+            }),
+            per_peer_receive: Rc::new(|| {
+                vec![videocall_client::PeerReceiveDiag {
+                    session_id: 7,
+                    label: "alice".to_string(),
+                    video: Some(ReceivedLayerSnapshot {
+                        kind: PrefMediaKind::Video,
+                        layer_index: 2,
+                        layer_count: 3,
+                        width: 1280,
+                        height: 720,
+                        kbps: 1500,
+                    }),
+                    screen: None,
+                    audio: Some(ReceivedLayerSnapshot {
+                        kind: PrefMediaKind::Audio,
+                        layer_index: 0,
+                        layer_count: 3,
+                        width: 0,
+                        height: 0,
+                        kbps: 24,
+                    }),
+                }]
+            }),
+        };
+
+        // Summary line shows the effective setting.
+        assert_eq!(
+            format_simulcast_summary(&reader.summary),
+            "Video/Screen: 3 layers (flag 3 × device cap 3) · Audio: 3 layers (flag 3 × device cap 3)"
+        );
+
+        // SEND: video header + per-layer lines.
+        let v = (reader.send_video)();
+        assert_eq!(format_send_header(&v), "3 of 3 layers active");
+        let v_lines: Vec<String> = v
+            .layers
+            .iter()
+            .map(|l| format_send_layer(l.layer_id, l.width, l.height, l.bitrate_kbps))
+            .collect();
+        assert_eq!(
+            v_lines,
+            vec![
+                "L0 640×360 · 400 kbps",
+                "L1 960×540 · 900 kbps",
+                "L2 1280×720 · 1500 kbps",
+            ]
+        );
+        // SEND: screen shows shed state (2 of 3).
+        let s = (reader.send_screen)().expect("sharing");
+        assert_eq!(format_send_header(&s), "2 of 3 layers active");
+
+        // RECEIVE: one peer, video + audio lines, no screen.
+        let peers = (reader.per_peer_receive)();
+        assert_eq!(peers.len(), 1);
+        let p = &peers[0];
+        assert_eq!(p.label, "alice");
+        assert_eq!(
+            format_peer_kind_line("video", p.video.as_ref()),
+            Some("video L3/3 · 1280×720".to_string())
+        );
+        assert_eq!(format_peer_kind_line("screen", p.screen.as_ref()), None);
+        assert_eq!(
+            format_peer_kind_line("audio", p.audio.as_ref()),
+            Some("audio L1/3 · 24 kbps".to_string())
+        );
     }
 
     #[test]

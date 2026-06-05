@@ -105,38 +105,61 @@ import { waitForServices } from "../helpers/wait-for-services";
 // ---------------------------------------------------------------------------
 
 /**
- * Drive a fresh page from the home form into the meeting grid. Mirrors the
- * proven flow in two-users-meeting.spec.ts / settings-modal.spec.ts.
+ * Drive a fresh page through the #1061 pre-join device-preview screen into the
+ * meeting grid.
+ *
+ * The old home-form flow (type into #meeting-id/#username, press Enter) no
+ * longer lands directly in the grid: every join now stops on the pre-join
+ * device-preview card (issue #1061/#959), which this helper must navigate. We
+ * use the canonical pattern proven by prejoin-device-preview.spec.ts:
+ *   1. Seed `vc_display_name` (read by the meeting page) and
+ *      `vc_prejoin_camera_on=true` (so the publisher's camera is ON and the
+ *      encoder actually runs — REQUIRED for the receive-needle assertions; the
+ *      pre-join camera defaults to OFF, which would leave the send encoder idle
+ *      and nothing for peers to decode) via an init script BEFORE navigation.
+ *   2. Navigate straight to `/meeting/{id}` (no home form) — the pre-join card
+ *      renders with a "Start Meeting"/"Join Meeting" action button.
+ *   3. Click that button to enter the meeting; resolve once `#grid-container`
+ *      is visible.
+ *
+ * Applies to BOTH publisher and receiver contexts.
  */
 async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
-  await page.goto("/");
-  await page.waitForTimeout(1500);
+  // Seed display name + camera-ON BEFORE the app boots. addInitScript runs on
+  // every navigation in this page prior to the page's own scripts.
+  await page.addInitScript((name: string) => {
+    try {
+      window.localStorage.setItem("vc_display_name", name);
+      // Pre-join camera defaults to OFF; force it ON so the publisher emits
+      // video (the receive-side needles need a real decoded stream).
+      window.localStorage.setItem("vc_prejoin_camera_on", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the meeting origin sets it */
+    }
+  }, displayName);
 
-  await page.locator("#meeting-id").click();
-  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 60 });
-
-  await page.locator("#username").click();
-  await page.locator("#username").fill("");
-  await page.locator("#username").pressSequentially(displayName, { delay: 60 });
-  await page.waitForTimeout(400);
-  await page.locator("#username").press("Enter");
-
+  await page.goto(`/meeting/${meetingId}`);
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
-  await page.waitForTimeout(1500);
 
+  // The pre-join device-preview card presents the Start/Join action button.
   const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
   const grid = page.locator("#grid-container");
 
-  // Either an explicit Start/Join button appears, or we auto-join straight to
-  // the grid.
+  // Either the pre-join button appears (the normal path), or — defensively — a
+  // build that auto-joins lands straight in the grid. Race both.
   const result = await Promise.race([
     joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
     grid.waitFor({ timeout: 30_000 }).then(() => "auto" as const),
   ]);
 
   if (result === "join") {
+    // The button is not interactive the instant it renders; a brief settle
+    // mirrors the proven helper. Swallow click-after-detach in case the build
+    // auto-transitioned past the pre-join card.
     await page.waitForTimeout(800);
-    await joinButton.click();
+    await joinButton.click().catch(() => {
+      /* auto-join already unmounted the pre-join button */
+    });
   }
 
   await expect(grid).toBeVisible({ timeout: 15_000 });

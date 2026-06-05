@@ -106,6 +106,18 @@ interface PerformancePreference {
 async function joinMeeting(page: Page, testLabel: string): Promise<void> {
   const meetingId = `e2e_perf_${testLabel}_${Date.now()}`;
 
+  // The #1061 pre-join card defaults the camera to OFF. Force it ON before the
+  // app boots so the SEND encoder actually runs — otherwise the live send video
+  // VU readout reads "Camera off" instead of `{w}x{h}…kbps`. addInitScript runs
+  // on every navigation (including the post-reload one) before the page scripts.
+  await page.addInitScript(() => {
+    try {
+      window.localStorage.setItem("vc_prejoin_camera_on", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin sets it */
+    }
+  });
+
   await page.goto("/");
   await page.waitForTimeout(1500);
 
@@ -314,11 +326,13 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
     await expect(popover).toHaveCount(0);
 
-    // Click "?" → popover opens with the explanation copy.
+    // Click "?" → popover opens with the explanation copy. The SEND help body
+    // (C1 rewording) reads "Sets the best (right) and worst (left) quality this
+    // device PUBLISHES, …" — match the best/worst + publishes shape.
     await helpBtn.click();
     await expect(helpBtn).toHaveAttribute("aria-expanded", "true");
     await expect(popover).toBeVisible();
-    await expect(popover).toContainText(/best.*worst.*video quality/i);
+    await expect(popover).toContainText(/best.*worst.*quality.*publish/i);
 
     // Escape closes it.
     await page.keyboard.press("Escape");
@@ -378,8 +392,9 @@ test.describe("Performance settings panel (#961)", () => {
       .locator('[data-testid="perf-video-range-value"]')
       .textContent();
     expect(rangeValueBefore).not.toBeNull();
-    // While Auto the text is literally "Range: Auto"; once a manual bound is set
-    // it shows a concrete tier range, so it must NOT be the Auto placeholder.
+    // The send range-value reads "Sending: {worst – best}". With a manual bound
+    // set it shows a concrete tier range; it must never read the "Auto" word
+    // (span_text emits tier labels, not "Auto").
     expect(rangeValueBefore).not.toContain("Auto");
 
     // ── Reload and rejoin; the preference must restore from localStorage ──

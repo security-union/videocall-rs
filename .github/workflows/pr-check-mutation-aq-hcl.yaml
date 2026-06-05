@@ -1,0 +1,146 @@
+name: Mutation Test — videocall-aq (HCL)
+
+# ADVISORY mutation testing for the AQ / simulcast logic crate.
+#
+# Why this exists: passing tests proves they RUN; mutation testing proves they
+# would FAIL if the code under test were wrong. It mechanically catches the
+# "tautological / non-asserting test" class that CLAUDE.md's Adversarial
+# Self-Review Rule (check #2) calls out by hand. `videocall-aq` is the target
+# because it is pure host-testable arithmetic (p75 aggregation, hysteresis,
+# layer-shed, PID) — exactly the bug-prone numeric logic where a surviving
+# mutant means a test isn't actually pinning the behaviour it claims to.
+#
+# Scope: DIFF-ONLY (`--in-diff`) — mutates only the lines this PR changed, so
+# it stays fast and relevant instead of sweeping the whole crate.
+#
+# Enforcement: ADVISORY for now. The job NEVER fails the PR (`continue-on-error`
+# on the run step + an always-green summary). Surviving mutants are surfaced in
+# the job summary / artifact so we can read the signal and tune skip markers
+# before deciding whether to promote this to a hard gate. (See the PR that
+# introduced this file for the rationale.)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'videocall-aq/**'
+
+concurrency:
+  group: pr-check-mutation-aq-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  CARGO_HOME: /var/lib/ci/cargo
+  RUSTUP_HOME: /var/lib/ci/rustup
+  CARGO_INCREMENTAL: "0"
+  PATH: /var/lib/ci/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  mutation-aq:
+    name: mutation test (videocall-aq, advisory)
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.2.0
+        with:
+          clean: false
+          path: mutation-repo
+          # Need the base branch to compute the diff for --in-diff.
+          fetch-depth: 0
+
+      # Install cargo-mutants if the runner doesn't already have it. Pinned so a
+      # new upstream release can't silently change behaviour mid-stream.
+      - name: Ensure cargo-mutants is installed
+        working-directory: mutation-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          if ! command -v cargo-mutants >/dev/null 2>&1; then
+            cargo install cargo-mutants --version 25.0.0 --locked
+          fi
+          cargo mutants --version
+
+      # Compute the diff of THIS PR against its base branch, restricted to the
+      # AQ crate, and feed it to --in-diff so only changed lines are mutated.
+      - name: Build PR diff (videocall-aq only)
+        working-directory: mutation-repo
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
+          # Diff base...HEAD limited to the crate; if empty, the run step no-ops.
+          git diff "${BASE}...HEAD" -- videocall-aq/ > /tmp/aq.diff || true
+          echo "Diff lines: $(wc -l < /tmp/aq.diff)"
+
+      # ADVISORY: never fail the PR. Surviving mutants are reported, not gated.
+      - name: Run cargo-mutants (diff-scoped, advisory)
+        id: mutants
+        continue-on-error: true
+        working-directory: mutation-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: |
+          if [ ! -s /tmp/aq.diff ]; then
+            echo "No videocall-aq changes in this PR diff — skipping mutation run."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # cargo-mutants writes results to <output>/mutants.out/. We pass
+          # --output /tmp/mut so the report lands at /tmp/mut/mutants.out/.
+          rm -rf /tmp/mut && mkdir -p /tmp/mut
+          set +e
+          cargo mutants \
+            --package videocall-aq \
+            --in-diff /tmp/aq.diff \
+            --no-shuffle \
+            --output /tmp/mut \
+            --timeout 120
+          code=$?
+          set -e
+          # cargo-mutants exit codes: 0 = all caught, 2 = some survived/missed,
+          # other = tooling error. We record but never propagate a failure.
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          echo "status=ran" >> "$GITHUB_OUTPUT"
+
+      # Report to BOTH the job log (always visible on GHES) and the step summary
+      # (if the runner supports it). No artifact upload — actions/upload-artifact
+      # is unsupported on this GHES 3.16 instance (see project notes), and no
+      # other workflow here uses it. The report is in the log; that's sufficient
+      # for an advisory check.
+      - name: Summarize surviving mutants
+        if: always()
+        working-directory: mutation-repo
+        run: |
+          report() {
+            echo "## Mutation test — videocall-aq (advisory)"
+            echo ""
+            if [ "${{ steps.mutants.outputs.status }}" = "skipped" ]; then
+              echo "No \`videocall-aq\` changes in this PR — nothing to mutate."
+              return 0
+            fi
+            OUT=/tmp/mut/mutants.out
+            if [ -f "$OUT/missed.txt" ] && [ -s "$OUT/missed.txt" ]; then
+              echo "WARNING: Surviving mutants — a changed line was mutated and NO test"
+              echo "failed, so the test for that line may not actually assert its"
+              echo "behaviour (CLAUDE.md adversarial-review check #2). ADVISORY, not blocking:"
+              echo ""
+              cat "$OUT/missed.txt"
+            else
+              echo "OK: No surviving mutants in the changed videocall-aq lines —"
+              echo "every mutated line was caught by a failing test."
+            fi
+            if [ -f "$OUT/timeout.txt" ] && [ -s "$OUT/timeout.txt" ]; then
+              echo ""
+              echo "Timed-out mutants (inconclusive, not failures):"
+              cat "$OUT/timeout.txt"
+            fi
+          }
+          # Always to the job log.
+          report
+          # And to the step summary when the runner provides it.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            report >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -96,6 +96,11 @@ e2e/bots-app/run/
 bot/assets/costumes/
 
 # AI
+# Private, per-developer instructions for Claude in this repo. The tracked
+# CLAUDE.md is shared with the whole team; CLAUDE.local.md is personal and must
+# never be committed (it would otherwise be untracked-but-not-ignored, the exact
+# state that gets swept into `git add -A`).
+CLAUDE.local.md
 .claude/worktrees/
 .claude/settings.local.json
 .claude/agent-memory/

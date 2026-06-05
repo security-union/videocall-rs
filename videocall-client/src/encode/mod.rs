@@ -32,13 +32,14 @@ use videocall_types::Callback;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, CameraEncoder,
+    camera_encoder_frames_submitted_ok, CameraEncoder, LiveQualitySnapshot, QualityTierBounds,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
     screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
-    screen_encoder_frames_submitted_ok, ScreenEncoder, ScreenShareEvent,
+    screen_encoder_frames_submitted_ok, ScreenEncoder, ScreenQualitySnapshot,
+    ScreenQualityTierBounds, ScreenShareEvent,
 };
 
 /// Trait to abstract over different microphone encoder implementations
@@ -79,6 +80,7 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 /// atomics from the `CameraEncoder`. When provided, the microphone encoder
 /// reads the audio quality tier from the camera encoder's quality manager
 /// instead of creating its own `EncoderBitrateController`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_microphone_encoder(
     client: VideoCallClient,
     bitrate_kbps: u32,
@@ -87,6 +89,7 @@ pub fn create_microphone_encoder(
     vad_threshold: Option<f32>,
     shared_audio_tier_bitrate: Option<Rc<AtomicU32>>,
     shared_audio_tier_fec: Option<Rc<AtomicBool>>,
+    max_layers: u32,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
         client,
@@ -96,5 +99,6 @@ pub fn create_microphone_encoder(
         vad_threshold,
         shared_audio_tier_bitrate,
         shared_audio_tier_fec,
+        max_layers,
     ))
 }

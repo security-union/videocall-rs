@@ -6193,3 +6193,429 @@ html[data-theme="light"] .glow-switch input:checked + .glow-switch-track::after 
   font-size: 11px;
   opacity: 0.6;
 }
+
+/* ──────────────────────────────────────────────────────────────────
+   Unified Performance settings panel — SEND quality bounds (#961) AND
+   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
+   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
+   VU needles, Auto toggle + "?" help. All colors are design tokens
+   (see global.css) — no literals.
+   ────────────────────────────────────────────────────────────────── */
+
+/* Segmented Receive | Send direction toggle (top of the panel). Only the
+   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
+   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
+.perf-direction-toggle {
+  display: flex;
+  gap: 2px;
+  margin: 14px 0 16px;
+  padding: 3px;
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+}
+
+.perf-direction-segment {
+  flex: 1 1 0;
+  min-height: 34px;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-direction-segment:hover {
+  color: var(--text-primary);
+  background: var(--field-bg-hover);
+}
+
+.perf-direction-segment:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Active segment: filled with the accent surface. aria-checked also conveys
+   selection to AT, so color is not the sole signal. */
+.perf-direction-segment.is-active {
+  color: var(--accent);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Inline "your download" / "your upload" consequence beside each row title, so
+   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+.perf-stream-consequence {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* Receive / Send emphasis in the intro paragraph — bold + direction accent
+   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
+.perf-emph-recv,
+.perf-emph-send {
+  font-weight: 700;
+}
+
+.perf-emph-recv {
+  color: var(--accent);
+}
+
+.perf-emph-send {
+  color: var(--success);
+}
+
+.perf-stream-group {
+  margin: 18px 0;
+  padding: 14px 16px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+/* Subtle left accent to distinguish the two directions at a glance (color is
+   not the sole cue — each row is labelled "Receive" / "Send"). */
+.perf-recv-row {
+  border-left: 3px solid var(--accent);
+}
+
+.perf-send-row {
+  border-left: 3px solid var(--success-border-vivid);
+}
+
+.perf-stream-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.perf-stream-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* "?" help button + its popover, anchored next to the section title. */
+.perf-help {
+  position: relative;
+  display: inline-flex;
+}
+
+.perf-help-button {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-help-button:hover {
+  background: var(--field-bg-hover);
+  color: var(--text-primary);
+}
+
+.perf-help-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Transparent outside-click catcher behind the popover. */
+.perf-help-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: transparent;
+}
+
+.perf-help-popover {
+  position: absolute;
+  z-index: 1001;
+  top: calc(100% + 8px);
+  left: 0;
+  width: 260px;
+  max-width: 80vw;
+  padding: 12px 14px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.perf-help-popover-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.perf-fixed-badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+}
+
+/* "Auto" toggle, pinned to the right of the stream header. */
+.perf-auto-button {
+  margin-left: auto;
+  min-height: 32px;
+  padding: 4px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--field-bg);
+  border: 1px solid var(--border-emphasis);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.perf-auto-button:hover {
+  background: var(--field-bg-hover);
+}
+
+.perf-auto-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Auto ACTIVE (toggle pressed): green/active. The aria-pressed state + label
+   convey this to AT, so color is not the sole signal. */
+.perf-auto-button.is-active {
+  color: var(--success);
+  background: var(--success-bg-soft);
+  border-color: var(--success-border-vivid);
+}
+
+.perf-auto-button.is-active:hover {
+  background: var(--success-bg-soft-hover);
+}
+
+/* Per-section body: the VU needle gauge beside the slider + range text. */
+.perf-stream-body {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.perf-stream-controls {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── Dual-thumb range slider ── */
+
+.perf-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.perf-range-end-label {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: center;
+}
+
+/* The two range inputs are absolutely stacked over a shared track. */
+.perf-range-track-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  height: 44px; /* >=44px touch target for the thumbs */
+}
+
+.perf-range-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 6px;
+  transform: translateY(-50%);
+  background: var(--border);
+  border-radius: var(--radius-pill);
+}
+
+.perf-range-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+  transition: left 0.3s ease, right 0.3s ease;
+}
+
+.perf-range-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  /* Let pointer events fall through the track area to whichever thumb is under
+     the cursor; thumbs re-enable pointer events below. */
+  pointer-events: none;
+}
+
+.perf-range-input:focus-visible {
+  outline: none;
+}
+
+/* N3 fix: when both thumbs collapse to one position (Fixed state), the max
+   input (later in the DOM) would otherwise sit on top and swallow pointer
+   drags meant for the min thumb. Raise the min input above the max input so its
+   thumb stays grabbable by mouse; the max thumb remains reachable (it is to the
+   right of, or coincident with, the min thumb). A focused input always wins so
+   keyboard control is unaffected. */
+.perf-range-input-min {
+  z-index: 2;
+}
+
+.perf-range-input-max {
+  z-index: 1;
+}
+
+.perf-range-input:focus-visible {
+  z-index: 3;
+}
+
+/* WebKit thumb */
+.perf-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Firefox thumb */
+.perf-range-input::-moz-range-thumb {
+  pointer-events: auto;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-elevated);
+  border: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+.perf-range-input:focus-visible::-moz-range-thumb {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.perf-range-value {
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-range-fill {
+    transition: none;
+  }
+}
+
+/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
+
+.perf-vu-gauge {
+  flex: 0 0 auto;
+  width: 150px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 10px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.perf-vu-svg {
+  width: 120px;
+  height: 78px;
+}
+
+.perf-vu-arc {
+  stroke: var(--border-emphasis);
+}
+
+.perf-vu-tick {
+  stroke: var(--text-quaternary);
+}
+
+.perf-vu-needle {
+  stroke: var(--accent);
+  /* Pivot at the hub so rotation looks like an analog needle. */
+  transform-origin: 60px 64px;
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.perf-vu-hub {
+  fill: var(--accent);
+}
+
+.perf-vu-label {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.perf-vu-readout {
+  margin-top: 2px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-vu-needle {
+    transition: none;
+  }
+}
+
+/* On narrow widths stack the needle above the slider instead of beside it. */
+@media (max-width: 540px) {
+  .perf-stream-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .perf-vu-gauge {
+    width: 100%;
+  }
+}

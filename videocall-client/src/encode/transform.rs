@@ -112,6 +112,7 @@ pub fn transform_screen_chunk(
     encoder_target_bitrate_kbps: u32,
     adaptive_tier: String,
     cause_hint: String,
+    simulcast_layer_id: u32,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
@@ -148,6 +149,13 @@ pub fn transform_screen_chunk(
         // Cleartext discriminator so the relay can apply viewport-aware VIDEO
         // filtering without decrypting the inner MediaPacket (HCL issue #988).
         media_kind: MediaKind::SCREEN.into(),
+        // Cleartext simulcast layer id (issue #989, Phase 3b). Tag 5 serializes
+        // only when non-zero, so layer 0 — the single-layer default and what
+        // every pre-simulcast screen publisher emits — is wire-identical to
+        // today. The relay's per-(source, SCREEN) layer filter and the
+        // receiver's screen layer-select guard read this to forward/decode one
+        // screen layer (mirrors transform_video_chunk).
+        simulcast_layer_id,
         ..Default::default()
     }
 }
@@ -211,5 +219,45 @@ mod tests {
         let bytes = with_two.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 2);
+    }
+
+    /// Phase 3b: the SCREEN wrapper carries the same cleartext layer-id contract
+    /// as VIDEO. A SCREEN wrapper at layer 0 must be wire-identical to one that
+    /// never set the field (so single-layer screen publishers are unchanged on
+    /// the wire), and a non-zero screen layer must round-trip.
+    fn screen_wrapper_with_layer(layer: u32) -> PacketWrapper {
+        PacketWrapper {
+            data: vec![9, 9, 9],
+            user_id: b"bob".to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::SCREEN.into(),
+            simulcast_layer_id: layer,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn screen_layer_id_zero_is_wire_absent() {
+        let zero_bytes = screen_wrapper_with_layer(0).write_to_bytes().unwrap();
+        let baseline = PacketWrapper {
+            data: vec![9, 9, 9],
+            user_id: b"bob".to_vec(),
+            packet_type: PacketType::MEDIA.into(),
+            media_kind: MediaKind::SCREEN.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_bytes,
+            baseline.write_to_bytes().unwrap(),
+            "screen layer 0 must be byte-identical to a wrapper that never set the field"
+        );
+    }
+
+    #[test]
+    fn screen_layer_id_two_round_trips() {
+        let bytes = screen_wrapper_with_layer(2).write_to_bytes().unwrap();
+        let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.simulcast_layer_id, 2);
+        assert_eq!(parsed.media_kind.enum_value(), Ok(MediaKind::SCREEN));
     }
 }

@@ -213,8 +213,9 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
 ///
 /// Note this is only the *capability ceiling*. The effective layer count the
 /// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
-/// and the flag defaults to 1 (feature off) — so a high-end device still emits a single
-/// layer until an operator raises the flag for a controlled test meeting.
+/// and the flag now defaults to 3 (feature ON, #1082) — so a high-end device
+/// emits up to 3 layers by default while a weak device is still gated down to 1
+/// (or 2) here regardless of the flag.
 ///
 /// The only non-test caller is the wasm32-gated `capability_max_simulcast_layers`
 /// below, so a native non-test build (e.g. `cargo clippy --all`) sees this as
@@ -313,7 +314,8 @@ pub fn assess_capability() -> CapabilityVerdict {
 /// globals are unreachable.
 ///
 /// This is only the capability ceiling; the encoder uses
-/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag defaults to 1.
+/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag now
+/// defaults to 3 (feature ON, #1082) — this ceiling is the weak-device safety floor.
 ///
 /// wasm32-only: it sniffs `web_sys` navigator and calls
 /// `videocall_client::capability::videocall_capability_score()`, which is
@@ -666,5 +668,56 @@ mod tests {
             max_simulcast_layers(&CapabilityVerdict::Ok, 30_000, false),
             3
         );
+    }
+
+    /// Issue #1082: with simulcast now ON BY DEFAULT (flag = 3), the device
+    /// capability ceiling is the safety floor for weak devices. The effective
+    /// layer count the encoder uses is `min(flag, capability_ceiling)`, so a weak
+    /// device must still end up at 1 layer even though the flag default is 3.
+    /// This models that `min` at the host call site without a browser.
+    #[test]
+    fn default_on_still_gates_weak_device_to_one_layer() {
+        const DEFAULT_FLAG: u32 = 3; // experimentalSimulcastMaxLayers default (issue 1082)
+
+        // Block verdict → ceiling 1 → effective 1.
+        let weak_block =
+            max_simulcast_layers(&CapabilityVerdict::Block("too weak".into()), 0, false);
+        assert_eq!(DEFAULT_FLAG.min(weak_block), 1, "Block device gated to 1");
+
+        // StrongWarn verdict → ceiling 1 → effective 1.
+        let weak_warn = max_simulcast_layers(
+            &CapabilityVerdict::StrongWarn("limited cpu".into()),
+            0,
+            false,
+        );
+        assert_eq!(
+            DEFAULT_FLAG.min(weak_warn),
+            1,
+            "StrongWarn device gated to 1"
+        );
+
+        // Older Intel Mac (Ok verdict but flagged) → ceiling 1 → effective 1.
+        let older_intel = max_simulcast_layers(&CapabilityVerdict::Ok, 99_999, true);
+        assert_eq!(
+            DEFAULT_FLAG.min(older_intel),
+            1,
+            "older Intel Mac gated to 1"
+        );
+
+        // Low-benchmark Ok device → ceiling 1 → effective 1.
+        let low_score = max_simulcast_layers(&CapabilityVerdict::Ok, 4999, false);
+        assert_eq!(
+            DEFAULT_FLAG.min(low_score),
+            1,
+            "low-score device gated to 1"
+        );
+
+        // Mid device → ceiling 2 → effective 2 (default flag does not force 3).
+        let mid = max_simulcast_layers(&CapabilityVerdict::Ok, 5000, false);
+        assert_eq!(DEFAULT_FLAG.min(mid), 2, "mid device runs 2 layers");
+
+        // Capable device → ceiling 3 → effective 3 (default-ON delivers full ladder).
+        let strong = max_simulcast_layers(&CapabilityVerdict::Ok, 30_000, false);
+        assert_eq!(DEFAULT_FLAG.min(strong), 3, "capable device runs 3 layers");
     }
 }

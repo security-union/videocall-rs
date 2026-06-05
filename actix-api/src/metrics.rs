@@ -780,7 +780,7 @@ lazy_static! {
     /// would otherwise fire silently) and gives plain "LAYER_PREFERENCE
     /// received" visibility via the `accepted` outcome.
     ///
-    /// `outcome` is bounded — exactly 4 values:
+    /// `outcome` is bounded — exactly 5 values:
     /// - `accepted`:              update was applied to the receiver's map.
     /// - `rate_limited`:          arrived within
     ///   `LAYER_PREFERENCE_MIN_UPDATE_INTERVAL` of the last accepted update;
@@ -788,13 +788,16 @@ lazy_static! {
     /// - `truncated`:             the entries list exceeded
     ///   `LAYER_PREFERENCE_MAX_ENTRIES` and was capped (fail-open on the
     ///   excess). Counted in ADDITION to `accepted` for the same packet.
+    /// - `layer_id_out_of_bound`: at least one entry's `desired_layer` exceeded
+    ///   `LAYER_PREFERENCE_MAX_LAYER_ID` and was skipped (fail-open per source,
+    ///   #1082). Counted in ADDITION to `accepted` for the same packet.
     /// - `ignored_other_subject`: arrived on a subject other than the receiver's
     ///   own; expected for normal NATS fan-out and dropped without mutating state.
     ///
-    /// CARDINALITY: bounded — `room` × 4 outcomes. No per-session label.
+    /// CARDINALITY: bounded — `room` × 5 outcomes. No per-session label.
     pub static ref RELAY_LAYER_PREFERENCE_UPDATES_TOTAL: CounterVec = register_counter_vec!(
         "relay_layer_preference_updates_total",
-        "LAYER_PREFERENCE control-packet update outcomes per room (accepted|rate_limited|truncated|ignored_other_subject) (#989)",
+        "LAYER_PREFERENCE control-packet update outcomes per room (accepted|rate_limited|truncated|layer_id_out_of_bound|ignored_other_subject) (#989, #1082)",
         &["room", "outcome"]
     )
     .expect("Failed to create relay_layer_preference_updates_total metric");

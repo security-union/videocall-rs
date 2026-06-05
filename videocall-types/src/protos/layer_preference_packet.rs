@@ -28,7 +28,8 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_7_2;
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct LayerPreferencePacket {
     // message fields
-    ///  Per-source desired-layer entries. Empty = no layer constraint (fail-open).
+    ///  Per-(source, media-kind) desired-layer entries. Empty = no layer
+    ///  constraint (fail-open).
     // @@protoc_insertion_point(field:LayerPreferencePacket.entries)
     pub entries: ::std::vec::Vec<layer_preference_packet::Entry>,
     // special fields
@@ -150,8 +151,8 @@ impl ::protobuf::reflect::ProtobufValue for LayerPreferencePacket {
 
 /// Nested message and enums of message `LayerPreferencePacket`
 pub mod layer_preference_packet {
-    ///  One desired-layer entry: for a given source session, the simulcast layer
-    ///  the receiver wants forwarded.
+    ///  One desired-layer entry: for a given source session AND media kind, the
+    ///  simulcast layer the receiver wants forwarded.
     // @@protoc_insertion_point(message:LayerPreferencePacket.Entry)
     #[derive(PartialEq,Clone,Default,Debug)]
     pub struct Entry {
@@ -168,6 +169,15 @@ pub mod layer_preference_packet {
         ///  for this source entirely (see the message-level comment above).
         // @@protoc_insertion_point(field:LayerPreferencePacket.Entry.desired_layer)
         pub desired_layer: u32,
+        ///  Which media kind of `session_id` this entry constrains (issue #989,
+        ///  Phase 3). Additive field; default 0 (UNSPECIFIED) = VIDEO for back-compat
+        ///  (see EntryMediaKind). The relay keys its per-receiver preference map by
+        ///  (session_id, media_kind), and matches an entry against a forwarded
+        ///  packet's cleartext `PacketWrapper.media_kind`. AUDIO/SCREEN entries are
+        ///  ignored by pre-Phase-3 relays (which only filter VIDEO), so an old relay
+        ///  simply forwards those streams unfiltered — fail-open, never a wrong drop.
+        // @@protoc_insertion_point(field:LayerPreferencePacket.Entry.media_kind)
+        pub media_kind: ::protobuf::EnumOrUnknown<EntryMediaKind>,
         // special fields
         // @@protoc_insertion_point(special_field:LayerPreferencePacket.Entry.special_fields)
         pub special_fields: ::protobuf::SpecialFields,
@@ -185,7 +195,7 @@ pub mod layer_preference_packet {
         }
 
         pub(in super) fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-            let mut fields = ::std::vec::Vec::with_capacity(2);
+            let mut fields = ::std::vec::Vec::with_capacity(3);
             let mut oneofs = ::std::vec::Vec::with_capacity(0);
             fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
                 "session_id",
@@ -196,6 +206,11 @@ pub mod layer_preference_packet {
                 "desired_layer",
                 |m: &Entry| { &m.desired_layer },
                 |m: &mut Entry| { &mut m.desired_layer },
+            ));
+            fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+                "media_kind",
+                |m: &Entry| { &m.media_kind },
+                |m: &mut Entry| { &mut m.media_kind },
             ));
             ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<Entry>(
                 "LayerPreferencePacket.Entry",
@@ -221,6 +236,9 @@ pub mod layer_preference_packet {
                     16 => {
                         self.desired_layer = is.read_uint32()?;
                     },
+                    24 => {
+                        self.media_kind = is.read_enum_or_unknown()?;
+                    },
                     tag => {
                         ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                     },
@@ -239,6 +257,9 @@ pub mod layer_preference_packet {
             if self.desired_layer != 0 {
                 my_size += ::protobuf::rt::uint32_size(2, self.desired_layer);
             }
+            if self.media_kind != ::protobuf::EnumOrUnknown::new(EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED) {
+                my_size += ::protobuf::rt::int32_size(3, self.media_kind.value());
+            }
             my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
             self.special_fields.cached_size().set(my_size as u32);
             my_size
@@ -250,6 +271,9 @@ pub mod layer_preference_packet {
             }
             if self.desired_layer != 0 {
                 os.write_uint32(2, self.desired_layer)?;
+            }
+            if self.media_kind != ::protobuf::EnumOrUnknown::new(EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED) {
+                os.write_enum(3, ::protobuf::EnumOrUnknown::value(&self.media_kind))?;
             }
             os.write_unknown_fields(self.special_fields.unknown_fields())?;
             ::std::result::Result::Ok(())
@@ -270,6 +294,7 @@ pub mod layer_preference_packet {
         fn clear(&mut self) {
             self.session_id = 0;
             self.desired_layer = 0;
+            self.media_kind = ::protobuf::EnumOrUnknown::new(EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED);
             self.special_fields.clear();
         }
 
@@ -277,6 +302,7 @@ pub mod layer_preference_packet {
             static instance: Entry = Entry {
                 session_id: 0,
                 desired_layer: 0,
+                media_kind: ::protobuf::EnumOrUnknown::from_i32(0),
                 special_fields: ::protobuf::SpecialFields::new(),
             };
             &instance
@@ -299,86 +325,210 @@ pub mod layer_preference_packet {
     impl ::protobuf::reflect::ProtobufValue for Entry {
         type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
     }
+
+    ///  The media kind an Entry applies to (issue #989, Phase 3). Mirrors
+    ///  `PacketWrapper.MediaKind` so camera VIDEO, AUDIO, and SCREEN of the SAME
+    ///  source session can be addressed INDEPENDENTLY: a receiver can request a
+    ///  low SCREEN layer while keeping full camera VIDEO, etc.
+    ///
+    ///  BACK-COMPAT: the default (UNSPECIFIED = 0) MUST be treated by the relay as
+    ///  VIDEO. Pre-Phase-3 clients omit this field (proto3 default 0), and before
+    ///  Phase 3 the relay only ever filtered VIDEO — so an absent media_kind is
+    ///  exactly "this entry is about the source's camera video", preserving the
+    ///  existing wire contract with no flag-day.
+    #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+    // @@protoc_insertion_point(enum:LayerPreferencePacket.EntryMediaKind)
+    pub enum EntryMediaKind {
+        // @@protoc_insertion_point(enum_value:LayerPreferencePacket.EntryMediaKind.ENTRY_MEDIA_KIND_UNSPECIFIED)
+        ENTRY_MEDIA_KIND_UNSPECIFIED = 0,
+        // @@protoc_insertion_point(enum_value:LayerPreferencePacket.EntryMediaKind.ENTRY_VIDEO)
+        ENTRY_VIDEO = 1,
+        // @@protoc_insertion_point(enum_value:LayerPreferencePacket.EntryMediaKind.ENTRY_AUDIO)
+        ENTRY_AUDIO = 2,
+        // @@protoc_insertion_point(enum_value:LayerPreferencePacket.EntryMediaKind.ENTRY_SCREEN)
+        ENTRY_SCREEN = 3,
+    }
+
+    impl ::protobuf::Enum for EntryMediaKind {
+        const NAME: &'static str = "EntryMediaKind";
+
+        fn value(&self) -> i32 {
+            *self as i32
+        }
+
+        fn from_i32(value: i32) -> ::std::option::Option<EntryMediaKind> {
+            match value {
+                0 => ::std::option::Option::Some(EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED),
+                1 => ::std::option::Option::Some(EntryMediaKind::ENTRY_VIDEO),
+                2 => ::std::option::Option::Some(EntryMediaKind::ENTRY_AUDIO),
+                3 => ::std::option::Option::Some(EntryMediaKind::ENTRY_SCREEN),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        fn from_str(str: &str) -> ::std::option::Option<EntryMediaKind> {
+            match str {
+                "ENTRY_MEDIA_KIND_UNSPECIFIED" => ::std::option::Option::Some(EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED),
+                "ENTRY_VIDEO" => ::std::option::Option::Some(EntryMediaKind::ENTRY_VIDEO),
+                "ENTRY_AUDIO" => ::std::option::Option::Some(EntryMediaKind::ENTRY_AUDIO),
+                "ENTRY_SCREEN" => ::std::option::Option::Some(EntryMediaKind::ENTRY_SCREEN),
+                _ => ::std::option::Option::None
+            }
+        }
+
+        const VALUES: &'static [EntryMediaKind] = &[
+            EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED,
+            EntryMediaKind::ENTRY_VIDEO,
+            EntryMediaKind::ENTRY_AUDIO,
+            EntryMediaKind::ENTRY_SCREEN,
+        ];
+    }
+
+    impl ::protobuf::EnumFull for EntryMediaKind {
+        fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| super::file_descriptor().enum_by_package_relative_name("LayerPreferencePacket.EntryMediaKind").unwrap()).clone()
+        }
+
+        fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+            let index = *self as usize;
+            Self::enum_descriptor().value_by_index(index)
+        }
+    }
+
+    impl ::std::default::Default for EntryMediaKind {
+        fn default() -> Self {
+            EntryMediaKind::ENTRY_MEDIA_KIND_UNSPECIFIED
+        }
+    }
+
+    impl EntryMediaKind {
+        pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+            ::protobuf::reflect::GeneratedEnumDescriptorData::new::<EntryMediaKind>("LayerPreferencePacket.EntryMediaKind")
+        }
+    }
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n#types/layer_preference_packet.proto\"\x9c\x01\n\x15LayerPreferencePac\
+    \n#types/layer_preference_packet.proto\"\xcb\x02\n\x15LayerPreferencePac\
     ket\x126\n\x07entries\x18\x01\x20\x03(\x0b2\x1c.LayerPreferencePacket.En\
-    tryR\x07entries\x1aK\n\x05Entry\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
-    \x04R\tsessionId\x12#\n\rdesired_layer\x18\x02\x20\x01(\rR\x0cdesiredLay\
-    erJ\x92\x18\n\x06\x12\x04\0\06\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\xba\
-    \x10\n\x02\x04\0\x12\x04$\06\x01\x1a\xad\x10\x20Client\x20->\x20relay\
-    \x20simulcast\x20layer-preference\x20control\x20payload\x20(#989,\x20Pha\
-    se\x201b;\n\x20see\x20discussion\x20#890).\n\n\x20Carried\x20inside\x20a\
-    \x20PacketWrapper\x20whose\x20`packet_type`\x20is\x20LAYER_PREFERENCE.\
-    \x20The\n\x20sending\x20(receiving)\x20client\x20lists,\x20per\x20source\
-    \x20session\x20it\x20is\x20rendering,\x20which\n\x20simulcast\x20layer\
-    \x20it\x20wants\x20the\x20relay\x20to\x20forward.\x20The\x20relay\x20rec\
-    ords\x20this\x20per\n\x20receiver\x20session\x20and\x20drops\x20simulcas\
-    t\x20VIDEO\x20layers\x20that\x20do\x20NOT\x20match\x20the\n\x20recorded\
-    \x20preference\x20for\x20that\x20source,\x20saving\x20downstream\x20band\
-    width.\n\n\x20Layer\x20semantics\x20(these\x20describe\x20the\x20relay's\
-    \x20IMPLEMENTED\x20behavior\x20\xe2\x80\x94\x20a\x20client\n\x20producer\
-    \x20MUST\x20follow\x20them\x20exactly):\n\x20\x20\x20*\x20NO\x20ENTRY\
-    \x20for\x20a\x20source\x20session\x20=\x20\"no\x20preference\":\x20the\
-    \x20relay\x20forwards\n\x20\x20\x20\x20\x20EVERY\x20layer\x20from\x20tha\
-    t\x20source\x20(fail-open).\x20This\x20is\x20the\x20only\x20way\x20to\
-    \x20say\n\x20\x20\x20\x20\x20\"send\x20me\x20whatever\".\x20To\x20stop\
-    \x20constraining\x20a\x20source,\x20OMIT\x20its\x20entry\x20\xe2\x80\x94\
-    \x20do\n\x20\x20\x20\x20\x20NOT\x20send\x20an\x20entry\x20with\x20desire\
-    d_layer\x20=\x200.\n\x20\x20\x20*\x20A\x20recorded\x20Entry\x20with\x20`\
-    desired_layer\x20=\x20N`\x20(N\x20!=\x200)\x20=\x20\"forward\x20ONLY\n\
-    \x20\x20\x20\x20\x20layer\x20N\x20from\x20this\x20source\":\x20the\x20re\
-    lay\x20drops\x20every\x20other\x20non-base\x20layer\n\x20\x20\x20\x20\
-    \x20from\x20it.\n\x20\x20\x20*\x20A\x20recorded\x20Entry\x20with\x20`des\
-    ired_layer\x20=\x200`\x20is\x20therefore\x20\"BASE\x20LAYER\n\x20\x20\
-    \x20\x20\x20ONLY\",\x20NOT\x20\"no\x20preference\".\x20Layer\x200\x20on\
-    \x20a\x20media\x20PacketWrapper\x20is\x20the\x20base\n\x20\x20\x20\x20\
-    \x20/\x20unspecified\x20layer\x20and\x20is\x20ALWAYS\x20forwarded\x20(se\
-    e\x20PacketWrapper\x20field\x205),\n\x20\x20\x20\x20\x20so\x20an\x20entr\
-    y\x20of\x200\x20keeps\x20base\x20flowing\x20while\x20dropping\x20every\
-    \x20upgraded\x20layer\n\x20\x20\x20\x20\x20from\x20that\x20source.\n\n\
-    \x20Security:\x20like\x20ViewportPacket\x20this\x20signal\x20is\x20SUBTR\
-    ACT-ONLY\x20and\x20consumed\n\x20purely\x20for\x20VIDEO\x20layer-drop\
-    \x20decisions.\x20It\x20can\x20only\x20reduce\x20what\x20an\n\x20already\
-    -authorized\x20session\x20receives;\x20it\x20never\x20grants\x20access.\
-    \x20No\x20recorded\n\x20preference\x20(or\x20no\x20LAYER_PREFERENCE\x20p\
-    acket\x20at\x20all)\x20means\x20\"no\x20layer\x20signal\"\n\x20and\x20th\
-    e\x20relay\x20forwards\x20every\x20layer\x20(fail-open\x20to\x20pre-#989\
-    \x20behaviour).\x20The\n\x20relay\x20does\x20NOT\x20validate\x20that\x20\
-    the\x20requested\x20layer\x20is\x20actually\x20being\x20produced\n\x20by\
-    \x20the\x20source:\x20a\x20client\x20requesting\x20an\x20absent\x20layer\
-    \x20black-tiles\x20ITSELF;\x20the\n\x20client-side\x20clamp\x20(only\x20\
-    request\x20observed-arriving\x20layers)\x20is\x20the\x20mitigation\n\x20\
-    and\x20is\x20a\x20separate\x20frontend\x20increment.\x20AUDIO/SCREEN\x20\
-    are\x20NEVER\x20filtered\x20by\n\x20this\x20signal.\x20This\x20packet\
-    \x20is\x20consumed\x20by\x20the\x20relay\x20and\x20never\x20re-broadcast\
-    .\n\n\n\n\x03\x04\0\x01\x12\x03$\x08\x1d\nw\n\x04\x04\0\x03\0\x12\x04'\
-    \x022\x03\x1ai\x20One\x20desired-layer\x20entry:\x20for\x20a\x20given\
-    \x20source\x20session,\x20the\x20simulcast\x20layer\n\x20the\x20receiver\
-    \x20wants\x20forwarded.\n\n\x0c\n\x05\x04\0\x03\0\x01\x12\x03'\n\x0f\n\
-    \xce\x01\n\x06\x04\0\x03\0\x02\0\x12\x03+\x04\x1a\x1a\xbe\x01\x20The\x20\
-    source\x20session_id\x20(publisher)\x20this\x20preference\x20applies\x20\
-    to.\x20This\x20is\n\x20the\x20SUBJECT-derived\x20publisher\x20session\
-    \x20the\x20relay\x20matches\x20against\x20on\x20the\n\x20forwarding\x20p\
-    ath,\x20NOT\x20a\x20forgeable\x20inner\x20field.\n\n\x0e\n\x07\x04\0\x03\
-    \0\x02\0\x05\x12\x03+\x04\n\n\x0e\n\x07\x04\0\x03\0\x02\0\x01\x12\x03+\
-    \x0b\x15\n\x0e\n\x07\x04\0\x03\0\x02\0\x03\x12\x03+\x18\x19\n\xe9\x02\n\
-    \x06\x04\0\x03\0\x02\x01\x12\x031\x04\x1d\x1a\xd9\x02\x20The\x20simulcas\
-    t\x20layer\x20the\x20receiver\x20wants\x20from\x20`session_id`.\x20Match\
-    ed\n\x20against\x20the\x20cleartext\x20`PacketWrapper.simulcast_layer_id\
-    `\x20(field\x205).\n\x200\x20=\x20BASE\x20LAYER\x20ONLY\x20(drop\x20upgr\
-    aded\x20layers\x20from\x20this\x20source),\x20NOT\x20\"no\n\x20preferenc\
-    e\"\x20\xe2\x80\x94\x20to\x20express\x20\"no\x20preference\x20/\x20forwa\
-    rd\x20all\",\x20omit\x20the\x20entry\n\x20for\x20this\x20source\x20entir\
-    ely\x20(see\x20the\x20message-level\x20comment\x20above).\n\n\x0e\n\x07\
-    \x04\0\x03\0\x02\x01\x05\x12\x031\x04\n\n\x0e\n\x07\x04\0\x03\0\x02\x01\
-    \x01\x12\x031\x0b\x18\n\x0e\n\x07\x04\0\x03\0\x02\x01\x03\x12\x031\x1b\
-    \x1c\nY\n\x04\x04\0\x02\0\x12\x035\x02\x1d\x1aL\x20Per-source\x20desired\
-    -layer\x20entries.\x20Empty\x20=\x20no\x20layer\x20constraint\x20(fail-o\
-    pen).\n\n\x0c\n\x05\x04\0\x02\0\x04\x12\x035\x02\n\n\x0c\n\x05\x04\0\x02\
-    \0\x06\x12\x035\x0b\x10\n\x0c\n\x05\x04\0\x02\0\x01\x12\x035\x11\x18\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x035\x1b\x1cb\x06proto3\
+    tryR\x07entries\x1a\x91\x01\n\x05Entry\x12\x1d\n\nsession_id\x18\x01\x20\
+    \x01(\x04R\tsessionId\x12#\n\rdesired_layer\x18\x02\x20\x01(\rR\x0cdesir\
+    edLayer\x12D\n\nmedia_kind\x18\x03\x20\x01(\x0e2%.LayerPreferencePacket.\
+    EntryMediaKindR\tmediaKind\"f\n\x0eEntryMediaKind\x12\x20\n\x1cENTRY_MED\
+    IA_KIND_UNSPECIFIED\x10\0\x12\x0f\n\x0bENTRY_VIDEO\x10\x01\x12\x0f\n\x0b\
+    ENTRY_AUDIO\x10\x02\x12\x10\n\x0cENTRY_SCREEN\x10\x03J\xd2#\n\x06\x12\
+    \x04\0\0P\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\xba\x10\n\x02\x04\0\x12\
+    \x04$\0P\x01\x1a\xad\x10\x20Client\x20->\x20relay\x20simulcast\x20layer-\
+    preference\x20control\x20payload\x20(#989,\x20Phase\x201b;\n\x20see\x20d\
+    iscussion\x20#890).\n\n\x20Carried\x20inside\x20a\x20PacketWrapper\x20wh\
+    ose\x20`packet_type`\x20is\x20LAYER_PREFERENCE.\x20The\n\x20sending\x20(\
+    receiving)\x20client\x20lists,\x20per\x20source\x20session\x20it\x20is\
+    \x20rendering,\x20which\n\x20simulcast\x20layer\x20it\x20wants\x20the\
+    \x20relay\x20to\x20forward.\x20The\x20relay\x20records\x20this\x20per\n\
+    \x20receiver\x20session\x20and\x20drops\x20simulcast\x20VIDEO\x20layers\
+    \x20that\x20do\x20NOT\x20match\x20the\n\x20recorded\x20preference\x20for\
+    \x20that\x20source,\x20saving\x20downstream\x20bandwidth.\n\n\x20Layer\
+    \x20semantics\x20(these\x20describe\x20the\x20relay's\x20IMPLEMENTED\x20\
+    behavior\x20\xe2\x80\x94\x20a\x20client\n\x20producer\x20MUST\x20follow\
+    \x20them\x20exactly):\n\x20\x20\x20*\x20NO\x20ENTRY\x20for\x20a\x20sourc\
+    e\x20session\x20=\x20\"no\x20preference\":\x20the\x20relay\x20forwards\n\
+    \x20\x20\x20\x20\x20EVERY\x20layer\x20from\x20that\x20source\x20(fail-op\
+    en).\x20This\x20is\x20the\x20only\x20way\x20to\x20say\n\x20\x20\x20\x20\
+    \x20\"send\x20me\x20whatever\".\x20To\x20stop\x20constraining\x20a\x20so\
+    urce,\x20OMIT\x20its\x20entry\x20\xe2\x80\x94\x20do\n\x20\x20\x20\x20\
+    \x20NOT\x20send\x20an\x20entry\x20with\x20desired_layer\x20=\x200.\n\x20\
+    \x20\x20*\x20A\x20recorded\x20Entry\x20with\x20`desired_layer\x20=\x20N`\
+    \x20(N\x20!=\x200)\x20=\x20\"forward\x20ONLY\n\x20\x20\x20\x20\x20layer\
+    \x20N\x20from\x20this\x20source\":\x20the\x20relay\x20drops\x20every\x20\
+    other\x20non-base\x20layer\n\x20\x20\x20\x20\x20from\x20it.\n\x20\x20\
+    \x20*\x20A\x20recorded\x20Entry\x20with\x20`desired_layer\x20=\x200`\x20\
+    is\x20therefore\x20\"BASE\x20LAYER\n\x20\x20\x20\x20\x20ONLY\",\x20NOT\
+    \x20\"no\x20preference\".\x20Layer\x200\x20on\x20a\x20media\x20PacketWra\
+    pper\x20is\x20the\x20base\n\x20\x20\x20\x20\x20/\x20unspecified\x20layer\
+    \x20and\x20is\x20ALWAYS\x20forwarded\x20(see\x20PacketWrapper\x20field\
+    \x205),\n\x20\x20\x20\x20\x20so\x20an\x20entry\x20of\x200\x20keeps\x20ba\
+    se\x20flowing\x20while\x20dropping\x20every\x20upgraded\x20layer\n\x20\
+    \x20\x20\x20\x20from\x20that\x20source.\n\n\x20Security:\x20like\x20View\
+    portPacket\x20this\x20signal\x20is\x20SUBTRACT-ONLY\x20and\x20consumed\n\
+    \x20purely\x20for\x20VIDEO\x20layer-drop\x20decisions.\x20It\x20can\x20o\
+    nly\x20reduce\x20what\x20an\n\x20already-authorized\x20session\x20receiv\
+    es;\x20it\x20never\x20grants\x20access.\x20No\x20recorded\n\x20preferenc\
+    e\x20(or\x20no\x20LAYER_PREFERENCE\x20packet\x20at\x20all)\x20means\x20\
+    \"no\x20layer\x20signal\"\n\x20and\x20the\x20relay\x20forwards\x20every\
+    \x20layer\x20(fail-open\x20to\x20pre-#989\x20behaviour).\x20The\n\x20rel\
+    ay\x20does\x20NOT\x20validate\x20that\x20the\x20requested\x20layer\x20is\
+    \x20actually\x20being\x20produced\n\x20by\x20the\x20source:\x20a\x20clie\
+    nt\x20requesting\x20an\x20absent\x20layer\x20black-tiles\x20ITSELF;\x20t\
+    he\n\x20client-side\x20clamp\x20(only\x20request\x20observed-arriving\
+    \x20layers)\x20is\x20the\x20mitigation\n\x20and\x20is\x20a\x20separate\
+    \x20frontend\x20increment.\x20AUDIO/SCREEN\x20are\x20NEVER\x20filtered\
+    \x20by\n\x20this\x20signal.\x20This\x20packet\x20is\x20consumed\x20by\
+    \x20the\x20relay\x20and\x20never\x20re-broadcast.\n\n\n\n\x03\x04\0\x01\
+    \x12\x03$\x08\x1d\n\xf3\x04\n\x04\x04\0\x04\0\x12\x04/\x024\x03\x1a\xe4\
+    \x04\x20The\x20media\x20kind\x20an\x20Entry\x20applies\x20to\x20(issue\
+    \x20#989,\x20Phase\x203).\x20Mirrors\n\x20`PacketWrapper.MediaKind`\x20s\
+    o\x20camera\x20VIDEO,\x20AUDIO,\x20and\x20SCREEN\x20of\x20the\x20SAME\n\
+    \x20source\x20session\x20can\x20be\x20addressed\x20INDEPENDENTLY:\x20a\
+    \x20receiver\x20can\x20request\x20a\n\x20low\x20SCREEN\x20layer\x20while\
+    \x20keeping\x20full\x20camera\x20VIDEO,\x20etc.\n\n\x20BACK-COMPAT:\x20t\
+    he\x20default\x20(UNSPECIFIED\x20=\x200)\x20MUST\x20be\x20treated\x20by\
+    \x20the\x20relay\x20as\n\x20VIDEO.\x20Pre-Phase-3\x20clients\x20omit\x20\
+    this\x20field\x20(proto3\x20default\x200),\x20and\x20before\n\x20Phase\
+    \x203\x20the\x20relay\x20only\x20ever\x20filtered\x20VIDEO\x20\xe2\x80\
+    \x94\x20so\x20an\x20absent\x20media_kind\x20is\n\x20exactly\x20\"this\
+    \x20entry\x20is\x20about\x20the\x20source's\x20camera\x20video\",\x20pre\
+    serving\x20the\n\x20existing\x20wire\x20contract\x20with\x20no\x20flag-d\
+    ay.\n\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03/\x07\x15\n.\n\x06\x04\0\x04\0\
+    \x02\0\x12\x030\x04%\"\x1f\x20treated\x20as\x20VIDEO\x20by\x20the\x20rel\
+    ay\n\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x030\x04\x20\n\x0e\n\x07\x04\
+    \0\x04\0\x02\0\x02\x12\x030#$\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x031\x04\
+    \x14\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x031\x04\x0f\n\x0e\n\x07\
+    \x04\0\x04\0\x02\x01\x02\x12\x031\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x02\
+    \x12\x032\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x032\x04\x0f\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x032\x12\x13\n\r\n\x06\x04\0\x04\
+    \0\x02\x03\x12\x033\x04\x15\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x033\
+    \x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x033\x13\x14\n\x86\x01\
+    \n\x04\x04\0\x03\0\x12\x048\x02K\x03\x1ax\x20One\x20desired-layer\x20ent\
+    ry:\x20for\x20a\x20given\x20source\x20session\x20AND\x20media\x20kind,\
+    \x20the\n\x20simulcast\x20layer\x20the\x20receiver\x20wants\x20forwarded\
+    .\n\n\x0c\n\x05\x04\0\x03\0\x01\x12\x038\n\x0f\n\xce\x01\n\x06\x04\0\x03\
+    \0\x02\0\x12\x03<\x04\x1a\x1a\xbe\x01\x20The\x20source\x20session_id\x20\
+    (publisher)\x20this\x20preference\x20applies\x20to.\x20This\x20is\n\x20t\
+    he\x20SUBJECT-derived\x20publisher\x20session\x20the\x20relay\x20matches\
+    \x20against\x20on\x20the\n\x20forwarding\x20path,\x20NOT\x20a\x20forgeab\
+    le\x20inner\x20field.\n\n\x0e\n\x07\x04\0\x03\0\x02\0\x05\x12\x03<\x04\n\
+    \n\x0e\n\x07\x04\0\x03\0\x02\0\x01\x12\x03<\x0b\x15\n\x0e\n\x07\x04\0\
+    \x03\0\x02\0\x03\x12\x03<\x18\x19\n\xe9\x02\n\x06\x04\0\x03\0\x02\x01\
+    \x12\x03B\x04\x1d\x1a\xd9\x02\x20The\x20simulcast\x20layer\x20the\x20rec\
+    eiver\x20wants\x20from\x20`session_id`.\x20Matched\n\x20against\x20the\
+    \x20cleartext\x20`PacketWrapper.simulcast_layer_id`\x20(field\x205).\n\
+    \x200\x20=\x20BASE\x20LAYER\x20ONLY\x20(drop\x20upgraded\x20layers\x20fr\
+    om\x20this\x20source),\x20NOT\x20\"no\n\x20preference\"\x20\xe2\x80\x94\
+    \x20to\x20express\x20\"no\x20preference\x20/\x20forward\x20all\",\x20omi\
+    t\x20the\x20entry\n\x20for\x20this\x20source\x20entirely\x20(see\x20the\
+    \x20message-level\x20comment\x20above).\n\n\x0e\n\x07\x04\0\x03\0\x02\
+    \x01\x05\x12\x03B\x04\n\n\x0e\n\x07\x04\0\x03\0\x02\x01\x01\x12\x03B\x0b\
+    \x18\n\x0e\n\x07\x04\0\x03\0\x02\x01\x03\x12\x03B\x1b\x1c\n\x8d\x04\n\
+    \x06\x04\0\x03\0\x02\x02\x12\x03J\x04\"\x1a\xfd\x03\x20Which\x20media\
+    \x20kind\x20of\x20`session_id`\x20this\x20entry\x20constrains\x20(issue\
+    \x20#989,\n\x20Phase\x203).\x20Additive\x20field;\x20default\x200\x20(UN\
+    SPECIFIED)\x20=\x20VIDEO\x20for\x20back-compat\n\x20(see\x20EntryMediaKi\
+    nd).\x20The\x20relay\x20keys\x20its\x20per-receiver\x20preference\x20map\
+    \x20by\n\x20(session_id,\x20media_kind),\x20and\x20matches\x20an\x20entr\
+    y\x20against\x20a\x20forwarded\n\x20packet's\x20cleartext\x20`PacketWrap\
+    per.media_kind`.\x20AUDIO/SCREEN\x20entries\x20are\n\x20ignored\x20by\
+    \x20pre-Phase-3\x20relays\x20(which\x20only\x20filter\x20VIDEO),\x20so\
+    \x20an\x20old\x20relay\n\x20simply\x20forwards\x20those\x20streams\x20un\
+    filtered\x20\xe2\x80\x94\x20fail-open,\x20never\x20a\x20wrong\x20drop.\n\
+    \n\x0e\n\x07\x04\0\x03\0\x02\x02\x06\x12\x03J\x04\x12\n\x0e\n\x07\x04\0\
+    \x03\0\x02\x02\x01\x12\x03J\x13\x1d\n\x0e\n\x07\x04\0\x03\0\x02\x02\x03\
+    \x12\x03J\x20!\nh\n\x04\x04\0\x02\0\x12\x03O\x02\x1d\x1a[\x20Per-(source\
+    ,\x20media-kind)\x20desired-layer\x20entries.\x20Empty\x20=\x20no\x20lay\
+    er\n\x20constraint\x20(fail-open).\n\n\x0c\n\x05\x04\0\x02\0\x04\x12\x03\
+    O\x02\n\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03O\x0b\x10\n\x0c\n\x05\x04\0\
+    \x02\0\x01\x12\x03O\x11\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03O\x1b\x1c\
+    b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -399,7 +549,8 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             let mut messages = ::std::vec::Vec::with_capacity(2);
             messages.push(LayerPreferencePacket::generated_message_descriptor_data());
             messages.push(layer_preference_packet::Entry::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(0);
+            let mut enums = ::std::vec::Vec::with_capacity(1);
+            enums.push(layer_preference_packet::EntryMediaKind::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

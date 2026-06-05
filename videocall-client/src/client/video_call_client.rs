@@ -21,9 +21,11 @@ use super::super::connection::{
     MediaStreamKey,
 };
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -51,6 +53,9 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use videocall_types::protos::layer_preference_packet::{
+    layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
+};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
@@ -363,6 +368,17 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
+    /// Send-side state machine for the simulcast `LAYER_PREFERENCE` control
+    /// packet (issue #989, Phase 2). Holds the last-sent desired-layer map +
+    /// rate-limit clock so a `LAYER_PREFERENCE` packet is emitted only when the
+    /// receiver-driven chooser's per-peer desired layers actually change. See
+    /// [`LayerPreferenceSender`].
+    layer_preference_sender: LayerPreferenceSender,
+    /// User-configured RECEIVE-side simulcast layer bounds per kind (issue #989,
+    /// Phase 4). Default fully-open = pure auto. Applied to every per-(peer,kind)
+    /// chooser's desired layer at the monitor tick, so the requested + decoded
+    /// layer is bounded. Set via [`VideoCallClient::set_receive_layer_bounds`].
+    receive_layer_bounds: ReceiveLayerBounds,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
@@ -523,6 +539,74 @@ fn send_viewport_via(
     }
 }
 
+/// Build a cleartext `LAYER_PREFERENCE` control packet from `(session_id,
+/// desired_layer)` entries and dispatch it on the reliable Control stream
+/// (issue #989, Phase 2).
+///
+/// `entries` is the receiver-driven chooser's per-peer desired-layer map,
+/// already change-detected, rate-limited, capped and canonicalized by
+/// [`LayerPreferenceSender`]. Like `ViewportPacket`, the `LayerPreferencePacket`
+/// is NOT E2EE-sealed — it is pure relay routing metadata the relay consumes and
+/// never forwards to peers. The relay records it keyed by the RECEIVER's own
+/// NATS subject, so it can only subtract what THIS receiver gets; the
+/// `session_id`s here are the real relay session ids of the peers this client is
+/// receiving, never forged. It rides the Control stream so it is never stalled
+/// behind a large video keyframe write.
+fn send_layer_preference_via(
+    connection_controller: &Rc<RefCell<Option<Rc<ConnectionController>>>>,
+    user_id: &str,
+    entries: Vec<(u64, PrefMediaKind, u32)>,
+) {
+    const LAYER_PREF_LOG_SAMPLE: usize = 8;
+    debug!(
+        "Sending LAYER_PREFERENCE packet: first {} of {} entry(ies): {:?}",
+        entries.len().min(LAYER_PREF_LOG_SAMPLE),
+        entries.len(),
+        &entries[..entries.len().min(LAYER_PREF_LOG_SAMPLE)]
+    );
+    let packet = LayerPreferencePacket {
+        entries: entries
+            .into_iter()
+            .map(|(session_id, kind, desired_layer)| LayerPreferenceEntry {
+                session_id,
+                desired_layer,
+                // Map the chooser's PrefMediaKind to the proto EntryMediaKind.
+                // Both share the wire discriminant (VIDEO=1/AUDIO=2/SCREEN=3),
+                // so a from_i32 of `wire_value()` is exact and back-compatible.
+                media_kind: ::protobuf::EnumOrUnknown::from_i32(kind.wire_value()),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let data = match packet.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to serialize LayerPreferencePacket: {e}");
+            return;
+        }
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::LAYER_PREFERENCE.into(),
+        user_id: user_id.as_bytes().to_vec(),
+        data,
+        ..Default::default()
+    };
+    match connection_controller.try_borrow() {
+        Ok(cc) => match cc.as_ref() {
+            Some(controller) => {
+                if let Err(e) = controller.send_packet(wrapper, MediaStreamKey::Control) {
+                    debug!("Failed to send LAYER_PREFERENCE packet: {e}");
+                }
+            }
+            None => {
+                debug!("No connection controller available; dropping LAYER_PREFERENCE packet")
+            }
+        },
+        Err(_) => warn!("connection_controller busy; dropping LAYER_PREFERENCE packet"),
+    }
+}
+
 fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
     if packet.display_name.is_empty() {
         warn!(
@@ -666,6 +750,8 @@ impl VideoCallClient {
                     &options,
                     diagnostics.clone(),
                 ),
+                layer_preference_sender: LayerPreferenceSender::new(),
+                receive_layer_bounds: ReceiveLayerBounds::default(),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
@@ -825,6 +911,23 @@ impl VideoCallClient {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
 
+                            // On (re)connect the relay also allocated a fresh
+                            // empty layer-preference map for the new session_id
+                            // (fail-open → every layer forwarded). Clear the
+                            // sender's last-sent memory so the NEXT peer-monitor
+                            // tick re-sends the current per-peer desired layers
+                            // unconditionally and downlink-aware filtering
+                            // resumes (issue #989, Phase 2). We reset here rather
+                            // than re-send inline because the desired map is
+                            // recomputed from live per-peer health on the tick.
+                            if let Some(inner) = Weak::upgrade(&inner) {
+                                if let Ok(mut inner) = inner.try_borrow_mut() {
+                                    inner.layer_preference_sender.reset_for_reconnect();
+                                } else {
+                                    warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
+                                }
+                            }
+
                             // On (re)connect the session_id changed and the
                             // relay allocated a fresh empty viewport (fail-open
                             // → all streams). Re-send the current viewport so
@@ -895,6 +998,36 @@ impl VideoCallClient {
                                             }
                                         }
                                     }
+                                }
+
+                                // Phase 2 (#989): run the receiver-driven layer
+                                // chooser for every peer (updates each peer's
+                                // decode guard) and, if the desired per-peer
+                                // layer map changed AND the relay's rate-limit
+                                // allows, emit a LAYER_PREFERENCE packet so the
+                                // relay drops the layers this receiver's downlink
+                                // cannot sustain. When every source publishes
+                                // only the base layer (the default until the P1
+                                // send flag is raised), every chosen layer is 0
+                                // and the relay's fail-open already forwards base
+                                // — so this is a no-op on the wire (the empty /
+                                // all-zero map dedups after the first send).
+                                let now_ms = js_sys::Date::now() as u64;
+                                // Phase 4: pass the user's receive-layer bounds so
+                                // the chooser output is clamped per kind. `Copy`,
+                                // so snapshot it to avoid an aliasing borrow with
+                                // `&mut peer_decode_manager`.
+                                let bounds = inner.receive_layer_bounds;
+                                let desired = inner
+                                    .peer_decode_manager
+                                    .tick_layer_choosers(now_ms, &bounds);
+                                if let Some(entries) = inner
+                                    .layer_preference_sender
+                                    .take_if_changed(&desired, now_ms)
+                                {
+                                    let user_id = inner.options.user_id.clone();
+                                    let cc = inner.connection_controller.clone();
+                                    send_layer_preference_via(&cc, &user_id, entries);
                                 }
                             }
                             Err(_) => {
@@ -1317,6 +1450,85 @@ impl VideoCallClient {
             return inner.peer_decode_manager.peer_audio_level(key);
         }
         0.0
+    }
+
+    /// Set (or clear) the user's RECEIVE-side simulcast layer bounds for one
+    /// media kind (issue #989, Phase 4).
+    ///
+    /// `kind` is `PrefMediaKind::{Video, Screen, Audio}`. `min`/`max` are
+    /// inclusive **LAYER indices**, where **0 = base = LOWEST quality** and a
+    /// HIGHER index = HIGHER quality (the OPPOSITE of the 8-tier SEND index
+    /// convention). Ladders: video/screen `0..=2`, audio `0..=1`. `None` =
+    /// "no bound" on that end; `(None, None)` (the default) = full range = pure
+    /// auto-adaptation.
+    ///
+    /// The bound is GLOBAL for the kind — it applies to EVERY incoming peer of
+    /// that kind ("never receive any peer's video below `min` or above `max`").
+    /// It clamps each per-(peer,kind) chooser's desired layer, so the client
+    /// never REQUESTS (and the relay never forwards) an out-of-bounds layer, and
+    /// the local decode selection is bounded to match.
+    ///
+    /// Applies IMMEDIATELY: this re-ticks the choosers and re-sends the
+    /// `LAYER_PREFERENCE` packet, so lowering `max` below the current selection
+    /// steps down at once rather than waiting for the next monitor tick.
+    pub fn set_receive_layer_bounds(
+        &self,
+        kind: PrefMediaKind,
+        min: Option<u32>,
+        max: Option<u32>,
+    ) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.receive_layer_bounds.set_kind(kind, min, max);
+            // Immediate enforcement: re-tick (clamps + updates decode guards) and
+            // re-send the (now-bounded) preference so the relay drops out-of-bounds
+            // layers without waiting ~1 monitor tick.
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            let desired = inner
+                .peer_decode_manager
+                .tick_layer_choosers(now_ms, &bounds);
+            if let Some(entries) = inner
+                .layer_preference_sender
+                .take_if_changed(&desired, now_ms)
+            {
+                let user_id = inner.options.user_id.clone();
+                let cc = inner.connection_controller.clone();
+                send_layer_preference_via(&cc, &user_id, entries);
+            }
+        } else {
+            warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
+        }
+    }
+
+    /// The user's current RECEIVE-side layer bounds (issue #989, Phase 4), for
+    /// the UI to render its current min/max selection. Default fully-open.
+    pub fn receive_layer_bounds(&self) -> ReceiveLayerBounds {
+        self.inner
+            .try_borrow()
+            .map(|inner| inner.receive_layer_bounds)
+            .unwrap_or_default()
+    }
+
+    /// Real-time snapshot of the simulcast layer this client is CURRENTLY
+    /// receiving for `kind`, for the P5 quality needles (issue #989, Phase 4).
+    ///
+    /// Returns `None` when nothing of that kind is being received. The reported
+    /// layer is POST-CLAMP (what is actually decoded), so it never exceeds the
+    /// user's `max` bound. Resolution/bitrate come from the per-kind layer
+    /// ladder. Per-kind aggregation (one needle per kind): active talker for
+    /// audio, active speaker for video, the screen-sharer for screen, each with
+    /// a highest-layer fallback — see
+    /// [`PeerDecodeManager::received_layer_snapshot`]. Panic-safe; cheap to poll
+    /// each render. The UI polls this like the other per-frame accessors.
+    ///
+    /// At the 1-layer default (flag off) this reports layer 0 / base — no error.
+    pub fn received_layer_snapshot(&self, kind: PrefMediaKind) -> Option<ReceivedLayerSnapshot> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner.try_borrow_mut().ok().and_then(|mut inner| {
+            inner
+                .peer_decode_manager
+                .received_layer_snapshot(kind, now_ms)
+        })
     }
 
     /// Returns a shared reference to the camera force-keyframe flag.

@@ -1041,6 +1041,17 @@ impl CameraEncoder {
             // Revisit this cap if the fatal-error classifier is broadened.
             const MAX_RESTARTS: u32 = 5;
 
+            // Last active-layer count we logged a transition for. Declared
+            // OUTSIDE `'restart` so it persists across encoder restart cycles:
+            // seeding it per-restart from `n_layers` would fake a phantom
+            // `n_layers->current` transition on the first frame after any
+            // restart that happens once the controller has already shed layers.
+            // Seeded from the shared atomic's CURRENT value so the first frame
+            // logs only a real change. The encode loop refreshes and compares it
+            // each frame, emitting ONE line only when the count actually changes.
+            let mut prev_active_layers: usize =
+                shared_active_layer_count.load(Ordering::Relaxed) as usize;
+
             'restart: loop {
                 // Backoff + max-restart guard (skip on first iteration).
                 if restart_count > 0 {
@@ -1434,6 +1445,9 @@ impl CameraEncoder {
                         );
                     }
                     // Refresh the active-layer count each frame (simulcast only).
+                    // The event-driven transition log is emitted AFTER the
+                    // per-layer reconfigure pass below, so the reported
+                    // `local_bitrate` reflects the bitrate just applied this tick.
                     local_active_layers =
                         shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
@@ -1601,6 +1615,70 @@ impl CameraEncoder {
                     if fatal_reconfigure {
                         restart_count += 1;
                         break 'encode;
+                    }
+
+                    // Event-driven simulcast layer-transition log (issue #989).
+                    //
+                    // Fires ONCE per change in the active-layer count — a layer
+                    // being shed (count drops) or restored (count rises). NOT a
+                    // periodic heartbeat: layer changes are heavily damped by the
+                    // AQ controller's hysteresis (≈1.5s to shed, ≈5s to restore),
+                    // so a per-tick snapshot would be near-silent noise. We log
+                    // the TRANSITION, not the steady state.
+                    //
+                    // Emitted HERE, after the per-layer reconfigure pass above,
+                    // so each layer's `local_bitrate` already reflects the
+                    // bitrate applied on this same tick — when AQ changes the
+                    // active-layer count and the per-layer bitrate together, the
+                    // log shows the new bitrate, not the previous tick's value.
+                    //
+                    // Gated on `simulcast` (n_layers > 1) so single-stream
+                    // sessions — where this count is pinned at 1 — never emit it.
+                    // `info!` is safe here: this is per-transition, several
+                    // seconds apart at most, never per-frame or per-packet.
+                    if simulcast && local_active_layers != prev_active_layers {
+                        // Directional reason only. The richer cause (server
+                        // CONGESTION vs WS-backpressure force-cut vs gradual /
+                        // floor-saturated degrade vs recovery) lives in the
+                        // `EncoderBitrateController` in the separate diagnostics
+                        // loop and reaches the encode loop solely through the
+                        // `shared_active_layer_count` atomic — no reason flag is
+                        // plumbed across. We avoid adding heavy plumbing just for
+                        // this string.
+                        // TODO(#989): surface the precise shed reason
+                        // (congestion / degrade / recover) from the controller
+                        // via a small shared enum atomic so this can read e.g.
+                        // reason=congestion instead of the directional fallback.
+                        let reason = if local_active_layers < prev_active_layers {
+                            "shed-under-load"
+                        } else {
+                            "restore"
+                        };
+                        let detail = layers
+                            .iter()
+                            .map(|l| {
+                                if (l.layer_id as usize) < local_active_layers {
+                                    format!(
+                                        "[{}] {}x{} ~{}kbps ACTIVE",
+                                        l.layer_id,
+                                        l.current_w,
+                                        l.current_h,
+                                        l.local_bitrate / 1000
+                                    )
+                                } else {
+                                    format!("[{}] {}x{} SHED", l.layer_id, l.current_w, l.current_h)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        log::info!(
+                            "Simulcast layer change: active {}->{} (reason={}) | {}",
+                            prev_active_layers,
+                            local_active_layers,
+                            reason,
+                            detail
+                        );
+                        prev_active_layers = local_active_layers;
                     }
 
                     match JsFuture::from(video_reader.read()).await {

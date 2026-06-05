@@ -198,10 +198,11 @@ pub fn format_send_layer(layer_id: u32, width: u32, height: u32, bitrate_kbps: u
 
 /// Format the SEND simulcast header for a kind, e.g.
 /// `"3 of 3 layers active"` (active vs effective). For single-stream it reads
-/// `"single layer"`. Pure / host-tested.
+/// `"Single layer"` (capitalized to match the footer's display copy). Pure /
+/// host-tested.
 pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
     if !snap.simulcast_active {
-        "single layer".to_string()
+        "Single layer".to_string()
     } else {
         format!(
             "{} of {} layers active",
@@ -241,8 +242,11 @@ pub fn format_peer_kind_line(
 pub struct DiagnosticsReader {
     /// The effective simulcast setting (flag × capability), captured at mount.
     pub summary: SimulcastSummary,
-    /// Reads the camera's live SEND simulcast snapshot.
-    pub send_video: Rc<dyn Fn() -> SimulcastSendSnapshot>,
+    /// Reads the camera's live SEND simulcast snapshot (`None` while the camera
+    /// is off — gated on `prev_video_enabled`, mirroring the quality needle and
+    /// the screen path; otherwise stale "N of M layers active" would render with
+    /// the camera disabled, since the encoder atomics aren't reset on stop).
+    pub send_video: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
     /// Reads the screen's live SEND simulcast snapshot (`None` while not sharing).
     pub send_screen: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
     /// Reads the per-peer RECEIVE diagnostics.
@@ -255,12 +259,7 @@ impl DiagnosticsReader {
     pub fn none() -> Self {
         DiagnosticsReader {
             summary: SimulcastSummary::default(),
-            send_video: Rc::new(|| SimulcastSendSnapshot {
-                simulcast_active: false,
-                effective_layers: 1,
-                active_layers: 1,
-                layers: Vec::new(),
-            }),
+            send_video: Rc::new(|| None),
             send_screen: Rc::new(|| None),
             per_peer_receive: Rc::new(Vec::new),
         }
@@ -1569,14 +1568,21 @@ fn SendDiagFooter(
     let detail_id = format!("{id_prefix}-diag-detail");
     let is_open = open_diag() == Some(id_prefix);
 
-    // Screen not sharing → static line, no disclosure.
+    // Source off → static line, no disclosure. The video row reads "Camera —
+    // off" (camera disabled) and the screen row "Screen — not sharing"; both
+    // gate on their reader returning `None` so no stale layer counts render.
     if not_sharing {
+        let off_text = if id_prefix == "perf-video" {
+            "Camera — off"
+        } else {
+            "Screen — not sharing"
+        };
         return rsx! {
             div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
                 span {
                     class: "perf-diag-summary perf-diag-static",
                     "data-testid": "{id_prefix}-diag-summary",
-                    "Screen — not sharing"
+                    "{off_text}"
                 }
             }
         };
@@ -1635,13 +1641,28 @@ fn SendDiagFooter(
     // Simulcast active → disclosure button summary + expandable ladder.
     let header = format_send_header(&snap);
     let total = format_send_total_kbps(&snap);
-    let summary_text = format!("{header} · {} total", format_mbps(total));
-    let aria = format!(
-        "Sending layers: {} of {} active, {} total. Expand for per-layer detail.",
-        snap.active_layers,
-        snap.effective_layers,
-        format_mbps(total)
-    );
+    // Suppress the "· N Mbps total" suffix until real bitrates arrive: before the
+    // encoder-control loop first ticks, the per-layer bitrate atomics are empty so
+    // `total == 0`, which would otherwise read as a misleading "· 0 Mbps total".
+    let (summary_text, aria) = if total == 0 {
+        (
+            header.clone(),
+            format!(
+                "Sending layers: {} of {} active. Expand for per-layer detail.",
+                snap.active_layers, snap.effective_layers
+            ),
+        )
+    } else {
+        (
+            format!("{header} · {} total", format_mbps(total)),
+            format!(
+                "Sending layers: {} of {} active, {} total. Expand for per-layer detail.",
+                snap.active_layers,
+                snap.effective_layers,
+                format_mbps(total)
+            ),
+        )
+    };
     // Weight each chip's flex-grow by its bitrate so wider = more bitrate.
     let max_kbps = snap
         .layers
@@ -1913,45 +1934,33 @@ pub fn PerformanceSettingsPanel(
     // open at a time so the no-scroll budget can never be blown (#1095 redesign).
     let open_diag: Signal<Option<&'static str>> = use_signal(|| None);
 
-    // Panel-level ~4 Hz refresh tick. The per-row diagnostics SUMMARIES are now
+    // Panel-level 4 Hz refresh tick. The per-row diagnostics SUMMARIES are now
     // always visible AND live (layer count / total uplink / peer spread change at
     // runtime), so the whole panel subtree must re-render periodically. This loop
     // is gated to the panel mount (the panel only mounts on the open Performance
     // tab), and the summaries are cheap (count / min-max); the expensive ladder /
     // peer-list only renders when a row's detail is open.
+    //
+    // Driven by a 250 ms `setInterval` (gloo `Interval`) rather than a 60 Hz rAF
+    // gated to a 250 ms time-check (jay-boyd #1101 review): the panel only needs a
+    // ~4 Hz re-render, so the timer wakes 4×/s instead of 60×/s — a battery/CPU
+    // win on low-core machines. The needle drivers stay on rAF (they animate a
+    // CSS transform that wants frame-aligned updates); only this discrete
+    // re-render tick moves to the timer. Cleanup: the `Interval` handle lives in a
+    // `use_hook` cell and `use_drop` drops it on unmount, which cancels the timer.
     let mut diag_tick = use_signal(|| 0u64);
     {
-        type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
-        let cb: RafCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
-        {
-            let cb = cb.clone();
-            use_hook(move || {
-                let cb_inner = cb.clone();
-                let last_ms = Rc::new(std::cell::Cell::new(0.0_f64));
-                let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-                    let now = web_sys::window()
-                        .and_then(|w| w.performance())
-                        .map(|p| p.now())
-                        .unwrap_or(0.0);
-                    if now - last_ms.get() >= 250.0 {
-                        last_ms.set(now);
-                        let next = diag_tick.peek().wrapping_add(1);
-                        diag_tick.set(next);
-                    }
-                    if let (Some(win), Some(c)) = (web_sys::window(), cb_inner.borrow().as_ref()) {
-                        let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-                    }
-                })
-                    as Box<dyn FnMut()>);
-                *cb.borrow_mut() = Some(closure);
-                if let (Some(win), Some(c)) = (web_sys::window(), cb.borrow().as_ref()) {
-                    let _ = win.request_animation_frame(c.as_ref().unchecked_ref());
-                }
+        type IntervalCell = Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>>;
+        let cell: IntervalCell = use_hook(|| {
+            let interval = gloo_timers::callback::Interval::new(250, move || {
+                let next = diag_tick.peek().wrapping_add(1);
+                diag_tick.set(next);
             });
-        }
-        let cb = cb.clone();
+            Rc::new(std::cell::RefCell::new(Some(interval)))
+        });
         use_drop(move || {
-            *cb.borrow_mut() = None;
+            // Dropping the `Interval` cancels the underlying `setInterval`.
+            *cell.borrow_mut() = None;
         });
     }
     // Subscribe this subtree to the throttled refresh.
@@ -2080,8 +2089,12 @@ pub fn PerformanceSettingsPanel(
                 is_auto: pref.video_auto,
                 open_help,
                 open_diag,
-                diag_snap: Some(send_video_snap.clone()),
-                diag_not_sharing: false,
+                // Video: `Some` while the camera is on (real per-layer data),
+                // `None` = camera off → static "Camera — off" (mirrors the
+                // screen "not sharing" path; gated on `prev_video_enabled` in
+                // the reader so stale layer counts never show with the camera off).
+                diag_snap: send_video_snap.clone(),
+                diag_not_sharing: send_video_snap.is_none(),
                 diag_effective_audio: diag_summary.effective_audio,
                 diag_is_audio: false,
                 on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
@@ -3236,7 +3249,7 @@ mod tests {
             active_layers: 1,
             layers: Vec::new(),
         };
-        assert_eq!(format_send_header(&single), "single layer");
+        assert_eq!(format_send_header(&single), "Single layer");
     }
 
     #[test]
@@ -3273,13 +3286,11 @@ mod tests {
 
     #[test]
     fn diagnostics_reader_none_is_inert() {
-        // The default reader yields a single-layer send snapshot, no screen, and
-        // no peers — so a panel without diagnostics wired renders an empty,
-        // harmless disclosure body.
+        // The default reader yields no video snapshot (camera-off / unwired), no
+        // screen, and no peers — so a panel without diagnostics wired renders the
+        // static "off" lines, not a stale disclosure body.
         let r = DiagnosticsReader::none();
-        let v = (r.send_video)();
-        assert!(!v.simulcast_active);
-        assert!(v.layers.is_empty());
+        assert!((r.send_video)().is_none());
         assert!((r.send_screen)().is_none());
         assert!((r.per_peer_receive)().is_empty());
         assert_eq!(r.summary, SimulcastSummary::default());

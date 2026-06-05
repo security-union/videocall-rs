@@ -829,7 +829,20 @@ pub fn Host(
             let state_s = state.clone();
             DiagnosticsReader {
                 summary,
-                send_video: Rc::new(move || state_v.borrow().camera.live_simulcast_snapshot()),
+                // Gate the camera snapshot on the camera being enabled, mirroring
+                // the quality needle (and the screen path below). The encoder's
+                // `live_simulcast_snapshot()` keys off the STATIC effective layer
+                // count and its active-layer/bitrate atomics are not reset on
+                // `set_enabled(false)`/`stop`, so without this gate the footer
+                // would render stale "N of M layers active" with the camera off.
+                send_video: Rc::new(move || {
+                    let s = state_v.borrow();
+                    if s.prev_video_enabled {
+                        Some(s.camera.live_simulcast_snapshot())
+                    } else {
+                        None
+                    }
+                }),
                 send_screen: Rc::new(move || state_s.borrow().screen.live_simulcast_snapshot()),
                 per_peer_receive: Rc::new(move || client.per_peer_received_snapshots()),
             }

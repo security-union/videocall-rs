@@ -2060,6 +2060,12 @@ impl PeerDecodeManager {
     /// Used by the panel's "Live diagnostics" disclosure to show what this
     /// receiver is pulling from each peer. Panic-safe; iterates peers in their
     /// stable ordered-key order.
+    ///
+    /// NOT a pure getter despite its name: it calls
+    /// [`LayerAvailability::highest_available`], which takes `&mut self` and runs
+    /// `.retain()` to evict stale per-layer observations. The eviction is benign
+    /// here (≤3 entries, and the decode path evicts on its own cadence anyway),
+    /// but callers must hold `&mut self`.
     pub fn per_peer_received_snapshots(&mut self, now_ms: u64) -> Vec<PeerReceiveDiag> {
         use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
         let keys = self.connected_peers.ordered_keys().clone();

@@ -1537,6 +1537,11 @@ impl VideoCallClient {
     /// "Live diagnostics" disclosure polls this to show what this client is
     /// pulling from every peer. Returns an empty Vec when nothing is being
     /// received or the inner is transiently borrowed.
+    ///
+    /// Takes `&self` but borrows the inner mutably: the underlying
+    /// `PeerDecodeManager::per_peer_received_snapshots` evicts stale per-layer
+    /// observations (`LayerAvailability::highest_available` runs `.retain()`), so
+    /// this is not a pure read despite the `&self` signature.
     pub fn per_peer_received_snapshots(&self) -> Vec<PeerReceiveDiag> {
         let now_ms = js_sys::Date::now() as u64;
         self.inner

@@ -86,6 +86,12 @@ pub fn is_older_intel_mac(platform: &str, cores: u32) -> bool {
 /// * `"Windows 10"` / `"Windows 11"` for `Windows NT 10.0`+ hosts.
 /// * `"Linux"` for any X11/Linux UA.
 /// * `""` if nothing matched (unknown).
+///
+/// Like [`max_simulcast_layers`], the only non-test caller is the wasm32-gated
+/// [`capability_max_simulcast_layers`], so a native non-test build (e.g.
+/// `cargo clippy --all`) sees this as dead code; the `allow` keeps that build
+/// warning-free without hiding genuine dead code on wasm or in the host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn parse_platform_from_ua(user_agent: &str) -> String {
     // Mac UA tokens look like: "(Macintosh; Intel Mac OS X 10_15_7)".
     if let Some(rest) = user_agent.split("Mac OS X ").nth(1) {

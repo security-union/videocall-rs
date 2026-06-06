@@ -7322,6 +7322,204 @@ html[data-theme="light"] .settings-divider {
   color: var(--success);
 }
 
+/* ── Live simulcast diagnostics (issue #1095 redesign) — embedded per row +
+   one global strip. No new tokens; accents via descendant selectors. ── */
+
+/* Global effective-setting strip: one slim line directly under the toggle. */
+.perf-simulcast-strip {
+  padding: 6px 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Per-row diagnostics footer — last child of .perf-stream-controls, so it
+   left-aligns with the slider (not the gauge). */
+.perf-diag {
+  margin-top: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* (1) Always-visible summary. As a button it is the disclosure trigger; the
+   static variants (single-layer / 1-peer / empty) reuse the same line metrics. */
+.perf-diag-summary {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.perf-diag-trigger {
+  padding: 2px 2px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.perf-diag-trigger:hover {
+  color: var(--text-primary);
+}
+
+.perf-diag-trigger:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.perf-diag-static {
+  padding: 2px 2px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.perf-diag-summary-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.perf-diag-chevron {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+/* (2) Expandable detail region. */
+.perf-diag-detail {
+  margin-top: 6px;
+}
+
+/* SEND ladder: flex row of per-layer chips, lowest layer left. */
+.perf-diag-ladder {
+  display: flex;
+  gap: 4px;
+  align-items: stretch;
+}
+
+.perf-diag-rung {
+  flex: 1 1 auto;
+  min-width: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  /* Horizontal 4px (was 2px) so a 4-char res like "1080p" doesn't kiss the chip
+     edge at the 540px breakpoint with 3 chips at the 44px min-width (#1095). */
+  padding: 4px 4px 6px;
+  position: relative;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* Active layer: solid accent border + a 2px bottom strip. */
+.perf-diag-rung.is-active {
+  background: var(--field-bg);
+  border: 1px solid var(--success-border-vivid);
+}
+
+.perf-diag-rung.is-active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--success);
+  border-bottom-left-radius: var(--radius-sm);
+  border-bottom-right-radius: var(--radius-sm);
+}
+
+/* Shed (inactive) layer: dimmed + dashed, no strip. */
+.perf-diag-rung.is-shed {
+  opacity: 0.4;
+  border-style: dashed;
+}
+
+.perf-diag-rung-id {
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.perf-diag-rung-res {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.perf-diag-rung-kbps {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* RECEIVE per-peer detail rows. */
+.perf-diag-peers {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.perf-diag-peer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.perf-diag-pip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 2px;
+}
+
+.perf-diag-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--border);
+}
+
+.perf-diag-dot.is-on {
+  background: var(--text-secondary);
+}
+
+.perf-diag-peer-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.perf-diag-peer-meta {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+.perf-diag-more {
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+/* ── Direction accenting via descendant selectors ONLY (text stays neutral). ── */
+.perf-recv-row .perf-diag-chevron {
+  color: var(--accent);
+}
+
+.perf-recv-row .perf-diag-dot.is-on {
+  background: var(--accent);
+}
+
+.perf-send-row .perf-diag-chevron {
+  color: var(--success);
+}
+
 .perf-stream-group {
   margin: 18px 0;
   padding: 14px 16px;

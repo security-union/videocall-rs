@@ -3,8 +3,8 @@
  * Licensed under MIT OR Apache-2.0
  */
 use crate::components::performance_settings::{
-    KindReceivePref, PerformancePreference, PerformanceSettingsPanel, ReceivePreference,
-    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+    DiagnosticsReader, KindReceivePref, PerformancePreference, PerformanceSettingsPanel,
+    ReceivePreference, ReceivedReader, ScreenSnapshotReader, SnapshotReader,
 };
 use crate::context::{
     clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
@@ -346,6 +346,10 @@ pub fn DeviceSettingsModal(
     /// needles. Defaults to `None` (nothing received). (#989)
     #[props(default = ReceivedReader::none())]
     received_reader: ReceivedReader,
+    /// Live simulcast/AQ diagnostics for the Performance panel's collapsible
+    /// "Live diagnostics" disclosure. Defaults to an inert reader. (#1095)
+    #[props(default = DiagnosticsReader::none())]
+    diagnostics_reader: DiagnosticsReader,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -420,16 +424,13 @@ pub fn DeviceSettingsModal(
                     "aria-label": "Close settings",
                     onclick: move |_| on_close.call(()),
 
-                    svg {
-                        view_box: "0 0 24 24",
-                        width: "16",
-                        height: "16",
+                    svg { view_box: "0 0 24 24", width: "16", height: "16",
 
                         path {
                             d: "M6 6L18 18M18 6L6 18",
                             stroke: "currentColor",
                             stroke_width: "2",
-                            stroke_linecap: "round"
+                            stroke_linecap: "round",
                         }
                     }
                 }
@@ -443,7 +444,25 @@ pub fn DeviceSettingsModal(
                         h2 {
                             id: "device-settings-title",
                             class: "settings-sidebar-title",
-                            "Settings"
+
+                            svg {
+                                class: "settings-sidebar-title-icon",
+                                xmlns: "http://www.w3.org/2000/svg",
+                                width: "20",
+                                height: "20",
+                                view_box: "0 0 24 24",
+                                fill: "none",
+                                stroke: "currentColor",
+                                stroke_width: "2",
+                                stroke_linecap: "round",
+                                stroke_linejoin: "round",
+
+                                path { d: "M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" }
+
+                                circle { cx: "12", cy: "12", r: "3" }
+                            }
+
+                            span { "Settings" }
                         }
 
                         for section in SettingsSection::all() {
@@ -476,10 +495,13 @@ pub fn DeviceSettingsModal(
                                         label { r#for: "modal-audio-select", "Microphone" }
                                         SettingsGlassSelect {
                                             id: "modal-audio-select",
-                                            options: microphones.iter().map(|d| GlassSelectOption {
-                                                value: d.device_id(),
-                                                label: d.label(),
-                                            }).collect::<Vec<_>>(),
+                                            options: microphones
+                                                .iter()
+                                                .map(|d| GlassSelectOption {
+                                                    value: d.device_id(),
+                                                    label: d.label(),
+                                                })
+                                                .collect::<Vec<_>>(),
                                             selected_value: selected_microphone_id.clone().unwrap_or_default(),
                                             on_change: {
                                                 let microphones = microphones.clone();
@@ -498,10 +520,13 @@ pub fn DeviceSettingsModal(
                                             label { r#for: "modal-speaker-select", "Speaker" }
                                             SettingsGlassSelect {
                                                 id: "modal-speaker-select",
-                                                options: speakers.iter().map(|d| GlassSelectOption {
-                                                    value: d.device_id(),
-                                                    label: d.label(),
-                                                }).collect::<Vec<_>>(),
+                                                options: speakers
+                                                    .iter()
+                                                    .map(|d| GlassSelectOption {
+                                                        value: d.device_id(),
+                                                        label: d.label(),
+                                                    })
+                                                    .collect::<Vec<_>>(),
                                                 selected_value: selected_speaker_id.clone().unwrap_or_default(),
                                                 on_change: {
                                                     let speakers = speakers.clone();
@@ -515,9 +540,9 @@ pub fn DeviceSettingsModal(
                                             }
                                         }
                                     } else {
-                                        div { class: "device-setting-group",
-                                            p {
-                                                class: "ios-speaker-note",
+                                        div {
+                                        id: SettingsSection::Network.panel_id(),
+                                            p { class: "ios-speaker-note",
                                                 "Speaker selection is handled by your device settings on iOS/Safari."
                                             }
                                         }
@@ -532,18 +557,19 @@ pub fn DeviceSettingsModal(
                                     "aria-labelledby": SettingsSection::Video.tab_id(),
 
                                     h3 { class: "settings-section-title", "Video" }
-                                    p { class: "settings-section-description",
-                                        "Choose the camera used during the call."
-                                    }
+                                    p { class: "settings-section-description", "Choose the camera used during the call." }
 
                                     div { class: "device-setting-group",
                                         label { r#for: "modal-video-select", "Camera" }
                                         SettingsGlassSelect {
                                             id: "modal-video-select",
-                                            options: cameras.iter().map(|d| GlassSelectOption {
-                                                value: d.device_id(),
-                                                label: d.label(),
-                                            }).collect::<Vec<_>>(),
+                                            options: cameras
+                                                .iter()
+                                                .map(|d| GlassSelectOption {
+                                                    value: d.device_id(),
+                                                    label: d.label(),
+                                                })
+                                                .collect::<Vec<_>>(),
                                             selected_value: selected_camera_id.clone().unwrap_or_default(),
                                             open_dropdown,
                                             on_change: {
@@ -554,7 +580,7 @@ pub fn DeviceSettingsModal(
                                                     }
                                                 }
                                             },
-                                        }
+                                        } // Persist immediately so the choice survives an unexpected tab close.
                                     }
                                 }
                             },
@@ -579,6 +605,8 @@ pub fn DeviceSettingsModal(
                                             on_receive_change.call((kind, sub));
                                         },
                                         received_reader: received_reader.clone(),
+                                        // Live diagnostics (#1095).
+                                        diagnostics_reader: diagnostics_reader.clone(),
                                     }
                                 }
                             },
@@ -589,10 +617,12 @@ pub fn DeviceSettingsModal(
                                     role: "tabpanel",
                                     "aria-labelledby": SettingsSection::Network.tab_id(),
 
-                                    h3 { class: "settings-section-title", "Network" }
-                                    p { class: "settings-section-description",
-                                        "Choose the transport protocol for media connections."
+                                    h3 { class: "settings-section-title settings-section-title-with-icon",
+                                        {render_nav_icon(SettingsSection::Network)}
+                                        span { "Network" }
                                     }
+
+                                    p { class: "settings-section-description", "Choose the transport protocol for media connections." }
 
                                     // Selection is staged in `pending_protocol`; "Apply" commits and reloads.
                                     div { class: "device-setting-group",
@@ -642,9 +672,7 @@ pub fn DeviceSettingsModal(
                                                         class: "sticky-protocol-label",
                                                         "Remember protocol choice"
                                                     }
-                                                    p { class: "sticky-protocol-hint",
-                                                        "Pin this protocol across browser sessions."
-                                                    }
+                                                    p { class: "sticky-protocol-hint", "Pin this protocol across browser sessions." }
                                                 }
                                                 label {
                                                     class: "glow-switch",
@@ -705,9 +733,7 @@ pub fn DeviceSettingsModal(
                                                 }
                                             }
                                             div { class: "settings-info-panel-body",
-                                                p { class: "settings-info-panel-title",
-                                                    "Protocol pinned"
-                                                }
+                                                p { class: "settings-info-panel-title", "Protocol pinned" }
                                                 p { class: "settings-info-panel-text",
                                                     "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
                                                 }
@@ -718,9 +744,7 @@ pub fn DeviceSettingsModal(
                                     // Only shown when the pending selection diverges from the active one.
                                     if pending_protocol() != transport_preference {
                                         div { class: "transport-apply-row",
-                                            p { class: "transport-preference-note",
-                                                "Changing protocol will reload the page."
-                                            }
+                                            p { class: "transport-preference-note", "Changing protocol will reload the page." }
                                             button {
                                                 r#type: "button",
                                                 class: "transport-apply-button",
@@ -834,7 +858,13 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                 stroke_width: "1.6",
                 stroke_linecap: "round",
                 stroke_linejoin: "round",
-                rect { x: "3", y: "6", width: "13", height: "12", rx: "2" }
+                rect {
+                    x: "3",
+                    y: "6",
+                    width: "13",
+                    height: "12",
+                    rx: "2",
+                }
                 path { d: "M16 10l5-3v10l-5-3z" }
             }
         },

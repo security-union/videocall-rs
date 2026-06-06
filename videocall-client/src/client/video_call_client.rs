@@ -26,7 +26,7 @@ use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
-use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::decode::peer_decode_manager::{PeerDecodeError, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
@@ -35,7 +35,7 @@ use futures::future::LocalBoxFuture;
 use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -1568,6 +1568,30 @@ impl VideoCallClient {
         })
     }
 
+    /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability): one
+    /// [`PeerReceiveDiag`] per connected peer that is receiving at least one
+    /// media kind, each carrying the per-kind decoded-layer snapshot. The panel's
+    /// "Live diagnostics" disclosure polls this to show what this client is
+    /// pulling from every peer. Returns an empty Vec when nothing is being
+    /// received or the inner is transiently borrowed.
+    ///
+    /// Takes `&self` but borrows the inner mutably: the underlying
+    /// `PeerDecodeManager::per_peer_received_snapshots` evicts stale per-layer
+    /// observations (`LayerAvailability::highest_available` runs `.retain()`), so
+    /// this is not a pure read despite the `&self` signature.
+    pub fn per_peer_received_snapshots(&self) -> Vec<PeerReceiveDiag> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner
+            .try_borrow_mut()
+            .ok()
+            .map(|mut inner| {
+                inner
+                    .peer_decode_manager
+                    .per_peer_received_snapshots(now_ms)
+            })
+            .unwrap_or_default()
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -2209,7 +2233,11 @@ impl Inner {
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
-        debug!(
+        // PER-PACKET hot path (#1 console-log offender, ~106 lines/sec; also a
+        // `String::from_utf8_lossy` alloc on every packet). Demoted debug!->trace!
+        // so it stays off even when console-log collection bumps to Debug. Not
+        // used by the meeting analyzer.
+        trace!(
             "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
             String::from_utf8_lossy(&response.user_id),
@@ -2350,7 +2378,10 @@ impl Inner {
             Ok(PacketType::DIAGNOSTICS) => {
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
-                    debug!("Received diagnostics packet: {diagnostics_packet:?}");
+                    // PER-DIAGNOSTICS-PACKET `{:?}` struct dump (~23K lines/session,
+                    // #2 console-log offender). Demoted debug!->trace! — stays off at
+                    // collection's Debug ceiling. Not used by the meeting analyzer.
+                    trace!("Received diagnostics packet: {diagnostics_packet:?}");
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
                     }

@@ -2,4 +2,3 @@
 
 //! Shared, framework-agnostic helpers used across dioxus-ui.
 
-pub mod color_math;

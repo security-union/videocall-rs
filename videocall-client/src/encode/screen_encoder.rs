@@ -61,8 +61,11 @@ use crate::adaptive_quality_constants::{
     ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
+// Reuse the SEND-side simulcast diagnostics types defined alongside the camera
+// encoder (issue #1095 observability) so screen + camera share one shape.
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
+use crate::encode::camera_encoder::{build_simulcast_layers, SimulcastSendSnapshot};
 use videocall_aq::fit_within_preserving_aspect;
 
 /// Upper bound on SCREEN simulcast layers regardless of what the caller
@@ -547,6 +550,60 @@ impl ScreenEncoder {
             fps: tier.target_fps,
             ideal_kbps: tier.ideal_bitrate_kbps,
             target_bitrate_kbps,
+        })
+    }
+
+    /// Live SEND-side simulcast diagnostics for the screen share (issue #1095
+    /// observability). `None` while not sharing (mirrors
+    /// [`Self::live_screen_snapshot`]). Reads the active-layer count + per-layer
+    /// target-bitrate atomics and resolves EVERY effective layer's fixed
+    /// resolution from the SCREEN simulcast ladder. Panic-safe; cheap to poll.
+    ///
+    /// Emits one rung per EFFECTIVE layer (not just active), so a SHED layer
+    /// (`bitrate_kbps == 0`) stays visible instead of the ladder shrinking —
+    /// same shed-aware logic as the camera (issue #1095), via the shared
+    /// [`build_simulcast_layers`] helper.
+    ///
+    /// In single-stream mode (effective layers == 1) the returned snapshot has
+    /// `simulcast_active = false` and an empty `layers` Vec.
+    pub fn live_simulcast_snapshot(&self) -> Option<SimulcastSendSnapshot> {
+        if !self.screen_sharing_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let effective = self.effective_layer_count();
+        if effective <= 1 {
+            return Some(SimulcastSendSnapshot {
+                simulcast_active: false,
+                effective_layers: effective,
+                active_layers: 1,
+                layers: Vec::new(),
+            });
+        }
+        // Full SCREEN ladder resolutions (every effective layer, shed included).
+        let resolutions: Vec<(u32, u32)> = simulcast_screen_layers(effective as usize)
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
+        let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
+            .min(effective)
+            .max(1);
+        let active_bitrates_kbps: Vec<u32> = {
+            let bitrate_atomics = self.shared_layer_bitrates_bps.borrow();
+            (0..active)
+                .map(|layer_id| {
+                    bitrate_atomics
+                        .get(layer_id as usize)
+                        .map(|a| a.load(Ordering::Relaxed) / 1000)
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let layers = build_simulcast_layers(effective, active, &resolutions, &active_bitrates_kbps);
+        Some(SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: effective,
+            active_layers: active,
+            layers,
         })
     }
 

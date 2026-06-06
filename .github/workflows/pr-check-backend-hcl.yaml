@@ -74,6 +74,44 @@ jobs:
         working-directory: backend-repo
         run: sudo docker volume prune -f || true
 
+      - name: Free disk space before heavy build
+        # The `cargo tests` job was running the host out of disk ("No space
+        # left on device") while building the actix-api test image and
+        # spinning up the integration stack. The biggest accumulation is from
+        # rebuilding docker/Dockerfile.actix.dev (FROM nixos/nix, multi-GB Nix
+        # toolchain layers): every flake.nix/flake.lock/Dockerfile change leaves
+        # the previous image dangling, and the BuildKit cache grows unbounded.
+        #
+        # SHARED, SELF-HOSTED RUNNER SAFETY:
+        # This host runs 4 hcl-ci runners against ONE docker daemon. We must
+        # NOT use `docker system prune -a --volumes` — that would delete
+        # tagged base images (postgres:12, nats:2.10-alpine, the actix dev
+        # image) and named volumes that *other concurrent jobs* depend on.
+        # We only reclaim space that is provably unused by ANY job:
+        #   * `docker image prune -f`   -> dangling (untagged) images only.
+        #     Images referenced by a tag or by any running/stopped container
+        #     are kept, so concurrent jobs' images are untouched.
+        #   * `docker builder prune -f` -> unused build cache only. BuildKit
+        #     never evicts cache that an in-flight build is still using.
+        # The deliberate absence of `-a`/`--all` on both is what keeps this
+        # safe for parallel jobs. The `df -h` / `docker system df` brackets
+        # give visibility into how much was reclaimed; `|| true` ensures a
+        # cleanup hiccup never fails the test job.
+        working-directory: backend-repo
+        run: |
+          echo "=== Disk usage BEFORE cleanup ==="
+          df -h || true
+          echo "=== Docker disk usage BEFORE cleanup ==="
+          sudo docker system df || true
+          echo "=== Pruning dangling images (untagged, unreferenced) ==="
+          sudo docker image prune -f || true
+          echo "=== Pruning unused build cache ==="
+          sudo docker builder prune -f || true
+          echo "=== Disk usage AFTER cleanup ==="
+          df -h || true
+          echo "=== Docker disk usage AFTER cleanup ==="
+          sudo docker system df || true
+
       - name: Pre-create target dirs to prevent Docker from initializing them as root
         working-directory: backend-repo
         run: mkdir -p actix-api/target

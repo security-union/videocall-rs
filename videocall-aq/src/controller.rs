@@ -143,6 +143,28 @@ pub struct EncoderBitrateController {
     /// [`STEP_UP_STABILIZATION_WINDOW_MS`]. Reset to `None` whenever the depth
     /// rises above CLEAR. Maintained by [`tick`](Self::tick).
     backpressure_clear_since_ms: Option<f64>,
+
+    // --- Relay layer-union suppression cap (issue #1108, Stage 3) ---
+    /// Active-layer COUNT cap derived from the relay's per-source layer-union
+    /// hint (the `LAYER_HINT` packet). The relay tracks the MAX simulcast layer
+    /// any receiver currently wants for this (publisher, media-kind) and feeds it
+    /// in via [`observe_union_requested_layer`](Self::observe_union_requested_layer),
+    /// which converts the max-layer-id to a count (`max_layer + 1`). The
+    /// controller then caps the published ladder to this count so it stops
+    /// encoding a top layer NO receiver wants — saving sender CPU + uplink.
+    ///
+    /// **Fail-open:** [`usize::MAX`] means "no cap" (the publisher keeps its full
+    /// backpressure-governed ladder). This is the default and the value the
+    /// `u32::MAX` wire sentinel maps to, so a missing/absent hint suppresses
+    /// nothing.
+    ///
+    /// **Composite, never overriding backpressure:** in [`tick`](Self::tick) this
+    /// is a FURTHER `min` restriction applied AFTER the backpressure decision —
+    /// it can only LOWER active toward the base or RAISE it back toward the
+    /// backpressure ceiling as the union grows; it can never raise active ABOVE
+    /// what backpressure/budget allows, and never below 1 (the base layer is
+    /// always published). No-op in single-stream mode (floored at 1).
+    union_requested_layer_cap: usize,
 }
 
 impl EncoderBitrateController {
@@ -234,6 +256,10 @@ impl EncoderBitrateController {
             last_encoder_queue_depth: 0,
             backpressure_high_since_ms: None,
             backpressure_clear_since_ms: None,
+            // Relay layer-union cap (issue #1108, Stage 3). Fail-open: no cap
+            // until a LAYER_HINT arrives and observe_union_requested_layer() is
+            // called. usize::MAX => inert (full ladder).
+            union_requested_layer_cap: usize::MAX,
         }
     }
 
@@ -388,6 +414,83 @@ impl EncoderBitrateController {
             );
         }
 
+        // --- Relay layer-union suppression cap (issue #1108, Stage 3) ---
+        //
+        // The backpressure block above has just settled `active_layer_count()` to
+        // the backpressure axis's decision for THIS tick. The union cap is a
+        // FURTHER `min` restriction layered on top of that: the relay tells each
+        // publisher the MAX layer ANY receiver currently wants (the union), and we
+        // stop encoding layers above it so no CPU/uplink is spent on a top layer
+        // nobody will decode.
+        //
+        // INVARIANTS (see the field doc): the cap may only LOWER active below the
+        // backpressure ceiling (suppress) or RAISE it back toward that ceiling
+        // when the union grows (restore). It must NEVER raise active above what
+        // backpressure/budget allows (backpressure wins on the down side), and
+        // NEVER below 1 (the base layer is always published). The `usize::MAX`
+        // fail-open sentinel makes the whole block inert (no hint → full ladder,
+        // byte-identical to Stage 2).
+        //
+        // No second publisher-side debounce: the RELAY debounces the down
+        // direction, so we apply the union cap eagerly each tick (suppress-lazy /
+        // restore-eager). The restore reuses the SAME min-interval gate the
+        // explicit force_* layer-shed paths use (`forced_transition_guards_clear`).
+        // Because `add_top_layer` does not arm `last_transition_time_ms`, a pure
+        // union restore (no tier movement) keeps that gate clear, so it climbs one
+        // layer per qualifying tick (~1 Hz) — not one per
+        // `MIN_TIER_TRANSITION_INTERVAL_MS` — matching the `wanted_degrade_at_floor`
+        // precedent (see the inline note below). No parallel timer state.
+        let union_count = self.union_requested_layer_cap;
+        if self.quality_manager.is_simulcast() && union_count != usize::MAX {
+            // The backpressure ceiling this tick: when backpressure is actively
+            // shedding (`degrade`), it owns the down direction, so the ceiling is
+            // wherever it just left active (the union must not re-add against an
+            // active degrade). Otherwise backpressure is healthy/recovering and
+            // would, over time, restore to the full ladder — so the union may
+            // restore up to the full ladder (still clamped by the union itself
+            // below). This keeps backpressure authoritative on the down side while
+            // letting a grown union climb back toward what backpressure permits.
+            let backpressure_ceiling = if degrade {
+                self.quality_manager.active_layer_count()
+            } else {
+                self.quality_manager.simulcast_layer_count()
+            };
+            // desired = min(backpressure ceiling, union cap), floored at 1. Both
+            // terms are ≤ the ladder, so the ladder is implicit. `desired` can
+            // never exceed `backpressure_ceiling`, which is the invariant that
+            // keeps the union cap from raising active above backpressure.
+            let desired = backpressure_ceiling.min(union_count).max(1);
+
+            // Suppress (eager, ungated): drop the whole excess this tick. The
+            // relay already debounced the down direction, so there is no second
+            // publisher-side debounce. `drop_top_layer` floors at 1.
+            let mut union_acted = false;
+            while self.quality_manager.active_layer_count() > desired {
+                if self.quality_manager.drop_top_layer() {
+                    union_acted = true;
+                } else {
+                    break;
+                }
+            }
+
+            // Restore (gated): add ONE layer back toward `desired` when the
+            // min-interval guard is clear — the same gate the force_* layer sheds
+            // use. One layer per qualifying tick throttles the climb to the tier
+            // transition cadence without any parallel timer (restore-eager: a
+            // grown union re-adds within ~1 eligible tick). Backpressure permits
+            // it because `desired ≤ backpressure_ceiling`.
+            if self.quality_manager.active_layer_count() < desired
+                && self.quality_manager.forced_transition_guards_clear(now)
+                && self.quality_manager.add_top_layer()
+            {
+                union_acted = true;
+            }
+
+            if union_acted {
+                self.tier_changed = true;
+            }
+        }
+
         // --- Per-layer (or single-stream) target bitrates ---
         // Nominal-budget baseline (issue #1108): each active layer's target is
         // its tier ideal, clamped by `layer_upper_clamp_kbps` (pinned to the tier
@@ -419,9 +522,16 @@ impl EncoderBitrateController {
             self.last_aq_summary_ms = now;
             let video_tier = self.quality_manager.current_video_tier();
             let audio_tier = self.quality_manager.current_audio_tier();
+            // Render the union cap as "none" when fail-open (usize::MAX) so the
+            // log stays readable; otherwise show the active-layer-count cap.
+            let union_cap_str = if self.union_requested_layer_cap == usize::MAX {
+                "none".to_string()
+            } else {
+                self.union_requested_layer_cap.to_string()
+            };
             log::info!(
                 "AQ_STATUS: video_tier={}({}) audio_tier={}({}) target_fps={} \
-                 target_bitrate={:.0} encoder_queue_depth={} active_layers={}",
+                 target_bitrate={:.0} encoder_queue_depth={} active_layers={} union_cap={}",
                 video_tier.label,
                 self.quality_manager.video_tier_index(),
                 audio_tier.label,
@@ -430,6 +540,7 @@ impl EncoderBitrateController {
                 self.last_target_bitrate_kbps,
                 self.last_encoder_queue_depth,
                 self.quality_manager.active_layer_count(),
+                union_cap_str,
             );
         }
     }
@@ -611,6 +722,53 @@ impl EncoderBitrateController {
     /// always `0` for the native bot).
     pub fn last_encoder_queue_depth(&self) -> u32 {
         self.last_encoder_queue_depth
+    }
+
+    /// Feed the relay's per-source layer-union hint into the controller (issue
+    /// #1108, Stage 3) — parallel to
+    /// [`observe_encoder_queue_depth`](Self::observe_encoder_queue_depth).
+    ///
+    /// `max_layer` is the HIGHEST simulcast layer id ANY receiver currently wants
+    /// for this (publisher, media-kind), as computed by the relay (the union/max
+    /// of every receiver's requested layer) and delivered on the publisher's own
+    /// self-subject via the `LAYER_HINT` packet. The publisher may stop encoding
+    /// layers ABOVE this id.
+    ///
+    /// Converts the max-layer-**id** to an active-layer **COUNT** via
+    /// `max_layer + 1` (layer ids are 0-based, so id 0 => 1 layer / base only,
+    /// id 2 => 3 layers). The conversion saturates: the `u32::MAX` wire sentinel
+    /// (meaning "some receiver wants the full ladder; suppress nothing") maps to
+    /// the fail-open [`usize::MAX`] count, so the cap stays inert.
+    ///
+    /// The cap is applied by the next [`tick`](Self::tick) as a further `min`
+    /// restriction on the backpressure decision (see [`tick`](Self::tick) and the
+    /// [`union_requested_layer_cap`](Self::union_requested_layer_cap) field doc).
+    /// It can only suppress below the backpressure ceiling or restore back toward
+    /// it — never raise active above what backpressure/budget allows, and never
+    /// below 1.
+    pub fn observe_union_requested_layer(&mut self, max_layer: u32) {
+        // The `u32::MAX` wire sentinel ("some receiver wants the full ladder;
+        // suppress nothing") maps to the `usize::MAX` fail-open count. Handle it
+        // explicitly rather than via `as usize` + saturating arithmetic, which is
+        // target-dependent: on 32-bit `usize` (wasm32) `u32::MAX as usize + 1`
+        // saturates to `usize::MAX`, but on 64-bit (native test target) it would
+        // become 2^32, NOT the sentinel — so an explicit check keeps the fail-open
+        // mapping identical on every target.
+        self.union_requested_layer_cap = if max_layer == u32::MAX {
+            usize::MAX
+        } else {
+            // max-layer-id -> layer COUNT (ids are 0-based). `+ 1` cannot overflow
+            // here because `max_layer < u32::MAX`, and `as usize` widens losslessly
+            // (usize is ≥ 32 bits on every supported target).
+            max_layer as usize + 1
+        };
+    }
+
+    /// The current active-layer COUNT cap derived from the relay layer-union hint
+    /// (issue #1108, Stage 3). [`usize::MAX`] = fail-open (no cap / full ladder).
+    /// Test/observability accessor.
+    pub fn union_requested_layer_cap(&self) -> usize {
+        self.union_requested_layer_cap
     }
 
     /// Force an immediate video quality step-down due to server congestion.
@@ -1142,6 +1300,278 @@ mod tests {
             "sustained backpressure-clear must restore a shed layer (active {} -> {})",
             shed_count,
             controller.active_layer_count()
+        );
+    }
+
+    // =====================================================================
+    // tick(): relay layer-union suppression cap (issue #1108, Stage 3)
+    // =====================================================================
+
+    /// Spacing that clears warmup + the min-transition guard between ticks, so
+    /// `forced_transition_guards_clear` is true and the union restore can add a
+    /// layer each eligible tick.
+    fn union_step_ms() -> f64 {
+        (MIN_TIER_TRANSITION_INTERVAL_MS as f64).max(STEP_UP_STABILIZATION_WINDOW_MS as f64) + 500.0
+    }
+
+    /// `observe_union_requested_layer(0)` on a 3-layer controller must, after one
+    /// tick, cap active to the BASE layer only (count 1) — never 0. Layer id 0 =
+    /// "only the base layer is wanted", i.e. a 1-layer count.
+    #[test]
+    fn test_union_caps_to_base_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Union says "highest wanted layer id == 0" → only the base layer.
+        controller.observe_union_requested_layer(0);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union max-layer 0 must cap active to the base layer (count 1), never 0"
+        );
+    }
+
+    /// The union cap floors at 1 and is eager (suppress applies immediately, no
+    /// second publisher-side debounce): a single tick after observing union 0
+    /// drops the full excess down to 1.
+    #[test]
+    fn test_union_never_below_one_and_eager() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // union 0 → desired count 1 (floored at 1, never 0), applied in ONE tick.
+        controller.observe_union_requested_layer(0);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union must suppress eagerly to the base in a single tick and never below 1"
+        );
+    }
+
+    /// Composite min: with the backpressure ceiling at 2 (one layer shed by
+    /// backpressure) and a union count of 2, active settles at 2; a union of 1
+    /// then drops it to 1. The union cap is a further `min` on the backpressure
+    /// decision.
+    #[test]
+    fn test_union_composite_min_with_backpressure() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Drive backpressure to shed exactly one layer → backpressure ceiling 2.
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        // Union 2 is non-binding while active is 3→2 (it equals the ceiling once
+        // shed), so this isolates the backpressure shed.
+        controller.observe_union_requested_layer(1); // max-layer id 1 → count 2
+        for _ in 0..8 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() <= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "backpressure ceiling 2 with union count 2 must settle at 2"
+        );
+
+        // Now tighten the union to count 1 → must drop to 1 (further min).
+        controller.observe_union_requested_layer(0); // max-layer id 0 → count 1
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union count 1 must further cap the already-backpressured ladder to 1"
+        );
+    }
+
+    /// The `u32::MAX` wire sentinel (mapped to the `usize::MAX` fail-open count)
+    /// leaves the ladder governed purely by backpressure — no cap. With healthy
+    /// (zero) backpressure the full ladder stays active.
+    #[test]
+    fn test_union_sentinel_is_inert() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        controller.observe_union_requested_layer(u32::MAX);
+        assert_eq!(
+            controller.union_requested_layer_cap(),
+            usize::MAX,
+            "u32::MAX must map to the usize::MAX fail-open count"
+        );
+        for _ in 0..10 {
+            t += union_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "the fail-open sentinel must leave the full ladder active (no cap)"
+        );
+    }
+
+    /// Restore-eager: from a union-suppressed `active == 1`, raising the union
+    /// back to the full ladder must climb active back toward the backpressure
+    /// ceiling over subsequent ticks (one layer per min-interval). The first
+    /// eligible tick begins the climb; the loop confirms it reaches the ceiling.
+    #[test]
+    fn test_union_restore_eager_climbs_back() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Suppress to the base via union 0.
+        controller.observe_union_requested_layer(0);
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "precondition: suppressed"
+        );
+
+        // Now the union grows back to the full ladder (max-layer id 2 → count 3).
+        controller.observe_union_requested_layer(2);
+
+        // First eligible tick must START the climb (restore-eager).
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert!(
+            controller.active_layer_count() > 1,
+            "a grown union must begin restoring within one eligible tick (got {})",
+            controller.active_layer_count()
+        );
+
+        // Subsequent ticks climb back to the backpressure ceiling (full ladder).
+        let mut restored_full = controller.active_layer_count() == 3;
+        for _ in 0..6 {
+            t += union_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                restored_full = true;
+                break;
+            }
+        }
+        assert!(
+            restored_full,
+            "union restore must climb back to the full ladder (active {})",
+            controller.active_layer_count()
+        );
+    }
+
+    /// The union cap must NEVER raise active above the backpressure ceiling: with
+    /// backpressure holding active at 2 (one layer shed), a union of 3 (full
+    /// ladder) must NOT re-add the layer backpressure shed — backpressure wins on
+    /// the down side.
+    #[test]
+    fn test_union_never_raises_above_backpressure_ceiling() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Shed exactly one layer via sustained backpressure → ceiling 2.
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        for _ in 0..8 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() <= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: backpressure shed one layer (ceiling 2)"
+        );
+
+        // Union allows the FULL ladder (count 3). While backpressure remains HIGH
+        // (still degrading), the union must NOT re-add the shed layer.
+        controller.observe_union_requested_layer(2); // count 3
+        for _ in 0..6 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            assert!(
+                controller.active_layer_count() <= 2,
+                "union count 3 must not raise active above the backpressure ceiling of 2 \
+                 while backpressure is degrading (active {})",
+                controller.active_layer_count()
+            );
+        }
+    }
+
+    /// Fail-open default: a fresh controller that NEVER receives
+    /// `observe_union_requested_layer` keeps its full ladder (the cap starts at
+    /// the `usize::MAX` sentinel = inert).
+    #[test]
+    fn test_union_fail_open_default_full_ladder() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(
+            controller.union_requested_layer_cap(),
+            usize::MAX,
+            "a fresh controller must default to the fail-open (no-cap) sentinel"
+        );
+
+        let mut t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        for _ in 0..10 {
+            tick_at(&mut controller, &clock, t, 0);
+            t += union_step_ms();
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "with no LAYER_HINT ever observed the full ladder must stay active"
+        );
+    }
+
+    /// Single-stream mode is unaffected by the union cap: even union 0 leaves the
+    /// sole (base) layer active (count 1, floored).
+    #[test]
+    fn test_union_single_stream_unaffected() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        // No set_simulcast_layers → single-stream (count 1).
+        assert!(!controller.is_simulcast());
+
+        controller.observe_union_requested_layer(0);
+        let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "single-stream mode is floored at 1 and unaffected by the union cap"
         );
     }
 

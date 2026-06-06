@@ -239,6 +239,16 @@ pub fn Host(
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
         screen.set_reelection_completed_signal(client.reelection_completed_signal());
 
+        // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
+        // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
+        // u32::MAX fail-open sentinel) and its AQ control loop reads it; here we
+        // hand the SAME atom to the client so the inbound LAYER_HINT dispatch arm
+        // writes the relay's per-source max-requested-layer into it. This is the
+        // inverse of the keyframe-flag wiring (atom owned by the encoder, not the
+        // client). The client also resets these atoms to u32::MAX on reconnect.
+        client.set_camera_union_requested_layer(camera.shared_union_requested_layer());
+        client.set_screen_union_requested_layer(screen.shared_union_requested_layer());
+
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(
             camera.shared_video_tier_index(),

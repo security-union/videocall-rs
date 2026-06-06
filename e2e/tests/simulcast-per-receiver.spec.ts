@@ -128,7 +128,7 @@
  *   - `[data-testid="perf-recv-video-auto"]`        video Auto toggle (aria-pressed)
  */
 
-import { test, expect, chromium, Browser, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
@@ -142,6 +142,56 @@ import { waitForServices } from "../helpers/wait-for-services";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Transport the publish-suppression (#1108 Stage 3) cases are parameterised over. */
+type Transport = "webtransport" | "websocket";
+
+/**
+ * Pin a BrowserContext to a specific media transport BEFORE its first navigation
+ * by seeding the sticky preference the UI reads from localStorage at boot
+ * (`context.rs`). Mirrors the canonical cross-transport pin in
+ * `cross-transport-display-name.spec.ts`. Used by the #1108 Stage 3 cases so the
+ * same publish-suppression assertion can be run over BOTH WebTransport and
+ * WebSocket without any toxiproxy dependency (no impairment is involved here —
+ * the trigger is every receiver PINNING the base layer, not a degraded link).
+ */
+async function pinTransport(context: BrowserContext, t: Transport) {
+  await context.addInitScript((pref: string) => {
+    try {
+      window.localStorage.setItem("vc_transport_preference", pref);
+      window.localStorage.setItem("vc_transport_sticky", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin will set it */
+    }
+  }, t);
+}
+
+/**
+ * Drag a receiver's RECEIVE max-layer slider for `kind` down to the lowest rung
+ * (index 0 = base layer) with Auto OFF, so this receiver requests ONLY the base
+ * layer for the publisher's stream. This is the #1108 Stage 3 DRIVE primitive:
+ * when EVERY receiver does this, the relay's per-source layer UNION collapses to
+ * base, it emits a `LAYER_HINT` to the publisher, and the publisher caps its
+ * published ladder (top rungs shed).
+ *
+ * The wiring is already live end-to-end on this branch (slider →
+ * `set_receive_layer_bounds` → `LAYER_PREFERENCE` → relay union → `LAYER_HINT` →
+ * `shared_union_requested_layer` → AQ `observe_union_requested_layer`); the part
+ * that is NOT yet observable from the DOM is the publisher-side RESULT — see the
+ * Stage 3 describe block header for the `live_simulcast_snapshot` blocker.
+ */
+async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "screen" = "video") {
+  const autoToggle = page.locator(`[data-testid="perf-recv-${kind}-auto"]`);
+  if ((await autoToggle.getAttribute("aria-pressed")) === "true") {
+    await autoToggle.click();
+  }
+  const maxThumb = page.locator(`[data-testid="perf-recv-${kind}-range-max"]`);
+  await expect(maxThumb).toBeVisible({ timeout: 10_000 });
+  await maxThumb.focus();
+  await maxThumb.fill("0");
+  await maxThumb.dispatchEvent("input");
+  await expect(maxThumb).toHaveValue("0");
+}
 
 /**
  * Drive a fresh page from the HOME FORM into the meeting grid, navigating the
@@ -1332,4 +1382,301 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
       await rxBrowser.close();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// #1108 Stage 3 — publish-side layer SUPPRESSION (relay LAYER_HINT → publisher
+// caps its ladder when EVERY receiver only wants the base layer; restore-eager
+// when any receiver wants more again). Covers BOTH WebTransport and WebSocket.
+//
+// Relay commit 096795a6 + publisher commit 0a6d8761.
+//
+// =========================================================================
+// WHAT STAGE 3 DOES (the behaviour under test)
+// =========================================================================
+// The relay computes, per source, the UNION (max over all receivers) of the
+// simulcast layer each receiver requested for that source. When that union sits
+// below the publisher's published depth (i.e. NO receiver wants a higher rung),
+// the relay hints the publisher — on the publisher's OWN NATS self-subject, like
+// CONGESTION — to stop encoding the unwanted top rung(s). The publisher's AQ
+// loop (`observe_union_requested_layer`) caps its active layer count to
+// `min(backpressure ceiling, union count)`, floored at 1 — the BASE layer is
+// ALWAYS published, never fully suppressed. Suppress is debounced DOWN at the
+// relay (≈2 s); restore is EAGER (immediate) so when any receiver un-pins / a
+// new receiver joins / a viewport grows, the dropped rung comes back promptly
+// and that receiver receives it again.
+//
+// =========================================================================
+// TWO INDEPENDENT BLOCKERS → these tests are `test.fixme` (both transports)
+// =========================================================================
+// 1. NO PUBLISHER-SIDE DOM OBSERVABILITY ON THIS BRANCH.
+//    The behaviour the spec must assert is "the PUBLISHER stopped encoding the
+//    top rung(s)". On this branch the publisher's shrinking ladder is NOT
+//    surfaced to any DOM element:
+//      - The SEND Performance panel renders a single aggregate
+//        `LiveQualitySnapshot` (`#perf-vu-video-readout` = `{w}x{h}·{fps}fps·
+//        {kbps}kbps`, driven by a quality-TIER index + target bitrate). It has
+//        NO per-rung array and NO shed marker.
+//      - The encoder DOES track the capped count internally
+//        (`CameraEncoder::shared_active_layer_count`, written from
+//        `EncoderBitrateController::active_layer_count()` which the Stage 3 union
+//        cap feeds), but that atom is NOT exposed in `dioxus-ui/src/` — grep for
+//        `active_layer_count` in the UI returns nothing.
+//    The per-rung publisher diagnostics this task expects (the
+//    `live_simulcast_snapshot` shed markers — top rungs rendering
+//    `bitrate_kbps == 0` / shed styling, testids `perf-video-diag-rung-*`) live
+//    on the UNMERGED branch `feat/perf-panel-simulcast-diagnostics` (PR #1095 /
+//    #1101). They are NOT on `main` and NOT on this Stage 3 branch, so there is
+//    no stable selector to assert against today. The body below is written
+//    against those `perf-video-diag-rung-*` testids so it goes green the moment
+//    that diagnostics panel merges AND the multi-party harness (below) lands.
+//
+// 2. MULTI-PARTY HARNESS LIMITS — #1093 (same blocker as every other
+//    multi-context test in this spec). These cases join 3+ authenticated
+//    contexts each running camera + simulcast encode/decode; in headless CI the
+//    extra renderers crash ("Target page/context closed") and the capability
+//    ceiling clamps the runner to 1 layer (so there is no top rung TO shed). The
+//    WS case also relies on driving "every receiver pins base" reliably across
+//    contexts, which is exactly the multi-party determinism #1093 tracks.
+//
+// =========================================================================
+// WHAT IS RUNNABLE NOW vs FIXME
+// =========================================================================
+//   - RUNNABLE NOW: the DRIVE side primitives only — `pinReceiverToBaseLayer`
+//     (the RECEIVE max-layer slider → `LAYER_PREFERENCE` path) and `pinTransport`
+//     are both exercised live by other tests in this repo
+//     (performance-settings.spec.ts and cross-transport-display-name.spec.ts
+//     respectively). There is NO runnable ASSERTION of the publisher-side result
+//     today because the observable surface does not exist on this branch.
+//   - FIXME (both WT and WS): the end-to-end "publisher sheds the top rung, then
+//     restores it" assertion — blocked on BOTH (1) the diagnostics panel merging
+//     and (2) the #1093 multi-party harness. No NEW tracking issue is needed:
+//     blocker (2) reuses #1093 (multi-party harness); blocker (1) is the
+//     PR #1095/#1101 diagnostics merge.
+//
+// NOTE: unlike the Stage 2 `@impair` divergence test, Stage 3 needs NO toxiproxy
+// / network shaping — the suppression trigger is purely "all receivers request
+// base", which is a receiver-side preference (slider), not a degraded link. That
+// is why these are plain `fixme` (not `@impair`-gated): they belong in the
+// default suite once unblocked.
+// ---------------------------------------------------------------------------
+test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
+  test.describe.configure({ timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * Shared body for the WT and WS variants. Parameterised over the media
+   * transport so the identical publish-suppression assertion runs over both.
+   *
+   * Topology: 1 publisher + 2 receivers (>=3 participants, per the task). All
+   * three on `transport`. Both receivers pin the base layer → relay union = base
+   * → publisher sheds the top rung(s). Then ONE receiver un-pins (requests a
+   * higher layer) and the publisher must RESTORE the rung promptly (<= a couple
+   * seconds, restore-eager) and that receiver must receive it.
+   */
+  const publishSuppressionBody =
+    (transport: Transport) =>
+    async ({ baseURL }: { baseURL?: string }) => {
+      const uiURL = baseURL || "http://localhost:3001";
+      const meetingId = `e2e_sim_suppress_${transport}_${Date.now()}`;
+
+      const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+      const rxABrowser = await chromium.launch({ args: BROWSER_ARGS });
+      const rxBBrowser = await chromium.launch({ args: BROWSER_ARGS });
+      try {
+        const pubCtx = await createAuthenticatedContext(
+          pubBrowser,
+          `sim-sup-pub-${transport}@videocall.rs`,
+          "SimSupPublisher",
+          uiURL,
+        );
+        const rxACtx = await createAuthenticatedContext(
+          rxABrowser,
+          `sim-sup-rxa-${transport}@videocall.rs`,
+          "SimSupReceiverA",
+          uiURL,
+        );
+        const rxBCtx = await createAuthenticatedContext(
+          rxBBrowser,
+          `sim-sup-rxb-${transport}@videocall.rs`,
+          "SimSupReceiverB",
+          uiURL,
+        );
+
+        // Flag ON for all three so the publisher encodes a multi-rung ladder that
+        // there is actually something to SHED.
+        await enableSimulcastFlag(pubCtx, 3);
+        await enableSimulcastFlag(rxACtx, 3);
+        await enableSimulcastFlag(rxBCtx, 3);
+
+        // Pin every context to the transport under test. MUST run before the first
+        // navigation (these are init scripts).
+        await pinTransport(pubCtx, transport);
+        await pinTransport(rxACtx, transport);
+        await pinTransport(rxBCtx, transport);
+
+        const pubPage = await pubCtx.newPage();
+        const rxAPage = await rxACtx.newPage();
+        const rxBPage = await rxBCtx.newPage();
+
+        await joinMeeting(pubPage, meetingId, "SimSupPublisher");
+        await joinMeeting(rxAPage, meetingId, "SimSupReceiverA");
+        await joinMeeting(rxBPage, meetingId, "SimSupReceiverB");
+
+        // Each receiver sees the publisher's tile (peers connected).
+        await expect(rxAPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+          timeout: 30_000,
+        });
+        await expect(rxBPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+          timeout: 30_000,
+        });
+
+        // Open the receive Performance panels (where the max-layer sliders live)
+        // on both receivers, and the SEND Performance panel on the publisher
+        // (where the per-rung send diagnostics render once #1095/#1101 merges).
+        await openPerformancePanel(rxAPage);
+        await openPerformancePanel(rxBPage);
+        await pubPage.locator('[data-testid="open-settings"]').click();
+        await expect(pubPage.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+        await pubPage.getByRole("tab", { name: "Performance" }).click();
+        await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
+          timeout: 10_000,
+        });
+        // The publisher's per-rung diagnostics are under the SEND direction.
+        const pubSendSeg = pubPage.locator('[data-testid="perf-direction-send"]');
+        await pubSendSeg.click();
+        await expect(pubSendSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+
+        // PHASE 0 — let both receivers climb above base so there is a top rung the
+        // publisher is actually encoding (and therefore can later shed). Capability
+        // ceiling can clamp to a single layer on a weak runner; SKIP rather than
+        // assert a false negative (mirrors the other multi-layer tests).
+        await expect
+          .poll(
+            async () => {
+              const a = await readVideoLayer(rxAPage);
+              const b = await readVideoLayer(rxBPage);
+              if (!a || !b) return -1;
+              return Math.min(a.layerCount, b.layerCount);
+            },
+            { timeout: 45_000, intervals: [1000, 2000, 3000] },
+          )
+          .toBeGreaterThan(0);
+
+        const aStart = await readVideoLayer(rxAPage);
+        const bStart = await readVideoLayer(rxBPage);
+        test.skip(
+          (aStart?.layerCount ?? 1) <= 1 || (bStart?.layerCount ?? 1) <= 1,
+          "capability ceiling clamped the publisher to a single layer; there is no " +
+            "top rung to suppress on this runner (see helpers/simulcast-config.ts)",
+        );
+        const topRung = (aStart?.layerCount ?? 1) - 1; // 0-based id of the highest rung
+
+        // The publisher's per-rung send diagnostics expose one element per rung
+        // (PR #1095/#1101). The top rung must START live (non-zero bitrate / no
+        // shed styling) — we have something to shed.
+        const topRungDiag = pubPage.locator(`[data-testid="perf-video-diag-rung-${topRung}"]`);
+        await expect(topRungDiag).toBeVisible({ timeout: 10_000 });
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
+            timeout: 30_000,
+            intervals: [1000, 2000],
+          })
+          .toBeGreaterThan(0);
+
+        // PHASE 1 — make EVERY receiver request ONLY the base layer. The relay's
+        // per-source union now sits at base, so after the suppress-debounce
+        // (~2 s) it hints the publisher to stop the top rung(s).
+        await pinReceiverToBaseLayer(rxAPage, "video");
+        await pinReceiverToBaseLayer(rxBPage, "video");
+
+        // PHASE 2 — assert the PUBLISHER sheds the top rung: its diagnostics for
+        // the highest rung flip to the shed marker (`bitrate_kbps == 0` / the shed
+        // data-state). Allow generously for the relay's ~2 s suppress-debounce plus
+        // a couple of AQ ticks. The BASE rung must NEVER be shed.
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "1"), {
+            timeout: 30_000,
+            intervals: [1000, 2000, 3000],
+          })
+          .toBe(0);
+        await expect(topRungDiag).toHaveAttribute("data-shed", "true", { timeout: 5_000 });
+
+        const baseRungDiag = pubPage.locator('[data-testid="perf-video-diag-rung-0"]');
+        await expect(
+          baseRungDiag,
+          "base layer must ALWAYS be published — never shed",
+        ).not.toHaveAttribute("data-shed", "true");
+        expect(
+          Number((await baseRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"),
+          "base layer must keep a non-zero bitrate (never fully suppressed)",
+        ).toBeGreaterThan(0);
+
+        // Both receivers, having pinned base, must still be decoding at the base
+        // layer (suppression of higher rungs must not break the base stream).
+        await expect
+          .poll(async () => (await readVideoLayer(rxAPage))?.layerIndex ?? -1, {
+            timeout: 20_000,
+            intervals: [1000, 2000],
+          })
+          .toBe(0);
+
+        // PHASE 3 — RESTORE-EAGER: one receiver requests a higher layer again
+        // (un-pin: Auto back ON = full range). The relay's union grows past base,
+        // and because restore is EAGER (no debounce) the publisher must re-enable
+        // the top rung PROMPTLY — assert within a couple of seconds.
+        const rxAAuto = rxAPage.locator('[data-testid="perf-recv-video-auto"]');
+        if ((await rxAAuto.getAttribute("aria-pressed")) !== "true") {
+          await rxAAuto.click();
+        }
+        await expect(rxAAuto).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
+
+        // The publisher restores the top rung promptly (restore-eager). ~3 s budget
+        // covers the LAYER_PREFERENCE round-trip + one AQ restore tick; the relay
+        // adds NO debounce on the UP direction.
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
+            timeout: 6_000,
+            intervals: [250, 500, 1000],
+          })
+          .toBeGreaterThan(0);
+        await expect(topRungDiag).not.toHaveAttribute("data-shed", "true");
+
+        // PHASE 4 — and the un-pinning receiver actually RECEIVES the higher layer
+        // again (the restore is end-to-end, not just a publisher-side flag). It
+        // climbs back above the base layer.
+        await expect
+          .poll(async () => (await readVideoLayer(rxAPage))?.layerIndex ?? 0, {
+            timeout: 30_000,
+            intervals: [1000, 2000, 3000],
+          })
+          .toBeGreaterThan(0);
+      } finally {
+        await pubBrowser.close();
+        await rxABrowser.close();
+        await rxBBrowser.close();
+      }
+    };
+
+  // FIXME(#1093 + PR #1095/#1101): see the describe-block header for the two
+  // blockers — (1) no publisher-side per-rung DOM observability on this branch
+  // (the `perf-video-diag-rung-*` diagnostics are unmerged), (2) the multi-party
+  // harness limits tracked under #1093. WebTransport is the production-primary
+  // transport, so this is the higher-priority variant to un-fixme first.
+  test.fixme(
+    "publisher sheds top rung when all receivers pin base, restores when one un-pins (WT, #1108)",
+    publishSuppressionBody("webtransport"),
+  );
+
+  // FIXME(#1093 + PR #1095/#1101): same two blockers as the WT case above. Unlike
+  // the Stage 2 divergence test this needs NO toxiproxy — the trigger is a
+  // receiver PREFERENCE (all pin base), not an impaired link — so this belongs in
+  // the default suite (not `@impair`) once unblocked.
+  test.fixme(
+    "publisher sheds top rung when all receivers pin base, restores when one un-pins (WS, #1108)",
+    publishSuppressionBody("websocket"),
+  );
 });

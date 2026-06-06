@@ -330,6 +330,65 @@ pub const LAYER_PREFERENCE_MIN_UPDATE_INTERVAL: Duration = VIEWPORT_MIN_UPDATE_I
 /// never dropped wholesale and the connection is never errored.
 pub const LAYER_PREFERENCE_MAX_LAYER_ID: u32 = 7;
 
+// ---------------------------------------------------------------------------
+// Publish-side layer suppression (#1108, Stage 3)
+// ---------------------------------------------------------------------------
+
+/// Debounce window (in milliseconds) before the relay emits a LOWER layer-union
+/// hint to a publisher (#1108, Stage 3 — publish-side layer suppression).
+///
+/// The relay computes, per source, the UNION (max) over every receiver of the
+/// simulcast layer that receiver requested, and emits a LAYER_HINT telling the
+/// publisher it may stop encoding layers above that union (see
+/// [`crate::actors::chat_server`] `RecomputeLayerHints`). The emit policy is
+/// deliberately ASYMMETRIC:
+///
+/// * **Suppress-lazy (DOWN):** a hint that LOWERS the union below what the
+///   publisher is currently encoding is only emitted after the union has stayed
+///   below that level for this entire window. This absorbs transient flaps — a
+///   receiver briefly dropping a tile, a viewport scroll, a reconnect wave —
+///   so we do not tell a publisher to tear down an upper encode that a receiver
+///   re-requests a few hundred ms later (re-spinning a simulcast layer is
+///   expensive and visibly stutters every consumer of it). The debounce is
+///   realized with a deferred `notify_later` re-check, so the lower hint fires
+///   even when no further preference change occurs.
+/// * **Restore-eager (UP):** a hint that RAISES the union (a receiver now wants
+///   a higher layer, or a constraining receiver left so the fail-open union
+///   grows) is emitted IMMEDIATELY — never debounced. Delaying restoration
+///   would leave a receiver black-tiled / stuck on a low layer for the window;
+///   over-encoding briefly is the safe failure (fail-open).
+///
+/// 2000 ms is a FIRST GUESS and is PENDING PERF REVIEW. It is long enough to
+/// ride out a reconnection wave on a high-latency (200 ms+) link and short
+/// viewport flaps, while short enough that a genuine, sustained drop in demand
+/// reclaims publisher CPU / uplink within a couple of seconds. Tune against real
+/// traffic once Stage 3 is wired end-to-end (it mirrors the order of magnitude
+/// of the keyframe congestion-relax window but is intentionally separate).
+pub const LAYER_HINT_SUPPRESS_DEBOUNCE_MS: u64 = 2000;
+
+/// Maximum number of receiver sessions the relay will scan when computing the
+/// per-source layer union for a LAYER_HINT (#1108, Stage 3 — DoS bound).
+///
+/// The union is an INVERTED query: for one source it must inspect every other
+/// receiver's recorded layer preference for that source (the prefs map is
+/// receiver-keyed, so there is no per-source index). That scan is O(room size)
+/// and runs inside the single-threaded `ChatServer` actor, so an adversary who
+/// could inflate a room's membership could otherwise make each recompute
+/// arbitrarily expensive and stall the actor for every room it serves.
+///
+/// This caps the scan at a fixed number of receivers. Mirrors the
+/// [`LAYER_PREFERENCE_MAX_ENTRIES`] philosophy (bound the per-event work an
+/// attacker can induce) and is sized well above our target 20-user rooms with
+/// comfortable headroom, so a legitimate meeting's union is always computed over
+/// every real receiver. When a room exceeds the cap the union is computed over
+/// the first [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] receivers encountered and is
+/// FAIL-OPEN on the remainder: an un-scanned receiver is treated exactly like a
+/// receiver with no recorded preference (it contributes the full-ladder
+/// sentinel), so truncation can only ever cause the relay to suppress LESS, never
+/// to suppress a layer some unseen receiver still wants. FIRST GUESS / PENDING
+/// PERF REVIEW.
+pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;

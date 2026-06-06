@@ -361,6 +361,19 @@ pub struct ScreenEncoder {
     /// (owns the controller). **Stage 1: stored-only on the controller side, so
     /// it is observability with no behavior change.**
     shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Relay layer-union hint for this publisher's SCREEN ladder (issue #1108,
+    /// Stage 3). Mirror of `CameraEncoder::shared_union_requested_layer` for the
+    /// SCREEN media-kind: the relay delivers the MAX simulcast layer ANY receiver
+    /// wants for this (publisher, SCREEN) on the publisher's own self-subject via
+    /// a `LAYER_HINT` packet, `VideoCallClient`'s dispatch arm writes it here, and
+    /// the screen AQ control loop reads it each tick and feeds
+    /// [`EncoderBitrateController::observe_union_requested_layer`] to cap the
+    /// published screen ladder.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (no cap)** and reset to
+    /// `u32::MAX` on reconnect so a stale cap from the old relay cannot suppress
+    /// against a new session.
+    shared_union_requested_layer: Rc<AtomicU32>,
     /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
     /// #1108). The encoder holds the only strong reference; `set_encoder_control`
     /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
@@ -425,6 +438,9 @@ impl ScreenEncoder {
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
             shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // Relay layer-union hint (issue #1108, Stage 3). Starts at u32::MAX
+            // (fail-open / no cap); reset to u32::MAX on reconnect.
+            shared_union_requested_layer: Rc::new(AtomicU32::new(u32::MAX)),
             // AQ control-loop liveness token (issue #1108). Sole strong owner;
             // the self-tick loop holds a Weak and exits when this drops.
             control_loop_liveness: Rc::new(()),
@@ -444,6 +460,19 @@ impl ScreenEncoder {
     /// Returns the current screen share quality tier index (0=high, 1=medium, 2=low).
     pub fn shared_screen_tier_index(&self) -> Rc<AtomicU32> {
         self.shared_screen_tier_index.clone()
+    }
+
+    /// Returns the relay layer-union hint atomic for this SCREEN ladder (issue
+    /// #1108, Stage 3).
+    ///
+    /// `VideoCallClient` stores this clone (via
+    /// [`VideoCallClient::set_screen_union_requested_layer`](crate::VideoCallClient::set_screen_union_requested_layer))
+    /// and writes the MAX-requested-layer carried by an inbound `LAYER_HINT`
+    /// packet's SCREEN entry into it. The screen AQ control loop reads it each
+    /// tick to cap the published ladder. The value is a max-layer **id**
+    /// (`u32::MAX` = fail-open / no cap).
+    pub fn shared_union_requested_layer(&self) -> Rc<AtomicU32> {
+        self.shared_union_requested_layer.clone()
     }
 
     /// Returns the shared tier transitions buffer for health reporting.
@@ -608,6 +637,10 @@ impl ScreenEncoder {
         // READS the depth the encode loop published and forwards it to the
         // controller on each self-timer tick.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Relay layer-union hint (issue #1108, Stage 3): the control loop READS
+        // the max-layer the client wrote (from a LAYER_HINT packet) and forwards
+        // it to the controller's union cap each tick.
+        let shared_union_requested_layer = self.shared_union_requested_layer.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
         // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
         // unmount), so the immortal `spawn_local` future doesn't leak per remount.
@@ -678,6 +711,14 @@ impl ScreenEncoder {
                 // receiver FPS no longer reaches the sender AQ.
                 encoder_control.observe_encoder_queue_depth(
                     shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
+                // Relay layer-union hint (issue #1108, Stage 3): feed the latest
+                // max-requested-layer the client wrote for SCREEN (u32::MAX =
+                // fail-open / no cap) so the controller caps the screen ladder to
+                // what some receiver actually wants. Applied right before `tick`
+                // so it composes with the just-observed backpressure decision.
+                encoder_control.observe_union_requested_layer(
+                    shared_union_requested_layer.load(Ordering::Relaxed),
                 );
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());

@@ -30,7 +30,6 @@ use crate::context::{
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
-use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
@@ -38,7 +37,6 @@ use videocall_client::{
     initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
     ScreenShareEvent,
 };
-use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -262,16 +260,13 @@ pub fn Host(
             camera.shared_dwell_samples(),
         );
 
-        // Wire up encoder controls. The microphone encoder no longer needs
-        // its own diagnostics channel — it reads audio tier settings from
-        // the camera encoder's shared atomics.
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
-        camera.set_encoder_control(rx);
-
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
-        screen.set_encoder_control(rx);
+        // Wire up encoder controls. Issue #1108: the encoder AQ is now a
+        // self-timer driven by the sender's OWN encoder backpressure — it no
+        // longer subscribes to receiver-reported diagnostics, so there are no
+        // diagnostics channels to wire here. (The microphone encoder still reads
+        // audio tier settings from the camera encoder's shared atomics.)
+        camera.set_encoder_control();
+        screen.set_encoder_control();
 
         // Apply the user's persisted performance (quality-bounds) preference
         // (issue #961) before the encoder starts, so the very first encode honors

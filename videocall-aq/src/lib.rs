@@ -45,6 +45,4 @@ pub use clock::JsDateClock;
 
 pub use manager::{AdaptiveQualityManager, TierTransitionRecord};
 
-pub use controller::{
-    DiagnosticPacketWindow, DiagnosticPackets, EncoderBitrateController, EncoderControl,
-};
+pub use controller::{EncoderBitrateController, EncoderControl};

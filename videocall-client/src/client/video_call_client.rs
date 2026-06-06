@@ -31,7 +31,6 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc::UnboundedSender;
 use futures::future::LocalBoxFuture;
 use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -1925,17 +1924,12 @@ impl VideoCallClient {
         self.send_packet(wrapper);
     }
 
-    pub fn subscribe_diagnostics(
-        &self,
-        tx: UnboundedSender<DiagnosticsPacket>,
-        media_type: MediaType,
-    ) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(sender_diagnostics) = &inner.sender_diagnostics {
-                sender_diagnostics.add_sender_channel(tx, media_type);
-            }
-        }
-    }
+    // NOTE(#1108): `subscribe_diagnostics` (the per-(media-type) channel that
+    // fanned receiver-reported DiagnosticsPackets into the encoder AQ) was
+    // removed in Stage 2. The sender no longer adapts to receiver FPS, so there
+    // is no encoder-AQ sink to subscribe. The sender still INGESTS peer
+    // diagnostics (see `handle_diagnostic_packet`) for the global vcprobe
+    // broadcast + the UI stats string (diagnostics_manager sinks 1 & 2).
 
     pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
         subscribe_global_diagnostics()

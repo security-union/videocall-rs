@@ -17,8 +17,6 @@
  */
 
 use crate::connection::MediaStreamKey;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
@@ -31,7 +29,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -355,6 +352,24 @@ pub struct ScreenEncoder {
     /// loop in simulcast mode; read by the encode loop. Empty in single-stream
     /// mode (the legacy `current_bitrate` atomic is used instead).
     shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Sender-side screen encoder backpressure (issue #1108, Phase B): the max
+    /// `VideoEncoder::encode_queue_size()` across the base `screen_encoder` and
+    /// the ACTIVE `extra_layers`, written by the encode loop each frame and read
+    /// by the screen AQ control loop to feed
+    /// [`EncoderBitrateController::observe_encoder_queue_depth`]. Borrow-safe
+    /// bridge between the encode task (owns the encoders) and the control task
+    /// (owns the controller). **Stage 1: stored-only on the controller side, so
+    /// it is observability with no behavior change.**
+    shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
+    /// #1108). The encoder holds the only strong reference; `set_encoder_control`
+    /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
+    /// returns `None` (encoder dropped on Host unmount). The control loop runs on
+    /// `wasm_bindgen_futures::spawn_local` (NOT scope-bound), so without this it
+    /// would tick forever and leak one loop per remount. Bounds the CONTROL loop
+    /// only — the encode loop (`run_screen_encoding`) already exits on
+    /// `enabled == false`.
+    control_loop_liveness: Rc<()>,
 }
 
 impl ScreenEncoder {
@@ -407,6 +422,12 @@ impl ScreenEncoder {
                 max_layers,
             ))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
+            // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
+            // (no frames queued); the encode loop publishes the live depth.
+            shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // AQ control-loop liveness token (issue #1108). Sole strong owner;
+            // the self-tick loop holds a Weak and exits when this drops.
+            control_loop_liveness: Rc::new(()),
         }
     }
 
@@ -557,10 +578,13 @@ impl ScreenEncoder {
         })
     }
 
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
+    /// Spawn the screen-encoder AQ control loop (issue #1108: now a self-timer).
+    ///
+    /// Mirrors `CameraEncoder::set_encoder_control`: receiver FPS no longer
+    /// drives the sender AQ, so this ticks at `AQ_TICK_INTERVAL_MS` off the
+    /// screen encoder's own backpressure (`shared_encoder_queue_depth`) plus the
+    /// re-election signal, instead of consuming a diagnostics channel.
+    pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
@@ -580,6 +604,14 @@ impl ScreenEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the control loop
+        // READS the depth the encode loop published and forwards it to the
+        // controller on each self-timer tick.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
+        // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
+        // unmount), so the immortal `spawn_local` future doesn't leak per remount.
+        let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control =
                 EncoderBitrateController::new_for_screen(current_fps.clone(), SCREEN_QUALITY_TIERS);
@@ -604,7 +636,23 @@ impl ScreenEncoder {
                     *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
                 }
             }
-            while let Some(event) = diagnostics_receiver.next().await {
+            // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
+            // instead of waiting on receiver diagnostics. Runs for the lifetime
+            // of the owning ScreenEncoder. This `spawn_local` future is NOT bound
+            // to the Dioxus component scope, so it must break itself when the
+            // encoder is torn down (Host unmount) via the liveness Weak —
+            // otherwise it ticks forever and leaks one loop per remount.
+            loop {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
+                ))
+                .await;
+                // Encoder torn down? Stop ticking and release the captured Rc graph.
+                if control_loop_liveness.upgrade().is_none() {
+                    log::debug!("ScreenEncoder: AQ control loop exiting (encoder dropped)");
+                    break;
+                }
+                let now = js_sys::Date::now();
                 // Apply user screen-quality bounds if the UI changed them since
                 // we last applied. Cheap generation check; the controller snaps
                 // the current tier into range and surfaces it via
@@ -624,7 +672,15 @@ impl ScreenEncoder {
                     }
                 }
 
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                // Sender encoder backpressure (issue #1108). Feed the depth the
+                // encode loop published into the screen controller, then advance
+                // the AQ one tick. This is the SOLE gradual quality axis now:
+                // receiver FPS no longer reaches the sender AQ.
+                encoder_control.observe_encoder_queue_depth(
+                    shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
+                encoder_control.tick(now);
+                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
                 // Screen simulcast (issue #989, Phase 3b): publish the active
                 // layer count + per-layer target bitrates to the encode loop
@@ -962,6 +1018,9 @@ impl ScreenEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): forwarded into the
+        // shared encode loop, which WRITES the max active-layer queue depth.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let screen_to_share = stream;
@@ -993,6 +1052,7 @@ impl ScreenEncoder {
                 n_layers,
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
+                shared_encoder_queue_depth,
             )
             .await;
         });
@@ -1044,6 +1104,9 @@ impl ScreenEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): forwarded into the
+        // shared encode loop, which WRITES the max active-layer queue depth.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -1163,6 +1226,7 @@ impl ScreenEncoder {
                 n_layers,
                 shared_active_layer_count,
                 shared_layer_bitrates_bps,
+                shared_encoder_queue_depth,
             )
             .await;
         });
@@ -1215,6 +1279,11 @@ impl ScreenEncoder {
         n_layers: usize,
         shared_active_layer_count: Rc<AtomicU32>,
         shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+        // Sender encoder backpressure (issue #1108, Phase B): the encode loop
+        // WRITES the max active-layer `encode_queue_size()` here each frame for
+        // the screen AQ control loop. Stored-only on the controller side in
+        // Stage 1 (no behavior change).
+        shared_encoder_queue_depth: Rc<AtomicU32>,
     ) {
         let simulcast = n_layers > 1;
         // Per-layer sequence numbers persist across restarts so a receiver
@@ -2232,6 +2301,27 @@ impl ScreenEncoder {
                         }
 
                         video_frame.close();
+
+                        // Sender encoder backpressure (issue #1108, Phase B).
+                        // After submitting this frame to the base encoder and
+                        // every ACTIVE higher layer, sample the max
+                        // `encode_queue_size()` across them and publish it for the
+                        // screen AQ control loop. The base `screen_encoder` is
+                        // always layer 0 (active); higher layers mirror the encode
+                        // gate above (skip `>= local_active_layers`) so a shed
+                        // layer's stale queue can't keep the signal hot. For N==1
+                        // `extra_layers` is empty, so this is just the base
+                        // encoder's depth. Stage 1: stored-only on the controller
+                        // side, so this is observability with no behavior change.
+                        let max_active_queue_depth = extra_layers
+                            .iter()
+                            .filter(|l| (l.layer_id as usize) < local_active_layers)
+                            .map(|l| l.encoder.encode_queue_size())
+                            .max()
+                            .unwrap_or(0)
+                            .max(screen_encoder.encode_queue_size());
+                        shared_encoder_queue_depth.store(max_active_queue_depth, Ordering::Relaxed);
+
                         screen_frame_counter += 1;
                     }
                     Err(e) => {

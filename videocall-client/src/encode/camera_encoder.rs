@@ -60,7 +60,6 @@ pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -96,9 +95,6 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
 use videocall_aq::fit_within_preserving_aspect;
-
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -412,6 +408,26 @@ pub struct CameraEncoder {
     /// in single-stream mode (the legacy `current_bitrate` atomic is used
     /// instead). Sized to `SIMULCAST_MAX_SUPPORTED_LAYERS` lazily on first use.
     shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Sender-side encoder backpressure (issue #1108, Phase B): the max
+    /// `VideoEncoder::encode_queue_size()` across the ACTIVE layers, written by
+    /// the encode loop each frame and read by the AQ control loop to feed
+    /// [`EncoderBitrateController::observe_encoder_queue_depth`]. The encode loop
+    /// owns the `VideoEncoder`s and the control loop owns the controller, so this
+    /// atomic is the borrow-safe bridge between the two tasks — neither borrows
+    /// the other's state. **Stage 1: the controller only stores this value (no
+    /// shed/tier effect), so it is observability-only.**
+    shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Liveness token whose sole purpose is to bound the lifetime of the AQ
+    /// control-loop `spawn_local` future (issue #1108). The encoder holds the
+    /// only strong reference; `set_encoder_control` captures a [`Weak`] and
+    /// breaks its 1 Hz `tick` loop as soon as `upgrade()` returns `None`. Because
+    /// the control loop runs on `wasm_bindgen_futures::spawn_local` (NOT bound to
+    /// the Dioxus component scope), it would otherwise run forever and pin its
+    /// cloned `Rc` graph + `on_encoder_settings_update` callback across `Host`
+    /// remounts. When this `CameraEncoder` is dropped on unmount, the strong
+    /// count hits 0 and the loop exits cleanly — restoring the pre-#1108 lifetime
+    /// where the loop ended when the diagnostics channel closed.
+    control_loop_liveness: Rc<()>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -516,6 +532,13 @@ impl CameraEncoder {
             // build; the control loop adjusts it down/up under congestion.
             shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
+            // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
+            // (no frames queued); the encode loop publishes the live depth.
+            shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // AQ control-loop liveness token (issue #1108). The encoder is the
+            // sole strong owner; the self-tick loop holds a Weak and exits when
+            // this drops (encoder torn down on Host unmount).
+            control_loop_liveness: Rc::new(()),
         }
     }
 
@@ -530,10 +553,14 @@ impl CameraEncoder {
         clamp_layer_count(self.max_layers)
     }
 
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
+    /// Spawn the encoder AQ control loop (issue #1108: now a self-timer).
+    ///
+    /// Receiver-reported FPS no longer drives the sender AQ, so this loop is no
+    /// longer fed by a diagnostics channel. It ticks at `AQ_TICK_INTERVAL_MS`,
+    /// reading the sender's own encoder-queue backpressure (published by the
+    /// encode loop into `shared_encoder_queue_depth`) plus the server-CONGESTION
+    /// and WS-send-buffer signals, and applies tier/layer/bitrate decisions.
+    pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
@@ -561,6 +588,15 @@ impl CameraEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the control loop
+        // READS the depth the encode loop published and forwards it to the
+        // controller on each self-timer tick.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Liveness sentinel (issue #1108): a Weak to the encoder-owned token.
+        // The loop below breaks as soon as this fails to upgrade, i.e. when the
+        // CameraEncoder is dropped (Host unmount). Without this, the
+        // `spawn_local` future is immortal and leaks per remount.
+        let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -593,7 +629,30 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
-            while let Some(event) = diagnostics_receiver.next().await {
+            // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
+            // instead of waiting on receiver diagnostics. Runs for the lifetime
+            // of the owning CameraEncoder: this `spawn_local` future is NOT bound
+            // to the Dioxus component scope, so it must break itself when the
+            // encoder is torn down (Host unmount) — otherwise it would tick
+            // forever, pinning its cloned Rc graph and firing into a stale
+            // `on_encoder_settings_update` callback, leaking one loop per remount.
+            // The `control_loop_liveness` Weak fails to upgrade once the encoder
+            // (sole strong owner of the token) is dropped, which is our exit. The
+            // `enabled` flag does NOT terminate the loop — it only gates the
+            // bitrate-vs-"Disabled" emit below, so a muted-then-unmuted camera
+            // keeps adapting without re-arming.
+            loop {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
+                ))
+                .await;
+                // Encoder torn down? Stop ticking and let the future complete so
+                // its captured Rc graph is released.
+                if control_loop_liveness.upgrade().is_none() {
+                    log::debug!("CameraEncoder: AQ control loop exiting (encoder dropped)");
+                    break;
+                }
+                let now = js_sys::Date::now();
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
                 let screen_active = screen_sharing_active.load(Ordering::Acquire);
@@ -649,8 +708,7 @@ impl CameraEncoder {
                 // no-op.
                 {
                     let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
-                    let now_ms = js_sys::Date::now();
-                    let elapsed_ms = now_ms - ws_drop_window_start_ms;
+                    let elapsed_ms = now - ws_drop_window_start_ms;
 
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
@@ -667,13 +725,28 @@ impl CameraEncoder {
                             encoder_control.force_video_step_down();
                         }
                         last_ws_drop_snapshot = current_ws_drops;
-                        ws_drop_window_start_ms = now_ms;
+                        ws_drop_window_start_ms = now;
                     }
                 }
 
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                // Sender encoder backpressure (issue #1108). Feed the depth the
+                // encode loop published into the controller, then advance the AQ
+                // one tick. This is the SOLE gradual quality axis now: receiver
+                // FPS no longer reaches the sender AQ. The native bot feeds 0 in
+                // its own loop; here we forward the live WebCodecs queue depth.
+                encoder_control.observe_encoder_queue_depth(
+                    shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
+                encoder_control.tick(now);
+                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
-                // Write encoder decision inputs to shared atomics for health reporting.
+                // Write encoder decision inputs to shared atomics for health
+                // reporting. Issue #1108: the receiver-FPS-derived signals are
+                // gone — `last_fps_ratio()` / `last_bitrate_ratio()` now return
+                // NaN (the health reporter's is_finite() guard drops those proto
+                // fields), and `last_p75_peer_fps()` is REPOINTED to carry the new
+                // sender backpressure signal (encoder queue depth) so the existing
+                // host telemetry channel surfaces it with no proto/Grafana churn.
                 shared_encoder_fps_ratio.store(
                     (encoder_control.last_fps_ratio() as f32).to_bits(),
                     Ordering::Relaxed,
@@ -1125,6 +1198,9 @@ impl CameraEncoder {
         let simulcast = n_layers > 1;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the encode loop
+        // WRITES the max active-layer encode_queue_size() here each frame.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -2018,6 +2094,27 @@ impl CameraEncoder {
                             // the frame data by here. Never double-close: the
                             // fatal path below also reaches this single close.
                             video_frame.close();
+
+                            // Sender encoder backpressure (issue #1108, Phase B).
+                            // After submitting this frame to every ACTIVE layer,
+                            // sample the max `encode_queue_size()` across those
+                            // layers and publish it for the AQ control loop. We
+                            // mirror the encode gate above (skip layers
+                            // `>= local_active_layers` in simulcast mode) so a
+                            // shed layer's stale queue can't keep the signal hot.
+                            // For N==1 this is just the sole base layer's depth.
+                            // Stage 1: stored-only on the controller side, so this
+                            // is observability with no behavior change.
+                            let max_active_queue_depth = layers
+                                .iter()
+                                .filter(|l| {
+                                    !simulcast || (l.layer_id as usize) < local_active_layers
+                                })
+                                .map(|l| l.encoder.encode_queue_size())
+                                .max()
+                                .unwrap_or(0);
+                            shared_encoder_queue_depth
+                                .store(max_active_queue_depth, Ordering::Relaxed);
 
                             // First healthy frame after a restart resets the restart
                             // counter so transient errors don't accumulate toward

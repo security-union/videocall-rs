@@ -80,33 +80,40 @@ jobs:
         # spinning up the integration stack. The biggest accumulation is from
         # rebuilding docker/Dockerfile.actix.dev (FROM nixos/nix, multi-GB Nix
         # toolchain layers): every flake.nix/flake.lock/Dockerfile change leaves
-        # the previous image dangling, and the BuildKit cache grows unbounded.
+        # the *previous* tagged dev image orphaned (untagged-by-overwrite or
+        # simply no longer referenced), and the BuildKit cache grows unbounded.
+        #
+        # ESCALATION: a prior dangling-only prune (`docker image prune -f` +
+        # `docker builder prune -f`) was validated in CI and freed essentially
+        # nothing — the root disk was 100% full (500G/500G before AND after).
+        # The 500G is held by *tagged but unused* images (orphaned Nix dev
+        # images) that dangling-only pruning cannot touch. So we escalate to
+        # `docker system prune -af`.
         #
         # SHARED, SELF-HOSTED RUNNER SAFETY:
-        # This host runs 4 hcl-ci runners against ONE docker daemon. We must
-        # NOT use `docker system prune -a --volumes` — that would delete
-        # tagged base images (postgres:12, nats:2.10-alpine, the actix dev
-        # image) and named volumes that *other concurrent jobs* depend on.
-        # We only reclaim space that is provably unused by ANY job:
-        #   * `docker image prune -f`   -> dangling (untagged) images only.
-        #     Images referenced by a tag or by any running/stopped container
-        #     are kept, so concurrent jobs' images are untouched.
-        #   * `docker builder prune -f` -> unused build cache only. BuildKit
-        #     never evicts cache that an in-flight build is still using.
-        # The deliberate absence of `-a`/`--all` on both is what keeps this
-        # safe for parallel jobs. The `df -h` / `docker system df` brackets
-        # give visibility into how much was reclaimed; `|| true` ensures a
-        # cleanup hiccup never fails the test job.
+        # This host runs 4 hcl-ci runners against ONE docker daemon.
+        #   * `-af` removes ALL images not *currently in use* by a container
+        #     (plus stopped containers, unused networks, and build cache).
+        #     "Unused" means not referenced by a running/created container —
+        #     so every other concurrent job's running containers AND their
+        #     images are preserved. A concurrent job that merely *expected* a
+        #     cached image it isn't actively running will re-pull/rebuild it:
+        #     slower, not broken.
+        #   * `--volumes` is deliberately OMITTED. Named volumes (postgres/nats
+        #     data, the Nix store and cargo caches used by other runners) are
+        #     NEVER deleted by this step. Volume reclamation stays scoped to
+        #     the per-runner steps above (`compose down -v` + `volume prune`).
+        # The `df -h` / `docker system df` brackets give visibility into how
+        # much was reclaimed; `|| true` ensures a cleanup hiccup never fails
+        # the test job.
         working-directory: backend-repo
         run: |
           echo "=== Disk usage BEFORE cleanup ==="
           df -h || true
           echo "=== Docker disk usage BEFORE cleanup ==="
           sudo docker system df || true
-          echo "=== Pruning dangling images (untagged, unreferenced) ==="
-          sudo docker image prune -f || true
-          echo "=== Pruning unused build cache ==="
-          sudo docker builder prune -f || true
+          echo "=== Pruning ALL unused images + stopped containers + networks + build cache (volumes preserved) ==="
+          sudo docker system prune -af || true
           echo "=== Disk usage AFTER cleanup ==="
           df -h || true
           echo "=== Docker disk usage AFTER cleanup ==="

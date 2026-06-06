@@ -99,6 +99,11 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
     rsx! {
         button {
             class,
+            // Stable hook for E2E (the in-meeting camera toggle). Used by
+            // performance-settings.spec.ts to drive the camera ON/OFF for the
+            // send-diagnostics "Camera — off" regression guard (#1101) instead of
+            // a fragile tooltip/class selector.
+            "data-testid": "camera-toggle-button",
             disabled: !available,
             onclick: move |evt| onclick.call(evt),
             if enabled {

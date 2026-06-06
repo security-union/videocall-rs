@@ -805,6 +805,47 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // 1b. RECEIVE-side per-row diagnostics footer (PR #1101 / issue #1095).
+  //
+  // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
+  // needs a renderer-crash-resilient runner + a capability-override hook. The
+  // RECEIVE diagnostics footer's DISCLOSURE only appears when the receiver is
+  // decoding the SAME kind from MORE THAN ONE peer:
+  //   * 0 peers → static "Not receiving" (covered single-context, green, in
+  //     performance-settings.spec.ts → receive-needle/readout tests),
+  //   * 1 peer  → static inline "From {peer} · L{i}/{N} · {res}" (no disclosure),
+  //   * >= 2 peers → a disclosure `<button>` (`perf-recv-{kind}-diag-summary`,
+  //     "{n} peers · L{lo}–L{hi}") whose detail (`perf-recv-{kind}-diag-detail`)
+  //     lists the top-3 peers as `perf-recv-{kind}-diag-peer-{sessionId}` rows
+  //     plus, when n > 3, a `perf-recv-{kind}-diag-more` tail ("+{n-3} more …").
+  //
+  // Exercising the per-peer rows + the "+N more" tail therefore requires a real
+  // multi-peer simulcast meeting (>= 2 senders so the receiver has >= 2 peers for
+  // a kind, and ideally >= 4 to render the "+more" tail). That is blocked on the
+  // same harness gaps as every other multi-party test here (#1093): headless CI
+  // crashes the extra contexts ("Target page/context closed") and the capability
+  // ceiling clamps layers to 1. Documented as `test.fixme` (the single-context
+  // structural receive coverage lives in performance-settings.spec.ts #1078).
+  //
+  // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
+  // purpose so it is a documented stub, not a runnable test):
+  //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
+  //   2. openPerformancePanel(rxPage) (Receive direction).
+  //   3. expect.poll `perf-recv-video-diag-summary` to read /\d+ peers · L/.
+  //   4. Click it → `perf-recv-video-diag-detail` visible; assert a
+  //      `perf-recv-video-diag-peer-{sessionId}` row exists for each visible peer
+  //      (top-3), and with >= 4 publishers assert `perf-recv-video-diag-more`
+  //      reads /\+\d+ more/.
+  //   5. Capability-gate the per-peer LAYER assertions (rung/layer counts) on the
+  //      received ladder size, mirroring the send-side single-layer skip.
+  // -------------------------------------------------------------------------
+  test.fixme("receive diagnostics list per-peer rows and a '+N more' tail with multiple publishers", async () => {
+    // Blocked on #1093 (multi-peer harness): see the block comment above for
+    // the intended multi-publisher flow and the `perf-recv-*-diag-peer-{id}` /
+    // `perf-recv-*-diag-more` assertions this will perform.
+  });
+
+  // -------------------------------------------------------------------------
   // 2. Per-receiver congestion DIVERGENCE over WebSocket (issues #1080 + #1108).
   //
   //    Now EXERCISED via the per-client downlink-impairment infra

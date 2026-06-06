@@ -33,6 +33,7 @@ pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
     camera_encoder_frames_submitted_ok, CameraEncoder, LiveQualitySnapshot, QualityTierBounds,
+    SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{

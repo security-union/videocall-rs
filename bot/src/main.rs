@@ -799,6 +799,9 @@ async fn run_client(
         let ekg_height = v0.max_height;
         let ekg_fps = v0.target_fps.max(1);
         let video_mode = &bot_config.video_mode;
+        // Resolved simulcast layer count (#989): default 3, clamped to
+        // 1..=SIMULCAST_MAX_LAYERS. N==1 = legacy single-stream path.
+        let simulcast_layers = bot_config.simulcast_layer_count();
         if *video_mode == VideoMode::Costume {
             if let Some(ref dir) = costume_dir {
                 let renderer = CostumeRenderer::load(Path::new(dir))?;
@@ -814,6 +817,7 @@ async fn run_client(
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
                     transport_drops_counter.clone(),
+                    simulcast_layers,
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -838,6 +842,7 @@ async fn run_client(
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
                     transport_drops_counter.clone(),
+                    simulcast_layers,
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -859,6 +864,7 @@ async fn run_client(
                 encoder_errors_generic.clone(),
                 encoder_frames_ok.clone(),
                 transport_drops_counter.clone(),
+                simulcast_layers,
             )?);
             info!("EKG video producer started for {}", user_id);
         }

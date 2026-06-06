@@ -24,7 +24,6 @@ use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
-    capability_check::{assess_capability, CapabilityVerdict},
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -797,14 +796,6 @@ pub fn AttendantsComponent(
     let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
-    // Pre-join capability verdict (Phase 9). Computed once at component mount —
-    // hardware concurrency / UA platform don't change while the page is open.
-    // Block / StrongWarn surfaces UI in the lobby below; Ok proceeds normally.
-    let capability_verdict = use_hook(assess_capability);
-    // Has the user explicitly dismissed the StrongWarn modal? Once true the
-    // join button (and the auto_join effect) proceeds normally for the rest
-    // of the lobby session.
-    let mut capability_acknowledged = use_signal(|| false);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
@@ -2573,30 +2564,18 @@ pub fn AttendantsComponent(
         }
     });
 
-    // Auto-join on first render if requested.
-    // Gated by the Phase 9 capability verdict: a Block must surface its UI
-    // before media is acquired, and a StrongWarn must be acknowledged first.
+    // Auto-join on first render if requested. Every device joins regardless of
+    // capabilities (issue #1054) — there is no pre-join gate.
     {
         let mda = mda.clone();
-        let verdict = capability_verdict.clone();
         use_effect(move || {
             if !auto_join {
                 return;
             }
-            match &verdict {
-                CapabilityVerdict::Block(_) => {
-                    log::warn!("capability-check: auto_join suppressed by Block verdict");
-                }
-                CapabilityVerdict::StrongWarn(_) if !capability_acknowledged() => {
-                    log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
-                }
-                _ => {
-                    // Direct-URL auto-join: a real join, so the permission
-                    // callback must proceed to connect (issue #959).
-                    join_requested.set(true);
-                    mda.borrow().request();
-                }
-            }
+            // Direct-URL auto-join: a real join, so the permission callback must
+            // proceed to connect (issue #959).
+            join_requested.set(true);
+            mda.borrow().request();
         });
     }
 
@@ -3247,21 +3226,9 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
-        // Phase 9 capability gating. Snapshot the verdict for this render so we
-        // don't pay the navigator cost again — `assess_capability` already ran
-        // at component mount via `use_hook`.
-        let verdict = capability_verdict.clone();
-        let is_blocked = matches!(verdict, CapabilityVerdict::Block(_));
-        let strong_warn_msg = match &verdict {
-            CapabilityVerdict::StrongWarn(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let block_msg = match &verdict {
-            CapabilityVerdict::Block(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let show_strong_warn_modal = strong_warn_msg.is_some() && !capability_acknowledged();
-
+        // Every device joins regardless of capabilities (issue #1054): the
+        // lobby always renders the PreJoinSettingsCard and the join button is
+        // always enabled. No pre-join capability gate.
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
@@ -3270,178 +3237,96 @@ pub fn AttendantsComponent(
                     div { class: "floating-element floating-element-2" }
                     div { class: "floating-element floating-element-3" }
                     div { class: "hero-content",
-                        if let Some(msg) = block_msg.clone() {
-                            // Hard-block: render an error card in place of the
-                            // join card. The user has to switch to a different
-                            // device — there is no override for this verdict.
-                            div {
-                                class: "settings-card",
-                                role: "alert",
-                                "aria-live": "assertive",
-                                div { class: "join-meeting-header",
-                                    h2 { class: "join-meeting-title",
-                                        span { class: "join-meeting-title-text", "Device not supported" }
+                        PreJoinSettingsCard {
+                            is_owner,
+                            meeting_id: id.clone(),
+                            waiting_room_toggle,
+                            admitted_can_admit_toggle,
+                            end_on_host_leave_toggle,
+                            allow_guests_toggle,
+                            saving,
+                            toggle_error,
+                            connection_error,
+                            media_access_granted: media_access_granted(),
+                            speaker_selection_supported: speaker_supported,
+                            cameras: prejoin_cameras(),
+                            microphones: prejoin_microphones(),
+                            speakers: prejoin_speakers(),
+                            selected_camera_id: prejoin_selected_camera(),
+                            selected_microphone_id: prejoin_selected_mic(),
+                            selected_speaker_id: prejoin_selected_speaker(),
+                            camera_on: prejoin_camera_on,
+                            mic_on: prejoin_mic_on,
+                            on_request_permission: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Preview-only permission request: does NOT join
+                                    // (join_requested stays false).
+                                    mda.borrow().request();
+                                }
+                            },
+                            on_camera_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_camera_on.set(on);
+                                    save_preferred_camera_on(on);
+                                    if on {
+                                        let id = prejoin_selected_camera()
+                                            .unwrap_or_default();
+                                        preview_engine.start_camera(id);
+                                    } else {
+                                        preview_engine.stop_camera();
                                     }
                                 }
-                                p { class: "toggle-error", "{msg}" }
-                                div { class: "settings-action-row",
-                                    button {
-                                        class: "btn-apple btn-primary settings-action-btn",
-                                        disabled: true,
-                                        "aria-disabled": "true",
-                                        if is_owner {
-                                            "Start Meeting"
-                                        } else {
-                                            "Join Meeting"
-                                        }
+                            },
+                            on_mic_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_mic_on.set(on);
+                                    save_preferred_mic_on(on);
+                                    if on {
+                                        let id = prejoin_selected_mic().unwrap_or_default();
+                                        preview_engine.start_mic_meter(id);
+                                    } else {
+                                        preview_engine.stop_mic_meter();
                                     }
                                 }
-                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
-                                    "Meeting join is disabled for this device."
-                                }
-                            }
-                        } else {
-                            PreJoinSettingsCard {
-                                is_owner,
-                                meeting_id: id.clone(),
-                                waiting_room_toggle,
-                                admitted_can_admit_toggle,
-                                end_on_host_leave_toggle,
-                                allow_guests_toggle,
-                                saving,
-                                toggle_error,
-                                connection_error,
-                                media_access_granted: media_access_granted(),
-                                speaker_selection_supported: speaker_supported,
-                                cameras: prejoin_cameras(),
-                                microphones: prejoin_microphones(),
-                                speakers: prejoin_speakers(),
-                                selected_camera_id: prejoin_selected_camera(),
-                                selected_microphone_id: prejoin_selected_mic(),
-                                selected_speaker_id: prejoin_selected_speaker(),
-                                camera_on: prejoin_camera_on,
-                                mic_on: prejoin_mic_on,
-                                on_request_permission: {
-                                    let mda = mda.clone();
-                                    move |_| {
-                                        // Preview-only permission request: does NOT join
-                                        // (join_requested stays false).
-                                        mda.borrow().request();
-                                    }
-                                },
-                                on_camera_toggle: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |on: bool| {
-                                        prejoin_camera_on.set(on);
-                                        save_preferred_camera_on(on);
-                                        if on {
-                                            let id = prejoin_selected_camera()
-                                                .unwrap_or_default();
-                                            preview_engine.start_camera(id);
-                                        } else {
-                                            preview_engine.stop_camera();
-                                        }
-                                    }
-                                },
-                                on_mic_toggle: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |on: bool| {
-                                        prejoin_mic_on.set(on);
-                                        save_preferred_mic_on(on);
-                                        if on {
-                                            let id = prejoin_selected_mic().unwrap_or_default();
-                                            preview_engine.start_mic_meter(id);
-                                        } else {
-                                            preview_engine.stop_mic_meter();
-                                        }
-                                    }
-                                },
-                                on_camera_select: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |info: DeviceInfo| {
-                                        prejoin_selected_camera.set(Some(info.device_id.clone()));
-                                        save_preferred_camera_id(&info.device_id);
-                                        // Re-acquire the preview with the new device
-                                        // (only while the camera is on).
-                                        if prejoin_camera_on() {
-                                            preview_engine.start_camera(info.device_id);
-                                        }
-                                    }
-                                },
-                                on_microphone_select: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |info: DeviceInfo| {
-                                        prejoin_selected_mic.set(Some(info.device_id.clone()));
-                                        save_preferred_mic_id(&info.device_id);
-                                        if prejoin_mic_on() {
-                                            preview_engine.start_mic_meter(info.device_id);
-                                        }
-                                    }
-                                },
-                                on_speaker_select: move |info: DeviceInfo| {
-                                    prejoin_selected_speaker.set(Some(info.device_id.clone()));
-                                    save_preferred_speaker_id(&info.device_id);
-                                },
-                                on_join: {
-                                    let mda = mda.clone();
-                                    let has_strong_warn = strong_warn_msg.is_some();
-                                    move |_| {
-                                        if is_blocked {
-                                            log::warn!("capability-check: join click ignored — Block verdict");
-                                            return;
-                                        }
-                                        if has_strong_warn && !capability_acknowledged() {
-                                            log::info!("capability-check: showing StrongWarn modal");
-                                            return;
-                                        }
-                                        // Mark this as a real join so the permission
-                                        // callback proceeds to connect (issue #959).
-                                        join_requested.set(true);
-                                        mda.borrow().request();
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-                if show_strong_warn_modal {
-                    {
-                        let msg = strong_warn_msg.clone().unwrap_or_default();
-                        let mda_continue = mda.clone();
-                        let mda_audio = mda.clone();
-                        rsx! {
-                            div {
-                                class: "modal-overlay",
-                                role: "dialog",
-                                "aria-modal": "true",
-                                "aria-labelledby": "capability-warn-title",
-                                div { class: "modal-window",
-                                    h3 { id: "capability-warn-title", "Performance warning" }
-                                    p { style: "margin-top: 0.5rem;", "{msg}" }
-                                    div { style: "display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap;",
-                                        button {
-                                            class: "btn-apple btn-secondary",
-                                            onclick: move |_| {
-                                                log::info!("capability-check: user chose Audio-only");
-                                                capability_acknowledged.set(true);
-                                                join_requested.set(true);
-                                                mda_audio.borrow().request();
-                                            },
-                                            "Switch to audio-only"
-                                        }
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            onclick: move |_| {
-                                                log::info!("capability-check: user chose Continue anyway");
-                                                capability_acknowledged.set(true);
-                                                join_requested.set(true);
-                                                mda_continue.borrow().request();
-                                            },
-                                            "Continue anyway"
-                                        }
+                            },
+                            on_camera_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_camera.set(Some(info.device_id.clone()));
+                                    save_preferred_camera_id(&info.device_id);
+                                    // Re-acquire the preview with the new device
+                                    // (only while the camera is on).
+                                    if prejoin_camera_on() {
+                                        preview_engine.start_camera(info.device_id);
                                     }
                                 }
-                            }
+                            },
+                            on_microphone_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_mic.set(Some(info.device_id.clone()));
+                                    save_preferred_mic_id(&info.device_id);
+                                    if prejoin_mic_on() {
+                                        preview_engine.start_mic_meter(info.device_id);
+                                    }
+                                }
+                            },
+                            on_speaker_select: move |info: DeviceInfo| {
+                                prejoin_selected_speaker.set(Some(info.device_id.clone()));
+                                save_preferred_speaker_id(&info.device_id);
+                            },
+                            on_join: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Mark this as a real join so the permission
+                                    // callback proceeds to connect (issue #959).
+                                    join_requested.set(true);
+                                    mda.borrow().request();
+                                }
+                            },
                         }
                     }
                 }

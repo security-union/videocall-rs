@@ -1374,9 +1374,14 @@ html[data-theme="light"] #invite-overlay p {
   --accent-2: #8e66ff;
   --accent-3: #bf5af2;
 
-  /* Settings modal geometry */
+  /* Settings modal geometry. Height bumped 720→760 / 92→94vh so the Performance
+     tab's three per-kind cards fit the modal body without scrolling on a 768px
+     display (the #1095 no-scroll requirement). Applied to the SHARED token, not
+     just the Performance tab, so switching tabs never resizes the modal (no
+     resize-on-tab-switch jank). On a 768px screen the body is now ~634px usable
+     vs ~622px of Performance content. */
   --settings-modal-width: min(880px, 92vw);
-  --settings-modal-height: min(720px, 92vh);
+  --settings-modal-height: min(760px, 94vh);
   --settings-modal-radius: 16px;
   --settings-panel-radius: 16px;
   --settings-sidebar-width: 250px;

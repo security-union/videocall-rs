@@ -4,7 +4,7 @@
  */
 
 //! Unified Performance settings panel — SEND quality bounds (#961) AND RECEIVE
-//! layer bounds (#989 simulcast), with live "Sending" and "Receiving" needles.
+//! layer bounds (#989 simulcast), with live "Sending" and "Receiving" bar-meters.
 //!
 //! Now that the call supports per-receiver simulcast, the Performance panel
 //! exposes **two** controls per media kind (Video, Audio, Screen/content):
@@ -34,15 +34,17 @@
 //! so the visual is consistent; only the index→bound mapping differs, and it is
 //! kept strictly separate by the module boundary.
 //!
-//! # The needles
+//! # The bar-meters
 //!
-//! Each kind shows a **Sending** needle (from [`SnapshotReader`], the live
-//! encoder snapshot) and a **Receiving** needle (from
-//! [`receive::ReceivedReader`], the live `received_layer_snapshot`). Two headless
-//! rAF drivers ([`QualityVuMeterDriver`] for send, [`receive::ReceivedQualityDriver`]
-//! for receive) poll at ~4 Hz and write each needle's rotation + readout straight
-//! to the DOM by id (bypassing the Dioxus diff). Send and receive needles use
-//! DISTINCT DOM ids so the two drivers never fight over the same node.
+//! Each kind shows a **Sending** bar-meter (from [`SnapshotReader`], the live
+//! encoder snapshot) and a **Receiving** bar-meter (from
+//! [`receive::ReceivedReader`], the live `received_layer_snapshot`). Each meter is
+//! four vertical bars whose lit count is a level `0..=4`, plus a one-line readout.
+//! Two headless rAF drivers ([`QualityVuMeterDriver`] for send,
+//! [`receive::ReceivedQualityDriver`] for receive) poll at ~4 Hz and write each
+//! meter's `data-level` attribute + readout text straight to the DOM by id
+//! (bypassing the Dioxus diff). Send and receive meters use DISTINCT DOM ids so
+//! the two drivers never fight over the same node.
 
 use dioxus::prelude::*;
 use std::rc::Rc;
@@ -211,7 +213,7 @@ pub struct DiagnosticsReader {
     /// The effective simulcast setting (flag × capability), captured at mount.
     pub summary: SimulcastSummary,
     /// Reads the camera's live SEND simulcast snapshot (`None` while the camera
-    /// is off — gated on `prev_video_enabled`, mirroring the quality needle and
+    /// is off — gated on `prev_video_enabled`, mirroring the quality meter and
     /// the screen path; otherwise stale "N of M layers active" would render with
     /// the camera disabled, since the encoder atomics aren't reset on stop).
     pub send_video: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
@@ -417,6 +419,25 @@ pub fn format_audio_receive_summary(n_peers: usize) -> String {
         "Not receiving audio".to_string()
     } else {
         "Pulling near-full quality".to_string()
+    }
+}
+
+/// AUDIO SEND summary, derived from the user's bounds (the audio row has no
+/// per-layer encoder snapshot, so unlike video/content this reads the *intent*,
+/// not the live wire). On Auto or full-range → `"Sending high quality"`; with a
+/// manual cap → `"Sending up to {best-tier kbps}"` so a lowered cap is reflected
+/// rather than claiming "high quality" falsely (#5). `best` is the best-allowed
+/// SEND tier index (0 = best); `None` = no cap. Pure / host-tested.
+pub fn format_audio_send_summary(is_auto: bool, best: Option<usize>) -> String {
+    // Auto, or no upper cap, or the cap is already the best tier (index 0) →
+    // we're sending the full-quality top tier.
+    match best {
+        _ if is_auto => "Sending high quality".to_string(),
+        None | Some(0) => "Sending high quality".to_string(),
+        Some(idx) => {
+            let label = AUDIO_TIER_LABELS.get(idx).copied().unwrap_or("?");
+            format!("Sending up to {label}")
+        }
     }
 }
 
@@ -1438,9 +1459,19 @@ fn SendCell(
 
     rsx! {
         div { class: "perf-side perf-side--send",
+            // Head row: the bar-meter sits INLINE here (not on its own line) to
+            // keep the per-side height down for the no-scroll budget (#2d).
             div { class: "perf-side__head",
                 span { class: "perf-side__title", "Sending" }
                 span { class: "perf-side__consequence", "{consequence}" }
+                PerfMeter {
+                    testid: vu_testid,
+                    meter_id: vu_meter_id,
+                    readout_id: vu_readout_id,
+                    label: vu_label,
+                    initial_level: vu_initial_level,
+                    initial_readout: vu_initial_readout,
+                }
                 HelpPopover {
                     key_id: id_prefix,
                     help_testid,
@@ -1472,14 +1503,6 @@ fn SendCell(
                     "Auto"
                 }
             }
-            PerfMeter {
-                testid: vu_testid,
-                meter_id: vu_meter_id,
-                readout_id: vu_readout_id,
-                label: vu_label,
-                initial_level: vu_initial_level,
-                initial_readout: vu_initial_readout,
-            }
             DualRangeSlider {
                 id_prefix,
                 min_testid,
@@ -1489,13 +1512,18 @@ fn SendCell(
                 sel,
                 on_change: move |s: RangeSel| on_change.call(s),
             }
-            p {
-                class: "perf-range-value",
-                "data-testid": "{id_prefix}-range-value",
-                "aria-live": "polite",
-                "Sending: {range_str}"
+            // The slider range readout + the live summary share ONE flex line to
+            // save vertical space (#2e). The range-value keeps its own testid and
+            // stable `span_text` content (no aria-live — #4: a native range input
+            // already announces on change; two live regions/side were SR chatter).
+            div { class: "perf-side__caption",
+                p {
+                    class: "perf-range-value",
+                    "data-testid": "{id_prefix}-range-value",
+                    "Sending: {range_str}"
+                }
+                p { class: "perf-summary-line", "{summary_line}" }
             }
-            p { class: "perf-summary-line", "{summary_line}" }
         }
     }
 }
@@ -1622,7 +1650,10 @@ pub fn PerformanceSettingsPanel(
             .map(|p| p.snap.layer_index)
             .collect::<Vec<_>>(),
     );
-    let audio_send_line = "Sending high quality".to_string();
+    // Audio has no per-layer snapshot; derive its send summary from the user's
+    // bounds so a lowered cap is reflected rather than always claiming "high
+    // quality" (#5).
+    let audio_send_line = format_audio_send_summary(pref.audio_auto, pref.audio_max);
     let audio_recv_line = format_audio_receive_summary(recv_audio_peers.len());
     let content_send_line = format_content_send_summary(send_screen_snap.as_ref());
     // Top-layer screen-share peer (highest layer_index) for the content receive line.
@@ -2463,6 +2494,14 @@ pub mod receive {
                 div { class: "perf-side__head",
                     span { class: "perf-side__title", "Receiving" }
                     span { class: "perf-side__consequence", "{consequence}" }
+                    super::PerfMeter {
+                        testid: meta.vu_testid,
+                        meter_id: vu_meter_id,
+                        readout_id: vu_readout_id,
+                        label: meta.vu_label,
+                        initial_level: vu_initial_level,
+                        initial_readout: vu_initial_readout,
+                    }
                     super::HelpPopover {
                         key_id: meta.id_prefix,
                         help_testid: meta.help_testid,
@@ -2501,14 +2540,6 @@ pub mod receive {
                         "Auto"
                     }
                 }
-                super::PerfMeter {
-                    testid: meta.vu_testid,
-                    meter_id: vu_meter_id,
-                    readout_id: vu_readout_id,
-                    label: meta.vu_label,
-                    initial_level: vu_initial_level,
-                    initial_readout: vu_initial_readout,
-                }
                 DualRangeSlider {
                     kind,
                     id_prefix: meta.id_prefix,
@@ -2521,13 +2552,16 @@ pub mod receive {
                         on_change.call(KindReceivePref { min, max, auto: false });
                     },
                 }
-                p {
-                    class: "perf-range-value",
-                    "data-testid": "{meta.id_prefix}-range-value",
-                    "aria-live": "polite",
-                    "Receiving: {range_str}"
+                // One flex line for the range readout + live summary (#2e). No
+                // aria-live on the range-value (#4).
+                div { class: "perf-side__caption",
+                    p {
+                        class: "perf-range-value",
+                        "data-testid": "{meta.id_prefix}-range-value",
+                        "Receiving: {range_str}"
+                    }
+                    p { class: "perf-summary-line", "{summary_line}" }
                 }
-                p { class: "perf-summary-line", "{summary_line}" }
             }
         }
     }
@@ -3195,6 +3229,35 @@ mod tests {
         assert_eq!(format_audio_receive_summary(0), "Not receiving audio");
         assert_eq!(format_audio_receive_summary(1), "Pulling near-full quality");
         assert_eq!(format_audio_receive_summary(5), "Pulling near-full quality");
+    }
+
+    #[test]
+    fn audio_send_summary_reflects_a_lowered_cap() {
+        // Auto → the full-quality phrase regardless of stored index.
+        assert_eq!(
+            format_audio_send_summary(true, Some(2)),
+            "Sending high quality"
+        );
+        // Manual, no cap / best-tier cap → full quality.
+        assert_eq!(
+            format_audio_send_summary(false, None),
+            "Sending high quality"
+        );
+        assert_eq!(
+            format_audio_send_summary(false, Some(0)),
+            "Sending high quality"
+        );
+        // Manual with a lowered cap → reflects the capped tier (not "high
+        // quality"). AUDIO_TIER_LABELS[2] == "24 kbps".
+        assert_eq!(
+            format_audio_send_summary(false, Some(2)),
+            "Sending up to 24 kbps"
+        );
+        // Out-of-range index degrades gracefully rather than panicking.
+        assert_eq!(
+            format_audio_send_summary(false, Some(99)),
+            "Sending up to ?"
+        );
     }
 
     #[test]

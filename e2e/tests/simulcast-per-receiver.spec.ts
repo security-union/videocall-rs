@@ -310,11 +310,11 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
 /**
  * Open Settings → Performance and return the visible perf tabpanel locator.
  *
- * The unified panel (#1078) has a `Receive | Send` direction toggle and renders
- * ONLY the active direction's three rows. Receive is the default, but this whole
- * spec reads RECEIVE needles/controls, so we click the Receive segment defensively
- * to guarantee the receive rows are mounted (the `@impair` divergence test reads
- * the receive needle and must be on this direction).
+ * The #1095 redesign REMOVED the old `Receive | Send` direction toggle: every
+ * per-kind card now renders both a Sending and a Receiving column at once, so the
+ * receive controls/meters (`perf-recv-*` / `perf-vu-recv-*`) are always mounted
+ * once the Performance tab is open. We assert the receive video meter is visible
+ * as a readiness guard (this whole spec reads RECEIVE needles/controls).
  */
 async function openPerformancePanel(page: Page) {
   await page.locator('[data-testid="open-settings"]').click();
@@ -855,19 +855,24 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 1b. RECEIVE-side per-row diagnostics footer (PR #1101 / issue #1095).
+  // 1b. Per-peer RECEIVE breakdown — now in the Diagnostics "Simulcast layers"
+  // section (#1095 §6 MOVE; the old in-panel `perf-recv-{kind}-diag-*` footer was
+  // REMOVED).
   //
   // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
-  // needs a renderer-crash-resilient runner + a capability-override hook. The
-  // RECEIVE diagnostics footer's DISCLOSURE only appears when the receiver is
-  // decoding the SAME kind from MORE THAN ONE peer:
-  //   * 0 peers → static "Not receiving" (covered single-context, green, in
+  // needs a renderer-crash-resilient runner + a capability-override hook. After
+  // the #1095 redesign the per-peer receive breakdown lives in the Diagnostics
+  // sidebar (reached via the `diag-open-performance` ⇄ `perf-open-diagnostics`
+  // cross-nav), one block per kind, only rendered when >= 1 peer is decoding that
+  // kind:
+  //   * 0 peers → the kind block is absent (single-context receive coverage —
+  //     the "Not receiving" readout placeholder — is green in
   //     performance-settings.spec.ts → receive-needle/readout tests),
-  //   * 1 peer  → static inline "From {peer} · L{i}/{N} · {res}" (no disclosure),
-  //   * >= 2 peers → a disclosure `<button>` (`perf-recv-{kind}-diag-summary`,
-  //     "{n} peers · L{lo}–L{hi}") whose detail (`perf-recv-{kind}-diag-detail`)
-  //     lists the top-3 peers as `perf-recv-{kind}-diag-peer-{sessionId}` rows
-  //     plus, when n > 3, a `perf-recv-{kind}-diag-more` tail ("+{n-3} more …").
+  //   * >= 1 peer → `[data-testid="diag-simulcast-recv-{kind}"]` with a head
+  //     "{kind} · {n} peer(s) · {spread}", the top-3 peers as
+  //     `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` rows, plus, when
+  //     n > 3, a `[data-testid="diag-simulcast-recv-more-{kind}"]` tail
+  //     ("+{n-3} more peer(s) at L{lo}").
   //
   // Exercising the per-peer rows + the "+N more" tail therefore requires a real
   // multi-peer simulcast meeting (>= 2 senders so the receiver has >= 2 peers for
@@ -880,19 +885,22 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
   // purpose so it is a documented stub, not a runnable test):
   //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
-  //   2. openPerformancePanel(rxPage) (Receive direction).
-  //   3. expect.poll `perf-recv-video-diag-summary` to read /\d+ peers · L/.
-  //   4. Click it → `perf-recv-video-diag-detail` visible; assert a
-  //      `perf-recv-video-diag-peer-{sessionId}` row exists for each visible peer
-  //      (top-3), and with >= 4 publishers assert `perf-recv-video-diag-more`
-  //      reads /\+\d+ more/.
+  //   2. openPerformancePanel(rxPage), then click `perf-open-diagnostics` to land
+  //      in the Diagnostics sidebar's "Simulcast layers" section.
+  //   3. expect.poll `[data-testid="diag-simulcast-recv-video"]` head to read
+  //      /\d+ peer\(s\) · L/.
+  //   4. Assert a `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` row
+  //      exists for each visible peer (top-3), and with >= 4 publishers assert
+  //      `[data-testid="diag-simulcast-recv-more-video"]` reads /\+\d+ more/.
   //   5. Capability-gate the per-peer LAYER assertions (rung/layer counts) on the
   //      received ladder size, mirroring the send-side single-layer skip.
   // -------------------------------------------------------------------------
   test.fixme("receive diagnostics list per-peer rows and a '+N more' tail with multiple publishers", async () => {
-    // Blocked on #1093 (multi-peer harness): see the block comment above for
-    // the intended multi-publisher flow and the `perf-recv-*-diag-peer-{id}` /
-    // `perf-recv-*-diag-more` assertions this will perform.
+    // Blocked on #1093 (multi-peer harness): see the block comment above for the
+    // intended multi-publisher flow and the `diag-simulcast-recv-peer-{id}` /
+    // `diag-simulcast-recv-more-{kind}` assertions this will perform (the breakdown
+    // moved to the Diagnostics panel in #1095; the old `perf-recv-*-diag-*` footer
+    // testids no longer exist).
   });
 
   // -------------------------------------------------------------------------
@@ -1407,37 +1415,27 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 // and that receiver receives it again.
 //
 // =========================================================================
-// TWO INDEPENDENT BLOCKERS → these tests are `test.fixme` (both transports)
+// REMAINING BLOCKER → these tests are `test.fixme` (both transports)
 // =========================================================================
-// 1. NO PUBLISHER-SIDE DOM OBSERVABILITY ON THIS BRANCH.
-//    The behaviour the spec must assert is "the PUBLISHER stopped encoding the
-//    top rung(s)". On this branch the publisher's shrinking ladder is NOT
-//    surfaced to any DOM element:
-//      - The SEND Performance panel renders a single aggregate
-//        `LiveQualitySnapshot` (`#perf-vu-video-readout` = `{w}x{h}·{fps}fps·
-//        {kbps}kbps`, driven by a quality-TIER index + target bitrate). It has
-//        NO per-rung array and NO shed marker.
-//      - The encoder DOES track the capped count internally
-//        (`CameraEncoder::shared_active_layer_count`, written from
-//        `EncoderBitrateController::active_layer_count()` which the Stage 3 union
-//        cap feeds), but that atom is NOT exposed in `dioxus-ui/src/` — grep for
-//        `active_layer_count` in the UI returns nothing.
-//    The per-rung publisher diagnostics this task expects (the
-//    `live_simulcast_snapshot` shed markers — top rungs rendering
-//    `bitrate_kbps == 0` / shed styling, testids `perf-video-diag-rung-*`) live
-//    on the UNMERGED branch `feat/perf-panel-simulcast-diagnostics` (PR #1095 /
-//    #1101). They are NOT on `main` and NOT on this Stage 3 branch, so there is
-//    no stable selector to assert against today. The body below is written
-//    against those `perf-video-diag-rung-*` testids so it goes green the moment
-//    that diagnostics panel merges AND the multi-party harness (below) lands.
+// MULTI-PARTY HARNESS LIMITS — #1093 (same blocker as every other multi-context
+// test in this spec). These cases join 3+ authenticated contexts each running
+// camera + simulcast encode/decode; in headless CI the extra renderers crash
+// ("Target page/context closed") and the capability ceiling clamps the runner to
+// 1 layer (so there is no top rung TO shed). The WS case also relies on driving
+// "every receiver pins base" reliably across contexts, which is exactly the
+// multi-party determinism #1093 tracks.
 //
-// 2. MULTI-PARTY HARNESS LIMITS — #1093 (same blocker as every other
-//    multi-context test in this spec). These cases join 3+ authenticated
-//    contexts each running camera + simulcast encode/decode; in headless CI the
-//    extra renderers crash ("Target page/context closed") and the capability
-//    ceiling clamps the runner to 1 layer (so there is no top rung TO shed). The
-//    WS case also relies on driving "every receiver pins base" reliably across
-//    contexts, which is exactly the multi-party determinism #1093 tracks.
+// NOTE — publisher-side DOM observability is NO LONGER a blocker. It WAS (the
+// old design exposed nothing), but the #1095 redesign on THIS branch surfaces the
+// publisher's per-rung send ladder in the Diagnostics sidebar's "Simulcast
+// layers" section: one chip per layer, testid `diag-simulcast-rung-{layer_id}`,
+// with the shed state conveyed by an `is-shed` CSS class (active rungs carry
+// `is-active`). The body below is written against THOSE selectors (reached via
+// the `perf-open-diagnostics` cross-nav on the publisher), so it goes green the
+// moment the #1093 multi-party harness lands — no further UI work is needed.
+// (The earlier `perf-video-diag-rung-*` / `data-shed` / `data-bitrate-kbps`
+// contract from the never-merged `feat/perf-panel-simulcast-diagnostics` branch
+// does NOT exist; do not reintroduce it.)
 //
 // =========================================================================
 // WHAT IS RUNNABLE NOW vs FIXME
@@ -1446,13 +1444,12 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 //     (the RECEIVE max-layer slider → `LAYER_PREFERENCE` path) and `pinTransport`
 //     are both exercised live by other tests in this repo
 //     (performance-settings.spec.ts and cross-transport-display-name.spec.ts
-//     respectively). There is NO runnable ASSERTION of the publisher-side result
-//     today because the observable surface does not exist on this branch.
+//     respectively). The publisher-side ASSERTION surface (the Diagnostics
+//     ladder) now exists, but the end-to-end test still cannot RUN because the
+//     3-context join is blocked on #1093.
 //   - FIXME (both WT and WS): the end-to-end "publisher sheds the top rung, then
-//     restores it" assertion — blocked on BOTH (1) the diagnostics panel merging
-//     and (2) the #1093 multi-party harness. No NEW tracking issue is needed:
-//     blocker (2) reuses #1093 (multi-party harness); blocker (1) is the
-//     PR #1095/#1101 diagnostics merge.
+//     restores it" assertion — blocked ONLY on the #1093 multi-party harness now.
+//     No NEW tracking issue is needed: it reuses #1093.
 //
 // NOTE: unlike the Stage 2 `@impair` divergence test, Stage 3 needs NO toxiproxy
 // / network shaping — the suppression trigger is purely "all receivers request
@@ -1535,8 +1532,11 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
         });
 
         // Open the receive Performance panels (where the max-layer sliders live)
-        // on both receivers, and the SEND Performance panel on the publisher
-        // (where the per-rung send diagnostics render once #1095/#1101 merges).
+        // on both receivers, and the Diagnostics sidebar on the publisher (where
+        // the per-rung SEND ladder now lives after the #1095 redesign — it MOVED
+        // out of the Performance panel into the "Simulcast layers" section). Reach
+        // it via the in-panel "Diagnostics" cross-nav button so this also exercises
+        // the Perf→Diagnostics nav.
         await openPerformancePanel(rxAPage);
         await openPerformancePanel(rxBPage);
         await pubPage.locator('[data-testid="open-settings"]').click();
@@ -1545,10 +1545,13 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
         await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
           timeout: 10_000,
         });
-        // The publisher's per-rung diagnostics are under the SEND direction.
-        const pubSendSeg = pubPage.locator('[data-testid="perf-direction-send"]');
-        await pubSendSeg.click();
-        await expect(pubSendSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+        // The publisher's per-rung send ladder is in the Diagnostics sidebar now,
+        // not behind a SEND-direction segment (the Receive | Send toggle was
+        // removed in #1095). Cross-nav to it.
+        await pubPage.locator('[data-testid="perf-open-diagnostics"]').click();
+        await expect(pubPage.locator("#diagnostics-sidebar.visible")).toBeVisible({
+          timeout: 5_000,
+        });
 
         // PHASE 0 — let both receivers climb above base so there is a top rung the
         // publisher is actually encoding (and therefore can later shed). Capability
@@ -1575,17 +1578,15 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
         );
         const topRung = (aStart?.layerCount ?? 1) - 1; // 0-based id of the highest rung
 
-        // The publisher's per-rung send diagnostics expose one element per rung
-        // (PR #1095/#1101). The top rung must START live (non-zero bitrate / no
-        // shed styling) — we have something to shed.
-        const topRungDiag = pubPage.locator(`[data-testid="perf-video-diag-rung-${topRung}"]`);
+        // The publisher's per-rung send ladder (Diagnostics "Simulcast layers")
+        // exposes one chip per layer, testid `diag-simulcast-rung-{layer_id}`.
+        // Active rungs carry the `is-active` class; shed rungs carry `is-shed`
+        // (the shed state is a CSS class, NOT a `data-shed`/`data-bitrate-kbps`
+        // attribute — that was the never-merged earlier design). The top rung must
+        // START active (we have something to shed).
+        const topRungDiag = pubPage.locator(`[data-testid="diag-simulcast-rung-${topRung}"]`);
         await expect(topRungDiag).toBeVisible({ timeout: 10_000 });
-        await expect
-          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
-            timeout: 30_000,
-            intervals: [1000, 2000],
-          })
-          .toBeGreaterThan(0);
+        await expect(topRungDiag).toHaveClass(/is-active/, { timeout: 30_000 });
 
         // PHASE 1 — make EVERY receiver request ONLY the base layer. The relay's
         // per-source union now sits at base, so after the suppress-debounce
@@ -1593,27 +1594,17 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
         await pinReceiverToBaseLayer(rxAPage, "video");
         await pinReceiverToBaseLayer(rxBPage, "video");
 
-        // PHASE 2 — assert the PUBLISHER sheds the top rung: its diagnostics for
-        // the highest rung flip to the shed marker (`bitrate_kbps == 0` / the shed
-        // data-state). Allow generously for the relay's ~2 s suppress-debounce plus
-        // a couple of AQ ticks. The BASE rung must NEVER be shed.
-        await expect
-          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "1"), {
-            timeout: 30_000,
-            intervals: [1000, 2000, 3000],
-          })
-          .toBe(0);
-        await expect(topRungDiag).toHaveAttribute("data-shed", "true", { timeout: 5_000 });
+        // PHASE 2 — assert the PUBLISHER sheds the top rung: its ladder chip for
+        // the highest rung flips from `is-active` to `is-shed`. Allow generously
+        // for the relay's ~2 s suppress-debounce plus a couple of AQ ticks. The
+        // BASE rung must NEVER be shed.
+        await expect(topRungDiag).toHaveClass(/is-shed/, { timeout: 30_000 });
 
-        const baseRungDiag = pubPage.locator('[data-testid="perf-video-diag-rung-0"]');
-        await expect(
-          baseRungDiag,
-          "base layer must ALWAYS be published — never shed",
-        ).not.toHaveAttribute("data-shed", "true");
-        expect(
-          Number((await baseRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"),
-          "base layer must keep a non-zero bitrate (never fully suppressed)",
-        ).toBeGreaterThan(0);
+        const baseRungDiag = pubPage.locator('[data-testid="diag-simulcast-rung-0"]');
+        await expect(baseRungDiag, "base layer must ALWAYS be published — never shed").toHaveClass(
+          /is-active/,
+        );
+        await expect(baseRungDiag).not.toHaveClass(/is-shed/);
 
         // Both receivers, having pinned base, must still be decoding at the base
         // layer (suppression of higher rungs must not break the base stream).
@@ -1634,16 +1625,11 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
         }
         await expect(rxAAuto).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
 
-        // The publisher restores the top rung promptly (restore-eager). ~3 s budget
+        // The publisher restores the top rung promptly (restore-eager). ~6 s budget
         // covers the LAYER_PREFERENCE round-trip + one AQ restore tick; the relay
-        // adds NO debounce on the UP direction.
-        await expect
-          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
-            timeout: 6_000,
-            intervals: [250, 500, 1000],
-          })
-          .toBeGreaterThan(0);
-        await expect(topRungDiag).not.toHaveAttribute("data-shed", "true");
+        // adds NO debounce on the UP direction. The chip flips back to `is-active`.
+        await expect(topRungDiag).toHaveClass(/is-active/, { timeout: 6_000 });
+        await expect(topRungDiag).not.toHaveClass(/is-shed/);
 
         // PHASE 4 — and the un-pinning receiver actually RECEIVES the higher layer
         // again (the restore is end-to-end, not just a publisher-side flag). It
@@ -1661,20 +1647,22 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
       }
     };
 
-  // FIXME(#1093 + PR #1095/#1101): see the describe-block header for the two
-  // blockers — (1) no publisher-side per-rung DOM observability on this branch
-  // (the `perf-video-diag-rung-*` diagnostics are unmerged), (2) the multi-party
-  // harness limits tracked under #1093. WebTransport is the production-primary
-  // transport, so this is the higher-priority variant to un-fixme first.
+  // FIXME(#1093): see the describe-block header — the ONLY remaining blocker is
+  // the multi-party (3-context) harness (#1093). The publisher-side per-rung
+  // observability now exists (Diagnostics "Simulcast layers" ladder,
+  // `diag-simulcast-rung-{id}` + `is-shed`/`is-active`), so the body is ready to
+  // run as-is once #1093 lands. WebTransport is the production-primary transport,
+  // so this is the higher-priority variant to un-fixme first.
   test.fixme(
     "publisher sheds top rung when all receivers pin base, restores when one un-pins (WT, #1108)",
     publishSuppressionBody("webtransport"),
   );
 
-  // FIXME(#1093 + PR #1095/#1101): same two blockers as the WT case above. Unlike
-  // the Stage 2 divergence test this needs NO toxiproxy — the trigger is a
-  // receiver PREFERENCE (all pin base), not an impaired link — so this belongs in
-  // the default suite (not `@impair`) once unblocked.
+  // FIXME(#1093): same single remaining blocker as the WT case above (the
+  // multi-party harness). Unlike the Stage 2 divergence test this needs NO
+  // toxiproxy — the trigger is a receiver PREFERENCE (all pin base), not an
+  // impaired link — so this belongs in the default suite (not `@impair`) once
+  // unblocked.
   test.fixme(
     "publisher sheds top rung when all receivers pin base, restores when one un-pins (WS, #1108)",
     publishSuppressionBody("websocket"),

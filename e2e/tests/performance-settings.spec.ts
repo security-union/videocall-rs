@@ -299,7 +299,8 @@ test.describe("Performance settings panel (#961)", () => {
   }) => {
     await joinMeeting(page, "render");
     await openPerformanceTab(page);
-    // Default direction is Receive; reveal the SEND rows before asserting them.
+    // Both directions render together now (no toggle); this guards the send
+    // meters rendered before we assert them.
     await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
@@ -334,6 +335,40 @@ test.describe("Performance settings panel (#961)", () => {
       await expect(minInput).toHaveValue("0");
       await expect(maxInput).toHaveValue(String(topPos[stream]));
     }
+  });
+
+  test("no-scroll: the Performance panel content fits the modal body without scrolling on a desktop display (#1095)", async ({
+    page,
+  }) => {
+    // The user's headline #1095 requirement: "all metrics fit in one dialog
+    // without scrolling". This is a DESKTOP requirement (the spec accepts a small
+    // scroll on mobile), so assert at exactly the 768px desktop target the layout
+    // was budgeted against (~622px content vs ~634px usable). The ~12px headroom
+    // is deliberately tight so a regression that re-grows a card (+padding/margin)
+    // or re-splits a caption onto a second line pushes scrollHeight past
+    // clientHeight and fails here, rather than hiding behind generous slack.
+    await page.setViewportSize({ width: 1280, height: 768 });
+    await joinMeeting(page, "no_scroll");
+    await openPerformanceTab(page);
+    await selectSendDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    await expect(panel).toBeVisible();
+    // All three cards must be present (so we're measuring the full content, not a
+    // partially-rendered panel).
+    await expect(panel.locator(".perf-kind-card")).toHaveCount(3);
+
+    // The scrollable container is `.settings-panel` (it carries overflow-y:auto),
+    // which WRAPS the `#settings-panel-performance` tabpanel. It must NOT be
+    // overflowing: scrollHeight <= clientHeight (allow 1px for sub-pixel
+    // rounding). If this fails, the panel scrolls — the no-scroll requirement is
+    // broken.
+    const scrollContainer = page.locator(".settings-panel");
+    const overflow = await scrollContainer.evaluate((el) => el.scrollHeight - el.clientHeight);
+    expect(
+      overflow,
+      `Performance panel overflows its modal body by ${overflow}px (no-scroll requirement)`,
+    ).toBeLessThanOrEqual(1);
   });
 
   test("Auto toggle: flips aria-pressed and snaps thumbs to extremes; slider stays enabled throughout", async ({
@@ -391,13 +426,16 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(helpBtn).toHaveAttribute("aria-expanded", "false");
     await expect(popover).toHaveCount(0);
 
-    // Click "?" → popover opens with the explanation copy. The SEND help body
-    // (C1 rewording) reads "Sets the best (right) and worst (left) quality this
-    // device PUBLISHES, …" — match the best/worst + publishes shape.
+    // Click "?" → popover opens with the explanation copy. The SEND video help
+    // body (`HELP_VIDEO_SEND` in performance_settings.rs) reads "Your camera
+    // sends several quality versions ('layers') … The slider caps the best and
+    // worst versions you'll send." Match the distinctive "best and worst …
+    // send" tail so a copy change here breaks the test (the source of truth is
+    // the Rust constant, not this regex).
     await helpBtn.click();
     await expect(helpBtn).toHaveAttribute("aria-expanded", "true");
     await expect(popover).toBeVisible();
-    await expect(popover).toContainText(/best.*worst.*quality.*publish/i);
+    await expect(popover).toContainText(/best and worst versions you'll send/i);
 
     // Escape closes it.
     await page.keyboard.press("Escape");
@@ -488,8 +526,9 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(grid).toBeVisible({ timeout: 15_000 });
 
     await openPerformanceTab(page);
-    // The panel reopens on the default Receive direction after reload; switch
-    // back to Send to re-read the persisted send-side video preference.
+    // Both directions render together after reload (no toggle); guard that the
+    // send meters are present before re-reading the persisted send-side video
+    // preference.
     await selectSendDirection(page);
     const panelAfter = page.locator("#settings-panel-performance");
 
@@ -605,12 +644,32 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     await expect(panel.locator('[data-testid="perf-direction-receive"]')).toHaveCount(0);
     await expect(panel.locator('[data-testid="perf-direction-send"]')).toHaveCount(0);
 
-    // Send-side controls (meter + dual-range) are present for video…
-    await expect(panel.locator('[data-testid="perf-vu-video"]')).toBeVisible();
-    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeVisible();
-    // …and the receive-side controls are present at the same time.
-    await expect(panel.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible();
-    await expect(panel.locator('[data-testid="perf-recv-video-range-min"]')).toBeVisible();
+    // For EVERY kind (video / audio / content) the Send-side meter + dual-range
+    // AND the Receive-side meter + dual-range must be visible AT THE SAME TIME.
+    // Asserting both sides per kind is what makes this a real regression guard
+    // for the "show both directions" requirement: a redesign that hid one side
+    // (or only kept video's receive column) would fail here, whereas checking a
+    // single direction would silently pass.
+    for (const kind of ["video", "audio", "screen"] as const) {
+      // Send side present…
+      await expect(
+        panel.locator(`[data-testid="perf-vu-${kind}"]`),
+        `${kind} SEND meter visible`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-${kind}-range-min"]`),
+        `${kind} SEND min thumb visible`,
+      ).toBeVisible();
+      // …and the receive side present simultaneously.
+      await expect(
+        panel.locator(`[data-testid="perf-vu-recv-${kind}"]`),
+        `${kind} RECEIVE meter visible`,
+      ).toBeVisible();
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`),
+        `${kind} RECEIVE min thumb visible`,
+      ).toBeVisible();
+    }
 
     // The Diagnostics cross-nav button lives in the panel header (#1095 §4a).
     await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toBeVisible();
@@ -621,7 +680,8 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
   }) => {
     await joinMeeting(page, "recv_render");
     await openPerformanceTab(page);
-    // Receive is the default direction; assert it explicitly for isolation.
+    // Both directions render together (no toggle); guard the receive meters
+    // rendered before asserting the receive controls.
     await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
@@ -813,16 +873,41 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     page,
   }) => {
     await joinMeeting(page, "xnav");
-    // Perf → Diagnostics.
-    await openDiagnosticsFromPerformance(page);
-    // The settings modal is gone; the diagnostics sidebar shows the new section.
-    await expect(page.locator(".device-settings-modal")).toHaveCount(0);
-    await expect(page.getByRole("heading", { name: "Simulcast layers" })).toBeVisible();
 
-    // Diagnostics → Performance: click the header action; settings reopens on the
-    // Performance tab and the diagnostics sidebar closes.
+    // ── ROUND-TRIP 1: Performance → Diagnostics ──
+    // Before navigating, the Performance panel must be the thing on screen.
+    await openPerformanceTab(page);
+    await expect(page.locator("#settings-panel-performance")).toBeVisible();
+    // Click the in-panel "Diagnostics" cross-nav button.
+    await page.locator('[data-testid="perf-open-diagnostics"]').click();
+    // The settings modal is gone AND the diagnostics sidebar is open.
+    await expect(page.locator(".device-settings-modal")).toHaveCount(0);
+    await expect(page.locator("#diagnostics-sidebar.visible")).toBeVisible({ timeout: 5_000 });
+
+    // The relocated "Simulcast layers" section (#1095 §6 MOVE) is now present in
+    // the Diagnostics sidebar — assert the heading AND the moved sub-structure so
+    // this fails if the MOVE regressed (a bare heading could survive an empty
+    // section). Single-context (camera off / no peers) so the live ladder +
+    // per-peer testids are NOT in the DOM; assert the always-present structure:
+    // both SEND blocks (by title) and the per-peer RECEIVE sub-section header.
+    const sidebar = page.locator("#diagnostics-sidebar");
+    await expect(sidebar.getByRole("heading", { name: "Simulcast layers" })).toBeVisible();
+    await expect(sidebar.locator('.simulcast-send-title:text-is("Video (sending)")')).toBeVisible();
+    await expect(
+      sidebar.locator('.simulcast-send-title:text-is("Screen (sending)")'),
+    ).toBeVisible();
+    await expect(sidebar.locator(".simulcast-recv-title")).toBeVisible();
+
+    // ── ROUND-TRIP 2: Diagnostics → Performance (must LAND on the Performance
+    //    tab, not just reopen settings) ──
     await page.locator('[data-testid="diag-open-performance"]').click();
+    // Settings reopens AND the Performance tabpanel is the active one (the
+    // `device_settings_initial_section = "performance"` wiring) …
     await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
+    // …proven by a Performance-only control being visible (the panel content, not
+    // just the tabpanel wrapper, is mounted) …
+    await expect(page.locator('[data-testid="perf-vu-video"]')).toBeVisible({ timeout: 5_000 });
+    // …and the diagnostics sidebar has closed (unmounted).
     await expect(page.locator("#diagnostics-sidebar.visible")).toHaveCount(0);
   });
 

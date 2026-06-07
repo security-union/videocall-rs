@@ -20,9 +20,9 @@ use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
 use crate::components::performance_settings::{
-    format_kbps_compact, format_mbps, format_peer_kind_line, format_receive_spread,
-    format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
-    format_simulcast_summary, peers_for_kind, DiagnosticsReader,
+    format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
+    format_send_layer_short, format_send_total_kbps, format_simulcast_summary, peers_for_kind,
+    DiagnosticsReader,
 };
 use crate::context::{
     confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
@@ -747,33 +747,13 @@ pub fn Diagnostics(
         });
     });
 
-    // 4 Hz refresh tick for the live "Simulcast layers" section: the reader's
-    // closures read encoder atomics / client per-peer state, which change at
-    // runtime, so this subtree must re-render periodically while the panel is
-    // open. Gated to `is_open` so a closed panel does no work. A 250 ms
-    // `gloo` `Interval` (≈4 Hz) — cheap counts/min-max, not a 60 Hz rAF. The
-    // handle lives in a `use_hook` cell; `use_drop` drops it on unmount.
-    let mut simulcast_tick = use_signal(|| 0u64);
-    {
-        type IntervalCell = Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>>;
-        let cell: IntervalCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
-        let cell_effect = cell.clone();
-        use_effect(move || {
-            if is_open {
-                let interval = gloo_timers::callback::Interval::new(250, move || {
-                    let next = simulcast_tick.peek().wrapping_add(1);
-                    simulcast_tick.set(next);
-                });
-                *cell_effect.borrow_mut() = Some(interval);
-            } else {
-                // Stop ticking while closed (dropping the Interval cancels it).
-                *cell_effect.borrow_mut() = None;
-            }
-        });
-        use_drop(move || {
-            *cell.borrow_mut() = None;
-        });
-    }
+    // The live "Simulcast layers" section runs its OWN 250 ms (≈4 Hz) refresh
+    // tick, scoped to its child component `SimulcastLayersSection` (below), so the
+    // tick re-renders ONLY that small subtree — NOT this top-level `Diagnostics`
+    // body, which re-executes the expensive NetEq prelude (clone + parse of up to
+    // 60×N JSON lines). Keeping the tick out of here avoids ~thousands of JSON
+    // parses/sec at scale on the main thread (perf review #1). The section's
+    // `is_open` gating + `use_drop` interval cleanup live in that child.
 
     // Resolve numeric session IDs to display names via VideoCallClient context.
     let client = use_context::<VideoCallClient>();
@@ -850,19 +830,6 @@ pub fn Diagnostics(
     };
     let peer_info = format!("Showing statistics for: {current_peer_display}");
 
-    // ── Simulcast layers section data (#1095 §6 MOVE) ──────────────────
-    // Subscribe this subtree to the 4 Hz refresh so the live atomics re-render.
-    let _ = simulcast_tick();
-    let simulcast_summary_line = diagnostics_reader
-        .as_ref()
-        .map(|r| format_simulcast_summary(&r.summary));
-    let send_video_snap = diagnostics_reader.as_ref().and_then(|r| (r.send_video)());
-    let send_screen_snap = diagnostics_reader.as_ref().and_then(|r| (r.send_screen)());
-    let per_peer_receive = diagnostics_reader
-        .as_ref()
-        .map(|r| (r.per_peer_receive)())
-        .unwrap_or_default();
-
     rsx! {
         div {
             id: "diagnostics-sidebar",
@@ -938,24 +905,10 @@ pub fn Diagnostics(
                 }
                 // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
                 // per-peer RECEIVE breakdown that used to live in the Performance
-                // panel's expandable footers. Fed by the live `DiagnosticsReader`.
-                div { class: "diagnostics-section",
-                    h3 { "Simulcast layers" }
-                    if let Some(summary) = &simulcast_summary_line {
-                        p { class: "simulcast-effective", "{summary}" }
-                    }
-                    SimulcastSendLadder {
-                        title: "Video (sending)",
-                        not_sharing_text: "Camera — off",
-                        snap: send_video_snap,
-                    }
-                    SimulcastSendLadder {
-                        title: "Screen (sending)",
-                        not_sharing_text: "Screen — not sharing",
-                        snap: send_screen_snap,
-                    }
-                    SimulcastReceiveBreakdown { peers: per_peer_receive }
-                }
+                // panel's expandable footers. Extracted into its own child so its
+                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
+                // prelude / charts in this parent (perf review #1).
+                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
                 div { class: "diagnostics-section",
                     h3 { "Transport Preference" }
                     div { class: "device-setting-group",
@@ -1122,6 +1075,77 @@ pub fn Diagnostics(
     }
 }
 
+/// The live "Simulcast layers" section, extracted into its OWN component so its
+/// 4 Hz refresh tick re-renders only this small subtree — NOT the parent
+/// [`Diagnostics`] body (which re-executes the expensive NetEq prelude). This is
+/// the scoped-subscription pattern the perf meters already use (perf review #1).
+///
+/// Owns the 250 ms `gloo` `Interval` (gated to `is_open`, dropped on unmount via
+/// `use_drop`) and the three live reads off the `DiagnosticsReader`. The reader's
+/// closures touch encoder atomics / client per-peer state, so this subtree must
+/// re-render periodically; the reads are cheap (counts / min-max / a small
+/// per-peer Vec). `reader` is `None` until `Host` publishes it (or when
+/// diagnostics aren't wired) → the section renders nothing.
+#[component]
+fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> Element {
+    // 4 Hz refresh tick scoped to THIS component. Gated to `is_open`; the handle
+    // lives in a `use_hook` cell and `use_drop` cancels it on unmount.
+    let mut tick = use_signal(|| 0u64);
+    {
+        type IntervalCell = Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>>;
+        let cell: IntervalCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+        let cell_effect = cell.clone();
+        use_effect(move || {
+            if is_open {
+                let interval = gloo_timers::callback::Interval::new(250, move || {
+                    let next = tick.peek().wrapping_add(1);
+                    tick.set(next);
+                });
+                *cell_effect.borrow_mut() = Some(interval);
+            } else {
+                *cell_effect.borrow_mut() = None;
+            }
+        });
+        use_drop(move || {
+            *cell.borrow_mut() = None;
+        });
+    }
+    // Subscribe this subtree (only) to the throttled refresh.
+    let _ = tick();
+
+    // No reader wired → render nothing (no empty "Simulcast layers" heading).
+    let Some(reader) = reader.as_ref() else {
+        return rsx! {};
+    };
+
+    let summary_line = format_simulcast_summary(&reader.summary);
+    let send_video_snap = (reader.send_video)();
+    let send_screen_snap = (reader.send_screen)();
+    let per_peer_receive = (reader.per_peer_receive)();
+
+    rsx! {
+        div { class: "diagnostics-section",
+            h3 { "Simulcast layers" }
+            p { class: "simulcast-effective", "{summary_line}" }
+            // The SEND ladder labels rungs 0-based (L0 = base) while the RECEIVE
+            // breakdown labels layers 1-based ("L1/3"); a one-line hint reconciles
+            // the two conventions under this single heading (#10).
+            p { class: "simulcast-note", "Send rungs are 0-based (L0 = base); receive layers are 1-based." }
+            SimulcastSendLadder {
+                title: "Video (sending)",
+                not_sharing_text: "Camera — off",
+                snap: send_video_snap,
+            }
+            SimulcastSendLadder {
+                title: "Screen (sending)",
+                not_sharing_text: "Screen — not sharing",
+                snap: send_screen_snap,
+            }
+            SimulcastReceiveBreakdown { peers: per_peer_receive }
+        }
+    }
+}
+
 /// One SEND stream's per-layer simulcast ladder for the Diagnostics "Simulcast
 /// layers" section (#1095 §6 MOVE — relocated from the Performance panel). One
 /// chip per EFFECTIVE layer (res + bitrate), styled active vs shed. `snap` is
@@ -1230,32 +1254,42 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                 (PrefMediaKind::Screen, "screen"),
             ] {
                 {
-                    let kind_peers = peers_for_kind(&peers, kind);
+                    // `peers_for_kind` returns a fresh owned Vec; sort it IN PLACE
+                    // (no extra `.clone()` per tick) and read the spread off the
+                    // sorted order rather than building a second `layers` Vec.
+                    let mut kind_peers = peers_for_kind(&peers, kind);
                     if kind_peers.is_empty() {
                         rsx! {}
                     } else {
                         let n = kind_peers.len();
-                        let layers: Vec<u32> = kind_peers.iter().map(|p| p.snap.layer_index).collect();
-                        let spread = format_receive_spread(&layers);
-                        // Top-3 by layer DESC (highest quality first).
-                        let mut sorted = kind_peers.clone();
-                        sorted.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
-                        let top: Vec<_> = sorted.iter().take(3).cloned().collect();
-                        let lowest_layer = sorted.last().map(|p| p.snap.layer_index + 1).unwrap_or(1);
+                        // Sort by layer DESC (highest quality first) — top-3 shown.
+                        kind_peers.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
+                        // Spread = lowest..highest layer; the Vec is now DESC, so
+                        // last = lowest, first = highest.
+                        let lowest_layer = kind_peers.last().map(|p| p.snap.layer_index + 1).unwrap_or(1);
+                        let highest_layer = kind_peers.first().map(|p| p.snap.layer_index + 1).unwrap_or(1);
+                        let spread = if lowest_layer == highest_layer {
+                            format!("L{lowest_layer}")
+                        } else {
+                            format!("L{lowest_layer}–L{highest_layer}")
+                        };
                         let extra = n.saturating_sub(3);
+                        kind_peers.truncate(3);
                         rsx! {
                             div { class: "simulcast-recv-kind",
                                 "data-testid": "diag-simulcast-recv-{kind_label}",
                                 span { class: "simulcast-recv-kind-head", "{kind_label} · {n} peer(s) · {spread}" }
-                                for p in top.iter().cloned() {
+                                for p in kind_peers.into_iter() {
                                     {
+                                        // Borrow the label for the testid; the line owns its String.
+                                        let session_id = p.session_id;
                                         let line = format_peer_kind_line(kind_label, Some(&p.snap))
                                             .map(|l| format!("{}: {l}", p.label))
-                                            .unwrap_or_else(|| p.label.clone());
+                                            .unwrap_or(p.label);
                                         rsx! {
                                             div {
                                                 class: "simulcast-recv-peer",
-                                                "data-testid": "diag-simulcast-recv-peer-{p.session_id}",
+                                                "data-testid": "diag-simulcast-recv-peer-{session_id}",
                                                 "{line}"
                                             }
                                         }

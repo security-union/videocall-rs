@@ -4314,6 +4314,15 @@ select {
   padding-top: 6px;
 }
 
+/* Performance tab only: tighter inter-element spacing so the three per-kind
+   cards + header + intro + strip fit the modal body without scrolling (#1095
+   no-scroll requirement). Scoped via :has(.perf-header-row) so other tabs keep
+   the roomier default. */
+.settings-section:has(.perf-header-row) {
+  gap: 10px;
+  padding-top: 0;
+}
+
 .appearance-section-title,
 .settings-section-title,
 .settings-section-title-with-icon,
@@ -7249,10 +7258,10 @@ html[data-theme="light"] .settings-divider {
 
 /* ──────────────────────────────────────────────────────────────────
    Unified Performance settings panel — SEND quality bounds (#961) AND
-   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
-   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
-   VU needles, Auto toggle + "?" help. All colors are design tokens
-   (see global.css) — no literals.
+   RECEIVE layer bounds (#989 simulcast): per-kind CARDS each split into a
+   Sending column + a Receiving column, dual-thumb range sliders,
+   "Sending"/"Receiving" inline bar-meters (level-driven via data-level),
+   Auto toggle + "?" help. All colors are design tokens (see global.css).
    ────────────────────────────────────────────────────────────────── */
 
 /* ── Panel header row: "Performance" title left, Diagnostics cross-nav button
@@ -7370,8 +7379,9 @@ html[data-theme="light"] .settings-divider {
    (#1095 redesign). A card is a glass surface; its two columns share the
    `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
 .perf-kind-card {
-  margin: 8px 0;
-  padding: 12px 14px;
+  /* No vertical margin: the parent `.settings-section` flex `gap` already spaces
+     the cards; a margin here would double-space (#2a). */
+  padding: 10px 14px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -7384,7 +7394,7 @@ html[data-theme="light"] .settings-divider {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 /* Two side-by-side columns (Send | Receive). Collapses to one column below the
@@ -7441,11 +7451,14 @@ html[data-theme="light"] .settings-divider {
 }
 
 /* ── Inline bar-meter (replaces the VU needle). Four vertical bars + a one-line
-   readout; the container carries data-level and CSS lights the first N bars. ── */
+   readout; the container carries data-level and CSS lights the first N bars. It
+   sits INLINE in `.perf-side__head` now (#2d), so it center-aligns with the row
+   and the readout may shrink/ellipsize rather than push the row taller. ── */
 .perf-meter-wrap {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .perf-meter {
@@ -7460,7 +7473,9 @@ html[data-theme="light"] .settings-divider {
 .perf-meter__bar {
   flex: 1 1 0;
   width: 3px;
-  background: rgba(255, 255, 255, 0.12);
+  /* Unlit bars: a touch brighter than before so an at-rest (level 0) meter still
+     reads as "a meter", not an empty gap (#9). */
+  background: rgba(255, 255, 255, 0.16);
   border-radius: 1px;
   transition: background 0.2s ease;
 }
@@ -7501,12 +7516,27 @@ html[data-theme="light"] .settings-divider {
   color: var(--text-secondary);
   line-height: 1.2;
   min-width: 0;
-  overflow-wrap: anywhere;
+  /* Don't break mid-word (#11): truncate with an ellipsis if the head row is
+     tight rather than wrapping a "1280x720·30fps" token across two lines. */
+  overflow-wrap: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* The always-visible per-card summary line under each slider. */
+/* The slider range readout + the live summary share ONE flex row per side (#2e)
+   so the two captions cost one line, not two. Wraps to two lines only when the
+   column is too narrow (mobile, where a small scroll is acceptable). */
+.perf-side__caption {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+/* The always-visible per-card summary line (the §3 live copy). */
 .perf-summary-line {
-  margin: 2px 0 0;
+  margin: 0;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
@@ -7525,6 +7555,7 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-help-button {
+  position: relative;
   width: 22px;
   height: 22px;
   display: inline-flex;
@@ -7538,6 +7569,20 @@ html[data-theme="light"] .settings-divider {
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
+}
+
+/* Expand the HIT AREA to 44×44 without enlarging the 22px visual glyph or
+   disturbing layout (#3): a transparent, centered, absolutely-positioned
+   pseudo-element that overflows the button. The wrapper `.perf-help` is
+   position:relative, so this does not affect sibling flow. */
+.perf-help-button::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
 }
 
 .perf-help-button:hover {
@@ -7564,12 +7609,22 @@ html[data-theme="light"] .settings-divider {
   top: calc(100% + 8px);
   left: 0;
   width: 260px;
-  max-width: 80vw;
+  /* Cap to the card's own width so the popover can't overhang the card / modal
+     edge (#8). `cqw` resolves against `.perf-kind-card` (container-type set). */
+  max-width: min(260px, 90cqw);
   padding: 12px 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
+}
+
+/* Receive column is the RIGHT column: anchor its popover to the right edge so it
+   opens leftward into the card instead of overhanging the modal's right side
+   (#8). */
+.perf-side--recv .perf-help-popover {
+  left: auto;
+  right: 0;
 }
 
 .perf-help-popover-text {
@@ -7594,7 +7649,9 @@ html[data-theme="light"] .settings-divider {
 /* "Auto" toggle, pinned to the right of the stream header. */
 .perf-auto-button {
   margin-left: auto;
-  min-height: 32px;
+  /* 44px touch target (#3). Pinned right via margin-left:auto, so the taller hit
+     area doesn't shift the rest of the head row. */
+  min-height: 44px;
   padding: 4px 14px;
   font-size: 13px;
   font-weight: 600;
@@ -7762,6 +7819,13 @@ html[data-theme="light"] .settings-divider {
   margin: 0 0 8px;
   font-size: 12px;
   color: var(--text-tertiary);
+}
+
+.simulcast-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-quaternary);
 }
 
 .simulcast-send {

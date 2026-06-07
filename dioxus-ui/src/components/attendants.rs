@@ -4344,6 +4344,12 @@ pub fn AttendantsComponent(
                                                 diagnostics_open.set(opening);
                                                 if opening {
                                                     peer_list_open.set(false);
+                                                    // Close Device Settings so its
+                                                    // Performance-tab 4Hz tick can't
+                                                    // run alongside the diagnostics
+                                                    // one (symmetry with the reverse
+                                                    // at DeviceSettingsButton; #6).
+                                                    device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);

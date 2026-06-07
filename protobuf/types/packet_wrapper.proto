@@ -18,6 +18,35 @@ message PacketWrapper {
     // set). The relay consumes this to filter VIDEO it forwards downstream
     // (see ViewportPacket). It is never re-broadcast to other peers.
     VIEWPORT = 11;
+    // Client -> relay ONLY control packet (#989, Phase 1b). Carries the
+    // per-sender simulcast layer each receiver wants the relay to forward
+    // (its "layer preferences"). The relay consumes this to drop simulcast
+    // VIDEO layers the receiver did not select (see LayerPreferencePacket).
+    // It is never re-broadcast to other peers, and — like VIEWPORT — it is
+    // recorded ONLY when it arrives on the receiver's own NATS subject, so a
+    // forged payload only self-degrades the forger's OWN view.
+    LAYER_PREFERENCE = 12;
+    // Relay -> publisher ONLY control packet (#1108, Stage 3). This is the
+    // mirror image of LAYER_PREFERENCE: where LAYER_PREFERENCE flows UP from a
+    // receiver to constrain what the relay FORWARDS, LAYER_HINT flows DOWN from
+    // the relay to a single publisher to hint what it should bother ENCODING.
+    // The relay computes, per source, the UNION (max) of every receiver's
+    // requested layer for that source and, when NO receiver wants a given upper
+    // layer, hints the publisher to stop producing it (publish-side
+    // suppression). See LayerHintPacket.
+    //
+    // TRUST BOUNDARY (security-critical, inverse of LAYER_PREFERENCE): this
+    // packet is RELAY-AUTHORED and travels relay -> publisher ONLY. It is
+    // delivered on the publisher's OWN per-session NATS subject
+    // (room.{room}.{publisher_session}) exactly like the server-authored
+    // CONGESTION self-packet. The relay NEVER accepts a LAYER_HINT from a
+    // client: there is no inbound LAYER_HINT ingest path, no
+    // try_intercept_layer_hint, and no handler that records or acts on a
+    // LAYER_HINT arriving on a session subject. A client that forges one only
+    // sends bytes the relay drops on the floor. The hint is purely ADVISORY —
+    // the publisher clamps it against its own real ladder and a missing/garbage
+    // hint simply means "encode the full ladder" (fail-open).
+    LAYER_HINT = 13;
   }
 
   // Cleartext media-kind discriminator on the OUTER envelope.

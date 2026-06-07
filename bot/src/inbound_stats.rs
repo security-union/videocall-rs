@@ -17,21 +17,19 @@
 //! numbers, measures inter-arrival variability, and computes A/V sync drift.
 //! Reports a summary line at `INFO` level every 10 seconds.
 
+use crate::keyframe_requester::KeyframeRequester;
+use crate::layer_preference_sender::LayerPreferenceSender;
+use crate::rtt_probe::RttProbeState;
+use crate::viewport_sender::ViewportSender;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use tracing::{debug, info};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-
-use crate::aq_controller::BotAq;
-use crate::keyframe_requester::KeyframeRequester;
-use crate::rtt_probe::RttProbeState;
-use crate::viewport_sender::ViewportSender;
 
 #[cfg(feature = "metrics")]
 use crate::metrics_server::BotMetrics;
@@ -79,11 +77,10 @@ pub struct InboundStats {
     last_seen: HashMap<String, Instant>,
     /// Intern map: raw user_id bytes → owned String to avoid per-packet allocation.
     sender_names: HashMap<Vec<u8>, String>,
-    /// Optional adaptive-quality controller. When set, inbound DIAGNOSTICS
-    /// packets are forwarded here so the bot's encoders can adapt.
-    aq: Option<Arc<BotAq>>,
-    /// Number of DIAGNOSTICS packets that failed to parse since the last reset.
-    diagnostics_parse_errors: u64,
+    // NOTE(#1108): the `aq` controller handle and `diagnostics_parse_errors`
+    // counter were removed — inbound DIAGNOSTICS are no longer parsed or routed
+    // into the AQ (receiver FPS no longer feeds the sender AQ). The bot AQ ticks
+    // on a timer in `main`.
     /// Optional RTT probe state. When set, echoed RTT packets are routed here
     /// to compute real round-trip time instead of being counted as media.
     rtt_probe: Option<Arc<RttProbeState>>,
@@ -94,6 +91,11 @@ pub struct InboundStats {
     /// inbound media packet is fed here so the bot can emit VIEWPORT control
     /// packets like a real client (HCL issue #988).
     viewport_sender: Option<ViewportSender>,
+    /// Optional layer-preference sender. When set, the source session_id of
+    /// every inbound media packet is fed here so the bot can emit
+    /// LAYER_PREFERENCE control packets pinning each source to a fixed simulcast
+    /// layer, like a real client that selected a quality tier (#1083-A2).
+    layer_preference_sender: Option<LayerPreferenceSender>,
     /// Optional Prometheus metrics handle. When set, every inbound packet
     /// increments `bot_packets_received_total` (labeled by media_type) and
     /// parse failures increment `bot_packets_parsed_error_total`.
@@ -110,11 +112,8 @@ struct InboundMetrics {
 }
 
 impl InboundStats {
-    /// Attach an adaptive-quality controller. Once set, every inbound
-    /// DIAGNOSTICS packet is forwarded to it so the bot's encoders can adapt.
-    pub fn set_aq(&mut self, aq: Arc<BotAq>) {
-        self.aq = Some(aq);
-    }
+    // NOTE(#1108): `set_aq` was removed — inbound DIAGNOSTICS no longer feed the
+    // AQ. The bot AQ ticks on a timer in `main`.
 
     /// Attach an RTT probe state. When set, echoed RTT packets from the relay
     /// are routed to `RttProbeState::record_echo` instead of being counted as
@@ -134,6 +133,14 @@ impl InboundStats {
     /// control packets mimicking a real client's on-screen tile set (#988).
     pub fn set_viewport_sender(&mut self, sender: ViewportSender) {
         self.viewport_sender = Some(sender);
+    }
+
+    /// Attach a layer-preference sender. When set, the relay-stamped source
+    /// session_id of every inbound media packet is fed to it so the bot emits
+    /// LAYER_PREFERENCE control packets pinning each source to a fixed simulcast
+    /// layer, mimicking a real client that selected a quality tier (#1083-A2).
+    pub fn set_layer_preference_sender(&mut self, sender: LayerPreferenceSender) {
+        self.layer_preference_sender = Some(sender);
     }
 
     /// Install (or replace) the Prometheus metrics handle. Calls made before
@@ -171,7 +178,10 @@ impl InboundStats {
         }
     }
 
-    pub fn record_packet(&mut self, my_user_id: &str, data: &[u8]) {
+    // `_my_user_id` is retained in the signature (many callers pass it) but is
+    // no longer used: DIAGNOSTICS filtering-by-sender moved out with the AQ
+    // fan-in removal (issue #1108).
+    pub fn record_packet(&mut self, _my_user_id: &str, data: &[u8]) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -186,38 +196,15 @@ impl InboundStats {
             return;
         };
 
-        // DIAGNOSTICS packets are fed to the AQ controller so the bot can
-        // react to downstream quality signals like a real browser client.
-        // We deliberately intercept this before the MEDIA early-return so the
-        // relay's diagnostic broadcasts stop being silently dropped.
+        // DIAGNOSTICS packets: counted for inbound-stats accounting only.
         //
-        // Only forward packets about *this bot's* own stream — match the
-        // browser's `SenderDiagnosticManager` which filters on
-        // `sender_id == self.userid` before feeding the encoder. Without this
-        // filter, unrelated peer→peer reports would be mixed into this bot's
-        // AQ controller's per-reporter window.
+        // NOTE(#1108): previously these were parsed and fed into the bot's AQ
+        // controller (`aq.process_diagnostics`) so the bot reacted to receiver-
+        // reported FPS like a browser. Stage 2 removed receiver FPS from the
+        // sender AQ entirely, so we no longer parse or route them — the bot's AQ
+        // is now a self-timer driven from `main` (see `BotAq::tick`). We still
+        // account for the packet here so inbound stats stay accurate.
         if wrapper.packet_type.enum_value() == Ok(PacketType::DIAGNOSTICS) {
-            match DiagnosticsPacket::parse_from_bytes(&wrapper.data) {
-                Ok(diag) => {
-                    if diag.sender_id == my_user_id {
-                        if let Some(ref aq) = self.aq {
-                            aq.process_diagnostics(diag);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.diagnostics_parse_errors += 1;
-                    #[cfg(feature = "metrics")]
-                    self.bump_parse_error("diagnostics");
-                    // Rate-limit so a malformed peer cannot spam the log.
-                    if self.diagnostics_parse_errors.is_multiple_of(100) {
-                        warn!(
-                            "Failed to parse DIAGNOSTICS packet (total: {}): {}",
-                            self.diagnostics_parse_errors, e
-                        );
-                    }
-                }
-            }
             self.other_packets += 1;
             #[cfg(feature = "metrics")]
             self.bump_received("diagnostics");
@@ -273,6 +260,14 @@ impl InboundStats {
         // `PacketWrapper.session_id` on the decode path.
         if let Some(ref mut vs) = self.viewport_sender {
             vs.on_source_seen(wrapper.session_id);
+        }
+
+        // Feed the same relay-stamped source session_id to the layer-preference
+        // sender so a "pin to layer N" bot emits a LAYER_PREFERENCE for each
+        // discovered source (#1083-A2). Same fail-open/unstamped-sentinel
+        // handling as the viewport sender above.
+        if let Some(ref mut lps) = self.layer_preference_sender {
+            lps.on_source_seen(wrapper.session_id);
         }
 
         match media.media_type.enum_value() {
@@ -401,10 +396,10 @@ impl InboundStats {
         let max_audio_seq = std::mem::take(&mut self.max_audio_seq);
         let max_video_seq = std::mem::take(&mut self.max_video_seq);
         let sender_names = std::mem::take(&mut self.sender_names);
-        let aq = self.aq.take();
         let rtt_probe = self.rtt_probe.take();
         let keyframe_requester = self.keyframe_requester.take();
         let viewport_sender = self.viewport_sender.take();
+        let layer_preference_sender = self.layer_preference_sender.take();
         #[cfg(feature = "metrics")]
         let metrics = self.metrics.take();
         *self = Self::default();
@@ -415,10 +410,10 @@ impl InboundStats {
         self.max_audio_seq = max_audio_seq;
         self.max_video_seq = max_video_seq;
         self.sender_names = sender_names;
-        self.aq = aq;
         self.rtt_probe = rtt_probe;
         self.keyframe_requester = keyframe_requester;
         self.viewport_sender = viewport_sender;
+        self.layer_preference_sender = layer_preference_sender;
         #[cfg(feature = "metrics")]
         {
             self.metrics = metrics;
@@ -444,6 +439,15 @@ impl InboundStats {
         // connection re-asserts a tiny control packet at most once per window.
         if let Some(ref mut vs) = self.viewport_sender {
             vs.resend_on_reconnect();
+        }
+
+        // Same re-assert for the layer-preference signal (#1083-A2): the relay
+        // drops a receiver's recorded layer preference on disconnect, and a
+        // reconnect leaves it empty (fail-open → the bot silently receives the
+        // full ladder again). `resend_on_reconnect` is idempotent, guarded on
+        // `has_sent`, and rate-limited, exactly like the viewport re-assert.
+        if let Some(ref mut lps) = self.layer_preference_sender {
+            lps.resend_on_reconnect();
         }
     }
 

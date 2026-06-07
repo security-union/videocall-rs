@@ -55,6 +55,14 @@ pub struct JoinRoom {
     pub is_host: bool,
     /// Whether the meeting should end when the host leaves.
     pub end_on_host_leave: bool,
+    /// Transport this session connected over (`"websocket"` | `"webtransport"`).
+    ///
+    /// Threaded through so the per-session NATS subscription loop's `handle_msg`
+    /// closure can attribute an inbound actor-mailbox overflow drop to the
+    /// receiver's transport — the `Recipient<Message>` stored in
+    /// `ChatServer::sessions` is transport-erased, so the transport is otherwise
+    /// unknown at the mailbox-drop site (dashboard audit Tier B #2 / #1057).
+    pub transport: String,
 }
 
 #[derive(ActixMessage)]
@@ -104,4 +112,22 @@ pub struct Leave {
 #[rtype(result = "()")]
 pub struct ActivateConnection {
     pub session: SessionId,
+}
+
+/// Sent from a session's NATS loop when it receives a PARTICIPANT_LIST_REQUEST
+/// event. The ChatServer re-publishes this session's PARTICIPANT_JOINED so the
+/// requesting joiner learns about this peer.
+///
+/// The reply is published to the requester's per-session subject
+/// (`room.{room}.{requester_session}`) so that, although every session receives
+/// it via the room wildcard subscription, only the requester forwards it to its
+/// client (see the MEETING unicast filter in `handle_msg`).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct RebroadcastPresence {
+    /// The responding peer's own session (the peer being announced).
+    pub session: SessionId,
+    /// The joiner that asked for the participant list; the reply is addressed
+    /// to this session.
+    pub requester_session: SessionId,
 }

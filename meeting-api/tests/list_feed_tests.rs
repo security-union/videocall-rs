@@ -580,3 +580,196 @@ async fn test_participant_count_matches_legacy() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+// ── Scenario 9: user_last_attended_at — admitted user gets their own ts ───
+
+/// A user who was admitted to a meeting gets
+/// `user_last_attended_at == Some(their admitted_at in ms)`. The field must
+/// be present, in milliseconds, and consistent with `last_active_at` (which,
+/// for an admitted user, is exactly that same admission time via the COALESCE
+/// first branch).
+#[tokio::test]
+#[serial]
+async fn test_user_last_attended_at_present_for_admitted_user() {
+    let pool = get_test_pool().await;
+    let host = "feed-ula-admitted@example.com";
+    let room_id = "feed-test-ula-admitted";
+
+    create_meeting_wr_off(&pool, host, room_id).await;
+    join_meeting(&pool, room_id, host).await;
+
+    let body = list_feed(&pool, host, None).await;
+    assert!(body.success);
+    let m = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("admitted user's meeting must appear in the feed");
+
+    let attended = m
+        .user_last_attended_at
+        .expect("user_last_attended_at must be Some for an admitted user");
+    assert!(
+        attended >= MS_LOWER_BOUND,
+        "user_last_attended_at must be in milliseconds, got {attended}"
+    );
+    // For an admitted user, last_active_at == COALESCE(last_admit, ...) takes
+    // the last_admit branch, so the two must be equal.
+    assert_eq!(
+        attended, m.last_active_at,
+        "for an admitted user, user_last_attended_at must equal last_active_at"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 10: user_last_attended_at — owner who never joined => None ───
+
+/// An owner who never joined their own meeting gets
+/// `user_last_attended_at == None`. This is the case that proves the field is
+/// the raw user-scoped `p.last_admit` and NOT `last_active_at` (which falls
+/// back to started_at/created_at and is therefore always Some).
+#[tokio::test]
+#[serial]
+async fn test_user_last_attended_at_none_for_owner_never_joined() {
+    let pool = get_test_pool().await;
+    let host = "feed-ula-never-joined@example.com";
+    let room_id = "feed-test-ula-never-joined";
+
+    // Create but never /join.
+    create_meeting_wr_off(&pool, host, room_id).await;
+
+    let body = list_feed(&pool, host, None).await;
+    assert!(body.success);
+    let m = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("owned-never-joined meeting must appear in the feed");
+
+    assert!(
+        m.user_last_attended_at.is_none(),
+        "owner who never joined must have user_last_attended_at == None, got {:?}",
+        m.user_last_attended_at
+    );
+    // Contrast: last_active_at still falls back to a meeting-level timestamp,
+    // so it is present. This is the exact distinction the new field exists to
+    // draw.
+    assert!(
+        m.last_active_at >= MS_LOWER_BOUND,
+        "last_active_at must still be present (fallback) even when never admitted"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 11: user_last_attended_at is the REQUESTING user's, not any ──
+
+/// Two participants admitted at different times must each see THEIR OWN
+/// admission time in `user_last_attended_at`. This locks requirement #1's
+/// user-scoping: the field must reflect the requesting user's
+/// `MAX(admitted_at)`, never another participant's.
+#[tokio::test]
+#[serial]
+async fn test_user_last_attended_at_is_requesting_user_scoped() {
+    let pool = get_test_pool().await;
+    let user_a = "feed-ula-scope-a@example.com";
+    let user_b = "feed-ula-scope-b@example.com";
+    let room_id = "feed-test-ula-scope";
+
+    create_meeting_wr_off(&pool, user_a, room_id).await;
+    // A is admitted first.
+    join_meeting(&pool, room_id, user_a).await;
+    // Push the two admissions apart so admitted_at differs on fast hardware.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // B is admitted second (WR off => auto-admit).
+    join_meeting(&pool, room_id, user_b).await;
+
+    // A's feed must show A's (earlier) admission.
+    let body_a = list_feed(&pool, user_a, None).await;
+    assert!(body_a.success);
+    let attended_a = body_a
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("user A must see the meeting")
+        .user_last_attended_at
+        .expect("user A was admitted, so user_last_attended_at must be Some");
+
+    // B's feed must show B's (later) admission.
+    let body_b = list_feed(&pool, user_b, None).await;
+    assert!(body_b.success);
+    let attended_b = body_b
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("user B must see the meeting")
+        .user_last_attended_at
+        .expect("user B was admitted, so user_last_attended_at must be Some");
+
+    // The field is user-scoped: B joined after A, so B's timestamp must be
+    // strictly later than A's. If the query leaked another participant's
+    // (or the meeting-wide) max, both users would see the same value.
+    assert!(
+        attended_b > attended_a,
+        "B was admitted after A, so B's user_last_attended_at ({attended_b}) must be > A's ({attended_a}) — \
+         equality would mean the field is not user-scoped"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+// ── Scenario 12: user_last_attended_at is the MAX (re-admission wins) ─────
+
+/// A user admitted, then left and re-admitted, gets the MAX (most recent)
+/// admitted_at. The `(meeting_id, user_id)` row is unique, so a re-join does
+/// `DO UPDATE SET admitted_at = NOW()`, advancing the user's
+/// `MAX(admitted_at)`. The feed must reflect the newer admission.
+#[tokio::test]
+#[serial]
+async fn test_user_last_attended_at_reflects_max_on_readmission() {
+    let pool = get_test_pool().await;
+    let host = "feed-ula-host@example.com";
+    let attendee = "feed-ula-readmit@example.com";
+    let room_id = "feed-test-ula-readmit";
+
+    create_meeting_wr_off(&pool, host, room_id).await;
+    join_meeting(&pool, room_id, host).await;
+
+    // First admission of the attendee.
+    join_meeting(&pool, room_id, attendee).await;
+    let first = list_feed(&pool, attendee, None)
+        .await
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("attendee must see the meeting after first admission")
+        .user_last_attended_at
+        .expect("first admission must yield Some");
+
+    // Leave + re-admit: a plain re-join refreshes admitted_at to NOW().
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    join_meeting(&pool, room_id, attendee).await;
+    let second = list_feed(&pool, attendee, None)
+        .await
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("attendee must see the meeting after re-admission")
+        .user_last_attended_at
+        .expect("re-admission must yield Some");
+
+    assert!(
+        second > first,
+        "re-admission must advance user_last_attended_at to the MAX (most recent) \
+         admitted_at: second ({second}) must be > first ({first})"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

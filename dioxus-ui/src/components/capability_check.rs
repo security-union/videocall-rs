@@ -16,116 +16,37 @@
  * conditions.
  */
 
-//! Pre-join capability check — Phase 9 (Jay's UX-1 + UX-2 action items).
+//! Simulcast layer-capability ceiling (issue #989 / #1082).
 //!
-//! Before the user attempts to attach media and connect transports, we sniff
-//! `navigator.hardwareConcurrency` and the User-Agent platform string to
-//! decide whether the device is likely to survive a group meeting at all.
-//! Underpowered hosts (notably 2-core / older Intel MacBooks) historically
-//! hit catastrophic CPU stalls in cc7tp; warning ahead of join is the
-//! cheapest mitigation.
+//! This module is **only** a publisher-side encode-CPU budget: it derives the
+//! maximum number of simulcast layers a device should encode, given its CPU
+//! core count, UA platform, and the synthetic capability benchmark. Encoding N
+//! layers is ~N× the encode CPU, so a weak publisher that overcommits to 3
+//! layers would stall its own main thread (the failure mode discussion #890 /
+//! #562 documents on 2-core Intel Macs).
 //!
-//! The pure-logic core lives in [`assess_from_inputs`] / [`is_older_intel_mac`]
+//! It is **not** a join gate. Per product decision (issue #1054) every client
+//! joins regardless of capabilities — there is no pre-join block or warning.
+//! The old `assess_from_inputs` / `assess_capability` verdict path that gated
+//! join has been removed.
+//!
+//! The pure-logic core lives in [`max_simulcast_layers`] / [`is_older_intel_mac`]
 //! / [`parse_platform_from_ua`] so it can be unit-tested on host without a
-//! browser. [`assess_capability`] is the wasm32 wrapper that sources real
-//! navigator data.
-//!
-//! See discussion 562 (Phase 9).
-//!
-//! ## Verdict semantics
-//!
-//! - [`CapabilityVerdict::Block`] — fewer than 4 logical cores. Almost
-//!   certainly going to be unusable in any group meeting; the join button
-//!   is disabled and an explanation is rendered in place of the lobby card.
-//! - [`CapabilityVerdict::StrongWarn`] — fewer than 6 cores, OR an older
-//!   Intel Mac (`macOS 14*` always; `macOS 15*` only when cores <= 8).
-//!   The user can still join, but a prominent modal must be acknowledged
-//!   first.
-//! - [`CapabilityVerdict::SoftWarn`] — reserved for future use; at present
-//!   we never construct this variant. Kept in the public enum so call sites
-//!   can match exhaustively without requiring a future breaking change.
-//! - [`CapabilityVerdict::Ok`] — no concerns. Logged at info level.
+//! browser. [`capability_max_simulcast_layers`] is the wasm32 wrapper that
+//! sources real navigator data.
 
-/// Outcome of a pre-join capability assessment.
+/// At or below this core count the device is "marginal" for simulcast: encode
+/// CPU is too tight to safely run more than a single layer.
 ///
-/// The associated [`String`] on [`Block`](Self::Block),
-/// [`StrongWarn`](Self::StrongWarn), and [`SoftWarn`](Self::SoftWarn)
-/// is the user-facing copy to render alongside the verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CapabilityVerdict {
-    /// Hard-block: render the explanation, leave the join button disabled.
-    Block(String),
-    /// Soft-block: render a prominent warning, but allow the user to
-    /// proceed once they have explicitly acknowledged it.
-    StrongWarn(String),
-    /// Reserved for future telemetry-only notices. Never constructed by
-    /// [`assess_from_inputs`] today; the `#[allow(dead_code)]` is deliberate
-    /// — keeping the variant in the public enum lets call sites keep an
-    /// exhaustive `match` without us shipping a future breaking change.
-    #[allow(dead_code)]
-    SoftWarn(String),
-    /// No concerns.
-    Ok,
-}
+/// Anchored in the cc7tp post-mortem: 2-core / low-core Intel MacBooks hit
+/// catastrophic main-thread stalls under multi-layer encode. This preserves the
+/// old StrongWarn floor (cores < 6); the old Block floor (cores < 4 / unknown)
+/// collapses into it since both pin the ceiling to 1 layer.
+const MIN_CORES_FOR_MULTILAYER: u32 = 6;
 
-/// Below this core count we hard-block joining a group meeting.
-///
-/// Anchored in the cc7tp post-mortem: Jason's 2-core Intel MacBook
-/// hit a catastrophic main-thread stall well before re-election even fired.
-const MIN_CORES_BLOCK: u32 = 4;
-
-/// At or below this core count we strong-warn but still allow join.
-const MIN_CORES_STRONG_WARN: u32 = 6;
-
-/// Cap for the `macOS 15*` strong-warn rule. Above this, modern Intel /
-/// Apple-Silicon Macs are typically fine for group calls.
+/// Cap for the `macOS 15*` older-Intel rule. Above this, modern Intel /
+/// Apple-Silicon Macs are typically fine.
 const OLDER_INTEL_MAC_15_CORE_CEILING: u32 = 8;
-
-/// Pure-logic core: assess capability from already-extracted inputs.
-///
-/// `cores` should be `navigator.hardwareConcurrency` cast to `u32`
-/// (with `0` treated as "unknown" — we conservatively treat unknown
-/// as a block).
-///
-/// `platform` should be the platform token produced by
-/// [`parse_platform_from_ua`] (e.g. `"macOS 14"`, `"Windows 10"`,
-/// `"Linux"`, or `""` if unknown).
-pub fn assess_from_inputs(cores: u32, platform: &str) -> CapabilityVerdict {
-    if cores == 0 {
-        // navigator.hardwareConcurrency unavailable / spoofed to 0.
-        // Be conservative — block — rather than silently letting a
-        // potentially toaster-grade device into a group meeting.
-        return CapabilityVerdict::Block(
-            "We couldn't detect your device's CPU capability. Group video meetings require at \
-             least 4 CPU cores to run smoothly. Please join from a different device."
-                .to_string(),
-        );
-    }
-
-    if cores < MIN_CORES_BLOCK {
-        return CapabilityVerdict::Block(format!(
-            "Your device has only {cores} CPU core{plural}. Group video meetings need at least \
-             4 cores to run smoothly. Please join from a different device.",
-            plural = if cores == 1 { "" } else { "s" }
-        ));
-    }
-
-    if cores < MIN_CORES_STRONG_WARN {
-        return CapabilityVerdict::StrongWarn(format!(
-            "Your device has limited CPU resources ({cores} cores). Meeting performance may \
-             degrade. Consider joining audio-only or from a more powerful device."
-        ));
-    }
-
-    if is_older_intel_mac(platform, cores) {
-        return CapabilityVerdict::StrongWarn(
-            "Older Intel Macs may struggle with large meetings. Consider audio-only mode."
-                .to_string(),
-        );
-    }
-
-    CapabilityVerdict::Ok
-}
 
 /// Heuristic: does this look like an older Intel Mac that we should
 /// warn about for large meetings?
@@ -165,6 +86,12 @@ pub fn is_older_intel_mac(platform: &str, cores: u32) -> bool {
 /// * `"Windows 10"` / `"Windows 11"` for `Windows NT 10.0`+ hosts.
 /// * `"Linux"` for any X11/Linux UA.
 /// * `""` if nothing matched (unknown).
+///
+/// Like [`max_simulcast_layers`], the only non-test caller is the wasm32-gated
+/// [`capability_max_simulcast_layers`], so a native non-test build (e.g.
+/// `cargo clippy --all`) sees this as dead code; the `allow` keeps that build
+/// warning-free without hiding genuine dead code on wasm or in the host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn parse_platform_from_ua(user_agent: &str) -> String {
     // Mac UA tokens look like: "(Macintosh; Intel Mac OS X 10_15_7)".
     if let Some(rest) = user_agent.split("Mac OS X ").nth(1) {
@@ -190,29 +117,90 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
     String::new()
 }
 
+/// Simulcast capability ceiling (issue #989), derived from raw device inputs.
+///
+/// Maps a device's CPU `cores`, UA `platform` token, its
+/// `videocall_capability_score()` (a synthetic per-device benchmark; higher =
+/// faster — see `videocall-client/src/capability.rs`), to the maximum number of
+/// simulcast layers the publisher should encode.
+///
+/// Encoding N layers is ~N× the encode CPU, so this is deliberately
+/// conservative — a weak publisher that overcommits to 3 layers would stall its
+/// own main thread (the exact failure mode discussion #890 / #562 documents on
+/// 2-core Intel Macs). Rules:
+///
+/// * **1 layer** (single stream, byte-identical to pre-simulcast) when the
+///   device is at all marginal: `cores < 6` (this absorbs the old StrongWarn
+///   floor, and the old Block floor of `cores < 4` / unknown cores `== 0`
+///   collapses into it), OR an older Intel Mac (see [`is_older_intel_mac`]), OR
+///   a benchmark `score < 5000`.
+/// * **2 layers** for a non-marginal device with `5000 <= score < 30000`.
+/// * **3 layers** for a non-marginal device with `score >= 30000`.
+///
+/// Note this is only the *capability ceiling*. The effective layer count the
+/// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
+/// and the flag now defaults to 3 (feature ON, #1082) — so a high-end device
+/// emits up to 3 layers by default while a weak device is still gated down to 1
+/// (or 2) here regardless of the flag.
+///
+/// The only non-test caller is the wasm32-gated `capability_max_simulcast_layers`
+/// below, so a native non-test build (e.g. `cargo clippy --all`) sees this as
+/// dead code; the `allow` keeps that build warning-free without hiding genuine
+/// dead code on wasm or in the host test build.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn max_simulcast_layers(cores: u32, platform: &str, score: u32) -> u32 {
+    const SCORE_FOR_2_LAYERS: u32 = 5000;
+    const SCORE_FOR_3_LAYERS: u32 = 30000;
+
+    // `cores == 0` means navigator.hardwareConcurrency was unavailable /
+    // spoofed; treat unknown as marginal. `cores < 6` then also covers the old
+    // hard-block floor of `cores < 4`.
+    let marginal = cores < MIN_CORES_FOR_MULTILAYER
+        || is_older_intel_mac(platform, cores)
+        || score < SCORE_FOR_2_LAYERS;
+
+    if marginal {
+        return 1;
+    }
+
+    if score >= SCORE_FOR_3_LAYERS {
+        3
+    } else {
+        // Not marginal, 5000 <= score < 30000.
+        2
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Browser-side wrapper. Compiled for both host and wasm32 — the lib itself
-// targets host for `cargo test --lib`, and `web_sys::window()` returning
-// `None` on host is the safe path that exits with a Block verdict.
+// Browser-side wrapper. The simulcast ceiling needs the live navigator + the
+// wasm-gated capability benchmark, so the real implementation is wasm32-only;
+// the host build (used by `cargo test --lib`) gets a conservative stub.
 // ---------------------------------------------------------------------------
 
-/// Sniff `navigator.hardwareConcurrency` and the UA platform token, then
-/// run [`assess_from_inputs`].
+/// Device-capability ceiling on simulcast layers (issue #989), sniffed from
+/// the live browser environment.
 ///
-/// Falls back to [`CapabilityVerdict::Block`] if the browser globals are
-/// unreachable (which would be deeply unusual at this point in the lifecycle —
-/// we're already inside a Dioxus render).
-pub fn assess_capability() -> CapabilityVerdict {
+/// Sniffs `navigator.hardwareConcurrency` + UA platform exactly once, reads the
+/// publisher CPU benchmark via
+/// `videocall_client::capability::videocall_capability_score()`, then applies
+/// [`max_simulcast_layers`]. Returns a conservative **1** if the browser
+/// globals are unreachable.
+///
+/// This is only the capability ceiling; the encoder uses
+/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag now
+/// defaults to 3 (feature ON, #1082) — this ceiling is the weak-device safety floor.
+///
+/// wasm32-only: it sniffs `web_sys` navigator and calls
+/// `videocall_client::capability::videocall_capability_score()`, which is
+/// itself `#[cfg(target_arch = "wasm32")]`. The pure-logic
+/// [`max_simulcast_layers`] above is available on host for unit testing.
+#[cfg(target_arch = "wasm32")]
+pub fn capability_max_simulcast_layers() -> u32 {
     let Some(window) = web_sys::window() else {
-        return CapabilityVerdict::Block(
-            "We couldn't access your browser environment. Please refresh and try again."
-                .to_string(),
-        );
+        return 1;
     };
     let navigator = window.navigator();
 
-    // hardware_concurrency() returns f64; clamp to u32 and treat negatives /
-    // NaN as 0 (== "unknown" in assess_from_inputs).
     let cores_f64 = navigator.hardware_concurrency();
     let cores: u32 = if cores_f64.is_finite() && cores_f64 >= 1.0 {
         cores_f64.min(u32::MAX as f64) as u32
@@ -223,30 +211,26 @@ pub fn assess_capability() -> CapabilityVerdict {
     let user_agent = navigator.user_agent().unwrap_or_default();
     let platform = parse_platform_from_ua(&user_agent);
 
-    let verdict = assess_from_inputs(cores, &platform);
+    let score = videocall_client::capability::videocall_capability_score();
+    let older_intel = is_older_intel_mac(&platform, cores);
 
-    // Always log the assessment: even on Ok we want a single info line in
-    // the console log collector so we can correlate later quality reports.
-    match &verdict {
-        CapabilityVerdict::Block(msg) => {
-            log::warn!("capability-check: BLOCK cores={cores} platform={platform:?} reason={msg}");
-        }
-        CapabilityVerdict::StrongWarn(msg) => {
-            log::warn!(
-                "capability-check: STRONG_WARN cores={cores} platform={platform:?} reason={msg}"
-            );
-        }
-        CapabilityVerdict::SoftWarn(msg) => {
-            log::info!(
-                "capability-check: SOFT_WARN cores={cores} platform={platform:?} reason={msg}"
-            );
-        }
-        CapabilityVerdict::Ok => {
-            log::info!("capability-check: OK cores={cores} platform={platform:?}");
-        }
-    }
+    let layers = max_simulcast_layers(cores, &platform, score);
+    log::info!(
+        "simulcast capability ceiling: {layers} layer(s) (cores={cores} platform={platform:?} score={score} older_intel={older_intel})"
+    );
+    layers
+}
 
-    verdict
+/// Host-build stub of [`capability_max_simulcast_layers`]. The real
+/// implementation is wasm32-only (it needs `web_sys` navigator + the
+/// wasm-gated capability benchmark). On host — where `cargo test --lib`
+/// compiles `host.rs` — there is no browser to sniff, so we return the
+/// conservative single-layer ceiling. `host.rs` is browser-only at runtime, so
+/// this stub is never actually exercised; it exists purely so the native test
+/// build links.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn capability_max_simulcast_layers() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -256,140 +240,6 @@ pub fn assess_capability() -> CapabilityVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- assess_from_inputs ---------------------------------------------
-
-    #[test]
-    fn cores_zero_is_blocked() {
-        match assess_from_inputs(0, "macOS 26") {
-            CapabilityVerdict::Block(msg) => {
-                assert!(
-                    msg.to_lowercase().contains("couldn't detect"),
-                    "expected unknown-cores wording, got: {msg}"
-                );
-            }
-            other => panic!("expected Block for cores=0, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cores_below_block_threshold_blocks_with_count() {
-        for cores in 1..MIN_CORES_BLOCK {
-            match assess_from_inputs(cores, "Windows 10") {
-                CapabilityVerdict::Block(msg) => {
-                    assert!(
-                        msg.contains(&cores.to_string()),
-                        "block message should mention core count, got: {msg}"
-                    );
-                }
-                other => panic!("expected Block for cores={cores}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn cores_at_block_threshold_does_not_block() {
-        // 4 cores is the floor; should not block.
-        assert!(!matches!(
-            assess_from_inputs(MIN_CORES_BLOCK, "Windows 10"),
-            CapabilityVerdict::Block(_)
-        ));
-    }
-
-    #[test]
-    fn cores_below_strong_warn_threshold_strong_warns() {
-        for cores in MIN_CORES_BLOCK..MIN_CORES_STRONG_WARN {
-            match assess_from_inputs(cores, "Windows 10") {
-                CapabilityVerdict::StrongWarn(msg) => {
-                    assert!(
-                        msg.to_lowercase().contains("limited cpu"),
-                        "expected limited-cpu wording, got: {msg}"
-                    );
-                }
-                other => panic!("expected StrongWarn for cores={cores}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn cores_at_strong_warn_threshold_on_modern_platform_is_ok() {
-        // 6 cores on modern platform clears every rule.
-        assert_eq!(
-            assess_from_inputs(MIN_CORES_STRONG_WARN, "Windows 10"),
-            CapabilityVerdict::Ok
-        );
-    }
-
-    #[test]
-    fn jason_macos_14_two_cores_is_blocked() {
-        // Below 4 cores wins regardless of the older-Intel-Mac rule.
-        match assess_from_inputs(2, "macOS 14") {
-            CapabilityVerdict::Block(msg) => {
-                assert!(
-                    msg.contains('2'),
-                    "block message should mention 2 cores: {msg}"
-                );
-            }
-            other => panic!("expected Block for Jason's profile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn macos_14_with_enough_cores_strong_warns() {
-        // 8 cores avoids both core-based rules but trips the older-Intel-Mac rule.
-        match assess_from_inputs(8, "macOS 14") {
-            CapabilityVerdict::StrongWarn(msg) => {
-                assert!(
-                    msg.to_lowercase().contains("intel"),
-                    "expected older-Intel-Mac wording, got: {msg}"
-                );
-            }
-            other => panic!("expected StrongWarn for macOS 14 / 8 cores, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn kent_macos_15_six_cores_strong_warns() {
-        // Kent's profile per the Phase 9 spec.
-        match assess_from_inputs(6, "macOS 15") {
-            CapabilityVerdict::StrongWarn(msg) => {
-                assert!(
-                    msg.to_lowercase().contains("intel"),
-                    "expected older-Intel-Mac wording, got: {msg}"
-                );
-            }
-            other => panic!("expected StrongWarn for Kent's profile, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tony_macos_26_twelve_cores_is_ok() {
-        // Tony's profile per the Phase 9 spec.
-        assert_eq!(assess_from_inputs(12, "macOS 26"), CapabilityVerdict::Ok);
-    }
-
-    #[test]
-    fn modern_apple_silicon_high_core_macos_15_is_ok() {
-        // 12 cores on macOS 15 is above the older-Intel ceiling.
-        assert_eq!(assess_from_inputs(12, "macOS 15"), CapabilityVerdict::Ok);
-    }
-
-    #[test]
-    fn windows_10_with_8_cores_is_ok() {
-        assert_eq!(assess_from_inputs(8, "Windows 10"), CapabilityVerdict::Ok);
-    }
-
-    #[test]
-    fn linux_with_4_cores_strong_warns_but_not_for_intel_mac() {
-        match assess_from_inputs(4, "Linux") {
-            CapabilityVerdict::StrongWarn(msg) => {
-                // Should be the limited-cpu wording, not the older-Intel-Mac wording.
-                assert!(msg.to_lowercase().contains("limited cpu"));
-                assert!(!msg.to_lowercase().contains("intel"));
-            }
-            other => panic!("expected StrongWarn for Linux / 4 cores, got {other:?}"),
-        }
-    }
 
     // --- is_older_intel_mac ---------------------------------------------
 
@@ -495,5 +345,105 @@ mod tests {
     fn unknown_ua_returns_empty_platform() {
         assert_eq!(parse_platform_from_ua("Mozilla/5.0 (Unknown OS)"), "");
         assert_eq!(parse_platform_from_ua(""), "");
+    }
+
+    // --- max_simulcast_layers (issue #989) ------------------------------
+    //
+    // Boundary cases spanning every branch and both score thresholds. Inputs
+    // are now raw (cores, platform, score) rather than a precomputed verdict.
+
+    #[test]
+    fn simulcast_low_cores_is_one_layer() {
+        // The old hard-block floor (cores < 4 / unknown) collapses into the
+        // marginal `cores < 6` rule — both pin to 1 even with a huge score.
+        assert_eq!(max_simulcast_layers(0, "Windows 10", 99_999), 1);
+        assert_eq!(max_simulcast_layers(2, "Windows 10", 99_999), 1);
+        assert_eq!(max_simulcast_layers(3, "Windows 10", 99_999), 1);
+    }
+
+    #[test]
+    fn simulcast_marginal_cores_is_one_layer() {
+        // The old StrongWarn floor (4 <= cores < 6) also pins to 1.
+        for cores in 4..MIN_CORES_FOR_MULTILAYER {
+            assert_eq!(
+                max_simulcast_layers(cores, "Windows 10", 99_999),
+                1,
+                "cores={cores} should pin to 1 layer"
+            );
+        }
+    }
+
+    #[test]
+    fn simulcast_older_intel_is_one_layer() {
+        // Older Intel Mac pins to 1 even with plenty of cores + a high score.
+        // macOS 14 always, macOS 15 at/under the 8-core ceiling.
+        assert_eq!(max_simulcast_layers(8, "macOS 14", 99_999), 1);
+        assert_eq!(max_simulcast_layers(8, "macOS 15", 99_999), 1);
+    }
+
+    #[test]
+    fn simulcast_low_score_is_one_layer() {
+        // Capable cores but score just below the 2-layer threshold → 1.
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 4999), 1);
+    }
+
+    #[test]
+    fn simulcast_mid_score_is_two_layers() {
+        // Lower boundary of the 2-layer band (inclusive).
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 5000), 2);
+        // Just below the 3-layer threshold stays at 2.
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 29_999), 2);
+    }
+
+    #[test]
+    fn simulcast_high_score_is_three_layers() {
+        // Lower boundary of the 3-layer band (inclusive).
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 30_000), 3);
+    }
+
+    /// Issue #1082: with simulcast now ON BY DEFAULT (flag = 3), the device
+    /// capability ceiling is the safety floor for weak devices. The effective
+    /// layer count the encoder uses is `min(flag, capability_ceiling)`, so a weak
+    /// device must still end up at 1 layer even though the flag default is 3.
+    /// This models that `min` at the host call site without a browser.
+    #[test]
+    fn default_on_still_gates_weak_device_to_one_layer() {
+        const DEFAULT_FLAG: u32 = 3; // experimentalSimulcastMaxLayers default (issue 1082)
+
+        // Unknown / very low cores (old Block floor) → ceiling 1 → effective 1.
+        let weak_block = max_simulcast_layers(0, "Windows 10", 0);
+        assert_eq!(DEFAULT_FLAG.min(weak_block), 1, "no-core device gated to 1");
+
+        // Marginal cores (old StrongWarn floor) → ceiling 1 → effective 1.
+        let weak_warn = max_simulcast_layers(4, "Windows 10", 0);
+        assert_eq!(
+            DEFAULT_FLAG.min(weak_warn),
+            1,
+            "marginal-core device gated to 1"
+        );
+
+        // Older Intel Mac (plenty of cores + high score) → ceiling 1 → effective 1.
+        let older_intel = max_simulcast_layers(8, "macOS 14", 99_999);
+        assert_eq!(
+            DEFAULT_FLAG.min(older_intel),
+            1,
+            "older Intel Mac gated to 1"
+        );
+
+        // Low-benchmark capable device → ceiling 1 → effective 1.
+        let low_score = max_simulcast_layers(8, "Windows 10", 4999);
+        assert_eq!(
+            DEFAULT_FLAG.min(low_score),
+            1,
+            "low-score device gated to 1"
+        );
+
+        // Mid device → ceiling 2 → effective 2 (default flag does not force 3).
+        let mid = max_simulcast_layers(8, "Windows 10", 5000);
+        assert_eq!(DEFAULT_FLAG.min(mid), 2, "mid device runs 2 layers");
+
+        // Capable device → ceiling 3 → effective 3 (default-ON delivers full ladder).
+        let strong = max_simulcast_layers(8, "Windows 10", 30_000);
+        assert_eq!(DEFAULT_FLAG.min(strong), 3, "capable device runs 3 layers");
     }
 }

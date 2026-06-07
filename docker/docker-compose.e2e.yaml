@@ -29,6 +29,58 @@ services:
     image: nats:2.10-alpine
     command: ["-js", "--http_port", "8222"]
 
+  # Per-client downlink-impairment proxy (issue #1080). OFF by default: gated
+  # behind the `impair` compose profile so normal e2e runs never start it and
+  # the existing suite is not slowed. Bring it up with the profile:
+  #   COMPOSE_PROFILES=impair docker compose -p videocall-e2e \
+  #     -f docker/docker-compose.e2e.yaml up -d
+  # (or `make e2e-up-impair`).
+  #
+  # WHY THIS EXISTS — the per-receiver-simulcast *divergence* test needs ONE
+  # receiver's downlink degraded so its layer chooser steps DOWN while a healthy
+  # co-receiver stays high. The chooser steps down on PACKET LOSS / PLI, not raw
+  # throughput (videocall-client/src/decode/layer_chooser.rs::is_congested →
+  # loss_per_sec >= LOSS_STEP_DOWN_PER_SEC || kf_per_sec >= PLI_STEP_DOWN_PER_SEC).
+  #
+  # MECHANISM (WS path, verified by code trace — see helpers/downlink-impair.ts):
+  # the relay's WsChatSession holds a BOUNDED 128-slot outbound channel
+  # (WS_OUTBOUND_CHANNEL_CAPACITY) drained straight to the TCP socket via
+  # `ctx.binary` with NO app-level retransmit. Severely bandwidth-limiting ONE
+  # receiver's WS TCP connection makes that receiver's kernel send buffer fill →
+  # the drain stalls on TCP backpressure → the outbound channel fills →
+  # `try_send` returns Full → VIDEO frames are shed (priority-drop policy,
+  # videocall_outbound_channel_drops_total, issue #1057). A shed frame never
+  # reaches that receiver, so the receive-side SequenceTracker sees a gap →
+  # loss_per_sec rises → the chooser steps that receiver DOWN. The sender and
+  # the healthy receiver have their own session actors + channels, so they are
+  # untouched — exactly the per-receiver divergence the test asserts.
+  #
+  # toxiproxy listens on 8666 (published to the host so the browser dials it)
+  # and upstreams to websocket-api:8080 inside the compose network. The 8474
+  # HTTP control API lets a test add/adjust/remove a `bandwidth` toxic mid-run.
+  # A test routes ONLY the degraded BrowserContext through it by overriding
+  # `window.__APP_CONFIG.wsUrl` to `ws://localhost:8666` via an init script (see
+  # helpers/downlink-impair.ts); the committed config.js is never touched.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: ["impair"]
+    # Pre-create the `ws-downlink` proxy at boot so the control API is
+    # immediately usable. `-host 0.0.0.0` binds the control API on all
+    # interfaces so the host-side test can reach it on the published port.
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+    volumes:
+      - type: bind
+        source: ./toxiproxy
+        target: /config
+        read_only: true
+    ports:
+      # toxiproxy HTTP control API (add/update/delete toxics at runtime).
+      - "8474:8474"
+      # The shaped WS listener the degraded browser dials instead of :8080.
+      - "8666:8666"
+    depends_on:
+      - websocket-api
+
   meeting-api:
     build:
       dockerfile: docker/Dockerfile.actix.dev

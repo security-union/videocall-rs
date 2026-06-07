@@ -17,7 +17,10 @@
  */
 
 use crate::connection::ConnectionController;
-use crate::connection::{connection_handshake_failures, connection_session_drops};
+use crate::connection::{
+    connection_handshake_failures, connection_session_drops, reelection_aborted_total,
+    reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
+};
 use crate::decode::peer_decode_manager::keyframe_requests_sent_count;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
@@ -27,7 +30,7 @@ use crate::encode::{
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use protobuf::Message;
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -228,6 +231,14 @@ pub struct HealthReporter {
     /// diagnostics subsystem. `None` until the controller publishes its first
     /// decision (no peers / pre-warmup), in which case the field is omitted.
     decode_budget: Rc<RefCell<Option<DecodeBudgetSnapshot>>>,
+    /// #1032: Latest total-process memory reading from
+    /// `performance.measureUserAgentSpecificMemory()`. That API is async
+    /// (returns a Promise) and Chrome-only/`crossOriginIsolated`-gated, so it
+    /// is sampled in a background task and the last resolved value is cached
+    /// here. The report loop reads this cell synchronously and never awaits.
+    /// `None` until the first sample resolves, or permanently when the API is
+    /// unavailable, in which case the proto field is omitted.
+    agent_memory_bytes: Rc<RefCell<Option<u64>>>,
 }
 
 /// Static client metadata read from JS globals (TELEM-7).
@@ -405,6 +416,7 @@ impl HealthReporter {
             longtask_buffer: Rc::new(RefCell::new(Vec::new())),
             render_fps: Rc::new(RefCell::new(None)),
             decode_budget: Rc::new(RefCell::new(None)),
+            agent_memory_bytes: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -705,7 +717,11 @@ impl HealthReporter {
                             if let MetricValue::Text(json_str) = &metric.value {
                                 if let Ok(neteq_json) = serde_json::from_str::<Value>(json_str) {
                                     peer_data.update_audio_stats(neteq_json);
-                                    debug!(
+                                    // Per-NetEQ-event (continuous audio-stats stream).
+                                    // Demoted debug!->trace!; not on the analyzer keep-list
+                                    // (the analyzer greps "audio health (buffer: Nms)" below,
+                                    // NOT this line).
+                                    trace!(
                                      "Updated NetEQ stats for peer: {target_peer} (from {reporting_peer})"
                                     );
                                 }
@@ -720,7 +736,9 @@ impl HealthReporter {
                         }
                         "packets_awaiting_decode" => {
                             if let MetricValue::U64(packets) = &metric.value {
-                                debug!(
+                                // Per-NetEQ-event. Demoted debug!->trace!; not on the
+                                // analyzer keep-list.
+                                trace!(
                                     "Updated packets awaiting decode: {packets} for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
@@ -732,9 +750,12 @@ impl HealthReporter {
         }
         // Handle sender events (from local SenderDiagnosticManager)
         else if event.subsystem == "sender" {
-            debug!(
+            // Per-sender-event (fires for every received diagnostics packet).
+            // Demoted debug!->trace!; not on the analyzer keep-list.
+            trace!(
                 "Received sender event for peer: {} at {}",
-                target_peer, event.ts_ms
+                target_peer,
+                event.ts_ms
             );
             // Sender events are mainly for server reporting, less impact on health status
         }
@@ -849,14 +870,136 @@ impl HealthReporter {
 
                 if is_screen {
                     peer_data.update_screen_stats(video_stats);
-                    debug!("Updated screen health for peer: {target_peer}");
+                    // Per-video-event (continuous per-stream stats). Demoted
+                    // debug!->trace!; not on the analyzer keep-list.
+                    trace!("Updated screen health for peer: {target_peer}");
                 } else {
                     peer_data.update_camera_stats(video_stats);
-                    debug!("Updated camera health for peer: {target_peer}");
+                    // Per-video-event. Demoted debug!->trace!; not on the analyzer
+                    // keep-list.
+                    trace!("Updated camera health for peer: {target_peer}");
                 }
             }
         }
     }
+
+    /// #1032: Start the background total-process memory sampler.
+    ///
+    /// `performance.measureUserAgentSpecificMemory()` returns total agent
+    /// memory including GPU-backed and worker allocations — exactly the
+    /// non-heap memory that `performance.memory` (JS heap) misses. It is:
+    ///   - **async** (returns a Promise), so we must `await` it OFF the
+    ///     health-report hot path and cache the resolved value, and
+    ///   - **Chrome-only and gated on `crossOriginIsolated`**, so it may be
+    ///     entirely absent. We feature-detect once and, if missing, never spawn
+    ///     the loop (the cached value stays `None`, the proto field is omitted,
+    ///     and `agent_memory_bytes` simply never appears for that client).
+    ///
+    /// Graceful degradation: any missing global, non-isolated context, thrown
+    /// exception, or malformed result clears the cache — we never panic and
+    /// never block the report cadence.
+    #[cfg(target_arch = "wasm32")]
+    fn start_agent_memory_sampler(&self) {
+        use wasm_bindgen::JsCast;
+
+        // Feature-detect: window + crossOriginIsolated + the API function.
+        // `measureUserAgentSpecificMemory` only exists in cross-origin-isolated
+        // contexts on Chromium; bail out cleanly everywhere else.
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let cross_origin_isolated = js_sys::Reflect::get(&window, &"crossOriginIsolated".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !cross_origin_isolated {
+            debug!("agent-memory sampler: not crossOriginIsolated, skipping");
+            return;
+        }
+        let Some(perf) = window.performance() else {
+            return;
+        };
+        let measure_fn = match js_sys::Reflect::get(&perf, &"measureUserAgentSpecificMemory".into())
+        {
+            Ok(f) if f.is_function() => f.unchecked_into::<js_sys::Function>(),
+            _ => {
+                debug!(
+                    "agent-memory sampler: measureUserAgentSpecificMemory unavailable, skipping"
+                );
+                return;
+            }
+        };
+
+        // Sample on a slow cadence — this is a coarse pressure signal, not a
+        // per-frame metric, and the API itself can take tens of ms to resolve.
+        const AGENT_MEMORY_SAMPLE_INTERVAL_MS: u32 = 30_000;
+
+        let cache = Rc::downgrade(&self.agent_memory_bytes);
+        let shutdown = Rc::downgrade(&self.shutdown);
+
+        spawn_local(async move {
+            use wasm_bindgen_futures::JsFuture;
+
+            loop {
+                // Honour shutdown the same way the report loop does.
+                match Weak::upgrade(&shutdown) {
+                    Some(flag) if flag.load(Ordering::Acquire) => break,
+                    None => break,
+                    _ => {}
+                }
+
+                // Invoke the API. It returns a Promise resolving to an object
+                // whose `bytes` field is the total agent memory in bytes.
+                match measure_fn.call0(&perf) {
+                    Ok(promise_val) => {
+                        let promise: js_sys::Promise = promise_val.into();
+                        match JsFuture::from(promise).await {
+                            Ok(result) => {
+                                let sample = js_sys::Reflect::get(&result, &"bytes".into())
+                                    .ok()
+                                    .and_then(|bytes| bytes.as_f64())
+                                    .map(|bytes_f64| bytes_f64 as u64);
+                                if let Some(cell) = Weak::upgrade(&cache) {
+                                    if let Ok(mut c) = cell.try_borrow_mut() {
+                                        *c = sample;
+                                    }
+                                } else {
+                                    // HealthReporter dropped; stop sampling.
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                // Rejected (e.g. permissions/throttling). Clear the
+                                // cached value so stale data cannot linger forever.
+                                if let Some(cell) = Weak::upgrade(&cache) {
+                                    if let Ok(mut c) = cell.try_borrow_mut() {
+                                        *c = None;
+                                    }
+                                }
+                                debug!("agent-memory sampler: measure rejected: {e:?}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(cell) = Weak::upgrade(&cache) {
+                            if let Ok(mut c) = cell.try_borrow_mut() {
+                                *c = None;
+                            }
+                        }
+                        debug!("agent-memory sampler: call threw: {e:?}");
+                    }
+                }
+
+                gloo_timers::future::TimeoutFuture::new(AGENT_MEMORY_SAMPLE_INTERVAL_MS).await;
+            }
+            debug!("agent-memory sampler stopped");
+        });
+    }
+
+    /// Non-wasm builds have no browser memory API; the sampler is a no-op and
+    /// `agent_memory_bytes` stays `None`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_agent_memory_sampler(&self) {}
 
     /// Start periodic health reporting
     pub fn start_health_reporting(&self) {
@@ -864,6 +1007,11 @@ impl HealthReporter {
             warn!("Cannot start health reporting: no send packet callback set");
             return;
         }
+
+        // #1032: kick off the background total-process memory sampler. It runs
+        // on its own cadence and caches the last resolved value so the report
+        // loop below can read it synchronously (never awaiting in the hot path).
+        self.start_agent_memory_sampler();
 
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
         let session_id = Rc::downgrade(&self.session_id);
@@ -899,6 +1047,8 @@ impl HealthReporter {
         let longtask_buffer = self.longtask_buffer.clone();
         let render_fps_cell = self.render_fps.clone();
         let decode_budget_cell = self.decode_budget.clone();
+        // #1032: cached total-process memory reading sampled in the background.
+        let agent_memory_cell = self.agent_memory_bytes.clone();
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -1030,6 +1180,12 @@ impl HealthReporter {
                         let decode_budget_snapshot =
                             decode_budget_cell.try_borrow().ok().and_then(|v| *v);
 
+                        // #1032: read cached total-process memory (None until the
+                        // background sampler resolves, or permanently when the API
+                        // is unavailable). Synchronous read — never awaits here.
+                        let agent_memory_bytes =
+                            agent_memory_cell.try_borrow().ok().and_then(|v| *v);
+
                         // TELEM-7: read client metadata from JS globals
                         let client_meta = read_client_metadata();
 
@@ -1064,10 +1220,17 @@ impl HealthReporter {
                             drained_dwells,
                             connection_handshake_failures(),
                             connection_session_drops(),
+                            [
+                                reelection_proceeded_total(),
+                                reelection_aborted_total(),
+                                reelection_preserved_total(),
+                                reelection_failed_total(),
+                            ],
                             drained_longtasks,
                             current_render_fps,
                             client_meta,
                             decode_budget_snapshot,
+                            agent_memory_bytes,
                         );
 
                         if let Some(packet) = health_packet {
@@ -1116,14 +1279,19 @@ impl HealthReporter {
         dwell_samples: Vec<(String, f64)>,
         handshake_failures_total: u64,
         session_drops_total: u64,
+        // Cumulative re-election outcome totals (Tier B #3), in the fixed order
+        // [proceeded, aborted, preserved, failed]. Cumulative since process
+        // start — the relay maps these onto a GaugeVec it .set()s, so the
+        // monotonic client value charts correctly with increase()/rate().
+        reelection_totals: [u64; 4],
         longtask_durations: Vec<f64>,
         render_fps: Option<f64>,
         client_metadata: ClientMetadata,
         decode_budget: Option<DecodeBudgetSnapshot>,
+        agent_memory_bytes: Option<u64>,
     ) -> Option<PacketWrapper> {
-        if health_map.is_empty() {
-            return None;
-        }
+        // Keep client-wide telemetry flowing even before any peer stats have
+        // been observed (solo sessions / warm-up).
 
         // Build protobuf HealthPacket with structured stats
         let mut pb = PbHealthPacket::new();
@@ -1283,6 +1451,23 @@ impl HealthReporter {
             pb.connection_session_drops_total = Some(session_drops_total);
         }
 
+        // Re-election outcome counters (Tier B #3). Only attach a field when its
+        // cumulative value is non-zero — keeps the packet small for the common
+        // case (most sessions never re-elect) and mirrors the connection-loss
+        // counters directly above. Order: [proceeded, aborted, preserved, failed].
+        if reelection_totals[0] > 0 {
+            pb.reelection_proceeded_total = Some(reelection_totals[0]);
+        }
+        if reelection_totals[1] > 0 {
+            pb.reelection_aborted_total = Some(reelection_totals[1]);
+        }
+        if reelection_totals[2] > 0 {
+            pb.reelection_preserved_total = Some(reelection_totals[2]);
+        }
+        if reelection_totals[3] > 0 {
+            pb.reelection_failed_total = Some(reelection_totals[3]);
+        }
+
         // TELEM-7: Static client metadata
         if client_metadata.cores > 0 {
             pb.client_cores = Some(client_metadata.cores);
@@ -1368,6 +1553,28 @@ impl HealthReporter {
                     }
                 }
             }
+
+            // #1032: WASM linear-memory size — WebAssembly.Memory.buffer.byteLength.
+            // This is the WASM heap, distinct from the JS heap read above. Always
+            // available, synchronous, O(1); the highest-value cheapest non-heap
+            // signal. `wasm_bindgen::memory()` returns the `WebAssembly.Memory`
+            // JsValue whose `.buffer.byteLength` is the current linear-memory size.
+            let mem = wasm_bindgen::memory();
+            if let Ok(buffer) = js_sys::Reflect::get(&mem, &"buffer".into()) {
+                if let Ok(byte_len) = js_sys::Reflect::get(&buffer, &"byteLength".into()) {
+                    if let Some(len_f64) = byte_len.as_f64() {
+                        pb.wasm_memory_bytes = Some(len_f64 as u64);
+                    }
+                }
+            }
+        }
+
+        // #1032: total-process memory from the background sampler (cached value;
+        // see `start_agent_memory_sampler`). Absent when the API is unavailable
+        // or has not yet resolved its first reading. Platform-agnostic so the
+        // value flows through on the wire identically on every target.
+        if let Some(agent_mem) = agent_memory_bytes {
+            pb.agent_memory_bytes = Some(agent_mem);
         }
 
         let now_ms = SystemTime::now()
@@ -1826,9 +2033,11 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
+            None,
             None,
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
@@ -1902,15 +2111,166 @@ mod tests {
             Vec::new(),
             0,
             0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
             decode_budget,
+            None,
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1032: build a HealthPacket through the production path with the given
+    /// cached agent-memory value, then round-trip it through protobuf so the
+    /// assertions are on exactly what goes on the wire.
+    fn health_packet_with_agent_memory(agent_memory_bytes: Option<u64>) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            agent_memory_bytes,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.
+    #[test]
+    fn agent_memory_rides_health_packet_when_present() {
+        let pb = health_packet_with_agent_memory(Some(2_147_483_648));
+        assert_eq!(pb.agent_memory_bytes, Some(2_147_483_648));
+    }
+
+    /// #1032: when the background sampler has produced no value (API absent or
+    /// not yet resolved), the field is omitted — Grafana shows a gap, not a
+    /// misleading zero.
+    #[test]
+    fn agent_memory_absent_when_none() {
+        let pb = health_packet_with_agent_memory(None);
+        assert!(pb.agent_memory_bytes.is_none());
+    }
+
+    /// #1032: packet construction must not disappear just because the peer
+    /// health map is still empty; client-wide telemetry like non-heap memory
+    /// still needs to flow during solo sessions and warm-up.
+    #[test]
+    fn health_packet_still_emitted_with_empty_peer_map() {
+        let health_map = HashMap::new();
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            false,
+            0,
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            Some(512),
+        )
+        .expect("empty peer map must still produce a packet");
+
+        let pb = PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf");
+
+        assert!(pb.peer_stats.is_empty());
+        assert_eq!(pb.agent_memory_bytes, Some(512));
+    }
+
+    /// #1032: a failed sample must clear the cache instead of leaving the last
+    /// successful measurement visible forever.
+    #[test]
+    fn agent_memory_cache_clears_on_failure() {
+        let cache = Rc::new(RefCell::new(Some(123)));
+        *cache.borrow_mut() = Some(456);
+        assert_eq!(*cache.borrow(), Some(456));
+
+        *cache.borrow_mut() = None;
+        assert_eq!(*cache.borrow(), None);
+    }
+
+    /// #1032: WASM linear memory is read inline in a `wasm32`-gated block, so on
+    /// the (non-wasm) test target the field must be absent. This guards against
+    /// anyone moving the read out of the cfg block and emitting a host-side
+    /// value that would be meaningless for browser memory observability.
+    #[test]
+    fn wasm_memory_absent_on_non_wasm_target() {
+        let pb = health_packet_with_agent_memory(None);
+        assert!(
+            pb.wasm_memory_bytes.is_none(),
+            "wasm_memory_bytes must only be populated on the wasm32 target"
+        );
     }
 
     #[test]

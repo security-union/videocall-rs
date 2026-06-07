@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+// Relay -> publisher simulcast layer-HINT control payload (#1108, Stage 3;
+// publish-side layer suppression). This is the inverse of
+// LayerPreferencePacket.
+//
+// Carried inside a PacketWrapper whose `packet_type` is LAYER_HINT. The relay
+// computes, per source it is relaying, the UNION (max) over every receiver of
+// the simulcast layer that receiver requested for that source (via
+// LAYER_PREFERENCE). When the union is below the source's published depth — i.e.
+// NO receiver wants an upper layer — the relay hints the publisher to stop
+// ENCODING that layer, saving the publisher CPU and uplink bandwidth it would
+// otherwise spend producing a layer nobody consumes.
+//
+// SCOPE: there is intentionally NO source/session id in this message. The
+// packet is delivered on the publisher's OWN per-session subject
+// (room.{room}.{publisher_session}), so the delivery subject alone scopes the
+// hint to exactly one publisher — there is nothing to address. Each Entry is
+// keyed only by media_kind because a single publisher produces at most one
+// camera VIDEO / one SCREEN / one AUDIO ladder.
+//
+// LAYER SEMANTICS (the publisher MUST follow these):
+//   * `max_requested_layer = N` means "no receiver currently wants any layer
+//     ABOVE N for this media kind; you may stop encoding layers > N". The
+//     publisher CLAMPS N against its own real ladder depth — the relay is
+//     deliberately layer-count-agnostic and never learns how many layers the
+//     publisher actually produces, so N may exceed the real top layer, in which
+//     case the publisher simply keeps encoding its full ladder.
+//   * The relay only emits an Entry when it has POSITIVE knowledge that EVERY
+//     receiver wants less than the full ladder. If even one receiver has no
+//     recorded preference for this (source, kind), it counts as "wants the FULL
+//     ladder" (fail-open) and the relay emits the full-ladder sentinel (a very
+//     large value) — i.e. "suppress nothing". Absence of information ⇒ encode
+//     everything.
+//
+// SECURITY / TRUST BOUNDARY (inverse of LayerPreferencePacket — see also the
+// PacketType.LAYER_HINT doc): this packet is RELAY-AUTHORED and consumed by the
+// PUBLISHER only. It travels relay -> publisher, never client -> relay. The
+// relay NEVER parses an inbound LAYER_HINT: there is no interceptor and no
+// handler that records or acts on a LAYER_HINT arriving on any session subject,
+// so a client cannot forge one to influence another publisher (or itself).
+// Because the hint is purely ADVISORY and the publisher clamps it against its
+// own ladder, a missing, delayed, or even maliciously-crafted hint can at worst
+// cause the publisher to encode MORE than strictly necessary (fail-open to
+// today's full-ladder behaviour) — it can never make a publisher encode a layer
+// it does not have, nor reveal anything about other receivers.
+message LayerHintPacket {
+  // The media kind an Entry applies to. Mirrors `PacketWrapper.MediaKind` so a
+  // publisher's camera VIDEO, AUDIO, and SCREEN ladders can be hinted
+  // INDEPENDENTLY (a receiver set may want full camera VIDEO but only base
+  // SCREEN, etc.).
+  //
+  // BACK-COMPAT / fail-open: the default (UNSPECIFIED = 0) MUST be treated by
+  // the publisher as "no actionable hint for a known kind" and ignored — the
+  // relay always stamps a concrete VIDEO/AUDIO/SCREEN kind on the entries it
+  // emits, so an UNSPECIFIED entry is never produced on the happy path.
+  enum MediaKind {
+    MEDIA_KIND_UNSPECIFIED = 0;
+    VIDEO = 1;
+    AUDIO = 2;
+    SCREEN = 3;
+  }
+
+  // One per-media-kind hint for the publisher this packet is addressed to (by
+  // delivery subject).
+  message Entry {
+    // Which media-kind ladder of THIS publisher the hint constrains.
+    MediaKind media_kind = 1;
+    // The highest simulcast layer id ANY receiver currently wants for this
+    // (publisher, media kind) — the union/max of all receivers' requested
+    // layers. The publisher may stop encoding layers ABOVE this value, after
+    // clamping it against its own real ladder depth. A very large value is the
+    // fail-open sentinel meaning "some receiver wants the full ladder; suppress
+    // nothing".
+    uint32 max_requested_layer = 2;
+  }
+
+  // One Entry per media kind the relay has an actionable union for. Empty = no
+  // hint (publisher keeps encoding its full ladder; fail-open).
+  repeated Entry entries = 1;
+}

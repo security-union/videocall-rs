@@ -28,14 +28,55 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use super::webmedia::{ConnectOptions, MediaStreamKey, WebMedia};
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Task {
     WebSocket(WebSocketTask),
     WebTransport(WebTransportTask),
+    /// No-op send path for unit tests (records last send kind + stream key).
+    #[cfg(test)]
+    Stub(StubTask),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StubSendKind {
+    Reliable,
+    Datagram,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct StubTask {
+    last_send: RefCell<Option<(StubSendKind, MediaStreamKey)>>,
+}
+
+#[cfg(test)]
+impl StubTask {
+    pub(super) fn new() -> Self {
+        Self {
+            last_send: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn take_last_send_for_test(&self) -> Option<(StubSendKind, MediaStreamKey)> {
+        self.last_send.borrow_mut().take()
+    }
+
+    pub(super) fn clear_last_send_for_test(&self) {
+        *self.last_send.borrow_mut() = None;
+    }
 }
 
 impl Task {
+    #[cfg(test)]
+    pub(super) fn stub() -> Self {
+        Task::Stub(StubTask::new())
+    }
+
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
         if webtransport {
             debug!("Task::connect trying WebTransport");
@@ -53,6 +94,11 @@ impl Task {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet, stream_key),
             Task::WebTransport(wt) => wt.send_packet(packet, stream_key),
+            #[cfg(test)]
+            Task::Stub(stub) => {
+                let _ = packet;
+                *stub.last_send.borrow_mut() = Some((StubSendKind::Reliable, stream_key));
+            }
         }
     }
 
@@ -68,6 +114,12 @@ impl Task {
             // delivery on the Control stream-key (ignored by WS).
             Task::WebSocket(ws) => ws.send_packet(packet, MediaStreamKey::Control),
             Task::WebTransport(wt) => wt.send_packet_datagram(packet),
+            #[cfg(test)]
+            Task::Stub(stub) => {
+                let _ = packet;
+                *stub.last_send.borrow_mut() =
+                    Some((StubSendKind::Datagram, MediaStreamKey::Control));
+            }
         }
     }
 
@@ -75,6 +127,8 @@ impl Task {
         match self {
             Task::WebSocket(ws) => ws.get_buffered_amount(),
             Task::WebTransport(_) => None, // WebTransport doesn't expose bufferedAmount
+            #[cfg(test)]
+            Task::Stub(_) => None,
         }
     }
 
@@ -91,6 +145,10 @@ impl Task {
         match self {
             Task::WebSocket(ws) => ws.send_bytes(bytes, stream_key),
             Task::WebTransport(wt) => wt.send_bytes(bytes, stream_key),
+            #[cfg(test)]
+            Task::Stub(_) => {
+                let _ = (bytes, stream_key);
+            }
         }
     }
 
@@ -102,6 +160,25 @@ impl Task {
         match self {
             Task::WebSocket(ws) => ws.send_bytes_datagram(bytes),
             Task::WebTransport(wt) => wt.send_bytes_datagram(bytes),
+            #[cfg(test)]
+            Task::Stub(_) => {
+                let _ = bytes;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_last_send_for_test(&self) -> Option<(StubSendKind, MediaStreamKey)> {
+        match self {
+            Task::Stub(stub) => stub.take_last_send_for_test(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_last_send_for_test(&self) {
+        if let Task::Stub(stub) = self {
+            stub.clear_last_send_for_test();
         }
     }
 }

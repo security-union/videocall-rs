@@ -279,6 +279,116 @@ pub const VIEWPORT_MAX_SESSION_IDS: usize = 64;
 /// human-driven scroll cadence.
 pub const VIEWPORT_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Maximum number of per-source layer-preference entries the relay will accept
+/// from a single LAYER_PREFERENCE control packet (#989, Phase 1b).
+///
+/// `LayerPreferencePacket.entries` is an unbounded `repeated`. As with
+/// [`VIEWPORT_MAX_SESSION_IDS`] the relay's NATS fan-out delivers every packet
+/// to every receiver, so an attacker spamming a huge entries list would impose
+/// O(list length) work per packet. This cap bounds that work. It is sized to
+/// match the viewport cap (one layer preference per visible tile), so a
+/// legitimate client rendering up to a 64-tile grid is never truncated.
+/// Packets exceeding the cap have their list truncated to the first
+/// [`LAYER_PREFERENCE_MAX_ENTRIES`] entries (fail-open on the excess rather
+/// than rejecting the whole update).
+pub const LAYER_PREFERENCE_MAX_ENTRIES: usize = VIEWPORT_MAX_SESSION_IDS;
+
+/// Minimum interval between accepted LAYER_PREFERENCE updates for a single
+/// session (#989, Phase 1b).
+///
+/// Mirrors [`VIEWPORT_MIN_UPDATE_INTERVAL`]: layer-preference packets are
+/// client-driven (a receiver switching the layer it wants for a tile) and
+/// should be infrequent. This throttle bounds how often a session can mutate
+/// its layer-preference map, blunting a client that spams updates to force
+/// repeated map rebuilds. Updates that arrive sooner than this after the last
+/// accepted one are dropped (the packet is still consumed and never
+/// re-broadcast).
+pub const LAYER_PREFERENCE_MIN_UPDATE_INTERVAL: Duration = VIEWPORT_MIN_UPDATE_INTERVAL;
+
+/// Upper bound on the `desired_layer` id the relay will record from a single
+/// LAYER_PREFERENCE entry (#1082, defense-in-depth).
+///
+/// The relay is deliberately **layer-count-agnostic**: it never learns how many
+/// simulcast layers a source actually produces (see the "AVAILABILITY NOT
+/// VALIDATED" note on the forwarding path in `chat_server.rs`). It only compares
+/// the receiver's recorded `desired_layer` against the cleartext
+/// `simulcast_layer_id` on each media packet. That means a forged or garbage
+/// LAYER_PREFERENCE could otherwise stuff an arbitrary `u32` into the per-source
+/// layer map. Such an entry never matches any real packet, so the source's
+/// non-base layers all get dropped and the forger self-degrades to base — but it
+/// still consumes a map slot and represents nonsense state the relay should not
+/// retain.
+///
+/// This bound caps the *value range* of a recorded layer id. It is NOT the real
+/// layer count (which the relay does not and must not know): today every kind
+/// ships at most 3 layers (ids 0..=2; #1082 keeps video=3/audio=3/content=3),
+/// and even the assessed video=5 ceiling is ids 0..=4. `7` leaves comfortable
+/// headroom for near-future ladders while still rejecting obviously-forged ids.
+/// Entries whose `desired_layer` exceeds this bound are **skipped** (not
+/// recorded) — fail-open per source: the receiver simply self-degrades to base
+/// for that source, exactly as if no preference had been sent. The packet is
+/// never dropped wholesale and the connection is never errored.
+pub const LAYER_PREFERENCE_MAX_LAYER_ID: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// Publish-side layer suppression (#1108, Stage 3)
+// ---------------------------------------------------------------------------
+
+/// Debounce window (in milliseconds) before the relay emits a LOWER layer-union
+/// hint to a publisher (#1108, Stage 3 — publish-side layer suppression).
+///
+/// The relay computes, per source, the UNION (max) over every receiver of the
+/// simulcast layer that receiver requested, and emits a LAYER_HINT telling the
+/// publisher it may stop encoding layers above that union (see
+/// [`crate::actors::chat_server`] `RecomputeLayerHints`). The emit policy is
+/// deliberately ASYMMETRIC:
+///
+/// * **Suppress-lazy (DOWN):** a hint that LOWERS the union below what the
+///   publisher is currently encoding is only emitted after the union has stayed
+///   below that level for this entire window. This absorbs transient flaps — a
+///   receiver briefly dropping a tile, a viewport scroll, a reconnect wave —
+///   so we do not tell a publisher to tear down an upper encode that a receiver
+///   re-requests a few hundred ms later (re-spinning a simulcast layer is
+///   expensive and visibly stutters every consumer of it). The debounce is
+///   realized with a deferred `notify_later` re-check, so the lower hint fires
+///   even when no further preference change occurs.
+/// * **Restore-eager (UP):** a hint that RAISES the union (a receiver now wants
+///   a higher layer, or a constraining receiver left so the fail-open union
+///   grows) is emitted IMMEDIATELY — never debounced. Delaying restoration
+///   would leave a receiver black-tiled / stuck on a low layer for the window;
+///   over-encoding briefly is the safe failure (fail-open).
+///
+/// 2000 ms is a FIRST GUESS and is PENDING PERF REVIEW. It is long enough to
+/// ride out a reconnection wave on a high-latency (200 ms+) link and short
+/// viewport flaps, while short enough that a genuine, sustained drop in demand
+/// reclaims publisher CPU / uplink within a couple of seconds. Tune against real
+/// traffic once Stage 3 is wired end-to-end (it mirrors the order of magnitude
+/// of the keyframe congestion-relax window but is intentionally separate).
+pub const LAYER_HINT_SUPPRESS_DEBOUNCE_MS: u64 = 2000;
+
+/// Maximum number of receiver sessions the relay will scan when computing the
+/// per-source layer union for a LAYER_HINT (#1108, Stage 3 — DoS bound).
+///
+/// The union is an INVERTED query: for one source it must inspect every other
+/// receiver's recorded layer preference for that source (the prefs map is
+/// receiver-keyed, so there is no per-source index). That scan is O(room size)
+/// and runs inside the single-threaded `ChatServer` actor, so an adversary who
+/// could inflate a room's membership could otherwise make each recompute
+/// arbitrarily expensive and stall the actor for every room it serves.
+///
+/// This caps the scan at a fixed number of receivers. Mirrors the
+/// [`LAYER_PREFERENCE_MAX_ENTRIES`] philosophy (bound the per-event work an
+/// attacker can induce) and is sized well above our target 20-user rooms with
+/// comfortable headroom, so a legitimate meeting's union is always computed over
+/// every real receiver. When a room exceeds the cap the union is computed over
+/// the first [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] receivers encountered and is
+/// FAIL-OPEN on the remainder: an un-scanned receiver is treated exactly like a
+/// receiver with no recorded preference (it contributes the full-ladder
+/// sentinel), so truncation can only ever cause the relay to suppress LESS, never
+/// to suppress a layer some unseen receiver still wants. FIRST GUESS / PENDING
+/// PERF REVIEW.
+pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;

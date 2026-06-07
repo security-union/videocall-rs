@@ -1,0 +1,8 @@
+[
+  {
+    "name": "ws-downlink",
+    "listen": "0.0.0.0:8666",
+    "upstream": "websocket-api:8080",
+    "enabled": true
+  }
+]

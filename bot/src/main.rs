@@ -30,6 +30,7 @@ use bot::ekg_renderer::{self, EkgRenderer};
 use bot::health_reporter::{spawn_health_reporter, HealthReporterConfig};
 use bot::inbound_stats::InboundStats;
 use bot::keyframe_requester::KeyframeRequester;
+use bot::layer_preference_sender::LayerPreferenceSender;
 #[cfg(feature = "metrics")]
 use bot::metrics_server::{self, BotMetrics};
 use bot::netsim::{Admission, Direction, NetSimShim, NetworkProfile};
@@ -469,14 +470,15 @@ async fn run_client(
     }
 
     // Shared inbound stats -- used by both the transport's inbound consumer
-    // and the health reporter for per-sender packet rate tracking. We also
-    // wire the AQ controller here so incoming DIAGNOSTICS packets get fed
-    // straight into the PID loop.
+    // and the health reporter for per-sender packet rate tracking.
+    //
+    // NOTE(#1108): the AQ controller is no longer wired into inbound stats —
+    // receiver-reported DIAGNOSTICS no longer feed the sender AQ. The AQ now
+    // advances on a self-timer (see the `aq.tick()` task spawned below).
     let stats = Arc::new(Mutex::new(InboundStats::default()));
+    #[cfg(feature = "metrics")]
     {
         let mut s = stats.lock().unwrap();
-        s.set_aq(aq.clone());
-        #[cfg(feature = "metrics")]
         if let Some(ref m) = metrics {
             s.set_metrics(
                 Arc::clone(m),
@@ -637,6 +639,30 @@ async fn run_client(
 
     // For WebSocket transport, heartbeats go through the shared mpsc channel
     let quit = Arc::new(AtomicBool::new(false));
+
+    // Adaptive-quality self-timer (issue #1108). The sender AQ no longer reacts
+    // to receiver-reported DIAGNOSTICS; it advances on its own tick, reading the
+    // bot's (always-zero) encoder backpressure plus any explicit force_* signals.
+    // The bot has no WebCodecs encoder, so with zero backpressure it never
+    // degrades on the gradual axis — matching the browser's behavior on a
+    // healthy sender. Ticks until `quit`.
+    {
+        let aq_tick = aq.clone();
+        let quit_tick = quit.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(
+                videocall_aq::constants::AQ_TICK_INTERVAL_MS,
+            ));
+            loop {
+                interval.tick().await;
+                if quit_tick.load(Ordering::Relaxed) {
+                    break;
+                }
+                aq_tick.tick();
+            }
+        });
+    }
+
     if matches!(resolved_transport, Transport::WebSocket) {
         spawn_heartbeat_producer(
             client_config.user_id.clone(),
@@ -697,6 +723,33 @@ async fn run_client(
         }
         let mut s = stats.lock().unwrap();
         s.set_viewport_sender(vs);
+    }
+
+    // --- Layer-preference sender (HCL follow-up #1083-A2) ---
+    // Per-receiver simulcast: a browser receiver tells the relay which simulcast
+    // layer it wants per source via a LAYER_PREFERENCE control packet. The bot
+    // has no receiver chooser, so this "pin to layer N" mode is the only way it
+    // expresses a preference: when `pin_layer` is set it emits a LAYER_PREFERENCE
+    // pinning every discovered source to that fixed layer (0 = base only). This
+    // validates the relay's per-receiver layer filter from the bot side. `None`
+    // keeps legacy behaviour (no LAYER_PREFERENCE — relay forwards every layer).
+    {
+        let lps = LayerPreferenceSender::new(
+            user_id.clone(),
+            bot_config.pin_layer,
+            bot_config.pin_media_kind(),
+            packet_tx.clone(),
+        );
+        if lps.is_enabled() {
+            info!(
+                "[{}] LAYER_PREFERENCE pin enabled: pinning every source to layer {:?} ({:?})",
+                user_id,
+                bot_config.pin_layer,
+                bot_config.pin_media_kind()
+            );
+        }
+        let mut s = stats.lock().unwrap();
+        s.set_layer_preference_sender(lps);
     }
 
     // Spawn health reporter -- sends HealthPacket every 1s so senders can
@@ -771,6 +824,9 @@ async fn run_client(
         let ekg_height = v0.max_height;
         let ekg_fps = v0.target_fps.max(1);
         let video_mode = &bot_config.video_mode;
+        // Resolved simulcast layer count (#989): default 3, clamped to
+        // 1..=SIMULCAST_MAX_LAYERS. N==1 = legacy single-stream path.
+        let simulcast_layers = bot_config.simulcast_layer_count();
         if *video_mode == VideoMode::Costume {
             if let Some(ref dir) = costume_dir {
                 let renderer = CostumeRenderer::load(Path::new(dir))?;
@@ -786,6 +842,7 @@ async fn run_client(
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
                     transport_drops_counter.clone(),
+                    simulcast_layers,
                 )?);
                 info!("Costume video producer started for {} ({})", user_id, dir);
             } else {
@@ -810,6 +867,7 @@ async fn run_client(
                     encoder_errors_generic.clone(),
                     encoder_frames_ok.clone(),
                     transport_drops_counter.clone(),
+                    simulcast_layers,
                 )?);
                 info!("EKG video producer started for {} (fallback)", user_id);
             }
@@ -831,6 +889,7 @@ async fn run_client(
                 encoder_errors_generic.clone(),
                 encoder_frames_ok.clone(),
                 transport_drops_counter.clone(),
+                simulcast_layers,
             )?);
             info!("EKG video producer started for {}", user_id);
         }

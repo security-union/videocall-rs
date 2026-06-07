@@ -97,6 +97,49 @@ pub struct BotConfig {
     /// filtering.
     #[serde(default)]
     pub viewport_visible_count: Option<usize>,
+    /// Per-receiver simulcast layer-preference fidelity (HCL follow-up #1083-A2).
+    ///
+    /// When set, each bot emits a `LAYER_PREFERENCE` control packet pinning every
+    /// source `session_id` it discovers to this simulcast layer — exactly like a
+    /// real browser receiver that selected a fixed quality tier. `Some(0)` =
+    /// "BASE LAYER ONLY" (drop every upgraded layer from each source); a
+    /// per-receiver-simulcast relay then forwards only that layer to this bot, so
+    /// a load test can validate the relay's layer-filter (the pinned bot's
+    /// per-source `video_bytes` should fall to the base-layer rate while a
+    /// no-preference bot keeps the full ladder).
+    ///
+    /// `None` (the default) preserves legacy behaviour: the bot never sends a
+    /// LAYER_PREFERENCE and the relay forwards every layer (fail-open). The bot
+    /// has NO receiver chooser, so this is the only way it expresses a layer
+    /// preference — there is no dynamic per-tile selection.
+    ///
+    /// CLI: `--pin-layer <N>`. Env: `BOT_PIN_LAYER=<N>`.
+    #[serde(default)]
+    pub pin_layer: Option<u32>,
+    /// Which media kind the `pin_layer` preference constrains (`video` | `audio`
+    /// | `screen`). Only meaningful when `pin_layer` is set. Defaults to `video`
+    /// — the only media kind the relay layer-filters today.
+    ///
+    /// CLI: `--pin-layer-kind <kind>`. Env: `BOT_PIN_LAYER_KIND=<kind>`.
+    #[serde(default)]
+    pub pin_layer_kind: Option<String>,
+    /// Number of simultaneous simulcast VIDEO layers this bot PRODUCES (#989).
+    ///
+    /// Mirrors the real browser client: when `>= 2`, the bot runs one VP9
+    /// encoder per layer at the simulcast ladder's FIXED tier resolution
+    /// (lowest layer first, from `videocall_aq::constants::simulcast_layers`)
+    /// and stamps `PacketWrapper.simulcast_layer_id` per layer so the relay can
+    /// exercise its per-receiver layer SELECTION/forwarding path.
+    ///
+    /// `None` (the default) resolves to **3 layers** via
+    /// [`Self::simulcast_layer_count`]. `Some(1)` reproduces today's exact
+    /// single-stream behaviour byte-for-byte (one AQ-adaptive encoder, layer 0)
+    /// and is the A/B rollback path. Values are clamped to
+    /// `1..=SIMULCAST_MAX_LAYERS`.
+    ///
+    /// CLI: `--simulcast-layers <N>`. Env: `BOT_SIMULCAST_LAYERS=<N>`.
+    #[serde(default)]
+    pub simulcast_layers: Option<u32>,
     /// CLI-only: apply this preset to every participant that has no `network:`
     /// block of its own. Never overrides manifest settings; only fills gaps.
     #[serde(default, skip)]
@@ -176,6 +219,9 @@ impl BotConfig {
         let mut metrics_port: Option<u16> = None;
         let mut metrics_bind: Option<std::net::IpAddr> = None;
         let mut strict_memory = false;
+        let mut pin_layer: Option<u32> = None;
+        let mut pin_layer_kind: Option<String> = None;
+        let mut simulcast_layers: Option<u32> = None;
 
         let mut i = 1; // skip argv[0]
         while i < args.len() {
@@ -265,6 +311,45 @@ impl BotConfig {
                     strict_memory = true;
                     i += 1;
                 }
+                "--pin-layer" => {
+                    if i + 1 < args.len() {
+                        pin_layer = Some(
+                            args[i + 1]
+                                .parse()
+                                .map_err(|_| anyhow!("--pin-layer requires a u32 layer index"))?,
+                        );
+                        i += 2;
+                    } else {
+                        return Err(anyhow!("--pin-layer requires a layer-index argument"));
+                    }
+                }
+                "--pin-layer-kind" => {
+                    if i + 1 < args.len() {
+                        let kind = args[i + 1].clone();
+                        if crate::layer_preference_sender::PinMediaKind::parse(&kind).is_none() {
+                            return Err(anyhow!(
+                                "--pin-layer-kind: unknown kind '{}'. Use video, audio, or screen.",
+                                kind
+                            ));
+                        }
+                        pin_layer_kind = Some(kind);
+                        i += 2;
+                    } else {
+                        return Err(anyhow!(
+                            "--pin-layer-kind requires <video|audio|screen> argument"
+                        ));
+                    }
+                }
+                "--simulcast-layers" => {
+                    if i + 1 < args.len() {
+                        simulcast_layers = Some(args[i + 1].parse().map_err(|_| {
+                            anyhow!("--simulcast-layers requires a u32 layer count")
+                        })?);
+                        i += 2;
+                    } else {
+                        return Err(anyhow!("--simulcast-layers requires a count argument"));
+                    }
+                }
                 "--help" | "-h" => {
                     println!("{}", help_text());
                     std::process::exit(0);
@@ -292,6 +377,47 @@ impl BotConfig {
         config.metrics_port = metrics_port;
         config.metrics_bind = metrics_bind;
         config.strict_memory = strict_memory;
+
+        // Layer-preference pin (#1083-A2). Precedence: CLI flag > env var > YAML
+        // file value. Mirrors how the viewport knob is configured (config field)
+        // while also accepting CLI/env like the metrics/impairment knobs, so a
+        // single bot can be launched in "pin to layer N" mode without editing
+        // the shared config file. Default stays OFF (bot behaviour unchanged).
+        if let Some(layer) = pin_layer {
+            config.pin_layer = Some(layer);
+        } else if let Ok(env_layer) = std::env::var("BOT_PIN_LAYER") {
+            config.pin_layer = Some(
+                env_layer
+                    .parse()
+                    .map_err(|_| anyhow!("BOT_PIN_LAYER must be a u32 layer index"))?,
+            );
+        }
+        if let Some(kind) = pin_layer_kind {
+            config.pin_layer_kind = Some(kind);
+        } else if let Ok(env_kind) = std::env::var("BOT_PIN_LAYER_KIND") {
+            if crate::layer_preference_sender::PinMediaKind::parse(&env_kind).is_none() {
+                return Err(anyhow!(
+                    "BOT_PIN_LAYER_KIND: unknown kind '{}'. Use video, audio, or screen.",
+                    env_kind
+                ));
+            }
+            config.pin_layer_kind = Some(env_kind);
+        }
+
+        // Simulcast layer count (#989). Precedence: CLI flag > env var > YAML
+        // file value > default (3, resolved later in `simulcast_layer_count`).
+        // Mirrors the pin-layer knob above. The raw value is stored unclamped;
+        // `simulcast_layer_count()` applies the `1..=SIMULCAST_MAX_LAYERS` clamp
+        // and the default-3 fallback at use sites.
+        if let Some(n) = simulcast_layers {
+            config.simulcast_layers = Some(n);
+        } else if let Ok(env_n) = std::env::var("BOT_SIMULCAST_LAYERS") {
+            config.simulcast_layers = Some(
+                env_n
+                    .parse()
+                    .map_err(|_| anyhow!("BOT_SIMULCAST_LAYERS must be a u32 layer count"))?,
+            );
+        }
 
         Ok((config, num_users))
     }
@@ -416,6 +542,29 @@ impl BotConfig {
 
     pub fn broadcasters(&self) -> usize {
         self.broadcasters.unwrap_or(0)
+    }
+
+    /// Resolve the media kind the `pin_layer` preference applies to. Defaults to
+    /// VIDEO when unset or unparseable (the only kind the relay layer-filters).
+    pub fn pin_media_kind(&self) -> crate::layer_preference_sender::PinMediaKind {
+        use crate::layer_preference_sender::PinMediaKind;
+        self.pin_layer_kind
+            .as_deref()
+            .and_then(PinMediaKind::parse)
+            .unwrap_or(PinMediaKind::Video)
+    }
+
+    /// Resolve how many simultaneous simulcast VIDEO layers this bot produces.
+    ///
+    /// Default (field unset) is **3** — the full ladder, matching the browser
+    /// client. The value is clamped into `1..=SIMULCAST_MAX_LAYERS` so an
+    /// out-of-range config degrades to the nearest valid ladder rather than
+    /// panicking. `1` is the single-stream rollback path.
+    pub fn simulcast_layer_count(&self) -> u32 {
+        use videocall_aq::constants::SIMULCAST_MAX_LAYERS;
+        self.simulcast_layers
+            .unwrap_or(3)
+            .clamp(1, SIMULCAST_MAX_LAYERS as u32)
     }
 }
 
@@ -601,6 +750,21 @@ fn help_text() -> String {
          \x20 --strict-memory               Exit with code 1 if costume frames exceed 80%% of\n\
          \x20                               available RAM (default: warn only).\n\
          \n\
+         Simulcast layer preference (#1083; off by default):\n\
+         \x20 --pin-layer <N>               Emit a LAYER_PREFERENCE pinning every discovered\n\
+         \x20                               source to simulcast layer N (0 = base layer only).\n\
+         \x20                               Validates the relay's per-receiver layer filter.\n\
+         \x20                               Also via BOT_PIN_LAYER env var.\n\
+         \x20 --pin-layer-kind <kind>       Media kind to constrain: video (default), audio,\n\
+         \x20                               or screen. Also via BOT_PIN_LAYER_KIND env var.\n\
+         \n\
+         Simulcast production (#989; produces multiple layers):\n\
+         \x20 --simulcast-layers <N>        Number of simultaneous VIDEO layers this bot\n\
+         \x20                               PUBLISHES (1..=3, default 3). N>=2 runs one VP9\n\
+         \x20                               encoder per ladder tier and stamps\n\
+         \x20                               simulcast_layer_id per layer. N=1 = legacy single\n\
+         \x20                               AQ-adaptive stream. Also via BOT_SIMULCAST_LAYERS.\n\
+         \n\
          Observability (requires `--features metrics` at build time):\n\
          \x20 --metrics-port <port>         Start a Prometheus `/metrics` HTTP endpoint on the\n\
          \x20                               given port (off by default).\n\
@@ -670,6 +834,161 @@ mod tests {
         let help = help_text();
         assert!(help.contains("Safety:"));
         assert!(help.contains("--strict-memory"));
+    }
+
+    #[test]
+    fn pin_layer_defaults_to_off() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(
+            config.pin_layer.is_none(),
+            "pin_layer must default to None (legacy fail-open)"
+        );
+        // Accessor still resolves a sane default kind for the disabled case.
+        assert_eq!(
+            config.pin_media_kind(),
+            crate::layer_preference_sender::PinMediaKind::Video
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pin_layer_flag_parses_layer_and_kind() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--pin-layer".to_string(),
+            "0".to_string(),
+            "--pin-layer-kind".to_string(),
+            "screen".to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.pin_layer, Some(0));
+        assert_eq!(
+            config.pin_media_kind(),
+            crate::layer_preference_sender::PinMediaKind::Screen
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pin_layer_kind_rejects_unknown_value() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--pin-layer-kind".to_string(),
+            "garbage".to_string(),
+        ];
+        let err = BotConfig::from_args_inner(&args, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown kind"),
+            "unexpected error: {}",
+            err
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn help_text_mentions_pin_layer() {
+        let help = help_text();
+        assert!(help.contains("--pin-layer"));
+        assert!(help.contains("--pin-layer-kind"));
+    }
+
+    #[test]
+    fn simulcast_layers_defaults_to_3() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert!(
+            config.simulcast_layers.is_none(),
+            "raw field must stay None when the flag/env are absent"
+        );
+        // The resolved count — what the producers actually consume — must be 3.
+        assert_eq!(
+            config.simulcast_layer_count(),
+            3,
+            "absent simulcast-layers must resolve to the full 3-layer ladder"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn simulcast_layers_flag_parses() {
+        let path = write_temp_config();
+        let args = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--simulcast-layers".to_string(),
+            "1".to_string(),
+        ];
+        let (config, _) = BotConfig::from_args_inner(&args, None).unwrap();
+        assert_eq!(config.simulcast_layers, Some(1));
+        assert_eq!(
+            config.simulcast_layer_count(),
+            1,
+            "explicit --simulcast-layers 1 must resolve to the single-stream path"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn simulcast_layers_clamps() {
+        let path = write_temp_config();
+        // Above SIMULCAST_MAX_LAYERS (3) clamps down to 3.
+        let args_high = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--simulcast-layers".to_string(),
+            "99".to_string(),
+        ];
+        let (config_high, _) = BotConfig::from_args_inner(&args_high, None).unwrap();
+        assert_eq!(config_high.simulcast_layers, Some(99));
+        assert_eq!(
+            config_high.simulcast_layer_count(),
+            3,
+            "99 layers must clamp to SIMULCAST_MAX_LAYERS (3)"
+        );
+
+        // Zero clamps up to the base single layer (never 0 encoders).
+        let args_zero = vec![
+            "bot".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--simulcast-layers".to_string(),
+            "0".to_string(),
+        ];
+        let (config_zero, _) = BotConfig::from_args_inner(&args_zero, None).unwrap();
+        assert_eq!(config_zero.simulcast_layers, Some(0));
+        assert_eq!(
+            config_zero.simulcast_layer_count(),
+            1,
+            "0 layers must clamp up to 1 (single stream), never 0 encoders"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn help_text_mentions_simulcast_layers() {
+        let help = help_text();
+        assert!(help.contains("--simulcast-layers"));
+        assert!(help.contains("Simulcast production"));
     }
 
     #[test]

@@ -23,8 +23,11 @@
 
 use crate::components::login::{do_login, ProviderButton};
 use crate::components::meeting_format::format_meeting_state_label;
+use crate::components::meetings_filter::{
+    filter_and_sort_meetings, AttendedWithin, FilterState, SortDir, SortKey, SortState,
+};
 use crate::constants::meeting_api_client;
-use crate::local_storage::{load_bool, save_bool};
+use crate::local_storage::{load_bool, load_json, save_bool, save_json};
 use crate::routing::Route;
 use dioxus::prelude::*;
 use videocall_meeting_types::responses::{ListFeedResponse, MeetingFeedSummary};
@@ -33,6 +36,15 @@ use wasm_bindgen::JsCast;
 /// `localStorage` key for the merged "Meetings" section's expand/collapse state.
 /// Defaults to expanded (`true`) on first load.
 const EXPANDED_STORAGE_KEY: &str = "home.meetings.expanded";
+
+/// `localStorage` key for the persisted meetings-list filter selections
+/// (JSON-serialised [`FilterState`]). Resilient to absent/corrupt values —
+/// see [`crate::local_storage::load_json`].
+const FILTER_STORAGE_KEY: &str = "home.meetings.filter";
+
+/// `localStorage` key for the persisted meetings-list sort selection
+/// (JSON-serialised [`SortState`]).
+const SORT_STORAGE_KEY: &str = "home.meetings.sort";
 
 /// Legacy key from when the home page rendered "My Meetings" and "Previously
 /// Joined" as two separate sections. Read once on first load to migrate the
@@ -68,6 +80,27 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
     let mut error = use_signal(|| None::<String>);
     let mut unauthenticated = use_signal(|| false);
     let mut expanded = use_signal(load_merged_expanded_default);
+
+    // Filter / sort selections, restored from localStorage on mount and
+    // persisted on every change. `load_json` falls back to `Default` for
+    // absent/corrupt stored values, so a garbled key can never wedge the UI.
+    let mut filter =
+        use_signal(|| load_json::<FilterState>(FILTER_STORAGE_KEY, FilterState::default()));
+    let mut sort = use_signal(|| load_json::<SortState>(SORT_STORAGE_KEY, SortState::default()));
+
+    // Whether the filter popover / sort dropdown are open. Only one of the two
+    // floating panels is open at a time (opening one closes the other).
+    let mut filter_open = use_signal(|| false);
+    let mut sort_open = use_signal(|| false);
+
+    // Derived list: filter + sort over the in-memory feed. Recomputed only when
+    // (meetings, filter, sort) change — NOT on every unrelated re-render. `now`
+    // is read once per recompute via the browser clock; the actual filtering is
+    // the pure `filter_and_sort_meetings` (host-testable with `now` injected).
+    let visible_meetings = use_memo(move || {
+        let now_ms = js_sys::Date::now() as i64;
+        filter_and_sort_meetings(&meetings(), &filter(), &sort(), now_ms)
+    });
 
     #[allow(unused_mut)]
     let mut fetch_meetings = move || {
@@ -121,27 +154,90 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
         }
     };
 
+    // Persist + apply a new filter. Centralised so every checkbox/radio writes
+    // through the same path.
+    let mut set_filter = move |next: FilterState| {
+        filter.set(next);
+        save_json(FILTER_STORAGE_KEY, &next);
+    };
+
+    // Persist + apply a new sort state.
+    let set_sort = move |next: SortState| {
+        sort.set(next);
+        save_json(SORT_STORAGE_KEY, &next);
+    };
+
+    let clear_filters = move |_| {
+        set_filter(FilterState::default());
+        filter_open.set(false);
+    };
+
+    let active_filter_count = filter().active_count();
+    // Bind the derived list ONCE per render and reuse it for both the
+    // filtered-empty check and the row loop, so the ≤200-row Vec isn't cloned
+    // twice on every render (including on popover open/close).
+    let visible = visible_meetings();
+    // Distinguish the two empty states: the generic "no meetings yet" (feed is
+    // genuinely empty) vs. "no meetings match your filters" (feed has rows but
+    // the active filter excludes them all). Only the latter is reachable when
+    // a filter is active.
+    let feed_empty = meetings().is_empty();
+    let filtered_empty = !feed_empty && visible.is_empty();
+    // The filter/sort controls live on the header row (issue #1), so they must
+    // only render once the feed is expanded, loaded, authenticated, error-free,
+    // and actually has rows to refine — matching when the list body shows rows.
+    let show_controls =
+        expanded() && !loading() && !unauthenticated() && error().is_none() && !feed_empty;
+
     rsx! {
         div { class: "meetings-list-container",
-            button {
-                class: "meetings-list-toggle",
-                onclick: toggle_expanded,
-                r#type: "button",
-                svg {
-                    class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "20",
-                    height: "20",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    polyline { points: "6 9 12 15 18 9" }
+            // Header row: collapsible "Meetings" title on the left, the
+            // filter/sort controls on the right (space-between).
+            div { class: "meetings-list-header",
+                button {
+                    class: "meetings-list-toggle",
+                    onclick: toggle_expanded,
+                    r#type: "button",
+                    svg {
+                        class: if expanded() { "chevron-icon expanded" } else { "chevron-icon" },
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "20",
+                        height: "20",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        polyline { points: "6 9 12 15 18 9" }
+                    }
+                    span { "Meetings" }
+                    span { class: "meeting-count", "({meetings().len()})" }
                 }
-                span { "Meetings" }
-                span { class: "meeting-count", "({meetings().len()})" }
+
+                if show_controls {
+                    MeetingsToolbar {
+                        filter: filter(),
+                        sort: sort(),
+                        active_filter_count,
+                        filter_open: filter_open(),
+                        sort_open: sort_open(),
+                        on_filter_change: set_filter,
+                        on_sort_change: set_sort,
+                        on_toggle_filter: move |_| {
+                            let open = !filter_open();
+                            filter_open.set(open);
+                            if open { sort_open.set(false); }
+                        },
+                        on_toggle_sort: move |_| {
+                            let open = !sort_open();
+                            sort_open.set(open);
+                            if open { filter_open.set(false); }
+                        },
+                        on_close_filter: move |_| filter_open.set(false),
+                        on_close_sort: move |_| sort_open.set(false),
+                    }
+                }
             }
 
             if expanded() {
@@ -161,11 +257,22 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
                             span { "Error: {err}" }
                             button { onclick: refresh, class: "retry-btn", "Retry" }
                         }
-                    } else if meetings().is_empty() {
+                    } else if feed_empty {
                         div { class: "meetings-empty", "No meetings yet" }
                     } else {
+                        if filtered_empty {
+                            div { class: "meetings-empty meetings-empty-filtered",
+                                span { "No meetings match your filters" }
+                                button {
+                                    class: "meetings-clear-filters-btn",
+                                    r#type: "button",
+                                    onclick: clear_filters,
+                                    "Clear filters"
+                                }
+                            }
+                        } else {
                         ul { class: "meetings-list",
-                            for meeting in meetings().iter() {
+                            for meeting in visible.iter() {
                                 MeetingItem {
                                     key: "{meeting.meeting_id}",
                                     meeting: meeting.clone(),
@@ -195,6 +302,7 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
                                     },
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -352,6 +460,279 @@ fn MeetingItem(
                         path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
                         line { x1: "10", y1: "11", x2: "10", y2: "17" }
                         line { x1: "14", y1: "11", x2: "14", y2: "17" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Filter + sort toolbar rendered on the right of the "Meetings" header row
+/// (same line as the collapsible title) whenever the feed has rows. Owns no
+/// business state — it renders the current `filter`/`sort` props
+/// and bubbles every change up to `MeetingsList`, which persists it. Splitting
+/// it out keeps `MeetingsList`'s render tree small and lets the popover /
+/// dropdown manage their own open state via props.
+///
+/// Accessibility: both floating panels are dismissible by Escape (keydown on
+/// the panel) and by clicking the transparent full-viewport backdrop
+/// (outside-click). The trigger buttons carry `aria-haspopup`/`aria-expanded`;
+/// checkboxes and radios are wrapped in `<label>`s so the text is clickable and
+/// announced. The direction toggle exposes an `aria-label` describing the
+/// current direction.
+#[component]
+#[allow(clippy::too_many_arguments)]
+fn MeetingsToolbar(
+    filter: FilterState,
+    sort: SortState,
+    active_filter_count: usize,
+    filter_open: bool,
+    sort_open: bool,
+    on_filter_change: EventHandler<FilterState>,
+    on_sort_change: EventHandler<SortState>,
+    on_toggle_filter: EventHandler<()>,
+    on_toggle_sort: EventHandler<()>,
+    on_close_filter: EventHandler<()>,
+    on_close_sort: EventHandler<()>,
+) -> Element {
+    let dir_is_desc = sort.dir == SortDir::Desc;
+    let dir_label = if dir_is_desc {
+        "Sort direction: descending. Activate to sort ascending."
+    } else {
+        "Sort direction: ascending. Activate to sort descending."
+    };
+    let filters_active = active_filter_count > 0;
+
+    // Stable ids on the trigger buttons so focus can return to them on close.
+    // Popover positioning is now pure CSS (absolute, anchored to the
+    // `.meetings-toolbar-group` wrapper) — no JS rect math.
+    const FILTER_BTN_ID: &str = "meetings-filter-trigger";
+    const SORT_BTN_ID: &str = "meetings-sort-trigger";
+
+    rsx! {
+        div { class: "meetings-toolbar",
+            // ---- Filter popover ------------------------------------------
+            // Escape is handled at the GROUP level (not on the popover div) so a
+            // keydown from the focused trigger button — the common case, and
+            // what Playwright's `.press('Escape')` produces — bubbles up and
+            // closes the popover regardless of where focus sits while open.
+            div {
+                class: "meetings-toolbar-group",
+                onkeydown: move |e: KeyboardEvent| {
+                    if filter_open && e.key() == Key::Escape {
+                        e.stop_propagation();
+                        on_close_filter.call(());
+                        focus_element_by_id(FILTER_BTN_ID);
+                    }
+                },
+                button {
+                    id: FILTER_BTN_ID,
+                    class: if filters_active { "meetings-icon-btn is-active" } else { "meetings-icon-btn" },
+                    r#type: "button",
+                    aria_haspopup: "true",
+                    aria_expanded: filter_open,
+                    title: "Filter meetings",
+                    aria_label: if filters_active {
+                        format!("Filter meetings ({active_filter_count} active)")
+                    } else {
+                        "Filter meetings".to_string()
+                    },
+                    onclick: move |_| on_toggle_filter.call(()),
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16",
+                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                        "aria-hidden": "true",
+                        polygon { points: "22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" }
+                    }
+                    if filters_active {
+                        span { class: "meetings-filter-badge", "aria-hidden": "true", "{active_filter_count}" }
+                    }
+                }
+
+                if filter_open {
+                    // Transparent backdrop: clicking anywhere outside the panel
+                    // closes the popover (outside-click dismissal). Returns
+                    // focus to the trigger so keyboard focus isn't stranded.
+                    div {
+                        class: "meetings-popover-backdrop",
+                        onclick: move |_| {
+                            on_close_filter.call(());
+                            focus_element_by_id(FILTER_BTN_ID);
+                        },
+                    }
+                    div {
+                        class: "meetings-popover meetings-filter-popover",
+                        role: "dialog",
+                        aria_label: "Filter meetings",
+                        // Position is pure CSS (absolute, anchored to the
+                        // toolbar-group wrapper) — see `.meetings-popover`.
+                        // Escape is handled on the enclosing group (above);
+                        // stop click propagation so a click inside the panel
+                        // never reaches the backdrop.
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
+
+                        fieldset { class: "meetings-filter-group",
+                            legend { class: "meetings-filter-legend", "Ownership" }
+                            label { class: "meetings-filter-option",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: filter.own_owned,
+                                    onchange: move |e| {
+                                        on_filter_change.call(FilterState { own_owned: e.checked(), ..filter });
+                                    },
+                                }
+                                span { "Owned" }
+                            }
+                            label { class: "meetings-filter-option",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: filter.own_not_owned,
+                                    onchange: move |e| {
+                                        on_filter_change.call(FilterState { own_not_owned: e.checked(), ..filter });
+                                    },
+                                }
+                                span { "Not Owned" }
+                            }
+                        }
+
+                        fieldset { class: "meetings-filter-group",
+                            legend { class: "meetings-filter-legend", "Status" }
+                            label { class: "meetings-filter-option",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: filter.status_active,
+                                    onchange: move |e| {
+                                        on_filter_change.call(FilterState { status_active: e.checked(), ..filter });
+                                    },
+                                }
+                                span { "Active" }
+                            }
+                            label { class: "meetings-filter-option",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: filter.status_ended,
+                                    onchange: move |e| {
+                                        on_filter_change.call(FilterState { status_ended: e.checked(), ..filter });
+                                    },
+                                }
+                                span { "Ended" }
+                            }
+                        }
+
+                        fieldset { class: "meetings-filter-group",
+                            legend { class: "meetings-filter-legend", "Attended within" }
+                            for window in [
+                                AttendedWithin::Last7Days,
+                                AttendedWithin::Last30Days,
+                                AttendedWithin::Last6Months,
+                                AttendedWithin::Any,
+                            ] {
+                                label { class: "meetings-filter-option", key: "{window.as_id()}",
+                                    input {
+                                        r#type: "radio",
+                                        name: "meetings-attended-within",
+                                        value: window.as_id(),
+                                        checked: filter.attended_within == window,
+                                        onchange: move |_| {
+                                            on_filter_change.call(FilterState { attended_within: window, ..filter });
+                                        },
+                                    }
+                                    span { "{window.label()}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Sort dropdown -------------------------------------------
+            // Group-level Escape (see filter group comment) so a keydown from
+            // the focused sort trigger closes the popover.
+            div {
+                class: "meetings-toolbar-group",
+                onkeydown: move |e: KeyboardEvent| {
+                    if sort_open && e.key() == Key::Escape {
+                        e.stop_propagation();
+                        on_close_sort.call(());
+                        focus_element_by_id(SORT_BTN_ID);
+                    }
+                },
+                button {
+                    id: SORT_BTN_ID,
+                    class: "meetings-sort-btn",
+                    r#type: "button",
+                    aria_haspopup: "true",
+                    aria_expanded: sort_open,
+                    title: "Sort meetings",
+                    onclick: move |_| on_toggle_sort.call(()),
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
+                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                        "aria-hidden": "true",
+                        line { x1: "3", y1: "6", x2: "13", y2: "6" }
+                        line { x1: "3", y1: "12", x2: "10", y2: "12" }
+                        line { x1: "3", y1: "18", x2: "7", y2: "18" }
+                    }
+                    span { class: "meetings-sort-label", "{sort.key.label()}" }
+                }
+
+                // Direction toggle, always visible next to the sort button.
+                button {
+                    class: "meetings-icon-btn meetings-sort-dir-btn",
+                    r#type: "button",
+                    aria_label: dir_label,
+                    title: dir_label,
+                    onclick: move |_| {
+                        on_sort_change.call(SortState { dir: sort.dir.flipped(), ..sort });
+                    },
+                    svg {
+                        class: if dir_is_desc { "meetings-sort-dir-icon is-desc" } else { "meetings-sort-dir-icon" },
+                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
+                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                        "aria-hidden": "true",
+                        line { x1: "12", y1: "5", x2: "12", y2: "19" }
+                        polyline { points: "19 12 12 19 5 12" }
+                    }
+                }
+
+                if sort_open {
+                    div {
+                        class: "meetings-popover-backdrop",
+                        onclick: move |_| {
+                            on_close_sort.call(());
+                            focus_element_by_id(SORT_BTN_ID);
+                        },
+                    }
+                    // Plain menu of buttons (no role="listbox"/"option"): there
+                    // is no arrow-key roving to back full listbox semantics, so
+                    // the markup deliberately under-promises. Tab + Escape is
+                    // the supported keyboard model; a roving-tabindex listbox is
+                    // a deferred follow-up. `aria_current` marks the active sort
+                    // without implying single-select listbox behaviour.
+                    div {
+                        class: "meetings-popover meetings-sort-popover",
+                        aria_label: "Sort by",
+                        // Escape handled on the enclosing group (above); stop
+                        // click propagation so an in-panel click never reaches
+                        // the backdrop.
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                        for key in SortKey::all() {
+                            button {
+                                class: if sort.key == key { "meetings-sort-option is-selected" } else { "meetings-sort-option" },
+                                r#type: "button",
+                                aria_current: if sort.key == key { "true" } else { "false" },
+                                key: "{key.as_id()}",
+                                onclick: move |_| {
+                                    on_sort_change.call(SortState { key, ..sort });
+                                    on_close_sort.call(());
+                                    focus_element_by_id(SORT_BTN_ID);
+                                },
+                                "{key.label()}"
+                            }
+                        }
                     }
                 }
             }
@@ -607,6 +988,16 @@ fn hide_meeting_info_tooltip() {
     }
 }
 
+/// Return keyboard focus to a trigger button by id. Called when a popover
+/// closes (Escape, outside-click, or a selection that dismisses it) so focus
+/// doesn't get stranded on the now-removed panel.
+fn focus_element_by_id(id: &str) {
+    if let Some(el) = gloo_utils::document().get_element_by_id(id) {
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        let _ = html_el.focus();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the tooltip-HTML builder.
@@ -639,6 +1030,7 @@ mod tests {
             waiting_room_enabled: true,
             admitted_can_admit: false,
             end_on_host_leave: true,
+            user_last_attended_at: Some(1_714_323_600_000),
         }
     }
 

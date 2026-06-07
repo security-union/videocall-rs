@@ -17,6 +17,7 @@
  */
 
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
+use super::layer_chooser::{DownlinkSample, LayerAvailability, LayerChooser};
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder, MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
@@ -338,6 +339,38 @@ impl SequenceTracker {
     fn kf_per_sec(&self) -> f64 {
         self.kf_per_sec
     }
+
+    /// Re-anchor the tracker because the receiver switched to a DIFFERENT
+    /// simulcast layer (issue #989 / #1079 H1).
+    ///
+    /// Each simulcast layer is an independent encoder with its OWN per-layer
+    /// sequence space (camera/screen `sequence_numbers: vec![0; n_layers]`). When
+    /// the chooser switches `selected_*_layer`, the first packets of the new
+    /// layer arrive with sequence numbers from a DIFFERENT counter than the one
+    /// `high_seq` is tracking. Without this reset, `record_seq` would interpret
+    /// that cross-counter discontinuity as a huge window shift and manufacture
+    /// phantom loss — which is exactly the chooser's congestion signal, causing a
+    /// step-UP to immediately look like congestion and oscillate (UP→DOWN→UP).
+    ///
+    /// We clear the sequence-window state (`high_seq`, `seen_bits`, `lost_count`,
+    /// `loss_detected_at_ms`) so the next packet of the new layer establishes a
+    /// fresh baseline (the `high_seq == None` path in `record_seq` returns 0 loss
+    /// on the first packet), and clear the in-flight window accumulators
+    /// (`window_lost` / `window_kf_requests`) so the discontinuity does not leak
+    /// into the current rate window. We DELIBERATELY preserve the PLI backoff
+    /// history (`current_backoff_ms`, `unanswered_requests`,
+    /// `last_keyframe_request_ms`): that rate-limit state is connection-level, not
+    /// layer-level, and resetting it could let a PLI storm restart (issue #832).
+    /// The already-published `loss_per_sec` / `kf_per_sec` are left as-is; they
+    /// are recomputed on the next ~1s window rollover.
+    fn reanchor_for_layer_switch(&mut self) {
+        self.high_seq = None;
+        self.seen_bits = 0;
+        self.lost_count = 0;
+        self.loss_detected_at_ms = None;
+        self.window_lost = 0;
+        self.window_kf_requests = 0;
+    }
 }
 
 /// Result of `Peer::track_sequence`: a possible keyframe request plus, on
@@ -350,6 +383,26 @@ struct SeqTrackResult {
     /// `Some((loss_per_sec, kf_per_sec))` only when the rate window just rolled
     /// over and a fresh sample is ready to emit.
     rates: Option<(f64, f64)>,
+}
+
+/// Per-peer RECEIVE simulcast diagnostics for one connected peer (issue #1095
+/// observability — additive). Produced by
+/// [`PeerDecodeManager::per_peer_received_snapshots`] and shown in the panel's
+/// "Live diagnostics" disclosure. Each per-kind field is `Some` only when that
+/// kind is currently being received from the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReceiveDiag {
+    /// The peer's relay session id.
+    pub session_id: u64,
+    /// A human-friendly label: display name if known, else user id, else the
+    /// session id (so the row always has something to show).
+    pub label: String,
+    /// Decoded VIDEO layer snapshot, if video is being received.
+    pub video: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
+    /// Decoded SCREEN layer snapshot, if a screen share is being received.
+    pub screen: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
+    /// Decoded AUDIO layer snapshot, if audio is being received.
+    pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
 }
 
 pub struct Peer {
@@ -388,6 +441,51 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
+    /// Which simulcast layer (issue #989) this receiver decodes for this peer.
+    ///
+    /// VIDEO `PacketWrapper`s whose cleartext `simulcast_layer_id` does not
+    /// match this value are dropped BEFORE sequence tracking and decode, so a
+    /// peer publishing N>1 layers only ever costs this receiver one layer's
+    /// decode. The first-cut default is **0 (the lowest layer)** unconditionally
+    /// — which is also exactly what every pre-simulcast publisher emits, so
+    /// behaviour is unchanged for them. Viewport/tile-size-driven layer
+    /// selection (raising this to a higher layer for the focused tile) is
+    /// deferred to a later PR.
+    selected_video_layer: u32,
+    /// Receiver-driven per-peer simulcast layer chooser (issue #989, Phase 2).
+    /// Run on each monitor tick against this receiver's OWN downlink health for
+    /// this source; its output drives `selected_video_layer` (the decode guard)
+    /// and the `LAYER_PREFERENCE` packet sent to the relay. Independent per peer.
+    video_layer_chooser: LayerChooser,
+    /// Empirically-learned set of simulcast layers this source is producing,
+    /// observed from arriving `simulcast_layer_id`s (the relay does not
+    /// advertise availability). Caps how high the chooser may climb.
+    video_layer_availability: LayerAvailability,
+    /// Most recent windowed downlink sample for VIDEO (loss/sec + PLI/sec),
+    /// refreshed on each ~1s sequence-window rollover and consumed by the
+    /// chooser on the monitor tick. Starts clean so a fresh peer is not treated
+    /// as congested before any window has rolled.
+    last_video_downlink: DownlinkSample,
+    /// Which simulcast layer (issue #989, Phase 3) this receiver decodes for
+    /// this peer's SCREEN stream. Independent of `selected_video_layer`: a peer
+    /// can publish camera AND screen simultaneously and the receiver chooses a
+    /// layer for each separately. Defaults to 0 (base / un-upgraded publisher).
+    selected_screen_layer: u32,
+    /// Per-peer SCREEN layer chooser, availability, and last downlink sample
+    /// (issue #989, Phase 3). Mirror of the VIDEO trio, driven by the SCREEN
+    /// stream's own loss/PLI windows so screen adapts independently of camera.
+    screen_layer_chooser: LayerChooser,
+    screen_layer_availability: LayerAvailability,
+    last_screen_downlink: DownlinkSample,
+    /// Which simulcast layer (issue #989, Phase 3) this receiver decodes for
+    /// this peer's AUDIO stream. Defaults to 0.
+    selected_audio_layer: u32,
+    /// Per-peer AUDIO layer chooser + availability (issue #989, Phase 3). Audio
+    /// carries no per-window loss tracker here (NetEq path), so the chooser is
+    /// fed the VIDEO downlink as a proxy for shared-connection health (see
+    /// `tick_audio_layer_chooser`) — hence no separate `last_audio_downlink`.
+    audio_layer_chooser: LayerChooser,
+    audio_layer_availability: LayerAvailability,
     /// Reorder-tolerant sequence tracker for video packets.
     video_seq_tracker: SequenceTracker,
     /// Reorder-tolerant sequence tracker for screen packets.
@@ -406,9 +504,14 @@ pub struct Peer {
     /// no global ordering) the race surfaces reliably and the screen
     /// tile collapses out of the split layout.
     last_screen_frame_ms: u64,
-    /// HCL bug #1: same idea for the camera-video stream. Without this
-    /// guard a stale heartbeat with `video_enabled = false` would mute
-    /// an actively-streaming camera on WT for one heartbeat period.
+    /// Same idea for the camera-video stream, but resolved
+    /// against the short `LIVE_STREAM_FRESH_WINDOW_MS` (not the screen-sized
+    /// window) — a live camera streams continuously, so a recent frame only
+    /// has to out-vote a stale `false` heartbeat across one reorder gap.
+    /// Within the window this guard stops a stale `video_enabled = false`
+    /// heartbeat from blanking an actively-streaming camera on WT; once
+    /// frames actually stop (camera disabled) the next heartbeat reflects
+    /// the change on remote peers within ~500ms instead of ~5s.
     last_video_frame_ms: u64,
     /// HCL bug #1: same idea for the audio stream.
     last_audio_frame_ms: u64,
@@ -433,7 +536,48 @@ pub struct Peer {
 /// 5000ms is the minimum value that covers the worst case while still
 /// honouring genuine "publisher stopped sharing" transitions on the
 /// NEXT heartbeat after the window expires.
+///
+/// This window is correct for SCREEN ONLY. Screen-share is legitimately
+/// bursty/idle: a static shared window can emit no new frames for several
+/// seconds while the stream is still "on" (most screen encoders skip frames
+/// when nothing on screen changes), so we must NOT let a single stale
+/// `false` heartbeat clobber the flag. Audio and camera-video are continuous
+/// streams and use the much shorter `LIVE_STREAM_FRESH_WINDOW_MS` instead —
+/// see that constant for why.
 const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
+
+/// Freshness window for the CONTINUOUS live streams — audio and
+/// camera-video — deliberately MUCH shorter than `MEDIA_FRESH_WINDOW_MS`.
+///
+/// Audio and camera-video are fundamentally different from screen-share for
+/// this decision:
+///
+///   * They are continuous, high-rate streams. Audio is ~50 packets/sec
+///     (20ms framing); a live camera emits frames continuously at its frame
+///     rate even on a static scene (camera encoders, unlike screen encoders,
+///     do not skip frames when the picture is unchanging). When either is
+///     genuinely live, fresh frames keep arriving and re-stamp
+///     `last_{audio,video}_frame_ms`, so even a single reordered/late
+///     `false` heartbeat is naturally re-suppressed by the next frame. The
+///     window therefore only has to cover ONE worst-case reorder gap between
+///     a live frame and a contemporaneous stale heartbeat — NOT a full
+///     multi-second idle gap like screen needs.
+///
+///   * A real gap in audio/video frames is itself an immediate "stopped"
+///     signal (mute / camera-off), unlike screen which idles while still
+///     enabled. So a short window both protects against WT reorder AND lets
+///     a genuine stop reflect on remote peers promptly.
+///
+/// Sizing: 500ms comfortably exceeds plausible QUIC reorder/jitter spread
+/// on a high-latency (200ms+) lossy/mobile link between a live frame and a
+/// heartbeat sent at nearly the same time, so it does NOT introduce audio
+/// mute-flicker or camera flicker on bad networks. At the same time it
+/// bounds mute / camera-off propagation to at most ~500ms after the last
+/// frame (and effectively to the next heartbeat on the ordered WebSocket
+/// path, where a post-frame `false` heartbeat is already authoritative).
+/// This replaces the previous ~5s lag, which came from reusing the
+/// screen-sized window for these continuous streams.
+pub(crate) const LIVE_STREAM_FRESH_WINDOW_MS: u64 = 500;
 
 /// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
 /// arrives, given:
@@ -442,6 +586,12 @@ const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 ///   * `last_frame_ms` — timestamp of the most recent live X frame we
 ///     decoded (0 = none ever)
 ///   * `now_ms` — current monotonic clock
+///   * `fresh_window_ms` — how recent a live frame must be to out-vote a
+///     `false` heartbeat. Callers pass `MEDIA_FRESH_WINDOW_MS` for screen
+///     (legitimately bursty/idle stream) and the much shorter
+///     `LIVE_STREAM_FRESH_WINDOW_MS` for audio and camera-video (continuous
+///     high-rate streams where a frame gap is itself a stop signal; see
+///     those constants for the rationale).
 ///
 /// Returns the value to install on `self.X_enabled`.
 ///
@@ -451,14 +601,13 @@ const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 ///                      any contradicting "no frames seen" condition is
 ///                      a network problem, not a state problem).
 ///
-///   heartbeat=false  → if we saw an X frame within
-///                      `MEDIA_FRESH_WINDOW_MS`, KEEP `current`. The
-///                      heartbeat is stale relative to the live stream
-///                      (classic out-of-order-arrival window on WT, where
-///                      heartbeats and SCREEN frames live on different
-///                      QUIC streams with no global FIFO ordering). If
-///                      no recent frame, trust the heartbeat — the
-///                      publisher really did stop the X stream.
+///   heartbeat=false  → if we saw an X frame within `fresh_window_ms`,
+///                      KEEP `current`. The heartbeat is stale relative to
+///                      the live stream (classic out-of-order-arrival
+///                      window on WT, where heartbeats and media frames
+///                      live on different QUIC streams with no global FIFO
+///                      ordering). If no recent frame, trust the heartbeat
+///                      — the publisher really did stop the X stream.
 ///
 /// Pure function so it can be unit-tested without a real `Peer`.
 pub(crate) fn apply_heartbeat_enabled_flag(
@@ -466,6 +615,7 @@ pub(crate) fn apply_heartbeat_enabled_flag(
     heartbeat_value: bool,
     last_frame_ms: u64,
     now_ms: u64,
+    fresh_window_ms: u64,
 ) -> bool {
     if heartbeat_value {
         // Affirmative heartbeats always win — publisher is announcing
@@ -478,11 +628,60 @@ pub(crate) fn apply_heartbeat_enabled_flag(
     // guards the (unlikely) case where `now_ms < last_frame_ms` due to
     // a clock skew or test fixture setting future timestamps; we treat
     // that as "frame is fresh" rather than panic / wrap.
-    if last_frame_ms > 0 && now_ms.saturating_sub(last_frame_ms) < MEDIA_FRESH_WINDOW_MS {
+    if last_frame_ms > 0 && now_ms.saturating_sub(last_frame_ms) < fresh_window_ms {
         current
     } else {
         false
     }
+}
+
+/// Resolve a CONTINUOUS live-stream (audio / camera-video) enabled flag
+/// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`] so a
+/// real mute / camera-off reflects on remote peers sub-second.
+///
+/// Thin wrapper over [`apply_heartbeat_enabled_flag`] that BAKES IN the
+/// correct window. The window is the security-/correctness-critical knob here:
+/// a future "simplify by sharing one window" edit at the call site could
+/// silently widen audio/video back to the screen-sized window and reintroduce
+/// the ~5s mute/camera-off lag. Routing audio and camera-video through this
+/// wrapper makes that window non-passable at the call site.
+pub(crate) fn apply_live_stream_heartbeat_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    apply_heartbeat_enabled_flag(
+        current,
+        heartbeat_value,
+        last_frame_ms,
+        now_ms,
+        LIVE_STREAM_FRESH_WINDOW_MS,
+    )
+}
+
+/// Resolve the SCREEN-share enabled flag against a heartbeat, using the long
+/// [`MEDIA_FRESH_WINDOW_MS`]: screen is legitimately bursty/idle (encoders
+/// skip unchanged frames), so the multi-second window prevents a stale
+/// `false` heartbeat from collapsing a live split-share layout on WebTransport.
+///
+/// Companion to [`apply_live_stream_heartbeat_flag`]; BAKES IN the screen
+/// window for the same anti-misuse reason — the two media classes must NOT
+/// share a window, and which one each call site uses is no longer a free
+/// argument it can get wrong.
+pub(crate) fn apply_screen_heartbeat_flag(
+    current: bool,
+    heartbeat_value: bool,
+    last_frame_ms: u64,
+    now_ms: u64,
+) -> bool {
+    apply_heartbeat_enabled_flag(
+        current,
+        heartbeat_value,
+        last_frame_ms,
+        now_ms,
+        MEDIA_FRESH_WINDOW_MS,
+    )
 }
 
 use std::fmt::Debug;
@@ -538,6 +737,29 @@ impl Peer {
             context_initialized: false,
             vad_threshold,
             has_received_heartbeat: false,
+            // Default to the lowest layer (0). Pre-simulcast publishers send 0,
+            // so this is unchanged behaviour for them.
+            selected_video_layer: 0,
+            // Phase 2: start the chooser at the base layer (bandwidth-safe for a
+            // freshly-joined peer whose available layers we have not learned),
+            // with empty availability and a clean initial downlink sample.
+            video_layer_chooser: LayerChooser::new(now_ms()),
+            video_layer_availability: LayerAvailability::new(),
+            last_video_downlink: DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            // Phase 3: per-peer SCREEN + AUDIO choosers, mirroring VIDEO.
+            selected_screen_layer: 0,
+            screen_layer_chooser: LayerChooser::new(now_ms()),
+            screen_layer_availability: LayerAvailability::new(),
+            last_screen_downlink: DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: LayerChooser::new(now_ms()),
+            audio_layer_availability: LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             // HCL bug #1: 0 means "no media frame observed yet". The
@@ -618,6 +840,128 @@ impl Peer {
         Ok(())
     }
 
+    /// Select which simulcast layer (issue #989) this receiver decodes for this
+    /// peer. VIDEO packets tagged with a different `simulcast_layer_id` are
+    /// dropped before sequence tracking and decode. Defaults to 0 (lowest
+    /// layer). In Phase 2 this is driven automatically by
+    /// [`Self::tick_layer_chooser`]; it may also be set directly (tests / future
+    /// viewport-driven overrides).
+    pub fn set_selected_video_layer(&mut self, layer: u32) {
+        // Re-anchor the sequence tracker ONLY on an actual change (#1079 H1): the
+        // new layer has its own per-layer sequence counter, so the next packet
+        // must establish a fresh baseline rather than be diffed against the old
+        // layer's `high_seq` (which would manufacture phantom loss → chooser
+        // oscillation). A no-op switch (same layer) must not reset the tracker,
+        // or we would discard healthy loss/PLI history every tick.
+        if layer != self.selected_video_layer {
+            self.video_seq_tracker.reanchor_for_layer_switch();
+        }
+        self.selected_video_layer = layer;
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer.
+    pub fn selected_video_layer(&self) -> u32 {
+        self.selected_video_layer
+    }
+
+    /// Run the receiver-driven layer chooser one tick for this peer (issue #989,
+    /// Phase 2) and apply the result to the local decode guard.
+    ///
+    /// Folds the most recent windowed downlink sample
+    /// ([`Self::last_video_downlink`]) and the empirically-learned availability
+    /// cap into the per-peer [`LayerChooser`], updates `selected_video_layer` so
+    /// decode follows the chosen layer, and returns the desired layer so the
+    /// caller can build the aggregate `LAYER_PREFERENCE` packet.
+    ///
+    /// `now_ms` is threaded in (rather than read here) so the manager uses one
+    /// consistent clock per tick and so this stays testable. The chooser's raw
+    /// output is the value returned; P4 will clamp it to the user's
+    /// `[min, max]` at the manager level via
+    /// [`crate::decode::layer_chooser::clamp_to_user_range`] before it is
+    /// applied — a clean seam that does not touch this method.
+    pub fn tick_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
+        let highest = self.video_layer_availability.highest_available(now_ms);
+        let raw = self
+            .video_layer_chooser
+            .choose(self.last_video_downlink, highest, now_ms);
+        // Phase 4: clamp the auto-chosen layer to the user's receive bounds, so
+        // the REQUESTED (and relay-forwarded) layer is bounded, and the local
+        // decode guard matches. Open bounds (default) = identity.
+        let desired = bounds.clamp(raw);
+        // Re-anchor on an actual layer change (#1079 H1) — see
+        // `set_selected_video_layer` for the rationale. No-op when unchanged.
+        if desired != self.selected_video_layer {
+            self.video_seq_tracker.reanchor_for_layer_switch();
+        }
+        self.selected_video_layer = desired;
+        desired
+    }
+
+    /// Run the SCREEN layer chooser one tick (issue #989, Phase 3) and apply the
+    /// result to the screen decode guard. Independent of the camera VIDEO
+    /// chooser: a peer's screen adapts to this receiver's downlink separately.
+    pub fn tick_screen_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
+        let highest = self.screen_layer_availability.highest_available(now_ms);
+        let raw = self
+            .screen_layer_chooser
+            .choose(self.last_screen_downlink, highest, now_ms);
+        let desired = bounds.clamp(raw);
+        // Re-anchor on an actual layer change (#1079 H1) — see
+        // `set_selected_video_layer` for the rationale. No-op when unchanged.
+        if desired != self.selected_screen_layer {
+            self.screen_seq_tracker.reanchor_for_layer_switch();
+        }
+        self.selected_screen_layer = desired;
+        desired
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer's
+    /// screen stream.
+    pub fn selected_screen_layer(&self) -> u32 {
+        self.selected_screen_layer
+    }
+
+    /// Run the AUDIO layer chooser one tick (issue #989, Phase 3) and apply the
+    /// result to the audio decode guard.
+    ///
+    /// Audio carries no per-window sequence loss tracker here (audio decode goes
+    /// through NetEq, not `track_sequence`), and audio is only ~1-3% of call
+    /// bandwidth — so rather than build a dedicated audio loss pipeline, the
+    /// audio chooser is fed the receiver's VIDEO downlink as a proxy for overall
+    /// connection health (`last_video_downlink`): audio and video share the same
+    /// QUIC connection, so when the receiver's downlink is congested enough to
+    /// lose video it is the right moment to also shed the costlier audio layer.
+    /// This keeps audio adaptation cheap and conservative (the documented
+    /// cost-benefit: marginal savings, minimal added complexity).
+    pub fn tick_audio_layer_chooser(
+        &mut self,
+        now_ms: u64,
+        bounds: crate::decode::layer_chooser::KindLayerBounds,
+    ) -> u32 {
+        let highest = self.audio_layer_availability.highest_available(now_ms);
+        // Proxy audio downlink health with the video downlink window (see doc).
+        let raw = self
+            .audio_layer_chooser
+            .choose(self.last_video_downlink, highest, now_ms);
+        let desired = bounds.clamp(raw);
+        self.selected_audio_layer = desired;
+        desired
+    }
+
+    /// The simulcast layer this receiver currently decodes for this peer's audio
+    /// stream.
+    pub fn selected_audio_layer(&self) -> u32 {
+        self.selected_audio_layer
+    }
+
     /// Broadcast current media-enabled state to the diagnostics bus so the UI
     /// can update peer tiles.
     fn broadcast_peer_status(&self) {
@@ -650,6 +994,56 @@ impl Peer {
             ],
         };
         let _ = global_sender().try_broadcast(evt);
+    }
+
+    /// Authoritatively force *this* peer's audio and/or video to the *off*
+    /// state, bypassing the heartbeat freshness guard.
+    ///
+    /// This is the shared per-peer body behind both
+    /// [`PeerDecodeManager::force_peer_media_off`] (single target, HCL #1034)
+    /// and [`PeerDecodeManager::force_all_peers_media_off_except`] (mute-all /
+    /// disable-all, HCL #1036). It sets the tracked `audio_enabled` /
+    /// `video_enabled` flags **directly** and reuses the same decoder-flush
+    /// paths the heartbeat off-transition uses, so a frozen last frame is
+    /// cleared at the instant the tile flips and the NetEq buffer stops
+    /// emitting expand/hiss after the stream is gone.
+    ///
+    /// Idempotent: only mutates and reports a change on an actual
+    /// `enabled -> false` transition, so duplicate dual-transport deliveries or
+    /// already-off peers are no-ops. Returns `true` iff any tracked flag
+    /// transitioned, so the caller can drive a single `broadcast_peer_status()`
+    /// per real change.
+    fn force_media_off(&mut self, audio_off: bool, video_off: bool) -> bool {
+        let mut changed = false;
+
+        if audio_off && self.audio_enabled {
+            self.audio_enabled = false;
+            // Mute and flush the audio decoder the same way the heartbeat
+            // audio-off transition does, to prevent the NetEq buffer from
+            // emitting expand/hiss packets after the stream is gone.
+            self.audio.set_muted(true);
+            self.audio.flush();
+            changed = true;
+            debug!(
+                "force_media_off: muted audio for peer {} (host command)",
+                self.session_id
+            );
+        }
+
+        if video_off && self.video_enabled {
+            self.video_enabled = false;
+            // Reuse the heartbeat video-off flush path so the frozen last
+            // frame is cleared at the same instant the tile flips to the
+            // avatar — no lingering freeze-frame (#1034).
+            self.video.flush();
+            changed = true;
+            debug!(
+                "force_media_off: disabled video for peer {} (host command)",
+                self.session_id
+            );
+        }
+
+        changed
     }
 
     /// Emit windowed per-stream packet-loss and keyframe-request rates on the
@@ -706,6 +1100,20 @@ impl Peer {
             return Err(PeerDecodeError::IncorrectPacketType);
         }
 
+        // Read the cleartext simulcast layer id from the OUTER wrapper (issue
+        // #989) before `packet` is shadowed by the decrypted inner MediaPacket.
+        // Pre-simulcast publishers (and the single-layer default) send 0, so
+        // this is 0 for them. The VIDEO arm uses it to drop non-selected layers
+        // before any sequence tracking / decode.
+        let incoming_video_layer = packet.simulcast_layer_id;
+
+        // Compute the monotonic clock ONCE for this packet (perf follow-up):
+        // `now_ms()` crosses the JS boundary (`performance.now()`), and the decode
+        // path needs it for the media-freshness stamp AND the per-kind simulcast
+        // availability `observe`. Reusing one value avoids the extra per-packet
+        // boundary call (which ran even with simulcast off).
+        let now = now_ms();
+
         let packet = match self.aes {
             Some(aes) => {
                 let data = aes
@@ -722,11 +1130,56 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
+                // Phase 2 (#989): learn which layers this source produces from
+                // EVERY arriving VIDEO packet — including ones we are about to
+                // drop below — so the chooser knows how high it may climb. This
+                // MUST run before the drop guard, otherwise we would only ever
+                // observe the layer we already selected and could never learn a
+                // higher layer exists. Observing a non-selected layer here costs
+                // a hashmap insert; the packet is still dropped below.
+                //
+                // Security (#989): clamp the raw, attacker-controllable
+                // (un-sealed) layer id to the ladder range BEFORE observing, so a
+                // malicious publisher cycling unbounded unique ids cannot inflate
+                // availability cardinality between prunes.
+                self.video_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Video,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+
+                // Simulcast layer-select guard (issue #989). Drop any VIDEO
+                // packet that is not the layer this receiver is decoding for
+                // this peer — BEFORE sequence tracking and BEFORE decode.
+                //
+                // This MUST run before `track_sequence`: each simulcast layer
+                // carries an independent dense sequence, so feeding a
+                // non-selected layer's sequence into our single per-peer
+                // `video_seq_tracker` would manufacture phantom loss
+                // (~(N-1)/N) and trigger spurious PLI storms. For
+                // pre-simulcast publishers `incoming_video_layer` is 0 and
+                // `selected_video_layer` defaults to 0, so nothing is dropped.
+                if incoming_video_layer != self.selected_video_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // Track sequence numbers for gap detection (PLI) and windowed
                 // loss/keyframe-rate accounting (freeze observability #1013).
                 let seq = self.track_sequence(media_type, &packet);
                 if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
                     self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                    // Phase 2 (#989): cache this window's downlink health so the
+                    // monitor-tick chooser can fold it into the per-peer layer
+                    // decision. Only the SELECTED layer's sequence is tracked
+                    // (the guard above drops the rest), so this loss/PLI rate
+                    // measures exactly this receiver's ability to sustain the
+                    // layer it is currently pulling.
+                    self.last_video_downlink = DownlinkSample {
+                        loss_per_sec,
+                        kf_per_sec,
+                    };
                 }
                 let kf_request = seq.keyframe_request;
 
@@ -735,7 +1188,7 @@ impl Peer {
                 // "no heartbeat yet" and "heartbeat says off, drop frame"
                 // paths. The next heartbeat consults this to decide whether
                 // to trust its own metadata or the live frame stream.
-                self.last_video_frame_ms = now_ms();
+                self.last_video_frame_ms = now;
 
                 if !self.video_enabled {
                     if !self.has_received_heartbeat {
@@ -769,10 +1222,34 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
+                // Phase 3 (#989): learn AUDIO layer availability from arriving
+                // audio packets' layer ids. Audio simulcast is a small ladder
+                // (low/high); the chooser uses this to know whether a higher
+                // audio layer even exists before climbing. Single-layer audio
+                // publishers send 0, so availability stays {0} and the chooser
+                // never climbs — a no-op for them. Must run before any drop.
+                //
+                // Security (#989): clamp the raw (un-sealed) layer id to the
+                // audio ladder range before observing (see the VIDEO arm).
+                self.audio_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Audio,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+
+                // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop audio
+                // packets whose layer != the selected audio layer. Default
+                // selected_audio_layer is 0, matching single-layer publishers.
+                if incoming_video_layer != self.selected_audio_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // HCL bug #1: stamp audio freshness regardless of the
                 // straggler-drop path so the next heartbeat can detect
                 // recent audio frames and suppress a stale-muted heartbeat.
-                self.last_audio_frame_ms = now_ms();
+                self.last_audio_frame_ms = now;
 
                 if !self.audio_enabled {
                     if !self.has_received_heartbeat {
@@ -795,11 +1272,41 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
+                // Phase 3 (#989): learn SCREEN layer availability from EVERY
+                // arriving screen packet (incl. ones about to be dropped) so the
+                // screen chooser knows how high it may climb — independent of the
+                // camera VIDEO availability. Must run before the drop guard.
+                //
+                // Security (#989): clamp the raw (un-sealed) layer id to the
+                // screen ladder range before observing (see the VIDEO arm).
+                self.screen_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Screen,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+
+                // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop any
+                // SCREEN packet that is not the layer this receiver selected for
+                // this peer's screen — BEFORE sequence tracking and decode, for
+                // the same phantom-loss reason as the VIDEO guard. Pre-simulcast
+                // / single-layer screen publishers send layer 0 and the default
+                // selected_screen_layer is 0, so nothing is dropped for them.
+                if incoming_video_layer != self.selected_screen_layer {
+                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                }
+
                 // Track sequence numbers for gap detection (PLI) and windowed
                 // loss/keyframe-rate accounting (freeze observability #1013).
                 let seq = self.track_sequence(media_type, &packet);
                 if let Some((loss_per_sec, kf_per_sec)) = seq.rates {
                     self.emit_loss_metrics(local_user_id, media_type, loss_per_sec, kf_per_sec);
+                    // Phase 3: cache the SCREEN downlink window for the chooser.
+                    self.last_screen_downlink = DownlinkSample {
+                        loss_per_sec,
+                        kf_per_sec,
+                    };
                 }
                 let kf_request = seq.keyframe_request;
 
@@ -814,7 +1321,7 @@ impl Peer {
                 // observe `has_screen_share = false`, and the split-screen
                 // layout would collapse — exactly the WT-only symptom from
                 // the user report.
-                self.last_screen_frame_ms = now_ms();
+                self.last_screen_frame_ms = now;
 
                 if !self.screen_enabled {
                     // A SCREEN frame arrived while screen_enabled is false.
@@ -849,7 +1356,10 @@ impl Peer {
                 let effective_kf_request = if kf_request.is_some() {
                     kf_request
                 } else if self.screen.is_waiting_for_keyframe() {
-                    let now = now_ms();
+                    // Reuse the hoisted per-packet `now` (computed at the top of
+                    // decode) — within one synchronous decode call it is the same
+                    // instant for rate-limiting purposes, and avoids another
+                    // JS-boundary `now_ms()` call.
                     let elapsed =
                         now.saturating_sub(self.screen_seq_tracker.last_keyframe_request_ms);
                     if elapsed >= KEYFRAME_REQUEST_MIN_INTERVAL_MS {
@@ -886,19 +1396,27 @@ impl Peer {
                     // heartbeat period. The freshness check trusts the live
                     // media when we saw an X frame within the last
                     // `MEDIA_FRESH_WINDOW_MS`; otherwise the heartbeat wins.
-                    let resolved_video = apply_heartbeat_enabled_flag(
+                    // Camera-video uses the short continuous-stream window
+                    // (NOT the screen-sized one): a live camera streams
+                    // frames continuously, so a real camera-off must reflect
+                    // on remote peers sub-second — not after the ~5s screen
+                    // window. See `LIVE_STREAM_FRESH_WINDOW_MS` for the full
+                    // rationale.
+                    let resolved_video = apply_live_stream_heartbeat_flag(
                         self.video_enabled,
                         metadata.video_enabled,
                         self.last_video_frame_ms,
                         now,
                     );
-                    let resolved_audio = apply_heartbeat_enabled_flag(
+                    // Audio likewise uses the short continuous-stream window
+                    // so a real mute reflects on remote peers sub-second.
+                    let resolved_audio = apply_live_stream_heartbeat_flag(
                         self.audio_enabled,
                         metadata.audio_enabled,
                         self.last_audio_frame_ms,
                         now,
                     );
-                    let resolved_screen = apply_heartbeat_enabled_flag(
+                    let resolved_screen = apply_screen_heartbeat_flag(
                         self.screen_enabled,
                         metadata.screen_enabled,
                         self.last_screen_frame_ms,
@@ -1375,6 +1893,223 @@ impl PeerDecodeManager {
         removed_ids
     }
 
+    /// Run the receiver-driven simulcast layer chooser for every connected peer
+    /// (issue #989, Phase 2/3) and return the desired
+    /// `(session_id, media_kind) -> layer` map.
+    ///
+    /// Called on the monitor tick. For each peer this advances ALL THREE per-peer
+    /// choosers — camera VIDEO, SCREEN, and AUDIO (Phase 3) — each using that
+    /// peer-stream's own downlink health + learned per-kind availability, applies
+    /// each result to the matching decode guard, and collects the chosen layers
+    /// keyed by `(session_id, PrefMediaKind)`. The caller (`VideoCallClient`)
+    /// feeds that map to the `LayerPreferenceSender`, which emits a
+    /// `LAYER_PREFERENCE` packet only when the map actually changes and the
+    /// relay's rate-limit allows.
+    ///
+    /// Each (peer, kind) is fully independent: a congested screen never affects
+    /// the same peer's camera, and one peer never affects another. For a source
+    /// publishing only the base layer of a kind (the default until the P1/P3
+    /// send flags are raised), that kind's availability is 0, so its chosen layer
+    /// is 0 — a no-op relative to the relay's fail-open (base is always
+    /// forwarded). VIDEO is always emitted (every peer has a camera chooser);
+    /// SCREEN/AUDIO entries are emitted too, defaulting to base.
+    ///
+    /// `now_ms` is supplied by the caller so the whole tick shares one clock.
+    pub fn tick_layer_choosers(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let video_bounds = bounds.for_kind(PrefMediaKind::Video);
+        let screen_bounds = bounds.for_kind(PrefMediaKind::Screen);
+        let audio_bounds = bounds.for_kind(PrefMediaKind::Audio);
+        let mut desired = HashMap::new();
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // Phase 4: each per-(peer,kind) chooser output is clamped to the
+                // user's GLOBAL receive bounds for that kind. The tick updates the
+                // peer's DECODE guard (`selected_*_layer`) as a side effect and
+                // returns the (clamped) decode layer.
+                let video = peer.tick_layer_chooser(now_ms, video_bounds);
+                let screen = peer.tick_screen_layer_chooser(now_ms, screen_bounds);
+                let audio = peer.tick_audio_layer_chooser(now_ms, audio_bounds);
+
+                // Issue #1079 M1/M2: only ADVERTISE a preference for a kind when
+                // the final (clamped) decode layer actually constrains BELOW the
+                // highest available layer for that kind. This single rule captures
+                // BOTH sources of a real constraint:
+                //   * the chooser dropped below the top under congestion, and
+                //   * the user's receive `max` bound capped it below the top.
+                // On cold start / a healthy unclamped receiver, the chooser tracks
+                // the top (M2: it no longer ramps from base), so layer == highest
+                // and the entry is OMITTED → relay fail-open forwards all layers
+                // (no base-pin HD dip after reconnect). An all-omitted map yields
+                // no entries, so no LAYER_PREFERENCE packet goes out when there is
+                // nothing to constrain (M1).
+                let vh = peer.video_layer_availability.highest_available(now_ms);
+                if video < vh {
+                    desired.insert((session_id, PrefMediaKind::Video), video);
+                }
+                let sh = peer.screen_layer_availability.highest_available(now_ms);
+                if screen < sh {
+                    desired.insert((session_id, PrefMediaKind::Screen), screen);
+                }
+                let ah = peer.audio_layer_availability.highest_available(now_ms);
+                if audio < ah {
+                    desired.insert((session_id, PrefMediaKind::Audio), audio);
+                }
+            }
+        }
+        desired
+    }
+
+    /// Aggregate received-layer snapshot for one media kind (issue #989, Phase 4),
+    /// for the P5 quality needles. Returns `None` when nothing of that kind is
+    /// being received.
+    ///
+    /// Receive is per-peer, so this collapses to ONE representative stream the UI
+    /// shows as a single needle per kind:
+    ///   * **Audio** — the active talker: the speaking, audio-enabled peer with
+    ///     the highest `audio_level`; fallback to any audio-enabled peer.
+    ///   * **Video** — the active speaker's camera: the speaking, video-enabled
+    ///     peer; fallback to the video-enabled peer currently receiving the
+    ///     HIGHEST layer (the most prominent stream).
+    ///   * **Screen** — the screen-enabled peer receiving the highest screen
+    ///     layer (screen-share is typically singular).
+    ///
+    /// The layer reported is the peer's POST-CLAMP `selected_*_layer` (what is
+    /// actually decoded), so the needle never exceeds the user's `max` bound.
+    /// `layer_count` is the empirically-learned ladder size (highest observed
+    /// available layer + 1), clamped by the resolver. `now_ms` lets availability
+    /// expiry use one consistent clock. Panic-safe; cheap to poll each render.
+    pub fn received_layer_snapshot(
+        &mut self,
+        kind: crate::decode::layer_chooser::PrefMediaKind,
+        now_ms: u64,
+    ) -> Option<crate::decode::layer_chooser::ReceivedLayerSnapshot> {
+        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+
+        // Pick the representative (session_id) for this kind, plus its decoded
+        // layer + learned ladder size. Two-pass: prefer the active talker /
+        // speaker, else the highest-layer eligible peer.
+        let keys = self.connected_peers.ordered_keys().clone();
+        let mut speaker: Option<(u64, f32)> = None;
+        let mut fallback: Option<(u64, u32)> = None; // (sid, layer) — highest layer
+
+        for sid in &keys {
+            let Some(peer) = self.connected_peers.get(sid) else {
+                continue;
+            };
+            let eligible = match kind {
+                PrefMediaKind::Video => peer.video_enabled,
+                PrefMediaKind::Screen => peer.screen_enabled,
+                PrefMediaKind::Audio => peer.audio_enabled,
+            };
+            if !eligible {
+                continue;
+            }
+            let layer = match kind {
+                PrefMediaKind::Video => peer.selected_video_layer,
+                PrefMediaKind::Screen => peer.selected_screen_layer,
+                PrefMediaKind::Audio => peer.selected_audio_layer,
+            };
+            // Active-talker / active-speaker preference (video + audio).
+            if matches!(kind, PrefMediaKind::Video | PrefMediaKind::Audio) && peer.is_speaking {
+                let better = speaker
+                    .map(|(_, lvl)| peer.audio_level > lvl)
+                    .unwrap_or(true);
+                if better {
+                    speaker = Some((*sid, peer.audio_level));
+                }
+            }
+            // Highest-layer fallback (all kinds).
+            let take = fallback.map(|(_, l)| layer > l).unwrap_or(true);
+            if take {
+                fallback = Some((*sid, layer));
+            }
+        }
+
+        let chosen = speaker
+            .map(|(sid, _)| sid)
+            .or(fallback.map(|(sid, _)| sid))?;
+        let peer = self.connected_peers.get_mut(&chosen)?;
+        let (layer, count) = match kind {
+            PrefMediaKind::Video => (
+                peer.selected_video_layer,
+                peer.video_layer_availability.highest_available(now_ms) + 1,
+            ),
+            PrefMediaKind::Screen => (
+                peer.selected_screen_layer,
+                peer.screen_layer_availability.highest_available(now_ms) + 1,
+            ),
+            PrefMediaKind::Audio => (
+                peer.selected_audio_layer,
+                peer.audio_layer_availability.highest_available(now_ms) + 1,
+            ),
+        };
+        Some(received_layer_snapshot(kind, layer, count))
+    }
+
+    /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability).
+    ///
+    /// Unlike [`received_layer_snapshot`](Self::received_layer_snapshot) (which
+    /// collapses to ONE representative stream per kind for the needles), this
+    /// returns one [`PeerReceiveDiag`] for EVERY connected peer that is receiving
+    /// at least one media kind, each carrying the per-kind decoded-layer snapshot.
+    /// Used by the panel's "Live diagnostics" disclosure to show what this
+    /// receiver is pulling from each peer. Panic-safe; iterates peers in their
+    /// stable ordered-key order.
+    ///
+    /// NOT a pure getter despite its name: it calls
+    /// [`LayerAvailability::highest_available`], which takes `&mut self` and runs
+    /// `.retain()` to evict stale per-layer observations. The eviction is benign
+    /// here (≤3 entries, and the decode path evicts on its own cadence anyway),
+    /// but callers must hold `&mut self`.
+    pub fn per_peer_received_snapshots(&mut self, now_ms: u64) -> Vec<PeerReceiveDiag> {
+        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+        let keys = self.connected_peers.ordered_keys().clone();
+        let mut out = Vec::with_capacity(keys.len());
+        for sid in keys {
+            let Some(peer) = self.connected_peers.get_mut(&sid) else {
+                continue;
+            };
+            // Resolve each kind's snapshot only when that kind is enabled for the
+            // peer; otherwise the panel would show stale base-layer rows for
+            // streams that aren't flowing.
+            let video = peer.video_enabled.then(|| {
+                let count = peer.video_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Video, peer.selected_video_layer, count)
+            });
+            let screen = peer.screen_enabled.then(|| {
+                let count = peer.screen_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Screen, peer.selected_screen_layer, count)
+            });
+            let audio = peer.audio_enabled.then(|| {
+                let count = peer.audio_layer_availability.highest_available(now_ms) + 1;
+                received_layer_snapshot(PrefMediaKind::Audio, peer.selected_audio_layer, count)
+            });
+            // Skip peers with nothing flowing so the list stays compact.
+            if video.is_none() && screen.is_none() && audio.is_none() {
+                continue;
+            }
+            out.push(PeerReceiveDiag {
+                session_id: sid,
+                label: peer.display_name.clone().unwrap_or_else(|| {
+                    if peer.user_id.is_empty() {
+                        sid.to_string()
+                    } else {
+                        peer.user_id.clone()
+                    }
+                }),
+                video,
+                screen,
+                audio,
+            });
+        }
+        out
+    }
+
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let peer_session_id = packet.session_id;
@@ -1787,6 +2522,118 @@ impl PeerDecodeManager {
         }
     }
 
+    /// Authoritatively force a peer's audio and/or video to the *off* state,
+    /// identified by `user_id` (the `target_user_id` carried on a host-command
+    /// broadcast such as `HOST_MUTE_PARTICIPANT` / `HOST_DISABLE_VIDEO`).
+    ///
+    /// HCL issue #1034. A host command is **authoritative** — unlike a
+    /// heartbeat, it is not a possibly-stale announcement racing live media on
+    /// a separate QUIC stream. It is a deliberate moderation action the whole
+    /// room must reflect *immediately*. We therefore set the tracked
+    /// `audio_enabled` / `video_enabled` flags **directly**, bypassing
+    /// [`apply_heartbeat_enabled_flag`] and its `MEDIA_FRESH_WINDOW_MS`
+    /// freshness guard.
+    ///
+    /// Why bypassing the guard is correct here (and only here): the freshness
+    /// guard (HCL bug #1) exists to stop a *stale negative heartbeat* from
+    /// clobbering a *live* stream during the ~5s out-of-order window on
+    /// WebTransport. When the host mutes peer X, X stops its encoder and sends
+    /// an immediate off-heartbeat, but X is still flushing straggler frames, so
+    /// `last_video_frame_ms` / `last_audio_frame_ms` look fresh and the guard
+    /// would keep `enabled = true` until the window expires — the ~5s lag from
+    /// the bug report. The host command is independent ground truth, so it does
+    /// not need (and must not be subject to) the freshness arbitration.
+    ///
+    /// On video-off we reuse the same decoder-flush path the heartbeat
+    /// off-transition uses (`self.video.flush()`), so the frozen last frame is
+    /// cleared at the instant the tile flips — no lingering freeze-frame.
+    /// On audio-off we mute and flush the audio decoder the same way.
+    ///
+    /// This is **not** a permanent latch: it writes the very same tracked flags
+    /// the heartbeat path reads and writes. When the target later legitimately
+    /// re-enables and sends `heartbeat = true` with fresh frames,
+    /// [`apply_heartbeat_enabled_flag`] returns `true` (affirmative heartbeats
+    /// always win) and the peer recovers normally.
+    ///
+    /// Safe no-op when no connected peer matches `user_id` (e.g. the host's own
+    /// view, or a peer not yet known to this client). Only emits a peer-status
+    /// broadcast for peers whose state actually changed, avoiding redundant UI
+    /// churn on duplicate dual-transport deliveries.
+    pub fn force_peer_media_off(&mut self, user_id: &str, audio_off: bool, video_off: bool) {
+        if !audio_off && !video_off {
+            return;
+        }
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                if peer.user_id != user_id {
+                    continue;
+                }
+                // Per-peer force-off + change detection lives in the shared
+                // `Peer::force_media_off` helper (also used by the mute-all /
+                // disable-all path, #1036).
+                if peer.force_media_off(audio_off, video_off) {
+                    // Drives the `peer_status` diagnostics event the UI peer
+                    // tiles subscribe to, so the muted/video-off state shows
+                    // immediately rather than after the freshness window.
+                    peer.broadcast_peer_status();
+                }
+                // A given user_id maps to one peer per session; keep scanning
+                // in case the same user is present under multiple session_ids
+                // (multi-tab), so every tile for that user updates.
+            }
+        }
+    }
+
+    /// Authoritatively force audio and/or video to the *off* state for **every
+    /// connected peer except** the one whose `user_id` matches `except_user_id`.
+    ///
+    /// HCL issue #1036. The mute-all / disable-all host broadcasts
+    /// (`HOST_MUTE_PARTICIPANT` / `HOST_DISABLE_VIDEO` with an empty
+    /// `target_user_id`) must reflect across the whole room *immediately*, the
+    /// same way the single-target [`force_peer_media_off`] does — not lag behind
+    /// the slow heartbeat path. But a mute-all must **not** force-mute the
+    /// issuing host's own tile: the host muting everyone is not muting itself.
+    /// The server therefore carries the host's `user_id` on the broadcast via
+    /// `creator_id`, which the handler passes here as `except_user_id`; that one
+    /// peer is skipped entirely (its `audio_enabled` / `video_enabled` are left
+    /// untouched) while every other peer is forced off.
+    ///
+    /// Shares the exact per-peer force-off body, freshness-guard bypass, decoder
+    /// flush, idempotency (only a real `enabled -> false` transition mutates or
+    /// broadcasts), and multi-tab handling with [`force_peer_media_off`] via
+    /// [`Peer::force_media_off`]. Like that method it is **not** a permanent
+    /// latch: a later affirmative heartbeat with fresh frames re-enables the
+    /// peer normally.
+    ///
+    /// Safe no-op for `audio_off == video_off == false`. The exclusion is by
+    /// `user_id`, so all of the host's own sessions/tabs are excluded.
+    pub fn force_all_peers_media_off_except(
+        &mut self,
+        except_user_id: &str,
+        audio_off: bool,
+        video_off: bool,
+    ) {
+        if !audio_off && !video_off {
+            return;
+        }
+        let keys: Vec<u64> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                // Skip the issuing host's own tile(s) entirely — a mute-all
+                // must not mute the host that issued it (#1036).
+                if peer.user_id == except_user_id {
+                    continue;
+                }
+                if peer.force_media_off(audio_off, video_off) {
+                    // Single status broadcast per real change, same as the
+                    // single-target path, to avoid redundant UI churn.
+                    peer.broadcast_peer_status();
+                }
+            }
+        }
+    }
+
     /// Get the display name for a peer by session_id string.
     ///
     /// Checks the live peer entry first, then falls back to the persistent
@@ -1959,6 +2806,28 @@ mod tests {
         wrap(&media, session_id)
     }
 
+    /// A VIDEO `PacketWrapper` carrying an outer `simulcast_layer_id` and an
+    /// inner `VideoMetadata.sequence`, used by the receiver layer-select guard
+    /// tests (issue #989).
+    fn layered_video_packet(session_id: u64, layer: u32, seq: u64) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: "test@test.com".into(),
+            data: vec![0u8; 10],
+            frame_type: "key".to_string(),
+            video_metadata: Some(VideoMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let mut wrapper = packet_wrapper(&media, session_id);
+        wrapper.simulcast_layer_id = layer;
+        Arc::new(wrapper)
+    }
+
     /// Create a `Peer` with no-op decoders (no browser APIs required).
     /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
     /// decoder's muted state for test assertions.
@@ -1989,6 +2858,23 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -2199,11 +3085,29 @@ mod tests {
     #[test]
     fn apply_hb_flag_affirmative_heartbeat_wins() {
         // No media observed.
-        assert!(apply_heartbeat_enabled_flag(false, true, 0, 5_000));
+        assert!(apply_heartbeat_enabled_flag(
+            false,
+            true,
+            0,
+            5_000,
+            MEDIA_FRESH_WINDOW_MS
+        ));
         // Stale media (older than the freshness window).
-        assert!(apply_heartbeat_enabled_flag(false, true, 1_000, 10_000));
+        assert!(apply_heartbeat_enabled_flag(
+            false,
+            true,
+            1_000,
+            10_000,
+            MEDIA_FRESH_WINDOW_MS
+        ));
         // Fresh media.
-        assert!(apply_heartbeat_enabled_flag(true, true, 4_500, 5_000));
+        assert!(apply_heartbeat_enabled_flag(
+            true,
+            true,
+            4_500,
+            5_000,
+            MEDIA_FRESH_WINDOW_MS
+        ));
     }
 
     /// `heartbeat=false` with a SCREEN frame inside the freshness window
@@ -2221,10 +3125,11 @@ mod tests {
         let now = 10_000_u64;
         let last_frame = now - delta;
         assert!(apply_heartbeat_enabled_flag(
-            true,       /* current */
-            false,      /* heartbeat */
-            last_frame, /* last_frame_ms */
-            now,        /* now_ms */
+            true,                  /* current */
+            false,                 /* heartbeat */
+            last_frame,            /* last_frame_ms */
+            now,                   /* now_ms */
+            MEDIA_FRESH_WINDOW_MS, /* fresh_window_ms */
         ));
     }
 
@@ -2240,10 +3145,11 @@ mod tests {
         let now = 10_000_u64;
         let last_frame = now - delta;
         assert!(!apply_heartbeat_enabled_flag(
-            true,       /* current */
-            false,      /* heartbeat */
-            last_frame, /* last_frame_ms */
-            now,        /* now_ms */
+            true,                  /* current */
+            false,                 /* heartbeat */
+            last_frame,            /* last_frame_ms */
+            now,                   /* now_ms */
+            MEDIA_FRESH_WINDOW_MS, /* fresh_window_ms */
         ));
     }
 
@@ -2272,6 +3178,7 @@ mod tests {
             false,       /* heartbeat */
             now - 4_900, /* last_frame_ms — 4900ms ago */
             now,
+            MEDIA_FRESH_WINDOW_MS,
         );
         assert!(
             fresh,
@@ -2285,6 +3192,7 @@ mod tests {
             false,       /* heartbeat */
             now - 5_100, /* last_frame_ms — 5100ms ago */
             now,
+            MEDIA_FRESH_WINDOW_MS,
         );
         assert!(
             !stale,
@@ -2300,10 +3208,11 @@ mod tests {
     #[test]
     fn apply_hb_flag_zero_sentinel_is_not_fresh() {
         assert!(!apply_heartbeat_enabled_flag(
-            true,  /* current */
-            false, /* heartbeat */
-            0,     /* never observed */
-            500    /* now_ms inside window arithmetically */
+            true,                  /* current */
+            false,                 /* heartbeat */
+            0,                     /* never observed */
+            500,                   /* now_ms inside window arithmetically */
+            MEDIA_FRESH_WINDOW_MS, /* fresh_window_ms */
         ));
     }
 
@@ -2314,9 +3223,198 @@ mod tests {
     #[test]
     fn apply_hb_flag_clock_skew_treats_future_frame_as_fresh() {
         assert!(apply_heartbeat_enabled_flag(
-            true, false, 10_000, /* last_frame_ms */
-            5_000,  /* now_ms — earlier than last_frame */
+            true,
+            false,
+            10_000,                /* last_frame_ms */
+            5_000,                 /* now_ms — earlier than last_frame */
+            MEDIA_FRESH_WINDOW_MS, /* fresh_window_ms */
         ));
+    }
+
+    // --- audio/video stop latency vs. the freshness window ---------------
+    //
+    // Audio and camera-video reuse `apply_heartbeat_enabled_flag` but with
+    // the much shorter `LIVE_STREAM_FRESH_WINDOW_MS`. These tests pin that
+    // window's behaviour: a mute / camera-off must propagate sub-second, but
+    // a recently-arrived live frame must still out-vote a stale `false`
+    // heartbeat that raced it on WT. Screen keeps `MEDIA_FRESH_WINDOW_MS`.
+
+    /// The continuous-stream window must be far shorter than the screen
+    /// window so that mute / camera-off reflect on remote peers quickly. Pin
+    /// the relationship so a future "just reuse MEDIA_FRESH_WINDOW_MS for
+    /// audio/video" regression — the exact bug this fixes — fails loudly.
+    #[test]
+    fn live_stream_fresh_window_is_sub_second_and_shorter_than_media() {
+        assert!(
+            LIVE_STREAM_FRESH_WINDOW_MS <= 1_000,
+            "LIVE_STREAM_FRESH_WINDOW_MS must be sub-second so a mute / \
+             camera-off reflects within ~1 heartbeat, not after the ~5s \
+             screen window"
+        );
+        assert!(
+            LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
+            "the audio/video window must be strictly shorter than the screen \
+             window — reusing the screen window re-introduces the ~5s lag"
+        );
+    }
+
+    /// (a) A mute heartbeat (`audio_enabled = false`) arriving just after
+    /// audio frames stop must be honoured once the last frame ages past the
+    /// SHORT window. With the screen-sized window this took ~5s; with the
+    /// continuous-stream window it is sub-second. Frame is
+    /// `LIVE_STREAM_FRESH_WINDOW_MS + 50` old → heartbeat wins → muted.
+    #[test]
+    fn apply_hb_flag_audio_mute_reflects_after_short_window() {
+        let now = 10_000_u64;
+        let last_frame = now - (LIVE_STREAM_FRESH_WINDOW_MS + 50);
+        assert!(
+            !apply_heartbeat_enabled_flag(
+                true,  /* current: was unmuted */
+                false, /* heartbeat: now muted */
+                last_frame,
+                now,
+                LIVE_STREAM_FRESH_WINDOW_MS,
+            ),
+            "audio mute must be honoured once the last frame is older than \
+             the short window — this is the sub-second mute fix"
+        );
+
+        // Sanity: the SAME age, evaluated against the screen-sized window,
+        // would still (wrongly, for audio) suppress the mute — proving the
+        // window choice is what fixes the latency.
+        assert!(
+            apply_heartbeat_enabled_flag(true, false, last_frame, now, MEDIA_FRESH_WINDOW_MS),
+            "the screen window would keep audio unmuted at this age — \
+             demonstrates why audio needs the short window"
+        );
+    }
+
+    /// (b) A camera-off heartbeat (`video_enabled = false`) arriving just
+    /// after camera frames stop must be honoured once the last frame ages
+    /// past the SHORT window — the symmetric case to audio mute. This is the
+    /// fix for the camera-disable side of the ~5s lag: video now uses the
+    /// continuous-stream window, not the screen window.
+    #[test]
+    fn apply_hb_flag_video_disable_reflects_after_short_window() {
+        let now = 10_000_u64;
+        let last_frame = now - (LIVE_STREAM_FRESH_WINDOW_MS + 50);
+        assert!(
+            !apply_heartbeat_enabled_flag(
+                true,  /* current: camera was on */
+                false, /* heartbeat: camera now off */
+                last_frame,
+                now,
+                LIVE_STREAM_FRESH_WINDOW_MS,
+            ),
+            "camera-off must be honoured once the last video frame is older \
+             than the short window — this is the sub-second camera-disable fix"
+        );
+
+        // Sanity: the SAME age against the screen-sized window would still
+        // (wrongly, for camera-video) keep the camera shown — this is the
+        // exact ~5s lag the per-media-type window removes.
+        assert!(
+            apply_heartbeat_enabled_flag(true, false, last_frame, now, MEDIA_FRESH_WINDOW_MS),
+            "the screen window would keep the camera shown at this age — \
+             demonstrates why camera-video needs the short window"
+        );
+    }
+
+    /// A `false` heartbeat that raced a genuinely-live audio frame (frame is
+    /// only a few ms old, well inside the window) must NOT mute — this
+    /// preserves the WT out-of-order protection for audio too, just on a
+    /// tighter, reorder-sized window instead of a multi-second one.
+    #[test]
+    fn apply_hb_flag_audio_keeps_unmuted_when_frame_is_very_fresh() {
+        let now = 10_000_u64;
+        let last_frame = now - (LIVE_STREAM_FRESH_WINDOW_MS - 100); // just inside
+        assert!(
+            apply_heartbeat_enabled_flag(true, false, last_frame, now, LIVE_STREAM_FRESH_WINDOW_MS),
+            "a stale false heartbeat racing a fresh audio frame must not mute — \
+             WT reorder protection still applies within the short window"
+        );
+    }
+
+    /// Symmetric to the audio-fresh case: a `false` video heartbeat that
+    /// raced a genuinely-live camera frame (only a few ms old) must NOT blank
+    /// the camera — WT reorder protection still applies to video within the
+    /// short window, so re-enable / brief reorder does not flicker.
+    #[test]
+    fn apply_hb_flag_video_keeps_enabled_when_frame_is_very_fresh() {
+        let now = 10_000_u64;
+        let last_frame = now - (LIVE_STREAM_FRESH_WINDOW_MS - 100); // just inside
+        assert!(
+            apply_heartbeat_enabled_flag(true, false, last_frame, now, LIVE_STREAM_FRESH_WINDOW_MS),
+            "a stale false heartbeat racing a fresh camera frame must not blank \
+             the camera — WT reorder protection still applies within the window"
+        );
+    }
+
+    /// (c) Screen MUST keep the full `MEDIA_FRESH_WINDOW_MS` (no regression):
+    /// a `false` screen heartbeat racing a screen frame from up to ~5s ago
+    /// must still be suppressed, so the split-share layout does not collapse
+    /// on WT. This pins that the screen call site was NOT narrowed to the
+    /// short window along with audio/video.
+    #[test]
+    fn apply_hb_flag_screen_still_honors_full_window() {
+        let now = 10_000_u64;
+        // A screen frame 4.9s ago is far past the short audio/video window
+        // but still INSIDE the 5s screen window: screen must stay enabled.
+        let last_frame = now - 4_900;
+        assert!(
+            last_frame > now - MEDIA_FRESH_WINDOW_MS,
+            "fixture sanity: frame must be inside the 5s screen window"
+        );
+        assert!(
+            apply_heartbeat_enabled_flag(true, false, last_frame, now, MEDIA_FRESH_WINDOW_MS),
+            "screen must keep its 5s window — a stale false heartbeat within \
+             5s of a screen frame must NOT collapse the split-share layout (WT)"
+        );
+        // And confirm that age WOULD have muted under the short window —
+        // i.e. screen is genuinely relying on the longer window, proving the
+        // two windows are independent and screen was not narrowed.
+        assert!(
+            !apply_heartbeat_enabled_flag(
+                true,
+                false,
+                last_frame,
+                now,
+                LIVE_STREAM_FRESH_WINDOW_MS
+            ),
+            "sanity: at 4.9s the short window would clear the flag — screen's \
+             protection comes specifically from keeping MEDIA_FRESH_WINDOW_MS"
+        );
+    }
+
+    /// The two type-safe wrappers must carry DIFFERENT windows. At a frame age
+    /// between the two windows (here 600ms: past the 500ms live window, well
+    /// inside the 5s screen window) the live-stream wrapper must honour a mute
+    /// / camera-off (returns `false`) while the screen wrapper must suppress it
+    /// (keeps `current = true`). This is the regression the wrappers exist to
+    /// prevent: it fails loudly if someone makes both wrappers share a window.
+    #[test]
+    fn live_stream_and_screen_wrappers_use_distinct_windows() {
+        let now = 10_000_u64;
+        // 600ms old: past LIVE_STREAM_FRESH_WINDOW_MS (500), inside
+        // MEDIA_FRESH_WINDOW_MS (5000). Pin the fixture against the constants
+        // so it tracks any future tuning.
+        let last_frame = now - 600;
+        assert!(
+            last_frame < now - LIVE_STREAM_FRESH_WINDOW_MS
+                && last_frame > now - MEDIA_FRESH_WINDOW_MS,
+            "fixture sanity: frame age must fall between the live and screen windows"
+        );
+
+        assert!(
+            !apply_live_stream_heartbeat_flag(true, false, last_frame, now),
+            "audio/video wrapper must honour a mute / camera-off once the frame \
+             ages past the short window — not wait for the screen-sized window"
+        );
+        assert!(
+            apply_screen_heartbeat_flag(true, false, last_frame, now),
+            "screen wrapper must still suppress a stale false at this age — its \
+             window is the long one, so the split-share layout does not collapse"
+        );
     }
 
     /// Integration: simulate the exact WT-race scenario. A SCREEN
@@ -2375,6 +3473,43 @@ mod tests {
         assert!(
             !peer.screen_enabled,
             "heartbeat must clear screen_enabled when last frame is stale"
+        );
+    }
+
+    /// Integration: a mute heartbeat (`audio_enabled = false`) must mute the
+    /// peer's audio decoder quickly once audio frames have stopped. We force
+    /// `last_audio_frame_ms` to an age that is PAST the short audio window
+    /// but still WELL INSIDE the screen-sized window — the previous bug kept
+    /// the peer unmuted for ~5s at exactly this age. The decoder's muted
+    /// handle must flip to true.
+    #[wasm_bindgen_test]
+    fn audio_muted_promptly_by_heartbeat_after_frames_stop() {
+        let (mut peer, muted) = make_test_peer(195);
+
+        // Peer is currently unmuted with a recent audio frame.
+        peer.audio_enabled = true;
+        peer.audio.set_muted(false);
+        assert!(!muted.get(), "precondition: audio decoder is unmuted");
+
+        // Age the last audio frame past the short audio window but keep it
+        // far inside the screen window — `now_ms()` ≫ this value + 500 but
+        // ≪ this value + 5000 would require a real clock, so instead we set
+        // it to 1 (ancient): it is past BOTH windows, which is the >500ms
+        // mute path. The point of this integration test is that the AUDIO
+        // call site now uses the short window at all; the pure-function
+        // tests pin the exact boundary.
+        peer.last_audio_frame_ms = 1;
+
+        let hb = heartbeat_packet(195, false, false, false);
+        let _ = peer.decode(&hb, "");
+
+        assert!(
+            !peer.audio_enabled,
+            "audio_enabled must be cleared by the mute heartbeat"
+        );
+        assert!(
+            muted.get(),
+            "audio decoder must be muted promptly after a mute heartbeat"
         );
     }
 
@@ -3034,6 +4169,102 @@ mod tests {
         assert_eq!(peer.screen_seq_tracker.high_seq, Some(70));
     }
 
+    /// Build a VIDEO MediaPacket wrapper carrying a cleartext `simulcast_layer_id`
+    /// and a per-layer `sequence`, ready for `Peer::decode`. Mirrors the real
+    /// wire shape the encoders produce (outer wrapper layer id + inner
+    /// VideoMetadata sequence).
+    fn video_layer_wrap(layer_id: u32, seq: u64, session_id: u64) -> Arc<PacketWrapper> {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: b"test@test.com".to_vec(),
+            video_metadata: Some(VideoMetadata {
+                sequence: seq,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".to_string(),
+            ..Default::default()
+        };
+        let data = media.write_to_bytes().expect("serialize MediaPacket");
+        Arc::new(PacketWrapper {
+            data,
+            user_id: "test@test.com".into(),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            simulcast_layer_id: layer_id,
+            ..Default::default()
+        })
+    }
+
+    /// H1 (#1079) regression: a REAL simulcast layer switch driven through
+    /// `decode()` must NOT manufacture phantom loss / PLI.
+    ///
+    /// Each layer has its own per-layer sequence counter, so the new layer's
+    /// first packets carry sequence numbers from a different (lower) counter than
+    /// the old layer's `high_seq`. Without re-anchoring the tracker on switch,
+    /// `record_seq` reads the cross-counter discontinuity as a massive window
+    /// shift → phantom loss → the chooser's own congestion signal → oscillation.
+    /// This drives the real tracker path (decode → guard → track_sequence), not
+    /// synthetic DownlinkSamples, exactly as the reviewer required.
+    #[wasm_bindgen_test]
+    fn real_layer_switch_does_not_manufacture_phantom_loss() {
+        let (mut peer, _muted) = make_test_peer(909);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+
+        // Receiving layer 0 at a HIGH sequence (the old counter has advanced).
+        for seq in [100u64, 101, 102] {
+            let _ = peer.decode(&video_layer_wrap(0, seq, 909), "local@test.com");
+        }
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "no loss while steadily receiving layer 0"
+        );
+        assert_eq!(peer.video_seq_tracker.high_seq, Some(102));
+
+        // REAL switch to layer 1 (the production entry point the chooser uses).
+        // This must re-anchor the tracker so the new layer's low sequence numbers
+        // are not diffed against the old layer's high_seq.
+        peer.set_selected_video_layer(1);
+        assert!(
+            peer.video_seq_tracker.high_seq.is_none(),
+            "switch must re-anchor: tracker baseline cleared"
+        );
+
+        // Layer 1 starts from its OWN counter (low seq 0,1,2) — far below 102.
+        // Pre-fix, the first packet (seq 0 vs high_seq 102) would have looked like
+        // an enormous backwards jump / window shift; post-fix it is a clean
+        // fresh baseline.
+        for seq in [0u64, 1, 2] {
+            let _ = peer.decode(&video_layer_wrap(1, seq, 909), "local@test.com");
+        }
+
+        // The whole point: no phantom loss, no PLI, no loss-detected timestamp.
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "post-switch: a real layer switch must NOT manufacture phantom loss"
+        );
+        assert!(
+            peer.video_seq_tracker.loss_detected_at_ms.is_none(),
+            "post-switch: no loss should be flagged after re-anchor"
+        );
+        assert_eq!(
+            peer.video_seq_tracker.window_lost, 0,
+            "post-switch: the cross-counter discontinuity must not leak into the rate window"
+        );
+        // Baseline is the new layer's stream.
+        assert_eq!(peer.video_seq_tracker.high_seq, Some(2));
+
+        // A no-op "switch" to the SAME layer must NOT reset a healthy tracker.
+        peer.set_selected_video_layer(1);
+        assert_eq!(
+            peer.video_seq_tracker.high_seq,
+            Some(2),
+            "selecting the already-selected layer must be a no-op (no spurious reset)"
+        );
+    }
+
     /// Different peers should have independent sequence tracking.
     #[wasm_bindgen_test]
     fn different_peers_independent_sequence_tracking() {
@@ -3470,6 +4701,256 @@ mod tests {
             peer.video_seq_tracker.lost_count > 0,
             "Second loss should be detected independently"
         );
+    }
+
+    /// Receiver simulcast layer-select guard (issue #989).
+    ///
+    /// A peer publishing three layers (0/1/2) with independent dense per-layer
+    /// sequences, arriving interleaved 0,1,2,0,1,2,…, must:
+    ///   * only have layer 0 (the selected default) reach the decoder, and
+    ///   * produce ZERO phantom loss in `video_seq_tracker` — proving the guard
+    ///     runs before `track_sequence`, so the tracker only ever sees layer 0's
+    ///     dense 0,1,2,… stream rather than the merged 0,0,0,1,1,1,… that would
+    ///     manufacture ~2/3 loss and storm PLIs.
+    #[wasm_bindgen_test]
+    fn simulcast_guard_drops_non_selected_layers_and_keeps_loss_zero() {
+        let (mut peer, _muted) = make_test_peer(901);
+        // Make the peer eligible to actually decode: visible + video on, and
+        // pretend a heartbeat arrived so the straggler-inference path is skipped.
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        // Default selected layer is 0 (assert the invariant explicitly).
+        assert_eq!(peer.selected_video_layer, 0);
+
+        let mut decoded_video = 0usize;
+        let mut skipped_video = 0usize;
+
+        // Interleaved arrival: per layer the sequence is dense (0,1,2,…); across
+        // layers the wire order is 0,1,2,0,1,2,…
+        for seq in 0..6u64 {
+            for layer in 0..3u32 {
+                let pkt = layered_video_packet(901, layer, seq);
+                let (mt, status, _kf) = peer
+                    .decode(&pkt, "test@test.com")
+                    .expect("decode should not error");
+                assert_eq!(mt, MediaType::VIDEO);
+                // SKIPPED is signalled by rendered == false && first_frame == false
+                // for the dropped layers; layer 0 reaches the noop decoder.
+                if layer == 0 {
+                    decoded_video += 1;
+                } else if !status.rendered && !status.first_frame {
+                    skipped_video += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            decoded_video, 6,
+            "exactly the 6 layer-0 packets should reach the decoder"
+        );
+        assert_eq!(
+            skipped_video, 12,
+            "all 12 non-selected (layer 1 & 2) packets should be dropped"
+        );
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "guard must run before track_sequence so only layer 0's dense \
+             sequence is tracked → zero phantom loss"
+        );
+    }
+
+    /// Selecting a non-zero layer flips which layer is decoded and still keeps
+    /// loss at zero (the selected layer's sequence is dense).
+    #[wasm_bindgen_test]
+    fn simulcast_guard_honors_selected_layer() {
+        let (mut peer, _muted) = make_test_peer(902);
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.set_selected_video_layer(1);
+        assert_eq!(peer.selected_video_layer, 1);
+
+        let mut decoded_video = 0usize;
+        for seq in 0..4u64 {
+            for layer in 0..3u32 {
+                let pkt = layered_video_packet(902, layer, seq);
+                let (_mt, _status, _kf) = peer
+                    .decode(&pkt, "test@test.com")
+                    .expect("decode should not error");
+                if layer == 1 {
+                    decoded_video += 1;
+                }
+            }
+        }
+        assert_eq!(decoded_video, 4, "only layer 1 should reach the decoder");
+        assert_eq!(
+            peer.video_seq_tracker.lost_count, 0,
+            "selected layer's dense sequence → zero phantom loss"
+        );
+    }
+
+    /// Phase 2 (#989): the local decode guard must follow the chooser. After
+    /// observing higher layers as available and feeding sustained clean downlink
+    /// windows through the chooser tick, `selected_video_layer` must climb — and
+    /// the guard then decodes exactly that layer.
+    #[wasm_bindgen_test]
+    fn decode_guard_follows_layer_chooser() {
+        let (mut peer, _muted) = make_test_peer(903);
+        peer.visible = true;
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        assert_eq!(peer.selected_video_layer(), 0, "starts at base");
+
+        // Learn that layers 0,1,2 are available for this source by observing
+        // arriving packets of every layer (mirrors the decode path's observe()).
+        let mut t = 1000u64;
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, t);
+        }
+
+        // Feed sustained clean downlink windows (default sample is clean) with
+        // adequate spacing so dwell is satisfied; the chooser must climb toward
+        // the top available layer and the guard must follow.
+        for _ in 0..20 {
+            // Re-observe so availability does not expire across the long run.
+            for layer in 0..3u32 {
+                peer.video_layer_availability.observe(layer, t);
+            }
+            peer.tick_layer_chooser(t, crate::decode::layer_chooser::KindLayerBounds::default());
+            t += 1100;
+        }
+        assert_eq!(
+            peer.selected_video_layer(),
+            2,
+            "sustained clean downlink + availability must climb the decode guard to top"
+        );
+
+        // The guard now decodes layer 2 only.
+        let pkt2 = layered_video_packet(903, 2, 0);
+        let (_mt, _status, _kf) = peer.decode(&pkt2, "test@test.com").expect("decode ok");
+        let pkt0 = layered_video_packet(903, 0, 0);
+        let (_mt0, status0, _kf0) = peer.decode(&pkt0, "test@test.com").expect("decode ok");
+        assert!(!status0.rendered, "non-selected base layer must be dropped");
+    }
+
+    /// Phase 2/3 (#989): the manager's per-peer tick returns an independent
+    /// desired-layer entry for every connected peer AND every media kind
+    /// (VIDEO/SCREEN/AUDIO), keyed by (session_id, PrefMediaKind).
+    #[wasm_bindgen_test]
+    fn manager_tick_layer_choosers_returns_per_peer_kind_map() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut manager = PeerDecodeManager::new();
+        for sid in [10u64, 20, 30] {
+            let (peer, _muted) = make_test_peer(sid);
+            manager.connected_peers.insert(sid, peer);
+        }
+        let desired = manager.tick_layer_choosers(
+            1000,
+            &crate::decode::layer_chooser::ReceiveLayerBounds::default(),
+        );
+        // M2 (#1079): fresh peers (no availability learned, no congestion) advertise
+        // NO preference for any kind — the map is EMPTY, not 9 base entries. A
+        // base-pin on cold start would drop upgraded layers and cause an HD dip
+        // after every (re)connect. Absence = no constraint = relay forwards all.
+        assert!(
+            desired.is_empty(),
+            "fresh peers must advertise no preference (cold start = forward all): {desired:?}"
+        );
+        let _ = PrefMediaKind::Video; // keep the import used regardless of asserts
+    }
+
+    /// Phase 4 (#989): the user's receive-layer bounds clamp each peer's chosen
+    /// video layer, and lowering `max` steps the decode guard DOWN immediately on
+    /// the next tick (not after a delay).
+    #[wasm_bindgen_test]
+    fn receive_bounds_clamp_video_and_step_down_immediately() {
+        use crate::decode::layer_chooser::{KindLayerBounds, PrefMediaKind, ReceiveLayerBounds};
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(701);
+        manager.connected_peers.insert(701, peer);
+
+        // Learn 3 video layers + climb to the top under clean downlink, UNCLAMPED.
+        let open = ReceiveLayerBounds::default();
+        let mut t = 1000u64;
+        for _ in 0..20 {
+            if let Some(p) = manager.connected_peers.get_mut(&701) {
+                for layer in 0..3u32 {
+                    p.video_layer_availability.observe(layer, t);
+                }
+            }
+            manager.tick_layer_choosers(t, &open);
+            t += 1100;
+        }
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "unclamped: climbs to top"
+        );
+
+        // Now cap video at max layer 1 → next tick clamps the desired layer AND
+        // the decode guard down to 1 immediately.
+        let mut capped = ReceiveLayerBounds::default();
+        capped.set_kind(PrefMediaKind::Video, None, Some(1));
+        if let Some(p) = manager.connected_peers.get_mut(&701) {
+            for layer in 0..3u32 {
+                p.video_layer_availability.observe(layer, t);
+            }
+        }
+        let desired = manager.tick_layer_choosers(t, &capped);
+        assert_eq!(
+            desired.get(&(701, PrefMediaKind::Video)),
+            Some(&1),
+            "requested layer clamped to user max"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "decode guard steps down immediately to the clamped layer"
+        );
+        // Screen/audio are independent → still open (base).
+        let _ = KindLayerBounds::default();
+    }
+
+    /// Phase 4 (#989): received-layer snapshot aggregation. With one video-
+    /// enabled peer on a learned 3-layer ladder at the top layer, the snapshot
+    /// reports that layer + its hd resolution. None when nothing is received.
+    #[wasm_bindgen_test]
+    fn received_layer_snapshot_aggregates_representative_peer() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut manager = PeerDecodeManager::new();
+        // No peers → None.
+        assert!(manager
+            .received_layer_snapshot(PrefMediaKind::Video, 1000)
+            .is_none());
+
+        let (mut peer, _muted) = make_test_peer(801);
+        peer.video_enabled = true;
+        peer.set_selected_video_layer(2);
+        // Learn a 3-layer ladder.
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+        }
+        manager.connected_peers.insert(801, peer);
+
+        let snap = manager
+            .received_layer_snapshot(PrefMediaKind::Video, 1000)
+            .expect("a video-enabled peer is being received");
+        assert_eq!(snap.layer_index, 2);
+        assert_eq!(snap.layer_count, 3);
+        assert_eq!((snap.width, snap.height), (1280, 720));
+        // Audio not enabled on this peer → None for audio.
+        assert!(manager
+            .received_layer_snapshot(PrefMediaKind::Audio, 1000)
+            .is_none());
     }
 
     /// A MeetingPacket embedded in a PacketWrapper with MEETING type should
@@ -4248,6 +5729,23 @@ mod tests {
                 audio_level: 0.0,
                 transport_type: TransportType::TRANSPORT_UNKNOWN,
                 vad_threshold: None,
+                selected_video_layer: 0,
+                video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+                last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                    loss_per_sec: 0.0,
+                    kf_per_sec: 0.0,
+                },
+                selected_screen_layer: 0,
+                screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+                last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                    loss_per_sec: 0.0,
+                    kf_per_sec: 0.0,
+                },
+                selected_audio_layer: 0,
+                audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+                audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
                 video_seq_tracker: SequenceTracker::new(),
                 screen_seq_tracker: SequenceTracker::new(),
                 last_screen_frame_ms: 0,
@@ -4336,6 +5834,23 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -4395,6 +5910,23 @@ mod tests {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             vad_threshold: None,
+            selected_video_layer: 0,
+            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_screen_layer: 0,
+            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            },
+            selected_audio_layer: 0,
+            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
             video_seq_tracker: SequenceTracker::new(),
             screen_seq_tracker: SequenceTracker::new(),
             last_screen_frame_ms: 0,
@@ -4704,6 +6236,401 @@ mod tests {
             batch_sink.borrow().len(),
             0,
             "batch callback must not fire when no peers were removed"
+        );
+    }
+
+    // -- #1034: authoritative host-command force-off ----------------------
+
+    /// `force_peer_media_off(video_off)` flips `video_enabled` to false
+    /// **immediately**, even when a video frame was *just* decoded (the
+    /// `last_video_frame_ms` is brand-new and inside the freshness window).
+    ///
+    /// This is the crux of #1034: an off-*heartbeat* in this exact state would
+    /// be SUPPRESSED by `apply_heartbeat_enabled_flag` (the frame is fresh, so
+    /// the guard keeps `enabled = true` for up to `MEDIA_FRESH_WINDOW_MS`),
+    /// causing the ~5s freeze. A host *command* is authoritative and must
+    /// bypass that guard.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_disables_video_despite_fresh_frame() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1000);
+        peer.has_received_heartbeat = true;
+        // Peer's video is already on (host hasn't acted yet).
+        peer.video_enabled = true;
+        manager.connected_peers.insert(1000, peer);
+
+        // A video frame arrives "just now": stamps last_video_frame_ms to a
+        // fresh value. This is the precise state in which a stale off-heartbeat
+        // would be blocked by the guard.
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::VIDEO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1000,
+            ),
+            "test@test.com",
+        );
+        {
+            let peer = manager.connected_peers.get(&1000).unwrap();
+            assert!(peer.video_enabled, "video frame should enable video");
+            assert!(
+                peer.last_video_frame_ms > 0,
+                "video frame should stamp freshness"
+            );
+        }
+
+        // Authoritative host command: force video off.
+        manager.force_peer_media_off("test@test.com", false, true);
+
+        let peer = manager.connected_peers.get(&1000).unwrap();
+        assert!(
+            !peer.video_enabled,
+            "force_peer_media_off must disable video immediately, bypassing the \
+             freshness guard that would otherwise keep a fresh-frame peer enabled"
+        );
+        // Audio untouched (was never enabled, stays off).
+        assert!(!peer.audio_enabled);
+    }
+
+    /// `force_peer_media_off(audio_off)` mutes immediately and marks the
+    /// audio decoder muted, even with a just-decoded audio frame.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_disables_audio_despite_fresh_frame() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, muted) = make_test_peer(1001);
+        peer.has_received_heartbeat = true;
+        // Peer's audio is already on (unmuted) before the host acts.
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(1001, peer);
+
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::AUDIO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1001,
+            ),
+            "test@test.com",
+        );
+        {
+            let peer = manager.connected_peers.get(&1001).unwrap();
+            assert!(peer.audio_enabled, "audio frame should enable audio");
+            assert!(peer.last_audio_frame_ms > 0);
+        }
+        assert!(!muted.get(), "audio decoder unmuted after audio frame");
+
+        manager.force_peer_media_off("test@test.com", true, false);
+
+        let peer = manager.connected_peers.get(&1001).unwrap();
+        assert!(
+            !peer.audio_enabled,
+            "force_peer_media_off must mute audio immediately, bypassing freshness"
+        );
+        assert!(
+            muted.get(),
+            "audio decoder must be muted after force-off so no expand/hiss packets play"
+        );
+        // Video untouched.
+        assert!(!peer.video_enabled);
+    }
+
+    /// No permanent latch: after a host force-off, a later legitimate
+    /// `heartbeat = true` with fresh frames re-enables the peer normally. The
+    /// force-off writes the same tracked flags the heartbeat path reads, so an
+    /// affirmative heartbeat recovers (affirmative heartbeats always win).
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_does_not_latch_reenable_recovers() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, muted) = make_test_peer(1002);
+        peer.has_received_heartbeat = true;
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(1002, peer);
+
+        // Host force-off both.
+        manager.force_peer_media_off("test@test.com", true, true);
+        {
+            let peer = manager.connected_peers.get(&1002).unwrap();
+            assert!(!peer.video_enabled);
+            assert!(!peer.audio_enabled);
+            assert!(muted.get(), "audio muted by force-off");
+        }
+
+        // Target re-enables and a heartbeat=true arrives.
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    heartbeat_metadata: Some(HeartbeatMetadata {
+                        video_enabled: true,
+                        audio_enabled: true,
+                        screen_enabled: false,
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                },
+                1002,
+            ),
+            "test@test.com",
+        );
+
+        let peer = manager.connected_peers.get(&1002).unwrap();
+        assert!(
+            peer.video_enabled,
+            "an affirmative heartbeat after force-off must re-enable video (no latch)"
+        );
+        assert!(
+            peer.audio_enabled,
+            "an affirmative heartbeat after force-off must re-enable audio (no latch)"
+        );
+        assert!(
+            !muted.get(),
+            "audio decoder must be unmuted again on re-enable"
+        );
+    }
+
+    /// Unknown user_id is a safe no-op: it must not panic, and must not touch
+    /// any existing peer's state.
+    #[wasm_bindgen_test]
+    fn force_peer_media_off_unknown_user_is_noop() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1003);
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        manager.connected_peers.insert(1003, peer);
+
+        manager.force_peer_media_off("nobody@nowhere.com", true, true);
+
+        let peer = manager.connected_peers.get(&1003).unwrap();
+        assert!(
+            peer.video_enabled && peer.audio_enabled,
+            "force-off for an unknown user_id must not alter any peer"
+        );
+    }
+
+    /// Regression guard: the ORDINARY heartbeat path is UNCHANGED. A stale
+    /// `heartbeat = false` within the freshness window must STILL be suppressed
+    /// (the peer stays enabled) — proving #1034's force-off did not weaken the
+    /// `apply_heartbeat_enabled_flag` guard for normal heartbeats.
+    #[wasm_bindgen_test]
+    fn ordinary_stale_heartbeat_still_suppressed_within_fresh_window() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(1004);
+        peer.has_received_heartbeat = true;
+        // Peer's video is already on.
+        peer.video_enabled = true;
+        manager.connected_peers.insert(1004, peer);
+
+        // Fresh video frame stamps freshness (video already enabled).
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::VIDEO.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    data: vec![0u8; 10],
+                    ..Default::default()
+                },
+                1004,
+            ),
+            "test@test.com",
+        );
+        assert!(manager.connected_peers.get(&1004).unwrap().video_enabled);
+
+        // Ordinary stale off-heartbeat arrives within the window. The guard
+        // must KEEP video_enabled = true (this is the WT-race protection that
+        // #1034 must not regress).
+        let _ = manager.decode(
+            packet_wrapper(
+                &MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    user_id: b"test@test.com".to_vec(),
+                    heartbeat_metadata: Some(HeartbeatMetadata {
+                        video_enabled: false,
+                        audio_enabled: false,
+                        screen_enabled: false,
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                },
+                1004,
+            ),
+            "test@test.com",
+        );
+
+        assert!(
+            manager.connected_peers.get(&1004).unwrap().video_enabled,
+            "ordinary stale off-heartbeat within the freshness window must NOT flip a \
+             normal peer — the guard is unchanged by #1034"
+        );
+    }
+
+    // -- #1036: mute-all / disable-all host-excluded force-off ------------
+
+    /// Helper: build a connected peer with a distinct `user_id`, both media
+    /// flags ON, already past the first heartbeat, and a fresh just-decoded
+    /// video+audio frame so the freshness guard would *block* a stale
+    /// off-heartbeat (the exact state #1036's fast path must override).
+    fn insert_fresh_enabled_peer(
+        manager: &mut PeerDecodeManager,
+        session_id: u64,
+        user_id: &str,
+    ) -> Rc<Cell<bool>> {
+        let (mut peer, muted) = make_test_peer(session_id);
+        peer.user_id = user_id.into();
+        peer.has_received_heartbeat = true;
+        peer.video_enabled = true;
+        peer.audio_enabled = true;
+        muted.set(false);
+        manager.connected_peers.insert(session_id, peer);
+
+        // Fresh video + audio frames stamp `last_*_frame_ms` so a stale
+        // off-heartbeat would be suppressed by the freshness guard.
+        for mt in [MediaType::VIDEO, MediaType::AUDIO] {
+            let _ = manager.decode(
+                packet_wrapper(
+                    &MediaPacket {
+                        media_type: mt.into(),
+                        user_id: user_id.as_bytes().to_vec(),
+                        data: vec![0u8; 10],
+                        ..Default::default()
+                    },
+                    session_id,
+                ),
+                user_id,
+            );
+        }
+        muted.set(false);
+        let p = manager.connected_peers.get(&session_id).unwrap();
+        assert!(
+            p.video_enabled && p.audio_enabled,
+            "fresh frames should leave both media flags enabled before the host acts"
+        );
+        muted
+    }
+
+    /// `force_all_peers_media_off_except` forces audio + video OFF for every
+    /// peer EXCEPT the excluded host, **despite fresh frames** (same
+    /// guard-bypass property as `force_peer_media_off`). The excluded host
+    /// peer's `audio_enabled` / `video_enabled` must stay TRUE.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_excludes_host_despite_fresh_frames() {
+        let mut manager = PeerDecodeManager::new();
+        // Host owns two sessions (multi-tab) under the same user_id — BOTH
+        // must be excluded.
+        let _host_a = insert_fresh_enabled_peer(&mut manager, 2000, "host@hcl");
+        let _host_b = insert_fresh_enabled_peer(&mut manager, 2001, "host@hcl");
+        let alice_muted = insert_fresh_enabled_peer(&mut manager, 2002, "alice@hcl");
+        let bob_muted = insert_fresh_enabled_peer(&mut manager, 2003, "bob@hcl");
+
+        // Mute-all + disable-all in one shot: exclude the host.
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+
+        // Host's two tiles untouched — a mute-all must NOT mute the issuing
+        // host (the crux of #1036).
+        for sid in [2000u64, 2001u64] {
+            let host = manager.connected_peers.get(&sid).unwrap();
+            assert!(
+                host.audio_enabled && host.video_enabled,
+                "excluded host session {sid} must keep audio+video ON after mute-all"
+            );
+        }
+
+        // Every other peer forced fully off, despite their fresh frames.
+        for sid in [2002u64, 2003u64] {
+            let other = manager.connected_peers.get(&sid).unwrap();
+            assert!(
+                !other.audio_enabled,
+                "non-host peer {sid} audio must be forced off, bypassing freshness"
+            );
+            assert!(
+                !other.video_enabled,
+                "non-host peer {sid} video must be forced off, bypassing freshness"
+            );
+        }
+        assert!(
+            alice_muted.get() && bob_muted.get(),
+            "non-host audio decoders must be muted so no expand/hiss plays after force-off"
+        );
+    }
+
+    /// Audio-only variant (mute-all): only `audio_enabled` is forced off for
+    /// non-host peers; `video_enabled` is left untouched; the host is skipped.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_audio_only_leaves_video() {
+        let mut manager = PeerDecodeManager::new();
+        let _host = insert_fresh_enabled_peer(&mut manager, 2100, "host@hcl");
+        let _alice = insert_fresh_enabled_peer(&mut manager, 2101, "alice@hcl");
+
+        manager.force_all_peers_media_off_except("host@hcl", true, false);
+
+        let host = manager.connected_peers.get(&2100).unwrap();
+        assert!(
+            host.audio_enabled && host.video_enabled,
+            "host excluded from mute-all"
+        );
+        let alice = manager.connected_peers.get(&2101).unwrap();
+        assert!(!alice.audio_enabled, "alice audio forced off");
+        assert!(alice.video_enabled, "mute-all must NOT touch video_enabled");
+    }
+
+    /// Idempotent / no-op for already-off peers: a peer whose audio+video are
+    /// already off is unchanged, and a re-issued mute-all does not re-flip an
+    /// already-muted peer. (No-op guard mirrors `force_peer_media_off`.)
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_idempotent_for_already_off() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Already-off peer: make_test_peer defaults both flags to false.
+        let (mut already_off, _m) = make_test_peer(2200);
+        already_off.user_id = "alice@hcl".into();
+        already_off.has_received_heartbeat = true;
+        manager.connected_peers.insert(2200, already_off);
+
+        // First call forces it off — but it is already off, so this is a no-op
+        // transition (stays false, no panic).
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        {
+            let p = manager.connected_peers.get(&2200).unwrap();
+            assert!(!p.audio_enabled && !p.video_enabled);
+        }
+
+        // Now an enabled peer; force it off, then re-issue — the second call is
+        // a no-op (already off) and must not error or change state.
+        let _bob = insert_fresh_enabled_peer(&mut manager, 2201, "bob@hcl");
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        manager.force_all_peers_media_off_except("host@hcl", true, true);
+        let bob = manager.connected_peers.get(&2201).unwrap();
+        assert!(
+            !bob.audio_enabled && !bob.video_enabled,
+            "re-issuing mute-all on an already-off peer is an idempotent no-op"
+        );
+    }
+
+    /// `audio_off == video_off == false` is a safe no-op: nothing changes even
+    /// for non-host peers.
+    #[wasm_bindgen_test]
+    fn force_all_peers_media_off_except_no_flags_is_noop() {
+        let mut manager = PeerDecodeManager::new();
+        let _alice = insert_fresh_enabled_peer(&mut manager, 2300, "alice@hcl");
+
+        manager.force_all_peers_media_off_except("host@hcl", false, false);
+
+        let alice = manager.connected_peers.get(&2300).unwrap();
+        assert!(
+            alice.audio_enabled && alice.video_enabled,
+            "force-off with no flags set must not change any peer"
         );
     }
 }

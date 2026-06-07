@@ -16,6 +16,7 @@
  * conditions.
  */
 
+mod layer_preference_sender;
 mod video_call_client;
 mod viewport_sender;
 

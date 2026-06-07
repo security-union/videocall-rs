@@ -589,6 +589,162 @@ pub fn clear_display_name_from_storage() {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-join device preference persistence (issue #959)
+// ---------------------------------------------------------------------------
+//
+// The pre-join device-preview screen lets the user pick which camera, mic, and
+// speaker to use and whether to start with the camera/mic on, BEFORE joining.
+// We persist those choices in `localStorage` (mirroring the display-name /
+// transport-preference pattern above) and restore them on the next visit. The
+// in-meeting `Host` reads the stored device IDs on first device enumeration so
+// the pre-join selection is the one actually used when capture starts.
+
+const DEVICE_PREF_CAMERA_KEY: &str = "vc_prejoin_camera_id";
+const DEVICE_PREF_MIC_KEY: &str = "vc_prejoin_mic_id";
+const DEVICE_PREF_SPEAKER_KEY: &str = "vc_prejoin_speaker_id";
+const DEVICE_PREF_CAMERA_ON_KEY: &str = "vc_prejoin_camera_on";
+const DEVICE_PREF_MIC_ON_KEY: &str = "vc_prejoin_mic_on";
+
+fn read_local_storage(key: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .filter(|v| !v.is_empty())
+}
+
+fn write_local_storage(key: &str, value: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, value);
+    }
+}
+
+/// Resolve which device ID to actually use given the user's stored preference
+/// and the list of currently-available device IDs.
+///
+/// Resolution rules (pure; no DOM access so it is host-testable):
+///
+/// 1. If a `stored` ID is present AND still exists in `available`, use it.
+/// 2. Otherwise fall back to the first available device ID (the same
+///    "default = device 0" semantics `SelectableDevices::selected()` uses).
+/// 3. If `available` is empty, return `None`.
+///
+/// This makes us resilient to a persisted device that was unplugged between
+/// visits — we never select a phantom device, we just fall back to the default.
+pub fn restore_device_id(stored: Option<&str>, available: &[String]) -> Option<String> {
+    if let Some(id) = stored {
+        if !id.is_empty() && available.iter().any(|a| a == id) {
+            return Some(id.to_string());
+        }
+    }
+    available.first().cloned()
+}
+
+/// Resolve the initial on/off state to apply for a track when joining.
+///
+/// Pure decision function (host-testable). The user's stored preference only
+/// takes effect when the corresponding permission was granted AND a device of
+/// that kind actually exists. If permission was denied or no device is present,
+/// the track must start OFF regardless of the stored preference — we never try
+/// to enable capture we cannot perform.
+pub fn resolve_initial_enabled(
+    stored_on: bool,
+    permission_granted: bool,
+    has_device: bool,
+) -> bool {
+    stored_on && permission_granted && has_device
+}
+
+/// Feature-detect `HTMLMediaElement.prototype.setSinkId` support, given a
+/// capability flag. Pulled out as a pure function so the decision logic is
+/// host-testable; the actual JS feature probe lives in
+/// [`html_media_set_sink_id_supported`].
+///
+/// Chromium-based browsers expose `setSinkId`, allowing programmatic audio
+/// output (speaker) selection. Firefox and Safari do not, so the speaker
+/// dropdown must be rendered read-only there with an explanatory note.
+///
+/// The only non-test caller is the wasm-gated [`html_media_set_sink_id_supported`],
+/// so on the native build (which `cargo clippy --all` compiles) this has no
+/// caller outside `#[cfg(test)]`. Suppress dead_code only there — on wasm it is
+/// genuinely used, and the host test still exercises it under `cargo test`.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub fn speaker_selection_supported(set_sink_id_present: bool) -> bool {
+    set_sink_id_present
+}
+
+/// Probe the live browser for `HTMLMediaElement.prototype.setSinkId` support.
+///
+/// Returns `false` on non-web targets or when the prototype is unreachable.
+#[cfg(target_family = "wasm")]
+pub fn html_media_set_sink_id_supported() -> bool {
+    use wasm_bindgen::JsValue;
+    let present = web_sys::window()
+        .and_then(|w| js_sys::Reflect::get(&w, &JsValue::from_str("HTMLMediaElement")).ok())
+        .and_then(|ctor| js_sys::Reflect::get(&ctor, &JsValue::from_str("prototype")).ok())
+        .map(|proto| js_sys::Reflect::has(&proto, &JsValue::from_str("setSinkId")).unwrap_or(false))
+        .unwrap_or(false);
+    speaker_selection_supported(present)
+}
+
+/// Non-web fallback: no media element, so speaker selection is unsupported.
+#[cfg(not(target_family = "wasm"))]
+pub fn html_media_set_sink_id_supported() -> bool {
+    false
+}
+
+/// Load the persisted camera/mic/speaker device IDs. Any unset key yields
+/// `None`. The caller is responsible for validating these against the live
+/// device list via [`restore_device_id`].
+pub fn load_preferred_device_ids() -> (Option<String>, Option<String>, Option<String>) {
+    (
+        read_local_storage(DEVICE_PREF_CAMERA_KEY),
+        read_local_storage(DEVICE_PREF_MIC_KEY),
+        read_local_storage(DEVICE_PREF_SPEAKER_KEY),
+    )
+}
+
+/// Persist the selected camera device ID.
+pub fn save_preferred_camera_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_CAMERA_KEY, device_id);
+}
+
+/// Persist the selected microphone device ID.
+pub fn save_preferred_mic_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_MIC_KEY, device_id);
+}
+
+/// Persist the selected speaker (audio-output) device ID.
+pub fn save_preferred_speaker_id(device_id: &str) {
+    write_local_storage(DEVICE_PREF_SPEAKER_KEY, device_id);
+}
+
+/// Load the persisted camera on/off preference. Defaults to `false`
+/// (camera off) when no preference has been stored — matching the current
+/// pre-join default where camera starts off.
+pub fn load_preferred_camera_on() -> bool {
+    read_local_storage(DEVICE_PREF_CAMERA_ON_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Load the persisted mic on/off preference. Defaults to `false` (mic off).
+pub fn load_preferred_mic_on() -> bool {
+    read_local_storage(DEVICE_PREF_MIC_ON_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Persist the camera on/off preference.
+pub fn save_preferred_camera_on(on: bool) {
+    write_local_storage(DEVICE_PREF_CAMERA_ON_KEY, if on { "true" } else { "false" });
+}
+
+/// Persist the mic on/off preference.
+pub fn save_preferred_mic_on(on: bool) {
+    write_local_storage(DEVICE_PREF_MIC_ON_KEY, if on { "true" } else { "false" });
+}
+
+// ---------------------------------------------------------------------------
 // Persistent local user ID
 // ---------------------------------------------------------------------------
 
@@ -1278,5 +1434,102 @@ mod tests {
     fn resolve_dock_autohide_honors_stored_false() {
         // Explicitly disabled autohide stays disabled.
         assert!(!resolve_dock_autohide(Some("false")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-join device preference helpers (issue #959)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restore_device_id_uses_stored_when_present() {
+        let available = vec!["cam-a".to_string(), "cam-b".to_string()];
+        assert_eq!(
+            restore_device_id(Some("cam-b"), &available),
+            Some("cam-b".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_falls_back_when_stored_missing() {
+        // Stored device was unplugged between visits → fall back to first.
+        let available = vec!["cam-a".to_string(), "cam-b".to_string()];
+        assert_eq!(
+            restore_device_id(Some("cam-gone"), &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_falls_back_when_none_stored() {
+        let available = vec!["cam-a".to_string()];
+        assert_eq!(
+            restore_device_id(None, &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_stored_wins_over_default_first_entry() {
+        // Regression for the e2e restore-after-reload bug: Chrome's fake device
+        // set lists a pseudo "default" mic FIRST. A persisted non-default
+        // selection must win over that first "default" entry — restore must not
+        // collapse to the auto-selected first device.
+        let available = vec![
+            "default".to_string(),
+            "communications".to_string(),
+            "real-mic-id".to_string(),
+        ];
+        assert_eq!(
+            restore_device_id(Some("communications"), &available),
+            Some("communications".to_string())
+        );
+        assert_eq!(
+            restore_device_id(Some("real-mic-id"), &available),
+            Some("real-mic-id".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_empty_stored_falls_back() {
+        let available = vec!["cam-a".to_string()];
+        assert_eq!(
+            restore_device_id(Some(""), &available),
+            Some("cam-a".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_device_id_no_devices_returns_none() {
+        let available: Vec<String> = vec![];
+        assert_eq!(restore_device_id(Some("cam-a"), &available), None);
+        assert_eq!(restore_device_id(None, &available), None);
+    }
+
+    #[test]
+    fn resolve_initial_enabled_requires_all_conditions() {
+        // The happy path: stored on + permission + device present → on.
+        assert!(resolve_initial_enabled(true, true, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_stored_off() {
+        assert!(!resolve_initial_enabled(false, true, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_permission_denied() {
+        // Never enable capture we are not allowed to perform.
+        assert!(!resolve_initial_enabled(true, false, true));
+    }
+
+    #[test]
+    fn resolve_initial_enabled_off_when_no_device() {
+        assert!(!resolve_initial_enabled(true, true, false));
+    }
+
+    #[test]
+    fn speaker_selection_supported_tracks_capability_flag() {
+        assert!(speaker_selection_supported(true));
+        assert!(!speaker_selection_supported(false));
     }
 }

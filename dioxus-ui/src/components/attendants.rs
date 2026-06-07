@@ -19,11 +19,11 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
+use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
-    capability_check::{assess_capability, CapabilityVerdict},
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -45,15 +45,19 @@ use crate::constants::{
     CANVAS_LIMIT,
 };
 use crate::context::{
-    load_appearance_settings_from_storage, load_decode_budget_override, load_density_mode,
-    load_dock_autohide, load_dock_position, resolve_transport_config,
+    html_media_set_sink_id_supported, load_appearance_settings_from_storage,
+    load_decode_budget_override, load_density_mode, load_dock_autohide, load_dock_position,
+    load_preferred_camera_on, load_preferred_device_ids, load_preferred_mic_on,
+    resolve_initial_enabled, resolve_transport_config, restore_device_id,
     save_appearance_settings_to_storage, save_density_mode, save_display_name_to_storage,
-    save_dock_autohide, save_dock_position, validate_display_name, AppearanceSettingsCtx,
-    AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
-    DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
+    save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
+    save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id, validate_display_name,
+    AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
+    DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime,
+    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx,
 };
+use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -65,6 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use videocall_client::utils::is_ios;
 use videocall_client::Callback as VcCallback;
+use videocall_client::MediaDeviceList;
 use videocall_client::{
     ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
     MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
@@ -119,7 +124,6 @@ pub enum MediaErrorState {
 }
 
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
-const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
@@ -422,109 +426,9 @@ fn schedule_reconnect_no_jwt(
     .forget();
 }
 
-/// Aspect ratio of a rendered tile in the participant grid.
-///
-/// Must match `.grid-item { aspect-ratio: 3 / 2; }` in `static/style.css`
-/// (and the `.full-bleed` / `.split-peer-tile` overrides which use the
-/// same 3:2 cap). If this drifts from the CSS the grid cell will be wider
-/// than the tile and `place-self: center` will surface as visible internal
-/// padding around every tile.
-const TILE_AR: f64 = 3.0 / 2.0;
-
-/// Google Meet–style layout: try every column count, compute the maximum
-/// 3:2 tile size for each, and pick the variant with the largest tile area.
-/// Returns `(cols, rows, tile_width)`.
-fn compute_layout(n: usize, w: f64, h: f64, gap: f64) -> (usize, usize, f64) {
-    if n == 0 {
-        return (1, 1, w);
-    }
-    let mut best_cols = 1_usize;
-    let mut best_rows = 1_usize;
-    let mut best_area = 0.0_f64;
-    let mut best_tw = 0.0_f64;
-    let ar: f64 = TILE_AR;
-
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-
-        let avail_w = (w - (cols as f64 - 1.0) * gap).max(0.0);
-        let avail_h = (h - (rows as f64 - 1.0) * gap).max(0.0);
-
-        let mut tw = avail_w / cols as f64;
-        let mut th = tw / ar;
-
-        if th * rows as f64 > avail_h {
-            th = avail_h / rows as f64;
-            tw = th * ar;
-        }
-
-        let area = tw * th;
-        if area > best_area {
-            best_area = area;
-            best_cols = cols;
-            best_rows = rows;
-            best_tw = tw;
-        }
-    }
-
-    (best_cols, best_rows, best_tw)
-}
-
-/// Promote overflow speakers into the visible portion of a tile list.
-///
-/// When there are more tiles than fit on screen, tiles beyond `visible_count`
-/// are "overflow". If an overflow peer spoke within `active_ms` of `now_ms`,
-/// swap them with the least-recently-active visible peer that is NOT speaking.
-/// The loudest overflow speaker (most recent) gets priority.
-fn promote_speakers(
-    tiles: &mut [String],
-    visible_count: usize,
-    speech_map: &HashMap<String, f64>,
-    join_map: &HashMap<String, f64>,
-    now_ms: f64,
-    active_ms: f64,
-) {
-    if visible_count >= tiles.len() {
-        return;
-    }
-
-    // Effective timestamp: last speech time if exists, else join time.
-    let eff_ts = |peer: &str| -> f64 {
-        speech_map
-            .get(peer)
-            .copied()
-            .unwrap_or_else(|| join_map.get(peer).copied().unwrap_or(0.0))
-    };
-
-    // Overflow tiles that are actively speaking (most recent first).
-    let mut overflow_speakers: Vec<(usize, f64)> = Vec::new();
-    for (i, peer) in tiles.iter().enumerate().skip(visible_count) {
-        if let Some(&ts) = speech_map.get(peer) {
-            if now_ms - ts < active_ms {
-                overflow_speakers.push((i, ts));
-            }
-        }
-    }
-    overflow_speakers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Visible non-speaking tiles as swap candidates (least recently active first).
-    let mut swap_candidates: Vec<(usize, f64)> = (0..visible_count)
-        .filter(|&i| {
-            speech_map
-                .get(&tiles[i])
-                .is_none_or(|&ts| now_ms - ts >= active_ms)
-        })
-        .map(|i| (i, eff_ts(&tiles[i])))
-        .collect();
-    swap_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Swap pairs — all indices are disjoint so order doesn't matter.
-    let num_swaps = overflow_speakers.len().min(swap_candidates.len());
-    for i in 0..num_swaps {
-        tiles.swap(swap_candidates[i].0, overflow_speakers[i].0);
-    }
-}
-
+use super::attendants_layout::{
+    compute_effective_density, compute_layout, promote_speakers, TILE_AR,
+};
 use super::density::{DensityMode, DENSITY_MODES};
 
 #[component]
@@ -845,20 +749,53 @@ pub fn AttendantsComponent(
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
+    // True only when the user explicitly clicked Join/Start (vs. granting
+    // permission just to preview devices). Gates the auto-connect in the
+    // MediaDeviceAccess callback so a preview-permission grant does NOT join
+    // the meeting. (issue #959)
+    let mut join_requested = use_signal(|| false);
+
+    // ── Pre-join device preview state (issue #959) ─────────────────────
+    // Device lists + selections for the pre-join screen. Populated once
+    // getUserMedia permission is granted (labels are empty before that).
+    let prejoin_cameras = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let prejoin_microphones = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let prejoin_speakers = use_signal(Vec::<web_sys::MediaDeviceInfo>::new);
+    let mut prejoin_selected_camera = use_signal(|| None::<String>);
+    let mut prejoin_selected_mic = use_signal(|| None::<String>);
+    let mut prejoin_selected_speaker = use_signal(|| None::<String>);
+    // Restore the persisted on/off choices so they round-trip across visits.
+    let mut prejoin_camera_on = use_signal(load_preferred_camera_on);
+    let mut prejoin_mic_on = use_signal(load_preferred_mic_on);
+    // setSinkId support is fixed per-browser; probe once.
+    let speaker_supported = use_hook(html_media_set_sink_id_supported);
+
+    // The imperative preview engine owns the camera + mic preview hardware and
+    // drives the level meter. The meter is updated by DIRECT DOM writes (no
+    // Dioxus signal), so it never re-diffs the card per frame. One instance for
+    // the component's lifetime.
+    let preview_engine = use_hook(|| {
+        use crate::components::pre_join_settings_card::{
+            PREVIEW_MIC_METER_FILL_ID, PREVIEW_MIC_METER_ID, PREVIEW_VIDEO_ID,
+        };
+        PreviewEngine::new(
+            PREVIEW_VIDEO_ID,
+            PREVIEW_MIC_METER_ID,
+            PREVIEW_MIC_METER_FILL_ID,
+        )
+    });
+
+    // Pre-join device list (separate from the in-meeting Host's list). Loaded
+    // after permission is granted; restores persisted device-id selections.
+    let prejoin_devices: Rc<RefCell<MediaDeviceList>> =
+        use_hook(|| Rc::new(RefCell::new(MediaDeviceList::new())));
+
     let mut waiting_room_toggle = use_signal(move || waiting_room_enabled);
     let mut admitted_can_admit_toggle = use_signal(move || admitted_can_admit);
     let mut end_on_host_leave_toggle = use_signal(move || end_on_host_leave);
     let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
-    // Pre-join capability verdict (Phase 9). Computed once at component mount —
-    // hardware concurrency / UA platform don't change while the page is open.
-    // Block / StrongWarn surfaces UI in the lobby below; Ok proceeds normally.
-    let capability_verdict = use_hook(assess_capability);
-    // Has the user explicitly dismissed the StrongWarn modal? Once true the
-    // join button (and the auto_join effect) proceeds normally for the rest
-    // of the lobby session.
-    let mut capability_acknowledged = use_signal(|| false);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
@@ -981,13 +918,29 @@ pub fn AttendantsComponent(
                     session_loaded.set(true);
                     // Activate console log collection if enabled in config.
                     if crate::constants::console_log_upload_enabled().unwrap_or(false) {
-                        // Raise the WASM log level to Debug so uploaded logs
-                        // capture detailed diagnostic output. We use Debug
-                        // rather than Trace (as ticket #307 mentions) because
-                        // Trace is prohibitively noisy in WASM — every
-                        // wasm-bindgen call and Dioxus re-render generates
-                        // trace spans that would overwhelm the upload buffer.
-                        log::set_max_level(log::LevelFilter::Debug);
+                        // Raise the WASM log level so uploaded logs capture
+                        // detailed diagnostic output.
+                        //
+                        // PRECEDENCE (console-log perf fix):
+                        //  - If the operator EXPLICITLY set `logLevel` in config.js
+                        //    (ANY value, INCLUDING "info"), honour it as the ceiling
+                        //    — e.g. `logLevel: "info"` or `"warn"` deliberately
+                        //    REDUCES capture to cut per-packet log volume on a hot
+                        //    deployment, and `logLevel: "trace"` opts INTO the
+                        //    per-packet hot-path logs (which are emitted at trace!).
+                        //  - Otherwise (key ABSENT → `log_level_explicit()` is None),
+                        //    bump to Debug — the historical collection behaviour,
+                        //    preserved so existing meeting analysis keeps working
+                        //    unchanged. `Option<String>` lets us tell "absent" apart
+                        //    from an explicit "info" (a defaulted String could not).
+                        //
+                        // We use Debug rather than Trace by default (per ticket
+                        // #307) because Trace is prohibitively noisy in WASM and
+                        // the genuine per-packet spam now lives at trace!, off by
+                        // default even when collecting.
+                        let effective_level = crate::constants::log_level_explicit()
+                            .unwrap_or(log::LevelFilter::Debug);
+                        log::set_max_level(effective_level);
                         let dn = current_display_name();
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }
@@ -1621,9 +1574,20 @@ pub fn AttendantsComponent(
         });
     }
 
+    // Release any pre-join preview hardware (camera + mic) and close the
+    // AudioContext on unmount, covering the route-change / tab-close paths the
+    // join handler's explicit shutdown does not. Idempotent. (issue #959)
+    {
+        let preview_engine_for_drop = preview_engine.clone();
+        use_drop(move || {
+            preview_engine_for_drop.shutdown();
+        });
+    }
+
     let mda = use_hook(|| {
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
+        let preview_engine_for_mda = preview_engine.clone();
         mda.on_result = VcCallback::from(move |permit: MediaPermission| {
             let mut connection_error = connection_error;
             let mut media_access_granted = media_access_granted;
@@ -1637,6 +1601,7 @@ pub fn AttendantsComponent(
             let mut show_device_warning = show_device_warning;
             let mut reload_devices_counter = reload_devices_counter;
             let mut device_was_denied = device_was_denied;
+            let mut join_requested = join_requested;
 
             connection_error.set(None);
             mic_error.set(None);
@@ -1688,16 +1653,62 @@ pub fn AttendantsComponent(
                     video_enabled.set(false);
                     pending_video_enable.set(false);
                 }
+            } else if !join_requested() {
+                // Permission was requested just to PREVIEW devices (issue #959).
+                // Do NOT connect — the pre-join enumeration effect will pick up
+                // the granted permission and populate the device list. The user
+                // must click Join/Start to actually enter the meeting.
+                log::info!("Media permission granted for pre-join preview (not joining yet)");
             } else if mic_error.read().is_some() || video_error.read().is_some() {
                 show_device_warning.set(true);
                 meeting_joined.set(false);
+                join_requested.set(false);
             } else {
+                // Real join. Apply the pre-join camera/mic on-off choices.
+                //
+                // Each track is honored only if permission for it was granted
+                // AND a device exists, so we never try to enable capture we
+                // can't perform (`resolve_initial_enabled`).
+                //
+                // We set `mic_enabled`/`video_enabled` DIRECTLY rather than via
+                // `pending_*_enable`: the pending flags are consumed earlier in
+                // THIS same `on_result` invocation (the granted-pending check
+                // above), and `request()` fires `on_result` exactly once with
+                // nothing re-firing post-connect. Writing them here would be too
+                // late — the Host reads `mic_enabled`/`video_enabled` as props
+                // and acts on them when it mounts/renders, which is what drives
+                // `client.set_audio_enabled` / `set_video_enabled`. (issue #959)
+                let audio_ok = matches!(permit.audio, PermissionState::Granted);
+                let video_ok = matches!(permit.video, PermissionState::Granted);
+                let want_mic = resolve_initial_enabled(
+                    prejoin_mic_on(),
+                    audio_ok,
+                    !prejoin_microphones.read().is_empty(),
+                );
+                let want_cam = resolve_initial_enabled(
+                    prejoin_camera_on(),
+                    video_ok,
+                    !prejoin_cameras.read().is_empty(),
+                );
+
+                // Release the preview hardware BEFORE the real encoders start so
+                // there is no double-capture of the camera/mic. (issue #959)
+                preview_engine_for_mda.shutdown();
+
+                mic_enabled.set(want_mic);
+                video_enabled.set(want_cam);
+                // Clear any stale pending writes so a later focus re-check
+                // can't resurrect them.
+                pending_mic_enable.set(false);
+                pending_video_enable.set(false);
+
                 let mut connecting = connecting;
                 connecting.set(true);
                 if let Err(e) = client_cell.borrow_mut().connect() {
                     log::error!("Connection failed: {e:?}");
                 }
                 meeting_joined.set(true);
+                join_requested.set(false);
             }
 
             if device_was_denied() {
@@ -1707,6 +1718,168 @@ pub fn AttendantsComponent(
         });
         Rc::new(RefCell::new(mda))
     });
+
+    // ── Pre-join device enumeration + preview wiring (issue #959) ───────
+    //
+    // Once getUserMedia permission is granted (so device labels are populated)
+    // and we are still on the pre-join screen, enumerate devices, restore the
+    // persisted selections, and start the preview for any track the user chose
+    // to begin with ON. Re-runs when `reload_devices_counter` bumps (hot-plug /
+    // re-grant). The effect is a no-op after the meeting actually starts —
+    // teardown happens in the join handler and on unmount.
+    // Tracks the last (granted, reload_counter) key we ran `dev.load()` for, so
+    // the effect re-running for unrelated reasons does not re-enumerate and
+    // re-register the device-change listener every time. (code-review item 10)
+    let prejoin_loaded_key: Rc<Cell<Option<u32>>> = use_hook(|| Rc::new(Cell::new(None)));
+    {
+        let prejoin_devices = prejoin_devices.clone();
+        let preview_engine = preview_engine.clone();
+        let prejoin_loaded_key = prejoin_loaded_key.clone();
+        use_effect(move || {
+            // Subscribe to the reactive triggers.
+            let granted = media_access_granted();
+            let reload = reload_devices_counter();
+            if !granted || meeting_joined() {
+                return;
+            }
+            // Run `load()` once per grant, plus once per `reload_devices_counter`
+            // bump (hot-plug / re-grant). The counter is the load key.
+            if prejoin_loaded_key.get() == Some(reload) {
+                return;
+            }
+            prejoin_loaded_key.set(Some(reload));
+            let preview_engine = preview_engine.clone();
+            let mut dev = prejoin_devices.borrow_mut();
+
+            // Copy enumerated devices into signals and apply restored
+            // selections. Shared by the initial load and hot-plug changes.
+            let apply = {
+                let prejoin_devices = prejoin_devices.clone();
+                let preview_engine = preview_engine.clone();
+                move || {
+                    // Rebind Copy signals as local `mut` so this closure stays
+                    // `Fn` (required by VcCallback) — `.set()` mutates the local
+                    // handle, not a captured variable.
+                    let mut prejoin_cameras = prejoin_cameras;
+                    let mut prejoin_microphones = prejoin_microphones;
+                    let mut prejoin_speakers = prejoin_speakers;
+                    let mut prejoin_selected_camera = prejoin_selected_camera;
+                    let mut prejoin_selected_mic = prejoin_selected_mic;
+                    let mut prejoin_selected_speaker = prejoin_selected_speaker;
+                    let mut prejoin_camera_on = prejoin_camera_on;
+                    let mut prejoin_mic_on = prejoin_mic_on;
+
+                    let mut dev = prejoin_devices.borrow_mut();
+                    let cams = dev.video_inputs.devices();
+                    let mics = dev.audio_inputs.devices();
+                    let spks = dev.audio_outputs.devices();
+
+                    let (stored_cam, stored_mic, stored_spk) = load_preferred_device_ids();
+                    let cam_ids: Vec<String> = cams.iter().map(|d| d.device_id()).collect();
+                    let mic_ids: Vec<String> = mics.iter().map(|d| d.device_id()).collect();
+                    let spk_ids: Vec<String> = spks.iter().map(|d| d.device_id()).collect();
+
+                    let cam_sel = restore_device_id(stored_cam.as_deref(), &cam_ids);
+                    let mic_sel = restore_device_id(stored_mic.as_deref(), &mic_ids);
+                    let spk_sel = restore_device_id(stored_spk.as_deref(), &spk_ids);
+
+                    // Reflect the resolved selection back into the device list so
+                    // selected()/select() stay consistent with what we show.
+                    if let Some(id) = cam_sel.as_deref() {
+                        dev.video_inputs.select(id);
+                    }
+                    if let Some(id) = mic_sel.as_deref() {
+                        dev.audio_inputs.select(id);
+                    }
+                    if let Some(id) = spk_sel.as_deref() {
+                        dev.audio_outputs.select(id);
+                    }
+                    drop(dev);
+
+                    prejoin_cameras.set(cams);
+                    prejoin_microphones.set(mics);
+                    prejoin_speakers.set(spks);
+                    prejoin_selected_camera.set(cam_sel.clone());
+                    prejoin_selected_mic.set(mic_sel.clone());
+                    prejoin_selected_speaker.set(spk_sel);
+
+                    // Persist resolved selections (so a fallback after an
+                    // unplugged device becomes the new remembered choice).
+                    if let Some(id) = cam_sel.as_deref() {
+                        save_preferred_camera_id(id);
+                    }
+                    if let Some(id) = mic_sel.as_deref() {
+                        save_preferred_mic_id(id);
+                    }
+
+                    // Start preview for tracks the user wants ON, gated on a
+                    // device actually being present.
+                    if prejoin_camera_on() {
+                        if let Some(id) = cam_sel {
+                            preview_engine.start_camera(id);
+                        } else {
+                            prejoin_camera_on.set(false);
+                        }
+                    }
+                    if prejoin_mic_on() {
+                        if let Some(id) = mic_sel {
+                            preview_engine.start_mic_meter(id);
+                        } else {
+                            prejoin_mic_on.set(false);
+                        }
+                    }
+                }
+            };
+
+            dev.on_loaded = VcCallback::from({
+                let apply = apply.clone();
+                move |_| apply()
+            });
+            dev.on_devices_changed = VcCallback::from(move |_| apply());
+            dev.load();
+        });
+    }
+
+    // Keep each pre-join <select>'s DOM `.value` in sync with the restored
+    // selection signal once devices are enumerated. (issue #959 restore bug)
+    //
+    // The selects first render with no options (pre-enumeration), so the browser
+    // settles their `.value` on the implicit "default" option. When `apply()`
+    // later populates the option list AND the restored `prejoin_selected_*`
+    // signal, Dioxus patches the `<option selected>` attribute — but a browser
+    // `<select>` does NOT re-derive `.value` from a post-parse attribute
+    // mutation, so the control stays stuck on "default". This effect reads the
+    // selection + device-list SIGNALS (so it re-runs reactively after `apply`)
+    // and sets the IDL `value` directly, which reliably moves the selection.
+    // It lives here (not in the card) because Dioxus 0.7 `use_effect` only
+    // re-runs on Signal reads, not on plain prop-value changes.
+    {
+        use crate::components::pre_join_settings_card::{
+            sync_select_value, PREVIEW_CAMERA_SELECT_ID, PREVIEW_MIC_SELECT_ID,
+            PREVIEW_SPEAKER_SELECT_ID,
+        };
+        use_effect(move || {
+            // Reactive deps: selection ids + whether option lists are populated.
+            let cam = prejoin_selected_camera();
+            let mic = prejoin_selected_mic();
+            let spk = prejoin_selected_speaker();
+            let has_cams = !prejoin_cameras.read().is_empty();
+            let has_mics = !prejoin_microphones.read().is_empty();
+            let has_spks = !prejoin_speakers.read().is_empty();
+            if !media_access_granted() || meeting_joined() {
+                return;
+            }
+            if has_cams {
+                sync_select_value(PREVIEW_CAMERA_SELECT_ID, cam.as_deref());
+            }
+            if has_mics {
+                sync_select_value(PREVIEW_MIC_SELECT_ID, mic.as_deref());
+            }
+            if has_spks && speaker_supported {
+                sync_select_value(PREVIEW_SPEAKER_SELECT_ID, spk.as_deref());
+            }
+        });
+    }
 
     // Re-check permissions when the window regains focus, mirroring Yew behavior.
     // Only fires for users already in-meeting who had a prior denial — on the
@@ -2391,27 +2564,18 @@ pub fn AttendantsComponent(
         }
     });
 
-    // Auto-join on first render if requested.
-    // Gated by the Phase 9 capability verdict: a Block must surface its UI
-    // before media is acquired, and a StrongWarn must be acknowledged first.
+    // Auto-join on first render if requested. Every device joins regardless of
+    // capabilities (issue #1054) — there is no pre-join gate.
     {
         let mda = mda.clone();
-        let verdict = capability_verdict.clone();
         use_effect(move || {
             if !auto_join {
                 return;
             }
-            match &verdict {
-                CapabilityVerdict::Block(_) => {
-                    log::warn!("capability-check: auto_join suppressed by Block verdict");
-                }
-                CapabilityVerdict::StrongWarn(_) if !capability_acknowledged() => {
-                    log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
-                }
-                _ => {
-                    mda.borrow().request();
-                }
-            }
+            // Direct-URL auto-join: a real join, so the permission callback must
+            // proceed to connect (issue #959).
+            join_requested.set(true);
+            mda.borrow().request();
         });
     }
 
@@ -2625,54 +2789,17 @@ pub fn AttendantsComponent(
     };
 
     // --- Determine effective density mode ---
-    // If the user's chosen mode can't show all active speakers, auto-escalate
-    // to a denser mode so every speaker is always visible.
     let user_mode = density_mode();
-    let modes_by_density = [
-        DensityMode::Standard,
-        DensityMode::Auto,
-        DensityMode::Dense,
-        DensityMode::Maximum,
-    ];
-    let user_rank = modes_by_density
-        .iter()
-        .position(|&m| m == user_mode)
-        .unwrap_or(1);
-
-    let effective_mode = if active_speaker_count > 0 {
-        let mut chosen = user_mode;
-        for &mode in &modes_by_density[user_rank..] {
-            chosen = mode;
-            let mtw = mode.min_tile_width(vw);
-            // Find the max tile count where compute_layout yields tw >= mtw.
-            // Since tile_width is monotonically non-increasing as tile count
-            // grows, we can scan downward from total_tiles (fast in practice
-            // since the breakpoint is usually close to total_tiles).
-            let capacity = {
-                let mut t = total_tiles;
-                while t > 1 {
-                    let (_c, _r, tw) = compute_layout(t, avail_w, avail_h, gap);
-                    if tw >= mtw {
-                        break;
-                    }
-                    t -= 1;
-                }
-                t
-            };
-            let vis = if total_tiles > capacity {
-                capacity.saturating_sub(1).max(1)
-            } else {
-                total_tiles
-            };
-            let vis_real = num_display_peers.min(vis);
-            if vis_real >= active_speaker_count {
-                break;
-            }
-        }
-        chosen
-    } else {
-        user_mode
-    };
+    let effective_mode = compute_effective_density(
+        user_mode,
+        total_tiles,
+        avail_w,
+        avail_h,
+        gap,
+        active_speaker_count,
+        num_display_peers,
+        vw,
+    );
 
     // --- Determine visible tile count ---
     let min_tw = effective_mode.min_tile_width(vw);
@@ -3099,21 +3226,9 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
-        // Phase 9 capability gating. Snapshot the verdict for this render so we
-        // don't pay the navigator cost again — `assess_capability` already ran
-        // at component mount via `use_hook`.
-        let verdict = capability_verdict.clone();
-        let is_blocked = matches!(verdict, CapabilityVerdict::Block(_));
-        let strong_warn_msg = match &verdict {
-            CapabilityVerdict::StrongWarn(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let block_msg = match &verdict {
-            CapabilityVerdict::Block(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let show_strong_warn_modal = strong_warn_msg.is_some() && !capability_acknowledged();
-
+        // Every device joins regardless of capabilities (issue #1054): the
+        // lobby always renders the PreJoinSettingsCard and the join button is
+        // always enabled. No pre-join capability gate.
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
@@ -3122,122 +3237,96 @@ pub fn AttendantsComponent(
                     div { class: "floating-element floating-element-2" }
                     div { class: "floating-element floating-element-3" }
                     div { class: "hero-content",
-                        if let Some(msg) = block_msg.clone() {
-                            // Hard-block: render an error card in place of the
-                            // join card. The user has to switch to a different
-                            // device — there is no override for this verdict.
-                            div { class: "settings-card",
-                                role: "alert",
-                                "aria-live": "assertive",
-                                div { class: "join-meeting-header",
-                                    h2 { class: "join-meeting-title",
-                                        span { class: "join-meeting-title-text",
-                                            "Device not supported"
-                                        }
+                        PreJoinSettingsCard {
+                            is_owner,
+                            meeting_id: id.clone(),
+                            waiting_room_toggle,
+                            admitted_can_admit_toggle,
+                            end_on_host_leave_toggle,
+                            allow_guests_toggle,
+                            saving,
+                            toggle_error,
+                            connection_error,
+                            media_access_granted: media_access_granted(),
+                            speaker_selection_supported: speaker_supported,
+                            cameras: prejoin_cameras(),
+                            microphones: prejoin_microphones(),
+                            speakers: prejoin_speakers(),
+                            selected_camera_id: prejoin_selected_camera(),
+                            selected_microphone_id: prejoin_selected_mic(),
+                            selected_speaker_id: prejoin_selected_speaker(),
+                            camera_on: prejoin_camera_on,
+                            mic_on: prejoin_mic_on,
+                            on_request_permission: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Preview-only permission request: does NOT join
+                                    // (join_requested stays false).
+                                    mda.borrow().request();
+                                }
+                            },
+                            on_camera_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_camera_on.set(on);
+                                    save_preferred_camera_on(on);
+                                    if on {
+                                        let id = prejoin_selected_camera()
+                                            .unwrap_or_default();
+                                        preview_engine.start_camera(id);
+                                    } else {
+                                        preview_engine.stop_camera();
                                     }
                                 }
-                                p { class: "toggle-error", "{msg}" }
-                                div { class: "settings-action-row",
-                                    button {
-                                        class: "btn-apple btn-primary settings-action-btn",
-                                        disabled: true,
-                                        "aria-disabled": "true",
-                                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                            },
+                            on_mic_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_mic_on.set(on);
+                                    save_preferred_mic_on(on);
+                                    if on {
+                                        let id = prejoin_selected_mic().unwrap_or_default();
+                                        preview_engine.start_mic_meter(id);
+                                    } else {
+                                        preview_engine.stop_mic_meter();
                                     }
                                 }
-                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
-                                    "Meeting join is disabled for this device."
-                                }
-                            }
-                        } else {
-                            PreJoinSettingsCard {
-                                is_owner,
-                                meeting_id: id.clone(),
-                                waiting_room_toggle,
-                                admitted_can_admit_toggle,
-                                end_on_host_leave_toggle,
-                                allow_guests_toggle,
-                                saving,
-                                toggle_error,
-                                connection_error,
-                                on_join: {
-                                    let mda = mda.clone();
-                                    let has_strong_warn = strong_warn_msg.is_some();
-                                    move |_| {
-                                        if is_blocked {
-                                            // Defensive: the card should not be
-                                            // rendered when blocked, but in case
-                                            // it ever is, ignore the click.
-                                            log::warn!(
-                                                "capability-check: join click ignored — Block verdict"
-                                            );
-                                            return;
-                                        }
-                                        if has_strong_warn && !capability_acknowledged() {
-                                            // Bring up the strong-warn modal
-                                            // instead of immediately requesting
-                                            // media. The modal's CTAs will set
-                                            // `capability_acknowledged` and
-                                            // re-fire the request.
-                                            log::info!(
-                                                "capability-check: showing StrongWarn modal"
-                                            );
-                                            return;
-                                        }
-                                        mda.borrow().request();
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-                if show_strong_warn_modal {
-                    {
-                        let msg = strong_warn_msg.clone().unwrap_or_default();
-                        let mda_continue = mda.clone();
-                        let mda_audio = mda.clone();
-                        rsx! {
-                            div {
-                                class: "modal-overlay",
-                                role: "dialog",
-                                "aria-modal": "true",
-                                "aria-labelledby": "capability-warn-title",
-                                div { class: "modal-window",
-                                    h3 { id: "capability-warn-title", "Performance warning" }
-                                    p { style: "margin-top: 0.5rem;", "{msg}" }
-                                    div { style: "display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap;",
-                                        button {
-                                            class: "btn-apple btn-secondary",
-                                            onclick: move |_| {
-                                                // Audio-only: camera defaults to
-                                                // off in this lobby, so we just
-                                                // acknowledge and request media.
-                                                // Mic/camera buttons in the
-                                                // post-join controls remain
-                                                // available if the user changes
-                                                // their mind.
-                                                log::info!(
-                                                    "capability-check: user chose Audio-only"
-                                                );
-                                                capability_acknowledged.set(true);
-                                                mda_audio.borrow().request();
-                                            },
-                                            "Switch to audio-only"
-                                        }
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            onclick: move |_| {
-                                                log::info!(
-                                                    "capability-check: user chose Continue anyway"
-                                                );
-                                                capability_acknowledged.set(true);
-                                                mda_continue.borrow().request();
-                                            },
-                                            "Continue anyway"
-                                        }
+                            },
+                            on_camera_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_camera.set(Some(info.device_id.clone()));
+                                    save_preferred_camera_id(&info.device_id);
+                                    // Re-acquire the preview with the new device
+                                    // (only while the camera is on).
+                                    if prejoin_camera_on() {
+                                        preview_engine.start_camera(info.device_id);
                                     }
                                 }
-                            }
+                            },
+                            on_microphone_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_mic.set(Some(info.device_id.clone()));
+                                    save_preferred_mic_id(&info.device_id);
+                                    if prejoin_mic_on() {
+                                        preview_engine.start_mic_meter(info.device_id);
+                                    }
+                                }
+                            },
+                            on_speaker_select: move |info: DeviceInfo| {
+                                prejoin_selected_speaker.set(Some(info.device_id.clone()));
+                                save_preferred_speaker_id(&info.device_id);
+                            },
+                            on_join: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Mark this as a real join so the permission
+                                    // callback proceeds to connect (issue #959).
+                                    join_requested.set(true);
+                                    mda.borrow().request();
+                                }
+                            },
                         }
                     }
                 }
@@ -3478,11 +3567,26 @@ pub fn AttendantsComponent(
                                         stroke_width: "2",
                                         stroke_linecap: "round",
                                         stroke_linejoin: "round",
-                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        line {
+                                            x1: "1",
+                                            y1: "1",
+                                            x2: "23",
+                                            y2: "23",
+                                        }
                                         path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
                                         path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
-                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                        line {
+                                            x1: "12",
+                                            y1: "19",
+                                            x2: "12",
+                                            y2: "23",
+                                        }
+                                        line {
+                                            x1: "8",
+                                            y1: "23",
+                                            x2: "16",
+                                            y2: "23",
+                                        }
                                     }
                                 }
                                 span { class: "toast-text",
@@ -3515,7 +3619,7 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
-                        for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
                                     "peer-toast toast-joined"
@@ -3632,7 +3736,7 @@ pub fn AttendantsComponent(
                             rsx! {
                                 // Left panel — ONLY the most recent (active) screen sharer
                                 div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                            align-items: center; justify-content: center; overflow: hidden;",
+                                                                            align-items: center; justify-content: center; overflow: hidden;",
                                     if let Some(ref active_peer) = active_screen_sharer {
                                         PeerTile {
                                             key: "ss-active-{active_peer}",
@@ -3721,8 +3825,7 @@ pub fn AttendantsComponent(
                                     }
 
                                     if ss_overflow_count > 0 {
-                                        div {
-                                            class: "grid-overflow-badge",
+                                        div { class: "grid-overflow-badge",
                                             "+{ss_overflow_count}"
                                             span { "more in meeting" }
                                         }
@@ -3812,8 +3915,7 @@ pub fn AttendantsComponent(
                         }
 
                         if overflow_count > 0 {
-                            div {
-                                class: "grid-overflow-badge",
+                            div { class: "grid-overflow-badge",
                                 "+{overflow_count}"
                                 span { "more in meeting" }
                             }
@@ -3823,65 +3925,47 @@ pub fn AttendantsComponent(
                         if visible_tiles.is_empty() {
                             div {
                                 id: "invite-overlay",
-                                class: "card-apple",
-                                style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                                h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
-                                    "Share this meeting link with others you want in the meeting"
-                                }
-                                div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                    input {
-                                        id: "meeting-link-input",
-                                        value: "{meeting_link}",
-                                        readonly: true,
-                                        class: "input-apple",
-                                        style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
-                                    }
-                                    button {
-                                        class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                        style: "margin-left: 0.5rem;",
-                                        onclick: {
-                                            let meeting_link = meeting_link.clone();
-                                            move |_| {
-                                                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
-                                                {
-                                                    let _ = clipboard.write_text(&meeting_link);
-                                                    show_copy_toast.set(true);
-                                                    Timeout::new(
-                                                            1640,
-                                                            move || {
-                                                                show_copy_toast.set(false);
-                                                            },
-                                                        )
-                                                        .forget();
-                                                }
-                                            }
-                                        },
-                                        "Copy"
-                                        if show_copy_toast() {
-                                            div {
-                                                class: "sparkles",
-                                                "aria-hidden": "true",
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
+                                class: "invite-glass-card",
+
+                                h4 { class: "invite-glass-title", "Your meeting is ready!" }
+
+                                button {
+                                    class: if show_copy_toast() { "invite-share-button copied" } else { "invite-share-button" },
+                                    r#type: "button",
+                                    onclick: {
+                                        let meeting_link = meeting_link.clone();
+                                        move |_| {
+                                            if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
+                                            {
+                                                let _ = clipboard.write_text(&meeting_link);
+                                                show_copy_toast.set(true);
+                                                Timeout::new(
+                                                        1640,
+                                                        move || {
+                                                            show_copy_toast.set(false);
+                                                        },
+                                                    )
+                                                    .forget();
                                             }
                                         }
+                                    },
+
+                                    span { class: "invite-share-icon", "↗" }
+                                    span {
+                                        if show_copy_toast() {
+                                            "LINK COPIED"
+                                        } else {
+                                            "SHARE THE LINK"
+                                        }
                                     }
+                                    span { class: "invite-copy-icon", "⧉" }
                                 }
-                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
-                                    "People who use this meeting link must get your permission before they can join."
-                                }
+
                                 div {
                                     class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
                                     role: "alert",
                                     "aria-live": "assertive",
-                                    "Link copied to clipboard"
+                                    "Link copied"
                                 }
                             }
                         }
@@ -3889,7 +3973,8 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { id: "host-controls-nav",
+                        nav {
+                            id: "host-controls-nav",
                             class: "host",
                             style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             onmounted: move |evt| {
@@ -3966,7 +4051,10 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
+                                                let is_disabled = matches!(
+                                                    screen_share_state(),
+                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
+                                                );
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
@@ -4007,6 +4095,9 @@ pub fn AttendantsComponent(
                                                                         &framerate_constraint,
                                                                         &JsValue::from_str("ideal"),
                                                                         &JsValue::from_f64(10.0),
+                                                                        // StreamReady causes is_sharing() to return true,
+                                                                        // which gives Host share_screen=true so it picks
+                                                                        // up the pre-acquired stream and starts encoding.
                                                                     );
                                                                     let video_constraints = js_sys::Object::new();
                                                                     let _ = js_sys::Reflect::set(
@@ -4031,33 +4122,30 @@ pub fn AttendantsComponent(
 
                                                                     // This call happens synchronously in the click handler --
                                                                     // the browser returns a Promise without rejecting.
-                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                    let promise = match media_devices
+                                                                        .get_display_media_with_constraints(&constraints)
+                                                                    {
                                                                         Ok(p) => p,
                                                                         Err(e) => {
                                                                             log::error!("getDisplayMedia failed synchronously: {e:?}");
                                                                             return;
                                                                         }
                                                                     };
-
-                                                                    // Mark as requesting immediately so the button shows disabled
                                                                     screen_share_state.set(ScreenShareState::Requesting);
-
-                                                                    // Now await the promise asynchronously -- this is fine,
-                                                                    // the gesture requirement was satisfied above.
-                                                                    let cell = stream_cell.clone();
+                                                                    let cell = stream_cell.clone(); // User cancelled or browser denied
                                                                     wasm_bindgen_futures::spawn_local(async move {
                                                                         match JsFuture::from(promise).await {
                                                                             Ok(stream) => {
-                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                let media_stream: web_sys::MediaStream = stream
+                                                                                    .unchecked_into();
                                                                                 cell.borrow_mut().replace(media_stream);
-                                                                                // StreamReady causes is_sharing() to return true,
-                                                                                // which gives Host share_screen=true so it picks
-                                                                                // up the pre-acquired stream and starts encoding.
                                                                                 screen_share_state.set(ScreenShareState::StreamReady);
                                                                             }
                                                                             Err(e) => {
-                                                                                // User cancelled or browser denied
-                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                let is_cancel = js_sys::Reflect::get(
+                                                                                        &e,
+                                                                                        &JsValue::from_str("name"),
+                                                                                    )
                                                                                     .ok()
                                                                                     .and_then(|v| v.as_string())
                                                                                     .map(|n| n == "NotAllowedError")
@@ -4213,11 +4301,14 @@ pub fn AttendantsComponent(
                                                             role: "option",
                                                             onclick: move |e: MouseEvent| {
                                                                 e.stop_propagation();
+                                                                let was_closed = !device_settings_open();
+                                                                device_settings_open.set(true);
+                                                                if was_closed {
+                                                                    device_settings_generation
+                                                                        .set(device_settings_generation() + 1);
+                                                                }
                                                                 device_settings_initial_section
                                                                     .set(Some("appearance".to_string()));
-                                                                device_settings_generation
-                                                                    .set(device_settings_generation() + 1);
-                                                                device_settings_open.set(true);
                                                                 dock_menu_open.set(false);
                                                             },
                                                             "Dock Settings\u{2026}"
@@ -4308,9 +4399,20 @@ pub fn AttendantsComponent(
                                                     let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
                                                         if hangup_is_guest {
-                                                            let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &room_token).await;
-                                                        } else if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
-                                                            log::error!("Error leaving meeting: {e}");
+                                                            let _ = crate::meeting_api::leave_meeting_as_guest(
+                                                                &meeting_id,
+                                                                &room_token,
+                                                            )
+                                                            .await;
+                                                        } else if let Err(e) =
+                                                            crate::meeting_api::leave_meeting(
+                                                                &meeting_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::error!(
+                                                                "Error leaving meeting: {e}"
+                                                            );
                                                         }
                                                         let _ = window().location().set_href("/");
                                                     });
@@ -4458,9 +4560,11 @@ pub fn AttendantsComponent(
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
                             local_user_display_name: current_display_name(),
-                            on_edit_self_name: {move |_| {
-                                display_name_modal_open.set(true);
-                            }},
+                            on_edit_self_name: {
+                                move |_| {
+                                    display_name_modal_open.set(true);
+                                }
+                            },
                         }
                     }
                 }

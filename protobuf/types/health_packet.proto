@@ -191,6 +191,42 @@ message HealthPacket {
   // reasoning server-side instead of only in client console logs. Absent when
   // the controller has not produced a snapshot yet (no peers / pre-warmup).
   optional DecodeBudget decode_budget = 68;
+
+  // Non-heap / total-process memory telemetry (#1032). `memory_used_bytes`
+  // (field 12) is JS-heap only and stays single-digit MB during the freezes we
+  // care about; the multi-GB pressure lives OUTSIDE the JS heap (WASM linear
+  // memory, decoded VideoFrame GPU buffers, canvas/GPU textures).
+  //
+  // WASM linear-memory size in bytes — WebAssembly.Memory.buffer.byteLength.
+  // Always available (sync, O(1)); distinct from the JS heap in field 12.
+  optional uint64 wasm_memory_bytes = 69;
+  // Total agent memory in bytes from performance.measureUserAgentSpecificMemory()
+  // — includes GPU-backed and worker allocations. Chrome-only and gated on
+  // crossOriginIsolated; sampled in the background and absent when the API is
+  // unavailable or has not yet resolved its first reading.
+  optional uint64 agent_memory_bytes = 70;
+
+  // Transport re-election outcome counters (dashboard audit Tier B #2/#4;
+  // discussion #562). All cumulative since the connection manager was created,
+  // re-sent every health packet (same convention as the connection-loss
+  // counters in fields 54-55). The relay's metrics_server expands these into a
+  // single labeled counter `videocall_client_reelection_total{result=...}` so
+  // Grafana can chart re-election rate AND outcome without console logs.
+  //
+  // Buckets mirror the four terminal branches of
+  // ConnectionManager::complete_election:
+  //   * proceeded:  a (re-)election switched to a new winning connection.
+  //   * aborted:    re-election ran but the winner was not meaningfully better
+  //                 (hysteresis), so the existing connection was kept.
+  //   * preserved:  all candidates failed but the old connection was still
+  //                 fresh, so it was preserved (candidate-failure path, #539).
+  //   * failed:     election failed with no usable connection
+  //                 ("Election failed: No valid connections") — the on-call
+  //                 signal for a participant who has dropped off the call.
+  optional uint64 reelection_proceeded_total = 71;
+  optional uint64 reelection_aborted_total = 72;
+  optional uint64 reelection_preserved_total = 73;
+  optional uint64 reelection_failed_total = 74;
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

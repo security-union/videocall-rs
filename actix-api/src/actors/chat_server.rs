@@ -17,9 +17,17 @@
  */
 
 use crate::{
-    constants::{RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL},
+    constants::{
+        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_SUPPRESS_DEBOUNCE_MS,
+        LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MAX_LAYER_ID,
+        LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
+        VIEWPORT_MIN_UPDATE_INTERVAL,
+    },
     messages::{
-        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        server::{
+            ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave,
+            RebroadcastPresence,
+        },
         session::Message,
     },
     models::build_subject_and_queue,
@@ -39,9 +47,13 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::metrics::{
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
     RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
 };
+use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
+use videocall_types::protos::layer_hint_packet::LayerHintPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -100,6 +112,29 @@ const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated
 /// before `leave_rooms` runs, so this event is never published.
 const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 
+/// NATS subject for chat_server -> meeting-api notifications that a room just
+/// became empty (the last present participant disconnected/left) for a meeting
+/// that did NOT end. The meeting-api consumer writes `state='idle'` to the DB
+/// (via `db_meetings::set_idle`) so the meetings list reflects "no one is
+/// currently here" without ending the meeting.
+///
+/// Fired from two sites — the normal-departure path in
+/// [`ChatServer::leave_rooms`], and the `was_active=false` branch of
+/// [`ExecutePendingDeparture`]'s handler (a never-activated session, e.g. an
+/// RTT-election loser, whose grace period expired while it was the last member).
+/// In both cases the event is emitted only when the in-memory `room_members`
+/// count for the room reaches zero — exactly once per room-becomes-empty, not
+/// once per disconnect (the actor is single-threaded, so only the departure that
+/// drains the Vec to empty observes `is_empty()`). It is deliberately NOT
+/// emitted on the host-leave-ends-meeting path, where MEETING_ENDED +
+/// [`MEETING_ENDED_BY_HOST_SUBJECT`] fire instead and `ended` (terminal) must
+/// win. A non-ending host leave (`end_on_host_leave=false`) is treated as a
+/// normal departure and DOES contribute to this transition.
+///
+/// The consumer's `set_idle` guards on `state='active'`, so an idle event that
+/// races a host-leave END is harmless in either ordering.
+const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -137,6 +172,18 @@ struct MeetingSettingsUpdatePayload {
 /// clients' view of the meeting.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MeetingEndedByHostPayload {
+    room_id: String,
+}
+
+/// Payload for [`MEETING_BECAME_EMPTY_SUBJECT`].
+///
+/// Sent from chat_server to meeting-api when the last present participant left a
+/// room whose meeting did NOT end. The meeting-api consumer looks up the meeting
+/// by `room_id` and transitions its DB row to `state='idle'` (no-op if the
+/// meeting already ended). Mirrors [`MeetingEndedByHostPayload`] — a single
+/// `room_id` field, JSON over an internal subject.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MeetingBecameEmptyPayload {
     room_id: String,
 }
 
@@ -265,6 +312,387 @@ struct ViewportState {
 /// per-packet without a round-trip back into the actor.
 type DesiredStreams = Arc<RwLock<ViewportState>>;
 
+/// Per-session simulcast layer-preference state (#989, Phase 1b): the map from
+/// source `session_id` → the simulcast layer the owning receiver wants the
+/// relay to forward for that source, plus the time of the last accepted
+/// LAYER_PREFERENCE update (used to rate-limit updates).
+///
+/// **No-op / fail-open invariant:** an empty `layers` map means "no layer
+/// signal yet" and the relay forwards every layer, behaving exactly as it did
+/// before #989. A source with no entry in `layers` is likewise forwarded
+/// unchanged. This is what makes the feature DARK on an empty map: with no
+/// recorded preference the forwarding path is byte-identical to today.
+#[derive(Default)]
+struct LayerPrefsState {
+    /// Map of `(source session_id, media_kind)` → desired simulcast layer.
+    /// Empty / absent = fail-open (forward all layers). The `media_kind` is the
+    /// normalized wire discriminant (see [`normalize_pref_media_kind`]):
+    /// VIDEO(1) / AUDIO(2) / SCREEN(3). Keying by media kind (issue #989,
+    /// Phase 3) lets a receiver request, e.g., a low SCREEN layer while keeping
+    /// full camera VIDEO from the SAME source independently.
+    layers: HashMap<(u64, i32), u32>,
+    /// Instant of the last accepted LAYER_PREFERENCE update, for rate-limiting.
+    /// `None` until the first accepted update.
+    last_update: Option<std::time::Instant>,
+}
+
+/// Normalize a `LayerPreferencePacket.Entry.media_kind` (or a wire
+/// `PacketWrapper.media_kind`) into the canonical layer-preference key
+/// discriminant (issue #989, Phase 3).
+///
+/// Both enums share the same numbering (`UNSPECIFIED=0, VIDEO=1, AUDIO=2,
+/// SCREEN=3`). BACK-COMPAT: `0` (UNSPECIFIED) maps to VIDEO(1) — pre-Phase-3
+/// clients omit the field, and before Phase 3 the relay only filtered VIDEO, so
+/// an absent media_kind is exactly "this preference is about camera video".
+/// Anything outside `{1,2,3}` also collapses to VIDEO(1) (defensive; the relay
+/// only ever filters those three kinds).
+fn normalize_pref_media_kind(raw: i32) -> i32 {
+    match raw {
+        2 => 2, // AUDIO
+        3 => 3, // SCREEN
+        _ => 1, // VIDEO (covers UNSPECIFIED=0, VIDEO=1, and any unknown)
+    }
+}
+
+/// Per-session layer-preference state, shared between the session's NATS
+/// subscription task and [`ChatServer`].
+///
+/// Read on the hot forwarding path (after the viewport filter) to drop
+/// simulcast VIDEO layers the receiver did not select, and written by the same
+/// session's NATS loop when a fresh LAYER_PREFERENCE packet arrives. Uses an
+/// `Arc<RwLock<..>>` for the same reason as [`DesiredStreams`]: the spawned
+/// per-session subscription task can read it per-packet without re-entering the
+/// actor.
+///
+/// In addition to the lock, it carries a lock-free `non_empty` hint (an
+/// `AtomicBool`) updated by the writer. The forwarding hot path checks this
+/// FIRST so that — during the common interim where publishers have started
+/// stamping simulcast layer ids but no receiver has sent a LAYER_PREFERENCE yet
+/// — every non-zero-layer VIDEO packet short-circuits WITHOUT taking the read
+/// lock. This keeps the no-preference path lock-free (the no-op-first posture).
+/// The hint is intentionally a HINT, not authoritative: it is only ever set
+/// from `false`→`true` (a recorded map is never auto-emptied), so a spurious
+/// `true` merely costs one read-lock that finds no matching entry and fails
+/// open — never an incorrect drop.
+#[derive(Clone)]
+struct LayerPrefs {
+    state: Arc<RwLock<LayerPrefsState>>,
+    /// Lock-free fast-path hint: `true` once at least one layer preference has
+    /// been recorded for this session. See the type doc for why this is safe
+    /// to consult outside the lock.
+    non_empty: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for LayerPrefs {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(LayerPrefsState::default())),
+            non_empty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl LayerPrefs {
+    /// Cheap, lock-free check used to short-circuit the forwarding hot path.
+    /// `false` guarantees the map is empty (no preference recorded yet) → the
+    /// caller forwards without taking the read lock.
+    fn has_any(&self) -> bool {
+        self.non_empty.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// ===========================================================================
+// Publish-side layer suppression (#1108, Stage 3 — LAYER_HINT)
+// ===========================================================================
+
+/// Fail-open sentinel for the per-source layer union: "some receiver wants the
+/// FULL ladder for this (source, kind), so suppress nothing".
+///
+/// A receiver that has NO recorded preference for a `(source, kind)` is treated
+/// as wanting everything (this is the LAYER_PREFERENCE fail-open contract: no
+/// entry = forward all layers). It therefore contributes this value to the
+/// union, and because the union is a MAX, the presence of even one such receiver
+/// pins the union here — i.e. the relay suppresses a layer only when EVERY
+/// receiver explicitly asked for less. `u32::MAX` is well above any real layer
+/// id, so when the publisher clamps the emitted hint against its own ladder this
+/// resolves to "encode the full ladder". A poisoned prefs lock also collapses to
+/// this value (fail-open), mirroring the forwarding filter's `unwrap_or`.
+const LAYER_HINT_FULL_LADDER_SENTINEL: u32 = u32::MAX;
+
+/// The media kinds the relay computes a layer union for, as the normalized
+/// preference-map discriminants (VIDEO=1, AUDIO=2, SCREEN=3 — see
+/// [`normalize_pref_media_kind`]). A publisher produces at most one ladder per
+/// kind, so a hint carries at most one [`LayerHintEntry`] per element here.
+const LAYER_HINT_MEDIA_KINDS: [i32; 3] = [1, 2, 3];
+
+/// Map a normalized preference-map media-kind discriminant (1/2/3) onto the
+/// `LayerHintPacket.MediaKind` wire enum used when emitting a hint. Anything
+/// outside `{1,2,3}` maps to UNSPECIFIED(0) (never produced on the happy path —
+/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1/2/3).
+fn layer_hint_media_kind(
+    kind: i32,
+) -> videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind {
+    use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind;
+    match kind {
+        1 => MediaKind::VIDEO,
+        2 => MediaKind::AUDIO,
+        3 => MediaKind::SCREEN,
+        _ => MediaKind::MEDIA_KIND_UNSPECIFIED,
+    }
+}
+
+/// Actor message asking the [`ChatServer`] to recompute per-source layer unions
+/// and emit LAYER_HINT packets where the publisher's encode set should change
+/// (#1108, Stage 3).
+///
+/// This MUST run in the actor: the per-source union is an INVERTED query over
+/// the receiver-keyed `session_layer_prefs` map, and only the actor can see
+/// across all receivers (each per-session NATS task holds just its own one prefs
+/// `Arc`). The interceptors / teardown paths therefore `do_send` this message
+/// rather than computing the union themselves.
+///
+/// * `source = Some(s)`: recompute ONLY source `s` (used when a single
+///   receiver's preference for `s` changed).
+/// * `source = None`: recompute EVERY current publisher in `room` (used on
+///   receiver join / leave, which can shift many sources' fail-open unions at
+///   once).
+///
+/// SECURITY: this message is constructed ONLY by trusted, subject-authoritative
+/// relay paths (the LAYER_PREFERENCE interceptor after it has recorded an update
+/// on the receiver's OWN subject, and the join/leave lifecycle). There is NO
+/// path that constructs it from an inbound, client-sent LAYER_HINT — the relay
+/// never ingests LAYER_HINT at all.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RecomputeLayerHints {
+    room: String,
+    source: Option<SessionId>,
+}
+
+/// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
+///
+/// Tracks what the relay last TOLD a publisher and, when the union has dropped
+/// below that, when the downgrade was first observed (so the suppress-lazy
+/// window can be honored even without further preference changes — a deferred
+/// `notify_later` re-check drives the eventual emit).
+#[derive(Clone, Copy, Debug)]
+struct LayerHintEmitState {
+    /// The `max_requested_layer` value most recently EMITTED to the publisher
+    /// for this `(room, source, kind)`. Initialized to the full-ladder sentinel
+    /// the first time a key is seen, so the publisher's assumed starting state is
+    /// "encoding everything" (matching the fail-open default before any hint).
+    last_emitted: u32,
+    /// When a union STRICTLY below `last_emitted` was first observed. `None` when
+    /// the current union is `>= last_emitted` (no pending downgrade). Used to
+    /// enforce [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`] before emitting the lower hint.
+    pending_lower_since: Option<std::time::Instant>,
+}
+
+/// The outcome of [`decide_layer_hint`]: what the actor should do for one
+/// `(room, source, kind)` given the freshly computed union.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerHintDecision {
+    /// Emit a hint now. `direction` labels the metric (`"suppress"` for a lower
+    /// union, `"restore"` for a higher one). `value` is the union to send.
+    Emit {
+        value: u32,
+        direction: LayerHintDirection,
+    },
+    /// Do nothing now, but a lower union is pending; re-check after the debounce
+    /// window elapses (the `Instant` is the deadline to schedule `notify_later`
+    /// for). Returned the FIRST time a downgrade is observed.
+    ScheduleRecheck { deadline: std::time::Instant },
+    /// Do nothing, and the union is NOT below what was last emitted — so any
+    /// previously-pending downgrade must be CLEARED. Returned when the union is
+    /// unchanged (`== last_emitted`): a downgrade that was counting down has been
+    /// cancelled by demand returning, and a future downgrade must start a FRESH
+    /// debounce window rather than inheriting the stale `pending_lower_since`.
+    SkipClearPending,
+    /// Do nothing, and a downgrade is still pending within its window — KEEP the
+    /// pending timestamp so the scheduled re-check continues counting down toward
+    /// the original deadline.
+    SkipKeepPending,
+}
+
+/// Direction of an emitted LAYER_HINT, used only for the metric label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerHintDirection {
+    /// Lower union than last emitted — publisher may drop an upper layer.
+    Suppress,
+    /// Higher union than last emitted — publisher should restore a layer.
+    Restore,
+}
+
+impl LayerHintDirection {
+    fn as_label(self) -> &'static str {
+        match self {
+            LayerHintDirection::Suppress => "suppress",
+            LayerHintDirection::Restore => "restore",
+        }
+    }
+}
+
+/// Pure debounce decision for one `(room, source, kind)` (#1108, Stage 3).
+///
+/// Given the previous emit state (`None` = never emitted; assumed full-ladder),
+/// the freshly computed `union`, the current time `now`, and the debounce
+/// `window`, decide whether to emit, schedule a deferred re-check, or skip.
+///
+/// Policy:
+/// * `union > last_emitted` → **restore-eager**: emit immediately (clears any
+///   pending downgrade via the fresh emit state).
+/// * `union == last_emitted` → **change-detect**: skip, and CLEAR any pending
+///   downgrade (`SkipClearPending`) — demand returned to the emitted level, so a
+///   later drop must start a fresh debounce window, not inherit a stale one.
+/// * `union < last_emitted` → **suppress-lazy**:
+///     * first observation (no pending timestamp) → schedule a re-check at
+///       `now + window`; do not emit yet.
+///     * pending and `now - pending_since >= window` → emit (the lower union has
+///       been stable for the whole window).
+///     * pending and still within the window → `SkipKeepPending` (keep waiting;
+///       the scheduled re-check re-evaluates the *then-current* union).
+///
+/// The split Skip variants exist so the caller can correctly reconcile
+/// `pending_lower_since`: WITHOUT clearing it on the `==` path, a downgrade that
+/// was cancelled by restored demand would leave a stale timestamp, letting a much
+/// later downgrade bypass its debounce window (emit a suppress immediately).
+///
+/// Extracted as a free function (no `&self`, no NATS) so it is unit-testable in
+/// isolation with synthetic `Instant`s, mirroring the pure-resolver pattern used
+/// for the channel-capacity constant.
+fn decide_layer_hint(
+    prev: Option<LayerHintEmitState>,
+    union: u32,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> LayerHintDecision {
+    let last_emitted = prev
+        .map(|s| s.last_emitted)
+        .unwrap_or(LAYER_HINT_FULL_LADDER_SENTINEL);
+
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match union.cmp(&last_emitted) {
+        Greater => LayerHintDecision::Emit {
+            value: union,
+            direction: LayerHintDirection::Restore,
+        },
+        // Union back at the emitted level: cancel any pending downgrade.
+        Equal => LayerHintDecision::SkipClearPending,
+        Less => match prev.and_then(|s| s.pending_lower_since) {
+            // Already counting down: emit once the window has fully elapsed.
+            Some(since) if now.duration_since(since) >= window => LayerHintDecision::Emit {
+                value: union,
+                direction: LayerHintDirection::Suppress,
+            },
+            // Still within the window — keep counting toward the original deadline.
+            Some(_) => LayerHintDecision::SkipKeepPending,
+            // First time we see a downgrade — start the timer.
+            None => LayerHintDecision::ScheduleRecheck {
+                deadline: now + window,
+            },
+        },
+    }
+}
+
+/// Compute the set of SOURCE session ids whose desired layer changed between an
+/// old and a new per-receiver preference map (#1108, Stage 3).
+///
+/// A source is "changed" if, for ANY media kind, `old.get((source, kind))`
+/// differs from `new.get((source, kind))` — this includes entries that were
+/// ADDED (no old value), REMOVED (no new value; the source reverts to fail-open
+/// full ladder, which can raise its union), or had their value altered. Used by
+/// the LAYER_PREFERENCE interceptor to trigger a per-source layer-hint recompute
+/// only for the sources that actually moved, instead of the whole room.
+///
+/// Returned as a deduplicated `Vec` (source ids are unique). Pure / no `&self`
+/// so it is unit-testable in isolation.
+fn changed_pref_sources(
+    old: &HashMap<(u64, i32), u32>,
+    new: &HashMap<(u64, i32), u32>,
+) -> Vec<SessionId> {
+    let mut changed: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+    // Any (source, kind) present in old whose new value differs.
+    for (&(src, kind), &old_val) in old.iter() {
+        if new.get(&(src, kind)).copied() != Some(old_val) {
+            changed.insert(src);
+        }
+    }
+    // Any (source, kind) present in new whose old value differs (catches ADDED
+    // entries the first loop could not see).
+    for (&(src, kind), &new_val) in new.iter() {
+        if old.get(&(src, kind)).copied() != Some(new_val) {
+            changed.insert(src);
+        }
+    }
+    changed.into_iter().collect()
+}
+
+/// Pure per-source union computation for one `(source, media_kind)` (#1108).
+///
+/// Enumerates every receiver in `members` (capped at
+/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] for DoS bounding), reads each receiver's
+/// recorded preference for `(source, kind)` from `prefs`, and returns the MAX
+/// (the union). FAIL-OPEN throughout:
+/// * A receiver with NO recorded entry for `(source, kind)` contributes the
+///   full-ladder sentinel ([`LAYER_HINT_FULL_LADDER_SENTINEL`]).
+/// * A receiver whose prefs `RwLock` is POISONED also contributes the sentinel
+///   (mirrors the forwarding filter's `unwrap_or` fail-open at the layer drop
+///   site).
+/// * Receivers beyond the scan cap are not inspected and are implicitly treated
+///   as wanting the full ladder (truncation can only ever suppress LESS).
+///
+/// The source itself is skipped (a publisher is not its own receiver). The
+/// result is the RAW max-requested-layer id: the relay is layer-count-agnostic
+/// (see the "AVAILABILITY NOT VALIDATED" note on the forwarding path) and never
+/// learns the source's real ladder depth, so the publisher clamps this against
+/// its own ladder.
+///
+/// Free function (takes the maps by reference, no `&self`) so it is unit-testable
+/// without constructing a NATS-backed actor.
+fn compute_max_requested_layer(
+    members: &[SessionId],
+    prefs: &HashMap<SessionId, LayerPrefs>,
+    source: SessionId,
+    kind: i32,
+) -> u32 {
+    let mut union: u32 = 0;
+    let mut scanned: usize = 0;
+    for &receiver in members {
+        // A publisher is not a receiver of itself.
+        if receiver == source {
+            continue;
+        }
+        if scanned >= LAYER_HINT_MAX_RECEIVERS_SCANNED {
+            // DoS bound: anything past the cap is treated as fail-open (wants
+            // the full ladder), so pin the union to the sentinel and stop.
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        }
+        scanned += 1;
+
+        let contribution = match prefs.get(&receiver) {
+            // No prefs map for this receiver at all = fail-open (full ladder).
+            None => LAYER_HINT_FULL_LADDER_SENTINEL,
+            Some(p) => match p.state.read() {
+                Ok(guard) => guard
+                    .layers
+                    .get(&(source, kind))
+                    .copied()
+                    // No recorded preference for this (source, kind) = fail-open.
+                    .unwrap_or(LAYER_HINT_FULL_LADDER_SENTINEL),
+                // Poisoned lock = fail-open (mirror the forward filter).
+                Err(_) => LAYER_HINT_FULL_LADDER_SENTINEL,
+            },
+        };
+
+        union = union.max(contribution);
+        // Once the union hits the sentinel it can never decrease — short-circuit.
+        if union == LAYER_HINT_FULL_LADDER_SENTINEL {
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        }
+    }
+    union
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -329,6 +757,36 @@ pub struct ChatServer {
     /// exists purely to own the shared handle and bound its lifetime (entries
     /// are removed on `leave_rooms`/`forget_session`), not as a read source.
     session_desired_streams: HashMap<SessionId, DesiredStreams>,
+    /// Per-session simulcast layer preferences (#989, Phase 1b).
+    ///
+    /// Maps a receiver `SessionId` to its [`LayerPrefs`] (source `session_id` →
+    /// desired simulcast layer). Populated from LAYER_PREFERENCE control packets
+    /// and read on the forwarding path — AFTER the viewport filter — to drop
+    /// simulcast VIDEO layers the receiver did not select. The
+    /// `Arc<RwLock<..>>` value is shared with the session's NATS task so the
+    /// task can read/update it without re-entering the actor.
+    ///
+    /// Absent or empty = fail-open (forward all layers). Like
+    /// `session_desired_streams` this is a **subtract-only** filter layered
+    /// AFTER JWT/observer authorization; it never grants access. The actor never
+    /// *reads* this map; the map exists purely to own the shared handle and
+    /// bound its lifetime (entries are removed on `leave_rooms`/`forget_session`).
+    session_layer_prefs: HashMap<SessionId, LayerPrefs>,
+    /// Reverse index: `SessionId` → `room_id`. Enables O(1) room lookup in
+    /// paths like `RebroadcastPresence` instead of scanning all rooms.
+    /// Populated for non-observer sessions at JoinRoom; removed at
+    /// `leave_rooms` / `forget_session`.
+    session_room: HashMap<SessionId, String>,
+    /// Per-`(room, source session, media_kind)` LAYER_HINT emit/debounce state
+    /// (#1108, Stage 3 — publish-side layer suppression).
+    ///
+    /// Records what `max_requested_layer` the relay last EMITTED to each
+    /// publisher, plus the pending-downgrade timestamp that powers the
+    /// suppress-lazy debounce ([`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]). Consulted
+    /// and updated only inside [`Handler<RecomputeLayerHints>`] (actor-owned, no
+    /// lock needed). Entries are reaped when the publisher leaves (its
+    /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
+    layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
 }
 
 impl ChatServer {
@@ -347,10 +805,13 @@ impl ChatServer {
             session_instance: HashMap::new(),
             session_is_guest: HashMap::new(),
             session_desired_streams: HashMap::new(),
+            session_layer_prefs: HashMap::new(),
+            session_room: HashMap::new(),
+            layer_hint_state: HashMap::new(),
         }
     }
 
-    pub fn leave_rooms(&mut self, ctx: LeaveContext<'_>) {
+    pub fn leave_rooms(&mut self, leave_ctx: LeaveContext<'_>, actor_ctx: &mut Context<Self>) {
         let LeaveContext {
             session_id,
             room,
@@ -359,7 +820,7 @@ impl ChatServer {
             observer,
             is_host,
             end_on_host_leave,
-        } = ctx;
+        } = leave_ctx;
         // Remove the subscription task if it exists
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
@@ -369,6 +830,10 @@ impl ChatServer {
         // cleanup in `forget_session`; both teardown paths must release this
         // so the map cannot leak entries for departed sessions.
         let _ = self.session_desired_streams.remove(session_id);
+
+        // Drop the per-session layer-preference map (#989, Phase 1b). Same
+        // teardown invariant as the viewport set above.
+        let _ = self.session_layer_prefs.remove(session_id);
 
         // Clean up instance_index via reverse map: O(1) instead of O(n) retain.
         // If the entry was already replaced by a newer session (eviction), the
@@ -409,11 +874,47 @@ impl ChatServer {
         // have been seeded by a `MEETING_SETTINGS_UPDATE_SUBJECT` event
         // before the first JoinRoom, and a stale `Leave` / `Disconnect` for
         // that room must not wipe the legitimately-cached policy.
+        self.session_room.remove(session_id);
+
+        // Track whether THIS removal drained the room to empty. We read the
+        // count from `room_members` — the in-memory, actor-synchronous presence
+        // map — which is the same authoritative source the host-leave→end path
+        // uses. Because the chat_server actor processes one message at a time,
+        // exactly one `leave_rooms` call can observe the Vec transition from
+        // non-empty to empty: during a mass-disconnect (reconnection wave) the
+        // N departures are serialized, and only the last one sees
+        // `members.is_empty()`. This is what makes the empty→idle NATS event
+        // fire ONCE per room-becomes-empty rather than once per disconnect, so
+        // there is no O(n) NATS storm.
+        let mut room_became_empty = false;
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
+                room_became_empty = members.is_empty();
             }
             self.forget_room_if_empty(room_id);
+
+            // Publish-side suppression teardown + restore (#1108, Stage 3).
+            // The departing session may have been BOTH a publisher (a source
+            // with its own debounce state) AND a constraining receiver (its
+            // recorded preference held some other publisher's union DOWN).
+            //   1. Reap the departing session's own per-source hint state so the
+            //      `layer_hint_state` map cannot leak entries for a left source.
+            //   2. If the room still has members, recompute room-wide: with this
+            //      receiver gone its constraint disappears, so a publisher whose
+            //      remaining receivers all now (or already) want the full ladder
+            //      must get a RESTORE-eager hint. We message the actor rather
+            //      than recomputing inline to avoid borrowing `room_members`
+            //      while the recompute mutates `layer_hint_state`. This is
+            //      already excluded from the union scan above (the member was
+            //      retained-out), so the recompute sees post-departure demand.
+            self.forget_layer_hint_state_for_source(room_id, *session_id);
+            if !room_became_empty {
+                actor_ctx.address().do_send(RecomputeLayerHints {
+                    room: room_id.to_string(),
+                    source: None,
+                });
+            }
         }
 
         // End session using SessionManager
@@ -568,6 +1069,53 @@ impl ChatServer {
                             error!("Error ending session for room {}: {}", room_id, e);
                         }
                     }
+
+                    // Presence-driven empty→idle transition (everyone left a
+                    // meeting that did NOT end). We only reach here on the
+                    // normal-departure path — NOT the host-leave-ends-meeting
+                    // path above, where END must win and emitting an idle event
+                    // would be wrong. A non-ending host leave
+                    // (`end_on_host_leave=false`) flows through here too and is
+                    // treated as a normal departure that contributes to the
+                    // empty→idle transition, exactly as required.
+                    //
+                    // `room_became_empty` was computed synchronously in the
+                    // actor BEFORE this spawn, from the `room_members` count
+                    // reaching zero, so this publishes ONCE per
+                    // room-becomes-empty (not once per disconnect). meeting-api
+                    // resolves room_id->meeting and calls `set_idle`, which
+                    // no-ops on an already-ended meeting — so even if a stray
+                    // END races this idle event, ended (terminal) still wins.
+                    //
+                    // Multi-replica note: `room_members` is per-replica, the
+                    // same assumption the host-leave→end detection already
+                    // makes. "Empty" here means "empty on this replica". We do
+                    // not introduce a stronger cross-replica guarantee than the
+                    // existing host-leave path has.
+                    if room_became_empty {
+                        info!(
+                            "Room {} became empty after {} left - notifying meeting-api (empty->idle)",
+                            room_id, user_id
+                        );
+                        let payload = MeetingBecameEmptyPayload {
+                            room_id: room_id.clone(),
+                        };
+                        match serde_json::to_vec(&payload) {
+                            Ok(json) => {
+                                if let Err(e) =
+                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
+                                {
+                                    error!(
+                                        "Failed to publish {} for room {}: {}",
+                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -676,6 +1224,7 @@ impl ChatServer {
         // so the lookup still finds this session's instance_id.
         let instance_key = self.pending_departure_instance_key(session_id);
 
+        let mut room_still_populated = false;
         if let Some(members) = self.room_members.get_mut(room) {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
@@ -684,6 +1233,8 @@ impl ChatServer {
                 // set-size gauge series so the eviction teardown path also
                 // cannot leak a stale series for a drained room (HCL #988).
                 let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+            } else {
+                room_still_populated = true;
             }
         }
 
@@ -696,6 +1247,27 @@ impl ChatServer {
         let _ = self.suppress_join_broadcast.remove(&session_id);
         let _ = self.session_is_guest.remove(&session_id);
         let _ = self.session_desired_streams.remove(&session_id);
+        // Drop the per-session layer-preference map (#989, Phase 1b). Mirrors
+        // the `leave_rooms` cleanup; both teardown paths must release it.
+        let _ = self.session_layer_prefs.remove(&session_id);
+        let _ = self.session_room.remove(&session_id);
+
+        // Publish-side suppression teardown + restore (#1108, Stage 3) — the
+        // eviction analog of the `leave_rooms` trigger. An evicted session may
+        // have been a publisher (reap its own per-source hint state) and/or a
+        // constraining receiver (its departure can RAISE a remaining publisher's
+        // union → restore-eager). Recompute room-wide via the actor only while
+        // the room still has members. NOTE: in the common reconnection case the
+        // replacement session re-joins under a fresh session_id and re-sends its
+        // LAYER_PREFERENCE, which independently re-triggers a recompute; this
+        // path additionally covers a pure eviction with no replacement.
+        self.forget_layer_hint_state_for_source(room, session_id);
+        if room_still_populated {
+            ctx.address().do_send(RecomputeLayerHints {
+                room: room.to_string(),
+                source: None,
+            });
+        }
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
         // evict them while a departure is pending, we want the new session to
@@ -732,6 +1304,231 @@ impl ChatServer {
             Some(iid) => iid.clone(),
             None => format!("__session__:{session}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish-side layer suppression (#1108, Stage 3 — LAYER_HINT)
+    // -----------------------------------------------------------------------
+
+    /// Compute the per-source layer UNION for one `(source, media_kind)` over
+    /// every receiver currently in `room` (#1108, Stage 3).
+    ///
+    /// Thin `&self` wrapper that resolves the room's member session ids and
+    /// delegates the actual (pure, fail-open, DoS-bounded) max computation to
+    /// [`compute_max_requested_layer`]. Returns the full-ladder sentinel when the
+    /// room is unknown (fail-open: nothing to suppress).
+    fn max_requested_layer(&self, room: &str, source: SessionId, kind: i32) -> u32 {
+        let Some(members) = self.room_members.get(room) else {
+            // Unknown room → no actionable union; fail-open.
+            return LAYER_HINT_FULL_LADDER_SENTINEL;
+        };
+        let receiver_ids: Vec<SessionId> = members.iter().map(|m| m.session).collect();
+        compute_max_requested_layer(&receiver_ids, &self.session_layer_prefs, source, kind)
+    }
+
+    /// Recompute the layer union for a SINGLE source across all media kinds and
+    /// emit / schedule / skip a LAYER_HINT per the debounce policy (#1108).
+    ///
+    /// Collects every kind whose debounce decision is `Emit` into a single
+    /// `LayerHintPacket` and publishes it once to the publisher's self-subject.
+    /// Kinds that need the suppress-lazy window cause one deferred
+    /// `notify_later` re-check to be scheduled (idempotent — the re-check simply
+    /// recomputes the then-current union).
+    fn recompute_layer_hints_for_source(
+        &mut self,
+        room: &str,
+        source: SessionId,
+        ctx: &mut Context<Self>,
+    ) {
+        // Only emit hints for a source that is an actual current publisher in the
+        // room. If it has already left (no member row), there is nothing to hint
+        // and its debounce state was/will be reaped by the teardown path.
+        let is_member = self
+            .room_members
+            .get(room)
+            .is_some_and(|members| members.iter().any(|m| m.session == source));
+        if !is_member {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+
+        let mut entries: Vec<LayerHintEntry> = Vec::new();
+        let mut emit_directions: Vec<LayerHintDirection> = Vec::new();
+        let mut schedule_recheck = false;
+
+        for &kind in LAYER_HINT_MEDIA_KINDS.iter() {
+            let union = self.max_requested_layer(room, source, kind);
+            let key = (room.to_string(), source, kind);
+            let prev = self.layer_hint_state.get(&key).copied();
+
+            match decide_layer_hint(prev, union, now, window) {
+                LayerHintDecision::Emit { value, direction } => {
+                    // Record the emission: clear any pending downgrade and store
+                    // the value we are about to tell the publisher.
+                    self.layer_hint_state.insert(
+                        key,
+                        LayerHintEmitState {
+                            last_emitted: value,
+                            pending_lower_since: None,
+                        },
+                    );
+                    let mut entry = LayerHintEntry::new();
+                    entry.media_kind = layer_hint_media_kind(kind).into();
+                    entry.max_requested_layer = value;
+                    entries.push(entry);
+                    emit_directions.push(direction);
+                }
+                LayerHintDecision::ScheduleRecheck { .. } => {
+                    // Mark the pending downgrade so the (eventual) re-check knows
+                    // the window is already counting, and arrange exactly one
+                    // deferred recompute for this source.
+                    let entry = self
+                        .layer_hint_state
+                        .entry(key)
+                        .or_insert(LayerHintEmitState {
+                            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+                            pending_lower_since: None,
+                        });
+                    if entry.pending_lower_since.is_none() {
+                        entry.pending_lower_since = Some(now);
+                        schedule_recheck = true;
+                    }
+                }
+                LayerHintDecision::SkipClearPending => {
+                    // Demand returned to the last-emitted level: cancel a pending
+                    // downgrade so a future drop starts a fresh debounce window
+                    // (otherwise a stale `pending_lower_since` would let a much
+                    // later drop bypass the suppress-lazy delay).
+                    if let Some(state) = self.layer_hint_state.get_mut(&key) {
+                        state.pending_lower_since = None;
+                    }
+                }
+                LayerHintDecision::SkipKeepPending => {
+                    // Still counting down toward the original deadline — leave the
+                    // pending timestamp untouched.
+                }
+            }
+        }
+
+        if !entries.is_empty() {
+            self.emit_layer_hint(room, source, entries, &emit_directions);
+        }
+
+        if schedule_recheck {
+            // Deferred suppress-lazy re-check: re-evaluate this source's unions
+            // after the debounce window. Re-running is safe/idempotent — the
+            // decision is a pure function of persisted state + the then-current
+            // union, so a flapping receiver that has since restored demand simply
+            // yields a skip (or an eager restore) at the deadline instead of the
+            // suppress.
+            ctx.notify_later(
+                RecomputeLayerHints {
+                    room: room.to_string(),
+                    source: Some(source),
+                },
+                window,
+            );
+        }
+    }
+
+    /// Build a `LayerHintPacket` from `entries`, wrap it in a relay-authored
+    /// `PacketWrapper { packet_type: LAYER_HINT, .. }`, and publish it to the
+    /// publisher's OWN per-session NATS subject `room.{room}.{publisher}` — the
+    /// same self-subject delivery the CONGESTION self-packet uses (#1108).
+    ///
+    /// `directions` is parallel to `entries` and used only to attribute each
+    /// emission on the `relay_layer_hint_emitted_total` metric.
+    fn emit_layer_hint(
+        &self,
+        room: &str,
+        publisher: SessionId,
+        entries: Vec<LayerHintEntry>,
+        directions: &[LayerHintDirection],
+    ) {
+        // Resolve the publisher's user_id from room_members for the wrapper's
+        // `user_id` field (cosmetic / consistency with other self-packets; the
+        // delivery subject is what scopes the hint). Empty if unknown.
+        let user_id = self
+            .room_members
+            .get(room)
+            .and_then(|members| members.iter().find(|m| m.session == publisher))
+            .map(|m| m.user_id.clone())
+            .unwrap_or_default();
+
+        let mut inner = LayerHintPacket::new();
+        inner.entries = entries;
+
+        let data = match inner.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Failed to serialize LayerHintPacket for publisher {} in room {}: {}",
+                    publisher, room, e
+                );
+                return;
+            }
+        };
+
+        let mut wrapper = PacketWrapper::new();
+        wrapper.packet_type = PacketType::LAYER_HINT.into();
+        wrapper.session_id = publisher;
+        wrapper.user_id = user_id.into_bytes();
+        wrapper.data = data;
+
+        let bytes = match wrapper.write_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Failed to serialize LAYER_HINT PacketWrapper for publisher {} in room {}: {}",
+                    publisher, room, e
+                );
+                return;
+            }
+        };
+
+        // The publisher's own self-subject, sanitized identically to every other
+        // room subject (room ids match `^[a-zA-Z0-9_-]*$`, the session is a
+        // u64). This is exactly the subject the publisher subscribes to and the
+        // same one the server's CONGESTION/system self-packets are published on.
+        let subject = format!("room.{room}.{publisher}").replace(' ', "_");
+
+        // Account every emitted entry by its direction BEFORE the async publish
+        // so the metric reflects the decision even if the publish later fails.
+        let room_label = room.to_string();
+        for dir in directions {
+            RELAY_LAYER_HINT_EMITTED_TOTAL
+                .with_label_values(&[&room_label, dir.as_label()])
+                .inc();
+        }
+
+        debug!(
+            "Emitting LAYER_HINT to publisher {} in room {} on {} ({} entr{})",
+            publisher,
+            room,
+            subject,
+            directions.len(),
+            if directions.len() == 1 { "y" } else { "ies" }
+        );
+
+        let nc = self.nats_connection.clone();
+        tokio::spawn(async move {
+            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                warn!(
+                    "Failed to publish LAYER_HINT for publisher {} in room {}: {}",
+                    publisher, room_label, e
+                );
+            }
+        });
+    }
+
+    /// Drop all LAYER_HINT debounce state for a departed publisher `source` in
+    /// `room` (#1108). Called from the teardown paths so the
+    /// `layer_hint_state` map cannot leak entries for sessions that have left.
+    fn forget_layer_hint_state_for_source(&mut self, room: &str, source: SessionId) {
+        self.layer_hint_state
+            .retain(|(r, s, _kind), _| !(r == room && *s == source));
     }
 }
 
@@ -880,15 +1677,18 @@ impl Handler<Disconnect> for ChatServer {
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
         if observer {
-            self.leave_rooms(LeaveContext {
-                session_id: &session,
-                room: Some(&room),
-                user_id: Some(&user_id),
-                display_name: Some(&display_name),
-                observer: true,
-                is_host: false,
-                end_on_host_leave: true,
-            });
+            self.leave_rooms(
+                LeaveContext {
+                    session_id: &session,
+                    room: Some(&room),
+                    user_id: Some(&user_id),
+                    display_name: Some(&display_name),
+                    observer: true,
+                    is_host: false,
+                    end_on_host_leave: true,
+                },
+                ctx,
+            );
             return;
         }
 
@@ -980,7 +1780,7 @@ impl Handler<Leave> for ChatServer {
             room,
             user_id,
         }: Leave,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
         // Cancel any pending departure for THIS session's tab / client
         // instance (`(room, instance_key)`) to avoid a duplicate
@@ -1017,15 +1817,18 @@ impl Handler<Leave> for ChatServer {
             .unwrap_or((false, true, None));
 
         // Leave is always a real participant, never an observer.
-        self.leave_rooms(LeaveContext {
-            session_id: &session,
-            room: Some(&room),
-            user_id: Some(&user_id),
-            display_name: display_name.as_deref(),
-            observer: false,
-            is_host,
-            end_on_host_leave,
-        });
+        self.leave_rooms(
+            LeaveContext {
+                session_id: &session,
+                room: Some(&room),
+                user_id: Some(&user_id),
+                display_name: display_name.as_deref(),
+                observer: false,
+                is_host,
+                end_on_host_leave,
+            },
+            ctx,
+        );
     }
 }
 
@@ -1054,30 +1857,53 @@ impl Handler<ActivateConnection> for ChatServer {
             true
         };
 
+        // Resolve this session's (room, user_id) ONCE via the O(1) `session_room`
+        // reverse index over every room's members.
+        // Shared by the local same-instance eviction and the cross-server
+        // eviction broadcast below; only the elected (activating) connection
+        // needs it.
+        let room_user: Option<(String, String)> = if was_testing {
+            self.session_room.get(&session).and_then(|room_id| {
+                self.room_members.get(room_id).and_then(|members| {
+                    members
+                        .iter()
+                        .find(|m| m.session == session)
+                        .map(|m| (room_id.clone(), m.user_id.clone()))
+                })
+            })
+        } else {
+            None
+        };
+
+        // --- Local same-instance eviction ---
+        // Now that this session is elected (Testing → Active), evict any
+        // same-instance sibling that is still in room_members. This is the
+        // losing RTT-election candidate (WS or WT) whose JoinRoom ran BEFORE
+        // ours and whose entry is now stale.
+        if was_testing {
+            if let Some(iid) = self.session_instance.get(&session).cloned() {
+                if let Some((room_id, user_id)) = &room_user {
+                    let evicted = self.evict_stale_session(&iid, room_id, user_id, session, ctx);
+                    if evicted {
+                        self.suppress_join_broadcast.insert(session);
+                    }
+                }
+                // Claim the forward mapping now that we are the elected winner.
+                self.instance_index.insert(iid, session);
+            }
+        }
+
         // --- Cross-server eviction broadcast ---
         // Deferred from JoinRoom to here so that only the elected connection
         // (the winner of RTT election) publishes. Testing connections that
         // lose the election never trigger a NATS eviction message.
         if was_testing {
             if let Some(iid) = self.session_instance.get(&session).cloned() {
-                // Look up room and user_id from room_members.
-                let mut room_user: Option<(String, String)> = None;
-                for (room_id, members) in &self.room_members {
-                    for m in members {
-                        if m.session == session {
-                            room_user = Some((room_id.clone(), m.user_id.clone()));
-                            break;
-                        }
-                    }
-                    if room_user.is_some() {
-                        break;
-                    }
-                }
-                if let Some((room_id, user_id)) = room_user {
+                if let Some((room_id, user_id)) = &room_user {
                     let payload = EvictInstancePayload {
                         instance_id: iid,
-                        room: room_id,
-                        user_id,
+                        room: room_id.clone(),
+                        user_id: user_id.clone(),
                         new_session_id: session,
                     };
                     match serde_json::to_vec(&payload) {
@@ -1163,6 +1989,68 @@ impl Handler<ActivateConnection> for ChatServer {
     }
 }
 
+impl Handler<RebroadcastPresence> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: RebroadcastPresence, ctx: &mut Self::Context) -> Self::Result {
+        let found = self
+            .session_room
+            .get(&msg.session)
+            .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
+            .and_then(|(room_id, members)| {
+                members
+                    .iter()
+                    .find(|m| m.session == msg.session)
+                    .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
+            });
+
+        if let Some((room_id, user_id, display_name)) = found {
+            let responder_is_active =
+                self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
+            // The requester is "local" if this instance tracks its connection;
+            // then the in-memory existing-member replay already delivered the
+            // PARTICIPANT_JOINED, so a NATS reply would duplicate it.
+            let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
+            let is_guest = self
+                .session_is_guest
+                .get(&msg.session)
+                .copied()
+                .unwrap_or(false);
+
+            if let Some((subject, bytes)) = SessionManager::rebroadcast_reply_publication(
+                &room_id,
+                &user_id,
+                &display_name,
+                msg.session,
+                msg.requester_session,
+                is_guest,
+                responder_is_active,
+                requester_is_local,
+            ) {
+                info!(
+                    "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
+                    user_id, msg.session, msg.requester_session, subject
+                );
+                let nc = self.nats_connection.clone();
+                let fut = async move {
+                    if let Err(e) = nc.publish(subject, bytes.into()).await {
+                        error!(
+                            "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
+                            e
+                        );
+                    }
+                };
+                ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
+            } else {
+                debug!(
+                    "RebroadcastPresence: no reply for session {} (active={}, requester {} local={})",
+                    msg.session, responder_is_active, msg.requester_session, requester_is_local
+                );
+            }
+        }
+    }
+}
+
 /// Handle in-memory display-name updates triggered by NATS
 /// PARTICIPANT_DISPLAY_NAME_CHANGED events.
 ///
@@ -1224,6 +2112,41 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
             for member in members.iter_mut() {
                 if member.user_id == msg.user_id {
                     member.display_name.clone_from(&validated_name);
+                }
+            }
+        }
+    }
+}
+
+/// Recompute per-source layer unions and emit LAYER_HINT packets (#1108,
+/// Stage 3 — publish-side layer suppression).
+///
+/// Runs entirely in the actor because the union is an inverted query over the
+/// receiver-keyed `session_layer_prefs` map (see [`RecomputeLayerHints`]). A
+/// `Some(source)` recompute targets a single publisher; a `None` recompute fans
+/// out over every current publisher in the room (used on join/leave, which can
+/// shift many sources' fail-open unions at once).
+///
+/// SECURITY: there is intentionally NO inbound LAYER_HINT path — this handler is
+/// the ONLY producer of LAYER_HINT, and it is driven exclusively by trusted
+/// relay lifecycle events (subject-authoritative LAYER_PREFERENCE recording, and
+/// join/leave). It never parses or trusts a client-sent LAYER_HINT.
+impl Handler<RecomputeLayerHints> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: RecomputeLayerHints, ctx: &mut Self::Context) -> Self::Result {
+        match msg.source {
+            Some(source) => self.recompute_layer_hints_for_source(&msg.room, source, ctx),
+            None => {
+                // Room-wide recompute: snapshot the current publisher sessions so
+                // we are not holding an immutable borrow of `room_members` while
+                // `recompute_layer_hints_for_source` mutates `layer_hint_state`.
+                let sources: Vec<SessionId> = match self.room_members.get(&msg.room) {
+                    Some(members) => members.iter().map(|m| m.session).collect(),
+                    None => return,
+                };
+                for source in sources {
+                    self.recompute_layer_hints_for_source(&msg.room, source, ctx);
                 }
             }
         }
@@ -1356,7 +2279,7 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             is_host,
             end_on_host_leave,
         }: ExecutePendingDeparture,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
         // Use the instance_key captured at Disconnect time, NOT the user_id —
         // see the doc comment on `ChatServer::pending_departures` for why
@@ -1393,14 +2316,58 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                 // empty-room policy-cache eviction rule stays in lockstep with
                 // the `leave_rooms` path (both paths must drop `room_policy`
                 // when, and only when, this removal drained the room to empty).
+                //
+                // We still check empty→idle here even though this never-active
+                // session never broadcast a JOIN: if it was the LAST member it
+                // could be draining the room to empty while an earlier active
+                // participant already left (that earlier departure saw this
+                // testing session still present, so it did NOT emit the
+                // empty event). Without this branch the meeting could stay
+                // `active` despite being empty. We do NOT emit on the
+                // host-leave-ends path here because a never-active session is
+                // never the host's ending session (that goes through
+                // `leave_rooms`). meeting-api's `set_idle` guards on
+                // `state='active'`, so if the meeting was never activated this
+                // is a harmless no-op.
+                let mut room_became_empty = false;
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|m| m.session != session);
+                    room_became_empty = members.is_empty();
                 }
                 self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
                         self.instance_index.remove(&iid);
                     }
+                }
+                if room_became_empty {
+                    let nc = self.nats_connection.clone();
+                    let room_id = room.clone();
+                    tokio::spawn(async move {
+                        info!(
+                            "Room {} became empty after a never-activated session expired - \
+                             notifying meeting-api (empty->idle)",
+                            room_id
+                        );
+                        let payload = MeetingBecameEmptyPayload {
+                            room_id: room_id.clone(),
+                        };
+                        match serde_json::to_vec(&payload) {
+                            Ok(json) => {
+                                if let Err(e) =
+                                    nc.publish(MEETING_BECAME_EMPTY_SUBJECT, json.into()).await
+                                {
+                                    error!(
+                                        "Failed to publish {} for room {}: {}",
+                                        MEETING_BECAME_EMPTY_SUBJECT, room_id, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize MeetingBecameEmptyPayload: {}", e);
+                            }
+                        }
+                    });
                 }
                 return;
             }
@@ -1412,15 +2379,18 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             );
             // Observer sessions bypass the grace period entirely (handled
             // directly in Disconnect), so this path is always non-observer.
-            self.leave_rooms(LeaveContext {
-                session_id: &session,
-                room: Some(&room),
-                user_id: Some(&user_id),
-                display_name: Some(&display_name),
-                observer: false,
-                is_host,
-                end_on_host_leave,
-            });
+            self.leave_rooms(
+                LeaveContext {
+                    session_id: &session,
+                    room: Some(&room),
+                    user_id: Some(&user_id),
+                    display_name: Some(&display_name),
+                    observer: false,
+                    is_host,
+                    end_on_host_leave,
+                },
+                ctx,
+            );
         } else {
             info!(
                 "Pending departure for user {} in room {} already cancelled (reconnected)",
@@ -1509,6 +2479,7 @@ impl Handler<JoinRoom> for ChatServer {
             instance_id,
             is_host,
             end_on_host_leave,
+            transport,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -1532,25 +2503,13 @@ impl Handler<JoinRoom> for ChatServer {
         // Sanitize instance_id: reject oversized values to prevent memory abuse.
         let instance_id = instance_id.filter(|iid| !iid.is_empty() && iid.len() <= 64);
 
-        // --- Live session eviction by instance_id ---
-        // If the client provides an instance_id (stable UUID per tab/meeting),
-        // look up the instance_index to find the previous session for this
-        // client instance. If found (and it belongs to the same user), evict
-        // the stale session silently so peers don't see a spurious leave/join.
-        // This handles the common case where the client reconnects before the
-        // server's heartbeat timeout detects the old session is dead.
-        let mut evicted_old_session = false;
+        // Record session→iid now; the forward index and eviction are deferred to
+        // ActivateConnection. During RTT election both WS and WT candidates share
+        // one instance_id — evicting at JoinRoom would kill the earlier candidate's
+        // NATS task before we know which one wins, breaking PARTICIPANT_LIST_REQUEST
+        // responses.
         if let Some(ref iid) = instance_id {
-            evicted_old_session = self.evict_stale_session(iid, &room, &user_id, session, ctx);
-
-            // Register/update this instance_id → session mapping (both directions).
-            self.instance_index.insert(iid.clone(), session);
             self.session_instance.insert(session, iid.clone());
-
-            // Cross-server eviction broadcast is deferred to ActivateConnection.
-            // During RTT election, multiple connections (WS + WT) fire JoinRoom,
-            // but only the winner activates. Publishing here would send 2-4
-            // unnecessary NATS messages per connect.
         }
 
         // --- Multi-session-per-user is allowed (issue #828) ---
@@ -1618,8 +2577,10 @@ impl Handler<JoinRoom> for ChatServer {
         // Mark reconnection and observer sessions so ActivateConnection does not
         // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
         // "left" from peers' perspective; observers are never announced.
-        // Also suppress for instance_id-based evictions (same client instance).
-        if is_reconnection || evicted_old_session || observer {
+        // Instance_id-based eviction suppression is NOT set here — eviction is
+        // deferred to ActivateConnection, which adds the elected session to
+        // `suppress_join_broadcast` itself if it evicted a predecessor.
+        if is_reconnection || observer {
             self.suppress_join_broadcast.insert(session);
         }
 
@@ -1648,6 +2609,17 @@ impl Handler<JoinRoom> for ChatServer {
         let desired_streams: DesiredStreams = Default::default();
         self.session_desired_streams
             .insert(session, desired_streams.clone());
+
+        // Allocate the per-session layer-preference map (#989, Phase 1b),
+        // shared with the NATS subscription task below exactly like
+        // `desired_streams`: the task's LAYER_PREFERENCE interceptor writes it
+        // and `handle_msg` reads it on the forwarding path. A reconnection runs
+        // `JoinRoom` under a fresh `session_id`, so a new empty map is allocated
+        // and the client re-sends its preferences — no stale state survives a
+        // reconnect. Empty map = no-op (forward all layers).
+        let layer_prefs: LayerPrefs = Default::default();
+        self.session_layer_prefs
+            .insert(session, layer_prefs.clone());
 
         // Collect existing non-observer room members for notifying the new joiner.
         // On reconnection, we still send the existing member list so the
@@ -1684,6 +2656,7 @@ impl Handler<JoinRoom> for ChatServer {
 
         // Track this session in room_members (only for non-observers)
         if !observer {
+            self.session_room.insert(session, room.clone());
             self.room_members
                 .entry(room.clone())
                 .or_default()
@@ -1719,6 +2692,25 @@ impl Handler<JoinRoom> for ChatServer {
                     waiting_room_enabled: true,
                     allow_guests: false,
                 });
+
+            // Publish-side suppression restore (#1108, Stage 3). A newly-joined
+            // receiver has NO recorded layer preference yet, so under the
+            // fail-open contract it wants the FULL ladder from EVERY existing
+            // publisher. That can RAISE one or more sources' per-source unions
+            // (e.g. a publisher previously suppressed to base because its only
+            // receiver wanted base must now restore full for the new viewer).
+            // Recompute room-wide so each publisher gets a restore-eager hint.
+            // Routed through the actor (`do_send`) rather than computed inline to
+            // avoid borrowing `room_members` while the recompute mutates
+            // `layer_hint_state`; the new joiner is already in `room_members`
+            // above, so the recompute sees its (fail-open) demand. The joiner's
+            // own session has no debounce state yet, and it is a publisher of
+            // nothing until it sends media, so a `None` (room-wide) recompute is
+            // correct and idempotent.
+            ctx.address().do_send(RecomputeLayerHints {
+                room: room.clone(),
+                source: None,
+            });
         }
 
         // Clone the recipient so we can send existing member info directly to the new joiner
@@ -1727,8 +2719,20 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session;
         let server_addr = ctx.address();
+        // Recipient for publish-side layer-hint recomputes (#1108, Stage 3). The
+        // LAYER_PREFERENCE interceptor in this session's NATS loop messages the
+        // ACTOR (it cannot compute the cross-receiver union itself); a typed
+        // `Recipient<RecomputeLayerHints>` keeps the interceptor decoupled from
+        // the full `ChatServer` address and trivially mockable in unit tests.
+        let recompute_recipient = server_addr.clone().recipient::<RecomputeLayerHints>();
         // Shared viewport set for this session's NATS loop (HCL issue #988).
         let desired_streams_for_loop = desired_streams.clone();
+        // Shared layer-preference map for this session's NATS loop (#989).
+        let layer_prefs_for_loop = layer_prefs.clone();
+        // Receiver transport for the per-session NATS loop's `handle_msg`, so an
+        // inbound actor-mailbox overflow can be attributed to the right
+        // transport on `relay_inbound_mailbox_drops_total` (Tier B #2 / #1057).
+        let transport_for_loop = transport.clone();
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -1769,7 +2773,7 @@ impl Handler<JoinRoom> for ChatServer {
             // Reconnection joins also skip the broadcast (the user never
             // "left" from peers' perspective), and observer joins are
             // never broadcast either.
-            if is_reconnection || evicted_old_session {
+            if is_reconnection {
                 info!(
                     "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
                      (deferred broadcast also skipped)",
@@ -1825,9 +2829,32 @@ impl Handler<JoinRoom> for ChatServer {
                         observer,
                         user_id_clone.clone(),
                         desired_streams_for_loop.clone(),
+                        layer_prefs_for_loop.clone(),
+                        transport_for_loop.clone(),
                     );
                     let self_subject =
                         format!("room.{room_clone}.{session_clone}").replace(' ', "_");
+
+                    // Publish PARTICIPANT_LIST_REQUEST to the room system subject
+                    // so peers on other servers re-broadcast their PARTICIPANT_JOINED.
+                    // Those peers receive this request in their NATS loops and call
+                    // RebroadcastPresence on their local ChatServer, which replies
+                    // on this joiner's per-session subject. This joiner is now
+                    // subscribed and will receive the reply.
+                    if let Some((subject_req, request_bytes)) =
+                        SessionManager::participant_list_request_publication(
+                            observer,
+                            &room_clone,
+                            session_clone,
+                        )
+                    {
+                        if let Err(e) = nc2.publish(subject_req, request_bytes.into()).await {
+                            warn!(
+                                "Failed to publish PARTICIPANT_LIST_REQUEST for {} in {}: {}",
+                                user_id_clone, room_clone, e
+                            );
+                        }
+                    }
                     while let Some(msg) = sub.next().await {
                         // Parse the PacketWrapper EXACTLY ONCE per packet and
                         // share the result with every consumer below. This is
@@ -1846,6 +2873,7 @@ impl Handler<JoinRoom> for ChatServer {
                             session_clone,
                             &session_recipient,
                             &server_addr,
+                            &transport_for_loop,
                         ) {
                             continue;
                         }
@@ -1865,6 +2893,37 @@ impl Handler<JoinRoom> for ChatServer {
                             session_clone,
                             &desired_streams_for_loop,
                             &room_clone,
+                        ) {
+                            continue;
+                        }
+
+                        // LAYER_PREFERENCE control packets (#989, Phase 1b) are
+                        // consumed by the relay and never re-broadcast, exactly
+                        // like VIEWPORT above. A preference is recorded ONLY
+                        // when it arrived on THIS session's own publish subject
+                        // (subject-authoritative ownership); any other one is
+                        // dropped without mutating state. Either way we
+                        // `continue` so it never reaches `handle_msg`.
+                        if try_intercept_layer_preference(
+                            &msg,
+                            parsed.as_ref(),
+                            &self_subject,
+                            &layer_prefs_for_loop,
+                            &room_clone,
+                            &|m| recompute_recipient.do_send(m),
+                            session_clone,
+                        ) {
+                            continue;
+                        }
+
+                        // PARTICIPANT_LIST_REQUEST: a joiner asking existing
+                        // peers to re-announce themselves.
+                        // Consumed by the relay; never forwarded to clients.
+                        if try_intercept_participant_list_request(
+                            &msg,
+                            parsed.as_ref(),
+                            session_clone,
+                            &server_addr,
                         ) {
                             continue;
                         }
@@ -2053,6 +3112,276 @@ fn try_intercept_viewport(
     true
 }
 
+/// Checks whether `msg` is a LAYER_PREFERENCE control packet (#989, Phase 1b)
+/// and, if so, intercepts it so it is NEVER re-broadcast to other peers.
+///
+/// `parsed` is the already-decoded `PacketWrapper` for `msg` (parsed once per
+/// packet in the NATS loop and shared with every consumer); `None` means the
+/// payload was unparseable.
+///
+/// Returns `true` when the packet was a LAYER_PREFERENCE (caller must
+/// `continue` the NATS loop) and `false` when the caller should fall through to
+/// `handle_msg`.
+///
+/// # Ownership / security (mirrors `try_intercept_viewport`)
+///
+/// This is the enforcement point for the field-5 trust boundary (Tony's #993
+/// note). The cleartext `simulcast_layer_id` and this control packet both live
+/// OUTSIDE the AEAD seal, so a peer could forge either. Ownership of a layer
+/// preference is therefore decided by the NATS SUBJECT the packet arrived on,
+/// NOT by any payload field:
+///
+/// * A LAYER_PREFERENCE is "mine" iff it arrived on this session's own publish
+///   subject `self_subject` == `room.{room}.{receiver_session}`. The subject is
+///   set by the relay from the authenticated connection and cannot be forged by
+///   a peer.
+/// * Any LAYER_PREFERENCE arriving on a DIFFERENT subject is dropped WITHOUT
+///   mutating state. This is the guarantee that a forged value only
+///   self-degrades the forger's OWN view (it changes only the forger's own
+///   layer map); it can NEVER affect another receiver's preferences.
+///
+/// Accepted updates are bounded ([`LAYER_PREFERENCE_MAX_ENTRIES`]) and
+/// rate-limited ([`LAYER_PREFERENCE_MIN_UPDATE_INTERVAL`]) to blunt DoS via
+/// oversized / spammed maps. The map is **subtract-only** and consumed purely
+/// for the layer-drop decision in `handle_msg`; it never widens authorization.
+fn try_intercept_layer_preference(
+    msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
+    self_subject: &str,
+    layer_prefs: &LayerPrefs,
+    room: &str,
+    // Sink for per-source recompute requests (#1108, Stage 3). The interceptor
+    // runs in a per-session NATS task and CANNOT compute the cross-receiver
+    // union itself, so it hands each affected source to this sink, which in
+    // production forwards to the actor via `do_send`. Taking a closure (rather
+    // than the actor `Addr`/`Recipient` directly) keeps the interceptor a pure,
+    // synchronously-unit-testable function: tests pass a recording/no-op closure
+    // and never need a running actix system.
+    on_recompute: &dyn Fn(RecomputeLayerHints),
+    receiver_session: SessionId,
+) -> bool {
+    // Unparseable payloads are not our concern; let `handle_msg` apply its own
+    // fail-closed handling.
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return false,
+    };
+
+    if wrapper.packet_type != PacketType::LAYER_PREFERENCE.into() {
+        return false;
+    }
+
+    // From here on the packet IS a LAYER_PREFERENCE and must never be
+    // forwarded: every return path below yields `true`.
+
+    // Ownership is established by the SUBJECT, not the payload — see the doc
+    // comment. A LAYER_PREFERENCE arriving on any subject other than our own is
+    // normal NATS fan-out (every receiver sees the owner's packet) and is
+    // dropped without mutating our map.
+    if msg.subject.as_str() != self_subject {
+        RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+            .with_label_values(&[room, "ignored_other_subject"])
+            .inc();
+        return true;
+    }
+
+    if let Ok(prefs) =
+        videocall_types::protos::layer_preference_packet::LayerPreferencePacket::parse_from_bytes(
+            &wrapper.data,
+        )
+    {
+        // DoS bound: cap the number of entries we will process. Truncate rather
+        // than reject so an over-long list still applies its first N entries
+        // (fail-open on the excess), matching the viewport interceptor.
+        let raw_len = prefs.entries.len();
+        let mut bounded_any = false;
+        // Key by (session_id, normalized media_kind) (issue #989, Phase 3). The
+        // Entry's media_kind enum shares numbering with the wire MediaKind;
+        // `normalize_pref_media_kind` maps UNSPECIFIED(0)→VIDEO(1) for
+        // back-compat with pre-Phase-3 clients.
+        //
+        // DEFENSE-IN-DEPTH (#1082): clamp the VALUE RANGE of `desired_layer`.
+        // The relay is layer-count-agnostic (it never learns how many layers a
+        // source produces — see "AVAILABILITY NOT VALIDATED" on the forwarding
+        // path), so without this a forged/garbage entry could stuff an arbitrary
+        // `u32` into the per-source map. Such an id never matches a real packet,
+        // so the source's non-base layers all drop and the forger self-degrades
+        // to base — but the relay should not retain nonsense state. Entries
+        // exceeding `LAYER_PREFERENCE_MAX_LAYER_ID` are SKIPPED (`filter_map`),
+        // not clamped: skipping is fail-open per source (no recorded preference
+        // for that (source, kind) → the existing forwarding path forwards every
+        // layer = base-and-up), whereas clamping would invent a selection the
+        // receiver never asked for. This is O(1) per entry and adds no
+        // allocation. NOTE: this is NOT the real layer count — it is purely a
+        // forged-id bound (see the const doc).
+        let next: HashMap<(u64, i32), u32> = prefs
+            .entries
+            .into_iter()
+            .take(LAYER_PREFERENCE_MAX_ENTRIES)
+            .filter_map(|e| {
+                if e.desired_layer > LAYER_PREFERENCE_MAX_LAYER_ID {
+                    bounded_any = true;
+                    return None;
+                }
+                Some((
+                    (
+                        e.session_id,
+                        normalize_pref_media_kind(e.media_kind.value()),
+                    ),
+                    e.desired_layer,
+                ))
+            })
+            .collect();
+        if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
+            RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                .with_label_values(&[room, "truncated"])
+                .inc();
+        }
+        if bounded_any {
+            RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                .with_label_values(&[room, "layer_id_out_of_bound"])
+                .inc();
+        }
+
+        // Overwrite (not merge): the latest LAYER_PREFERENCE is the full
+        // current per-source layer map. `write()` only fails on a poisoned
+        // lock; in that case we leave the previous map untouched (fail-open
+        // relative to the new map).
+        match layer_prefs.state.write() {
+            Ok(mut guard) => {
+                let now = std::time::Instant::now();
+                let too_soon = guard.last_update.is_some_and(|last| {
+                    now.duration_since(last) < LAYER_PREFERENCE_MIN_UPDATE_INTERVAL
+                });
+                if too_soon {
+                    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                        .with_label_values(&[room, "rate_limited"])
+                        .inc();
+                } else {
+                    let now_non_empty = !next.is_empty();
+                    // Determine which SOURCE sessions had their desired layer
+                    // changed by this update, BEFORE the overwrite moves `next`
+                    // into the guard (#1108, Stage 3). A source "changed" if, for
+                    // ANY media kind, the recorded value differs between the old
+                    // and new maps — including a source whose entry was ADDED or
+                    // REMOVED (removal flips it back to the fail-open full ladder,
+                    // which can raise the per-source union, so a restore hint may
+                    // be owed). We only message the actor for sources that
+                    // actually changed, keeping the per-source recompute O(changed)
+                    // rather than O(room) on every preference packet.
+                    let changed_sources = changed_pref_sources(&guard.layers, &next);
+                    guard.layers = next;
+                    guard.last_update = Some(now);
+                    drop(guard);
+                    // Update the lock-free hot-path hint while still on the
+                    // writer side. Stored with Relaxed ordering: the only
+                    // consumer (`has_any` on the forwarding path) treats it as
+                    // a hint and re-checks under the lock, so no
+                    // happens-before relationship with the map contents is
+                    // required for correctness — a stale `true` costs at most
+                    // one lock that fails open, and a stale `false` cannot
+                    // occur because we only ever raise the hint here (an empty
+                    // overwrite lowers it, which can only cause an extra
+                    // forward = fail-open).
+                    layer_prefs
+                        .non_empty
+                        .store(now_non_empty, std::sync::atomic::Ordering::Relaxed);
+                    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                        .with_label_values(&[room, "accepted"])
+                        .inc();
+
+                    // Publish-side suppression trigger (#1108, Stage 3): this
+                    // receiver's demand for one or more sources changed, so ask
+                    // the ACTOR to recompute each affected source's per-source
+                    // union and hint its publisher. This MUST go through the
+                    // actor — the union is an inverted query over ALL receivers'
+                    // prefs, and this interceptor runs in a per-session NATS task
+                    // that can see only this one receiver's map. `do_send`
+                    // mirrors the display-name-change trigger: low-priority,
+                    // never blocks the NATS loop; if the actor mailbox is full the
+                    // recompute is simply skipped (the next preference change, or
+                    // a join/leave, will re-trigger it).
+                    for src in changed_sources {
+                        on_recompute(RecomputeLayerHints {
+                            room: room.to_string(),
+                            source: Some(src),
+                        });
+                    }
+                    debug!(
+                        "Recorded LAYER_PREFERENCE for receiver session {} in room {}; triggered per-source layer-hint recompute",
+                        receiver_session, room
+                    );
+                }
+            }
+            Err(_) => {
+                warn!("Layer-preference lock poisoned for self_subject {self_subject}; keeping previous map");
+            }
+        }
+    }
+    // Malformed inner payload: still consume the packet (drop it) but leave the
+    // existing map unchanged — fail-open to the prior behaviour.
+
+    true
+}
+
+/// Checks whether `msg` is a `PARTICIPANT_LIST_REQUEST` system event.
+/// If so, asks the local ChatServer (via `RebroadcastPresence`) to re-publish
+/// this session's own PARTICIPANT_JOINED addressed to the requesting joiner, so
+/// a cross-server joiner — whose NATS subscription was established after the
+/// original deferred PARTICIPANT_JOINED was published — learns about this peer.
+///
+/// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
+/// Returns `true` when intercepted (caller must `continue`); `false` otherwise.
+fn try_intercept_participant_list_request(
+    msg: &async_nats::Message,
+    parsed: Option<&PacketWrapper>,
+    own_session: SessionId,
+    server: &Addr<ChatServer>,
+) -> bool {
+    // The request is broadcast on the room system subject only.
+    if !msg.subject.ends_with(".system") {
+        return false;
+    }
+
+    let wrapper = match parsed {
+        Some(w) => w,
+        None => return false,
+    };
+
+    if wrapper.packet_type != PacketType::MEETING.into() {
+        return false;
+    }
+
+    if wrapper.user_id != SYSTEM_USER_ID.as_bytes() {
+        return false;
+    }
+
+    let inner = match MeetingPacket::parse_from_bytes(&wrapper.data) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if inner.event_type != MeetingEventType::PARTICIPANT_LIST_REQUEST.into() {
+        return false;
+    }
+
+    // Ignore our own request (we published it; no need to answer ourselves).
+    if inner.session_id == own_session {
+        return true;
+    }
+
+    debug!(
+        "PARTICIPANT_LIST_REQUEST received (requester session={}), re-broadcasting own presence \
+         for session {}",
+        inner.session_id, own_session
+    );
+    server.do_send(RebroadcastPresence {
+        session: own_session,
+        requester_session: inner.session_id,
+    });
+    true
+}
+
 /// Checks whether `msg` is a `PARTICIPANT_DISPLAY_NAME_CHANGED` system event.
 /// If so, validates and sanitises the packet, updates actor state via `server`,
 /// and forwards the rebuilt packet to `recipient`. Returns `true` when the
@@ -2065,6 +3394,7 @@ fn try_intercept_display_name_change(
     session: SessionId,
     recipient: &Recipient<Message>,
     server: &Addr<ChatServer>,
+    transport: &str,
 ) -> bool {
     if !msg.subject.ends_with(".system") {
         return false;
@@ -2176,6 +3506,11 @@ fn try_intercept_display_name_change(
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
                     .inc();
+                // Same inbound-mailbox overflow signature as the main fan-out
+                // site, attributed to the receiver's transport (Tier B #2 / #1057).
+                RELAY_INBOUND_MAILBOX_DROPS_TOTAL
+                    .with_label_values(&[transport])
+                    .inc();
                 warn!(
                     "Dropping sanitized PARTICIPANT_DISPLAY_NAME_CHANGED for session {}: {}",
                     session, e
@@ -2213,6 +3548,11 @@ fn try_intercept_display_name_change(
 ///
 /// A modified client cannot bypass isolation because the server never sends
 /// MEDIA packets to observer sessions in the first place.
+// The per-session forwarding closure legitimately needs all of these inputs
+// (recipient, room, session id, observer flag, user id, viewport set, layer
+// prefs, and now the receiver transport for mailbox-drop attribution). Grouping
+// them into a struct would not improve clarity for a single internal builder.
+#[allow(clippy::too_many_arguments)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -2220,6 +3560,8 @@ fn handle_msg(
     observer: bool,
     receiver_user_id: String,
     desired_streams: DesiredStreams,
+    layer_prefs: LayerPrefs,
+    transport: String,
 ) -> impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error> {
     // `parsed` is the PacketWrapper decoded ONCE per packet by the NATS loop
     // and shared with every consumer (display-name interceptor, viewport
@@ -2230,6 +3572,11 @@ fn handle_msg(
     move |msg, parsed| {
         let is_congestion = parsed
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+            .unwrap_or(false);
+
+        let is_meeting = parsed
+            .as_ref()
+            .map(|pw| pw.packet_type == PacketType::MEETING.into())
             .unwrap_or(false);
 
         // Self-skip prevents echo of our own broadcasts. We treat a packet
@@ -2262,8 +3609,39 @@ fn handle_msg(
             .map(|pw| pw.session_id != 0 && pw.session_id == session)
             .unwrap_or(false);
 
-        if (subject_self || inner_session_self) && !is_congestion {
+        // MEETING packets are server-authoritative — clients never publish them
+        // (`classify_packet` drops client MEETING packets). So a MEETING packet
+        // arriving on our OWN per-session subject is never an echo of our own
+        // traffic; it is a server message addressed to us (a PARTICIPANT_JOINED
+        // reply to our PARTICIPANT_LIST_REQUEST). MEETING packets therefore
+        // bypass the subject-based self-skip, but are still dropped by
+        // `inner_session_self` when they announce our own session.
+        let drop_self_echo = if is_meeting {
+            inner_session_self
+        } else {
+            subject_self || inner_session_self
+        };
+        if drop_self_echo && !is_congestion {
             return Ok(());
+        }
+
+        // Unicast MEETING reply filter (see `RebroadcastPresence`): a
+        // PARTICIPANT_JOINED sent in reply to a PARTICIPANT_LIST_REQUEST is
+        // addressed to a single requester by publishing on that requester's
+        // per-session subject (`room.{room}.{N}`). Every session receives it via
+        // the room wildcard, so drop it unless it targets us. Broadcast MEETING
+        // events (PARTICIPANT_JOINED at activation, PARTICIPANT_LEFT, etc.) use
+        // the `room.{room}.system` subject and are left untouched.
+        if is_meeting && !subject_self {
+            let targets_other_session = msg
+                .subject
+                .as_str()
+                .rsplit('.')
+                .next()
+                .is_some_and(|token| token.parse::<u64>().is_ok());
+            if targets_other_session {
+                return Ok(());
+            }
         }
 
         // PEER_EVENT packets are unicast at the application layer: the
@@ -2361,33 +3739,55 @@ fn handle_msg(
         // NOTE: this filter intentionally inspects ONLY the cleartext outer
         // `media_kind`. It never parses the (possibly E2EE-sealed) inner
         // MediaPacket, so it is correct whether or not E2EE is enabled.
+        //
+        // The viewport filter (#988) and the layer filter (#989) BOTH key off
+        // the SUBJECT-DERIVED source session and run only for VIDEO packets, so
+        // we resolve `source` ONCE here and share it across both — the source
+        // parse is on the relay's hottest path (every media frame × every
+        // receiver × every room) and was previously computed twice per VIDEO
+        // packet.
+        //
+        // SOURCE IDENTITY MUST come from the NATS subject, NEVER from the
+        // payload `pw.session_id`. The wrapper `session_id` is
+        // attacker-controllable (ingress only stamps it when the client sends 0;
+        // see the self-echo note above), so a modified client could forge it to
+        // a receiver-VISIBLE peer's id and smuggle off-screen VIDEO past these
+        // filters. The subject — `room.{room}.{publisher_session}` — is set by
+        // the relay from the authenticated connection and cannot be forged by a
+        // peer, exactly as relied on for `subject_self` and VIEWPORT ownership.
+        // Room IDs match `^[a-zA-Z0-9_-]*$` (no dots) and the session is a
+        // pure-digit u64, so the part after the LAST `.` is the publisher
+        // session. If it does not parse (shouldn't happen for normal media),
+        // FAIL OPEN — never drop on an unparseable source.
         if let Some(pw) = parsed {
-            let is_video = pw.media_kind.enum_value()
-                == Ok(videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::VIDEO);
-            if is_video {
-                // SOURCE IDENTITY MUST come from the NATS subject, NEVER from
-                // the payload `pw.session_id`. The wrapper `session_id` is
-                // attacker-controllable (ingress only stamps it when the
-                // client sends 0; see the self-echo note above), so a modified
-                // client could forge it to a receiver-VISIBLE peer's id and
-                // smuggle off-screen VIDEO past this filter. The subject —
-                // `room.{room}.{publisher_session}` — is set by the relay from
-                // the authenticated connection and cannot be forged by a peer,
-                // exactly as relied on for `subject_self` and VIEWPORT
-                // ownership. We parse the trailing session token from it.
-                //
-                // Room IDs match `^[a-zA-Z0-9_-]*$` (no dots) and the session
-                // is a pure-digit u64, so the part after the LAST `.` is the
-                // publisher session. If it does not parse (shouldn't happen for
-                // normal media), FAIL OPEN — never drop on an unparseable
-                // source.
-                let source = msg
-                    .subject
+            use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+            let wire_media_kind = pw.media_kind.enum_value();
+            let is_video = wire_media_kind == Ok(MediaKind::VIDEO);
+            // Layer filtering (issue #989, Phase 3) applies to VIDEO, SCREEN,
+            // AND AUDIO — each addressed independently via its media kind. The
+            // viewport filter remains VIDEO-only (it answers "is this sender's
+            // CAMERA wanted on screen"; screen/audio are never viewport-gated).
+            let is_layer_filterable = matches!(
+                wire_media_kind,
+                Ok(MediaKind::VIDEO) | Ok(MediaKind::SCREEN) | Ok(MediaKind::AUDIO)
+            );
+
+            // Resolve the SUBJECT-derived source ONCE, shared by both filters
+            // (source identity must come from the subject, never the forgeable
+            // payload session_id — see the block comment above).
+            let source = if is_video || is_layer_filterable {
+                msg.subject
                     .as_str()
                     .rsplit('.')
                     .next()
-                    .and_then(|tok| tok.parse::<u64>().ok());
+                    .and_then(|tok| tok.parse::<u64>().ok())
+            } else {
+                None
+            };
 
+            if is_video {
+                // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                //
                 // Read the viewport set ONCE: derive both the drop decision and
                 // the current set size from a single guard so the debug log on
                 // the drop path costs no extra RwLock read (the drop path runs
@@ -2431,6 +3831,86 @@ fn handle_msg(
                     .with_label_values(&[&room])
                     .inc();
             }
+
+            // ----- Layer filter (#989): "which LAYER of a wanted sender?" -----
+            //
+            // Phase 3: applies to VIDEO, SCREEN, AND AUDIO, each addressed
+            // independently by its media kind. For VIDEO this runs strictly
+            // AFTER the viewport filter above (a VIDEO packet only reaches here
+            // if the viewport forwarded it). SCREEN/AUDIO skip the viewport
+            // filter entirely.
+            //
+            // NO-OP-FIRST / fail-open. Drop iff ALL hold:
+            //   1. the cleartext `simulcast_layer_id` is non-zero, AND
+            //   2. this receiver has a recorded layer preference for the
+            //      (subject-derived source session, this media kind), AND
+            //   3. that preference selects a DIFFERENT layer.
+            // Everything else FORWARDS. In particular:
+            //   - No recorded preference for this (source, kind) (or empty map)
+            //     → FORWARD. The no-op gate: with no LAYER_PREFERENCE recorded
+            //     the path is byte-identical to pre-#989 behaviour.
+            //   - `simulcast_layer_id == 0` (base / un-upgraded publisher) →
+            //     always FORWARD.
+            //   - Non-media kinds are excluded by `is_layer_filterable`.
+            //
+            // The (source, media_kind) key (Phase 3) is what lets a receiver
+            // request a low SCREEN layer while keeping full camera VIDEO from
+            // the SAME source: the camera packet keys (src, VIDEO) and the
+            // screen packet keys (src, SCREEN), matched against the receiver's
+            // per-kind recorded preference.
+            //
+            // EMPTY-PREFS FAST PATH: `layer_prefs.has_any()` is a lock-free
+            // AtomicBool hint that is `false` until this receiver records its
+            // first LAYER_PREFERENCE, short-circuiting WITHOUT the read lock. A
+            // spurious `true` only costs a read lock that fails open (never a
+            // wrong drop) — see the `LayerPrefs` type doc.
+            //
+            // TRUST BOUNDARY (#993): both `simulcast_layer_id` (field 5) and the
+            // LAYER_PREFERENCE that populated `layer_prefs` live OUTSIDE the AEAD
+            // seal. A forged value only self-degrades the FORGER's OWN view.
+            // Source identity comes from the NATS SUBJECT, never the forgeable
+            // payload `session_id`.
+            //
+            // AVAILABILITY NOT VALIDATED: the relay does NOT check that the
+            // requested layer is actually produced by the source; a client
+            // requesting an absent layer black-tiles ITSELF (client-side clamp
+            // is the mitigation, see the receiver chooser).
+            if is_layer_filterable && pw.simulcast_layer_id != 0 && layer_prefs.has_any() {
+                // The wire media kind, normalized to the preference-map key
+                // discriminant (UNSPECIFIED→VIDEO etc.).
+                let kind_key =
+                    normalize_pref_media_kind(wire_media_kind.map(|k| k as i32).unwrap_or(0));
+                // Drop iff there is a recorded preference for this
+                // (source, kind) AND it selects a different layer. No entry →
+                // fail-open (forward). A poisoned lock fails OPEN (forward). An
+                // unparseable source (`None`) fails OPEN (forward).
+                let drop_layer = match source {
+                    Some(src) => layer_prefs
+                        .state
+                        .read()
+                        .map(|st| {
+                            st.layers
+                                .get(&(src, kind_key))
+                                .is_some_and(|&want| want != pw.simulcast_layer_id)
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+
+                if drop_layer {
+                    RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[&room]).inc();
+                    debug!(
+                        "Layer drop: simulcast layer {} (kind {}) from subject-derived source {:?} not selected by receiver session {} in room {}",
+                        pw.simulcast_layer_id, kind_key, source, session, room
+                    );
+                    return Ok(());
+                }
+                // Forwarded simulcast media — denominator complement of the
+                // layer-filtered counter (#989).
+                RELAY_LAYER_FORWARDED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
+            }
         }
 
         let message = Message {
@@ -2439,8 +3919,18 @@ fn handle_msg(
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            // Room-tagged forensic series (kept for per-room drill-down). The
+            // `transport="nats_delivery"` here is the publish-side identity, not
+            // the receiver's transport.
             RELAY_PACKET_DROPS_TOTAL
                 .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .inc();
+            // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
+            // room-wide-freeze signature, labeled by the RECEIVER's transport so
+            // an SRE can rate() it without scraping per-room series and can tell
+            // which transport's mailbox is overflowing.
+            RELAY_INBOUND_MAILBOX_DROPS_TOTAL
+                .with_label_values(&[&transport])
                 .inc();
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
@@ -2524,6 +4014,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -2587,6 +4078,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -2622,6 +4114,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -2685,6 +4178,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -2704,6 +4198,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3085,6 +4580,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3197,6 +4693,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3295,6 +4792,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3399,6 +4897,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3467,6 +4966,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3580,6 +5080,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3694,6 +5195,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3821,6 +5323,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3842,6 +5345,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -3951,6 +5455,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -3983,6 +5489,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4015,6 +5523,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4047,6 +5557,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4079,6 +5591,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -4112,6 +5626,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4144,6 +5660,8 @@ mod tests {
             true, // observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4176,6 +5694,8 @@ mod tests {
             false, // NOT an observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4222,6 +5742,8 @@ mod tests {
             false, // not an observer
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4259,6 +5781,8 @@ mod tests {
             false,
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Subject points at a DIFFERENT session id; payload session_id is
@@ -4297,6 +5821,8 @@ mod tests {
             false,
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4334,6 +5860,8 @@ mod tests {
             false,
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4370,6 +5898,8 @@ mod tests {
             false,
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4408,6 +5938,8 @@ mod tests {
             false,
             "recv-user".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4460,6 +5992,8 @@ mod tests {
             false,
             "alice".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4492,6 +6026,8 @@ mod tests {
             false,
             "bob".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4524,6 +6060,8 @@ mod tests {
             true,
             "alice".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4556,6 +6094,8 @@ mod tests {
             false,
             "alice".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let mut pw = PacketWrapper::new();
@@ -4575,6 +6115,130 @@ mod tests {
             count.load(Ordering::Relaxed),
             0,
             "PEER_EVENT with unparseable inner payload MUST be dropped"
+        );
+    }
+
+    // ======================================================================
+    // MEETING unicast reply filter (cross-server peer discovery)
+    // ======================================================================
+    //
+    // A PARTICIPANT_JOINED published in reply to a PARTICIPANT_LIST_REQUEST is
+    // addressed to ONE requester by publishing on that requester's per-session
+    // subject (`room.{room}.{N}`). Every session receives it via the room
+    // wildcard, so `handle_msg` must forward it ONLY to the targeted session N
+    // and drop it for everyone else (a presence info-leak boundary). Broadcast
+    // MEETING events use `room.{room}.system` and must still reach everyone.
+
+    /// A MEETING packet on the receiver's OWN per-session subject is the
+    /// targeted reply and must be forwarded. (`make_packet_bytes` leaves the
+    /// inner session_id at 0, so the self-echo `inner_session_self` guard does
+    /// not fire — the packet is delivered, not dropped.)
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_targeted_reply_forwarded_to_requester() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "requester".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.disc-room.7001",
+            make_packet_bytes(PacketType::MEETING),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "targeted MEETING reply on our own subject MUST be forwarded"
+        );
+    }
+
+    /// A MEETING packet on ANOTHER session's per-session subject is a reply
+    /// addressed to a different requester and MUST be dropped for us — this is
+    /// the presence info-leak boundary.
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_targeted_reply_dropped_for_non_requester() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "bystander".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Reply addressed to session 9999, not us (7001).
+        let nats_msg = make_nats_message(
+            "room.disc-room.9999",
+            make_packet_bytes(PacketType::MEETING),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "targeted MEETING reply on another session's subject MUST be dropped"
+        );
+    }
+
+    /// A broadcast MEETING event (PARTICIPANT_JOINED at activation,
+    /// PARTICIPANT_LEFT, etc.) uses the `.system` subject and MUST reach every
+    /// session, including ones that are not the targeted requester.
+    #[actix_rt::test]
+    async fn test_handle_msg_meeting_system_broadcast_forwarded() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "disc-room".to_string(),
+            7001,
+            false,
+            "peer".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.disc-room.system",
+            make_packet_bytes(PacketType::MEETING),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "broadcast MEETING event on .system subject MUST be forwarded to all"
         );
     }
 
@@ -4607,6 +6271,117 @@ mod tests {
             ids: ids.iter().copied().collect(),
             last_update: None,
         }))
+    }
+
+    /// An empty `LayerPrefs` — the no-op default used by every handle_msg test
+    /// that does not exercise the #989 layer filter. With an empty map the
+    /// layer filter forwards everything (byte-identical to pre-#989 behaviour).
+    fn empty_layer_prefs() -> LayerPrefs {
+        LayerPrefs::default()
+    }
+
+    /// Build a `LayerPrefs` pre-populated with the given (source_session,
+    /// desired_layer) entries, keyed as VIDEO (the pre-Phase-3 default). Sets
+    /// the lock-free `non_empty` hint to match the map so the forwarding hot
+    /// path's fast-path check is exercised faithfully.
+    fn layer_prefs_with(entries: &[(u64, u32)]) -> LayerPrefs {
+        let kinded: Vec<(u64, i32, u32)> = entries
+            .iter()
+            .map(|&(s, l)| (s, 1 /* VIDEO */, l))
+            .collect();
+        layer_prefs_with_kinds(&kinded)
+    }
+
+    /// Build a `LayerPrefs` keyed by (source_session, media_kind, desired_layer)
+    /// (issue #989, Phase 3). `media_kind` is the normalized wire discriminant
+    /// (VIDEO=1, AUDIO=2, SCREEN=3).
+    fn layer_prefs_with_kinds(entries: &[(u64, i32, u32)]) -> LayerPrefs {
+        let layers: HashMap<(u64, i32), u32> =
+            entries.iter().map(|&(s, k, l)| ((s, k), l)).collect();
+        let non_empty = !layers.is_empty();
+        LayerPrefs {
+            state: Arc::new(RwLock::new(LayerPrefsState {
+                layers,
+                last_update: None,
+            })),
+            non_empty: Arc::new(std::sync::atomic::AtomicBool::new(non_empty)),
+        }
+    }
+
+    /// Build a MEDIA `PacketWrapper` with explicit cleartext `media_kind`,
+    /// source `session_id`, and `simulcast_layer_id`, serialized to bytes.
+    /// Used by the #989 layer-filter tests.
+    fn make_media_packet_bytes_with_layer(
+        media_kind: MediaKind,
+        source_session: u64,
+        layer: u32,
+    ) -> Vec<u8> {
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::MEDIA.into();
+        pw.user_id = b"sender".to_vec();
+        pw.session_id = source_session;
+        pw.media_kind = media_kind.into();
+        pw.simulcast_layer_id = layer;
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    /// Build a LAYER_PREFERENCE `PacketWrapper` whose wire `session_id` is
+    /// `owner` (ownership is decided by SUBJECT, not this field — `owner` is
+    /// retained so tests can deliberately forge it to prove it is ignored)
+    /// carrying the given (source_session, desired_layer) entries.
+    fn make_layer_preference_packet_bytes(owner: u64, entries: &[(u64, u32)]) -> Vec<u8> {
+        use videocall_types::protos::layer_preference_packet::layer_preference_packet::Entry;
+        use videocall_types::protos::layer_preference_packet::LayerPreferencePacket;
+        let inner = LayerPreferencePacket {
+            entries: entries
+                .iter()
+                .map(|&(session_id, desired_layer)| Entry {
+                    session_id,
+                    desired_layer,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::LAYER_PREFERENCE.into();
+        pw.session_id = owner;
+        pw.data = inner
+            .write_to_bytes()
+            .expect("LayerPreferencePacket serialization should succeed");
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
+    }
+
+    /// Phase 3: build a LAYER_PREFERENCE carrying (source, EntryMediaKind, layer)
+    /// entries so tests can exercise per-(source,kind) recording.
+    fn make_layer_preference_packet_bytes_kinded(
+        owner: u64,
+        entries: &[(u64, i32, u32)],
+    ) -> Vec<u8> {
+        use videocall_types::protos::layer_preference_packet::layer_preference_packet::Entry;
+        use videocall_types::protos::layer_preference_packet::LayerPreferencePacket;
+        let inner = LayerPreferencePacket {
+            entries: entries
+                .iter()
+                .map(|&(session_id, kind, desired_layer)| Entry {
+                    session_id,
+                    desired_layer,
+                    media_kind: ::protobuf::EnumOrUnknown::from_i32(kind),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::LAYER_PREFERENCE.into();
+        pw.session_id = owner;
+        pw.data = inner
+            .write_to_bytes()
+            .expect("LayerPreferencePacket serialization should succeed");
+        pw.write_to_bytes()
+            .expect("PacketWrapper serialization should succeed")
     }
 
     /// Parse the payload of an `async_nats::Message` into an optional
@@ -4650,6 +6425,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4690,6 +6467,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Forged payload session_id = 200 (visible), but arrives on 999's subject.
@@ -4728,6 +6507,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4760,6 +6541,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200, 300]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         // Subject-derived source = 200 (in the viewport set).
@@ -4794,6 +6577,8 @@ mod tests {
             false,
             "recv".to_string(),
             DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4828,6 +6613,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4861,6 +6648,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4895,6 +6684,8 @@ mod tests {
             false,
             "recv".to_string(),
             desired_streams_with(&[200]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -4932,6 +6723,8 @@ mod tests {
             // Even a viewport set that "includes" the source must not let an
             // observer receive MEDIA.
             desired_streams_with(&[999]),
+            empty_layer_prefs(),
+            "websocket".to_string(),
         );
 
         let nats_msg = make_nats_message(
@@ -5285,6 +7078,7 @@ mod tests {
                 instance_id,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5347,6 +7141,13 @@ mod tests {
         // Allow the async JoinRoom task to start the NATS subscription
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+        // Activate session A so it is registered in instance_index. Eviction
+        // during B's ActivateConnection needs the forward mapping to find A.
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
+
         // Verify Session A is in room_members
         let members = chat_server
             .send(GetRoomMembers {
@@ -5374,6 +7175,12 @@ mod tests {
 
         // Allow the async JoinRoom task to complete
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Activate session B — this triggers eviction of session A.
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection B should succeed");
 
         // Verify Session A is evicted and Session B is in room_members
         let members = chat_server
@@ -5411,15 +7218,8 @@ mod tests {
             "Session A should have no active NATS subscription"
         );
 
-        // Verify PARTICIPANT_JOINED is suppressed for Session B
-        let suppressed = chat_server
-            .send(IsSuppressedJoinBroadcast { session: session_b })
-            .await
-            .expect("IsSuppressedJoinBroadcast should succeed");
-        assert!(
-            suppressed,
-            "Session B should have PARTICIPANT_JOINED suppressed (eviction reconnect)"
-        );
+        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
+        // (the flag is removed when the broadcast is correctly skipped).
     }
 
     // ------------------------------------------------------------------
@@ -5833,10 +7633,20 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed");
         assert!(result.is_ok(), "JoinRoom should succeed");
+
+        // Activate the session so instance_index is populated (eviction and the
+        // reverse lookup are deferred from JoinRoom to ActivateConnection).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Verify session is tracked
         let stored = chat_server
@@ -5924,10 +7734,19 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
+
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Send eviction for UNKNOWN instance_id
         chat_server
@@ -6009,10 +7828,19 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
+
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Send eviction with new_session_id == the SAME session (self-delivery)
         chat_server
@@ -6094,10 +7922,19 @@ mod tests {
                 instance_id: Some(instance_id.clone()),
                 is_host: false,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("JoinRoom should succeed")
             .expect("JoinRoom should return Ok");
+
+        // Activate so instance_index is populated (deferred from JoinRoom).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
 
         // Send eviction with DIFFERENT user_id (attacker scenario)
         chat_server
@@ -6217,6 +8054,27 @@ mod tests {
         }
     }
 
+    /// Drain `sub` for the full `deadline`, returning every payload received.
+    /// Unlike [`wait_for_first`] this does NOT stop at the first message, so it
+    /// can prove an event fired *exactly once* (and not once-per-disconnect).
+    async fn drain_all(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> Vec<Vec<u8>> {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        let start = Instant::now();
+        let mut out = Vec::new();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match timeout(remaining, sub.next()).await {
+                Ok(Some(msg)) => out.push(msg.payload.to_vec()),
+                _ => break,
+            }
+        }
+        out
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // TEST 1: Stable end_on_host_leave=true, host disconnects ->
     //         MEETING_ENDED broadcast AND internal.meeting_ended_by_host
@@ -6268,6 +8126,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6361,6 +8220,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: false,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6398,6 +8258,201 @@ mod tests {
         assert!(
             db_payload.is_none(),
             "internal.meeting_ended_by_host must NOT be published when no broadcast fires"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // EMPTY->IDLE TEST A: two non-host participants leave a meeting.
+    //         The became-empty event must fire EXACTLY ONCE — only after the
+    //         LAST participant leaves (room_members reaches zero), NOT once per
+    //         disconnect. This guards against an O(n) NATS storm on a mass
+    //         disconnect / reconnection wave.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_room_empty_publishes_idle_event_exactly_once() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-empty-idle-once";
+        let s1 = 9_700u64;
+        let s2 = 9_701u64;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        // Two participants join and activate.
+        for (sid, uid) in [(s1, "p1@example.com"), (s2, "p2@example.com")] {
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: uid.to_string(),
+                    display_name: uid.to_string(),
+                    is_guest: false,
+                    observer: false,
+                    instance_id: None,
+                    is_host: false,
+                    end_on_host_leave: false,
+                    transport: "websocket".to_string(),
+                })
+                .await
+                .expect("Message delivery should succeed")
+                .expect("JoinRoom should return Ok");
+            chat_server
+                .send(ActivateConnection { session: sid })
+                .await
+                .expect("ActivateConnection should succeed");
+        }
+        sleep(Duration::from_millis(300)).await;
+
+        // First participant leaves — room is NOT yet empty (s2 remains), so no
+        // became-empty event must fire.
+        chat_server
+            .send(Disconnect {
+                session: s1,
+                room: room.to_string(),
+                user_id: "p1@example.com".to_string(),
+                display_name: "p1@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait past the grace period for s1's departure to execute, then assert
+        // NO empty event yet.
+        let early = drain_all(&mut empty_sub, Duration::from_secs(5)).await;
+        assert!(
+            early.is_empty(),
+            "became-empty must NOT fire while a participant remains; got {} event(s)",
+            early.len()
+        );
+
+        // Second (last) participant leaves — room becomes empty now.
+        chat_server
+            .send(Disconnect {
+                session: s2,
+                room: room.to_string(),
+                user_id: "p2@example.com".to_string(),
+                display_name: "p2@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Drain the full window; expect exactly one became-empty event.
+        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "became-empty must fire EXACTLY ONCE when the room drains to empty, not once per \
+             disconnect; got {} event(s)",
+            events.len()
+        );
+        let parsed: MeetingBecameEmptyPayload =
+            serde_json::from_slice(&events[0]).expect("Payload should deserialize");
+        assert_eq!(parsed.room_id, room);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // EMPTY->IDLE TEST B: host leaves with end_on_host_leave=true. END must
+    //         win — the meeting ends, so the became-empty (idle) event must
+    //         NOT fire even though the room drained to empty.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_host_leave_eohl_true_does_not_emit_idle_event() {
+        use tokio::time::{sleep, Duration};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let room = "test-empty-idle-eohl-true";
+        let session_id = 9_702u64;
+
+        let mut empty_sub = nats_client
+            .subscribe(MEETING_BECAME_EMPTY_SUBJECT)
+            .await
+            .expect("Failed to subscribe to became-empty subject");
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host@example.com".to_string(),
+                display_name: "host@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: true,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        chat_server
+            .send(Disconnect {
+                session: session_id,
+                room: room.to_string(),
+                user_id: "host@example.com".to_string(),
+                display_name: "host@example.com".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: true,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // END wins: the host-leave path fires MEETING_ENDED + the ended-by-host
+        // event, NOT the became-empty idle event.
+        let events = drain_all(&mut empty_sub, Duration::from_secs(6)).await;
+        assert!(
+            events.is_empty(),
+            "became-empty (idle) must NOT fire when end_on_host_leave=true ends the meeting; \
+             got {} event(s)",
+            events.len()
         );
     }
 
@@ -6450,6 +8505,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6572,6 +8628,7 @@ mod tests {
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6621,6 +8678,7 @@ mod tests {
                 instance_id: Some("iid-reconnect-grace".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6691,6 +8749,7 @@ mod tests {
                 instance_id: None,
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6719,6 +8778,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6896,6 +8956,7 @@ mod tests {
                 instance_id: Some("inst-A".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -6927,6 +8988,7 @@ mod tests {
                 instance_id: Some("inst-B".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7053,6 +9115,7 @@ mod tests {
                 instance_id: Some("inst-laptop".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7077,6 +9140,7 @@ mod tests {
                 instance_id: Some("inst-phone".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7120,6 +9184,7 @@ mod tests {
                 instance_id: Some("inst-carol".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7187,6 +9252,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7212,6 +9278,7 @@ mod tests {
                 instance_id: None,
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7280,11 +9347,19 @@ mod tests {
                 instance_id: Some(iid.clone()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
             .expect("JoinRoom A should return Ok");
         sleep(Duration::from_millis(150)).await;
+
+        // Activate session A so it is registered in instance_index. Eviction
+        // during B's ActivateConnection needs the forward mapping to find A.
+        chat_server
+            .send(ActivateConnection { session: session_a })
+            .await
+            .expect("ActivateConnection A should succeed");
 
         // Session B with the SAME instance_id (in-tab transport reconnect).
         chat_server
@@ -7305,11 +9380,18 @@ mod tests {
                 instance_id: Some(iid),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
             .expect("JoinRoom B should return Ok");
         sleep(Duration::from_millis(150)).await;
+
+        // Activate session B — this triggers eviction of session A.
+        chat_server
+            .send(ActivateConnection { session: session_b })
+            .await
+            .expect("ActivateConnection B should succeed");
 
         let members = chat_server
             .send(GetRoomMembers {
@@ -7323,15 +9405,8 @@ mod tests {
             "In-tab reconnect (same instance_id) must still leave one member"
         );
         assert_eq!(members[0].session, session_b);
-
-        let suppressed = chat_server
-            .send(IsSuppressedJoinBroadcast { session: session_b })
-            .await
-            .expect("IsSuppressedJoinBroadcast should succeed");
-        assert!(
-            suppressed,
-            "In-tab reconnect should still suppress PARTICIPANT_JOINED"
-        );
+        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
+        // (the flag is removed when the broadcast is correctly skipped).
     }
 
     // ------------------------------------------------------------------
@@ -7398,6 +9473,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7446,6 +9522,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: true,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -7565,6 +9642,7 @@ mod tests {
                 instance_id: Some("iid-laptop".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery A")
@@ -7592,6 +9670,7 @@ mod tests {
                 instance_id: Some("iid-phone".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery B")
@@ -7694,6 +9773,7 @@ mod tests {
                     instance_id: Some(iid.to_string()),
                     is_host: false,
                     end_on_host_leave: true,
+                    transport: "websocket".to_string(),
                 })
                 .await
                 .expect("Delivery")
@@ -7781,6 +9861,7 @@ mod tests {
                     instance_id: Some(iid.to_string()),
                     is_host: false,
                     end_on_host_leave: true,
+                    transport: "websocket".to_string(),
                 })
                 .await
                 .expect("Delivery")
@@ -7889,6 +9970,7 @@ mod tests {
                 instance_id: Some("iid-A".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery A")
@@ -7932,6 +10014,7 @@ mod tests {
                 instance_id: Some("iid-B-fresh".to_string()),
                 is_host: false,
                 end_on_host_leave: true,
+                transport: "websocket".to_string(),
             })
             .await
             .expect("Delivery B")
@@ -8247,5 +10330,1354 @@ mod tests {
         ) -> Self::Result {
             MessageResult(self.room_policy.get(&msg.room).map(|p| p.end_on_host_leave))
         }
+    }
+
+    // ======================================================================
+    // Per-receiver simulcast LAYER selection (#989, Phase 1b)
+    // ======================================================================
+    //
+    // These exercise the layer-drop check in `handle_msg` (after the viewport
+    // filter) and the `try_intercept_layer_preference` control-packet
+    // interceptor in isolation. None require NATS.
+
+    #[actix_rt::test]
+    async fn test_handle_msg_empty_layer_prefs_is_noop_forward() {
+        // NO-OP-FIRST: with NO recorded layer preference, a simulcast VIDEO
+        // packet (layer != 0) is forwarded byte-identically to pre-#989.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(), // empty viewport = fail-open (forward all senders)
+            empty_layer_prefs(),       // empty prefs = no-op (forward all layers)
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "with no recorded layer preference, simulcast VIDEO MUST be forwarded (no-op)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_non_matching_layer() {
+        // Receiver wants layer 1 from source 999; a layer-2 packet from 999 is
+        // dropped.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "simulcast VIDEO whose layer != the recorded preference MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_forwards_matching_layer() {
+        // Receiver wants layer 2 from source 999; a layer-2 packet is forwarded.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "simulcast VIDEO whose layer matches the recorded preference MUST be forwarded"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_zero_always_forwarded() {
+        // simulcast_layer_id == 0 (base / un-upgraded publisher) is ALWAYS
+        // forwarded even when the receiver has a (non-zero) preference for the
+        // source. Layer 0 is the no-op gate on the media side.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 0),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "layer 0 (base) MUST always be forwarded regardless of preference"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_audio_not_filtered_by_video_preference() {
+        // Phase 3: layer prefs are keyed by (source, media_kind). An AUDIO
+        // packet is NOT filtered by a VIDEO-kind preference for the same source
+        // — the keys differ, so it fails open (forward). (Pre-Phase-3 this held
+        // because audio was excluded entirely; now it holds because of the
+        // per-kind key.)
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO)
+            "websocket".to_string(),
+        );
+
+        // AUDIO layer 2 with only a VIDEO preference for 999 → forward.
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::AUDIO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "AUDIO must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_non_matching_screen_layer() {
+        // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen
+        // layer 0 from source 999; a screen layer-2 packet is dropped.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 0)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "SCREEN whose layer != the recorded SCREEN preference MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_forwards_matching_screen_layer() {
+        // Phase 3: a SCREEN packet matching the recorded SCREEN preference is
+        // forwarded.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 1)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 1),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "matching SCREEN forwarded"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_drops_non_matching_audio_layer() {
+        // Phase 3: AUDIO is layer-filtered when an AUDIO-kind preference exists.
+        // Receiver wants audio layer 0 from 999; an audio layer-1 packet drops.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 2 /* AUDIO */, 0)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::AUDIO, 999, 1),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "AUDIO whose layer != the recorded AUDIO preference MUST be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_per_kind_independence_same_source() {
+        // Phase 3 core: camera VIDEO and SCREEN of the SAME source are addressed
+        // independently. Receiver wants VIDEO layer 2 but SCREEN layer 0 from
+        // 999. A VIDEO layer-2 packet forwards; a SCREEN layer-2 packet drops.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with_kinds(&[(999, 1 /* VIDEO */, 2), (999, 3 /* SCREEN */, 0)]),
+            "websocket".to_string(),
+        );
+
+        // VIDEO layer 2 matches the VIDEO pref → forward.
+        let video_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let vparsed = parse_pw(&video_msg);
+        handler(video_msg, vparsed.as_ref()).expect("ok");
+
+        // SCREEN layer 2 does NOT match the SCREEN pref (wants 0) → drop.
+        let screen_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let sparsed = parse_pw(&screen_msg);
+        handler(screen_msg, sparsed.as_ref()).expect("ok");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "VIDEO forwarded + SCREEN dropped independently for the same source"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_unknown_source_layer_fails_open() {
+        // Receiver has a preference for source 999, but a layer-2 packet for a
+        // DIFFERENT source (777) has no recorded preference → fail-open
+        // (forward).
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.777",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 777, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a source with no recorded layer preference MUST fail open (forward)"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_records_own_map() {
+        // A LAYER_PREFERENCE on the receiver's OWN subject updates the map.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes(100, &[(200, 1), (300, 2)]),
+        );
+        let parsed = parse_pw(&msg);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        );
+        assert!(
+            intercepted,
+            "LAYER_PREFERENCE packet must be intercepted (dropped)"
+        );
+        // The lock-free hot-path hint must be raised once a preference is
+        // recorded, so the forwarding path stops taking the empty-prefs fast
+        // path and consults the map.
+        assert!(
+            prefs.has_any(),
+            "non_empty hint must be set after an accepted update"
+        );
+        let st = prefs.state.read().unwrap();
+        // Phase 3: entries without media_kind default to the VIDEO(1) key.
+        assert_eq!(st.layers.get(&(200, 1)), Some(&1));
+        assert_eq!(st.layers.get(&(300, 1)), Some(&2));
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_records_per_media_kind() {
+        // Phase 3: an Entry's media_kind is recorded as part of the key, so the
+        // SAME source can carry distinct preferences for VIDEO vs SCREEN vs
+        // AUDIO, and UNSPECIFIED(0) maps to the VIDEO key (back-compat).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 0 /* UNSPECIFIED → VIDEO */, 1),
+                    (200, 3 /* SCREEN */, 0),
+                    (200, 2 /* AUDIO */, 0),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        let st = prefs.state.read().unwrap();
+        assert_eq!(
+            st.layers.get(&(200, 1)),
+            Some(&1),
+            "UNSPECIFIED keys as VIDEO"
+        );
+        assert_eq!(
+            st.layers.get(&(200, 3)),
+            Some(&0),
+            "SCREEN keyed distinctly"
+        );
+        assert_eq!(st.layers.get(&(200, 2)), Some(&0), "AUDIO keyed distinctly");
+        assert_eq!(st.layers.len(), 3, "three independent (source,kind) keys");
+    }
+
+    #[test]
+    fn test_layer_prefs_empty_hint_is_false_by_default() {
+        // The empty-prefs fast path depends on the hint being false until the
+        // first accepted update — this is what keeps the no-preference interim
+        // lock-free.
+        let prefs = LayerPrefs::default();
+        assert!(
+            !prefs.has_any(),
+            "a fresh LayerPrefs must report has_any() == false (empty-prefs fast path)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_empty_prefs_fast_path_forwards_nonzero_layer() {
+        // Explicit coverage of the lock-free empty-prefs early-out: a non-zero
+        // simulcast layer with NO recorded preference is forwarded (no-op),
+        // exercising the `has_any() == false` short-circuit.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let prefs = empty_layer_prefs();
+        assert!(!prefs.has_any(), "precondition: prefs start empty");
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            prefs,
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 3),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "empty-prefs fast path MUST forward a non-zero-layer VIDEO packet"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_other_subject_does_not_mutate() {
+        // A LAYER_PREFERENCE that arrived on a DIFFERENT publisher's subject is
+        // dropped but MUST NOT mutate this receiver's map. This is the
+        // field-5 / forged-payload trust boundary (#993): a forged value can
+        // only self-degrade the forger's OWN view.
+        let prefs = layer_prefs_with(&[(200, 1)]);
+        let self_subject = self_subject_for("r", 100);
+        // Packet arrived on session 555's subject (forging owner=100 in the
+        // payload), not ours (100).
+        let msg = make_nats_message(
+            "room.r.555",
+            make_layer_preference_packet_bytes(100, &[(200, 9), (999, 3)]),
+        );
+        let parsed = parse_pw(&msg);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        );
+        assert!(intercepted, "LAYER_PREFERENCE must still be consumed");
+        let st = prefs.state.read().unwrap();
+        assert_eq!(
+            st.layers.get(&(200, 1)),
+            Some(&1),
+            "another session's LAYER_PREFERENCE MUST NOT overwrite our map"
+        );
+        assert!(
+            !st.layers.contains_key(&(999, 1)),
+            "another session's LAYER_PREFERENCE MUST NOT add entries to our map"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_non_layer_packet_falls_through() {
+        // A non-LAYER_PREFERENCE packet returns false (caller falls through to
+        // handle_msg) and does not touch the map.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 100, 1),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(
+            !try_intercept_layer_preference(
+                &msg,
+                parsed.as_ref(),
+                &self_subject,
+                &prefs,
+                "r",
+                &|_| {},
+                100,
+            ),
+            "non-LAYER_PREFERENCE packet must fall through (return false)"
+        );
+        assert!(prefs.state.read().unwrap().layers.is_empty());
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_caps_entries() {
+        // A LAYER_PREFERENCE with more than LAYER_PREFERENCE_MAX_ENTRIES entries
+        // is truncated to the cap (DoS guard).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let big: Vec<(u64, u32)> = (0..(LAYER_PREFERENCE_MAX_ENTRIES as u64 + 50))
+            .map(|i| (1000 + i, 1u32))
+            .collect();
+        let msg = make_nats_message(&self_subject, make_layer_preference_packet_bytes(100, &big));
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        assert_eq!(
+            prefs.state.read().unwrap().layers.len(),
+            LAYER_PREFERENCE_MAX_ENTRIES,
+            "accepted entries must be capped at LAYER_PREFERENCE_MAX_ENTRIES"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_bounds_desired_layer() {
+        // #1082 defense-in-depth: an entry whose `desired_layer` exceeds
+        // LAYER_PREFERENCE_MAX_LAYER_ID is SKIPPED (not recorded), while
+        // in-bound entries in the SAME packet are still recorded. Skipping is
+        // fail-open per source: the out-of-bound source has no recorded
+        // preference, so the forwarding path forwards all its layers (base-and-up)
+        // exactly as if no preference had been sent for it.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+
+        // Source 200: in-bound layer (1) → recorded.
+        // Source 300: at the exact bound → recorded (inclusive upper bound).
+        // Source 400: one past the bound → skipped.
+        // Source 500: wildly forged u32::MAX → skipped.
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 1 /* VIDEO */, 1),
+                    (300, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID),
+                    (400, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1),
+                    (500, 1 /* VIDEO */, u32::MAX),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        let st = prefs.state.read().unwrap();
+        assert_eq!(
+            st.layers.get(&(200, 1)),
+            Some(&1),
+            "in-bound desired_layer must be recorded"
+        );
+        assert_eq!(
+            st.layers.get(&(300, 1)),
+            Some(&LAYER_PREFERENCE_MAX_LAYER_ID),
+            "desired_layer at the exact bound must be recorded (inclusive)"
+        );
+        assert!(
+            !st.layers.contains_key(&(400, 1)),
+            "desired_layer one past the bound must be SKIPPED (not recorded)"
+        );
+        assert!(
+            !st.layers.contains_key(&(500, 1)),
+            "forged u32::MAX desired_layer must be SKIPPED (not recorded)"
+        );
+        assert_eq!(
+            st.layers.len(),
+            2,
+            "exactly the two in-bound entries are recorded"
+        );
+        assert!(
+            prefs.has_any(),
+            "the non-empty hint must reflect the recorded in-bound entries"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_all_out_of_bound_records_nothing() {
+        // #1082: a packet whose every entry is out-of-bound records NOTHING and
+        // leaves the session in the empty / fail-open state (the non-empty hint
+        // stays false), so the forwarding path is byte-identical to no-preference.
+        // Subject ownership is still honored (the packet arrived on self_subject).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes_kinded(
+                100,
+                &[
+                    (200, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1),
+                    (300, 2 /* AUDIO */, u32::MAX),
+                ],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "an all-out-of-bound packet must record no entries (fail-open)"
+        );
+        assert!(
+            !prefs.has_any(),
+            "the non-empty hint must stay false when nothing is recorded"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_out_of_bound_other_subject_ignored() {
+        // #1082 + subject-authoritative: an out-of-bound (or any) entry arriving
+        // on a DIFFERENT subject than self_subject is dropped without mutating
+        // state — the bound check never even runs for non-owned packets.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let other_subject = self_subject_for("r", 999);
+        let msg = make_nats_message(
+            &other_subject,
+            make_layer_preference_packet_bytes_kinded(
+                999,
+                &[(200, 1 /* VIDEO */, LAYER_PREFERENCE_MAX_LAYER_ID + 1)],
+            ),
+        );
+        let parsed = parse_pw(&msg);
+        // Consumed (true) but never recorded — ownership decided by subject.
+        assert!(try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "a LAYER_PREFERENCE on another subject must never mutate our map"
+        );
+    }
+
+    #[test]
+    fn test_intercept_layer_preference_rate_limited() {
+        // A second update within LAYER_PREFERENCE_MIN_UPDATE_INTERVAL is
+        // consumed but ignored (the map keeps the first update's contents).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+
+        let msg1 = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes(100, &[(200, 1)]),
+        );
+        let parsed1 = parse_pw(&msg1);
+        assert!(try_intercept_layer_preference(
+            &msg1,
+            parsed1.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        assert_eq!(prefs.state.read().unwrap().layers.get(&(200, 1)), Some(&1));
+
+        // Immediate second update (well within the rate-limit window).
+        let msg2 = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes(100, &[(200, 5)]),
+        );
+        let parsed2 = parse_pw(&msg2);
+        assert!(try_intercept_layer_preference(
+            &msg2,
+            parsed2.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| {},
+            100,
+        ));
+        assert_eq!(
+            prefs.state.read().unwrap().layers.get(&(200, 1)),
+            Some(&1),
+            "rate-limited update must NOT mutate the map"
+        );
+    }
+
+    // ======================================================================
+    // Publish-side layer suppression — per-source layer union + debounce
+    // (#1108, Stage 3 — LAYER_HINT)
+    // ======================================================================
+    //
+    // These exercise the relay-side union computation, the change-detection used
+    // to trigger recomputes, the suppress-lazy / restore-eager debounce state
+    // machine, and the forge-resistance guarantee (no inbound LAYER_HINT ingest).
+    // They test the PURE functions directly and therefore need neither NATS nor a
+    // running actor.
+
+    /// One `(source_session, media_kind, desired_layer)` preference entry, as
+    /// consumed by [`layer_prefs_with_kinds`]. Aliased to keep the union-test
+    /// helper signatures under clippy's type-complexity threshold.
+    type LayerEntrySpec = (u64, i32, u32);
+    /// One receiver's spec: its session id plus the entries it has recorded.
+    type ReceiverSpec<'a> = (SessionId, &'a [LayerEntrySpec]);
+
+    /// Build a receiver-keyed prefs map from `(receiver, &[(source, kind, layer)])`
+    /// specs, mirroring the real `session_layer_prefs` shape. A receiver listed
+    /// with an EMPTY slice has a `LayerPrefs` whose map is empty (still a recorded
+    /// session, but no preference for any source → fail-open per (source,kind)).
+    fn receivers_map(specs: &[ReceiverSpec<'_>]) -> HashMap<SessionId, LayerPrefs> {
+        specs
+            .iter()
+            .map(|&(receiver, entries)| (receiver, layer_prefs_with_kinds(entries)))
+            .collect()
+    }
+
+    const VIDEO_KIND: i32 = 1;
+
+    #[test]
+    fn test_union_max_over_receivers() {
+        // Three receivers want layers {2, 1, 2} of source 900's VIDEO. The union
+        // (max) is 2.
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 2)]),
+            (2, &[(900, VIDEO_KIND, 1)]),
+            (3, &[(900, VIDEO_KIND, 2)]),
+        ]);
+        let members = [900, 1, 2, 3];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(union, 2, "union of {{2,1,2}} must be 2");
+    }
+
+    #[test]
+    fn test_union_fail_open_on_absent_entry() {
+        // Receiver 1 wants base (0); receiver 2 has NO recorded entry for source
+        // 900 (fail-open = wants the full ladder). The union must be the
+        // full-ladder sentinel, i.e. "suppress nothing".
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 0)]),
+            (2, &[(901, VIDEO_KIND, 0)]), // a pref for a DIFFERENT source only
+        ]);
+        let members = [900, 1, 2];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a receiver with no entry for (source,kind) is fail-open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_union_fail_open_on_missing_prefs_map() {
+        // A member with NO LayerPrefs entry at all (never recorded a single
+        // preference packet) is fail-open too.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 0)])]);
+        // Member 2 is in the room but absent from the prefs map entirely.
+        let members = [900, 1, 2];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a member with no prefs map entry is fail-open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_union_all_base_is_zero() {
+        // Every receiver explicitly wants base (0) → union 0 (fully suppressible).
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 0)]),
+            (2, &[(900, VIDEO_KIND, 0)]),
+            (3, &[(900, VIDEO_KIND, 0)]),
+        ]);
+        let members = [900, 1, 2, 3];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(union, 0, "when every receiver wants base the union is 0");
+    }
+
+    #[test]
+    fn test_union_skips_source_itself() {
+        // The source is not its own receiver: even if a (bogus) self entry exists
+        // it must not be counted. Here only the source has any entry, so the union
+        // over the *other* members (none) is 0.
+        let prefs = receivers_map(&[(900, &[(900, VIDEO_KIND, 2)])]);
+        let members = [900];
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, 0,
+            "the source's own entry must be skipped (a publisher is not its own receiver)"
+        );
+    }
+
+    #[test]
+    fn test_union_per_kind_independent() {
+        // The same source can carry distinct unions per media kind. Receivers
+        // want VIDEO {2,1} but SCREEN {0,0}; the VIDEO union is 2 while the
+        // SCREEN union is 0.
+        const SCREEN_KIND: i32 = 3;
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 2), (900, SCREEN_KIND, 0)]),
+            (2, &[(900, VIDEO_KIND, 1), (900, SCREEN_KIND, 0)]),
+        ]);
+        let members = [900, 1, 2];
+        assert_eq!(
+            compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND),
+            2,
+            "VIDEO union"
+        );
+        assert_eq!(
+            compute_max_requested_layer(&members, &prefs, 900, SCREEN_KIND),
+            0,
+            "SCREEN union is independent of VIDEO"
+        );
+    }
+
+    #[test]
+    fn test_union_disconnect_full_wanter_shrinks() {
+        // Before: receivers {1: layer 1, 2: full-ladder (no entry)} → union is the
+        // sentinel (fail-open). After receiver 2 (the full-ladder wanter) leaves,
+        // only receiver 1 remains and the union shrinks to 1.
+        let prefs = receivers_map(&[
+            (1, &[(900, VIDEO_KIND, 1)]),
+            (2, &[(901, VIDEO_KIND, 0)]), // no entry for 900 → fail-open for 900
+        ]);
+        let before = compute_max_requested_layer(&[900, 1, 2], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            before, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "with a fail-open receiver present the union is the full-ladder sentinel"
+        );
+        // Receiver 2 has left → it is no longer in the member list.
+        let after = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            after, 1,
+            "after the full-ladder receiver leaves, the union shrinks to the remaining max (1)"
+        );
+    }
+
+    #[test]
+    fn test_union_disconnect_base_wanter_unchanged() {
+        // Before: receivers {1: layer 2, 2: base 0} → union 2. After receiver 2
+        // (the base wanter, which was NOT the constraining max) leaves, the union
+        // is still 2.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 2)]), (2, &[(900, VIDEO_KIND, 0)])]);
+        let before = compute_max_requested_layer(&[900, 1, 2], &prefs, 900, VIDEO_KIND);
+        assert_eq!(before, 2);
+        let after = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            after, 2,
+            "removing a non-max (base) receiver leaves the union unchanged"
+        );
+    }
+
+    #[test]
+    fn test_union_dos_cap_truncates_fail_open() {
+        // A room larger than the scan cap fails open on the remainder: even if
+        // every scanned receiver wants base, the un-scanned tail is treated as
+        // wanting the full ladder, so the union is the sentinel. Build cap+2
+        // base-wanting receivers (ids 1..=cap+2) plus the source.
+        let cap = LAYER_HINT_MAX_RECEIVERS_SCANNED;
+        let specs: Vec<(SessionId, Vec<LayerEntrySpec>)> = (1..=(cap as u64 + 2))
+            .map(|r| (r, vec![(900u64, VIDEO_KIND, 0u32)]))
+            .collect();
+        let prefs: HashMap<SessionId, LayerPrefs> = specs
+            .iter()
+            .map(|(r, e)| (*r, layer_prefs_with_kinds(e)))
+            .collect();
+        let mut members: Vec<SessionId> = vec![900];
+        members.extend(1..=(cap as u64 + 2));
+        let union = compute_max_requested_layer(&members, &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "scanning past the DoS cap must fail open (treat the tail as full-ladder)"
+        );
+    }
+
+    #[test]
+    fn test_union_poisoned_lock_fails_open() {
+        // A receiver whose prefs RwLock is POISONED contributes the full-ladder
+        // sentinel (fail-open), mirroring the forwarding filter's `unwrap_or`.
+        let prefs = receivers_map(&[(1, &[(900, VIDEO_KIND, 0)])]);
+        // Poison receiver 1's lock by panicking while holding the write guard.
+        let target = prefs.get(&1).unwrap().clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = target.state.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        }));
+        assert!(
+            prefs.get(&1).unwrap().state.read().is_err(),
+            "precondition: receiver 1's lock is poisoned"
+        );
+        let union = compute_max_requested_layer(&[900, 1], &prefs, 900, VIDEO_KIND);
+        assert_eq!(
+            union, LAYER_HINT_FULL_LADDER_SENTINEL,
+            "a poisoned receiver lock must fail open → full ladder"
+        );
+    }
+
+    #[test]
+    fn test_changed_pref_sources_detects_add_remove_change() {
+        let mut old: HashMap<(u64, i32), u32> = HashMap::new();
+        old.insert((900, VIDEO_KIND), 2);
+        old.insert((901, VIDEO_KIND), 1);
+        old.insert((902, VIDEO_KIND), 0);
+
+        let mut new = old.clone();
+        new.insert((900, VIDEO_KIND), 0); // changed value for 900
+        new.remove(&(901, VIDEO_KIND)); // removed 901 (reverts to fail-open)
+        new.insert((903, VIDEO_KIND), 1); // added 903
+                                          // 902 unchanged
+
+        let mut changed = changed_pref_sources(&old, &new);
+        changed.sort_unstable();
+        assert_eq!(
+            changed,
+            vec![900, 901, 903],
+            "changed set must include value-change (900), removal (901), and add (903) — not the unchanged 902"
+        );
+    }
+
+    #[test]
+    fn test_changed_pref_sources_no_change_is_empty() {
+        let mut map: HashMap<(u64, i32), u32> = HashMap::new();
+        map.insert((900, VIDEO_KIND), 2);
+        let changed = changed_pref_sources(&map, &map.clone());
+        assert!(
+            changed.is_empty(),
+            "identical maps yield no changed sources (change-detect skip)"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_restore_is_eager() {
+        // A higher union than last emitted is emitted IMMEDIATELY (restore-eager),
+        // even with a long debounce window and zero elapsed time.
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let prev = Some(LayerHintEmitState {
+            last_emitted: 1,
+            pending_lower_since: None,
+        });
+        let decision = decide_layer_hint(prev, 3, now, window);
+        assert_eq!(
+            decision,
+            LayerHintDecision::Emit {
+                value: 3,
+                direction: LayerHintDirection::Restore
+            },
+            "a higher union must emit immediately (restore-eager)"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_unchanged_is_skip() {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let prev = Some(LayerHintEmitState {
+            last_emitted: 2,
+            pending_lower_since: None,
+        });
+        assert_eq!(
+            decide_layer_hint(prev, 2, now, window),
+            LayerHintDecision::SkipClearPending,
+            "an unchanged union must be skipped (change-detect) and clear any pending downgrade"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_lower_schedules_then_emits_after_window() {
+        // Suppress-lazy: the FIRST observation of a lower union schedules a
+        // re-check (no emit). Once the window has fully elapsed, the lower hint is
+        // emitted as a suppress.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+
+        // No prior state → assumed full-ladder. A concrete lower union (1) is a
+        // downgrade and must first SCHEDULE.
+        let first = decide_layer_hint(None, 1, t0, window);
+        match first {
+            LayerHintDecision::ScheduleRecheck { deadline } => {
+                assert_eq!(deadline, t0 + window, "deadline is now + window");
+            }
+            other => panic!("first lower observation must ScheduleRecheck, got {other:?}"),
+        }
+
+        // Simulate the actor having recorded the pending timestamp at t0, then the
+        // re-check firing AFTER the window: it must now EMIT (suppress).
+        let pending = Some(LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        });
+        let after = decide_layer_hint(pending, 1, t0 + window, window);
+        assert_eq!(
+            after,
+            LayerHintDecision::Emit {
+                value: 1,
+                direction: LayerHintDirection::Suppress
+            },
+            "after the stability window the lower union emits as a suppress"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_lower_within_window_is_skip() {
+        // While a downgrade is pending but the window has NOT elapsed, decisions
+        // skip (keep waiting) — this is what collapses a rapid flap into a single
+        // eventual lower hint instead of one per change.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+        let pending = Some(LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        });
+        // Half a window later — still pending.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(pending, 1, mid, window),
+            LayerHintDecision::SkipKeepPending,
+            "a still-pending downgrade within the window must keep waiting (debounce)"
+        );
+        // A DIFFERENT lower value mid-window also keeps waiting (does not reset to
+        // a fresh schedule, does not emit early).
+        assert_eq!(
+            decide_layer_hint(pending, 0, mid, window),
+            LayerHintDecision::SkipKeepPending,
+            "a changed-but-still-lower value mid-window keeps waiting"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_flap_back_up_cancels_suppress() {
+        // Rapid flap: union drops (schedule), then RISES back to/above the last
+        // emitted before the window elapses. The rise emits eagerly as a restore,
+        // and there is no lingering suppress. This proves the eager-up path wins
+        // over a pending downgrade.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+        // Pending downgrade from full-ladder to 1, recorded at t0.
+        let pending = Some(LayerHintEmitState {
+            last_emitted: 2,
+            pending_lower_since: Some(t0),
+        });
+        // Mid-window the union jumps to 3 (> last_emitted 2): restore-eager.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(pending, 3, mid, window),
+            LayerHintDecision::Emit {
+                value: 3,
+                direction: LayerHintDirection::Restore
+            },
+            "a mid-window rise above last_emitted emits a restore immediately"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_first_full_ladder_is_skip() {
+        // No prior state and the union is ALREADY the full ladder (the fail-open
+        // default the publisher is assumed to be encoding): nothing to say → skip.
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        assert_eq!(
+            decide_layer_hint(None, LAYER_HINT_FULL_LADDER_SENTINEL, now, window),
+            LayerHintDecision::SkipClearPending,
+            "a first observation equal to the assumed full-ladder baseline is a no-op"
+        );
+    }
+
+    #[test]
+    fn test_decide_layer_hint_cancelled_downgrade_re_debounces() {
+        // Regression guard for the stale-`pending_lower_since` bug: a downgrade
+        // that is CANCELLED by demand returning to the emitted level must reset
+        // the pending state, so a LATER downgrade starts a FRESH debounce window
+        // instead of emitting a suppress immediately.
+        let window = std::time::Duration::from_millis(LAYER_HINT_SUPPRESS_DEBOUNCE_MS);
+        let t0 = std::time::Instant::now();
+
+        // 1) Downgrade observed at t0 → schedule (pending set to t0 by the actor).
+        assert!(matches!(
+            decide_layer_hint(None, 1, t0, window),
+            LayerHintDecision::ScheduleRecheck { .. }
+        ));
+        let pending = LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: Some(t0),
+        };
+
+        // 2) Mid-window the union returns to the full-ladder baseline (==
+        //    last_emitted): the decision is SkipClearPending, and the actor clears
+        //    `pending_lower_since`.
+        let mid = t0 + window / 2;
+        assert_eq!(
+            decide_layer_hint(Some(pending), LAYER_HINT_FULL_LADDER_SENTINEL, mid, window),
+            LayerHintDecision::SkipClearPending,
+            "demand returning to baseline must cancel the pending downgrade"
+        );
+        let cleared = LayerHintEmitState {
+            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+            pending_lower_since: None,
+        };
+
+        // 3) Much LATER (well beyond the original window) the union drops again.
+        //    Because pending was cleared, this is a FIRST downgrade observation
+        //    again → ScheduleRecheck, NOT an immediate suppress emit. This is the
+        //    behaviour the bug would have broken.
+        let much_later = t0 + window * 5;
+        assert!(
+            matches!(
+                decide_layer_hint(Some(cleared), 1, much_later, window),
+                LayerHintDecision::ScheduleRecheck { .. }
+            ),
+            "a downgrade after a cancelled one must re-debounce (not bypass the window)"
+        );
+    }
+
+    #[test]
+    fn test_layer_hint_forge_resistance_no_inbound_ingest() {
+        // FORGE RESISTANCE (security): a LAYER_HINT packet arriving on a session
+        // subject MUST NOT be interpreted as a hint and MUST NOT mutate any
+        // union/preference state. The LAYER_PREFERENCE interceptor — the ONLY
+        // path that records union inputs — must FALL THROUGH (return false) for a
+        // LAYER_HINT, never recording anything, and never invoking the recompute
+        // sink. There is no try_intercept_layer_hint at all.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+
+        // Craft a LAYER_HINT wrapper (as a malicious client might) carrying a
+        // bogus payload, delivered on the receiver's OWN subject.
+        let mut inner = LayerHintPacket::new();
+        let mut entry = LayerHintEntry::new();
+        entry.media_kind =
+            videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind::VIDEO.into();
+        entry.max_requested_layer = 0; // "suppress everything" — must be ignored
+        inner.entries.push(entry);
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::LAYER_HINT.into();
+        pw.session_id = 100;
+        pw.data = inner.write_to_bytes().unwrap();
+        let bytes = pw.write_to_bytes().unwrap();
+        let msg = make_nats_message(&self_subject, bytes);
+        let parsed = parse_pw(&msg);
+
+        // Track whether the recompute sink is (wrongly) invoked.
+        let recompute_calls = std::cell::Cell::new(0u32);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| recompute_calls.set(recompute_calls.get() + 1),
+            100,
+        );
+
+        assert!(
+            !intercepted,
+            "a LAYER_HINT must FALL THROUGH the LAYER_PREFERENCE interceptor (return false) — \
+             it is not a preference and there is no inbound LAYER_HINT path"
+        );
+        assert!(
+            prefs.state.read().unwrap().layers.is_empty(),
+            "a forged LAYER_HINT must NOT record any preference / union input"
+        );
+        assert!(
+            !prefs.has_any(),
+            "a forged LAYER_HINT must not raise the recorded-prefs hint"
+        );
+        assert_eq!(
+            recompute_calls.get(),
+            0,
+            "a forged LAYER_HINT must never trigger a layer-hint recompute"
+        );
+    }
+
+    #[test]
+    fn test_layer_preference_triggers_recompute_for_changed_source_only() {
+        // A genuine LAYER_PREFERENCE on the OWN subject records the map AND invokes
+        // the recompute sink once per CHANGED source — proving the per-source
+        // trigger (checklist item 5) fires with the right source set.
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            &self_subject,
+            make_layer_preference_packet_bytes(100, &[(200, 1), (300, 2)]),
+        );
+        let parsed = parse_pw(&msg);
+
+        let recomputed: std::cell::RefCell<Vec<Option<SessionId>>> =
+            std::cell::RefCell::new(Vec::new());
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|m: RecomputeLayerHints| recomputed.borrow_mut().push(m.source),
+            100,
+        );
+        assert!(intercepted, "a LAYER_PREFERENCE must be intercepted");
+
+        let mut sources: Vec<u64> = recomputed
+            .borrow()
+            .iter()
+            .map(|s| s.expect("per-source trigger must carry Some(source)"))
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            vec![200, 300],
+            "recording two new sources must trigger a per-source recompute for each"
+        );
+    }
+
+    #[test]
+    fn test_layer_preference_other_subject_does_not_trigger_recompute() {
+        // A LAYER_PREFERENCE on a DIFFERENT subject is dropped without mutating
+        // state AND without triggering any recompute (the union must never be
+        // built from a non-subject-authoritative packet).
+        let prefs = LayerPrefs::default();
+        let self_subject = self_subject_for("r", 100);
+        let msg = make_nats_message(
+            "room.r.555",
+            make_layer_preference_packet_bytes(100, &[(200, 1)]),
+        );
+        let parsed = parse_pw(&msg);
+        let recompute_calls = std::cell::Cell::new(0u32);
+        let intercepted = try_intercept_layer_preference(
+            &msg,
+            parsed.as_ref(),
+            &self_subject,
+            &prefs,
+            "r",
+            &|_| recompute_calls.set(recompute_calls.get() + 1),
+            100,
+        );
+        assert!(intercepted, "still consumed");
+        assert_eq!(
+            recompute_calls.get(),
+            0,
+            "a foreign-subject LAYER_PREFERENCE must NOT trigger a recompute"
+        );
+        assert!(prefs.state.read().unwrap().layers.is_empty());
+    }
+
+    #[test]
+    fn test_layer_hint_media_kind_mapping() {
+        use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind as HintKind;
+        assert_eq!(layer_hint_media_kind(1), HintKind::VIDEO);
+        assert_eq!(layer_hint_media_kind(2), HintKind::AUDIO);
+        assert_eq!(layer_hint_media_kind(3), HintKind::SCREEN);
+        assert_eq!(layer_hint_media_kind(0), HintKind::MEDIA_KIND_UNSPECIFIED);
+        assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
     }
 }

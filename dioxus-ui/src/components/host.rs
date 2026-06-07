@@ -20,8 +20,8 @@ use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
-    save_performance_preference, save_receive_preference, KindReceivePref, PerformancePreference,
-    ReceivedReader, ScreenSnapshotReader, SnapshotReader,
+    save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
+    PerformancePreference, ReceivedReader, ScreenSnapshotReader, SimulcastSummary, SnapshotReader,
 };
 use crate::constants::*;
 use crate::context::{
@@ -30,7 +30,6 @@ use crate::context::{
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
-use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::Callback as VcCallback;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
@@ -38,7 +37,6 @@ use videocall_client::{
     initial_screen_tier, CameraEncoder, MediaDeviceList, PrefMediaKind, ScreenEncoder,
     ScreenShareEvent,
 };
-use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -241,6 +239,16 @@ pub fn Host(
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
         screen.set_reelection_completed_signal(client.reelection_completed_signal());
 
+        // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
+        // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
+        // u32::MAX fail-open sentinel) and its AQ control loop reads it; here we
+        // hand the SAME atom to the client so the inbound LAYER_HINT dispatch arm
+        // writes the relay's per-source max-requested-layer into it. This is the
+        // inverse of the keyframe-flag wiring (atom owned by the encoder, not the
+        // client). The client also resets these atoms to u32::MAX on reconnect.
+        client.set_camera_union_requested_layer(camera.shared_union_requested_layer());
+        client.set_screen_union_requested_layer(screen.shared_union_requested_layer());
+
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(
             camera.shared_video_tier_index(),
@@ -262,16 +270,13 @@ pub fn Host(
             camera.shared_dwell_samples(),
         );
 
-        // Wire up encoder controls. The microphone encoder no longer needs
-        // its own diagnostics channel — it reads audio tier settings from
-        // the camera encoder's shared atomics.
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
-        camera.set_encoder_control(rx);
-
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
-        screen.set_encoder_control(rx);
+        // Wire up encoder controls. Issue #1108: the encoder AQ is now a
+        // self-timer driven by the sender's OWN encoder backpressure — it no
+        // longer subscribes to receiver-reported diagnostics, so there are no
+        // diagnostics channels to wire here. (The microphone encoder still reads
+        // audio tier settings from the camera encoder's shared atomics.)
+        camera.set_encoder_control();
+        screen.set_encoder_control();
 
         // Apply the user's persisted performance (quality-bounds) preference
         // (issue #961) before the encoder starts, so the very first encode honors
@@ -804,6 +809,51 @@ pub fn Host(
         })
     };
 
+    // Live simulcast/AQ diagnostics reader for the Performance panel's "Live
+    // diagnostics" disclosure (#1095). Built once per mount (stable `Rc`s) so the
+    // panel prop is `PartialEq`-stable. The effective-setting summary is computed
+    // here (same `min(flag, capability)` rule the encoders are constructed with);
+    // the SEND/RECEIVE closures read the live encoder atomics / client per-peer
+    // state on each poll.
+    let diagnostics_reader: DiagnosticsReader = {
+        let state = state.clone();
+        let client = client.clone();
+        use_hook(move || {
+            let flag = experimental_simulcast_max_layers();
+            let video_capability =
+                crate::components::capability_check::capability_max_simulcast_layers();
+            let audio_capability = videocall_client::max_layers_for_kind(PrefMediaKind::Audio);
+            let summary = SimulcastSummary {
+                flag,
+                video_capability,
+                audio_capability,
+                effective_video: flag.min(video_capability),
+                effective_audio: flag.min(audio_capability),
+            };
+            let state_v = state.clone();
+            let state_s = state.clone();
+            DiagnosticsReader {
+                summary,
+                // Gate the camera snapshot on the camera being enabled, mirroring
+                // the quality needle (and the screen path below). The encoder's
+                // `live_simulcast_snapshot()` keys off the STATIC effective layer
+                // count and its active-layer/bitrate atomics are not reset on
+                // `set_enabled(false)`/`stop`, so without this gate the footer
+                // would render stale "N of M layers active" with the camera off.
+                send_video: Rc::new(move || {
+                    let s = state_v.borrow();
+                    if s.prev_video_enabled {
+                        Some(s.camera.live_simulcast_snapshot())
+                    } else {
+                        None
+                    }
+                }),
+                send_screen: Rc::new(move || state_s.borrow().screen.live_simulcast_snapshot()),
+                per_peer_receive: Rc::new(move || client.per_peer_received_snapshots()),
+            }
+        })
+    };
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -875,6 +925,7 @@ pub fn Host(
             let read_screen_snap = read_screen_snapshot.clone();
             let on_recv = on_receive_change.clone();
             let recv_reader = received_reader.clone();
+            let diag_reader = diagnostics_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -898,6 +949,7 @@ pub fn Host(
                     receive_preference: receive_preference(),
                     on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
                     received_reader: recv_reader.clone(),
+                    diagnostics_reader: diag_reader.clone(),
                 }
             }
         }

@@ -802,6 +802,34 @@ lazy_static! {
     )
     .expect("Failed to create relay_layer_preference_updates_total metric");
 
+    /// LAYER_HINT control-packets the relay EMITTED to publishers, per room
+    /// (#1108, Stage 3 — publish-side layer suppression).
+    ///
+    /// Mirrors [`RELAY_LAYER_PREFERENCE_UPDATES_TOTAL`] but for the OUTBOUND
+    /// (relay -> publisher) direction: it counts every LAYER_HINT the relay
+    /// publishes to a publisher's own self-subject after a per-source layer-union
+    /// recompute decided the publisher's encode set should change. Without this
+    /// the suppress/restore decisions (and the debounce) would fire silently.
+    ///
+    /// `direction` is bounded — exactly 2 values:
+    /// - `suppress`: a LOWER union than the publisher was last told to encode —
+    ///   emitted only after the suppress-lazy debounce window
+    ///   ([`crate::constants::LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]) so flaps do not
+    ///   thrash a publisher's encoder.
+    /// - `restore`:  a HIGHER union (a receiver wants more, or a constraining
+    ///   receiver left) — emitted IMMEDIATELY (restore-eager), never debounced.
+    ///
+    /// Change-detected, unchanged-skip emissions are NOT counted (nothing is
+    /// sent). CARDINALITY: bounded — `room` × 2 directions. No per-source/session
+    /// label (session IDs churn on reconnect, exactly as for the layer-filter
+    /// counters above).
+    pub static ref RELAY_LAYER_HINT_EMITTED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_layer_hint_emitted_total",
+        "LAYER_HINT control-packets emitted by the relay to publishers per room (suppress|restore) (#1108)",
+        &["room", "direction"]
+    )
+    .expect("Failed to create relay_layer_hint_emitted_total metric");
+
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
         "relay_outbound_queue_depth",

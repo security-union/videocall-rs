@@ -26,12 +26,11 @@ use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
-use crate::decode::peer_decode_manager::PeerDecodeError;
+use crate::decode::peer_decode_manager::{PeerDecodeError, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc::UnboundedSender;
 use futures::future::LocalBoxFuture;
 use gloo_timers::callback::Timeout;
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
@@ -53,6 +52,7 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use videocall_types::protos::layer_hint_packet::{layer_hint_packet::MediaKind, LayerHintPacket};
 use videocall_types::protos::layer_preference_packet::{
     layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
 };
@@ -425,6 +425,20 @@ struct Inner {
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Relay layer-union hint atom for the CAMERA (VIDEO) ladder (issue #1108,
+    /// Stage 3). A clone of `CameraEncoder::shared_union_requested_layer`, wired
+    /// in by the host after the encoder is built. The `LAYER_HINT` dispatch arm
+    /// writes the VIDEO entry's max-requested-layer here; the camera AQ control
+    /// loop reads the same atom and caps its published ladder. `None` when no
+    /// camera encoder is attached (e.g. observer mode / native lib callers), in
+    /// which case the hint is silently ignored (fail-open). Reset to `u32::MAX` on
+    /// reconnect so a stale cap from the old relay cannot suppress against a new
+    /// session.
+    camera_union_requested_layer: Option<Rc<AtomicU32>>,
+    /// Relay layer-union hint atom for the SCREEN ladder (issue #1108, Stage 3).
+    /// Mirror of `camera_union_requested_layer` for the SCREEN media-kind — a
+    /// clone of `ScreenEncoder::shared_union_requested_layer`. `None` until wired.
+    screen_union_requested_layer: Option<Rc<AtomicU32>>,
     /// Long Tasks API observer that emits `client_longtask_duration_ms` /
     /// `client_longtask_count` to the diagnostic bus whenever the main
     /// thread blocks for more than 50 ms. Held for its drop side-effect:
@@ -761,6 +775,11 @@ impl VideoCallClient {
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
+                // Relay layer-union hint atoms (issue #1108, Stage 3). None until
+                // the host wires in the camera/screen encoder accessors; the
+                // LAYER_HINT dispatch arm no-ops while None (fail-open).
+                camera_union_requested_layer: None,
+                screen_union_requested_layer: None,
                 _long_task_observer: long_task_observer,
                 _render_fps_observer: render_fps_observer,
             })),
@@ -923,6 +942,24 @@ impl VideoCallClient {
                             if let Some(inner) = Weak::upgrade(&inner) {
                                 if let Ok(mut inner) = inner.try_borrow_mut() {
                                     inner.layer_preference_sender.reset_for_reconnect();
+
+                                    // Relay layer-union cap reset (issue #1108,
+                                    // Stage 3). The NEW relay/session starts with
+                                    // an empty receiver set → no union yet → it
+                                    // would publish nothing (fail-open). Until its
+                                    // first LAYER_HINT lands, a cap left over from
+                                    // the OLD relay must not keep suppressing our
+                                    // ladder against a fresh session, so reset both
+                                    // kinds to the u32::MAX fail-open sentinel. The
+                                    // next LAYER_HINT (if any) re-establishes the
+                                    // cap. Same precedent as the
+                                    // layer_preference_sender reset above.
+                                    if let Some(atom) = &inner.camera_union_requested_layer {
+                                        atom.store(u32::MAX, Ordering::Relaxed);
+                                    }
+                                    if let Some(atom) = &inner.screen_union_requested_layer {
+                                        atom.store(u32::MAX, Ordering::Relaxed);
+                                    }
                                 } else {
                                     warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
                                 }
@@ -1531,6 +1568,30 @@ impl VideoCallClient {
         })
     }
 
+    /// Per-peer RECEIVE simulcast diagnostics (issue #1095 observability): one
+    /// [`PeerReceiveDiag`] per connected peer that is receiving at least one
+    /// media kind, each carrying the per-kind decoded-layer snapshot. The panel's
+    /// "Live diagnostics" disclosure polls this to show what this client is
+    /// pulling from every peer. Returns an empty Vec when nothing is being
+    /// received or the inner is transiently borrowed.
+    ///
+    /// Takes `&self` but borrows the inner mutably: the underlying
+    /// `PeerDecodeManager::per_peer_received_snapshots` evicts stale per-layer
+    /// observations (`LayerAvailability::highest_available` runs `.retain()`), so
+    /// this is not a pure read despite the `&self` signature.
+    pub fn per_peer_received_snapshots(&self) -> Vec<PeerReceiveDiag> {
+        let now_ms = js_sys::Date::now() as u64;
+        self.inner
+            .try_borrow_mut()
+            .ok()
+            .map(|mut inner| {
+                inner
+                    .peer_decode_manager
+                    .per_peer_received_snapshots(now_ms)
+            })
+            .unwrap_or_default()
+    }
+
     /// Returns a shared reference to the camera force-keyframe flag.
     ///
     /// Pass this to `CameraEncoder` so that incoming KEYFRAME_REQUEST packets
@@ -1562,6 +1623,35 @@ impl VideoCallClient {
     /// adaptive quality manager's crash ceiling suppression logic.
     pub fn reelection_completed_signal(&self) -> Rc<AtomicBool> {
         self.inner.borrow().reelection_completed_signal.clone()
+    }
+
+    /// Wire the CAMERA (VIDEO) relay layer-union hint atom (issue #1108, Stage 3).
+    ///
+    /// The host calls this with
+    /// [`CameraEncoder::shared_union_requested_layer`](crate::CameraEncoder::shared_union_requested_layer)
+    /// so the inbound `LAYER_HINT` dispatch arm can write the relay's
+    /// max-requested-layer for VIDEO into the SAME atom the camera AQ control loop
+    /// reads. Until this is wired the hint is ignored (fail-open). Mirrors the
+    /// keyframe-flag wiring, but with the atom OWNED by the encoder.
+    pub fn set_camera_union_requested_layer(&self, atom: Rc<AtomicU32>) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.camera_union_requested_layer = Some(atom);
+        } else {
+            warn!("set_camera_union_requested_layer: inner busy, skipping wiring");
+        }
+    }
+
+    /// Wire the SCREEN relay layer-union hint atom (issue #1108, Stage 3).
+    ///
+    /// Mirror of [`set_camera_union_requested_layer`](Self::set_camera_union_requested_layer)
+    /// for the SCREEN media-kind; pass
+    /// [`ScreenEncoder::shared_union_requested_layer`](crate::ScreenEncoder::shared_union_requested_layer).
+    pub fn set_screen_union_requested_layer(&self, atom: Rc<AtomicU32>) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.screen_union_requested_layer = Some(atom);
+        } else {
+            warn!("set_screen_union_requested_layer: inner busy, skipping wiring");
+        }
     }
 
     /// Bind adaptive quality tier sources from a `CameraEncoder` to the
@@ -1901,17 +1991,12 @@ impl VideoCallClient {
         self.send_packet(wrapper);
     }
 
-    pub fn subscribe_diagnostics(
-        &self,
-        tx: UnboundedSender<DiagnosticsPacket>,
-        media_type: MediaType,
-    ) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(sender_diagnostics) = &inner.sender_diagnostics {
-                sender_diagnostics.add_sender_channel(tx, media_type);
-            }
-        }
-    }
+    // NOTE(#1108): `subscribe_diagnostics` (the per-(media-type) channel that
+    // fanned receiver-reported DiagnosticsPackets into the encoder AQ) was
+    // removed in Stage 2. The sender no longer adapts to receiver FPS, so there
+    // is no encoder-AQ sink to subscribe. The sender still INGESTS peer
+    // diagnostics (see `handle_diagnostic_packet`) for the global vcprobe
+    // broadcast + the UI stats string (diagnostics_manager sinks 1 & 2).
 
     pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
         subscribe_global_diagnostics()
@@ -2800,6 +2885,79 @@ impl Inner {
                         "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
                         response.session_id, self.own_session_id,
                     );
+                }
+            }
+            Ok(PacketType::LAYER_HINT) => {
+                // Relay per-source layer-union hint (issue #1108, Stage 3). Like
+                // CONGESTION, the relay deliberately self-addresses this: it
+                // stamps OUR session_id and publishes to our own NATS subject so
+                // it reaches us alone. It carries, per media-kind, the MAX
+                // simulcast layer ANY receiver currently wants from us; we cap our
+                // published ladder to it so we stop encoding a top layer nobody
+                // will decode.
+                //
+                // Self-target check (defense-in-depth, mirroring CONGESTION): the
+                // transport self-filter already lets the self-addressed hint
+                // through, but the wildcard NATS fan-out means every session sees
+                // every packet, so we must confirm the embedded session_id is OURS
+                // before acting. A cross-session hint is noise — and ignoring it
+                // prevents a peer from suppressing our ladder.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if !is_self_targeted {
+                    debug!(
+                        "Ignoring cross-session LAYER_HINT for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                } else {
+                    match LayerHintPacket::parse_from_bytes(&response.data) {
+                        Ok(hint) => {
+                            // Write each per-kind union into the matching encoder's
+                            // shared atom. The encoder's AQ loop reads it next tick
+                            // and applies the cap. We do NOT clamp here — the
+                            // controller converts the max-layer id to a count and
+                            // composes it with backpressure + the real ladder depth
+                            // (fail-open if the value is the u32::MAX sentinel).
+                            // AUDIO / UNSPECIFIED entries have no simulcast ladder
+                            // and are ignored.
+                            for entry in &hint.entries {
+                                match entry.media_kind.enum_value() {
+                                    Ok(MediaKind::VIDEO) => {
+                                        if let Some(atom) = &self.camera_union_requested_layer {
+                                            atom.store(
+                                                entry.max_requested_layer,
+                                                Ordering::Relaxed,
+                                            );
+                                            debug!(
+                                                "LAYER_HINT: camera VIDEO union max_requested_layer={}",
+                                                entry.max_requested_layer,
+                                            );
+                                        }
+                                    }
+                                    Ok(MediaKind::SCREEN) => {
+                                        if let Some(atom) = &self.screen_union_requested_layer {
+                                            atom.store(
+                                                entry.max_requested_layer,
+                                                Ordering::Relaxed,
+                                            );
+                                            debug!(
+                                                "LAYER_HINT: screen union max_requested_layer={}",
+                                                entry.max_requested_layer,
+                                            );
+                                        }
+                                    }
+                                    // AUDIO has no simulcast ladder; UNSPECIFIED is
+                                    // the back-compat default the relay never emits.
+                                    // Ignore both (fail-open).
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to parse LayerHintPacket: {e}");
+                        }
+                    }
                 }
             }
             Ok(PacketType::PEER_EVENT) => {

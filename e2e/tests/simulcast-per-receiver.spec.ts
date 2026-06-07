@@ -1,6 +1,25 @@
 /**
  * E2E: per-receiver simulcast (PR #1079, issue #989 P1–P5).
  *
+ * ## #1108 — "one bad receiver must not degrade the others" (Phase B)
+ *
+ * Phase B (issue #1108) DECOUPLED the sender's adaptive-quality from receiver
+ * feedback. BEFORE: a publisher would shed simulcast layers / step its tier DOWN
+ * when REMOTE RECEIVERS reported low FPS, so one struggling receiver dragged the
+ * stream down for the WHOLE room. AFTER: the publisher adapts ONLY to its OWN
+ * signals (encoder-CPU backpressure, server CONGESTION, WS send-buffer pressure);
+ * receiver feedback now influences ONLY each receiver's OWN per-receiver layer
+ * pull (the simulcast chooser, already wired). The end-to-end proof of #1108 is
+ * therefore identical to the per-receiver DIVERGENCE this spec already exercises:
+ * throttle ONE receiver and assert ITS layer drops while the OTHER receivers KEEP
+ * the higher layer(s) — i.e. the publisher's ladder did NOT shrink for everyone.
+ * The `@impair` WS divergence test below carries that #1108 assertion explicitly
+ * (it captures the healthy peer's layer BEFORE the impairment and proves it does
+ * not regress AFTER). The unit/integration layer locks the inverse direction —
+ * the sender no longer even HAS an input path for receiver FPS — in
+ * `bot/tests/aq_degradation.rs` (`bot_does_not_degrade_on_receiver_fps`,
+ * `bot_degrades_on_synthetic_backpressure`, `bot_degrades_on_congestion_cut`).
+ *
  * The feature is FLAG-GATED OFF in production (`experimentalSimulcastMaxLayers`
  * defaults to 1 = single layer; effective layers =
  * `min(flag, device-capability-ceiling)`). This spec ENABLES the flag for the
@@ -60,14 +79,17 @@
  *       machinery went N-generic but the single-layer behavior
  *       must be unchanged).
  *
- *   - RUNS UNDER THE `@impair` PROJECT ONLY (issue #1080):
+ *   - RUNS UNDER THE `@impair` PROJECT ONLY (issues #1080 + #1108):
  *       2. Per-receiver congestion DIVERGENCE (WS path) — one of two
  *          co-receivers has its WS downlink bandwidth-clamped via toxiproxy,
  *          which overflows the relay's bounded per-receiver outbound channel;
  *          the relay sheds that receiver's video frames, the resulting sequence
  *          gaps push its `loss_per_sec` over the chooser's step-down threshold,
  *          and ONLY that receiver drops to a lower layer (sender + healthy peer
- *          unaffected). See `helpers/downlink-impair.ts` for the full verified
+ *          unaffected). This is ALSO the #1108 headline proof: the healthy peer's
+ *          layer is captured BEFORE the impairment and asserted NOT to regress
+ *          AFTER — the one bad receiver did not shrink the publisher's ladder for
+ *          everyone. See `helpers/downlink-impair.ts` for the full verified
  *          mechanism — the relay-side overflow is what manufactures the loss a
  *          raw bandwidth throttle alone could not. This test is TAGGED `@impair`
  *          and is grep-inverted OUT of the default `dioxus` suite + bvt0/bvt1
@@ -106,7 +128,7 @@
  *   - `[data-testid="perf-recv-video-auto"]`        video Auto toggle (aria-pressed)
  */
 
-import { test, expect, chromium, Browser, Page } from "@playwright/test";
+import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
 import { createAuthenticatedContext, BROWSER_ARGS } from "../helpers/auth-context";
 import { enableSimulcastFlag, pinSimulcastMaxLayers } from "../helpers/simulcast-config";
 import {
@@ -120,6 +142,56 @@ import { waitForServices } from "../helpers/wait-for-services";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Transport the publish-suppression (#1108 Stage 3) cases are parameterised over. */
+type Transport = "webtransport" | "websocket";
+
+/**
+ * Pin a BrowserContext to a specific media transport BEFORE its first navigation
+ * by seeding the sticky preference the UI reads from localStorage at boot
+ * (`context.rs`). Mirrors the canonical cross-transport pin in
+ * `cross-transport-display-name.spec.ts`. Used by the #1108 Stage 3 cases so the
+ * same publish-suppression assertion can be run over BOTH WebTransport and
+ * WebSocket without any toxiproxy dependency (no impairment is involved here —
+ * the trigger is every receiver PINNING the base layer, not a degraded link).
+ */
+async function pinTransport(context: BrowserContext, t: Transport) {
+  await context.addInitScript((pref: string) => {
+    try {
+      window.localStorage.setItem("vc_transport_preference", pref);
+      window.localStorage.setItem("vc_transport_sticky", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin will set it */
+    }
+  }, t);
+}
+
+/**
+ * Drag a receiver's RECEIVE max-layer slider for `kind` down to the lowest rung
+ * (index 0 = base layer) with Auto OFF, so this receiver requests ONLY the base
+ * layer for the publisher's stream. This is the #1108 Stage 3 DRIVE primitive:
+ * when EVERY receiver does this, the relay's per-source layer UNION collapses to
+ * base, it emits a `LAYER_HINT` to the publisher, and the publisher caps its
+ * published ladder (top rungs shed).
+ *
+ * The wiring is already live end-to-end on this branch (slider →
+ * `set_receive_layer_bounds` → `LAYER_PREFERENCE` → relay union → `LAYER_HINT` →
+ * `shared_union_requested_layer` → AQ `observe_union_requested_layer`); the part
+ * that is NOT yet observable from the DOM is the publisher-side RESULT — see the
+ * Stage 3 describe block header for the `live_simulcast_snapshot` blocker.
+ */
+async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "screen" = "video") {
+  const autoToggle = page.locator(`[data-testid="perf-recv-${kind}-auto"]`);
+  if ((await autoToggle.getAttribute("aria-pressed")) === "true") {
+    await autoToggle.click();
+  }
+  const maxThumb = page.locator(`[data-testid="perf-recv-${kind}-range-max"]`);
+  await expect(maxThumb).toBeVisible({ timeout: 10_000 });
+  await maxThumb.focus();
+  await maxThumb.fill("0");
+  await maxThumb.dispatchEvent("input");
+  await expect(maxThumb).toHaveValue("0");
+}
 
 /**
  * Drive a fresh page from the HOME FORM into the meeting grid, navigating the
@@ -783,7 +855,48 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2. Per-receiver congestion DIVERGENCE over WebSocket (issue #1080).
+  // 1b. RECEIVE-side per-row diagnostics footer (PR #1101 / issue #1095).
+  //
+  // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
+  // needs a renderer-crash-resilient runner + a capability-override hook. The
+  // RECEIVE diagnostics footer's DISCLOSURE only appears when the receiver is
+  // decoding the SAME kind from MORE THAN ONE peer:
+  //   * 0 peers → static "Not receiving" (covered single-context, green, in
+  //     performance-settings.spec.ts → receive-needle/readout tests),
+  //   * 1 peer  → static inline "From {peer} · L{i}/{N} · {res}" (no disclosure),
+  //   * >= 2 peers → a disclosure `<button>` (`perf-recv-{kind}-diag-summary`,
+  //     "{n} peers · L{lo}–L{hi}") whose detail (`perf-recv-{kind}-diag-detail`)
+  //     lists the top-3 peers as `perf-recv-{kind}-diag-peer-{sessionId}` rows
+  //     plus, when n > 3, a `perf-recv-{kind}-diag-more` tail ("+{n-3} more …").
+  //
+  // Exercising the per-peer rows + the "+N more" tail therefore requires a real
+  // multi-peer simulcast meeting (>= 2 senders so the receiver has >= 2 peers for
+  // a kind, and ideally >= 4 to render the "+more" tail). That is blocked on the
+  // same harness gaps as every other multi-party test here (#1093): headless CI
+  // crashes the extra contexts ("Target page/context closed") and the capability
+  // ceiling clamps layers to 1. Documented as `test.fixme` (the single-context
+  // structural receive coverage lives in performance-settings.spec.ts #1078).
+  //
+  // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
+  // purpose so it is a documented stub, not a runnable test):
+  //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
+  //   2. openPerformancePanel(rxPage) (Receive direction).
+  //   3. expect.poll `perf-recv-video-diag-summary` to read /\d+ peers · L/.
+  //   4. Click it → `perf-recv-video-diag-detail` visible; assert a
+  //      `perf-recv-video-diag-peer-{sessionId}` row exists for each visible peer
+  //      (top-3), and with >= 4 publishers assert `perf-recv-video-diag-more`
+  //      reads /\+\d+ more/.
+  //   5. Capability-gate the per-peer LAYER assertions (rung/layer counts) on the
+  //      received ladder size, mirroring the send-side single-layer skip.
+  // -------------------------------------------------------------------------
+  test.fixme("receive diagnostics list per-peer rows and a '+N more' tail with multiple publishers", async () => {
+    // Blocked on #1093 (multi-peer harness): see the block comment above for
+    // the intended multi-publisher flow and the `perf-recv-*-diag-peer-{id}` /
+    // `perf-recv-*-diag-more` assertions this will perform.
+  });
+
+  // -------------------------------------------------------------------------
+  // 2. Per-receiver congestion DIVERGENCE over WebSocket (issues #1080 + #1108).
   //
   //    Now EXERCISED via the per-client downlink-impairment infra
   //    (`helpers/downlink-impair.ts` + the toxiproxy `impair` compose profile).
@@ -794,6 +907,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    a lower layer. The sender and the healthy receiver share neither the
   //    proxy nor the relay channel, so they are unaffected. See the helper's
   //    header for the full verified mechanism.
+  //
+  //    #1108 HEADLINE PROOF ("one bad receiver doesn't degrade others"): after
+  //    Phase B the publisher's ladder NO LONGER shrinks in response to a
+  //    receiver's poor stats — receiver feedback drives ONLY that receiver's own
+  //    per-receiver layer pull. This test makes that literal: it records the
+  //    healthy peer's layer index BEFORE impairing the other receiver and, once
+  //    the degraded receiver has stepped down, asserts the healthy peer's layer
+  //    index has NOT regressed (it stays >= its pre-impairment value and strictly
+  //    above the degraded peer). A regression here would mean the bad receiver
+  //    dragged the whole room down — exactly the pre-#1108 behavior that was
+  //    removed (and is locked at the controller layer by
+  //    `bot/tests/aq_degradation.rs::bot_does_not_degrade_on_receiver_fps`).
   //
   //    NOTE: like the other multi-party tests it joins 3 contexts and is subject
   //    to the same headless-CI renderer-crash + capability limits — see #1093;
@@ -820,7 +945,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    for toxiproxy's control API on :8474, and (c) run
   //    `npx playwright test --project=impair`. Locally: `make e2e-impair`.
   // -------------------------------------------------------------------------
-  test("congested receiver pulls a LOWER video layer than the healthy peer (WS) @impair", async ({
+  test("one bad receiver does not degrade the others: congested receiver drops a layer, healthy peer holds (WS, #1108) @impair", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -908,6 +1033,17 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         })
         .toBeGreaterThan(0);
 
+      // Capture the healthy peer's layer index at the LAST moment before we
+      // impair the other receiver. This is the #1108 baseline: the publisher's
+      // ladder for THIS healthy peer must not shrink merely because the OTHER
+      // receiver is about to go bad. (Read just before PHASE 2 so it reflects
+      // the steady state immediately preceding the impairment.)
+      const healthyBeforeImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyBeforeImpair,
+        "healthy receiver must be decoding before we impair the other receiver",
+      ).not.toBeNull();
+
       // PHASE 2 — clamp ONLY the degraded receiver's downlink hard enough to
       // overflow the relay's 128-slot outbound channel (sheds video → loss →
       // step down). ~120 kbps is far below one HD layer's byte rate.
@@ -941,6 +1077,20 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "healthy receiver must stay above the base layer (unaffected by peer congestion)",
       ).toBeGreaterThan(0);
 
+      // #1108 NON-REGRESSION (the literal "one bad receiver doesn't degrade the
+      // others" proof): the healthy peer's layer must not have dropped relative
+      // to its pre-impairment baseline. Before Phase B the publisher would shed
+      // layers / step its tier down on the degraded receiver's feedback, shrinking
+      // the ladder for EVERY receiver — the healthy peer's index would fall here.
+      // After Phase B the publisher adapts only to its OWN signals, so the healthy
+      // peer holds (or climbs). Allow >= (a healthy peer may even climb into freed
+      // capacity); a strict drop is the forbidden pre-#1108 behavior.
+      expect(
+        healthyFinal!.layerIndex,
+        "#1108: the healthy peer's layer must NOT shrink because the OTHER receiver " +
+          `went bad (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
+      ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
+
       // PHASE 4 — heal the downlink and prove the degraded receiver climbs back
       // up (recovery), confirming the divergence was the impairment, not a
       // permanent failure. Climb-back is conservative (hysteresis), so allow a
@@ -964,11 +1114,13 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented).
+  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented). #1108 +
+  //     #1080 (WT path), tracked under #1093 for the harness work.
   //
-  // The same relay-side overflow → loss → step-down mechanism applies on the
-  // WebTransport path, but we cannot impair ONE WT client from this Playwright
-  // harness:
+  // The same relay-side overflow → loss → step-down mechanism (and therefore the
+  // same #1108 "one bad receiver doesn't degrade the others" proof) applies on
+  // the WebTransport path, but we cannot impair ONE WT client from this
+  // Playwright harness:
   //   - WebTransport is QUIC over UDP. toxiproxy (used by the WS case above) is
   //     TCP-only, and Playwright's `newContext({ proxy })` only carries the
   //     browser's TCP/HTTP(S) traffic — neither can shape QUIC/UDP datagrams.
@@ -976,15 +1128,154 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //     client's 5-tuple in an ISOLATED netns/veth. Playwright runs Chromium on
   //     the host in a SHARED netns, so a netem qdisc there degrades EVERY
   //     context (sender + both receivers), not just the degraded one.
-  // When the bots-app netsim orchestrator can drive a per-client veth, this can
-  // reuse the WS case's identical assertion against a UDP netem hook.
-  // (Multi-party renderer-crash + capability concerns also apply here — see #1093.)
+  // When the bots-app netsim orchestrator can drive a per-client veth (the #1093
+  // harness work), this can reuse the WS case's identical assertion against a UDP
+  // netem hook. (Multi-party renderer-crash + capability concerns also apply
+  // here — see #1093.)
+  //
+  // The body below is written out (but `fixme`d) so it is READY the moment a
+  // per-client UDP downlink-impairment helper exists. It mirrors the WS test
+  // exactly, INCLUDING the #1108 non-regression assertion (the healthy peer's
+  // layer must not shrink when the OTHER receiver goes bad). The only missing
+  // piece is the impairment hook — sketched here as `impairDownlinkUdp` /
+  // `healDownlinkUdp` (NOT YET IMPLEMENTED; see #1093). Until that helper lands,
+  // referencing it would not type-check, so the impairment + heal calls are left
+  // as TODO markers rather than live calls.
   // -------------------------------------------------------------------------
-  test.fixme("congested receiver pulls a LOWER video layer than the healthy peer (WT) — needs per-client UDP netem", async () => {
-    // Intentionally empty: the assertion is identical to the WS case above;
-    // only the per-client WT/QUIC downlink-impairment hook is missing (see the
-    // block comment for the concrete blocker). Kept as `fixme` so the gap is
-    // visible in the test report rather than silently absent.
+  test.fixme("one bad receiver does not degrade the others over WebTransport (WT, #1108) — needs per-client UDP netem", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_diverge_wt_${Date.now()}`;
+
+    // 1 publisher + 2 receivers, ALL on WebTransport (the production-primary
+    // transport). Unlike the WS case we do NOT pin the degraded receiver to WS —
+    // the whole point of this case is to prove the #1108 isolation holds on the
+    // QUIC path too.
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-dwt@videocall.rs",
+        "SimPublisherDWT",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-healthy-wt@videocall.rs",
+        "SimHealthyWT",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-degraded-wt@videocall.rs",
+        "SimDegradedWT",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3);
+      await enableSimulcastFlag(healthyCtx, 3);
+      await enableSimulcastFlag(degradedCtx, 3);
+
+      // TODO(#1093): route ONLY the degraded receiver's QUIC/UDP downlink
+      // through a per-client netem veth here, e.g.:
+      //   await routeDownlinkThroughUdpNetem(degradedCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      const degradedPage = await degradedCtx.newPage();
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherDWT");
+      await joinMeeting(healthyPage, meetingId, "SimHealthyWT");
+      await joinMeeting(degradedPage, meetingId, "SimDegradedWT");
+
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above the base layer on a healthy
+      // (un-impaired) downlink. Capability ceiling can clamp to a single layer
+      // on a weak runner; SKIP rather than assert a false negative.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped the publisher to a single layer; there is no " +
+          "ladder headroom to diverge on this runner (see helpers/simulcast-config.ts)",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // #1108 baseline: the healthy peer's layer just before impairment.
+      const healthyBeforeImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyBeforeImpair,
+        "healthy receiver must be decoding before we impair the other receiver",
+      ).not.toBeNull();
+
+      // PHASE 2 — clamp ONLY the degraded receiver's QUIC downlink.
+      // TODO(#1093): await impairDownlinkUdp({ rateKb: 15 });
+
+      // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
+      // the healthy receiver's.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            const degradedIdx = degraded?.layerIndex ?? 0;
+            if (!healthy) return false;
+            return degradedIdx < healthy.layerIndex;
+          },
+          { timeout: 90_000, intervals: [2000, 3000, 5000] },
+        )
+        .toBe(true);
+
+      // Healthy receiver unaffected, and #1108 non-regression: its layer must
+      // not have shrunk relative to the pre-impairment baseline.
+      const healthyFinal = await readVideoLayer(healthyPage);
+      expect(healthyFinal, "healthy receiver must still be decoding").not.toBeNull();
+      expect(
+        healthyFinal!.layerIndex,
+        "healthy receiver must stay above the base layer (unaffected by peer congestion)",
+      ).toBeGreaterThan(0);
+      expect(
+        healthyFinal!.layerIndex,
+        "#1108: the healthy peer's layer must NOT shrink because the OTHER receiver " +
+          `went bad over WT (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
+      ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
+
+      // PHASE 4 — heal and prove climb-back.
+      // TODO(#1093): await healDownlinkUdp();
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      // TODO(#1093): await healDownlinkUdp();
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
   });
 });
 
@@ -1091,4 +1382,301 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
       await rxBrowser.close();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// #1108 Stage 3 — publish-side layer SUPPRESSION (relay LAYER_HINT → publisher
+// caps its ladder when EVERY receiver only wants the base layer; restore-eager
+// when any receiver wants more again). Covers BOTH WebTransport and WebSocket.
+//
+// Relay commit 096795a6 + publisher commit 0a6d8761.
+//
+// =========================================================================
+// WHAT STAGE 3 DOES (the behaviour under test)
+// =========================================================================
+// The relay computes, per source, the UNION (max over all receivers) of the
+// simulcast layer each receiver requested for that source. When that union sits
+// below the publisher's published depth (i.e. NO receiver wants a higher rung),
+// the relay hints the publisher — on the publisher's OWN NATS self-subject, like
+// CONGESTION — to stop encoding the unwanted top rung(s). The publisher's AQ
+// loop (`observe_union_requested_layer`) caps its active layer count to
+// `min(backpressure ceiling, union count)`, floored at 1 — the BASE layer is
+// ALWAYS published, never fully suppressed. Suppress is debounced DOWN at the
+// relay (≈2 s); restore is EAGER (immediate) so when any receiver un-pins / a
+// new receiver joins / a viewport grows, the dropped rung comes back promptly
+// and that receiver receives it again.
+//
+// =========================================================================
+// TWO INDEPENDENT BLOCKERS → these tests are `test.fixme` (both transports)
+// =========================================================================
+// 1. NO PUBLISHER-SIDE DOM OBSERVABILITY ON THIS BRANCH.
+//    The behaviour the spec must assert is "the PUBLISHER stopped encoding the
+//    top rung(s)". On this branch the publisher's shrinking ladder is NOT
+//    surfaced to any DOM element:
+//      - The SEND Performance panel renders a single aggregate
+//        `LiveQualitySnapshot` (`#perf-vu-video-readout` = `{w}x{h}·{fps}fps·
+//        {kbps}kbps`, driven by a quality-TIER index + target bitrate). It has
+//        NO per-rung array and NO shed marker.
+//      - The encoder DOES track the capped count internally
+//        (`CameraEncoder::shared_active_layer_count`, written from
+//        `EncoderBitrateController::active_layer_count()` which the Stage 3 union
+//        cap feeds), but that atom is NOT exposed in `dioxus-ui/src/` — grep for
+//        `active_layer_count` in the UI returns nothing.
+//    The per-rung publisher diagnostics this task expects (the
+//    `live_simulcast_snapshot` shed markers — top rungs rendering
+//    `bitrate_kbps == 0` / shed styling, testids `perf-video-diag-rung-*`) live
+//    on the UNMERGED branch `feat/perf-panel-simulcast-diagnostics` (PR #1095 /
+//    #1101). They are NOT on `main` and NOT on this Stage 3 branch, so there is
+//    no stable selector to assert against today. The body below is written
+//    against those `perf-video-diag-rung-*` testids so it goes green the moment
+//    that diagnostics panel merges AND the multi-party harness (below) lands.
+//
+// 2. MULTI-PARTY HARNESS LIMITS — #1093 (same blocker as every other
+//    multi-context test in this spec). These cases join 3+ authenticated
+//    contexts each running camera + simulcast encode/decode; in headless CI the
+//    extra renderers crash ("Target page/context closed") and the capability
+//    ceiling clamps the runner to 1 layer (so there is no top rung TO shed). The
+//    WS case also relies on driving "every receiver pins base" reliably across
+//    contexts, which is exactly the multi-party determinism #1093 tracks.
+//
+// =========================================================================
+// WHAT IS RUNNABLE NOW vs FIXME
+// =========================================================================
+//   - RUNNABLE NOW: the DRIVE side primitives only — `pinReceiverToBaseLayer`
+//     (the RECEIVE max-layer slider → `LAYER_PREFERENCE` path) and `pinTransport`
+//     are both exercised live by other tests in this repo
+//     (performance-settings.spec.ts and cross-transport-display-name.spec.ts
+//     respectively). There is NO runnable ASSERTION of the publisher-side result
+//     today because the observable surface does not exist on this branch.
+//   - FIXME (both WT and WS): the end-to-end "publisher sheds the top rung, then
+//     restores it" assertion — blocked on BOTH (1) the diagnostics panel merging
+//     and (2) the #1093 multi-party harness. No NEW tracking issue is needed:
+//     blocker (2) reuses #1093 (multi-party harness); blocker (1) is the
+//     PR #1095/#1101 diagnostics merge.
+//
+// NOTE: unlike the Stage 2 `@impair` divergence test, Stage 3 needs NO toxiproxy
+// / network shaping — the suppression trigger is purely "all receivers request
+// base", which is a receiver-side preference (slider), not a degraded link. That
+// is why these are plain `fixme` (not `@impair`-gated): they belong in the
+// default suite once unblocked.
+// ---------------------------------------------------------------------------
+test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
+  test.describe.configure({ timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /**
+   * Shared body for the WT and WS variants. Parameterised over the media
+   * transport so the identical publish-suppression assertion runs over both.
+   *
+   * Topology: 1 publisher + 2 receivers (>=3 participants, per the task). All
+   * three on `transport`. Both receivers pin the base layer → relay union = base
+   * → publisher sheds the top rung(s). Then ONE receiver un-pins (requests a
+   * higher layer) and the publisher must RESTORE the rung promptly (<= a couple
+   * seconds, restore-eager) and that receiver must receive it.
+   */
+  const publishSuppressionBody =
+    (transport: Transport) =>
+    async ({ baseURL }: { baseURL?: string }) => {
+      const uiURL = baseURL || "http://localhost:3001";
+      const meetingId = `e2e_sim_suppress_${transport}_${Date.now()}`;
+
+      const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+      const rxABrowser = await chromium.launch({ args: BROWSER_ARGS });
+      const rxBBrowser = await chromium.launch({ args: BROWSER_ARGS });
+      try {
+        const pubCtx = await createAuthenticatedContext(
+          pubBrowser,
+          `sim-sup-pub-${transport}@videocall.rs`,
+          "SimSupPublisher",
+          uiURL,
+        );
+        const rxACtx = await createAuthenticatedContext(
+          rxABrowser,
+          `sim-sup-rxa-${transport}@videocall.rs`,
+          "SimSupReceiverA",
+          uiURL,
+        );
+        const rxBCtx = await createAuthenticatedContext(
+          rxBBrowser,
+          `sim-sup-rxb-${transport}@videocall.rs`,
+          "SimSupReceiverB",
+          uiURL,
+        );
+
+        // Flag ON for all three so the publisher encodes a multi-rung ladder that
+        // there is actually something to SHED.
+        await enableSimulcastFlag(pubCtx, 3);
+        await enableSimulcastFlag(rxACtx, 3);
+        await enableSimulcastFlag(rxBCtx, 3);
+
+        // Pin every context to the transport under test. MUST run before the first
+        // navigation (these are init scripts).
+        await pinTransport(pubCtx, transport);
+        await pinTransport(rxACtx, transport);
+        await pinTransport(rxBCtx, transport);
+
+        const pubPage = await pubCtx.newPage();
+        const rxAPage = await rxACtx.newPage();
+        const rxBPage = await rxBCtx.newPage();
+
+        await joinMeeting(pubPage, meetingId, "SimSupPublisher");
+        await joinMeeting(rxAPage, meetingId, "SimSupReceiverA");
+        await joinMeeting(rxBPage, meetingId, "SimSupReceiverB");
+
+        // Each receiver sees the publisher's tile (peers connected).
+        await expect(rxAPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+          timeout: 30_000,
+        });
+        await expect(rxBPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+          timeout: 30_000,
+        });
+
+        // Open the receive Performance panels (where the max-layer sliders live)
+        // on both receivers, and the SEND Performance panel on the publisher
+        // (where the per-rung send diagnostics render once #1095/#1101 merges).
+        await openPerformancePanel(rxAPage);
+        await openPerformancePanel(rxBPage);
+        await pubPage.locator('[data-testid="open-settings"]').click();
+        await expect(pubPage.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+        await pubPage.getByRole("tab", { name: "Performance" }).click();
+        await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
+          timeout: 10_000,
+        });
+        // The publisher's per-rung diagnostics are under the SEND direction.
+        const pubSendSeg = pubPage.locator('[data-testid="perf-direction-send"]');
+        await pubSendSeg.click();
+        await expect(pubSendSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+
+        // PHASE 0 — let both receivers climb above base so there is a top rung the
+        // publisher is actually encoding (and therefore can later shed). Capability
+        // ceiling can clamp to a single layer on a weak runner; SKIP rather than
+        // assert a false negative (mirrors the other multi-layer tests).
+        await expect
+          .poll(
+            async () => {
+              const a = await readVideoLayer(rxAPage);
+              const b = await readVideoLayer(rxBPage);
+              if (!a || !b) return -1;
+              return Math.min(a.layerCount, b.layerCount);
+            },
+            { timeout: 45_000, intervals: [1000, 2000, 3000] },
+          )
+          .toBeGreaterThan(0);
+
+        const aStart = await readVideoLayer(rxAPage);
+        const bStart = await readVideoLayer(rxBPage);
+        test.skip(
+          (aStart?.layerCount ?? 1) <= 1 || (bStart?.layerCount ?? 1) <= 1,
+          "capability ceiling clamped the publisher to a single layer; there is no " +
+            "top rung to suppress on this runner (see helpers/simulcast-config.ts)",
+        );
+        const topRung = (aStart?.layerCount ?? 1) - 1; // 0-based id of the highest rung
+
+        // The publisher's per-rung send diagnostics expose one element per rung
+        // (PR #1095/#1101). The top rung must START live (non-zero bitrate / no
+        // shed styling) — we have something to shed.
+        const topRungDiag = pubPage.locator(`[data-testid="perf-video-diag-rung-${topRung}"]`);
+        await expect(topRungDiag).toBeVisible({ timeout: 10_000 });
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
+            timeout: 30_000,
+            intervals: [1000, 2000],
+          })
+          .toBeGreaterThan(0);
+
+        // PHASE 1 — make EVERY receiver request ONLY the base layer. The relay's
+        // per-source union now sits at base, so after the suppress-debounce
+        // (~2 s) it hints the publisher to stop the top rung(s).
+        await pinReceiverToBaseLayer(rxAPage, "video");
+        await pinReceiverToBaseLayer(rxBPage, "video");
+
+        // PHASE 2 — assert the PUBLISHER sheds the top rung: its diagnostics for
+        // the highest rung flip to the shed marker (`bitrate_kbps == 0` / the shed
+        // data-state). Allow generously for the relay's ~2 s suppress-debounce plus
+        // a couple of AQ ticks. The BASE rung must NEVER be shed.
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "1"), {
+            timeout: 30_000,
+            intervals: [1000, 2000, 3000],
+          })
+          .toBe(0);
+        await expect(topRungDiag).toHaveAttribute("data-shed", "true", { timeout: 5_000 });
+
+        const baseRungDiag = pubPage.locator('[data-testid="perf-video-diag-rung-0"]');
+        await expect(
+          baseRungDiag,
+          "base layer must ALWAYS be published — never shed",
+        ).not.toHaveAttribute("data-shed", "true");
+        expect(
+          Number((await baseRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"),
+          "base layer must keep a non-zero bitrate (never fully suppressed)",
+        ).toBeGreaterThan(0);
+
+        // Both receivers, having pinned base, must still be decoding at the base
+        // layer (suppression of higher rungs must not break the base stream).
+        await expect
+          .poll(async () => (await readVideoLayer(rxAPage))?.layerIndex ?? -1, {
+            timeout: 20_000,
+            intervals: [1000, 2000],
+          })
+          .toBe(0);
+
+        // PHASE 3 — RESTORE-EAGER: one receiver requests a higher layer again
+        // (un-pin: Auto back ON = full range). The relay's union grows past base,
+        // and because restore is EAGER (no debounce) the publisher must re-enable
+        // the top rung PROMPTLY — assert within a couple of seconds.
+        const rxAAuto = rxAPage.locator('[data-testid="perf-recv-video-auto"]');
+        if ((await rxAAuto.getAttribute("aria-pressed")) !== "true") {
+          await rxAAuto.click();
+        }
+        await expect(rxAAuto).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
+
+        // The publisher restores the top rung promptly (restore-eager). ~3 s budget
+        // covers the LAYER_PREFERENCE round-trip + one AQ restore tick; the relay
+        // adds NO debounce on the UP direction.
+        await expect
+          .poll(async () => Number((await topRungDiag.getAttribute("data-bitrate-kbps")) ?? "0"), {
+            timeout: 6_000,
+            intervals: [250, 500, 1000],
+          })
+          .toBeGreaterThan(0);
+        await expect(topRungDiag).not.toHaveAttribute("data-shed", "true");
+
+        // PHASE 4 — and the un-pinning receiver actually RECEIVES the higher layer
+        // again (the restore is end-to-end, not just a publisher-side flag). It
+        // climbs back above the base layer.
+        await expect
+          .poll(async () => (await readVideoLayer(rxAPage))?.layerIndex ?? 0, {
+            timeout: 30_000,
+            intervals: [1000, 2000, 3000],
+          })
+          .toBeGreaterThan(0);
+      } finally {
+        await pubBrowser.close();
+        await rxABrowser.close();
+        await rxBBrowser.close();
+      }
+    };
+
+  // FIXME(#1093 + PR #1095/#1101): see the describe-block header for the two
+  // blockers — (1) no publisher-side per-rung DOM observability on this branch
+  // (the `perf-video-diag-rung-*` diagnostics are unmerged), (2) the multi-party
+  // harness limits tracked under #1093. WebTransport is the production-primary
+  // transport, so this is the higher-priority variant to un-fixme first.
+  test.fixme(
+    "publisher sheds top rung when all receivers pin base, restores when one un-pins (WT, #1108)",
+    publishSuppressionBody("webtransport"),
+  );
+
+  // FIXME(#1093 + PR #1095/#1101): same two blockers as the WT case above. Unlike
+  // the Stage 2 divergence test this needs NO toxiproxy — the trigger is a
+  // receiver PREFERENCE (all pin base), not an impaired link — so this belongs in
+  // the default suite (not `@impair`) once unblocked.
+  test.fixme(
+    "publisher sheds top rung when all receivers pin base, restores when one un-pins (WS, #1108)",
+    publishSuppressionBody("websocket"),
+  );
 });

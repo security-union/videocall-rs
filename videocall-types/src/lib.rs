@@ -102,6 +102,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::LAYER_PREFERENCE => {
                 write!(f, "LAYER_PREFERENCE")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::LAYER_HINT => {
+                write!(f, "LAYER_HINT")
+            }
         }
     }
 }

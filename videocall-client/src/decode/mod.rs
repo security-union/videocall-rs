@@ -29,7 +29,7 @@ pub mod video_decoder_wrapper;
 pub use layer_chooser::{
     max_layers_for_kind, KindLayerBounds, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot,
 };
-pub use peer_decode_manager::{PeerDecodeManager, PeerStatus};
+pub use peer_decode_manager::{PeerDecodeManager, PeerReceiveDiag, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;
 
 use neteq_audio_decoder::NetEqAudioPeerDecoder;

@@ -24,7 +24,6 @@ use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
     canvas_generator::{speak_style, TileMode},
-    capability_check::{assess_capability, CapabilityVerdict},
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -125,7 +124,6 @@ pub enum MediaErrorState {
 }
 
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
-const SUBTLE_FOOTNOTE_TEXT_STYLE: &str = "font-size: 0.8rem; opacity: 0.7;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
     match err {
@@ -798,14 +796,6 @@ pub fn AttendantsComponent(
     let mut allow_guests_toggle = use_signal(move || allow_guests);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
-    // Pre-join capability verdict (Phase 9). Computed once at component mount —
-    // hardware concurrency / UA platform don't change while the page is open.
-    // Block / StrongWarn surfaces UI in the lobby below; Ok proceeds normally.
-    let capability_verdict = use_hook(assess_capability);
-    // Has the user explicitly dismissed the StrongWarn modal? Once true the
-    // join button (and the auto_join effect) proceeds normally for the rest
-    // of the lobby session.
-    let mut capability_acknowledged = use_signal(|| false);
     let waiting_room_version = use_signal(|| 0u64);
     let mut host_el = use_signal(|| Option::<web_sys::Element>::None);
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
@@ -928,13 +918,29 @@ pub fn AttendantsComponent(
                     session_loaded.set(true);
                     // Activate console log collection if enabled in config.
                     if crate::constants::console_log_upload_enabled().unwrap_or(false) {
-                        // Raise the WASM log level to Debug so uploaded logs
-                        // capture detailed diagnostic output. We use Debug
-                        // rather than Trace (as ticket #307 mentions) because
-                        // Trace is prohibitively noisy in WASM — every
-                        // wasm-bindgen call and Dioxus re-render generates
-                        // trace spans that would overwhelm the upload buffer.
-                        log::set_max_level(log::LevelFilter::Debug);
+                        // Raise the WASM log level so uploaded logs capture
+                        // detailed diagnostic output.
+                        //
+                        // PRECEDENCE (console-log perf fix):
+                        //  - If the operator EXPLICITLY set `logLevel` in config.js
+                        //    (ANY value, INCLUDING "info"), honour it as the ceiling
+                        //    — e.g. `logLevel: "info"` or `"warn"` deliberately
+                        //    REDUCES capture to cut per-packet log volume on a hot
+                        //    deployment, and `logLevel: "trace"` opts INTO the
+                        //    per-packet hot-path logs (which are emitted at trace!).
+                        //  - Otherwise (key ABSENT → `log_level_explicit()` is None),
+                        //    bump to Debug — the historical collection behaviour,
+                        //    preserved so existing meeting analysis keeps working
+                        //    unchanged. `Option<String>` lets us tell "absent" apart
+                        //    from an explicit "info" (a defaulted String could not).
+                        //
+                        // We use Debug rather than Trace by default (per ticket
+                        // #307) because Trace is prohibitively noisy in WASM and
+                        // the genuine per-packet spam now lives at trace!, off by
+                        // default even when collecting.
+                        let effective_level = crate::constants::log_level_explicit()
+                            .unwrap_or(log::LevelFilter::Debug);
+                        log::set_max_level(effective_level);
                         let dn = current_display_name();
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }
@@ -2558,30 +2564,18 @@ pub fn AttendantsComponent(
         }
     });
 
-    // Auto-join on first render if requested.
-    // Gated by the Phase 9 capability verdict: a Block must surface its UI
-    // before media is acquired, and a StrongWarn must be acknowledged first.
+    // Auto-join on first render if requested. Every device joins regardless of
+    // capabilities (issue #1054) — there is no pre-join gate.
     {
         let mda = mda.clone();
-        let verdict = capability_verdict.clone();
         use_effect(move || {
             if !auto_join {
                 return;
             }
-            match &verdict {
-                CapabilityVerdict::Block(_) => {
-                    log::warn!("capability-check: auto_join suppressed by Block verdict");
-                }
-                CapabilityVerdict::StrongWarn(_) if !capability_acknowledged() => {
-                    log::warn!("capability-check: auto_join deferred — awaiting StrongWarn ack");
-                }
-                _ => {
-                    // Direct-URL auto-join: a real join, so the permission
-                    // callback must proceed to connect (issue #959).
-                    join_requested.set(true);
-                    mda.borrow().request();
-                }
-            }
+            // Direct-URL auto-join: a real join, so the permission callback must
+            // proceed to connect (issue #959).
+            join_requested.set(true);
+            mda.borrow().request();
         });
     }
 
@@ -3232,21 +3226,9 @@ pub fn AttendantsComponent(
         is_allowed.is_empty() || is_allowed.iter().any(|host| host == effective_user_id);
     // --- Pre-join screen ---
     if !meeting_joined() {
-        // Phase 9 capability gating. Snapshot the verdict for this render so we
-        // don't pay the navigator cost again — `assess_capability` already ran
-        // at component mount via `use_hook`.
-        let verdict = capability_verdict.clone();
-        let is_blocked = matches!(verdict, CapabilityVerdict::Block(_));
-        let strong_warn_msg = match &verdict {
-            CapabilityVerdict::StrongWarn(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let block_msg = match &verdict {
-            CapabilityVerdict::Block(msg) => Some(msg.clone()),
-            _ => None,
-        };
-        let show_strong_warn_modal = strong_warn_msg.is_some() && !capability_acknowledged();
-
+        // Every device joins regardless of capabilities (issue #1054): the
+        // lobby always renders the PreJoinSettingsCard and the join button is
+        // always enabled. No pre-join capability gate.
         return rsx! {
             div { id: "main-container", class: "meeting-page",
                 BrowserCompatibility {}
@@ -3255,198 +3237,96 @@ pub fn AttendantsComponent(
                     div { class: "floating-element floating-element-2" }
                     div { class: "floating-element floating-element-3" }
                     div { class: "hero-content",
-                        if let Some(msg) = block_msg.clone() {
-                            // Hard-block: render an error card in place of the
-                            // join card. The user has to switch to a different
-                            // device — there is no override for this verdict.
-                            div { class: "settings-card",
-                                role: "alert",
-                                "aria-live": "assertive",
-                                div { class: "join-meeting-header",
-                                    h2 { class: "join-meeting-title",
-                                        span { class: "join-meeting-title-text",
-                                            "Device not supported"
-                                        }
+                        PreJoinSettingsCard {
+                            is_owner,
+                            meeting_id: id.clone(),
+                            waiting_room_toggle,
+                            admitted_can_admit_toggle,
+                            end_on_host_leave_toggle,
+                            allow_guests_toggle,
+                            saving,
+                            toggle_error,
+                            connection_error,
+                            media_access_granted: media_access_granted(),
+                            speaker_selection_supported: speaker_supported,
+                            cameras: prejoin_cameras(),
+                            microphones: prejoin_microphones(),
+                            speakers: prejoin_speakers(),
+                            selected_camera_id: prejoin_selected_camera(),
+                            selected_microphone_id: prejoin_selected_mic(),
+                            selected_speaker_id: prejoin_selected_speaker(),
+                            camera_on: prejoin_camera_on,
+                            mic_on: prejoin_mic_on,
+                            on_request_permission: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Preview-only permission request: does NOT join
+                                    // (join_requested stays false).
+                                    mda.borrow().request();
+                                }
+                            },
+                            on_camera_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_camera_on.set(on);
+                                    save_preferred_camera_on(on);
+                                    if on {
+                                        let id = prejoin_selected_camera()
+                                            .unwrap_or_default();
+                                        preview_engine.start_camera(id);
+                                    } else {
+                                        preview_engine.stop_camera();
                                     }
                                 }
-                                p { class: "toggle-error", "{msg}" }
-                                div { class: "settings-action-row",
-                                    button {
-                                        class: "btn-apple btn-primary settings-action-btn",
-                                        disabled: true,
-                                        "aria-disabled": "true",
-                                        if is_owner { "Start Meeting" } else { "Join Meeting" }
+                            },
+                            on_mic_toggle: {
+                                let preview_engine = preview_engine.clone();
+                                move |on: bool| {
+                                    prejoin_mic_on.set(on);
+                                    save_preferred_mic_on(on);
+                                    if on {
+                                        let id = prejoin_selected_mic().unwrap_or_default();
+                                        preview_engine.start_mic_meter(id);
+                                    } else {
+                                        preview_engine.stop_mic_meter();
                                     }
                                 }
-                                p { style: "text-align: center; color: var(--color-text-secondary); font-size: 0.8rem; margin-top: 0.5rem; margin-bottom: 0.25rem;",
-                                    "Meeting join is disabled for this device."
-                                }
-                            }
-                        } else {
-                            PreJoinSettingsCard {
-                                is_owner,
-                                meeting_id: id.clone(),
-                                waiting_room_toggle,
-                                admitted_can_admit_toggle,
-                                end_on_host_leave_toggle,
-                                allow_guests_toggle,
-                                saving,
-                                toggle_error,
-                                connection_error,
-                                media_access_granted: media_access_granted(),
-                                speaker_selection_supported: speaker_supported,
-                                cameras: prejoin_cameras(),
-                                microphones: prejoin_microphones(),
-                                speakers: prejoin_speakers(),
-                                selected_camera_id: prejoin_selected_camera(),
-                                selected_microphone_id: prejoin_selected_mic(),
-                                selected_speaker_id: prejoin_selected_speaker(),
-                                camera_on: prejoin_camera_on,
-                                mic_on: prejoin_mic_on,
-                                on_request_permission: {
-                                    let mda = mda.clone();
-                                    move |_| {
-                                        // Preview-only permission request: does NOT join
-                                        // (join_requested stays false).
-                                        mda.borrow().request();
-                                    }
-                                },
-                                on_camera_toggle: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |on: bool| {
-                                        prejoin_camera_on.set(on);
-                                        save_preferred_camera_on(on);
-                                        if on {
-                                            let id = prejoin_selected_camera()
-                                                .unwrap_or_default();
-                                            preview_engine.start_camera(id);
-                                        } else {
-                                            preview_engine.stop_camera();
-                                        }
-                                    }
-                                },
-                                on_mic_toggle: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |on: bool| {
-                                        prejoin_mic_on.set(on);
-                                        save_preferred_mic_on(on);
-                                        if on {
-                                            let id = prejoin_selected_mic().unwrap_or_default();
-                                            preview_engine.start_mic_meter(id);
-                                        } else {
-                                            preview_engine.stop_mic_meter();
-                                        }
-                                    }
-                                },
-                                on_camera_select: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |info: DeviceInfo| {
-                                        prejoin_selected_camera.set(Some(info.device_id.clone()));
-                                        save_preferred_camera_id(&info.device_id);
-                                        // Re-acquire the preview with the new device
-                                        // (only while the camera is on).
-                                        if prejoin_camera_on() {
-                                            preview_engine.start_camera(info.device_id);
-                                        }
-                                    }
-                                },
-                                on_microphone_select: {
-                                    let preview_engine = preview_engine.clone();
-                                    move |info: DeviceInfo| {
-                                        prejoin_selected_mic.set(Some(info.device_id.clone()));
-                                        save_preferred_mic_id(&info.device_id);
-                                        if prejoin_mic_on() {
-                                            preview_engine.start_mic_meter(info.device_id);
-                                        }
-                                    }
-                                },
-                                on_speaker_select: move |info: DeviceInfo| {
-                                    prejoin_selected_speaker.set(Some(info.device_id.clone()));
-                                    save_preferred_speaker_id(&info.device_id);
-                                },
-                                on_join: {
-                                    let mda = mda.clone();
-                                    let has_strong_warn = strong_warn_msg.is_some();
-                                    move |_| {
-                                        if is_blocked {
-                                            // Defensive: the card should not be
-                                            // rendered when blocked, but in case
-                                            // it ever is, ignore the click.
-                                            log::warn!(
-                                                "capability-check: join click ignored — Block verdict"
-                                            );
-                                            return;
-                                        }
-                                        if has_strong_warn && !capability_acknowledged() {
-                                            // Bring up the strong-warn modal
-                                            // instead of immediately requesting
-                                            // media. The modal's CTAs will set
-                                            // `capability_acknowledged` and
-                                            // re-fire the request.
-                                            log::info!(
-                                                "capability-check: showing StrongWarn modal"
-                                            );
-                                            return;
-                                        }
-                                        // Mark this as a real join so the permission
-                                        // callback proceeds to connect (issue #959).
-                                        join_requested.set(true);
-                                        mda.borrow().request();
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-                if show_strong_warn_modal {
-                    {
-                        let msg = strong_warn_msg.clone().unwrap_or_default();
-                        let mda_continue = mda.clone();
-                        let mda_audio = mda.clone();
-                        rsx! {
-                            div {
-                                class: "modal-overlay",
-                                role: "dialog",
-                                "aria-modal": "true",
-                                "aria-labelledby": "capability-warn-title",
-                                div { class: "modal-window",
-                                    h3 { id: "capability-warn-title", "Performance warning" }
-                                    p { style: "margin-top: 0.5rem;", "{msg}" }
-                                    div { style: "display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap;",
-                                        button {
-                                            class: "btn-apple btn-secondary",
-                                            onclick: move |_| {
-                                                // Audio-only: camera defaults to
-                                                // off in this lobby, so we just
-                                                // acknowledge and request media.
-                                                // Mic/camera buttons in the
-                                                // post-join controls remain
-                                                // available if the user changes
-                                                // their mind.
-                                                log::info!(
-                                                    "capability-check: user chose Audio-only"
-                                                );
-                                                capability_acknowledged.set(true);
-                                                join_requested.set(true);
-                                                mda_audio.borrow().request();
-                                            },
-                                            "Switch to audio-only"
-                                        }
-                                        button {
-                                            class: "btn-apple btn-primary",
-                                            onclick: move |_| {
-                                                log::info!(
-                                                    "capability-check: user chose Continue anyway"
-                                                );
-                                                capability_acknowledged.set(true);
-                                                join_requested.set(true);
-                                                mda_continue.borrow().request();
-                                            },
-                                            "Continue anyway"
-                                        }
+                            },
+                            on_camera_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_camera.set(Some(info.device_id.clone()));
+                                    save_preferred_camera_id(&info.device_id);
+                                    // Re-acquire the preview with the new device
+                                    // (only while the camera is on).
+                                    if prejoin_camera_on() {
+                                        preview_engine.start_camera(info.device_id);
                                     }
                                 }
-                            }
+                            },
+                            on_microphone_select: {
+                                let preview_engine = preview_engine.clone();
+                                move |info: DeviceInfo| {
+                                    prejoin_selected_mic.set(Some(info.device_id.clone()));
+                                    save_preferred_mic_id(&info.device_id);
+                                    if prejoin_mic_on() {
+                                        preview_engine.start_mic_meter(info.device_id);
+                                    }
+                                }
+                            },
+                            on_speaker_select: move |info: DeviceInfo| {
+                                prejoin_selected_speaker.set(Some(info.device_id.clone()));
+                                save_preferred_speaker_id(&info.device_id);
+                            },
+                            on_join: {
+                                let mda = mda.clone();
+                                move |_| {
+                                    // Mark this as a real join so the permission
+                                    // callback proceeds to connect (issue #959).
+                                    join_requested.set(true);
+                                    mda.borrow().request();
+                                }
+                            },
                         }
                     }
                 }
@@ -3687,11 +3567,26 @@ pub fn AttendantsComponent(
                                         stroke_width: "2",
                                         stroke_linecap: "round",
                                         stroke_linejoin: "round",
-                                        line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        line {
+                                            x1: "1",
+                                            y1: "1",
+                                            x2: "23",
+                                            y2: "23",
+                                        }
                                         path { d: "M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" }
                                         path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
-                                        line { x1: "12", y1: "19", x2: "12", y2: "23" }
-                                        line { x1: "8", y1: "23", x2: "16", y2: "23" }
+                                        line {
+                                            x1: "12",
+                                            y1: "19",
+                                            x2: "12",
+                                            y2: "23",
+                                        }
+                                        line {
+                                            x1: "8",
+                                            y1: "23",
+                                            x2: "16",
+                                            y2: "23",
+                                        }
                                     }
                                 }
                                 span { class: "toast-text",
@@ -3724,7 +3619,7 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
-                        for (id , display_name , _ , is_joined) in peer_toasts().iter().cloned() {
+                        for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
                                     "peer-toast toast-joined"
@@ -3841,7 +3736,7 @@ pub fn AttendantsComponent(
                             rsx! {
                                 // Left panel — ONLY the most recent (active) screen sharer
                                 div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
-                                            align-items: center; justify-content: center; overflow: hidden;",
+                                                                            align-items: center; justify-content: center; overflow: hidden;",
                                     if let Some(ref active_peer) = active_screen_sharer {
                                         PeerTile {
                                             key: "ss-active-{active_peer}",
@@ -3930,8 +3825,7 @@ pub fn AttendantsComponent(
                                     }
 
                                     if ss_overflow_count > 0 {
-                                        div {
-                                            class: "grid-overflow-badge",
+                                        div { class: "grid-overflow-badge",
                                             "+{ss_overflow_count}"
                                             span { "more in meeting" }
                                         }
@@ -4021,8 +3915,7 @@ pub fn AttendantsComponent(
                         }
 
                         if overflow_count > 0 {
-                            div {
-                                class: "grid-overflow-badge",
+                            div { class: "grid-overflow-badge",
                                 "+{overflow_count}"
                                 span { "more in meeting" }
                             }
@@ -4032,65 +3925,47 @@ pub fn AttendantsComponent(
                         if visible_tiles.is_empty() {
                             div {
                                 id: "invite-overlay",
-                                class: "card-apple",
-                                style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;",
-                                h4 { style: "margin-top:0;", "Your meeting is ready!" }
-                                p { style: "{SUBTLE_HELP_TEXT_STYLE}",
-                                    "Share this meeting link with others you want in the meeting"
-                                }
-                                div { style: "display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;",
-                                    input {
-                                        id: "meeting-link-input",
-                                        value: "{meeting_link}",
-                                        readonly: true,
-                                        class: "input-apple",
-                                        style: "flex:1; overflow:hidden; text-overflow: ellipsis;",
-                                    }
-                                    button {
-                                        class: if show_copy_toast() { "btn-apple btn-primary btn-sm copy-button btn-pop-animate" } else { "btn-apple btn-primary btn-sm copy-button" },
-                                        style: "margin-left: 0.5rem;",
-                                        onclick: {
-                                            let meeting_link = meeting_link.clone();
-                                            move |_| {
-                                                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
-                                                {
-                                                    let _ = clipboard.write_text(&meeting_link);
-                                                    show_copy_toast.set(true);
-                                                    Timeout::new(
-                                                            1640,
-                                                            move || {
-                                                                show_copy_toast.set(false);
-                                                            },
-                                                        )
-                                                        .forget();
-                                                }
-                                            }
-                                        },
-                                        "Copy"
-                                        if show_copy_toast() {
-                                            div {
-                                                class: "sparkles",
-                                                "aria-hidden": "true",
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
-                                                span { class: "sparkle" }
+                                class: "invite-glass-card",
+
+                                h4 { class: "invite-glass-title", "Your meeting is ready!" }
+
+                                button {
+                                    class: if show_copy_toast() { "invite-share-button copied" } else { "invite-share-button" },
+                                    r#type: "button",
+                                    onclick: {
+                                        let meeting_link = meeting_link.clone();
+                                        move |_| {
+                                            if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard())
+                                            {
+                                                let _ = clipboard.write_text(&meeting_link);
+                                                show_copy_toast.set(true);
+                                                Timeout::new(
+                                                        1640,
+                                                        move || {
+                                                            show_copy_toast.set(false);
+                                                        },
+                                                    )
+                                                    .forget();
                                             }
                                         }
+                                    },
+
+                                    span { class: "invite-share-icon", "↗" }
+                                    span {
+                                        if show_copy_toast() {
+                                            "LINK COPIED"
+                                        } else {
+                                            "SHARE THE LINK"
+                                        }
                                     }
+                                    span { class: "invite-copy-icon", "⧉" }
                                 }
-                                p { style: "{SUBTLE_FOOTNOTE_TEXT_STYLE}",
-                                    "People who use this meeting link must get your permission before they can join."
-                                }
+
                                 div {
                                     class: if show_copy_toast() { "copy-toast copy-toast--visible" } else { "copy-toast" },
                                     role: "alert",
                                     "aria-live": "assertive",
-                                    "Link copied to clipboard"
+                                    "Link copied"
                                 }
                             }
                         }
@@ -4098,7 +3973,8 @@ pub fn AttendantsComponent(
 
                     // Controls nav
                     if can_stream {
-                        nav { id: "host-controls-nav",
+                        nav {
+                            id: "host-controls-nav",
                             class: "host",
                             style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
                             onmounted: move |evt| {
@@ -4175,7 +4051,10 @@ pub fn AttendantsComponent(
                                         if !is_ios() {
                                             {
                                                 let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(screen_share_state(), ScreenShareState::Requesting | ScreenShareState::StreamReady);
+                                                let is_disabled = matches!(
+                                                    screen_share_state(),
+                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
+                                                );
                                                 rsx! {
                                                     ScreenShareButton {
                                                         active: is_active,
@@ -4216,6 +4095,9 @@ pub fn AttendantsComponent(
                                                                         &framerate_constraint,
                                                                         &JsValue::from_str("ideal"),
                                                                         &JsValue::from_f64(10.0),
+                                                                        // StreamReady causes is_sharing() to return true,
+                                                                        // which gives Host share_screen=true so it picks
+                                                                        // up the pre-acquired stream and starts encoding.
                                                                     );
                                                                     let video_constraints = js_sys::Object::new();
                                                                     let _ = js_sys::Reflect::set(
@@ -4240,33 +4122,30 @@ pub fn AttendantsComponent(
 
                                                                     // This call happens synchronously in the click handler --
                                                                     // the browser returns a Promise without rejecting.
-                                                                    let promise = match media_devices.get_display_media_with_constraints(&constraints) {
+                                                                    let promise = match media_devices
+                                                                        .get_display_media_with_constraints(&constraints)
+                                                                    {
                                                                         Ok(p) => p,
                                                                         Err(e) => {
                                                                             log::error!("getDisplayMedia failed synchronously: {e:?}");
                                                                             return;
                                                                         }
                                                                     };
-
-                                                                    // Mark as requesting immediately so the button shows disabled
                                                                     screen_share_state.set(ScreenShareState::Requesting);
-
-                                                                    // Now await the promise asynchronously -- this is fine,
-                                                                    // the gesture requirement was satisfied above.
-                                                                    let cell = stream_cell.clone();
+                                                                    let cell = stream_cell.clone(); // User cancelled or browser denied
                                                                     wasm_bindgen_futures::spawn_local(async move {
                                                                         match JsFuture::from(promise).await {
                                                                             Ok(stream) => {
-                                                                                let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                                                                                let media_stream: web_sys::MediaStream = stream
+                                                                                    .unchecked_into();
                                                                                 cell.borrow_mut().replace(media_stream);
-                                                                                // StreamReady causes is_sharing() to return true,
-                                                                                // which gives Host share_screen=true so it picks
-                                                                                // up the pre-acquired stream and starts encoding.
                                                                                 screen_share_state.set(ScreenShareState::StreamReady);
                                                                             }
                                                                             Err(e) => {
-                                                                                // User cancelled or browser denied
-                                                                                let is_cancel = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                                                                                let is_cancel = js_sys::Reflect::get(
+                                                                                        &e,
+                                                                                        &JsValue::from_str("name"),
+                                                                                    )
                                                                                     .ok()
                                                                                     .and_then(|v| v.as_string())
                                                                                     .map(|n| n == "NotAllowedError")
@@ -4520,9 +4399,20 @@ pub fn AttendantsComponent(
                                                     let room_token = hangup_room_token.clone();
                                                     wasm_bindgen_futures::spawn_local(async move {
                                                         if hangup_is_guest {
-                                                            let _ = crate::meeting_api::leave_meeting_as_guest(&meeting_id, &room_token).await;
-                                                        } else if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
-                                                            log::error!("Error leaving meeting: {e}");
+                                                            let _ = crate::meeting_api::leave_meeting_as_guest(
+                                                                &meeting_id,
+                                                                &room_token,
+                                                            )
+                                                            .await;
+                                                        } else if let Err(e) =
+                                                            crate::meeting_api::leave_meeting(
+                                                                &meeting_id,
+                                                            )
+                                                            .await
+                                                        {
+                                                            log::error!(
+                                                                "Error leaving meeting: {e}"
+                                                            );
                                                         }
                                                         let _ = window().location().set_href("/");
                                                     });
@@ -4670,9 +4560,11 @@ pub fn AttendantsComponent(
                             host_display_name: host_display_name.clone(),
                             host_user_id: host_user_id.clone(),
                             local_user_display_name: current_display_name(),
-                            on_edit_self_name: {move |_| {
-                                display_name_modal_open.set(true);
-                            }},
+                            on_edit_self_name: {
+                                move |_| {
+                                    display_name_modal_open.set(true);
+                                }
+                            },
                         }
                     }
                 }

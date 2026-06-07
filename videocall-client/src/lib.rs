@@ -246,12 +246,13 @@ pub use client::{
 pub use connection::{ConnectionLostReason, ConnectionState};
 pub use decode::{
     create_audio_peer_decoder, max_layers_for_kind, AudioPeerDecoderTrait, KindLayerBounds,
-    PeerDecodeManager, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
+    PeerDecodeManager, PeerReceiveDiag, PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot,
+    VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,
     QualityTierBounds, ScreenEncoder, ScreenQualitySnapshot, ScreenQualityTierBounds,
-    ScreenShareEvent,
+    ScreenShareEvent, SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,

@@ -60,7 +60,6 @@ pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -96,9 +95,6 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
 use videocall_aq::fit_within_preserving_aspect;
-
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -186,6 +182,100 @@ pub struct LiveQualitySnapshot {
     /// Live PID target bitrate (kbps) the encoder is actually aiming at — the
     /// real-time "needle" value for the VU meter (distinct from the tier ideal).
     pub target_bitrate_kbps: f32,
+}
+
+/// One active simulcast layer's live diagnostics: its layer id, the bitrate the
+/// AQ controller is currently targeting for it, and its fixed tier resolution
+/// (issue #1095 observability). Used by [`SimulcastSendSnapshot`].
+///
+/// Resolution comes from the per-layer SIMULCAST ladder rung (the layer's tier
+/// is fixed; only the bitrate adapts), so it is stable and panic-safely resolved
+/// at snapshot time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulcastLayerInfo {
+    /// This layer's simulcast id (0 = base / lowest quality).
+    pub layer_id: u32,
+    /// The bitrate (kbps) the AQ controller is currently targeting for this
+    /// layer. `0` until the control loop has published a value.
+    pub bitrate_kbps: u32,
+    /// Fixed tier width (px) for this layer.
+    pub width: u32,
+    /// Fixed tier height (px) for this layer.
+    pub height: u32,
+}
+
+/// A real-time snapshot of the SEND-side simulcast state for one media kind
+/// (issue #1095 observability — additive, no AQ behavior change).
+///
+/// Read from the live shared encoder atomics + the SIMULCAST ladder at call
+/// time, so the panel never indexes the AQ tables itself. In single-stream mode
+/// (`effective_layers == 1`) `simulcast_active` is `false` and `layers` is empty
+/// — the panel then just shows the single adaptive tier from
+/// [`LiveQualitySnapshot`]. Cheap enough to poll at the needle cadence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulcastSendSnapshot {
+    /// `true` when this encoder is publishing more than one layer.
+    pub simulcast_active: bool,
+    /// The effective layer count this session may emit
+    /// (`min(flag, capability)` ladder size). `1` in single-stream mode.
+    pub effective_layers: u32,
+    /// How many layers are CURRENTLY active (encoded + sent). The AQ controller
+    /// sheds the top layer(s) under congestion, so this can be `< effective_layers`.
+    pub active_layers: u32,
+    /// Per-EFFECTIVE-layer breakdown (lowest layer first). Empty in single-stream
+    /// mode; otherwise length == `effective_layers`. The top
+    /// `effective_layers - active_layers` entries are SHED layers, carried with
+    /// `bitrate_kbps == 0` so the UI can render them ghosted/dashed (the
+    /// `layer_id < active_layers` boundary distinguishes active vs shed). Issue
+    /// #1095: shed rungs must stay visible rather than the ladder silently
+    /// shrinking when the AQ drops the top layer under congestion.
+    pub layers: Vec<SimulcastLayerInfo>,
+}
+
+/// Build the per-EFFECTIVE-layer simulcast breakdown (issue #1095), lowest layer
+/// first. One [`SimulcastLayerInfo`] per layer in `0..effective`:
+///   * resolution from `resolutions[layer_id]` (resolvable for ALL effective
+///     layers, shed included, since each layer's tier is fixed),
+///   * `bitrate_kbps` = the live value from `active_bitrates_kbps[layer_id]` for
+///     ACTIVE layers (`layer_id < active`), or **`0` for SHED layers**
+///     (`layer_id >= active`) — the UI lights up the dashed shed styling off the
+///     `layer_id < active` boundary, so a zero bitrate is the shed marker.
+///
+/// Pure (no atomics / clock) so the shed-vs-active boundary is host-testable
+/// without a live encoder. `active` is clamped to `[0, effective]` defensively.
+///
+/// `pub(crate)` so the screen encoder reuses the exact same shed logic.
+pub(crate) fn build_simulcast_layers(
+    effective: u32,
+    active: u32,
+    resolutions: &[(u32, u32)],
+    active_bitrates_kbps: &[u32],
+) -> Vec<SimulcastLayerInfo> {
+    let active = active.min(effective);
+    (0..effective)
+        .map(|layer_id| {
+            let (width, height) = resolutions
+                .get(layer_id as usize)
+                .copied()
+                .unwrap_or((0, 0));
+            // Active layers report their real targeted bitrate; shed layers
+            // (layer_id >= active) report 0 — the shed marker for the UI.
+            let bitrate_kbps = if layer_id < active {
+                active_bitrates_kbps
+                    .get(layer_id as usize)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            SimulcastLayerInfo {
+                layer_id,
+                bitrate_kbps,
+                width,
+                height,
+            }
+        })
+        .collect()
 }
 
 /// One simulcast layer's encoder and its per-layer mutable encode state
@@ -318,6 +408,43 @@ pub struct CameraEncoder {
     /// in single-stream mode (the legacy `current_bitrate` atomic is used
     /// instead). Sized to `SIMULCAST_MAX_SUPPORTED_LAYERS` lazily on first use.
     shared_layer_bitrates_bps: Rc<RefCell<Vec<Rc<AtomicU32>>>>,
+    /// Sender-side encoder backpressure (issue #1108, Phase B): the max
+    /// `VideoEncoder::encode_queue_size()` across the ACTIVE layers, written by
+    /// the encode loop each frame and read by the AQ control loop to feed
+    /// [`EncoderBitrateController::observe_encoder_queue_depth`]. The encode loop
+    /// owns the `VideoEncoder`s and the control loop owns the controller, so this
+    /// atomic is the borrow-safe bridge between the two tasks — neither borrows
+    /// the other's state. **Stage 1: the controller only stores this value (no
+    /// shed/tier effect), so it is observability-only.**
+    shared_encoder_queue_depth: Rc<AtomicU32>,
+    /// Relay layer-union hint for this publisher's VIDEO ladder (issue #1108,
+    /// Stage 3). The relay tracks the MAX simulcast layer ANY receiver currently
+    /// wants for this (publisher, VIDEO) and delivers it on the publisher's own
+    /// self-subject via a `LAYER_HINT` packet. `VideoCallClient`'s dispatch arm
+    /// writes the received max-layer id here; the AQ control loop reads it each
+    /// tick and feeds it to
+    /// [`EncoderBitrateController::observe_union_requested_layer`], which caps the
+    /// published ladder so the encoder stops spending CPU/uplink on a top layer
+    /// no receiver wants.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (no cap):** until a hint arrives,
+    /// the controller keeps its full backpressure-governed ladder. Reset back to
+    /// `u32::MAX` on reconnect so a stale cap from the old relay cannot suppress
+    /// against a freshly-allocated session on a new relay. Borrow-safe bridge
+    /// (atomic) between the inbound-packet task and the control-loop task, exactly
+    /// like `shared_encoder_queue_depth`.
+    shared_union_requested_layer: Rc<AtomicU32>,
+    /// Liveness token whose sole purpose is to bound the lifetime of the AQ
+    /// control-loop `spawn_local` future (issue #1108). The encoder holds the
+    /// only strong reference; `set_encoder_control` captures a [`Weak`] and
+    /// breaks its 1 Hz `tick` loop as soon as `upgrade()` returns `None`. Because
+    /// the control loop runs on `wasm_bindgen_futures::spawn_local` (NOT bound to
+    /// the Dioxus component scope), it would otherwise run forever and pin its
+    /// cloned `Rc` graph + `on_encoder_settings_update` callback across `Host`
+    /// remounts. When this `CameraEncoder` is dropped on unmount, the strong
+    /// count hits 0 and the loop exits cleanly — restoring the pre-#1108 lifetime
+    /// where the loop ended when the diagnostics channel closed.
+    control_loop_liveness: Rc<()>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -422,6 +549,17 @@ impl CameraEncoder {
             // build; the control loop adjusts it down/up under congestion.
             shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
+            // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
+            // (no frames queued); the encode loop publishes the live depth.
+            shared_encoder_queue_depth: Rc::new(AtomicU32::new(0)),
+            // Relay layer-union hint (issue #1108, Stage 3). Starts at u32::MAX
+            // (fail-open / no cap): the controller keeps its full ladder until a
+            // LAYER_HINT arrives. Reset to u32::MAX on reconnect.
+            shared_union_requested_layer: Rc::new(AtomicU32::new(u32::MAX)),
+            // AQ control-loop liveness token (issue #1108). The encoder is the
+            // sole strong owner; the self-tick loop holds a Weak and exits when
+            // this drops (encoder torn down on Host unmount).
+            control_loop_liveness: Rc::new(()),
         }
     }
 
@@ -436,10 +574,14 @@ impl CameraEncoder {
         clamp_layer_count(self.max_layers)
     }
 
-    pub fn set_encoder_control(
-        &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-    ) {
+    /// Spawn the encoder AQ control loop (issue #1108: now a self-timer).
+    ///
+    /// Receiver-reported FPS no longer drives the sender AQ, so this loop is no
+    /// longer fed by a diagnostics channel. It ticks at `AQ_TICK_INTERVAL_MS`,
+    /// reading the sender's own encoder-queue backpressure (published by the
+    /// encode loop into `shared_encoder_queue_depth`) plus the server-CONGESTION
+    /// and WS-send-buffer signals, and applies tier/layer/bitrate decisions.
+    pub fn set_encoder_control(&mut self) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
@@ -467,6 +609,19 @@ impl CameraEncoder {
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the control loop
+        // READS the depth the encode loop published and forwards it to the
+        // controller on each self-timer tick.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Relay layer-union hint (issue #1108, Stage 3): the control loop READS
+        // the max-layer the client wrote (from a LAYER_HINT packet) and forwards
+        // it to the controller's union cap each tick.
+        let shared_union_requested_layer = self.shared_union_requested_layer.clone();
+        // Liveness sentinel (issue #1108): a Weak to the encoder-owned token.
+        // The loop below breaks as soon as this fails to upgrade, i.e. when the
+        // CameraEncoder is dropped (Host unmount). Without this, the
+        // `spawn_local` future is immortal and leaks per remount.
+        let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -499,7 +654,30 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
-            while let Some(event) = diagnostics_receiver.next().await {
+            // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
+            // instead of waiting on receiver diagnostics. Runs for the lifetime
+            // of the owning CameraEncoder: this `spawn_local` future is NOT bound
+            // to the Dioxus component scope, so it must break itself when the
+            // encoder is torn down (Host unmount) — otherwise it would tick
+            // forever, pinning its cloned Rc graph and firing into a stale
+            // `on_encoder_settings_update` callback, leaking one loop per remount.
+            // The `control_loop_liveness` Weak fails to upgrade once the encoder
+            // (sole strong owner of the token) is dropped, which is our exit. The
+            // `enabled` flag does NOT terminate the loop — it only gates the
+            // bitrate-vs-"Disabled" emit below, so a muted-then-unmuted camera
+            // keeps adapting without re-arming.
+            loop {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(
+                    crate::adaptive_quality_constants::AQ_TICK_INTERVAL_MS,
+                ))
+                .await;
+                // Encoder torn down? Stop ticking and let the future complete so
+                // its captured Rc graph is released.
+                if control_loop_liveness.upgrade().is_none() {
+                    log::debug!("CameraEncoder: AQ control loop exiting (encoder dropped)");
+                    break;
+                }
+                let now = js_sys::Date::now();
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
                 let screen_active = screen_sharing_active.load(Ordering::Acquire);
@@ -555,8 +733,7 @@ impl CameraEncoder {
                 // no-op.
                 {
                     let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
-                    let now_ms = js_sys::Date::now();
-                    let elapsed_ms = now_ms - ws_drop_window_start_ms;
+                    let elapsed_ms = now - ws_drop_window_start_ms;
 
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
@@ -573,13 +750,36 @@ impl CameraEncoder {
                             encoder_control.force_video_step_down();
                         }
                         last_ws_drop_snapshot = current_ws_drops;
-                        ws_drop_window_start_ms = now_ms;
+                        ws_drop_window_start_ms = now;
                     }
                 }
 
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                // Sender encoder backpressure (issue #1108). Feed the depth the
+                // encode loop published into the controller, then advance the AQ
+                // one tick. This is the SOLE gradual quality axis now: receiver
+                // FPS no longer reaches the sender AQ. The native bot feeds 0 in
+                // its own loop; here we forward the live WebCodecs queue depth.
+                encoder_control.observe_encoder_queue_depth(
+                    shared_encoder_queue_depth.load(Ordering::Relaxed),
+                );
+                // Relay layer-union hint (issue #1108, Stage 3): feed the latest
+                // max-requested-layer the client wrote (u32::MAX = fail-open / no
+                // cap) so the controller caps the published ladder to what some
+                // receiver actually wants. Applied right before `tick` so the cap
+                // composes with the just-observed backpressure decision.
+                encoder_control.observe_union_requested_layer(
+                    shared_union_requested_layer.load(Ordering::Relaxed),
+                );
+                encoder_control.tick(now);
+                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
-                // Write encoder decision inputs to shared atomics for health reporting.
+                // Write encoder decision inputs to shared atomics for health
+                // reporting. Issue #1108: the receiver-FPS-derived signals are
+                // gone — `last_fps_ratio()` / `last_bitrate_ratio()` now return
+                // NaN (the health reporter's is_finite() guard drops those proto
+                // fields), and `last_p75_peer_fps()` is REPOINTED to carry the new
+                // sender backpressure signal (encoder queue depth) so the existing
+                // host telemetry channel surfaces it with no proto/Grafana churn.
                 shared_encoder_fps_ratio.store(
                     (encoder_control.last_fps_ratio() as f32).to_bits(),
                     Ordering::Relaxed,
@@ -791,6 +991,61 @@ impl CameraEncoder {
         }
     }
 
+    /// Live SEND-side simulcast diagnostics for the camera (issue #1095
+    /// observability). Reads the active-layer count + per-layer target-bitrate
+    /// atomics published by the AQ control loop, and resolves EVERY effective
+    /// layer's fixed resolution from the SIMULCAST ladder. Panic-safe (indices
+    /// clamped); cheap to poll at the needle cadence.
+    ///
+    /// Emits one rung per EFFECTIVE layer (the configured ladder depth), not just
+    /// the active ones, so a layer the AQ has SHED under congestion stays visible
+    /// (with `bitrate_kbps == 0`) instead of the ladder silently shrinking. The
+    /// `active_layers` field is the active-vs-shed boundary.
+    ///
+    /// In single-stream mode (effective layers == 1) this returns
+    /// `simulcast_active = false` with an empty `layers` Vec.
+    pub fn live_simulcast_snapshot(&self) -> SimulcastSendSnapshot {
+        let effective = self.effective_layer_count();
+        if effective <= 1 {
+            return SimulcastSendSnapshot {
+                simulcast_active: false,
+                effective_layers: effective,
+                active_layers: 1,
+                layers: Vec::new(),
+            };
+        }
+        // Fixed per-layer resolutions for the FULL ladder (lowest layer first) —
+        // resolvable for every effective layer, shed included.
+        let resolutions: Vec<(u32, u32)> = simulcast_layers(effective as usize)
+            .iter()
+            .map(|t| (t.max_width, t.max_height))
+            .collect();
+        // Active layer count is shed-aware (the AQ loop drops the top layer under
+        // congestion); clamp it to the ladder size defensively.
+        let active = (self.shared_active_layer_count.load(Ordering::Relaxed))
+            .min(effective)
+            .max(1);
+        // Live targeted bitrates (kbps) for the active layers, from the atomics.
+        let active_bitrates_kbps: Vec<u32> = {
+            let bitrate_atomics = self.shared_layer_bitrates_bps.borrow();
+            (0..active)
+                .map(|layer_id| {
+                    bitrate_atomics
+                        .get(layer_id as usize)
+                        .map(|a| a.load(Ordering::Relaxed) / 1000) // bps -> kbps
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let layers = build_simulcast_layers(effective, active, &resolutions, &active_bitrates_kbps);
+        SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: effective,
+            active_layers: active,
+            layers,
+        }
+    }
+
     /// Returns the encoder fps_ratio atomic (f32 bits).
     pub fn shared_encoder_fps_ratio(&self) -> Rc<AtomicU32> {
         self.shared_encoder_fps_ratio.clone()
@@ -809,6 +1064,19 @@ impl CameraEncoder {
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
     pub fn shared_encoder_target_bitrate_kbps(&self) -> Rc<AtomicU32> {
         self.shared_encoder_target_bitrate_kbps.clone()
+    }
+
+    /// Returns the relay layer-union hint atomic for this VIDEO ladder (issue
+    /// #1108, Stage 3).
+    ///
+    /// `VideoCallClient` stores this clone (via
+    /// [`VideoCallClient::set_camera_union_requested_layer`](crate::VideoCallClient::set_camera_union_requested_layer))
+    /// and writes the MAX-requested-layer carried by an inbound `LAYER_HINT`
+    /// packet into it. The encoder's AQ control loop reads it each tick to cap the
+    /// published ladder. The value is a max-layer **id** (`u32::MAX` = fail-open /
+    /// no cap); the controller converts it to an active-layer count.
+    pub fn shared_union_requested_layer(&self) -> Rc<AtomicU32> {
+        self.shared_union_requested_layer.clone()
     }
 
     /// Returns the shared tier transitions buffer for health reporting.
@@ -976,6 +1244,9 @@ impl CameraEncoder {
         let simulcast = n_layers > 1;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
+        // Sender encoder backpressure (issue #1108, Phase B): the encode loop
+        // WRITES the max active-layer encode_queue_size() here each frame.
+        let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -1040,6 +1311,17 @@ impl CameraEncoder {
             // short cascade without spinning forever if the browser is wedged.
             // Revisit this cap if the fatal-error classifier is broadened.
             const MAX_RESTARTS: u32 = 5;
+
+            // Last active-layer count we logged a transition for. Declared
+            // OUTSIDE `'restart` so it persists across encoder restart cycles:
+            // seeding it per-restart from `n_layers` would fake a phantom
+            // `n_layers->current` transition on the first frame after any
+            // restart that happens once the controller has already shed layers.
+            // Seeded from the shared atomic's CURRENT value so the first frame
+            // logs only a real change. The encode loop refreshes and compares it
+            // each frame, emitting ONE line only when the count actually changes.
+            let mut prev_active_layers: usize =
+                shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
             'restart: loop {
                 // Backoff + max-restart guard (skip on first iteration).
@@ -1434,6 +1716,9 @@ impl CameraEncoder {
                         );
                     }
                     // Refresh the active-layer count each frame (simulcast only).
+                    // The event-driven transition log is emitted AFTER the
+                    // per-layer reconfigure pass below, so the reported
+                    // `local_bitrate` reflects the bitrate just applied this tick.
                     local_active_layers =
                         shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
@@ -1601,6 +1886,70 @@ impl CameraEncoder {
                     if fatal_reconfigure {
                         restart_count += 1;
                         break 'encode;
+                    }
+
+                    // Event-driven simulcast layer-transition log (issue #989).
+                    //
+                    // Fires ONCE per change in the active-layer count — a layer
+                    // being shed (count drops) or restored (count rises). NOT a
+                    // periodic heartbeat: layer changes are heavily damped by the
+                    // AQ controller's hysteresis (≈1.5s to shed, ≈5s to restore),
+                    // so a per-tick snapshot would be near-silent noise. We log
+                    // the TRANSITION, not the steady state.
+                    //
+                    // Emitted HERE, after the per-layer reconfigure pass above,
+                    // so each layer's `local_bitrate` already reflects the
+                    // bitrate applied on this same tick — when AQ changes the
+                    // active-layer count and the per-layer bitrate together, the
+                    // log shows the new bitrate, not the previous tick's value.
+                    //
+                    // Gated on `simulcast` (n_layers > 1) so single-stream
+                    // sessions — where this count is pinned at 1 — never emit it.
+                    // `info!` is safe here: this is per-transition, several
+                    // seconds apart at most, never per-frame or per-packet.
+                    if simulcast && local_active_layers != prev_active_layers {
+                        // Directional reason only. The richer cause (server
+                        // CONGESTION vs WS-backpressure force-cut vs gradual /
+                        // floor-saturated degrade vs recovery) lives in the
+                        // `EncoderBitrateController` in the separate diagnostics
+                        // loop and reaches the encode loop solely through the
+                        // `shared_active_layer_count` atomic — no reason flag is
+                        // plumbed across. We avoid adding heavy plumbing just for
+                        // this string.
+                        // TODO(#989): surface the precise shed reason
+                        // (congestion / degrade / recover) from the controller
+                        // via a small shared enum atomic so this can read e.g.
+                        // reason=congestion instead of the directional fallback.
+                        let reason = if local_active_layers < prev_active_layers {
+                            "shed-under-load"
+                        } else {
+                            "restore"
+                        };
+                        let detail = layers
+                            .iter()
+                            .map(|l| {
+                                if (l.layer_id as usize) < local_active_layers {
+                                    format!(
+                                        "[{}] {}x{} ~{}kbps ACTIVE",
+                                        l.layer_id,
+                                        l.current_w,
+                                        l.current_h,
+                                        l.local_bitrate / 1000
+                                    )
+                                } else {
+                                    format!("[{}] {}x{} SHED", l.layer_id, l.current_w, l.current_h)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        log::info!(
+                            "Simulcast layer change: active {}->{} (reason={}) | {}",
+                            prev_active_layers,
+                            local_active_layers,
+                            reason,
+                            detail
+                        );
+                        prev_active_layers = local_active_layers;
                     }
 
                     match JsFuture::from(video_reader.read()).await {
@@ -1792,6 +2141,27 @@ impl CameraEncoder {
                             // fatal path below also reaches this single close.
                             video_frame.close();
 
+                            // Sender encoder backpressure (issue #1108, Phase B).
+                            // After submitting this frame to every ACTIVE layer,
+                            // sample the max `encode_queue_size()` across those
+                            // layers and publish it for the AQ control loop. We
+                            // mirror the encode gate above (skip layers
+                            // `>= local_active_layers` in simulcast mode) so a
+                            // shed layer's stale queue can't keep the signal hot.
+                            // For N==1 this is just the sole base layer's depth.
+                            // Stage 1: stored-only on the controller side, so this
+                            // is observability with no behavior change.
+                            let max_active_queue_depth = layers
+                                .iter()
+                                .filter(|l| {
+                                    !simulcast || (l.layer_id as usize) < local_active_layers
+                                })
+                                .map(|l| l.encoder.encode_queue_size())
+                                .max()
+                                .unwrap_or(0);
+                            shared_encoder_queue_depth
+                                .store(max_active_queue_depth, Ordering::Relaxed);
+
                             // First healthy frame after a restart resets the restart
                             // counter so transient errors don't accumulate toward
                             // MAX_RESTARTS across long-lived sessions. "Healthy" is
@@ -1851,9 +2221,92 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_layer_count, frame_is_healthy, is_fatal_encoder_error_message,
-        SIMULCAST_MAX_SUPPORTED_LAYERS,
+        build_simulcast_layers, clamp_layer_count, frame_is_healthy,
+        is_fatal_encoder_error_message, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
+
+    #[test]
+    fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {
+        // Issue #1095: the ladder must carry one rung per EFFECTIVE layer, with
+        // the top (effective - active) shed rungs at bitrate 0, so the UI can draw
+        // the ghosted/dashed shed rungs instead of the ladder silently shrinking.
+        let resolutions = [(640, 360), (960, 540), (1280, 720)];
+        let active_bitrates = [400u32, 900]; // only 2 active; L2 is shed
+        let layers = build_simulcast_layers(3, 2, &resolutions, &active_bitrates);
+
+        // All 3 effective rungs present (not just the 2 active).
+        assert_eq!(layers.len(), 3, "must emit one rung per EFFECTIVE layer");
+        assert_eq!(
+            layers,
+            vec![
+                SimulcastLayerInfo {
+                    layer_id: 0,
+                    bitrate_kbps: 400,
+                    width: 640,
+                    height: 360,
+                },
+                SimulcastLayerInfo {
+                    layer_id: 1,
+                    bitrate_kbps: 900,
+                    width: 960,
+                    height: 540,
+                },
+                // SHED layer: resolution still resolved, bitrate 0 = shed marker.
+                SimulcastLayerInfo {
+                    layer_id: 2,
+                    bitrate_kbps: 0,
+                    width: 1280,
+                    height: 720,
+                },
+            ]
+        );
+        // The shed boundary: layers[i].bitrate_kbps == 0 exactly for i >= active.
+        for (i, l) in layers.iter().enumerate() {
+            if (i as u32) >= 2 {
+                assert_eq!(l.bitrate_kbps, 0, "layer {i} is shed → bitrate 0");
+            } else {
+                assert!(l.bitrate_kbps > 0, "layer {i} is active → real bitrate");
+            }
+        }
+    }
+
+    #[test]
+    fn simulcast_layers_all_active_have_no_shed() {
+        // active == effective → every rung carries a real bitrate, none shed.
+        let resolutions = [(640, 360), (960, 540), (1280, 720)];
+        let active_bitrates = [400u32, 900, 1500];
+        let layers = build_simulcast_layers(3, 3, &resolutions, &active_bitrates);
+        assert_eq!(layers.len(), 3);
+        assert!(layers.iter().all(|l| l.bitrate_kbps > 0));
+        assert_eq!(layers[2].bitrate_kbps, 1500);
+    }
+
+    #[test]
+    fn simulcast_layers_clamp_active_and_missing_inputs() {
+        // active > effective is clamped (no panic), and missing resolution /
+        // bitrate slots default to 0 rather than indexing out of bounds.
+        let layers = build_simulcast_layers(2, 99, &[(640, 360)], &[]);
+        assert_eq!(layers.len(), 2);
+        // Resolution for L1 is missing → (0,0); bitrate atomics empty → 0.
+        assert_eq!(
+            layers[0],
+            SimulcastLayerInfo {
+                layer_id: 0,
+                bitrate_kbps: 0,
+                width: 640,
+                height: 360,
+            }
+        );
+        assert_eq!(
+            layers[1],
+            SimulcastLayerInfo {
+                layer_id: 1,
+                bitrate_kbps: 0,
+                width: 0,
+                height: 0,
+            }
+        );
+    }
 
     #[test]
     fn fatal_encoder_errors_match_closed_codec_signatures() {

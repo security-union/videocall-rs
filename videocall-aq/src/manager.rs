@@ -35,15 +35,12 @@ use std::sync::Arc;
 
 use crate::clock::{default_clock, Clock};
 use crate::constants::{
-    AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, AUDIO_TIER_DEGRADE_FPS_RATIO,
-    AUDIO_TIER_RECOVER_FPS_RATIO, CLIMB_COOLDOWN_BACKOFF, CLIMB_COOLDOWN_BASE_MS,
-    CLIMB_COOLDOWN_MAX_MS, CONGESTION_CUT_TIERS, CONGESTION_HOLD_MS, CRASH_MEMORY_RESET_MS,
-    DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS,
+    AudioQualityTier, VideoQualityTier, AUDIO_QUALITY_TIERS, CLIMB_COOLDOWN_BACKOFF,
+    CLIMB_COOLDOWN_BASE_MS, CLIMB_COOLDOWN_MAX_MS, CONGESTION_CUT_TIERS, CONGESTION_HOLD_MS,
+    CRASH_MEMORY_RESET_MS, DEFAULT_SCREEN_TIER_INDEX, DEFAULT_VIDEO_TIER_INDEX, DEFAULT_WARMUP_MS,
     MIN_TIER_TRANSITION_INTERVAL_MS, RECOVERY_SLOWDOWN_DECAY_MS, RECOVERY_SLOWDOWN_FACTOR,
     REELECTION_CEILING_SUPPRESSION_MS, SCREEN_QUALITY_WARMUP_MS, STEP_DOWN_REACTION_TIME_MS,
-    STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_TIER_DEGRADE_BITRATE_RATIO,
-    VIDEO_TIER_DEGRADE_FPS_RATIO, VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT,
-    VIDEO_TIER_RECOVER_BITRATE_RATIO, VIDEO_TIER_RECOVER_FPS_RATIO, YOYO_DETECTION_WINDOW_MS,
+    STEP_UP_STABILIZATION_WINDOW_MS, YOYO_DETECTION_WINDOW_MS,
 };
 
 /// Record of a single tier transition event, captured for health reporting.
@@ -65,6 +62,17 @@ pub struct AdaptiveQualityManager {
 
     /// Current video tier index (0 = highest quality, len-1 = lowest).
     video_tier_index: usize,
+
+    /// Baseline video tier index this stream started at — the ceiling that the
+    /// backpressure `recover` step-up may NOT climb above (issue #1108,
+    /// clamp-to-baseline recovery). Set once at construction from
+    /// `default_tier_index` (camera = `DEFAULT_VIDEO_TIER_INDEX`, screen =
+    /// `DEFAULT_SCREEN_TIER_INDEX`). With receiver FPS gone the sender has no
+    /// capacity signal, so it only ever *reverses its own* backpressure-induced
+    /// steps back to this baseline — it never speculatively probes for more
+    /// uplink. The DOWN path (`video_step_down_cap`) is unaffected, and an
+    /// explicit user `best` bound overrides this (an explicit capacity opt-in).
+    recovery_baseline_index: usize,
 
     /// Current audio tier index (0 = highest quality, len-1 = lowest).
     audio_tier_index: usize,
@@ -272,6 +280,9 @@ impl AdaptiveQualityManager {
         Self {
             video_tiers,
             video_tier_index: default_tier_index,
+            // Backpressure recovery may climb back to — but never above — the
+            // tier this stream started at (issue #1108, clamp-to-baseline).
+            recovery_baseline_index: default_tier_index,
             audio_tier_index: 0,
             last_transition_time_ms: now,
             degrade_start_ms: None,
@@ -377,47 +388,51 @@ impl AdaptiveQualityManager {
         )
     }
 
-    /// Process updated network signals and potentially transition tiers.
+    /// Process the sender's own backpressure decision and potentially
+    /// transition tiers (issue #1108, Phase B).
+    ///
+    /// Replaces the former receiver-FPS-driven `update(...)`. The sender no
+    /// longer adapts to how peers *receive* its stream; the only gradual signal
+    /// is the sender's own encode backpressure, pre-reduced by the controller to
+    /// two booleans:
+    ///
+    /// * `degrade` — the sender is under sustained encode backpressure (its
+    ///   WebCodecs encode queue has been at/above the HIGH threshold for the
+    ///   sustain window). Steps the video tier DOWN (and, only when video is at
+    ///   floor, the audio tier — the backpressure-gated safety net).
+    /// * `recover` — backpressure has been clear over the stabilization window.
+    ///   Steps tiers back UP (subject to the existing hysteresis / crash-ceiling
+    ///   / congestion-hold gating).
+    ///
+    /// **Clamp-to-baseline recovery (issue #1108):** `recover` only reverses the
+    /// sender's OWN backpressure-induced steps — it never climbs above the
+    /// un-degraded configuration (`recovery_baseline_index`, and the full
+    /// simulcast ladder). With no capacity signal (receiver FPS is gone) the
+    /// sender never speculatively probes for more uplink; the only signals that
+    /// push *below* baseline are this backpressure axis plus the explicit
+    /// `force_congestion_cut` / `force_video_step_down` paths. An explicit user
+    /// `best` quality bound is the one exception that may raise above baseline
+    /// (it is an explicit capacity opt-in).
     ///
     /// Returns `true` if a tier changed (video or audio), meaning the caller
     /// should apply the new tier settings to the encoder.
     ///
     /// # Arguments
-    /// * `received_fps` - FPS actually received (p75 aggregate across peers)
-    /// * `target_fps` - Target FPS we are aiming for
-    /// * `current_bitrate_kbps` - Actual bitrate being used
-    /// * `ideal_bitrate_kbps` - Ideal bitrate for the current tier
-    /// * `now_ms` - Current timestamp in milliseconds
-    /// * `effective_peer_count` - Number of peers that contributed FPS data
-    pub fn update(
-        &mut self,
-        received_fps: f64,
-        target_fps: f64,
-        current_bitrate_kbps: f64,
-        ideal_bitrate_kbps: f64,
-        now_ms: f64,
-        effective_peer_count: usize,
-    ) -> bool {
+    /// * `degrade` - sender is under sustained encode backpressure (step DOWN)
+    /// * `recover` - backpressure is sustained-clear (step UP)
+    /// * `now_ms` - current timestamp in milliseconds
+    pub fn update_from_backpressure(&mut self, degrade: bool, recover: bool, now_ms: f64) -> bool {
         // Issue #1077: clear the floor-saturated degrade signal each tick; it is
         // re-set below only if this tick warrants a step-down that the floor
         // blocks. (Cleared before the warmup/guard early-returns so a stale
         // signal can never leak across ticks.)
         self.degrade_floor_saturated = false;
 
-        // Warmup guard: during encoder startup, no frames have been produced yet
-        // so fps_ratio reads as 0.0, triggering false step-downs. Suppress all
-        // tier transitions until the encoder has had time to stabilize.
+        // Warmup guard: during encoder startup the sender is still spinning up,
+        // so suppress all tier transitions until it has had time to stabilize.
         if now_ms - self.created_at_ms < self.warmup_ms {
             return false;
         }
-
-        // Guard: if target values are zero or negative, skip to avoid division by zero.
-        if target_fps <= 0.0 || ideal_bitrate_kbps <= 0.0 {
-            return false;
-        }
-
-        let fps_ratio = received_fps / target_fps;
-        let bitrate_ratio = current_bitrate_kbps / ideal_bitrate_kbps;
 
         // Enforce minimum interval between any two transitions.
         let time_since_last_transition = now_ms - self.last_transition_time_ms;
@@ -426,28 +441,27 @@ impl AdaptiveQualityManager {
         let mut changed = false;
 
         // --- Video tier logic ---
-        changed |= self.update_video_tier(
-            fps_ratio,
-            bitrate_ratio,
-            now_ms,
-            can_transition,
-            effective_peer_count,
-        );
+        changed |= self.update_video_tier(degrade, recover, now_ms, can_transition);
 
         // --- Audio tier logic ---
-        changed |= self.update_audio_tier(fps_ratio, now_ms, can_transition);
+        changed |= self.update_audio_tier(degrade, recover, now_ms, can_transition);
 
         changed
     }
 
-    /// Handle video tier step-down and step-up logic.
+    /// Handle video tier step-down and step-up logic (issue #1108, Phase B).
+    ///
+    /// `degrade` / `recover` are the sender's own backpressure decision (see
+    /// [`update_from_backpressure`](Self::update_from_backpressure)); receiver
+    /// FPS no longer participates. All hysteresis, crash-ceiling, yo-yo,
+    /// re-election, congestion-hold, dwell, and floor-saturated logic is
+    /// unchanged — only the degrade/recover *predicates* are now boolean inputs.
     fn update_video_tier(
         &mut self,
-        fps_ratio: f64,
-        bitrate_ratio: f64,
+        degrade: bool,
+        recover: bool,
         now_ms: f64,
         can_transition: bool,
-        effective_peer_count: usize,
     ) -> bool {
         let max_video_index = self.video_tiers.len().saturating_sub(1);
 
@@ -456,15 +470,11 @@ impl AdaptiveQualityManager {
         self.maybe_reset_crash_memory(now_ms);
 
         // --- Step DOWN ---
-        // With fewer than 3 peers, p75 aggregation degenerates, so use a more
-        // lenient FPS threshold to avoid false degradation from a single outlier.
-        let degrade_fps_threshold = if effective_peer_count < 3 {
-            VIDEO_TIER_DEGRADE_FPS_RATIO_LENIENT
-        } else {
-            VIDEO_TIER_DEGRADE_FPS_RATIO
-        };
-        let should_degrade =
-            fps_ratio < degrade_fps_threshold || bitrate_ratio < VIDEO_TIER_DEGRADE_BITRATE_RATIO;
+        // The sender steps DOWN only on its OWN sustained encode backpressure
+        // (issue #1108). The former receiver-FPS / bitrate-ratio predicates
+        // (and the small-peer-count lenient threshold) are gone — a peer's link
+        // can no longer drive a sender step-down.
+        let should_degrade = degrade;
 
         // Step-DOWN cap: never exceed the user's `worst` bound (issue #961),
         // composed with the hard array bound — the more restrictive wins. This
@@ -511,25 +521,19 @@ impl AdaptiveQualityManager {
                 self.degrade_start_ms = None;
                 self.recover_start_ms = None;
                 let to_tier = self.video_tiers[self.video_tier_index].label.to_string();
-                // Primary trigger: fps drives degradation more than bitrate
-                let trigger = if fps_ratio < degrade_fps_threshold {
-                    "fps"
-                } else {
-                    "bitrate"
-                };
+                // Sender backpressure is now the sole gradual degrade trigger
+                // (issue #1108).
                 self.transition_buffer.push(TierTransitionRecord {
                     direction: "down",
                     stream: "video",
                     from_tier,
                     to_tier: to_tier.clone(),
-                    trigger,
+                    trigger: "backpressure",
                 });
                 log::info!(
-                    "AdaptiveQuality: video stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}, bitrate_ratio={:.2}",
+                    "AdaptiveQuality: video stepped DOWN to tier '{}' (index {}) on sender backpressure",
                     to_tier,
                     self.video_tier_index,
-                    fps_ratio,
-                    bitrate_ratio,
                 );
                 // Climb-rate limiter: evaluate yo-yo detection for ceiling arming.
                 // N.B. must be called before updating last_step_down_ms so it reads
@@ -553,21 +557,32 @@ impl AdaptiveQualityManager {
         }
 
         // --- Step UP ---
-        // Suppress step-up entirely while a self-targeted CONGESTION drain hold
-        // is active: the relay buffer is still draining and climbing tiers now
-        // would re-fill it. The hold expires by timestamp, after which recovery
-        // resumes normally.
-        let should_recover = !self.congestion_hold_active(now_ms)
-            && fps_ratio > VIDEO_TIER_RECOVER_FPS_RATIO
-            && bitrate_ratio > VIDEO_TIER_RECOVER_BITRATE_RATIO;
+        // Recover only when the sender's backpressure has been sustained-clear
+        // (issue #1108). Suppress step-up entirely while a self-targeted
+        // CONGESTION drain hold is active: the relay buffer is still draining and
+        // climbing tiers now would re-fill it. The hold expires by timestamp,
+        // after which recovery resumes normally.
+        let should_recover = recover && !self.congestion_hold_active(now_ms);
 
         // Respect the screen-share coordination ceiling, the crash ceiling, AND
         // the user's `best` floor (issue #961). The effective step-up floor is
         // the MOST restrictive (highest index) of these — the user `best` only
         // adds a further floor; it can never loosen a safety ceiling.
-        let min_allowed_index = self.video_step_up_floor();
+        //
+        // Issue #1108 (clamp-to-baseline recovery): backpressure-driven recovery
+        // may climb back to — but never above — the tier this stream started at
+        // (`recovery_baseline_index`). With receiver FPS gone the sender has no
+        // capacity signal, so it must not speculatively probe for more uplink; it
+        // only reverses its OWN backpressure-induced steps. EXCEPTION: when the
+        // user set an explicit `best` bound, that IS an explicit capacity
+        // authorization and wins — the baseline must not raise the floor above
+        // it. So the baseline clamp applies ONLY when no user-best is set.
+        let recover_floor = match self.user_video_best_index {
+            Some(_) => self.video_step_up_floor(),
+            None => self.video_step_up_floor().max(self.recovery_baseline_index),
+        };
 
-        if should_recover && self.video_tier_index > min_allowed_index {
+        if should_recover && self.video_tier_index > recover_floor {
             let recover_start = *self.recover_start_ms.get_or_insert(now_ms);
             let recover_duration = now_ms - recover_start;
 
@@ -590,26 +605,20 @@ impl AdaptiveQualityManager {
                     stream: "video",
                     from_tier,
                     to_tier: to_tier.clone(),
-                    trigger: "fps",
+                    trigger: "backpressure",
                 });
                 if slowdown > 1.01 {
                     log::info!(
-                        "AdaptiveQuality: video stepped UP to tier '{}' (index {}), \
-                         fps_ratio={:.2}, bitrate_ratio={:.2}, slowdown={:.2}x",
+                        "AdaptiveQuality: video stepped UP to tier '{}' (index {}) on sustained-clear backpressure, slowdown={:.2}x",
                         to_tier,
                         self.video_tier_index,
-                        fps_ratio,
-                        bitrate_ratio,
                         slowdown,
                     );
                 } else {
                     log::info!(
-                        "AdaptiveQuality: video stepped UP to tier '{}' (index {}), \
-                         fps_ratio={:.2}, bitrate_ratio={:.2}",
+                        "AdaptiveQuality: video stepped UP to tier '{}' (index {}) on sustained-clear backpressure",
                         to_tier,
                         self.video_tier_index,
-                        fps_ratio,
-                        bitrate_ratio,
                     );
                 }
                 return true;
@@ -620,13 +629,13 @@ impl AdaptiveQualityManager {
                 // Step-up would have triggered at normal speed but slowdown blocked it.
                 self.step_up_blocked_slowdown += 1;
             }
-        } else if should_recover && self.video_tier_index <= min_allowed_index {
-            // At the ceiling with good conditions — track recovery time so we
-            // can distinguish "would have stepped up this tick" from "conditions
-            // just became good". Only count a blocked event when the stabilization
-            // window is met (i.e., a step-up would have triggered absent the
-            // ceiling). Without this gate, the counter increments every evaluation
-            // tick, inflating telemetry.
+        } else if should_recover && self.video_tier_index <= recover_floor {
+            // At the (baseline/ceiling) recovery floor with good conditions —
+            // track recovery time so we can distinguish "would have stepped up
+            // this tick" from "conditions just became good". Only count a blocked
+            // event when the stabilization window is met (i.e., a step-up would
+            // have triggered absent the floor). Without this gate, the counter
+            // increments every evaluation tick, inflating telemetry.
             let recover_start = *self.recover_start_ms.get_or_insert(now_ms);
             let recover_duration = now_ms - recover_start;
             if recover_duration >= STEP_UP_STABILIZATION_WINDOW_MS as f64 && can_transition {
@@ -646,11 +655,20 @@ impl AdaptiveQualityManager {
         false
     }
 
-    /// Handle audio tier step-down and step-up logic.
+    /// Handle audio tier step-down and step-up logic — the backpressure-gated
+    /// safety net (issue #1108).
     ///
-    /// Audio only degrades when video is already at the lowest tier.
-    /// Audio recovers first (before video steps up).
-    fn update_audio_tier(&mut self, fps_ratio: f64, now_ms: f64, can_transition: bool) -> bool {
+    /// Audio still degrades LAST: only when video is already at the lowest tier
+    /// AND the sender is under its own sustained backpressure (`degrade`). A
+    /// receiver's link can never move audio. Audio recovers first (before video
+    /// steps up) on sustained-clear backpressure (`recover`).
+    fn update_audio_tier(
+        &mut self,
+        degrade: bool,
+        recover: bool,
+        now_ms: f64,
+        can_transition: bool,
+    ) -> bool {
         let max_audio_index = AUDIO_QUALITY_TIERS.len().saturating_sub(1);
         let video_at_lowest = self.video_tier_index >= self.video_tiers.len().saturating_sub(1);
 
@@ -664,8 +682,10 @@ impl AdaptiveQualityManager {
         let audio_step_up_floor = self.user_audio_best_index.unwrap_or(0);
 
         // --- Audio step DOWN ---
-        // Only degrade audio when video is already at the lowest tier.
-        let should_degrade_audio = video_at_lowest && fps_ratio < AUDIO_TIER_DEGRADE_FPS_RATIO;
+        // Only degrade audio when video is already at the lowest tier AND the
+        // sender itself is backpressured (issue #1108). Audio is the priority
+        // stream and must never react to a receiver's link.
+        let should_degrade_audio = video_at_lowest && degrade;
 
         if should_degrade_audio && self.audio_tier_index < audio_step_down_cap {
             let degrade_start = *self.audio_degrade_start_ms.get_or_insert(now_ms);
@@ -683,13 +703,12 @@ impl AdaptiveQualityManager {
                     stream: "audio",
                     from_tier,
                     to_tier: to_tier.clone(),
-                    trigger: "fps",
+                    trigger: "backpressure",
                 });
                 log::info!(
-                    "AdaptiveQuality: audio stepped DOWN to tier '{}' (index {}), fps_ratio={:.2}",
+                    "AdaptiveQuality: audio stepped DOWN to tier '{}' (index {}) on sender backpressure (video at floor)",
                     to_tier,
                     self.audio_tier_index,
-                    fps_ratio,
                 );
                 return true;
             }
@@ -708,7 +727,7 @@ impl AdaptiveQualityManager {
         // audio recovery here would keep the priority stream degraded for the full
         // ~2.5s hold for no meaningful buffer benefit, so we let it climb back
         // immediately. Do not add a congestion-hold guard to this branch.
-        let should_recover_audio = fps_ratio > AUDIO_TIER_RECOVER_FPS_RATIO;
+        let should_recover_audio = recover;
 
         if should_recover_audio && self.audio_tier_index > audio_step_up_floor {
             let recover_start = *self.audio_recover_start_ms.get_or_insert(now_ms);
@@ -726,13 +745,12 @@ impl AdaptiveQualityManager {
                     stream: "audio",
                     from_tier,
                     to_tier: to_tier.clone(),
-                    trigger: "fps",
+                    trigger: "backpressure",
                 });
                 log::info!(
-                    "AdaptiveQuality: audio stepped UP to tier '{}' (index {}), fps_ratio={:.2}",
+                    "AdaptiveQuality: audio stepped UP to tier '{}' (index {}) on sustained-clear backpressure",
                     to_tier,
                     self.audio_tier_index,
-                    fps_ratio,
                 );
                 return true;
             }
@@ -1386,6 +1404,11 @@ impl AdaptiveQualityManager {
     /// - 3: During a cascade, don't tighten — only tighten on re-crash after recovery
     /// - Re-election suppression: don't arm within 10s of a server swap
     fn maybe_arm_ceiling(&mut self, to_index: usize, now_ms: f64) {
+        // NOTE(#1108): reelection crash-ceiling suppression retained — still
+        // guards the kept force_congestion_cut/force_video_step_down step-downs
+        // from a re-election-coincident false crash-arm. (The receiver-FPS path
+        // that originally motivated it is gone in Stage 2, but the explicit
+        // force-step-down paths can still arm the ceiling, so this stays.)
         // Check re-election suppression window.
         if let Some(reelection_at) = self.reelection_completed_at_ms {
             if now_ms - reelection_at < REELECTION_CEILING_SUPPRESSION_MS {
@@ -1528,11 +1551,60 @@ mod tests {
     /// Create a manager with `created_at_ms` and `last_transition_time_ms` set
     /// to 0.0 so that tests using small `now_ms` values (e.g. 10000) are well
     /// past the warmup period and the min-transition guard.
+    ///
+    /// Also sets `recovery_baseline_index = 0` so the clamp-to-baseline recovery
+    /// policy (issue #1108) does NOT interfere with the many tests here that
+    /// exercise raw step-up / climb-rate-limiter mechanics from a manually-set
+    /// tier (they predate the policy and test the hysteresis/ceiling machinery,
+    /// not the baseline floor). The baseline-clamp policy itself is covered by
+    /// dedicated tests (`test_*recovery*baseline*` and the controller tests).
     fn new_test_manager(video_tiers: &'static [VideoQualityTier]) -> AdaptiveQualityManager {
         let mut mgr = AdaptiveQualityManager::new(video_tiers);
         mgr.created_at_ms = 0.0;
         mgr.last_transition_time_ms = 0.0;
+        mgr.recovery_baseline_index = 0;
         mgr
+    }
+
+    // -----------------------------------------------------------------
+    // Test-only compatibility shim (issue #1108).
+    //
+    // The production `update(received_fps, ...)` was replaced by
+    // `update_from_backpressure(degrade, recover, now)`. The bulk of the manager
+    // tests exercise the tier STATE MACHINE (crash ceiling, yo-yo, dwell, user
+    // bounds, min-interval) — which is unchanged — using "bad FPS" / "good FPS"
+    // as a proxy for "degrade" / "recover". This shim translates those FPS/bitrate
+    // arguments into the new boolean decision using the HISTORICAL thresholds so
+    // those tests keep their meaning without touching the production API. The
+    // `_effective_peer_count` arg is ignored on purpose: the small-peer-count
+    // lenient threshold was removed (a receiver's link no longer affects the
+    // sender), so the dedicated lenient/peer-count tests were deleted rather than
+    // shimmed.
+    impl AdaptiveQualityManager {
+        fn update(
+            &mut self,
+            received_fps: f64,
+            target_fps: f64,
+            current_bitrate_kbps: f64,
+            ideal_bitrate_kbps: f64,
+            now_ms: f64,
+            _effective_peer_count: usize,
+        ) -> bool {
+            // Historical degrade/recover predicates (pre-#1108): degrade on low
+            // fps OR low bitrate ratio; recover on high fps AND high bitrate
+            // ratio. Guard against the zero-target early-return the old code had.
+            if target_fps <= 0.0 || ideal_bitrate_kbps <= 0.0 {
+                // Old `update` returned false on non-positive targets after the
+                // warmup check; `update_from_backpressure` has no such guard, so
+                // emulate "no signal" (hold) here.
+                return self.update_from_backpressure(false, false, now_ms);
+            }
+            let fps_ratio = received_fps / target_fps;
+            let bitrate_ratio = current_bitrate_kbps / ideal_bitrate_kbps;
+            let degrade = fps_ratio < 0.50 || bitrate_ratio < 0.40;
+            let recover = fps_ratio > 0.70 && bitrate_ratio > 0.75;
+            self.update_from_backpressure(degrade, recover, now_ms)
+        }
     }
 
     #[test]
@@ -1778,23 +1850,114 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_recovers_before_video() {
+    fn test_audio_recovers_on_sustained_clear_backpressure() {
+        // Issue #1108: audio and video now share the SAME backpressure recover
+        // boolean (the old distinct audio/video FPS recover thresholds are gone).
+        // A degraded audio tier must climb back on sustained-clear backpressure.
+        // (The former "audio recovers at a lower FPS ratio than video" asymmetry
+        // no longer exists; audio is a backpressure-gated safety net.)
         let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        // Set both to degraded state
         let max_video = VIDEO_QUALITY_TIERS.len() - 1;
-        mgr.video_tier_index = max_video;
+        mgr.video_tier_index = max_video; // video at floor
         mgr.audio_tier_index = 2; // "low"
         mgr.last_transition_time_ms = 0.0;
 
         let base = 10000.0;
+        // recover = true (sustained-clear). Audio at the floor-video state must
+        // step back up.
+        let _ = mgr.update_from_backpressure(false, true, base);
+        let changed = mgr.update_from_backpressure(false, true, base + 5100.0);
+        assert!(changed, "sustained-clear backpressure must recover a tier");
+        assert_eq!(
+            mgr.audio_tier_index(),
+            1,
+            "audio must step UP on sustained-clear backpressure"
+        );
+    }
 
-        // fps_ratio = 0.65 > AUDIO_TIER_RECOVER_FPS_RATIO (0.60) but < VIDEO_TIER_RECOVER_FPS_RATIO (0.70)
-        // Audio should recover, video should not.
-        let _ = mgr.update(6.5, 10.0, 150.0, 150.0, base, 5);
-        let changed = mgr.update(6.5, 10.0, 150.0, 150.0, base + 5100.0, 5);
-        assert!(changed);
-        assert_eq!(mgr.audio_tier_index(), 1); // Audio stepped up
-        assert_eq!(mgr.video_tier_index, max_video); // Video unchanged
+    /// Issue #1108 clamp-to-baseline: with NO user `best`, sustained-clear
+    /// backpressure may recover the video tier back UP to the baseline
+    /// (`DEFAULT_VIDEO_TIER_INDEX`) but must STOP there — it must never climb
+    /// above the baseline (no speculative uplink probing). Uses the real
+    /// constructor so `recovery_baseline_index` is the production default.
+    #[test]
+    fn test_recovery_clamps_to_baseline_without_user_best() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        mgr.created_at_ms = 0.0;
+        mgr.last_transition_time_ms = 0.0;
+        assert_eq!(mgr.recovery_baseline_index, DEFAULT_VIDEO_TIER_INDEX);
+
+        // Force the tier BELOW baseline (worse quality) without touching the
+        // baseline, simulating a prior backpressure shed.
+        let below = DEFAULT_VIDEO_TIER_INDEX + 2;
+        assert!(below < VIDEO_QUALITY_TIERS.len());
+        mgr.video_tier_index = below;
+
+        // Sustained-clear recover over many spaced ticks must climb back to —
+        // and stop at — the baseline.
+        let mut t = 10_000.0;
+        for _ in 0..20 {
+            mgr.update_from_backpressure(false, true, t);
+            t += STEP_UP_STABILIZATION_WINDOW_MS as f64 + 500.0;
+            if mgr.video_tier_index() == DEFAULT_VIDEO_TIER_INDEX {
+                break;
+            }
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            DEFAULT_VIDEO_TIER_INDEX,
+            "recovery must climb back up to the baseline tier"
+        );
+
+        // Keep ticking recover: the tier must NOT climb above the baseline.
+        for _ in 0..10 {
+            mgr.update_from_backpressure(false, true, t);
+            t += STEP_UP_STABILIZATION_WINDOW_MS as f64 + 500.0;
+        }
+        assert_eq!(
+            mgr.video_tier_index(),
+            DEFAULT_VIDEO_TIER_INDEX,
+            "recovery must NEVER climb above the baseline tier (no speculative probing)"
+        );
+    }
+
+    /// Issue #1108 clamp-to-baseline EXCEPTION: an explicit user `best` quality
+    /// bound is an explicit capacity opt-in and overrides the baseline floor, so
+    /// recovery MAY climb above the baseline up to the user's `best`.
+    #[test]
+    fn test_recovery_exceeds_baseline_when_user_best_set() {
+        let mut mgr = AdaptiveQualityManager::new(VIDEO_QUALITY_TIERS);
+        mgr.created_at_ms = 0.0;
+        mgr.last_transition_time_ms = 0.0;
+        let baseline = mgr.recovery_baseline_index;
+        assert!(
+            baseline > 0,
+            "precondition: baseline is not already the top tier"
+        );
+
+        // User opts into a BETTER-than-baseline ceiling (lower index = higher
+        // quality). `best = 0` authorizes climbing all the way to the top tier.
+        mgr.set_video_quality_bounds(Some(0), None, 0.0);
+
+        // Start below baseline and recover; with the user opt-in, the tier must
+        // be able to climb ABOVE the baseline.
+        mgr.video_tier_index = baseline;
+        let mut t = 10_000.0;
+        let mut climbed_above_baseline = false;
+        for _ in 0..30 {
+            mgr.update_from_backpressure(false, true, t);
+            t += STEP_UP_STABILIZATION_WINDOW_MS as f64 + 500.0;
+            if mgr.video_tier_index() < baseline {
+                climbed_above_baseline = true;
+                break;
+            }
+        }
+        assert!(
+            climbed_above_baseline,
+            "an explicit user `best` must let recovery climb above the baseline \
+             (baseline={baseline}, ended at {})",
+            mgr.video_tier_index()
+        );
     }
 
     #[test]
@@ -1954,81 +2117,6 @@ mod tests {
             max_index,
             "Should clamp to last valid index"
         );
-    }
-
-    // =====================================================================
-    // Lenient threshold tests (effective_peer_count < 3)
-    // =====================================================================
-
-    #[test]
-    fn test_single_peer_uses_lenient_fps_threshold() {
-        // fps_ratio=0.40 is between LENIENT (0.30) and STANDARD (0.50).
-        // With 1 peer (< 3), should NOT degrade on FPS alone.
-        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        mgr.video_tier_index = 0;
-        let base = 10000.0;
-
-        // fps_ratio=0.40, bitrate_ratio=0.90 (good bitrate)
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 1);
-        assert!(!changed, "Degrade timer should start but not fire yet");
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 1);
-        assert!(
-            !changed,
-            "fps_ratio=0.40 with 1 peer should NOT trigger degradation (lenient threshold 0.30)"
-        );
-        assert_eq!(mgr.video_tier_index(), 0);
-    }
-
-    #[test]
-    fn test_single_peer_degrades_below_lenient_threshold() {
-        // fps_ratio=0.20 is below LENIENT (0.30). Should degrade even with 1 peer.
-        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        mgr.video_tier_index = 0;
-        let base = 10000.0;
-
-        // fps_ratio=0.20, good bitrate
-        let _ = mgr.update(6.0, 30.0, 1350.0, 1500.0, base, 1);
-        let changed = mgr.update(6.0, 30.0, 1350.0, 1500.0, base + 1600.0, 1);
-        assert!(
-            changed,
-            "fps_ratio=0.20 should degrade even with lenient threshold"
-        );
-        assert_eq!(mgr.video_tier_index(), 1);
-    }
-
-    #[test]
-    fn test_two_peers_uses_lenient_fps_threshold() {
-        // 2 peers also uses lenient threshold (< 3).
-        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        mgr.video_tier_index = 0;
-        let base = 10000.0;
-
-        // fps_ratio=0.40, bitrate_ratio=0.90
-        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 2);
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 2);
-        assert!(
-            !changed,
-            "fps_ratio=0.40 with 2 peers should NOT trigger degradation (lenient threshold 0.30)"
-        );
-        assert_eq!(mgr.video_tier_index(), 0);
-    }
-
-    #[test]
-    fn test_three_peers_uses_standard_fps_threshold() {
-        // 3 peers uses the standard threshold (>= 3).
-        // fps_ratio=0.40 is below STANDARD (0.50). Should degrade.
-        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        mgr.video_tier_index = 0;
-        let base = 10000.0;
-
-        // fps_ratio=0.40, bitrate_ratio=0.90 (good bitrate)
-        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 3);
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 1600.0, 3);
-        assert!(
-            changed,
-            "fps_ratio=0.40 with 3 peers should degrade using standard threshold (0.50)"
-        );
-        assert_eq!(mgr.video_tier_index(), 1);
     }
 
     // =====================================================================
@@ -2619,45 +2707,6 @@ mod tests {
         let changed = mgr.update(28.0, 30.0, 400.0, 400.0, t_up3, 5);
         assert!(!changed, "Should be blocked at crash ceiling 3");
         assert_eq!(mgr.video_tier_index(), 3);
-    }
-
-    #[test]
-    fn test_peer_count_boundary_no_flapping() {
-        // Verify that a peer joining (2→3) or dropping (3→2) near the threshold
-        // boundary doesn't cause spurious tier transitions. fps_ratio=0.40 is
-        // between LENIENT (0.30) and STANDARD (0.50), so it only triggers
-        // degradation at ≥3 peers.
-        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
-        mgr.video_tier_index = 0;
-        let base = 10000.0;
-
-        // Phase 1: 2 peers, fps_ratio=0.40 — lenient threshold, no degradation.
-        let _ = mgr.update(12.0, 30.0, 1350.0, 1500.0, base, 2);
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 1600.0, 2);
-        assert!(
-            !changed,
-            "Should NOT degrade at 2 peers with fps_ratio=0.40"
-        );
-        assert_eq!(mgr.video_tier_index(), 0);
-
-        // Phase 2: 3rd peer joins — standard threshold, degrade timer starts.
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 2000.0, 3);
-        assert!(!changed, "Degrade timer just started after peer join");
-
-        // Phase 3: 3rd peer drops before reaction time elapses — back to lenient.
-        // The degrade timer was running but the condition is no longer met under
-        // the lenient threshold, so it should reset.
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 3000.0, 2);
-        assert!(
-            !changed,
-            "Should NOT degrade: back to 2 peers (lenient threshold)"
-        );
-        assert_eq!(mgr.video_tier_index(), 0);
-
-        // Phase 4: Even after enough time, no degradation at 2 peers.
-        let changed = mgr.update(12.0, 30.0, 1350.0, 1500.0, base + 5000.0, 2);
-        assert!(!changed, "Still no degradation at 2 peers after long wait");
-        assert_eq!(mgr.video_tier_index(), 0);
     }
 
     // =====================================================================

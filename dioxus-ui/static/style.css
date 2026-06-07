@@ -7255,52 +7255,62 @@ html[data-theme="light"] .settings-divider {
    (see global.css) — no literals.
    ────────────────────────────────────────────────────────────────── */
 
-/* Segmented Receive | Send direction toggle (top of the panel). Only the
-   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
-   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
-.perf-direction-toggle {
+/* ── Panel header row: "Performance" title left, Diagnostics cross-nav button
+   right (#1095 §4a). The Receive | Send direction toggle was removed — both
+   directions now render side-by-side in each per-kind card. ── */
+.perf-header-row {
   display: flex;
-  gap: 2px;
-  margin: 14px 0 16px;
-  padding: 3px;
-  background: var(--field-bg);
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-pill);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.perf-direction-segment {
-  flex: 1 1 0;
-  min-height: 34px;
-  padding: 6px 14px;
-  font-size: 14px;
+/* Shared ghost button for both cross-nav buttons (Perf→Diag here, Diag→Perf in
+   the diagnostics sidebar header). 16–18px icon, 8px gap, >=44px hit area. */
+.perf-nav-button,
+.sidebar-header-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
-  border: none;
+  border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
 }
 
-.perf-direction-segment:hover {
+.perf-nav-button:hover,
+.sidebar-header-action:hover {
   color: var(--text-primary);
   background: var(--field-bg-hover);
 }
 
-.perf-direction-segment:focus-visible {
+.perf-nav-button:focus-visible,
+.sidebar-header-action:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-/* Active segment: filled with the accent surface. aria-checked also conveys
-   selection to AT, so color is not the sole signal. */
-.perf-direction-segment.is-active {
-  color: var(--accent);
-  background: var(--surface-elevated);
-  box-shadow: var(--shadow-sm);
+.perf-nav-button__icon {
+  flex: 0 0 auto;
 }
 
-/* Inline "your download" / "your upload" consequence beside each row title, so
-   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+/* Below ~480px the cross-nav buttons go icon-only (aria-label still conveys the
+   action; the visible text label is hidden). */
+@media (max-width: 480px) {
+  .perf-nav-button__label,
+  .sidebar-header-action__label {
+    display: none;
+  }
+}
+
+/* Inline "your upload" / "from N peers" consequence beside each side title, so
+   the meaning is legible without opening the "?" popover. */
+.perf-side__consequence,
 .perf-stream-consequence {
   font-size: 12px;
   font-weight: 500;
@@ -7322,236 +7332,193 @@ html[data-theme="light"] .settings-divider {
   color: var(--success);
 }
 
-/* ── Live simulcast diagnostics (issue #1095 redesign) — embedded per row +
-   one global strip. No new tokens; accents via descendant selectors. ── */
+/* ── Live simulcast effective-setting strip (issue #1095 redesign). The
+   expandable per-layer detail moved to the Diagnostics panel's "Simulcast
+   layers" section. No new tokens; accents via descendant selectors. ── */
 
-/* Global effective-setting strip: one slim line directly under the toggle. */
+/* Global effective-setting strip: one slim line under the intro, with an (i)
+   tooltip holding the full flag×cap text (#1095 redesign). */
 .perf-simulcast-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 2px;
   font-size: 12px;
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border);
 }
 
-/* Per-row diagnostics footer — last child of .perf-stream-controls, so it
-   left-aligns with the slider (not the gauge). */
-.perf-diag {
-  margin-top: 6px;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-/* (1) Always-visible summary. As a button it is the disclosure trigger; the
-   static variants (single-layer / 1-peer / empty) reuse the same line metrics. */
-.perf-diag-summary {
-  display: flex;
+.perf-simulcast-strip__info {
+  display: inline-flex;
   align-items: center;
-  width: 100%;
-  gap: 6px;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 12px;
+  line-height: 1;
   color: var(--text-secondary);
+  cursor: help;
 }
 
-.perf-diag-trigger {
-  padding: 2px 2px;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  text-align: left;
-}
-
-.perf-diag-trigger:hover {
-  color: var(--text-primary);
-}
-
-.perf-diag-trigger:focus-visible {
+.perf-simulcast-strip__info:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
 }
 
-.perf-diag-static {
-  padding: 2px 2px;
-  color: var(--text-tertiary);
-  font-style: italic;
+/* ── Per-kind cards (Video / Audio / Content), each split Send | Receive
+   (#1095 redesign). A card is a glass surface; its two columns share the
+   `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
+.perf-kind-card {
+  margin: 8px 0;
+  padding: 12px 14px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  /* Enable container queries so the columns collapse based on the card's own
+     width (independent of the viewport). */
+  container-type: inline-size;
 }
 
-.perf-diag-summary-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.perf-kind-card__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
 }
 
-.perf-diag-chevron {
-  margin-left: auto;
-  flex: 0 0 auto;
-  color: var(--text-tertiary);
+/* Two side-by-side columns (Send | Receive). Collapses to one column below the
+   card-width threshold (Send on top). `@container` first, with an `@media`
+   fallback for engines without container-query support. */
+.perf-card-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
 }
 
-/* (2) Expandable detail region. */
-.perf-diag-detail {
-  margin-top: 6px;
+@container (max-width: 560px) {
+  .perf-card-cols {
+    grid-template-columns: 1fr;
+  }
 }
 
-/* SEND ladder: flex row of per-layer chips, lowest layer left. */
-.perf-diag-ladder {
-  display: flex;
-  gap: 4px;
-  align-items: stretch;
+@media (max-width: 639px) {
+  .perf-card-cols {
+    grid-template-columns: 1fr;
+  }
 }
 
-.perf-diag-rung {
-  flex: 1 1 auto;
-  min-width: 44px;
+/* One column (Send or Receive). Subtle left accent distinguishes direction
+   (color is not the sole cue — each column is labelled "Sending"/"Receiving"). */
+.perf-side {
   display: flex;
   flex-direction: column;
+  gap: 4px;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  min-width: 0;
+}
+
+.perf-side--recv {
+  border-left-color: var(--accent);
+}
+
+.perf-side--send {
+  border-left-color: var(--success-border-vivid);
+}
+
+.perf-side__head {
+  display: flex;
   align-items: center;
-  gap: 1px;
-  /* Horizontal 4px (was 2px) so a 4-char res like "1080p" doesn't kiss the chip
-     edge at the 540px breakpoint with 3 chips at the 44px min-width (#1095). */
-  padding: 4px 4px 6px;
-  position: relative;
-  background: var(--field-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-/* Active layer: solid accent border + a 2px bottom strip. */
-.perf-diag-rung.is-active {
-  background: var(--field-bg);
-  border: 1px solid var(--success-border-vivid);
-}
-
-.perf-diag-rung.is-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: var(--success);
-  border-bottom-left-radius: var(--radius-sm);
-  border-bottom-right-radius: var(--radius-sm);
-}
-
-/* Shed (inactive) layer: dimmed + dashed, no strip. */
-.perf-diag-rung.is-shed {
-  opacity: 0.4;
-  border-style: dashed;
-}
-
-.perf-diag-rung-id {
-  font-size: 10px;
-  color: var(--text-tertiary);
-}
-
-.perf-diag-rung-res {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.perf-diag-rung-kbps {
-  font-size: 12px;
+.perf-side__title {
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
 }
 
-/* RECEIVE per-peer detail rows. */
-.perf-diag-peers {
+/* ── Inline bar-meter (replaces the VU needle). Four vertical bars + a one-line
+   readout; the container carries data-level and CSS lights the first N bars. ── */
+.perf-meter-wrap {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: flex-end;
+  gap: 8px;
 }
 
-.perf-diag-peer {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.perf-diag-pip {
-  flex: 0 0 auto;
+.perf-meter {
   display: inline-flex;
+  align-items: flex-end;
   gap: 2px;
-}
-
-.perf-diag-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--border);
-}
-
-.perf-diag-dot.is-on {
-  background: var(--text-secondary);
-}
-
-.perf-diag-peer-name {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-secondary);
-}
-
-.perf-diag-peer-meta {
+  width: 24px;
+  height: 16px;
   flex: 0 0 auto;
-  color: var(--text-tertiary);
 }
 
-.perf-diag-more {
-  color: var(--text-tertiary);
-  font-style: italic;
+.perf-meter__bar {
+  flex: 1 1 0;
+  width: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 1px;
+  transition: background 0.2s ease;
 }
 
-/* ── Direction accenting via descendant selectors ONLY (text stays neutral). ── */
-.perf-recv-row .perf-diag-chevron {
-  color: var(--accent);
+/* Staggered heights ▂▄▆█ so the meter reads as a rising ramp. */
+.perf-meter__bar:nth-child(1) {
+  height: 40%;
+}
+.perf-meter__bar:nth-child(2) {
+  height: 60%;
+}
+.perf-meter__bar:nth-child(3) {
+  height: 80%;
+}
+.perf-meter__bar:nth-child(4) {
+  height: 100%;
 }
 
-.perf-recv-row .perf-diag-dot.is-on {
+/* Light the first N bars per the container's data-level. Receive uses the
+   primary accent; send a green accent (matched to the column). */
+.perf-side--recv .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--recv .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--recv .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--recv .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
   background: var(--accent);
 }
 
-.perf-send-row .perf-diag-chevron {
-  color: var(--success);
+.perf-side--send .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--send .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--send .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--send .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
+  background: var(--success);
 }
 
-.perf-stream-group {
-  margin: 18px 0;
-  padding: 14px 16px;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+.perf-meter__readout {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  line-height: 1.2;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-/* Subtle left accent to distinguish the two directions at a glance (color is
-   not the sole cue — each row is labelled "Receive" / "Send"). */
-.perf-recv-row {
-  border-left: 3px solid var(--accent);
+/* The always-visible per-card summary line under each slider. */
+.perf-summary-line {
+  margin: 2px 0 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
 }
 
-.perf-send-row {
-  border-left: 3px solid var(--success-border-vivid);
+@media (prefers-reduced-motion: reduce) {
+  .perf-meter__bar {
+    transition: none;
+  }
 }
 
-.perf-stream-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-}
-
-.perf-stream-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-/* "?" help button + its popover, anchored next to the section title. */
+/* "?" help button + its popover, anchored next to the side title. */
 .perf-help {
   position: relative;
   display: inline-flex;
@@ -7657,18 +7624,6 @@ html[data-theme="light"] .settings-divider {
 
 .perf-auto-button.is-active:hover {
   background: var(--success-bg-soft-hover);
-}
-
-/* Per-section body: the VU needle gauge beside the slider + range text. */
-.perf-stream-body {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.perf-stream-controls {
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 /* ── Dual-thumb range slider ── */
@@ -7788,8 +7743,8 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-range-value {
-  margin: 10px 0 0;
-  font-size: 13px;
+  margin: 0;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
@@ -7800,73 +7755,106 @@ html[data-theme="light"] .settings-divider {
   }
 }
 
-/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
+/* ── Diagnostics panel: "Simulcast layers" section (#1095 §6 MOVE — the
+   per-layer SEND ladder + per-peer RECEIVE breakdown relocated from the
+   Performance panel's expandable footers). ── */
+.simulcast-effective {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
 
-.perf-vu-gauge {
-  flex: 0 0 auto;
-  width: 150px;
+.simulcast-send {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 12px 10px 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
+  gap: 4px;
+  margin-bottom: 10px;
 }
 
-.perf-vu-svg {
-  width: 120px;
-  height: 78px;
-}
-
-.perf-vu-arc {
-  stroke: var(--border-emphasis);
-}
-
-.perf-vu-tick {
-  stroke: var(--text-quaternary);
-}
-
-.perf-vu-needle {
-  stroke: var(--accent);
-  /* Pivot at the hub so rotation looks like an analog needle. */
-  transform-origin: 60px 64px;
-  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.perf-vu-hub {
-  fill: var(--accent);
-}
-
-.perf-vu-label {
-  margin-top: 4px;
-  font-size: 13px;
+.simulcast-send-title {
+  font-size: 12px;
   font-weight: 600;
-  color: var(--text-primary);
-}
-
-.perf-vu-readout {
-  margin-top: 2px;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .perf-vu-needle {
-    transition: none;
-  }
+.simulcast-send-static,
+.simulcast-send-header {
+  font-size: 12px;
+  color: var(--text-tertiary);
 }
 
-/* On narrow widths stack the needle above the slider instead of beside it. */
-@media (max-width: 540px) {
-  .perf-stream-body {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .perf-vu-gauge {
-    width: 100%;
-  }
+.simulcast-send-ladder {
+  display: flex;
+  gap: 4px;
+  margin-top: 2px;
 }
+
+.simulcast-rung {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 0;
+  min-width: 44px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulcast-rung.is-active {
+  border-color: var(--success-border-vivid);
+  background: var(--success-bg-soft);
+}
+
+.simulcast-rung.is-shed {
+  opacity: 0.5;
+}
+
+.simulcast-rung-id {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-rung-res,
+.simulcast-rung-kbps {
+  color: var(--text-tertiary);
+}
+
+.simulcast-recv {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.simulcast-recv-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-kind {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.simulcast-recv-kind-head {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-peer {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+
+.simulcast-recv-more {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+

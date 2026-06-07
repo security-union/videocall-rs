@@ -82,6 +82,17 @@ pub fn Host(
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
+    /// Cross-nav from the Performance tab to the Call Diagnostics panel. The
+    /// parent (attendants) closes settings and opens the diagnostics panel. (#1095 §4a)
+    #[props(default)]
+    on_open_diagnostics: EventHandler<()>,
+    /// Sink the parent (attendants) reads to feed the Diagnostics panel's
+    /// "Simulcast layers" section the live SEND simulcast snapshots. Host owns the
+    /// encoders, so it builds the `DiagnosticsReader` and publishes the handle here
+    /// once on mount; `None` until then. Optional so callers that don't need the
+    /// cross-component detail still compile. (#1095 §6 MOVE)
+    #[props(default)]
+    publish_diagnostics_reader: Option<Signal<Option<DiagnosticsReader>>>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -854,6 +865,22 @@ pub fn Host(
         })
     };
 
+    // Publish the reader handle to the parent (attendants) so the Diagnostics
+    // panel — a sibling of Host that can't reach the encoders — can read the live
+    // SEND simulcast snapshots for its "Simulcast layers" section. The handle is a
+    // cheap `Rc`-closure bundle built once per mount; we publish it in a
+    // `use_effect` (post-render, so we never write a parent signal mid-render). The
+    // effect body has no reactive reads, so it runs once after first render.
+    // (#1095 §6 MOVE)
+    {
+        let reader = diagnostics_reader.clone();
+        use_effect(move || {
+            if let Some(mut sink) = publish_diagnostics_reader {
+                sink.set(Some(reader.clone()));
+            }
+        });
+    }
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -950,6 +977,7 @@ pub fn Host(
                     on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
                     received_reader: recv_reader.clone(),
                     diagnostics_reader: diag_reader.clone(),
+                    on_open_diagnostics: move |_| on_open_diagnostics.call(()),
                 }
             }
         }

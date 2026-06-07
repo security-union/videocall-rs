@@ -19,6 +19,11 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
+use crate::components::performance_settings::{
+    format_kbps_compact, format_mbps, format_peer_kind_line, format_receive_spread,
+    format_send_header, format_send_layer, format_send_layer_short, format_send_total_kbps,
+    format_simulcast_summary, peers_for_kind, DiagnosticsReader,
+};
 use crate::context::{
     confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
 };
@@ -26,7 +31,8 @@ use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use videocall_client::VideoCallClient;
+use std::rc::Rc;
+use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
 
 // Serializable versions of DiagEvent structures
@@ -489,6 +495,15 @@ pub fn Diagnostics(
     mic_enabled: bool,
     share_screen: bool,
     encoder_settings: Option<String>,
+    /// Live SEND/RECEIVE simulcast reader for the "Simulcast layers" section,
+    /// published by `Host` (which owns the encoders). `None` until Host mounts /
+    /// when diagnostics aren't wired. (#1095 §6 MOVE)
+    #[props(default)]
+    diagnostics_reader: Option<DiagnosticsReader>,
+    /// Cross-nav: open Performance settings from the diagnostics header. Defaults
+    /// to a no-op so call sites that don't wire it still compile. (#1095 §4b)
+    #[props(default)]
+    on_open_performance: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
@@ -732,6 +747,34 @@ pub fn Diagnostics(
         });
     });
 
+    // 4 Hz refresh tick for the live "Simulcast layers" section: the reader's
+    // closures read encoder atomics / client per-peer state, which change at
+    // runtime, so this subtree must re-render periodically while the panel is
+    // open. Gated to `is_open` so a closed panel does no work. A 250 ms
+    // `gloo` `Interval` (≈4 Hz) — cheap counts/min-max, not a 60 Hz rAF. The
+    // handle lives in a `use_hook` cell; `use_drop` drops it on unmount.
+    let mut simulcast_tick = use_signal(|| 0u64);
+    {
+        type IntervalCell = Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>>;
+        let cell: IntervalCell = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+        let cell_effect = cell.clone();
+        use_effect(move || {
+            if is_open {
+                let interval = gloo_timers::callback::Interval::new(250, move || {
+                    let next = simulcast_tick.peek().wrapping_add(1);
+                    simulcast_tick.set(next);
+                });
+                *cell_effect.borrow_mut() = Some(interval);
+            } else {
+                // Stop ticking while closed (dropping the Interval cancels it).
+                *cell_effect.borrow_mut() = None;
+            }
+        });
+        use_drop(move || {
+            *cell.borrow_mut() = None;
+        });
+    }
+
     // Resolve numeric session IDs to display names via VideoCallClient context.
     let client = use_context::<VideoCallClient>();
     let peer_display_name = move |session_id: &str| -> String {
@@ -807,12 +850,54 @@ pub fn Diagnostics(
     };
     let peer_info = format!("Showing statistics for: {current_peer_display}");
 
+    // ── Simulcast layers section data (#1095 §6 MOVE) ──────────────────
+    // Subscribe this subtree to the 4 Hz refresh so the live atomics re-render.
+    let _ = simulcast_tick();
+    let simulcast_summary_line = diagnostics_reader
+        .as_ref()
+        .map(|r| format_simulcast_summary(&r.summary));
+    let send_video_snap = diagnostics_reader.as_ref().and_then(|r| (r.send_video)());
+    let send_screen_snap = diagnostics_reader.as_ref().and_then(|r| (r.send_screen)());
+    let per_peer_receive = diagnostics_reader
+        .as_ref()
+        .map(|r| (r.per_peer_receive)())
+        .unwrap_or_default();
+
     rsx! {
         div {
             id: "diagnostics-sidebar",
             class: if is_open { "visible" } else { "" },
             div { class: "sidebar-header",
                 h2 { "Call Diagnostics" }
+                // Spacer pushes the actions to the right; × stays rightmost.
+                div { style: "flex: 1 1 auto;" }
+                // Cross-nav: Diagnostics → Performance settings (#1095 §4b).
+                button {
+                    r#type: "button",
+                    class: "sidebar-header-action",
+                    "data-testid": "diag-open-performance",
+                    title: "Open Performance settings (set send/receive quality limits)",
+                    "aria-label": "Open Performance settings",
+                    onclick: move |_| on_open_performance.call(()),
+                    // Lucide sliders-horizontal.
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "18", height: "18", view_box: "0 0 24 24",
+                        fill: "none", stroke: "currentColor", stroke_width: "2",
+                        stroke_linecap: "round", stroke_linejoin: "round",
+                        "aria-hidden": "true",
+                        line { x1: "21", y1: "4", x2: "14", y2: "4" }
+                        line { x1: "10", y1: "4", x2: "3", y2: "4" }
+                        line { x1: "21", y1: "12", x2: "12", y2: "12" }
+                        line { x1: "8", y1: "12", x2: "3", y2: "12" }
+                        line { x1: "21", y1: "20", x2: "16", y2: "20" }
+                        line { x1: "12", y1: "20", x2: "3", y2: "20" }
+                        line { x1: "14", y1: "2", x2: "14", y2: "6" }
+                        line { x1: "8", y1: "10", x2: "8", y2: "14" }
+                        line { x1: "16", y1: "18", x2: "16", y2: "22" }
+                    }
+                    span { class: "sidebar-header-action__label", "Performance" }
+                }
                 button { class: "close-button", onclick: move |_| on_close.call(()), "\u{00d7}" }
             }
             div { class: "sidebar-content",
@@ -850,6 +935,26 @@ pub fn Diagnostics(
                 div { class: "diagnostics-section",
                     h3 { "Connection Manager" }
                     ConnectionManagerDisplay { connection_manager_state: conn_state }
+                }
+                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
+                // per-peer RECEIVE breakdown that used to live in the Performance
+                // panel's expandable footers. Fed by the live `DiagnosticsReader`.
+                div { class: "diagnostics-section",
+                    h3 { "Simulcast layers" }
+                    if let Some(summary) = &simulcast_summary_line {
+                        p { class: "simulcast-effective", "{summary}" }
+                    }
+                    SimulcastSendLadder {
+                        title: "Video (sending)",
+                        not_sharing_text: "Camera — off",
+                        snap: send_video_snap,
+                    }
+                    SimulcastSendLadder {
+                        title: "Screen (sending)",
+                        not_sharing_text: "Screen — not sharing",
+                        snap: send_screen_snap,
+                    }
+                    SimulcastReceiveBreakdown { peers: per_peer_receive }
                 }
                 div { class: "diagnostics-section",
                     h3 { "Transport Preference" }
@@ -1010,6 +1115,160 @@ pub fn Diagnostics(
                     div { class: "diagnostics-section",
                         h3 { "Media Status" }
                         pre { "{media_status}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One SEND stream's per-layer simulcast ladder for the Diagnostics "Simulcast
+/// layers" section (#1095 §6 MOVE — relocated from the Performance panel). One
+/// chip per EFFECTIVE layer (res + bitrate), styled active vs shed. `snap` is
+/// `None` when the source is off (camera off / not sharing) → a static line.
+#[component]
+fn SimulcastSendLadder(
+    title: &'static str,
+    /// Static line shown when `snap` is `None` (source off / not sharing).
+    not_sharing_text: &'static str,
+    snap: Option<videocall_client::SimulcastSendSnapshot>,
+) -> Element {
+    let Some(snap) = snap else {
+        return rsx! {
+            div { class: "simulcast-send",
+                span { class: "simulcast-send-title", "{title}" }
+                span { class: "simulcast-send-static", "{not_sharing_text}" }
+            }
+        };
+    };
+
+    // Single-layer → static line (no per-layer ladder to show).
+    if !snap.simulcast_active {
+        let detail = snap
+            .layers
+            .first()
+            .map(|l| {
+                format!(
+                    "Single layer · {} · {}",
+                    format_send_layer_short(l.width, l.height),
+                    format_kbps_compact(l.bitrate_kbps)
+                )
+            })
+            .unwrap_or_else(|| "Single layer".to_string());
+        return rsx! {
+            div { class: "simulcast-send",
+                span { class: "simulcast-send-title", "{title}" }
+                span { class: "simulcast-send-static", "{detail}" }
+            }
+        };
+    }
+
+    let header = format_send_header(&snap);
+    let total = format_send_total_kbps(&snap);
+    let header_line = if total == 0 {
+        header
+    } else {
+        format!("{header} · {} total", format_mbps(total))
+    };
+    let max_kbps = snap
+        .layers
+        .iter()
+        .map(|l| l.bitrate_kbps)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    rsx! {
+        div { class: "simulcast-send",
+            span { class: "simulcast-send-title", "{title}" }
+            span { class: "simulcast-send-header", "{header_line}" }
+            div { class: "simulcast-send-ladder", "data-testid": "diag-simulcast-ladder",
+                for layer in snap.layers.iter().cloned() {
+                    {
+                        let active = layer.layer_id < snap.active_layers;
+                        let grow = (layer.bitrate_kbps as f32 / max_kbps as f32).max(0.4);
+                        let chip_class = if active {
+                            "simulcast-rung is-active"
+                        } else {
+                            "simulcast-rung is-shed"
+                        };
+                        let full = format_send_layer(
+                            layer.layer_id, layer.width, layer.height, layer.bitrate_kbps,
+                        );
+                        let res_short = format_send_layer_short(layer.width, layer.height);
+                        let kbps_short = format_kbps_compact(layer.bitrate_kbps);
+                        rsx! {
+                            div {
+                                class: chip_class,
+                                "data-testid": "diag-simulcast-rung-{layer.layer_id}",
+                                title: "{full}",
+                                style: "flex-grow: {grow};",
+                                span { class: "simulcast-rung-id", "L{layer.layer_id}" }
+                                span { class: "simulcast-rung-res", "{res_short}" }
+                                span { class: "simulcast-rung-kbps", "{kbps_short}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The per-peer RECEIVE simulcast breakdown for the Diagnostics "Simulcast
+/// layers" section (#1095 §6 MOVE). One block per kind (video / audio / screen):
+/// the top-3 peers (highest layer first) + a "+N more" tail. Fed by the live
+/// per-peer snapshot list.
+#[component]
+fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> Element {
+    rsx! {
+        div { class: "simulcast-recv",
+            span { class: "simulcast-recv-title", "Receiving (per peer)" }
+            for (kind, kind_label) in [
+                (PrefMediaKind::Video, "video"),
+                (PrefMediaKind::Audio, "audio"),
+                (PrefMediaKind::Screen, "screen"),
+            ] {
+                {
+                    let kind_peers = peers_for_kind(&peers, kind);
+                    if kind_peers.is_empty() {
+                        rsx! {}
+                    } else {
+                        let n = kind_peers.len();
+                        let layers: Vec<u32> = kind_peers.iter().map(|p| p.snap.layer_index).collect();
+                        let spread = format_receive_spread(&layers);
+                        // Top-3 by layer DESC (highest quality first).
+                        let mut sorted = kind_peers.clone();
+                        sorted.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
+                        let top: Vec<_> = sorted.iter().take(3).cloned().collect();
+                        let lowest_layer = sorted.last().map(|p| p.snap.layer_index + 1).unwrap_or(1);
+                        let extra = n.saturating_sub(3);
+                        rsx! {
+                            div { class: "simulcast-recv-kind",
+                                "data-testid": "diag-simulcast-recv-{kind_label}",
+                                span { class: "simulcast-recv-kind-head", "{kind_label} · {n} peer(s) · {spread}" }
+                                for p in top.iter().cloned() {
+                                    {
+                                        let line = format_peer_kind_line(kind_label, Some(&p.snap))
+                                            .map(|l| format!("{}: {l}", p.label))
+                                            .unwrap_or_else(|| p.label.clone());
+                                        rsx! {
+                                            div {
+                                                class: "simulcast-recv-peer",
+                                                "data-testid": "diag-simulcast-recv-peer-{p.session_id}",
+                                                "{line}"
+                                            }
+                                        }
+                                    }
+                                }
+                                if extra > 0 {
+                                    span { class: "simulcast-recv-more",
+                                        "data-testid": "diag-simulcast-recv-more-{kind_label}",
+                                        "+{extra} more peer(s) at L{lowest_layer}"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

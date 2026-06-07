@@ -31,6 +31,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
+    performance_settings::DiagnosticsReader,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
@@ -713,6 +714,10 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
     let mut device_settings_generation = use_signal(|| 0u32);
+    // Host publishes its live diagnostics reader handle here once on mount, so the
+    // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
+    // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
+    let diagnostics_reader_sink: Signal<Option<DiagnosticsReader>> = use_signal(|| None);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -4516,6 +4521,13 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
+                                    // Cross-nav: Performance tab → Diagnostics panel.
+                                    // Close settings, open the diagnostics sidebar. (#1095 §4a)
+                                    on_open_diagnostics: move |_| {
+                                        device_settings_open.set(false);
+                                        diagnostics_open.set(true);
+                                    },
+                                    publish_diagnostics_reader: diagnostics_reader_sink,
                                 }
                             }
                             if is_guest {
@@ -4624,6 +4636,17 @@ pub fn AttendantsComponent(
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
                         encoder_settings: encoder_settings(),
+                        // Live SEND simulcast reader (published by Host on mount),
+                        // for the "Simulcast layers" section. (#1095 §6)
+                        diagnostics_reader: diagnostics_reader_sink(),
+                        // Cross-nav: Diagnostics → Performance settings. Close the
+                        // diagnostics panel, open settings on the Performance tab. (#1095 §4b)
+                        on_open_performance: move |_| {
+                            diagnostics_open.set(false);
+                            device_settings_initial_section.set(Some("performance".into()));
+                            device_settings_generation.set(device_settings_generation() + 1);
+                            device_settings_open.set(true);
+                        },
                     }
                 }
 

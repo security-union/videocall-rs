@@ -322,10 +322,10 @@ async function openPerformancePanel(page: Page) {
   await page.getByRole("tab", { name: "Performance" }).click();
   const panel = page.locator("#settings-panel-performance");
   await expect(panel).toBeVisible({ timeout: 10_000 });
-  // Ensure the RECEIVE direction is active (default, but assert for isolation).
-  const recvSeg = page.locator('[data-testid="perf-direction-receive"]');
-  await recvSeg.click();
-  await expect(recvSeg).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+  // The #1095 redesign removed the Receive | Send direction toggle: both
+  // directions render together, so the receive-side meter is always present.
+  // Assert it as a readiness guard (was: click the receive toggle segment).
+  await expect(page.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({ timeout: 5_000 });
   return panel;
 }
 

@@ -346,10 +346,14 @@ pub fn DeviceSettingsModal(
     /// needles. Defaults to `None` (nothing received). (#989)
     #[props(default = ReceivedReader::none())]
     received_reader: ReceivedReader,
-    /// Live simulcast/AQ diagnostics for the Performance panel's collapsible
-    /// "Live diagnostics" disclosure. Defaults to an inert reader. (#1095)
+    /// Live simulcast/AQ diagnostics for the Performance panel's summary lines.
+    /// Defaults to an inert reader. (#1095)
     #[props(default = DiagnosticsReader::none())]
     diagnostics_reader: DiagnosticsReader,
+    /// Cross-nav: open the Call Diagnostics panel from the Performance tab.
+    /// Defaults to a no-op so call sites that don't wire it still compile. (#1095 §4a)
+    #[props(default)]
+    on_open_diagnostics: EventHandler<()>,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -607,6 +611,8 @@ pub fn DeviceSettingsModal(
                                         received_reader: received_reader.clone(),
                                         // Live diagnostics (#1095).
                                         diagnostics_reader: diagnostics_reader.clone(),
+                                        // Cross-nav to the Diagnostics panel (#1095 §4a).
+                                        on_open_diagnostics: move |_| on_open_diagnostics.call(()),
                                     }
                                 }
                             },

@@ -110,41 +110,9 @@ impl PartialEq for ScreenSnapshotReader {
     }
 }
 
-// ── direction toggle (Receive | Send) ─────────────────────────────
-
-/// Which direction the panel is currently showing. The panel renders only the
-/// three rows (Video / Audio / Screen) for the active direction at a time, so
-/// the modal shows 3 rows instead of 6 and fits without excessive vertical
-/// scroll (the #961 "fit all sections" requirement). Defaults to
-/// [`Direction::Receive`] — the user's original receive-centric framing and the
-/// multicast-era primary control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// Bound what this client RECEIVES from peers (saves download).
-    Receive,
-    /// Bound what this client SENDS to peers (saves upload + CPU).
-    Send,
-}
-
-impl Direction {
-    /// The default direction the panel opens on: Receive (the original #961
-    /// receive-centric framing + the multicast-era primary control).
-    pub fn default_for_panel() -> Direction {
-        Direction::Receive
-    }
-
-    /// Whether this direction renders the RECEIVE rows (vs the SEND rows). Pure
-    /// seam so the toggle's "which rows show" contract is host-testable without
-    /// rendering the component.
-    pub fn shows_receive(self) -> bool {
-        matches!(self, Direction::Receive)
-    }
-}
-
-/// testid for the Receive segment of the direction toggle.
-pub const TESTID_DIRECTION_RECEIVE: &str = "perf-direction-receive";
-/// testid for the Send segment of the direction toggle.
-pub const TESTID_DIRECTION_SEND: &str = "perf-direction-send";
+// The Receive | Send direction toggle was removed in the #1095 redesign: both
+// directions now render side-by-side in each per-kind card, so there is no longer
+// a single "active direction" to track. (`Direction` enum + its testids deleted.)
 
 // ── live diagnostics (issue #1095 observability) ───────────────────
 //
@@ -277,13 +245,13 @@ impl PartialEq for DiagnosticsReader {
     }
 }
 
-/// testid for the global effective-setting strip (one line under the toggle).
+/// testid for the global effective-setting strip (one line under the intro).
 pub const TESTID_SIMULCAST_STRIP: &str = "perf-simulcast-strip";
 
-// Per-row diagnostics testids are derived from each row's `id_prefix`
-// (`perf-video|audio|screen` for send, `perf-recv-video|…` for receive):
-//   {id_prefix}-diag, -diag-summary, -diag-detail, -diag-ladder,
-//   -diag-rung-{layer_id}, -diag-peer-{session_id}, -diag-more.
+// The expandable per-row diagnostics (the send ladder + per-peer receive
+// breakdown, with the `{id_prefix}-diag*` testids) moved OUT of this panel into
+// the Diagnostics panel's "Simulcast layers" section (#1095 redesign). The panel
+// now keeps only the always-visible per-card SUMMARY line per side.
 
 /// Format the SLIM global simulcast strip line (issue #1095 redesign): compact
 /// copy `"Simulcast: 3 layers (device cap 3)"`, or `"Simulcast: off"` when the
@@ -361,6 +329,126 @@ pub fn format_receive_spread(layers: &[u32]) -> String {
 /// 400→`"0.4 Mbps"`. Used in the SEND per-row summary line. Pure / host-tested.
 pub fn format_mbps(kbps: u32) -> String {
     format!("{:.1} Mbps", kbps as f32 / 1000.0)
+}
+
+// ── per-card summary lines (#1095 redesign, §3 copy) ───────────────
+//
+// One always-visible summary line per side, under each slider. Templates carry
+// the spec's literal phrasings; live numbers are filled from the snapshots. Pure
+// so the copy is a host-tested source of truth (a wording change breaks a test).
+
+/// VIDEO SEND summary, e.g. `"Sending 3 of 3 layers · 540p–720p"`. Camera off
+/// (`snap` is `None`) → `"Camera — off"`. Single-stream → `"Sending single
+/// layer · {res}"` (the one adaptive layer's short res, when known). The res
+/// span uses the SEND snapshot's per-layer short resolutions across the EFFECTIVE
+/// (offered) layers, lowest→highest. Pure / host-tested.
+pub fn format_video_send_summary(snap: Option<&SimulcastSendSnapshot>) -> String {
+    let Some(s) = snap else {
+        return "Camera — off".to_string();
+    };
+    if !s.simulcast_active {
+        return match s.layers.first() {
+            Some(l) => format!(
+                "Sending single layer · {}",
+                format_send_layer_short(l.width, l.height)
+            ),
+            None => "Sending single layer".to_string(),
+        };
+    }
+    let span = send_layer_res_span(s);
+    if span.is_empty() {
+        format!(
+            "Sending {} of {} layers",
+            s.active_layers, s.effective_layers
+        )
+    } else {
+        format!(
+            "Sending {} of {} layers · {span}",
+            s.active_layers, s.effective_layers
+        )
+    }
+}
+
+/// The short-resolution span across a SEND snapshot's layers, lowest→highest,
+/// e.g. `"540p–720p"`, or a single `"720p"` when all layers share a resolution,
+/// or `""` when no resolutions are known yet (atomics not ticked). Pure.
+pub fn send_layer_res_span(snap: &SimulcastSendSnapshot) -> String {
+    let mut shorts: Vec<u32> = snap
+        .layers
+        .iter()
+        .filter(|l| l.width > 0 && l.height > 0)
+        .map(|l| l.width.min(l.height))
+        .collect();
+    if shorts.is_empty() {
+        return String::new();
+    }
+    shorts.sort_unstable();
+    let lo = *shorts.first().unwrap();
+    let hi = *shorts.last().unwrap();
+    if lo == hi {
+        format!("{lo}p")
+    } else {
+        format!("{lo}p–{hi}p")
+    }
+}
+
+/// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L1–L3 across 4
+/// peers"`. No peers → `"Not receiving video"`. `layers` is the per-peer
+/// `layer_index` list (1-indexed for display via [`format_receive_spread`]).
+/// Pure / host-tested.
+pub fn format_video_receive_summary(layers: &[u32]) -> String {
+    let n = layers.len();
+    if n == 0 {
+        return "Not receiving video".to_string();
+    }
+    let spread = format_receive_spread(layers);
+    let peers = if n == 1 {
+        "1 peer".to_string()
+    } else {
+        format!("{n} peers")
+    };
+    format!("Pulling up to high quality · {spread} across {peers}")
+}
+
+/// AUDIO RECEIVE summary. No peers → `"Not receiving audio"`; otherwise the spec
+/// phrase `"Pulling near-full quality"`. Pure / host-tested.
+pub fn format_audio_receive_summary(n_peers: usize) -> String {
+    if n_peers == 0 {
+        "Not receiving audio".to_string()
+    } else {
+        "Pulling near-full quality".to_string()
+    }
+}
+
+/// CONTENT (screen) SEND summary. Not sharing (`snap` is `None`) → `"Will send
+/// up to 1080p when you share"`; sharing → `"Sending {res} · {mbps}"` (or just
+/// `"Sending {res}"` before bitrates tick). Pure / host-tested.
+pub fn format_content_send_summary(snap: Option<&SimulcastSendSnapshot>) -> String {
+    let Some(s) = snap else {
+        return "Will send up to 1080p when you share".to_string();
+    };
+    let res = send_layer_res_span(s);
+    let total = format_send_total_kbps(s);
+    match (res.is_empty(), total) {
+        (false, t) if t > 0 => format!("Sending {res} · {}", format_mbps(t)),
+        (false, _) => format!("Sending {res}"),
+        (true, _) => "Sending screen".to_string(),
+    }
+}
+
+/// CONTENT (screen) RECEIVE summary. No peer sharing → `"Nobody is sharing"`;
+/// otherwise `"Pulling full quality · L{i} · {w}×{h}"` for the top-layer peer.
+/// `top` is the highest-layer peer snapshot currently received. Pure.
+pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> String {
+    match top {
+        None => "Nobody is sharing".to_string(),
+        Some(s) => format!(
+            "Pulling full quality · L{} · {}×{}",
+            s.layer_index + 1,
+            s.width,
+            s.height
+        ),
+    }
 }
 
 // ── localStorage key + persisted shape (SEND) ─────────────────────
@@ -772,32 +860,50 @@ pub fn span_text(sel: RangeSel, labels: &[&str]) -> String {
     }
 }
 
-// ── VU meter needle math (SEND) ────────────────────────────────────
+// ── bar-meter math (SEND) ──────────────────────────────────────────
+//
+// The VU needle (an analog dial) was replaced by an inline bar-meter (4 vertical
+// bars, ▂▄▆█) plus a one-line readout (#1095 redesign). The meter's lit-bar
+// count is an integer "level" 0..=MAX_METER_LEVEL, derived from a 0..1 quality
+// fraction (best = 1.0, worst = 0.0), so first paint and the live rAF loop agree.
+// The old needle-angle functions are gone; the tests now pin the index→level
+// mapping (the actually-rendered behaviour).
 
-/// Sweep range of the analog needle, in degrees. The needle swings from
-/// `-MAX_NEEDLE_DEG` (worst / left) to `+MAX_NEEDLE_DEG` (best / right) across
-/// the tier ladder, like a classic cassette-deck VU meter.
-pub const MAX_NEEDLE_DEG: f32 = 50.0;
+/// Number of bars in the inline bar-meter; the level ranges `0..=MAX_METER_LEVEL`.
+/// Level 0 = all bars unlit (empty/idle state); level 4 = all four lit (best).
+pub const MAX_METER_LEVEL: u8 = 4;
 
-/// Convert a tier index within a ladder of `tier_count` tiers into the needle
-/// rotation angle in degrees.
-///
-/// Index 0 (best) → `+MAX_NEEDLE_DEG` (needle pegged right); the worst index →
-/// `-MAX_NEEDLE_DEG` (needle pegged left). A single-tier ladder centers the
-/// needle. Out-of-range indices are clamped, so this never produces NaN and is
-/// safe to feed straight into a CSS transform.
-///
-/// Pure + host-tested.
-pub fn tier_to_needle_deg(index: usize, tier_count: usize) -> f32 {
+/// Map a 0..=1 quality fraction (0 = worst, 1 = best) to a lit-bar level
+/// `0..=MAX_METER_LEVEL` via `round(fraction * MAX_METER_LEVEL)`. The fraction is
+/// clamped to `[0, 1]` first, so out-of-range inputs (or NaN, which clamps to 0)
+/// never overflow the bar count. Pure / host-tested.
+pub fn level_from_fraction(fraction: f32) -> u8 {
+    let clamped = if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
+    (clamped * MAX_METER_LEVEL as f32).round() as u8
+}
+
+/// The 0..=1 quality fraction for a SEND tier index (0 = best tier). Best tier
+/// → `1.0`, worst tier → `0.0`. Single-tier ladder → `1.0` (a lone tier is the
+/// best available). Out-of-range clamps. Pure / host-tested.
+pub fn tier_quality_fraction(index: usize, tier_count: usize) -> f32 {
     if tier_count <= 1 {
-        return 0.0;
+        return 1.0;
     }
     let max_idx = tier_count - 1;
     let clamped = index.min(max_idx);
-    // 0.0 at best (index 0) … 1.0 at worst (index max_idx).
-    let frac = clamped as f32 / max_idx as f32;
-    // Best → +MAX, worst → -MAX.
-    MAX_NEEDLE_DEG - frac * (2.0 * MAX_NEEDLE_DEG)
+    // Index 0 (best) → 1.0; worst index → 0.0.
+    1.0 - (clamped as f32 / max_idx as f32)
+}
+
+/// Convert a SEND tier index into a meter level `0..=MAX_METER_LEVEL`. Best tier
+/// → `MAX_METER_LEVEL`; worst → 1 (never 0 — a flowing stream lights at least one
+/// bar; level 0 is reserved for the no-signal empty state). Pure / host-tested.
+pub fn tier_to_meter_level(index: usize, tier_count: usize) -> u8 {
+    level_from_fraction(tier_quality_fraction(index, tier_count)).max(1)
 }
 
 /// Format the video readout line for the meter: `{w}x{h}·{fps}fps·{kbps}kbps`.
@@ -823,67 +929,67 @@ pub fn format_screen_readout(snap: &ScreenQualitySnapshot) -> String {
     )
 }
 
-/// Empty-state needle angle: rested at the left peg (worst end) so a camera-off
-/// gauge reads as "no signal" rather than a frozen mid-scale value.
-pub const EMPTY_NEEDLE_DEG: f32 = -MAX_NEEDLE_DEG;
+/// Empty-state meter level: 0 = all bars unlit (no signal), distinct from a
+/// flowing stream's level (>=1).
+pub const EMPTY_METER_LEVEL: u8 = 0;
 
-/// Empty-state readout for the video gauge (camera off / no snapshot).
-pub const VIDEO_EMPTY_READOUT: &str = "Camera off";
-/// Empty-state readout for the audio gauge (no snapshot).
+/// Empty-state readout for the video meter (camera off / no snapshot).
+pub const VIDEO_EMPTY_READOUT: &str = "Camera — off";
+/// Empty-state readout for the audio meter (no snapshot).
 pub const AUDIO_EMPTY_READOUT: &str = "Idle";
-/// Empty-state readout for the screen gauge (not sharing / no snapshot).
-pub const SCREEN_EMPTY_READOUT: &str = "Not sharing";
+/// Empty-state readout for the screen meter (not sharing / no snapshot).
+pub const SCREEN_EMPTY_READOUT: &str = "Screen — not sharing";
 
-/// All three SEND gauges' render state: needle angle + readout text. Pure so the
-/// snapshot→gauge mapping (including the empty-state reset) is host-testable.
-#[derive(Debug, Clone, PartialEq)]
+/// All three SEND meters' render state: lit-bar level + readout text. Pure so the
+/// snapshot→meter mapping (including the empty-state reset) is host-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GaugeState {
-    pub video_deg: f32,
-    pub audio_deg: f32,
-    pub screen_deg: f32,
+    pub video_level: u8,
+    pub audio_level: u8,
+    pub screen_level: u8,
     pub video_text: String,
     pub audio_text: String,
     pub screen_text: String,
 }
 
-/// Map the optional live SEND snapshots to all three gauges' render state.
+/// Map the optional live SEND snapshots to all three meters' render state.
 ///
-/// `Some` → live needle angles + numeric readouts. `None` on an input (encoder
-/// unavailable — camera turned off, or screen not sharing) → that gauge's needle
-/// resets to the left peg with a placeholder readout, so a stopped stream never
-/// freezes on a stale reading. The video/audio gauges share one
-/// `LiveQualitySnapshot`; the screen gauge has its own already-`Option`
+/// `Some` → live lit-bar levels + numeric readouts. `None` on an input (encoder
+/// unavailable — camera turned off, or screen not sharing) → that meter resets to
+/// level 0 (all bars unlit) with a status readout, so a stopped stream never
+/// freezes on a stale reading. The video/audio meters share one
+/// `LiveQualitySnapshot`; the screen meter has its own already-`Option`
 /// `ScreenQualitySnapshot`. Single source of truth for both first paint and the
 /// rAF loop.
 pub fn gauge_state_from_snapshot(
     va: Option<&LiveQualitySnapshot>,
     screen: Option<&ScreenQualitySnapshot>,
 ) -> GaugeState {
-    let (video_deg, audio_deg, video_text, audio_text) = match va {
+    let (video_level, audio_level, video_text, audio_text) = match va {
         Some(s) => (
-            tier_to_needle_deg(s.video_tier_index, VIDEO_TIER_LABELS.len()),
-            tier_to_needle_deg(s.audio_tier_index, AUDIO_TIER_LABELS.len()),
+            tier_to_meter_level(s.video_tier_index, VIDEO_TIER_LABELS.len()),
+            tier_to_meter_level(s.audio_tier_index, AUDIO_TIER_LABELS.len()),
             format_video_readout(s),
             format_audio_readout(s),
         ),
         None => (
-            EMPTY_NEEDLE_DEG,
-            EMPTY_NEEDLE_DEG,
+            EMPTY_METER_LEVEL,
+            EMPTY_METER_LEVEL,
             VIDEO_EMPTY_READOUT.to_string(),
             AUDIO_EMPTY_READOUT.to_string(),
         ),
     };
-    let (screen_deg, screen_text) = match screen {
+    let (screen_level, screen_text) = match screen {
         Some(s) => (
-            tier_to_needle_deg(s.tier_index, SCREEN_TIER_LABELS.len()),
+            tier_to_meter_level(s.tier_index, SCREEN_TIER_LABELS.len()),
             format_screen_readout(s),
         ),
-        None => (EMPTY_NEEDLE_DEG, SCREEN_EMPTY_READOUT.to_string()),
+        None => (EMPTY_METER_LEVEL, SCREEN_EMPTY_READOUT.to_string()),
     };
     GaugeState {
-        video_deg,
-        audio_deg,
-        screen_deg,
+        video_level,
+        audio_level,
+        screen_level,
         video_text,
         audio_text,
         screen_text,
@@ -902,22 +1008,20 @@ fn focus_element_by_id_local(id: &str) {
     }
 }
 
-// ── DOM helpers for the throttled needle update (shared) ───────────
+// ── DOM helpers for the throttled meter update (shared) ────────────
 
-/// Write `style.transform = rotate(<deg>deg)` to the needle element by id.
+/// Write `data-level="<level>"` to the bar-meter element by id.
 ///
-/// This is the per-frame DOM write that drives the analog needle without
-/// triggering a Dioxus re-render (mirrors the pre-join mic meter's direct
-/// `style.width` write). No-ops if the element is missing.
-fn write_needle_rotation(needle_id: &str, deg: f32) {
+/// This is the per-tick DOM write that lights the meter bars without triggering a
+/// Dioxus re-render (mirrors the pre-join mic meter's direct attribute write). CSS
+/// reads `data-level` and lights the first N bars. One attribute write per tick.
+/// No-ops if the element is missing. Replaces the retired needle-rotation write.
+fn write_meter_level(meter_id: &str, level: u8) {
     if let Some(el) = web_sys::window()
         .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(needle_id))
-        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+        .and_then(|d| d.get_element_by_id(meter_id))
     {
-        let _ = el
-            .style()
-            .set_property("transform", &format!("rotate({deg}deg)"));
+        let _ = el.set_attribute("data-level", &level.to_string());
     }
 }
 
@@ -949,100 +1053,74 @@ pub const TESTID_SCREEN_RANGE_MAX: &str = "perf-screen-range-max";
 pub const TESTID_VIDEO_AUTO: &str = "perf-video-auto";
 pub const TESTID_AUDIO_AUTO: &str = "perf-audio-auto";
 pub const TESTID_SCREEN_AUTO: &str = "perf-screen-auto";
-/// SEND ("Sending") needle gauges.
+/// SEND ("Sending") bar-meters. The constant names are unchanged (#1095 e2e
+/// selectors still resolve) even though the element is now a `.perf-meter`
+/// bar-meter, not the retired VU needle gauge.
 pub const TESTID_VU_VIDEO: &str = "perf-vu-video";
 pub const TESTID_VU_AUDIO: &str = "perf-vu-audio";
 pub const TESTID_VU_SCREEN: &str = "perf-vu-screen";
 
-const VIDEO_NEEDLE_ID: &str = "perf-vu-video-needle";
-const AUDIO_NEEDLE_ID: &str = "perf-vu-audio-needle";
-const SCREEN_NEEDLE_ID: &str = "perf-vu-screen-needle";
+// The rAF driver writes `data-level` to the meter container by id and the
+// readout text to the readout span by id. Send and receive use DISTINCT ids per
+// kind so the two drivers never write the same node.
+const VIDEO_METER_ID: &str = "perf-meter-video";
+const AUDIO_METER_ID: &str = "perf-meter-audio";
+const SCREEN_METER_ID: &str = "perf-meter-screen";
+// Readout element ids keep their original `perf-vu-*-readout` names (NOT renamed
+// to `perf-meter-*`) so the #961/#989 e2e that polls these ids by `#id` still
+// resolves after the needle→bar-meter swap.
 const VIDEO_READOUT_ID: &str = "perf-vu-video-readout";
 const AUDIO_READOUT_ID: &str = "perf-vu-audio-readout";
 const SCREEN_READOUT_ID: &str = "perf-vu-screen-readout";
 
 // ── components ────────────────────────────────────────────────────
 
-/// A single analog VU needle gauge with a live numeric readout below it.
+/// An inline bar-meter (four vertical bars, ▂▄▆█) followed by a one-line readout
+/// on the same baseline (#1095 redesign — replaces the analog VU needle gauge).
 ///
-/// The arc + ticks are static SVG; only the `<line>` needle and the readout
-/// text node are mutated at runtime (by the rAF drivers) via direct DOM writes,
-/// so this component itself never re-renders per frame. Shared by both the
-/// "Sending" and "Receiving" needles (distinct ids per instance).
+/// The container carries `data-level="0..=MAX_METER_LEVEL"`; CSS lights the first
+/// N bars. Only the container's `data-level` attribute and the readout text node
+/// are mutated at runtime (by the rAF drivers) via direct DOM writes, so this
+/// component never re-renders per tick. The bars are `aria-hidden`; the readout is
+/// the sole accessible value (`aria-live="polite"`). Shared by both the "Sending"
+/// and "Receiving" sides (distinct ids per instance so the drivers never collide).
 #[component]
-fn VuGauge(
-    /// Stable testid / aria target for the gauge container.
+fn PerfMeter(
+    /// Stable testid / aria target for the meter container (the `data-level` host).
     testid: &'static str,
-    /// Id of the rotating needle `<line>` element.
-    needle_id: &'static str,
-    /// Id of the readout text element.
+    /// Id of the meter container (the rAF driver writes `data-level` here).
+    meter_id: &'static str,
+    /// Id of the readout text element (the rAF driver writes its text here).
     readout_id: &'static str,
     /// Accessible label, e.g. "Sending video" / "Receiving video".
     label: &'static str,
-    /// Initial needle rotation (degrees) for first paint before the loop ticks.
-    initial_deg: f32,
+    /// Initial lit-bar level for first paint before the loop ticks.
+    initial_level: u8,
     /// Initial readout text.
     initial_readout: String,
 ) -> Element {
     rsx! {
-        div {
-            class: "perf-vu-gauge",
-            "data-testid": testid,
-            "aria-label": label,
-            svg {
-                class: "perf-vu-svg",
-                view_box: "0 0 120 78",
-                width: "120",
-                height: "78",
-                "aria-hidden": "true",
-                // Outer arc (the dial face).
-                path {
-                    class: "perf-vu-arc",
-                    d: "M 14 64 A 50 50 0 0 1 106 64",
-                    fill: "none",
-                    stroke_width: "2",
-                }
-                // Tick marks across the sweep (drawn as short radial lines).
-                for i in 0..7 {
-                    {
-                        // Evenly space 7 ticks from -50deg..+50deg.
-                        let frac = i as f32 / 6.0;
-                        let deg = -MAX_NEEDLE_DEG + frac * (2.0 * MAX_NEEDLE_DEG);
-                        let rad = (deg - 90.0) * std::f32::consts::PI / 180.0;
-                        let (cx, cy) = (60.0_f32, 64.0_f32);
-                        let (r0, r1) = (44.0_f32, 50.0_f32);
-                        let x1 = cx + r0 * rad.cos();
-                        let y1 = cy + r0 * rad.sin();
-                        let x2 = cx + r1 * rad.cos();
-                        let y2 = cy + r1 * rad.sin();
-                        rsx! {
-                            line {
-                                class: "perf-vu-tick",
-                                x1: "{x1}", y1: "{y1}", x2: "{x2}", y2: "{y2}",
-                                stroke_width: "1.5",
-                            }
-                        }
-                    }
-                }
-                // Needle: pivots at (60,64), points up; rotated at runtime.
-                line {
-                    id: needle_id,
-                    class: "perf-vu-needle",
-                    x1: "60", y1: "64", x2: "60", y2: "20",
-                    stroke_width: "2.5",
-                    stroke_linecap: "round",
-                    style: "transform: rotate({initial_deg}deg);",
-                }
-                // Needle hub.
-                circle { class: "perf-vu-hub", cx: "60", cy: "64", r: "4" }
-            }
-            div { class: "perf-vu-label", "{label}" }
-            // The readout is the accessible value: announced to screen readers
-            // via aria-live when the quality changes. (The SVG gauge above is
-            // decorative — aria-hidden — so the readout is the sole SR source.)
+        div { class: "perf-meter-wrap",
+            // Bars: decorative, lit via CSS from the container's data-level. The
+            // four child bars are always present; CSS lights the first N.
             div {
+                id: meter_id,
+                class: "perf-meter",
+                "data-testid": testid,
+                "data-level": "{initial_level}",
+                "aria-hidden": "true",
+                role: "img",
+                "aria-label": "{label}",
+                span { class: "perf-meter__bar" }
+                span { class: "perf-meter__bar" }
+                span { class: "perf-meter__bar" }
+                span { class: "perf-meter__bar" }
+            }
+            // The readout is the accessible value: announced via aria-live when
+            // the quality changes (the bars above are decorative / aria-hidden).
+            span {
                 id: readout_id,
-                class: "perf-vu-readout",
+                class: "perf-meter__readout",
                 role: "status",
                 "aria-live": "polite",
                 "aria-label": "{label}",
@@ -1052,21 +1130,21 @@ fn VuGauge(
     }
 }
 
-/// Headless driver for the three SEND VU needles. Renders **nothing** — it only
+/// Headless driver for the three SEND bar-meters. Renders **nothing** — it only
 /// owns the single ~4 Hz `requestAnimationFrame` polling loop that reads
-/// `live_quality_snapshot()` / `live_screen_snapshot()` and writes the needle
-/// rotations + readouts straight to the DOM nodes **by id** (so the gauges can
-/// live anywhere in the tree, e.g. each inside its own threshold section).
+/// `live_quality_snapshot()` / `live_screen_snapshot()` and writes each meter's
+/// `data-level` + readout straight to the DOM nodes **by id** (so the meters can
+/// live anywhere in the tree, e.g. each inside its own per-kind card).
 ///
 /// Direct DOM writes mean no per-frame re-render. The loop self-cancels when the
 /// driver unmounts (the `use_drop` clears the closure cell).
 #[component]
 fn QualityVuMeterDriver(
-    /// Reads the current video/audio live snapshot. `None` → those gauges reset
-    /// to the empty state ("Camera off" / "Idle").
+    /// Reads the current video/audio live snapshot. `None` → those meters reset
+    /// to the empty state (level 0 + "Camera — off" / "Idle").
     read_snapshot: SnapshotReader,
     /// Reads the current screen-share live snapshot. `None` (not sharing) → the
-    /// screen gauge shows "Not sharing".
+    /// screen meter shows level 0 + "Screen — not sharing".
     read_screen_snapshot: ScreenSnapshotReader,
 ) -> Element {
     // Shared cell holds the rAF closure so it can reschedule itself, and so the
@@ -1091,15 +1169,15 @@ fn QualityVuMeterDriver(
                 if now - last_ms.get() >= 250.0 {
                     last_ms.set(now);
                     // Always write — including the `None`/stopped cases, which
-                    // reset the needle to the left peg and show the placeholder
-                    // readout. Without this branch a stream stopped *after* the
-                    // panel opened would freeze the needle on a stale value.
+                    // reset the meter to level 0 and show the status readout.
+                    // Without this branch a stream stopped *after* the panel opened
+                    // would freeze the meter on a stale level.
                     let snap = reader.read();
                     let screen_snap = screen_reader.read();
                     let state = gauge_state_from_snapshot(snap.as_ref(), screen_snap.as_ref());
-                    write_needle_rotation(VIDEO_NEEDLE_ID, state.video_deg);
-                    write_needle_rotation(AUDIO_NEEDLE_ID, state.audio_deg);
-                    write_needle_rotation(SCREEN_NEEDLE_ID, state.screen_deg);
+                    write_meter_level(VIDEO_METER_ID, state.video_level);
+                    write_meter_level(AUDIO_METER_ID, state.audio_level);
+                    write_meter_level(SCREEN_METER_ID, state.screen_level);
                     write_readout_text(VIDEO_READOUT_ID, &state.video_text);
                     write_readout_text(AUDIO_READOUT_ID, &state.audio_text);
                     write_readout_text(SCREEN_READOUT_ID, &state.screen_text);
@@ -1198,7 +1276,7 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{min_value}",
-                    "aria-label": "Minimum {stream_noun} send quality",
+                    "aria-label": "Worst {stream_noun} send quality",
                     "aria-valuetext": "{min_valuetext}",
                     oninput: move |evt| {
                         if let Ok(p) = evt.value().parse::<usize>() {
@@ -1215,7 +1293,7 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{max_value}",
-                    "aria-label": "Maximum {stream_noun} send quality",
+                    "aria-label": "Best {stream_noun} send quality",
                     "aria-valuetext": "{max_valuetext}",
                     oninput: move |evt| {
                         if let Ok(p) = evt.value().parse::<usize>() {
@@ -1309,23 +1387,17 @@ fn HelpPopover(
     }
 }
 
-/// One stream kind's unified section: a header (kind title) plus a **Receive**
-/// row and a **Send** row, each with its own needle gauge, dual-thumb slider,
-/// Auto toggle, Fixed badge, "?" help popover and live range text.
-///
-/// One kind's SEND row: a per-kind title (with the "your upload" consequence),
-/// needle gauge, dual-thumb slider, Auto/help/Fixed header and live range text.
-/// Rendered (one per kind) when the panel's direction toggle is on **Send**.
+/// One kind's SEND column inside a [`KindCard`]: a "Sending" head (consequence +
+/// "?" help + Auto/Fixed), a bar-meter, a dual-thumb slider, and a live summary
+/// line (#1095 redesign — replaces the old `SendRow` + diagnostics footer).
 ///
 /// Send uses the inverted tier convention (0 = best) and bounds what this peer
-/// publishes; the counterpart [`receive::ReceiveRow`] uses the direct layer
-/// convention (0 = lowest). Distinct testids / needle ids keep them from
-/// crossing.
+/// publishes; the counterpart [`receive::ReceiveCell`] uses the direct layer
+/// convention (0 = lowest). Distinct testids / meter ids keep them from crossing.
 #[allow(clippy::too_many_arguments)]
 #[component]
-fn SendRow(
-    /// Display title for the kind, e.g. "Video" / "Audio" / "Screen Share".
-    kind_title: &'static str,
+fn SendCell(
+    /// Accessible noun for the kind, e.g. "video" / "audio" / "screen share".
     stream_noun: &'static str,
     /// Send id prefix, e.g. "perf-video".
     id_prefix: &'static str,
@@ -1334,12 +1406,18 @@ fn SendRow(
     auto_testid: &'static str,
     fixed_testid: &'static str,
     help_testid: &'static str,
+    help_body: &'static str,
     vu_testid: &'static str,
-    vu_needle_id: &'static str,
+    vu_meter_id: &'static str,
     vu_readout_id: &'static str,
     vu_label: &'static str,
-    vu_initial_deg: f32,
+    vu_initial_level: u8,
     vu_initial_readout: String,
+    /// The "your upload" / "not sharing" consequence text right of the side title.
+    consequence: String,
+    /// The always-visible summary line under the slider (filled live by the
+    /// parent from the SEND snapshot).
+    summary_line: String,
     labels: Vec<&'static str>,
     best: Option<usize>,
     worst: Option<usize>,
@@ -1347,16 +1425,6 @@ fn SendRow(
     is_auto: bool,
     /// Shared single-open help signal (opening any popover closes the others).
     open_help: Signal<Option<&'static str>>,
-    /// Shared single-open diagnostics-detail signal (#1095).
-    open_diag: Signal<Option<&'static str>>,
-    /// Live SEND simulcast snapshot for this kind (video/screen); `None` for audio.
-    diag_snap: Option<SimulcastSendSnapshot>,
-    /// `true` for the screen row when not currently sharing.
-    diag_not_sharing: bool,
-    /// Effective audio layer count (used only by the audio row's footer).
-    diag_effective_audio: u32,
-    /// `true` for the audio row (no per-layer snapshot).
-    diag_is_audio: bool,
     on_change: EventHandler<RangeSel>,
     on_auto_toggle: EventHandler<bool>,
 ) -> Element {
@@ -1369,16 +1437,15 @@ fn SendRow(
     };
 
     rsx! {
-        div { class: "perf-stream-group perf-send-row",
-            div { class: "perf-stream-header",
-                // Per-kind title + the consequence, legible without the popover.
-                span { class: "perf-stream-title", "{kind_title}" }
-                span { class: "perf-stream-consequence", "your upload" }
+        div { class: "perf-side perf-side--send",
+            div { class: "perf-side__head",
+                span { class: "perf-side__title", "Sending" }
+                span { class: "perf-side__consequence", "{consequence}" }
                 HelpPopover {
                     key_id: id_prefix,
                     help_testid,
                     help_label: vu_label,
-                    help_body: "Sets the best (right) and worst (left) quality this device PUBLISHES, to save your upload bandwidth and CPU. The app adapts within these limits based on your network. Auto uses the full range.",
+                    help_body,
                     open_help,
                 }
                 if is_fixed {
@@ -1405,126 +1472,40 @@ fn SendRow(
                     "Auto"
                 }
             }
-            div { class: "perf-stream-body",
-                VuGauge {
-                    testid: vu_testid,
-                    needle_id: vu_needle_id,
-                    readout_id: vu_readout_id,
-                    label: vu_label,
-                    initial_deg: vu_initial_deg,
-                    initial_readout: vu_initial_readout,
-                }
-                div { class: "perf-stream-controls",
-                    DualRangeSlider {
-                        id_prefix,
-                        min_testid,
-                        max_testid,
-                        stream_noun,
-                        labels: labels.clone(),
-                        sel,
-                        on_change: move |s: RangeSel| on_change.call(s),
-                    }
-                    p {
-                        class: "perf-range-value",
-                        "data-testid": "{id_prefix}-range-value",
-                        "aria-live": "polite",
-                        "Sending: {range_str}"
-                    }
-                    // Per-row SEND diagnostics footer (#1095) — last child of the
-                    // controls so it left-aligns with the slider, not the gauge.
-                    SendDiagFooter {
-                        id_prefix,
-                        snap: diag_snap,
-                        not_sharing: diag_not_sharing,
-                        effective_audio: diag_effective_audio,
-                        is_audio: diag_is_audio,
-                        open_diag,
-                    }
-                }
+            PerfMeter {
+                testid: vu_testid,
+                meter_id: vu_meter_id,
+                readout_id: vu_readout_id,
+                label: vu_label,
+                initial_level: vu_initial_level,
+                initial_readout: vu_initial_readout,
             }
+            DualRangeSlider {
+                id_prefix,
+                min_testid,
+                max_testid,
+                stream_noun,
+                labels: labels.clone(),
+                sel,
+                on_change: move |s: RangeSel| on_change.call(s),
+            }
+            p {
+                class: "perf-range-value",
+                "data-testid": "{id_prefix}-range-value",
+                "aria-live": "polite",
+                "Sending: {range_str}"
+            }
+            p { class: "perf-summary-line", "{summary_line}" }
         }
     }
 }
 
-/// Segmented `Receive | Send` toggle shown at the top of the panel. A
-/// radiogroup of two `role="radio"` buttons (`aria-checked` + roving focus via
-/// the arrow keys / Home / End), so it is fully keyboard-accessible and announced
-/// as a single-choice group. Switching it changes which direction's three rows
-/// the panel renders, halving visible rows (6 → 3) so the panel fits.
-#[component]
-fn DirectionToggle(active: Direction, on_change: EventHandler<Direction>) -> Element {
-    let recv_active = active == Direction::Receive;
-    let send_active = active == Direction::Send;
-    let recv_class = if recv_active {
-        "perf-direction-segment is-active"
-    } else {
-        "perf-direction-segment"
-    };
-    let send_class = if send_active {
-        "perf-direction-segment is-active"
-    } else {
-        "perf-direction-segment"
-    };
-    rsx! {
-        div {
-            class: "perf-direction-toggle",
-            role: "radiogroup",
-            "aria-label": "Quality direction",
-            button {
-                r#type: "button",
-                class: recv_class,
-                "data-testid": TESTID_DIRECTION_RECEIVE,
-                role: "radio",
-                "aria-checked": if recv_active { "true" } else { "false" },
-                // Only the active radio is in the tab order; arrows move within.
-                tabindex: if recv_active { "0" } else { "-1" },
-                onclick: move |_| on_change.call(Direction::Receive),
-                onkeydown: move |evt: KeyboardEvent| {
-                    match evt.key() {
-                        Key::ArrowRight | Key::ArrowDown | Key::End => {
-                            evt.prevent_default();
-                            on_change.call(Direction::Send);
-                        }
-                        Key::Home => {
-                            evt.prevent_default();
-                            on_change.call(Direction::Receive);
-                        }
-                        _ => {}
-                    }
-                },
-                "Receive"
-            }
-            button {
-                r#type: "button",
-                class: send_class,
-                "data-testid": TESTID_DIRECTION_SEND,
-                role: "radio",
-                "aria-checked": if send_active { "true" } else { "false" },
-                tabindex: if send_active { "0" } else { "-1" },
-                onclick: move |_| on_change.call(Direction::Send),
-                onkeydown: move |evt: KeyboardEvent| {
-                    match evt.key() {
-                        Key::ArrowLeft | Key::ArrowUp | Key::Home => {
-                            evt.prevent_default();
-                            on_change.call(Direction::Receive);
-                        }
-                        Key::End => {
-                            evt.prevent_default();
-                            on_change.call(Direction::Send);
-                        }
-                        _ => {}
-                    }
-                },
-                "Send"
-            }
-        }
-    }
-}
-
-/// One peer's RECEIVE snapshot for a SINGLE kind, flattened for the per-row
-/// diagnostics footer (issue #1095 redesign). The panel splits the full
-/// per-peer `PeerReceiveDiag` list into one `PeerKindSnap` Vec per kind so each
-/// `ReceiveRow` gets exactly the peers receiving ITS kind.
+/// One peer's RECEIVE snapshot for a SINGLE kind, flattened for the per-kind
+/// receive summary (issue #1095 redesign). The panel splits the full per-peer
+/// `PeerReceiveDiag` list into one `PeerKindSnap` Vec per kind so each
+/// [`receive::ReceiveCell`] gets exactly the peers receiving ITS kind. The full
+/// per-peer breakdown now lives in the Diagnostics panel's "Simulcast layers"
+/// section; the card keeps only the aggregate summary line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerKindSnap {
     /// The peer's relay session id (used in the per-peer-row testid).
@@ -1535,366 +1516,26 @@ pub struct PeerKindSnap {
     pub snap: ReceivedLayerSnapshot,
 }
 
-/// SEND per-row diagnostics footer (issue #1095 redesign), inserted as the LAST
-/// child of `.perf-stream-controls` so it left-aligns with the slider.
-///
-/// Two tiers:
-///   * always-visible `.perf-diag-summary` — `{N of M layers active} · {mbps}`
-///     as a disclosure `<button>` (chevron far-right). Single-layer / not-sharing
-///     render a STATIC `<span>` (no button).
-///   * expandable `.perf-diag-ladder` — one chip per EFFECTIVE layer (active vs
-///     shed styling), gated single-open via `open_diag`.
-///
-/// `snap` is `Some` for video/screen (real per-layer data) and `None` for audio
-/// (no per-layer bitrate source); the audio case shows a static summary derived
-/// from `effective_audio`.
-#[allow(clippy::too_many_arguments)]
-#[component]
-fn SendDiagFooter(
-    id_prefix: &'static str,
-    /// Live SEND snapshot for video/screen, or `None` for audio.
-    snap: Option<SimulcastSendSnapshot>,
-    /// `true` for the screen row when not currently sharing (static "not sharing").
-    not_sharing: bool,
-    /// Effective audio layer count, used to summarise the audio SEND row (which
-    /// has no per-layer snapshot).
-    effective_audio: u32,
-    /// `true` for the audio row (uses `effective_audio` rather than `snap`).
-    is_audio: bool,
-    /// Single-open accordion signal (keyed by `id_prefix`).
-    open_diag: Signal<Option<&'static str>>,
-) -> Element {
-    let mut open_diag = open_diag;
-    let detail_id = format!("{id_prefix}-diag-detail");
-    let is_open = open_diag() == Some(id_prefix);
+// ── help-popover bodies (§3 copy) ──────────────────────────────────
 
-    // Source off → static line, no disclosure. The video row reads "Camera —
-    // off" (camera disabled) and the screen row "Screen — not sharing"; both
-    // gate on their reader returning `None` so no stale layer counts render.
-    if not_sharing {
-        let off_text = if id_prefix == "perf-video" {
-            "Camera — off"
-        } else {
-            "Screen — not sharing"
-        };
-        return rsx! {
-            div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-                span {
-                    class: "perf-diag-summary perf-diag-static",
-                    "data-testid": "{id_prefix}-diag-summary",
-                    "{off_text}"
-                }
-            }
-        };
-    }
+const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') at once so each viewer gets the best one their connection can handle. More layers = more upload. The slider caps the best and worst versions you'll send.";
+const HELP_AUDIO_SEND: &str =
+    "Your mic sends one or more audio quality versions. Higher = clearer voice but more upload.";
+const HELP_CONTENT_SEND: &str = "When you share your screen, this caps the sharpness and frame detail you publish. Text-heavy screens benefit from a higher cap; video benefits from a lower one if your upload is tight.";
 
-    // Audio: no per-layer snapshot — static effective-layer summary.
-    if is_audio {
-        let text = if effective_audio <= 1 {
-            "Single layer".to_string()
-        } else {
-            format!("{effective_audio} layers active")
-        };
-        return rsx! {
-            div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-                span {
-                    class: "perf-diag-summary perf-diag-static",
-                    "data-testid": "{id_prefix}-diag-summary",
-                    "{text}"
-                }
-            }
-        };
-    }
-
-    let snap = snap.unwrap_or(SimulcastSendSnapshot {
-        simulcast_active: false,
-        effective_layers: 1,
-        active_layers: 1,
-        layers: Vec::new(),
-    });
-
-    // Single-layer → static line (no per-layer ladder to expand).
-    if !snap.simulcast_active {
-        // Show the single adaptive layer's res/kbps if available (layer 0).
-        let detail = snap
-            .layers
-            .first()
-            .map(|l| {
-                format!(
-                    "Single layer · {} · {}",
-                    format_send_layer_short(l.width, l.height),
-                    format_kbps_compact(l.bitrate_kbps)
-                )
-            })
-            .unwrap_or_else(|| "Single layer".to_string());
-        return rsx! {
-            div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-                span {
-                    class: "perf-diag-summary perf-diag-static",
-                    "data-testid": "{id_prefix}-diag-summary",
-                    "{detail}"
-                }
-            }
-        };
-    }
-
-    // Simulcast active → disclosure button summary + expandable ladder.
-    let header = format_send_header(&snap);
-    let total = format_send_total_kbps(&snap);
-    // Suppress the "· N Mbps total" suffix until real bitrates arrive: before the
-    // encoder-control loop first ticks, the per-layer bitrate atomics are empty so
-    // `total == 0`, which would otherwise read as a misleading "· 0 Mbps total".
-    let (summary_text, aria) = if total == 0 {
-        (
-            header.clone(),
-            format!(
-                "Sending layers: {} of {} active. Expand for per-layer detail.",
-                snap.active_layers, snap.effective_layers
-            ),
-        )
-    } else {
-        (
-            format!("{header} · {} total", format_mbps(total)),
-            format!(
-                "Sending layers: {} of {} active, {} total. Expand for per-layer detail.",
-                snap.active_layers,
-                snap.effective_layers,
-                format_mbps(total)
-            ),
-        )
-    };
-    // Weight each chip's flex-grow by its bitrate so wider = more bitrate.
-    let max_kbps = snap
-        .layers
-        .iter()
-        .map(|l| l.bitrate_kbps)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    rsx! {
-        div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-            button {
-                r#type: "button",
-                class: "perf-diag-summary perf-diag-trigger",
-                "data-testid": "{id_prefix}-diag-summary",
-                "aria-expanded": if is_open { "true" } else { "false" },
-                "aria-controls": "{detail_id}",
-                "aria-label": "{aria}",
-                onclick: move |_| {
-                    if is_open { open_diag.set(None); } else { open_diag.set(Some(id_prefix)); }
-                },
-                span { class: "perf-diag-summary-text", "{summary_text}" }
-                span {
-                    class: "perf-diag-chevron",
-                    "aria-hidden": "true",
-                    if is_open { "⌃" } else { "▸" }
-                }
-            }
-            if is_open {
-                div {
-                    class: "perf-diag-detail",
-                    id: "{detail_id}",
-                    "data-testid": "{id_prefix}-diag-detail",
-                    role: "group",
-                    "aria-label": "Per-layer send detail",
-                    div {
-                        class: "perf-diag-ladder",
-                        "data-testid": "{id_prefix}-diag-ladder",
-                        for layer in snap.layers.iter().cloned() {
-                            {
-                                let active = layer.layer_id < snap.active_layers;
-                                let grow = (layer.bitrate_kbps as f32 / max_kbps as f32).max(0.4);
-                                let chip_class = if active {
-                                    "perf-diag-rung is-active"
-                                } else {
-                                    "perf-diag-rung is-shed"
-                                };
-                                let full = format_send_layer(
-                                    layer.layer_id, layer.width, layer.height, layer.bitrate_kbps,
-                                );
-                                let res_short = format_send_layer_short(layer.width, layer.height);
-                                let kbps_short = format_kbps_compact(layer.bitrate_kbps);
-                                rsx! {
-                                    div {
-                                        class: chip_class,
-                                        "data-testid": "{id_prefix}-diag-rung-{layer.layer_id}",
-                                        "aria-hidden": "true",
-                                        title: "{full}",
-                                        style: "flex-grow: {grow};",
-                                        span { class: "perf-diag-rung-id", "L{layer.layer_id}" }
-                                        span { class: "perf-diag-rung-res", "{res_short}" }
-                                        span { class: "perf-diag-rung-kbps", "{kbps_short}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// RECEIVE per-row diagnostics footer (issue #1095 redesign), inserted as the
-/// LAST child of `.perf-stream-controls`.
-///
-/// Always-visible summary: `{n} peers · L{lo}–L{hi}` (disclosure button). 1 peer
-/// → static inline `From {peer} · L{i}/{N} · {res}`; 0 peers → static
-/// "Not receiving". Expandable: top-3 peers (by layer DESC) as pip rows + a
-/// `+{n-3} more` tail. Single-open via `open_diag`.
-#[component]
-fn ReceiveDiagFooter(
-    id_prefix: &'static str,
-    /// The peers currently receiving THIS row's kind.
-    peers: Vec<PeerKindSnap>,
-    open_diag: Signal<Option<&'static str>>,
-) -> Element {
-    let mut open_diag = open_diag;
-    let detail_id = format!("{id_prefix}-diag-detail");
-    let is_open = open_diag() == Some(id_prefix);
-    let n = peers.len();
-
-    // 0 peers → static "Not receiving".
-    if n == 0 {
-        return rsx! {
-            div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-                span {
-                    class: "perf-diag-summary perf-diag-static",
-                    "data-testid": "{id_prefix}-diag-summary",
-                    "{receive::EMPTY_READOUT}"
-                }
-            }
-        };
-    }
-
-    // 1 peer → static inline detail, no disclosure.
-    if n == 1 {
-        let p = &peers[0];
-        let layer = p.snap.layer_index + 1;
-        let res = if matches!(p.snap.kind, PrefMediaKind::Audio) {
-            format!("{} kbps", p.snap.kbps)
-        } else {
-            format!("{}×{}", p.snap.width, p.snap.height)
-        };
-        let text = format!("From {} · L{layer}/{} · {res}", p.label, p.snap.layer_count);
-        return rsx! {
-            div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-                span {
-                    class: "perf-diag-summary perf-diag-static",
-                    "data-testid": "{id_prefix}-diag-summary",
-                    "{text}"
-                }
-            }
-        };
-    }
-
-    // Many peers → disclosure. Summary spread over the per-peer layers.
-    let layers: Vec<u32> = peers.iter().map(|p| p.snap.layer_index).collect();
-    let spread = format_receive_spread(&layers);
-    let summary_text = format!("{n} peers · {spread}");
-    let aria = format!(
-        "Receiving this stream from {n} peers, layers {spread}. Expand for per-peer detail."
-    );
-
-    // Sort peers by layer DESC for the detail (highest-quality first).
-    let mut sorted = peers.clone();
-    sorted.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
-    let top: Vec<PeerKindSnap> = sorted.iter().take(3).cloned().collect();
-    let lowest_layer = sorted.last().map(|p| p.snap.layer_index + 1).unwrap_or(1);
-    let extra = n.saturating_sub(3);
-
-    rsx! {
-        div { class: "perf-diag", "data-testid": "{id_prefix}-diag",
-            button {
-                r#type: "button",
-                class: "perf-diag-summary perf-diag-trigger",
-                "data-testid": "{id_prefix}-diag-summary",
-                "aria-expanded": if is_open { "true" } else { "false" },
-                "aria-controls": "{detail_id}",
-                "aria-label": "{aria}",
-                onclick: move |_| {
-                    if is_open { open_diag.set(None); } else { open_diag.set(Some(id_prefix)); }
-                },
-                span { class: "perf-diag-summary-text", "{summary_text}" }
-                span {
-                    class: "perf-diag-chevron",
-                    "aria-hidden": "true",
-                    if is_open { "⌃" } else { "▸" }
-                }
-            }
-            if is_open {
-                div {
-                    class: "perf-diag-detail",
-                    id: "{detail_id}",
-                    "data-testid": "{id_prefix}-diag-detail",
-                    role: "group",
-                    "aria-label": "Per-peer receive detail",
-                    div { class: "perf-diag-peers",
-                        for p in top.iter().cloned() {
-                            {
-                                let meta = receive::format_readout(&p.snap);
-                                // Pips track the ACTUAL layer count so a future
-                                // >3-layer kind shows e.g. 4 dots next to an "L4/4"
-                                // label (no hard cap at 3). The flex pip row + small
-                                // dots accommodate 4+ (#1095 P3).
-                                let total_pips = p.snap.layer_count.max(1);
-                                let filled = (p.snap.layer_index + 1).min(total_pips);
-                                // Full screen-reader / title text: peer name + the
-                                // kind-aware line (e.g. "alice: video L2/3 · 1280×720").
-                                let kind_label = match p.snap.kind {
-                                    PrefMediaKind::Video => "video",
-                                    PrefMediaKind::Screen => "screen",
-                                    PrefMediaKind::Audio => "audio",
-                                };
-                                let full = format_peer_kind_line(kind_label, Some(&p.snap))
-                                    .map(|line| format!("{}: {line}", p.label))
-                                    .unwrap_or_else(|| p.label.clone());
-                                rsx! {
-                                    div {
-                                        class: "perf-diag-peer",
-                                        "data-testid": "{id_prefix}-diag-peer-{p.session_id}",
-                                        title: "{full}",
-                                        span {
-                                            class: "perf-diag-pip",
-                                            "aria-hidden": "true",
-                                            for i in 0..total_pips {
-                                                span {
-                                                    class: if i < filled { "perf-diag-dot is-on" } else { "perf-diag-dot" },
-                                                }
-                                            }
-                                        }
-                                        span { class: "perf-diag-peer-name", "{p.label}" }
-                                        span { class: "perf-diag-peer-meta", "{meta}" }
-                                    }
-                                }
-                            }
-                        }
-                        if extra > 0 {
-                            span {
-                                class: "perf-diag-more",
-                                "data-testid": "{id_prefix}-diag-more",
-                                "+{extra} more peer(s) at L{lowest_layer}"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The unified Performance settings panel body. A `Receive | Send` segmented
-/// toggle (default Receive) at the top selects the direction; the panel then
-/// renders only that direction's three rows (Video, Audio, Screen), each with
-/// its own live needle. Two headless rAF drivers update the "Sending" and
-/// "Receiving" needles independently, regardless of which direction is visible.
+/// The unified Performance settings panel body (#1095 redesign). Three stacked
+/// per-kind cards (Video / Audio / Content), each split into a **Sending** column
+/// and a **Receiving** column, so both directions are visible at once without a
+/// direction tab. A header row carries the "Performance" title and a "Diagnostics"
+/// cross-nav button; a slim simulcast strip (with an `(i)` tooltip) sits under the
+/// intro. Two headless rAF drivers update the Sending and Receiving bar-meters
+/// independently by id.
 ///
 /// `pref` (send) + `receive_pref` are the current persisted preferences
 /// (controlled by the parent). On any change the panel derives the new bounds
 /// and calls the matching callback; the parent persists it and pushes it to the
 /// encoder (send) or client (receive). The panel is otherwise stateless apart
-/// from the local direction-toggle + open-popover signals.
+/// from the open-popover signal and the throttled refresh tick.
 #[component]
 pub fn PerformanceSettingsPanel(
     // SEND side (#961).
@@ -1909,45 +1550,39 @@ pub fn PerformanceSettingsPanel(
     // Live simulcast/AQ diagnostics (#1095 observability). Defaults to an inert
     // reader so existing call sites / tests that don't wire it still compile.
     #[props(default = DiagnosticsReader::none())] diagnostics_reader: DiagnosticsReader,
+    // Cross-nav: open the Call Diagnostics panel (closes settings). Defaults to a
+    // no-op so call sites / tests that don't wire it still compile. (#1095 §4a)
+    #[props(default)] on_open_diagnostics: EventHandler<()>,
 ) -> Element {
     let video_fixed = pref.video_is_fixed();
     let audio_fixed = pref.audio_is_fixed();
     let screen_fixed = pref.screen_is_fixed();
 
-    // First-paint SEND gauge values (before the rAF driver ticks). The same pure
+    // First-paint SEND meter values (before the rAF driver ticks). The same pure
     // mapper drives the live loop, so first paint and live updates agree.
     let initial = read_snapshot.read();
     let initial_screen = read_screen_snapshot.read();
     let g = gauge_state_from_snapshot(initial.as_ref(), initial_screen.as_ref());
 
-    // First-paint RECEIVE gauge values.
+    // First-paint RECEIVE meter values.
     let rgv = receive::gauge_state(received_reader.read(PrefMediaKind::Video).as_ref());
     let rga = receive::gauge_state(received_reader.read(PrefMediaKind::Audio).as_ref());
     let rgs = receive::gauge_state(received_reader.read(PrefMediaKind::Screen).as_ref());
 
     // Which popover (if any) is currently open. `None` = all closed. Shared
-    // across every row so opening one closes the others.
+    // across every cell so opening one closes the others.
     let open_help: Signal<Option<&'static str>> = use_signal(|| None);
 
-    // Which per-row diagnostics detail (if any) is expanded — single-open
-    // accordion keyed by `id_prefix`, mirroring `open_help`. At most one detail
-    // open at a time so the no-scroll budget can never be blown (#1095 redesign).
-    let open_diag: Signal<Option<&'static str>> = use_signal(|| None);
-
-    // Panel-level 4 Hz refresh tick. The per-row diagnostics SUMMARIES are now
-    // always visible AND live (layer count / total uplink / peer spread change at
-    // runtime), so the whole panel subtree must re-render periodically. This loop
-    // is gated to the panel mount (the panel only mounts on the open Performance
-    // tab), and the summaries are cheap (count / min-max); the expensive ladder /
-    // peer-list only renders when a row's detail is open.
+    // Panel-level 4 Hz refresh tick. The per-card SUMMARY lines are always
+    // visible AND live (layer count / total uplink / peer spread change at
+    // runtime), so the panel subtree must re-render periodically. This loop is
+    // gated to the panel mount (the panel only mounts on the open Performance
+    // tab), and the summaries are cheap (count / min-max).
     //
-    // Driven by a 250 ms `setInterval` (gloo `Interval`) rather than a 60 Hz rAF
-    // gated to a 250 ms time-check (jay-boyd #1101 review): the panel only needs a
-    // ~4 Hz re-render, so the timer wakes 4×/s instead of 60×/s — a battery/CPU
-    // win on low-core machines. The needle drivers stay on rAF (they animate a
-    // CSS transform that wants frame-aligned updates); only this discrete
-    // re-render tick moves to the timer. Cleanup: the `Interval` handle lives in a
-    // `use_hook` cell and `use_drop` drops it on unmount, which cancels the timer.
+    // Driven by a 250 ms `setInterval` (gloo `Interval`): the panel only needs a
+    // ~4 Hz re-render, so the timer wakes 4×/s — a battery/CPU win on low-core
+    // machines. The meter drivers stay on rAF. Cleanup: the `Interval` handle
+    // lives in a `use_hook` cell and `use_drop` drops it on unmount.
     let mut diag_tick = use_signal(|| 0u64);
     {
         type IntervalCell = Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>>;
@@ -1967,205 +1602,255 @@ pub fn PerformanceSettingsPanel(
     let _ = diag_tick();
 
     // Pull the live diagnostics once per (throttled) render. The SEND snapshots
-    // and per-peer RECEIVE list feed the per-row footers below.
+    // and per-peer RECEIVE list feed the per-card summary lines below.
     let diag_summary = diagnostics_reader.summary;
     let strip_compact = format_simulcast_summary_compact(&diag_summary);
     let strip_full = format_simulcast_summary(&diag_summary);
     let send_video_snap = (diagnostics_reader.send_video)();
     let send_screen_snap = (diagnostics_reader.send_screen)();
-    // Split the per-peer list into one Vec per kind for the receive footers.
+    // Split the per-peer list into one Vec per kind for the receive summaries.
     let per_peer = (diagnostics_reader.per_peer_receive)();
     let recv_video_peers = peers_for_kind(&per_peer, PrefMediaKind::Video);
     let recv_audio_peers = peers_for_kind(&per_peer, PrefMediaKind::Audio);
     let recv_screen_peers = peers_for_kind(&per_peer, PrefMediaKind::Screen);
 
-    // Active direction. Default Receive (the original #961 receive-centric
-    // framing + the multicast-era primary control). Only this direction's three
-    // rows render at a time, so the panel shows 3 rows, not 6, and fits without
-    // excessive vertical scroll.
-    let mut direction: Signal<Direction> = use_signal(Direction::default_for_panel);
-    let active = direction();
-    let showing_receive = active.shows_receive();
+    // Per-card summary lines (filled live from the snapshots — §3 templates).
+    let video_send_line = format_video_send_summary(send_video_snap.as_ref());
+    let video_recv_line = format_video_receive_summary(
+        &recv_video_peers
+            .iter()
+            .map(|p| p.snap.layer_index)
+            .collect::<Vec<_>>(),
+    );
+    let audio_send_line = "Sending high quality".to_string();
+    let audio_recv_line = format_audio_receive_summary(recv_audio_peers.len());
+    let content_send_line = format_content_send_summary(send_screen_snap.as_ref());
+    // Top-layer screen-share peer (highest layer_index) for the content receive line.
+    let content_top = recv_screen_peers
+        .iter()
+        .max_by_key(|p| p.snap.layer_index)
+        .map(|p| p.snap);
+    let content_recv_line = format_content_receive_summary(content_top.as_ref());
+
+    // Receive-side consequence strings (peer counts; "not sharing" for content).
+    let video_recv_consequence = consequence_from_peers(recv_video_peers.len());
+    let audio_recv_consequence = consequence_from_peers(recv_audio_peers.len());
+    let content_recv_consequence = if recv_screen_peers.is_empty() {
+        "not sharing".to_string()
+    } else {
+        consequence_from_peers(recv_screen_peers.len())
+    };
 
     rsx! {
-        h3 { class: "settings-section-title", "Performance" }
+        // Header row: title left, Diagnostics cross-nav button right (§4a).
+        div { class: "perf-header-row",
+            h3 { class: "settings-section-title", "Performance" }
+            button {
+                r#type: "button",
+                class: "perf-nav-button",
+                "data-testid": "perf-open-diagnostics",
+                title: "Open Call Diagnostics (live per-peer and per-layer detail)",
+                "aria-label": "Open Call Diagnostics",
+                onclick: move |_| on_open_diagnostics.call(()),
+                // Lucide panel-right-open (NOT a gear) — conveys "open the side panel".
+                svg {
+                    class: "perf-nav-button__icon",
+                    xmlns: "http://www.w3.org/2000/svg",
+                    width: "18", height: "18", view_box: "0 0 24 24",
+                    fill: "none", stroke: "currentColor", stroke_width: "2",
+                    stroke_linecap: "round", stroke_linejoin: "round",
+                    "aria-hidden": "true",
+                    rect { x: "3", y: "3", width: "18", height: "18", rx: "2" }
+                    path { d: "M15 3v18" }
+                    path { d: "m10 15-3-3 3-3" }
+                }
+                span { class: "perf-nav-button__label", "Diagnostics" }
+            }
+        }
         p { class: "settings-section-description",
             "Limit what you "
             span { class: "perf-emph-recv", "receive" }
-            " from others (saves your download) and what you "
+            " (saves your download) and what you "
             span { class: "perf-emph-send", "send" }
-            " to others (saves your upload + CPU). Each control adapts within its "
-            "range; the needle shows what's flowing right now."
+            " (saves your upload + CPU). Each control adapts within its "
+            "range; the meter shows what's flowing right now."
         }
 
-        // Direction toggle: switches the panel between the Receive and Send rows.
-        DirectionToggle {
-            active,
-            on_change: move |d: Direction| direction.set(d),
-        }
-
-        // Global effective-setting strip (one slim line under the toggle). Compact
-        // copy; full flag×cap text in title/aria.
+        // Global effective-setting strip with an (i) tooltip. Compact copy; full
+        // flag×cap text in the (i) title/aria.
         div {
             class: "perf-simulcast-strip",
             "data-testid": TESTID_SIMULCAST_STRIP,
-            title: "{strip_full}",
-            "aria-label": "{strip_full}",
-            "{strip_compact}"
+            span { class: "perf-simulcast-strip__text", "{strip_compact}" }
+            span {
+                class: "perf-simulcast-strip__info",
+                role: "img",
+                tabindex: "0",
+                title: "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "aria-label": "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "ⓘ"
+            }
         }
 
         // Headless drivers: one ~4 Hz rAF loop each, updating the Sending and
-        // Receiving needles by id. They render nothing and run regardless of the
-        // visible direction; writes to a needle that isn't currently mounted
-        // simply no-op until that direction is shown.
+        // Receiving bar-meters by id. They render nothing; both directions are
+        // always mounted now, so every write lands.
         QualityVuMeterDriver { read_snapshot, read_screen_snapshot }
         receive::ReceivedQualityDriver { reader: received_reader }
 
-        if showing_receive {
-            // ── RECEIVE rows (save MY download) ──
-            receive::ReceiveRow {
-                kind: PrefMediaKind::Video,
-                kind_title: "Video",
-                stream_noun: "video",
-                vu_initial_deg: rgv.deg,
-                vu_initial_readout: rgv.text.clone(),
-                sub: receive_pref.video,
-                open_help,
-                open_diag,
-                diag_peers: recv_video_peers,
-                on_change: move |sub: KindReceivePref| {
-                    on_receive_change.call((PrefMediaKind::Video, sub));
-                },
+        // ── Video card ──
+        div { class: "perf-kind-card",
+            div { class: "perf-kind-card__title", "Video" }
+            div { class: "perf-card-cols",
+                SendCell {
+                    stream_noun: "video",
+                    id_prefix: "perf-video",
+                    min_testid: TESTID_VIDEO_RANGE_MIN,
+                    max_testid: TESTID_VIDEO_RANGE_MAX,
+                    auto_testid: TESTID_VIDEO_AUTO,
+                    fixed_testid: "perf-video-fixed-badge",
+                    help_testid: "perf-video-help",
+                    help_body: HELP_VIDEO_SEND,
+                    vu_testid: TESTID_VU_VIDEO,
+                    vu_meter_id: VIDEO_METER_ID,
+                    vu_readout_id: VIDEO_READOUT_ID,
+                    vu_label: "Sending video",
+                    vu_initial_level: g.video_level,
+                    vu_initial_readout: g.video_text.clone(),
+                    consequence: "your upload".to_string(),
+                    summary_line: video_send_line,
+                    labels: VIDEO_TIER_LABELS.to_vec(),
+                    best: pref.video_max,
+                    worst: pref.video_min,
+                    is_fixed: video_fixed,
+                    is_auto: pref.video_auto,
+                    open_help,
+                    on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
+                    on_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
+                }
+                receive::ReceiveCell {
+                    kind: PrefMediaKind::Video,
+                    stream_noun: "video",
+                    vu_initial_level: rgv.level,
+                    vu_initial_readout: rgv.text.clone(),
+                    consequence: video_recv_consequence,
+                    summary_line: video_recv_line,
+                    sub: receive_pref.video,
+                    open_help,
+                    on_change: move |sub: KindReceivePref| {
+                        on_receive_change.call((PrefMediaKind::Video, sub));
+                    },
+                }
             }
-            receive::ReceiveRow {
-                kind: PrefMediaKind::Audio,
-                kind_title: "Audio",
-                stream_noun: "audio",
-                vu_initial_deg: rga.deg,
-                vu_initial_readout: rga.text.clone(),
-                sub: receive_pref.audio,
-                open_help,
-                open_diag,
-                diag_peers: recv_audio_peers,
-                on_change: move |sub: KindReceivePref| {
-                    on_receive_change.call((PrefMediaKind::Audio, sub));
-                },
+        }
+
+        // ── Audio card ──
+        div { class: "perf-kind-card",
+            div { class: "perf-kind-card__title", "Audio" }
+            div { class: "perf-card-cols",
+                SendCell {
+                    stream_noun: "audio",
+                    id_prefix: "perf-audio",
+                    min_testid: TESTID_AUDIO_RANGE_MIN,
+                    max_testid: TESTID_AUDIO_RANGE_MAX,
+                    auto_testid: TESTID_AUDIO_AUTO,
+                    fixed_testid: "perf-audio-fixed-badge",
+                    help_testid: "perf-audio-help",
+                    help_body: HELP_AUDIO_SEND,
+                    vu_testid: TESTID_VU_AUDIO,
+                    vu_meter_id: AUDIO_METER_ID,
+                    vu_readout_id: AUDIO_READOUT_ID,
+                    vu_label: "Sending audio",
+                    vu_initial_level: g.audio_level,
+                    vu_initial_readout: g.audio_text.clone(),
+                    consequence: "your upload".to_string(),
+                    summary_line: audio_send_line,
+                    labels: AUDIO_TIER_LABELS.to_vec(),
+                    best: pref.audio_max,
+                    worst: pref.audio_min,
+                    is_fixed: audio_fixed,
+                    is_auto: pref.audio_auto,
+                    open_help,
+                    on_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
+                    on_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
+                }
+                receive::ReceiveCell {
+                    kind: PrefMediaKind::Audio,
+                    stream_noun: "audio",
+                    vu_initial_level: rga.level,
+                    vu_initial_readout: rga.text.clone(),
+                    consequence: audio_recv_consequence,
+                    summary_line: audio_recv_line,
+                    sub: receive_pref.audio,
+                    open_help,
+                    on_change: move |sub: KindReceivePref| {
+                        on_receive_change.call((PrefMediaKind::Audio, sub));
+                    },
+                }
             }
-            receive::ReceiveRow {
-                kind: PrefMediaKind::Screen,
-                kind_title: "Screen Share",
-                stream_noun: "shared content",
-                vu_initial_deg: rgs.deg,
-                vu_initial_readout: rgs.text.clone(),
-                sub: receive_pref.screen,
-                open_help,
-                open_diag,
-                diag_peers: recv_screen_peers,
-                on_change: move |sub: KindReceivePref| {
-                    on_receive_change.call((PrefMediaKind::Screen, sub));
-                },
-            }
-        } else {
-            // ── SEND rows (save MY upload / CPU) ──
-            SendRow {
-                kind_title: "Video",
-                stream_noun: "video",
-                id_prefix: "perf-video",
-                min_testid: TESTID_VIDEO_RANGE_MIN,
-                max_testid: TESTID_VIDEO_RANGE_MAX,
-                auto_testid: TESTID_VIDEO_AUTO,
-                fixed_testid: "perf-video-fixed-badge",
-                help_testid: "perf-video-help",
-                vu_testid: TESTID_VU_VIDEO,
-                vu_needle_id: VIDEO_NEEDLE_ID,
-                vu_readout_id: VIDEO_READOUT_ID,
-                vu_label: "Sending video",
-                vu_initial_deg: g.video_deg,
-                vu_initial_readout: g.video_text.clone(),
-                labels: VIDEO_TIER_LABELS.to_vec(),
-                best: pref.video_max,
-                worst: pref.video_min,
-                is_fixed: video_fixed,
-                is_auto: pref.video_auto,
-                open_help,
-                open_diag,
-                // Video: `Some` while the camera is on (real per-layer data),
-                // `None` = camera off → static "Camera — off" (mirrors the
-                // screen "not sharing" path; gated on `prev_video_enabled` in
-                // the reader so stale layer counts never show with the camera off).
-                diag_snap: send_video_snap.clone(),
-                diag_not_sharing: send_video_snap.is_none(),
-                diag_effective_audio: diag_summary.effective_audio,
-                diag_is_audio: false,
-                on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
-                on_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
-            }
-            SendRow {
-                kind_title: "Audio",
-                stream_noun: "audio",
-                id_prefix: "perf-audio",
-                min_testid: TESTID_AUDIO_RANGE_MIN,
-                max_testid: TESTID_AUDIO_RANGE_MAX,
-                auto_testid: TESTID_AUDIO_AUTO,
-                fixed_testid: "perf-audio-fixed-badge",
-                help_testid: "perf-audio-help",
-                vu_testid: TESTID_VU_AUDIO,
-                vu_needle_id: AUDIO_NEEDLE_ID,
-                vu_readout_id: AUDIO_READOUT_ID,
-                vu_label: "Sending audio",
-                vu_initial_deg: g.audio_deg,
-                vu_initial_readout: g.audio_text.clone(),
-                labels: AUDIO_TIER_LABELS.to_vec(),
-                best: pref.audio_max,
-                worst: pref.audio_min,
-                is_fixed: audio_fixed,
-                is_auto: pref.audio_auto,
-                open_help,
-                open_diag,
-                diag_snap: None,
-                diag_not_sharing: false,
-                diag_effective_audio: diag_summary.effective_audio,
-                diag_is_audio: true,
-                on_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
-                on_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
-            }
-            SendRow {
-                kind_title: "Screen Share",
-                stream_noun: "screen share",
-                id_prefix: "perf-screen",
-                min_testid: TESTID_SCREEN_RANGE_MIN,
-                max_testid: TESTID_SCREEN_RANGE_MAX,
-                auto_testid: TESTID_SCREEN_AUTO,
-                fixed_testid: "perf-screen-fixed-badge",
-                help_testid: "perf-screen-help",
-                vu_testid: TESTID_VU_SCREEN,
-                vu_needle_id: SCREEN_NEEDLE_ID,
-                vu_readout_id: SCREEN_READOUT_ID,
-                vu_label: "Sending screen",
-                vu_initial_deg: g.screen_deg,
-                vu_initial_readout: g.screen_text.clone(),
-                labels: SCREEN_TIER_LABELS.to_vec(),
-                best: pref.screen_max,
-                worst: pref.screen_min,
-                is_fixed: screen_fixed,
-                is_auto: pref.screen_auto,
-                open_help,
-                open_diag,
-                // Screen: `Some` while sharing (real per-layer data), `None` =
-                // not sharing → static "Screen — not sharing".
-                diag_snap: send_screen_snap.clone(),
-                diag_not_sharing: send_screen_snap.is_none(),
-                diag_effective_audio: diag_summary.effective_audio,
-                diag_is_audio: false,
-                on_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
-                on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
+        }
+
+        // ── Content (screen share) card ──
+        div { class: "perf-kind-card",
+            div { class: "perf-kind-card__title", "Content" }
+            div { class: "perf-card-cols",
+                SendCell {
+                    stream_noun: "screen share",
+                    id_prefix: "perf-screen",
+                    min_testid: TESTID_SCREEN_RANGE_MIN,
+                    max_testid: TESTID_SCREEN_RANGE_MAX,
+                    auto_testid: TESTID_SCREEN_AUTO,
+                    fixed_testid: "perf-screen-fixed-badge",
+                    help_testid: "perf-screen-help",
+                    help_body: HELP_CONTENT_SEND,
+                    vu_testid: TESTID_VU_SCREEN,
+                    vu_meter_id: SCREEN_METER_ID,
+                    vu_readout_id: SCREEN_READOUT_ID,
+                    vu_label: "Sending screen",
+                    vu_initial_level: g.screen_level,
+                    vu_initial_readout: g.screen_text.clone(),
+                    consequence: if send_screen_snap.is_some() { "your upload".to_string() } else { "not sharing".to_string() },
+                    summary_line: content_send_line,
+                    labels: SCREEN_TIER_LABELS.to_vec(),
+                    best: pref.screen_max,
+                    worst: pref.screen_min,
+                    is_fixed: screen_fixed,
+                    is_auto: pref.screen_auto,
+                    open_help,
+                    on_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
+                    on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
+                }
+                receive::ReceiveCell {
+                    kind: PrefMediaKind::Screen,
+                    stream_noun: "shared content",
+                    vu_initial_level: rgs.level,
+                    vu_initial_readout: rgs.text.clone(),
+                    consequence: content_recv_consequence,
+                    summary_line: content_recv_line,
+                    sub: receive_pref.screen,
+                    open_help,
+                    on_change: move |sub: KindReceivePref| {
+                        on_receive_change.call((PrefMediaKind::Screen, sub));
+                    },
+                }
             }
         }
     }
 }
 
+/// The receive-side consequence string for a card head, e.g. `"from 4 peers"`
+/// (singular `"from 1 peer"`); 0 peers → `"no senders"`. Pure / host-tested.
+pub fn consequence_from_peers(n: usize) -> String {
+    match n {
+        0 => "no senders".to_string(),
+        1 => "from 1 peer".to_string(),
+        n => format!("from {n} peers"),
+    }
+}
+
 /// Flatten the per-peer `PeerReceiveDiag` list down to the peers receiving ONE
-/// kind, for that kind's [`ReceiveDiagFooter`]. Pure / host-tested.
+/// kind, for that kind's receive summary line and for the Diagnostics panel's
+/// "Simulcast layers" per-peer breakdown. Pure / host-tested.
 pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<PeerKindSnap> {
     peers
         .iter()
@@ -2191,7 +1876,7 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ones above.
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
-    use super::{write_needle_rotation, write_readout_text};
+    use super::{level_from_fraction, write_meter_level, write_readout_text};
     use dioxus::prelude::*;
     use std::rc::Rc;
     use videocall_client::{PrefMediaKind, ReceivedLayerSnapshot};
@@ -2450,28 +2135,32 @@ pub mod receive {
         }
     }
 
-    // ── needle math + readout ──────────────────────────────────────
+    // ── bar-meter math + readout ───────────────────────────────────
 
-    /// Sweep range of the analog needle, in degrees.
-    pub const MAX_NEEDLE_DEG: f32 = super::MAX_NEEDLE_DEG;
-
-    /// Empty-state needle angle: rested at the left peg (lowest end).
-    pub const EMPTY_NEEDLE_DEG: f32 = -MAX_NEEDLE_DEG;
+    /// Empty-state meter level: 0 = all bars unlit (nothing received).
+    pub const EMPTY_METER_LEVEL: u8 = super::EMPTY_METER_LEVEL;
 
     /// Empty-state readout shown when nothing of a kind is being received.
     pub const EMPTY_READOUT: &str = "Not receiving";
 
-    /// Convert a decoded `layer_index` within a `layer_count`-layer ladder into
-    /// the needle rotation angle. Layer 0 (lowest) → `-MAX` (left); top → `+MAX`
-    /// (right). Single-layer centers; out-of-range clamps. Pure.
-    pub fn needle_deg(layer_index: u32, layer_count: u32) -> f32 {
+    /// The 0..=1 quality fraction for a RECEIVE layer index (0 = lowest). Lowest
+    /// layer → `0.0`, top layer → `1.0`. Single-layer → `1.0`. Out-of-range
+    /// clamps. Note the convention is OPPOSITE the send side (here index 0 is the
+    /// worst, not the best). Pure / host-tested.
+    pub fn layer_quality_fraction(layer_index: u32, layer_count: u32) -> f32 {
         if layer_count <= 1 {
-            return 0.0;
+            return 1.0;
         }
         let max_idx = layer_count - 1;
         let clamped = layer_index.min(max_idx);
-        let frac = clamped as f32 / max_idx as f32;
-        -MAX_NEEDLE_DEG + frac * (2.0 * MAX_NEEDLE_DEG)
+        clamped as f32 / max_idx as f32
+    }
+
+    /// Convert a decoded `layer_index` into a meter level `0..=4`. Top layer →
+    /// 4; lowest layer → 1 (never 0 — a flowing stream lights at least one bar;
+    /// level 0 is the no-signal empty state). Pure / host-tested.
+    pub fn meter_level(layer_index: u32, layer_count: u32) -> u8 {
+        level_from_fraction(layer_quality_fraction(layer_index, layer_count)).max(1)
     }
 
     /// Format the readout line for a received snapshot. Video/screen show
@@ -2489,23 +2178,23 @@ pub mod receive {
         }
     }
 
-    /// One gauge's render state: needle angle + readout text. Pure.
-    #[derive(Debug, Clone, PartialEq)]
+    /// One meter's render state: lit-bar level + readout text. Pure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct GaugeState {
-        pub deg: f32,
+        pub level: u8,
         pub text: String,
     }
 
-    /// Map an optional received snapshot to a gauge's render state. `Some` →
-    /// live; `None` → needle reset to the left peg + "Not receiving".
+    /// Map an optional received snapshot to a meter's render state. `Some` →
+    /// live level + readout; `None` → level 0 (all bars unlit) + "Not receiving".
     pub fn gauge_state(snap: Option<&ReceivedLayerSnapshot>) -> GaugeState {
         match snap {
             Some(s) => GaugeState {
-                deg: needle_deg(s.layer_index, s.layer_count),
+                level: meter_level(s.layer_index, s.layer_count),
                 text: format_readout(s),
             },
             None => GaugeState {
-                deg: EMPTY_NEEDLE_DEG,
+                level: EMPTY_METER_LEVEL,
                 text: EMPTY_READOUT.to_string(),
             },
         }
@@ -2525,23 +2214,29 @@ pub mod receive {
     pub const TESTID_VIDEO_HELP: &str = "perf-recv-video-help";
     pub const TESTID_AUDIO_HELP: &str = "perf-recv-audio-help";
     pub const TESTID_SCREEN_HELP: &str = "perf-recv-screen-help";
+    // RECEIVE bar-meter testids. Names unchanged (#1095 e2e selectors) even
+    // though the element is now a `.perf-meter`, not the retired VU needle.
     pub const TESTID_VU_VIDEO: &str = "perf-vu-recv-video";
     pub const TESTID_VU_AUDIO: &str = "perf-vu-recv-audio";
     pub const TESTID_VU_SCREEN: &str = "perf-vu-recv-screen";
 
-    const VIDEO_NEEDLE_ID: &str = "perf-vu-recv-video-needle";
-    const AUDIO_NEEDLE_ID: &str = "perf-vu-recv-audio-needle";
-    const SCREEN_NEEDLE_ID: &str = "perf-vu-recv-screen-needle";
+    // Receive meter + readout ids — DISTINCT from the send ids so the two
+    // headless drivers never write the same node.
+    const VIDEO_METER_ID: &str = "perf-meter-recv-video";
+    const AUDIO_METER_ID: &str = "perf-meter-recv-audio";
+    const SCREEN_METER_ID: &str = "perf-meter-recv-screen";
+    // Readout ids keep their original `perf-vu-recv-*-readout` names so the
+    // #989 e2e that polls these by `#id` still resolves after the meter swap.
     const VIDEO_READOUT_ID: &str = "perf-vu-recv-video-readout";
     const AUDIO_READOUT_ID: &str = "perf-vu-recv-audio-readout";
     const SCREEN_READOUT_ID: &str = "perf-vu-recv-screen-readout";
 
-    /// DOM ids for a kind's receive needle + readout.
-    fn needle_ids(kind: PrefMediaKind) -> (&'static str, &'static str) {
+    /// DOM ids for a kind's receive meter + readout.
+    fn meter_ids(kind: PrefMediaKind) -> (&'static str, &'static str) {
         match kind {
-            PrefMediaKind::Video => (VIDEO_NEEDLE_ID, VIDEO_READOUT_ID),
-            PrefMediaKind::Audio => (AUDIO_NEEDLE_ID, AUDIO_READOUT_ID),
-            PrefMediaKind::Screen => (SCREEN_NEEDLE_ID, SCREEN_READOUT_ID),
+            PrefMediaKind::Video => (VIDEO_METER_ID, VIDEO_READOUT_ID),
+            PrefMediaKind::Audio => (AUDIO_METER_ID, AUDIO_READOUT_ID),
+            PrefMediaKind::Screen => (SCREEN_METER_ID, SCREEN_READOUT_ID),
         }
     }
 
@@ -2568,7 +2263,7 @@ pub mod receive {
                 help_testid: TESTID_VIDEO_HELP,
                 vu_testid: TESTID_VU_VIDEO,
                 vu_label: "Receiving video",
-                help_body: "Limits the camera-video quality you pull from other participants, to save YOUR download bandwidth. The call picks a layer within this range based on your network. The needle shows what you're receiving now.",
+                help_body: "You pull the quality layer each sender offers that best fits your download. 'L2 of 3' means you're getting the highest of three versions. Lower the cap to save your download.",
                 id_prefix: "perf-recv-video",
             },
             PrefMediaKind::Audio => RecvMeta {
@@ -2579,7 +2274,7 @@ pub mod receive {
                 help_testid: TESTID_AUDIO_HELP,
                 vu_testid: TESTID_VU_AUDIO,
                 vu_label: "Receiving audio",
-                help_body: "Limits the audio quality you pull from other participants. The call adapts within this range. Audio is already low-bandwidth, so the download savings here are small.",
+                help_body: "You pull the clearest audio each speaker offers that fits your download.",
                 id_prefix: "perf-recv-audio",
             },
             PrefMediaKind::Screen => RecvMeta {
@@ -2590,7 +2285,7 @@ pub mod receive {
                 help_testid: TESTID_SCREEN_HELP,
                 vu_testid: TESTID_VU_SCREEN,
                 vu_label: "Receiving shared content",
-                help_body: "Limits the quality of screen / shared-content you pull from others, to save YOUR download bandwidth. Independent of camera video; adapts on its own within the range.",
+                help_body: "You pull the sharpest screen-share layer the presenter offers that fits your download.",
                 id_prefix: "perf-recv-screen",
             },
         }
@@ -2598,9 +2293,9 @@ pub mod receive {
 
     // ── components ─────────────────────────────────────────────────
 
-    /// Headless driver for the three received-quality needles. Renders nothing;
-    /// owns one ~4 Hz rAF loop reading `received_layer_snapshot(kind)` per kind
-    /// and writing the needle rotations + readouts straight to the DOM by id.
+    /// Headless driver for the three received-quality bar-meters. Renders
+    /// nothing; owns one ~4 Hz rAF loop reading `received_layer_snapshot(kind)`
+    /// per kind and writing each meter's `data-level` + readout to the DOM by id.
     #[component]
     pub fn ReceivedQualityDriver(reader: ReceivedReader) -> Element {
         type RafCell = Rc<std::cell::RefCell<Option<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
@@ -2626,8 +2321,8 @@ pub mod receive {
                         ] {
                             let snap = reader.read(kind);
                             let state = gauge_state(snap.as_ref());
-                            let (needle_id, readout_id) = needle_ids(kind);
-                            write_needle_rotation(needle_id, state.deg);
+                            let (meter_id, readout_id) = meter_ids(kind);
+                            write_meter_level(meter_id, state.level);
                             write_readout_text(readout_id, &state.text);
                         }
                     }
@@ -2699,7 +2394,7 @@ pub mod receive {
                         max: "{top}",
                         step: "1",
                         value: "{sel.min_pos}",
-                        "aria-label": "Minimum received {stream_noun} quality",
+                        "aria-label": "Minimum {stream_noun} receive quality",
                         "aria-valuetext": "{min_valuetext}",
                         oninput: move |evt| {
                             if let Ok(p) = evt.value().parse::<u32>() {
@@ -2716,7 +2411,7 @@ pub mod receive {
                         max: "{top}",
                         step: "1",
                         value: "{sel.max_pos}",
-                        "aria-label": "Maximum received {stream_noun} quality",
+                        "aria-label": "Maximum {stream_noun} receive quality",
                         "aria-valuetext": "{max_valuetext}",
                         oninput: move |evt| {
                             if let Ok(p) = evt.value().parse::<u32>() {
@@ -2730,24 +2425,25 @@ pub mod receive {
         }
     }
 
-    /// One kind's RECEIVE row: a per-kind title (with the "your download"
-    /// consequence), needle gauge, dual-thumb slider, Auto/help/Fixed header and
-    /// live range text. Rendered (one per kind) when the panel's direction toggle
-    /// is on **Receive**.
+    /// One kind's RECEIVE column inside a `KindCard`: a "Receiving" head
+    /// (consequence + "?" help + Auto/Fixed), a bar-meter, a dual-thumb slider,
+    /// and a live summary line (#1095 redesign — replaces the old `ReceiveRow` +
+    /// diagnostics footer; the full per-peer breakdown moved to the Diagnostics
+    /// panel's "Simulcast layers" section).
+    #[allow(clippy::too_many_arguments)]
     #[component]
-    pub fn ReceiveRow(
+    pub fn ReceiveCell(
         kind: PrefMediaKind,
-        /// Display title for the kind, e.g. "Video" / "Audio" / "Screen Share".
-        kind_title: &'static str,
         stream_noun: &'static str,
-        vu_initial_deg: f32,
+        vu_initial_level: u8,
         vu_initial_readout: String,
+        /// The "from N peers" / "not sharing" consequence text right of the title.
+        consequence: String,
+        /// The always-visible summary line under the slider (filled live by the
+        /// parent from the per-peer snapshots).
+        summary_line: String,
         sub: KindReceivePref,
         open_help: Signal<Option<&'static str>>,
-        /// Shared single-open diagnostics-detail signal (#1095).
-        open_diag: Signal<Option<&'static str>>,
-        /// Peers currently receiving THIS kind, for the per-row footer.
-        diag_peers: Vec<super::PeerKindSnap>,
         on_change: EventHandler<KindReceivePref>,
     ) -> Element {
         let meta = recv_meta(kind);
@@ -2760,14 +2456,13 @@ pub mod receive {
         } else {
             "perf-auto-button"
         };
-        let (vu_needle_id, vu_readout_id) = needle_ids(kind);
+        let (vu_meter_id, vu_readout_id) = meter_ids(kind);
 
         rsx! {
-            div { class: "perf-stream-group perf-recv-row",
-                div { class: "perf-stream-header",
-                    // Per-kind title + the consequence, legible without the popover.
-                    span { class: "perf-stream-title", "{kind_title}" }
-                    span { class: "perf-stream-consequence", "your download" }
+            div { class: "perf-side perf-side--recv",
+                div { class: "perf-side__head",
+                    span { class: "perf-side__title", "Receiving" }
+                    span { class: "perf-side__consequence", "{consequence}" }
                     super::HelpPopover {
                         key_id: meta.id_prefix,
                         help_testid: meta.help_testid,
@@ -2806,43 +2501,33 @@ pub mod receive {
                         "Auto"
                     }
                 }
-                div { class: "perf-stream-body",
-                    super::VuGauge {
-                        testid: meta.vu_testid,
-                        needle_id: vu_needle_id,
-                        readout_id: vu_readout_id,
-                        label: meta.vu_label,
-                        initial_deg: vu_initial_deg,
-                        initial_readout: vu_initial_readout,
-                    }
-                    div { class: "perf-stream-controls",
-                        DualRangeSlider {
-                            kind,
-                            id_prefix: meta.id_prefix,
-                            min_testid: meta.min_testid,
-                            max_testid: meta.max_testid,
-                            stream_noun,
-                            sel,
-                            on_change: move |s: RangeSel| {
-                                let (min, max) = thumbs_to_bounds(kind, s);
-                                on_change.call(KindReceivePref { min, max, auto: false });
-                            },
-                        }
-                        p {
-                            class: "perf-range-value",
-                            "data-testid": "{meta.id_prefix}-range-value",
-                            "aria-live": "polite",
-                            "Receiving: {range_str}"
-                        }
-                        // Per-row RECEIVE diagnostics footer (#1095) — last child
-                        // of the controls so it left-aligns with the slider.
-                        super::ReceiveDiagFooter {
-                            id_prefix: meta.id_prefix,
-                            peers: diag_peers,
-                            open_diag,
-                        }
-                    }
+                super::PerfMeter {
+                    testid: meta.vu_testid,
+                    meter_id: vu_meter_id,
+                    readout_id: vu_readout_id,
+                    label: meta.vu_label,
+                    initial_level: vu_initial_level,
+                    initial_readout: vu_initial_readout,
                 }
+                DualRangeSlider {
+                    kind,
+                    id_prefix: meta.id_prefix,
+                    min_testid: meta.min_testid,
+                    max_testid: meta.max_testid,
+                    stream_noun,
+                    sel,
+                    on_change: move |s: RangeSel| {
+                        let (min, max) = thumbs_to_bounds(kind, s);
+                        on_change.call(KindReceivePref { min, max, auto: false });
+                    },
+                }
+                p {
+                    class: "perf-range-value",
+                    "data-testid": "{meta.id_prefix}-range-value",
+                    "aria-live": "polite",
+                    "Receiving: {range_str}"
+                }
+                p { class: "perf-summary-line", "{summary_line}" }
             }
         }
     }
@@ -3062,19 +2747,25 @@ pub mod receive {
         }
 
         #[test]
-        fn needle_deg_lowest_pegs_left_highest_pegs_right() {
-            assert_eq!(needle_deg(0, 3), -MAX_NEEDLE_DEG);
-            assert_eq!(needle_deg(2, 3), MAX_NEEDLE_DEG);
-            assert!(needle_deg(1, 3).abs() < 0.001);
-            assert_eq!(needle_deg(0, 2), -MAX_NEEDLE_DEG);
-            assert_eq!(needle_deg(1, 2), MAX_NEEDLE_DEG);
+        fn meter_level_lowest_is_one_highest_is_max() {
+            // Receive convention: layer 0 = LOWEST → level 1 (one bar, never 0);
+            // top layer = HIGHEST → level 4 (all bars). The 3-layer middle is
+            // index 1 → frac 0.5 → level 2.
+            let max = crate::components::performance_settings::MAX_METER_LEVEL;
+            assert_eq!(meter_level(0, 3), 1);
+            assert_eq!(meter_level(2, 3), max);
+            assert_eq!(meter_level(1, 3), 2); // frac 0.5 → round(2.0) = 2
+            assert_eq!(meter_level(0, 2), 1);
+            assert_eq!(meter_level(1, 2), max);
         }
 
         #[test]
-        fn needle_deg_clamps_and_single_layer_centers() {
-            assert_eq!(needle_deg(99, 3), MAX_NEEDLE_DEG);
-            assert_eq!(needle_deg(0, 1), 0.0);
-            assert_eq!(needle_deg(0, 0), 0.0);
+        fn meter_level_clamps_and_single_layer_is_max() {
+            // Out-of-range clamps to the top; a single layer is the best available.
+            let max = crate::components::performance_settings::MAX_METER_LEVEL;
+            assert_eq!(meter_level(99, 3), max);
+            assert_eq!(meter_level(0, 1), max);
+            assert_eq!(meter_level(0, 0), max);
         }
 
         #[test]
@@ -3119,11 +2810,15 @@ pub mod receive {
                 kbps: 1500,
             };
             let st = gauge_state(Some(&snap));
-            assert_eq!(st.deg, MAX_NEEDLE_DEG);
+            // top layer → all bars
+            assert_eq!(
+                st.level,
+                crate::components::performance_settings::MAX_METER_LEVEL
+            );
             assert_eq!(st.text, "L3/3 · 1280x720");
             let empty = gauge_state(None);
-            assert_eq!(empty.deg, EMPTY_NEEDLE_DEG);
-            assert_eq!(empty.deg, -MAX_NEEDLE_DEG);
+            assert_eq!(empty.level, EMPTY_METER_LEVEL);
+            assert_eq!(empty.level, 0); // no signal → all bars unlit
             assert_eq!(empty.text, "Not receiving");
         }
 
@@ -3162,29 +2857,6 @@ pub mod receive {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn direction_toggle_defaults_to_receive() {
-        // The panel opens on Receive (the original #961 receive-centric framing).
-        assert_eq!(Direction::default_for_panel(), Direction::Receive);
-    }
-
-    #[test]
-    fn direction_selects_which_rows_render() {
-        // The pure seam the panel uses to decide which 3 rows to render: Receive
-        // shows the receive rows, Send shows the send rows. This is what halves
-        // the visible rows (6 → 3) so the panel fits without excessive scroll.
-        assert!(Direction::Receive.shows_receive());
-        assert!(!Direction::Send.shows_receive());
-    }
-
-    #[test]
-    fn direction_toggle_testids_are_stable() {
-        // e2e drives the toggle by these ids; pin them so a rename is a test
-        // failure rather than a silently-broken selector.
-        assert_eq!(TESTID_DIRECTION_RECEIVE, "perf-direction-receive");
-        assert_eq!(TESTID_DIRECTION_SEND, "perf-direction-send");
-    }
 
     // ── Live diagnostics formatters (issue #1095) ──────────────────────
 
@@ -3297,23 +2969,12 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_testids_are_stable() {
-        // Global strip + the per-row derived id scheme (keyed by id_prefix).
+    fn simulcast_strip_testid_is_stable() {
+        // The global effective-setting strip testid is still driven by e2e; pin it
+        // so a rename is a test failure. (The expandable per-row `{prefix}-diag*`
+        // scheme moved to the Diagnostics panel's "Simulcast layers" section in
+        // the #1095 redesign and no longer exists here.)
         assert_eq!(TESTID_SIMULCAST_STRIP, "perf-simulcast-strip");
-        // The per-row testids are derived from id_prefix; pin the scheme so a
-        // rename is a test failure. (e2e drives these.)
-        let id = "perf-video";
-        assert_eq!(format!("{id}-diag"), "perf-video-diag");
-        assert_eq!(format!("{id}-diag-summary"), "perf-video-diag-summary");
-        assert_eq!(format!("{id}-diag-detail"), "perf-video-diag-detail");
-        assert_eq!(format!("{id}-diag-ladder"), "perf-video-diag-ladder");
-        assert_eq!(format!("{id}-diag-rung-{}", 2), "perf-video-diag-rung-2");
-        let rid = "perf-recv-video";
-        assert_eq!(
-            format!("{rid}-diag-peer-{}", 42u64),
-            "perf-recv-video-diag-peer-42"
-        );
-        assert_eq!(format!("{rid}-diag-more"), "perf-recv-video-diag-more");
     }
 
     // ── New compact formatters (issue #1095 redesign) ──────────────────
@@ -3435,6 +3096,144 @@ mod tests {
         assert_eq!(format_mbps(2600), "2.6 Mbps");
         assert_eq!(format_mbps(400), "0.4 Mbps");
         assert_eq!(format_mbps(2800), "2.8 Mbps");
+    }
+
+    // ── Per-card summary lines + consequence (#1095 redesign, §3 copy) ──
+
+    fn send_snap_3layer() -> SimulcastSendSnapshot {
+        SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: 3,
+            active_layers: 3,
+            layers: vec![
+                videocall_client::SimulcastLayerInfo {
+                    layer_id: 0,
+                    bitrate_kbps: 400,
+                    width: 640,
+                    height: 360,
+                },
+                videocall_client::SimulcastLayerInfo {
+                    layer_id: 1,
+                    bitrate_kbps: 900,
+                    width: 960,
+                    height: 540,
+                },
+                videocall_client::SimulcastLayerInfo {
+                    layer_id: 2,
+                    bitrate_kbps: 1500,
+                    width: 1280,
+                    height: 720,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn send_layer_res_span_spans_lowest_to_highest() {
+        assert_eq!(send_layer_res_span(&send_snap_3layer()), "360p–720p");
+        // All one resolution → single label.
+        let mut s = send_snap_3layer();
+        for l in &mut s.layers {
+            l.width = 1280;
+            l.height = 720;
+        }
+        assert_eq!(send_layer_res_span(&s), "720p");
+        // No known resolutions (atomics not ticked) → empty.
+        let single = SimulcastSendSnapshot {
+            simulcast_active: false,
+            effective_layers: 1,
+            active_layers: 1,
+            layers: Vec::new(),
+        };
+        assert_eq!(send_layer_res_span(&single), "");
+    }
+
+    #[test]
+    fn video_send_summary_camera_off_and_active() {
+        // Camera off (None) → the spec's off line.
+        assert_eq!(format_video_send_summary(None), "Camera — off");
+        // Active simulcast → "Sending A of E layers · lo–hi".
+        let s = send_snap_3layer();
+        assert_eq!(
+            format_video_send_summary(Some(&s)),
+            "Sending 3 of 3 layers · 360p–720p"
+        );
+        // Single-layer → "Sending single layer · {res}".
+        let single = SimulcastSendSnapshot {
+            simulcast_active: false,
+            effective_layers: 1,
+            active_layers: 1,
+            layers: vec![videocall_client::SimulcastLayerInfo {
+                layer_id: 0,
+                bitrate_kbps: 800,
+                width: 1280,
+                height: 720,
+            }],
+        };
+        assert_eq!(
+            format_video_send_summary(Some(&single)),
+            "Sending single layer · 720p"
+        );
+    }
+
+    #[test]
+    fn video_receive_summary_peers_and_spread() {
+        assert_eq!(format_video_receive_summary(&[]), "Not receiving video");
+        assert_eq!(
+            format_video_receive_summary(&[0, 1, 2, 2]),
+            "Pulling up to high quality · L1–L3 across 4 peers"
+        );
+        // Singular peer.
+        assert_eq!(
+            format_video_receive_summary(&[1]),
+            "Pulling up to high quality · L2 across 1 peer"
+        );
+    }
+
+    #[test]
+    fn audio_receive_summary_peers_and_none() {
+        assert_eq!(format_audio_receive_summary(0), "Not receiving audio");
+        assert_eq!(format_audio_receive_summary(1), "Pulling near-full quality");
+        assert_eq!(format_audio_receive_summary(5), "Pulling near-full quality");
+    }
+
+    #[test]
+    fn content_send_summary_sharing_and_not() {
+        // Not sharing → the spec's "will send up to 1080p" line.
+        assert_eq!(
+            format_content_send_summary(None),
+            "Will send up to 1080p when you share"
+        );
+        // Sharing with bitrates → "Sending {res} · {mbps}".
+        let s = send_snap_3layer();
+        assert_eq!(
+            format_content_send_summary(Some(&s)),
+            "Sending 360p–720p · 2.8 Mbps"
+        );
+    }
+
+    #[test]
+    fn content_receive_summary_top_peer_and_none() {
+        assert_eq!(format_content_receive_summary(None), "Nobody is sharing");
+        let top = ReceivedLayerSnapshot {
+            kind: PrefMediaKind::Screen,
+            layer_index: 2,
+            layer_count: 3,
+            width: 1920,
+            height: 1080,
+            kbps: 2500,
+        };
+        assert_eq!(
+            format_content_receive_summary(Some(&top)),
+            "Pulling full quality · L3 · 1920×1080"
+        );
+    }
+
+    #[test]
+    fn consequence_from_peers_singular_plural_zero() {
+        assert_eq!(consequence_from_peers(0), "no senders");
+        assert_eq!(consequence_from_peers(1), "from 1 peer");
+        assert_eq!(consequence_from_peers(4), "from 4 peers");
     }
 
     #[test]
@@ -3873,18 +3672,35 @@ mod tests {
     }
 
     #[test]
-    fn needle_deg_best_pegs_right_worst_pegs_left() {
-        assert_eq!(tier_to_needle_deg(0, 8), MAX_NEEDLE_DEG);
-        assert_eq!(tier_to_needle_deg(7, 8), -MAX_NEEDLE_DEG);
-        let mid = tier_to_needle_deg(3, 7);
-        assert!(mid.abs() < 0.001, "mid={mid}");
+    fn meter_level_best_is_max_worst_is_one() {
+        // SEND convention: tier 0 = BEST → all four bars; worst tier → one bar
+        // (a flowing stream is never level 0). The 8-tier ladder's far ends.
+        assert_eq!(tier_to_meter_level(0, 8), MAX_METER_LEVEL);
+        assert_eq!(tier_to_meter_level(7, 8), 1);
+        // A mid tier of a 5-tier ladder (index 2 → quality frac 0.5 → level 2).
+        assert_eq!(tier_to_meter_level(2, 5), 2);
     }
 
     #[test]
-    fn needle_deg_clamps_out_of_range_and_single_tier() {
-        assert_eq!(tier_to_needle_deg(99, 8), -MAX_NEEDLE_DEG);
-        assert_eq!(tier_to_needle_deg(0, 1), 0.0);
-        assert_eq!(tier_to_needle_deg(0, 0), 0.0);
+    fn meter_level_clamps_out_of_range_and_single_tier() {
+        // Out-of-range clamps to the worst tier → one bar; a single tier is the
+        // best available → all four bars.
+        assert_eq!(tier_to_meter_level(99, 8), 1);
+        assert_eq!(tier_to_meter_level(0, 1), MAX_METER_LEVEL);
+        assert_eq!(tier_to_meter_level(0, 0), MAX_METER_LEVEL);
+    }
+
+    #[test]
+    fn level_from_fraction_rounds_and_clamps() {
+        assert_eq!(level_from_fraction(0.0), 0);
+        assert_eq!(level_from_fraction(1.0), MAX_METER_LEVEL);
+        assert_eq!(level_from_fraction(0.5), 2); // round(2.0)
+        assert_eq!(level_from_fraction(0.6), 2); // round(2.4)
+        assert_eq!(level_from_fraction(0.7), 3); // round(2.8)
+                                                 // Out-of-range / NaN clamp into [0, MAX] (never panics or overflows).
+        assert_eq!(level_from_fraction(-5.0), 0);
+        assert_eq!(level_from_fraction(5.0), MAX_METER_LEVEL);
+        assert_eq!(level_from_fraction(f32::NAN), 0);
     }
 
     #[test]
@@ -3904,19 +3720,19 @@ mod tests {
     }
 
     #[test]
-    fn gauge_state_live_snapshot_maps_to_needles_and_readouts() {
+    fn gauge_state_live_snapshot_maps_to_levels_and_readouts() {
         let snap = LiveQualitySnapshot {
-            video_tier_index: 0,
+            video_tier_index: 0, // best of 8 → level 4
             video_width: 1920,
             video_height: 1080,
             video_fps: 30,
             video_ideal_kbps: 2500,
-            audio_tier_index: 3,
+            audio_tier_index: 3, // worst of 4 → level 1 (floored, never 0)
             audio_kbps: 16,
             target_bitrate_kbps: 2000.0,
         };
         let screen = ScreenQualitySnapshot {
-            tier_index: 1,
+            tier_index: 1, // middle of 3 → quality frac 0.5 → level 2
             width: 1280,
             height: 720,
             fps: 15,
@@ -3924,28 +3740,28 @@ mod tests {
             target_bitrate_kbps: 1100,
         };
         let st = gauge_state_from_snapshot(Some(&snap), Some(&screen));
-        assert_eq!(st.video_deg, MAX_NEEDLE_DEG);
-        assert_eq!(st.audio_deg, -MAX_NEEDLE_DEG);
+        assert_eq!(st.video_level, MAX_METER_LEVEL);
+        assert_eq!(st.audio_level, 1);
         assert_eq!(st.video_text, "1920x1080·30fps·2500kbps");
         assert_eq!(st.audio_text, "16 kbps");
-        assert!(st.screen_deg.abs() < 0.001, "screen_deg={}", st.screen_deg);
+        assert_eq!(st.screen_level, 2);
         assert_eq!(st.screen_text, "1280x720·15fps·1200kbps");
     }
 
     #[test]
     fn gauge_state_none_resets_to_empty_state() {
         let st = gauge_state_from_snapshot(None, None);
-        assert_eq!(st.video_deg, EMPTY_NEEDLE_DEG);
-        assert_eq!(st.audio_deg, EMPTY_NEEDLE_DEG);
-        assert_eq!(st.screen_deg, EMPTY_NEEDLE_DEG);
-        assert_eq!(st.video_deg, -MAX_NEEDLE_DEG);
-        assert_eq!(st.video_text, "Camera off");
+        assert_eq!(st.video_level, EMPTY_METER_LEVEL);
+        assert_eq!(st.audio_level, EMPTY_METER_LEVEL);
+        assert_eq!(st.screen_level, EMPTY_METER_LEVEL);
+        assert_eq!(st.video_level, 0); // no signal → all bars unlit
+        assert_eq!(st.video_text, "Camera — off");
         assert_eq!(st.audio_text, "Idle");
-        assert_eq!(st.screen_text, "Not sharing");
+        assert_eq!(st.screen_text, "Screen — not sharing");
     }
 
     #[test]
-    fn screen_gauge_none_shows_not_sharing_with_live_va() {
+    fn screen_meter_none_shows_not_sharing_with_live_va() {
         let va = LiveQualitySnapshot {
             video_tier_index: 2,
             video_width: 1280,
@@ -3958,8 +3774,8 @@ mod tests {
         };
         let st = gauge_state_from_snapshot(Some(&va), None);
         assert_eq!(st.video_text, "1280x720·30fps·1500kbps");
-        assert_eq!(st.screen_deg, EMPTY_NEEDLE_DEG);
-        assert_eq!(st.screen_text, "Not sharing");
+        assert_eq!(st.screen_level, EMPTY_METER_LEVEL);
+        assert_eq!(st.screen_text, "Screen — not sharing");
     }
 
     #[test]

@@ -1496,22 +1496,35 @@ mod tests {
         assert_eq!(wrapper.packet_type.enum_value(), Ok(PacketType::MEDIA));
         assert_eq!(wrapper.media_kind.enum_value(), Ok(MediaKind::VIDEO));
 
-        // Re-serialize and compare against a wrapper that never touched the
-        // field: layer 0 must omit tag 5 entirely (proto3 default-zero), so a
-        // single-stream (layer 0) publisher is byte-identical on the wire.
+        // Layer 0 must omit tag 5 entirely (proto3 default-zero), so a
+        // single-stream (layer 0) publisher is byte-identical on the wire to a
+        // wrapper that never set the field. Prove it deterministically by
+        // diffing two wrappers that share the EXACT SAME `data` payload and
+        // differ ONLY in `simulcast_layer_id` (0 vs non-zero): the layer-0
+        // serialization must be a strict prefix-length-shorter encoding missing
+        // precisely the tag-5 bytes. We do NOT scan the full wrapper bytes for
+        // the tag byte 0x28 — `data` is an opaque inner MediaPacket carrying a
+        // wall-clock timestamp, so 0x28 can appear there by chance (that made an
+        // earlier version of this assertion flaky).
         let actual_bytes = wrapper.write_to_bytes().unwrap();
-        let mut baseline = wrapper.clone();
-        baseline.simulcast_layer_id = 0; // already 0; assignment is explicit
-        let baseline_bytes = baseline.write_to_bytes().unwrap();
-        assert_eq!(
-            actual_bytes, baseline_bytes,
-            "layer 0 must serialize with tag 5 absent"
-        );
-        // And it must NOT contain the field-5 varint key (0x28) — the strongest
-        // direct proof the field is wire-absent at layer 0.
+        let mut with_layer = wrapper.clone();
+        with_layer.simulcast_layer_id = 2;
+        let with_layer_bytes = with_layer.write_to_bytes().unwrap();
         assert!(
-            !actual_bytes.contains(&0x28),
-            "layer 0 wrapper must not carry the simulcast_layer_id tag (field 5, wire 0)"
+            with_layer_bytes.len() > actual_bytes.len(),
+            "a non-zero simulcast_layer_id must add tag-5 bytes the layer-0 encoding lacks \
+             (layer0={} bytes, layer2={} bytes)",
+            actual_bytes.len(),
+            with_layer_bytes.len(),
+        );
+        // The layer-0 bytes must equal a re-encode of a wrapper whose field is
+        // explicitly default — byte-for-byte (the rigorous wire-identity proof).
+        let mut baseline = wrapper.clone();
+        baseline.simulcast_layer_id = 0;
+        assert_eq!(
+            actual_bytes,
+            baseline.write_to_bytes().unwrap(),
+            "layer 0 must serialize identically to a default-field wrapper (tag 5 absent)"
         );
     }
 

@@ -129,6 +129,15 @@ export const CERT_HASH_INIT_SCRIPT = (() => {
 })();`;
 })();
 
+export const DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT = `(() => {
+  try {
+    if (!localStorage.getItem("vc_transport_preference")) {
+      localStorage.setItem("vc_transport_preference", "websocket");
+      localStorage.setItem("vc_transport_sticky", "true");
+    }
+  } catch (_) {}
+})();`;
+
 // ---------------------------------------------------------------------------
 // Core helper
 // ---------------------------------------------------------------------------
@@ -157,6 +166,7 @@ export async function createAuthenticatedContext(
   // Harmless for WS-only specs (the wasm only reads the global on the WT
   // construction path).
   await context.addInitScript(CERT_HASH_INIT_SCRIPT);
+  await context.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
 
   const token = generateSessionToken(email, name);
   const url = new URL(uiURL);

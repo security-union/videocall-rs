@@ -642,6 +642,27 @@ lazy_static! {
     /// filtering) are tracked on their own metric so backpressure dashboards
     /// and alerts that sum across labels are not polluted. See
     /// [`RELAY_VIEWPORT_FILTERED_TOTAL`].
+    ///
+    /// `drop_reason` values:
+    /// - `mailbox_full`: a fan-out `try_send` into a receiver's actor mailbox
+    ///   failed (the #1057 room-wide-freeze signature). Emitted at the inbound
+    ///   fan-out hop (`chat_server.rs` `handle_msg`) for Critical/Control
+    ///   packets, packets the relay could not classify (unparseable wrapper /
+    ///   UNSPECIFIED `media_kind`), and `Closed`-mailbox drops.
+    /// - `channel_full`: a `try_send` into the policy-aware outbound channel
+    ///   failed (emitted at the per-transport `Handler<Message>` hop).
+    /// - `priority_drop_video` / `priority_drop_audio`: a droppable MEDIA frame
+    ///   (VIDEO/SCREEN → `_video`, AUDIO → `_audio`) was the kind SACRIFICED on
+    ///   overflow. Emitted BOTH at the outbound-channel hop (a true preemptive
+    ///   priority drop, keyed on channel fill) AND, as of #1145, at the inbound
+    ///   fan-out hop when a `Full` mailbox forced a media drop — there the
+    ///   label is ATTRIBUTION ONLY (the actix mailbox exposes no preemption
+    ///   API, so the packet could not be enqueued regardless; the label records
+    ///   WHICH kind was sacrificed so a fan-out burst reads as "video shed"
+    ///   rather than undifferentiated `mailbox_full`). Classified off the OUTER
+    ///   cleartext `media_kind` (E2EE-safe), never the inner MediaType.
+    /// The label set mirrors the OUTBOUND taxonomy on
+    /// [`OUTBOUND_CHANNEL_DROPS_TOTAL`] so one dashboard query spans both hops.
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "relay_packet_drops_total",
         "Total packets dropped due to full outbound queue or mailbox (backpressure loss only; intentional viewport drops are counted by relay_viewport_filtered_total)",
@@ -937,12 +958,23 @@ lazy_static! {
     ///
     /// This is the room-wide-freeze signature: when `ChatServer`'s NATS fan-out
     /// does `session_recipient.try_send(Message)` and the receiving session
-    /// actor's mailbox is full, the packet is shed indiscriminately (audio,
-    /// video, control alike) with NO CONGESTION feedback to the sender — the
-    /// failure mode diagnosed in #1057. Pre-#1057 the mailbox was the actix
+    /// actor's mailbox is full, the packet cannot be enqueued and is dropped
+    /// with NO CONGESTION feedback to the sender at THIS hop (CONGESTION is
+    /// owned by the downstream outbound-channel hop via `on_outbound_drop`) —
+    /// the failure mode diagnosed in #1057. Pre-#1057 the mailbox was the actix
     /// default (16 slots); post-#1057 it is sized to the outbound channel(s),
-    /// but this counter must still exist so a FUTURE mailbox overflow remains
-    /// visible the instant it recurs.
+    /// and post-#1144 to that × a small burst-headroom factor — but this
+    /// counter must still exist so a FUTURE mailbox overflow remains visible
+    /// the instant it recurs.
+    ///
+    /// NOTE (#1145): the DROP itself is no longer attributed indiscriminately.
+    /// The room-tagged `relay_packet_drops_total{drop_reason}` now records
+    /// WHICH KIND was sacrificed on a `Full` mailbox (`priority_drop_video` /
+    /// `priority_drop_audio` for droppable media, `mailbox_full` for
+    /// Critical/Control/unclassifiable). THIS aggregate counter, by contrast,
+    /// still increments on EVERY inbound-mailbox drop regardless of kind, so
+    /// the fleet-wide freeze signature (`rate()` summed over transport) is
+    /// unchanged by that per-room attribution split.
     ///
     /// DISTINCT FROM `relay_packet_drops_total{drop_reason="mailbox_full"}`:
     /// that existing series is room-tagged (unbounded `room` label, good for

@@ -38,6 +38,10 @@ use actix::{
     Actor, Addr, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
     SpawnHandle,
 };
+// `SendError` is re-exported only from `actix::prelude`, not the crate root, so
+// it needs its own import. We match on it (`Full` vs `Closed`) at the fan-out
+// hop to distinguish transient backpressure (a shed) from a gone receiver.
+use actix::prelude::SendError;
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
@@ -46,6 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
@@ -2806,6 +2811,11 @@ impl Handler<JoinRoom> for ChatServer {
                     "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
                     member.user_id, member.display_name, user_id_clone
                 );
+                // Priority attribution (#1145) deliberately NOT applied: this
+                // forwards a single PARTICIPANT_JOINED (`PacketType::MEETING`,
+                // Critical) during join setup — never a sheddable-media drop.
+                // (It also predates the mailbox-drop counters and intentionally
+                // stays a plain warn on this one-shot setup path.)
                 if let Err(e) = new_joiner_recipient.try_send(Message {
                     msg: existing_bytes,
                     session: member.session,
@@ -3503,6 +3513,17 @@ fn try_intercept_display_name_change(
                 session,
             };
             if let Err(e) = recipient.try_send(message) {
+                // PRIORITY ATTRIBUTION DELIBERATELY NOT APPLIED HERE (#1145).
+                // Unlike the main fan-out hop (`handle_msg`), this sibling
+                // `try_send` site forwards exactly ONE packet type — a
+                // sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, which is a
+                // `PacketType::MEETING` packet. `MEETING` is Critical in the
+                // shed taxonomy (`priority_drop::OutboundPriority::classify_*`),
+                // so it is NEVER a sheddable-media drop: running the classifier
+                // here would always return Critical and the `drop_reason` would
+                // always be `mailbox_full`. The label is therefore left as the
+                // constant `mailbox_full` rather than adding a provably-constant
+                // classify call on this rare (rename-only) path.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
                     .inc();
@@ -3919,19 +3940,91 @@ fn handle_msg(
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
+            //
+            // HONEST CONTRACT — read before "improving" this: the actix
+            // mailbox exposes NO capacity/length probe and NO preemption API
+            // on `Recipient<Message>` (only `try_send`/`do_send`, verified
+            // against actix 0.13.5). So when `try_send` returns `Full` the
+            // packet simply CANNOT be enqueued — we do NOT, and CANNOT, evict
+            // a queued packet to make room for a higher-priority one. The
+            // value this block adds is therefore (a) correct ATTRIBUTION of
+            // WHICH KIND was sacrificed on overflow (video vs audio vs
+            // lifecycle), so dashboards/alerts see "video shed under fan-out
+            // burst" rather than an undifferentiated `mailbox_full`, and
+            // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
+            // the burst room to land in the mailbox and then spill onto the
+            // policy-aware outbound channel (which DOES shed video-first and
+            // fire CONGESTION). Shedding alone can't save a critical packet on
+            // a full mailbox; the headroom is what actually prevents the drop.
+            //
+            // We classify off the OUTER cleartext wrapper that was already
+            // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
+            // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
+            // AES-sealed under E2EE. This is the SAME data the #988/#989
+            // filters above already read, so the added per-receiver work here
+            // is O(1): two enum reads on already-decoded fields, no parse, no
+            // allocation, no lock. Fail-open: an unparseable wrapper
+            // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
+            // as Control and is attributed `mailbox_full` (never preferentially
+            // blamed as a media shed).
+            //
+            // We also distinguish `Full` (transient backpressure — the fan-out
+            // burst case) from `Closed` (the receiver actor is gone). Only
+            // `Full` is a shed scenario; a `Closed` drop keeps the plain
+            // `mailbox_full` label and the warn, exactly as before.
+            let is_full = matches!(e, SendError::Full(_));
+            let priority = match parsed {
+                Some(pw) => OutboundPriority::classify_outer(
+                    true,
+                    pw.packet_type
+                        .enum_value()
+                        .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+                    pw.media_kind.enum_value().unwrap_or(
+                        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                    ),
+                ),
+                // Unparseable outer wrapper → fail-open Control (never a media shed).
+                None => OutboundPriority::Control,
+            };
+
+            // Pick the per-room `drop_reason` label. On a `Full` mailbox a
+            // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
+            // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
+            // kind; everything else (Critical/Control, or a `Closed` mailbox)
+            // keeps the legacy `mailbox_full` label. The labels mirror the
+            // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
+            // (`metrics.rs`), so a single dashboard query spans both hops.
+            let drop_reason = match (is_full, priority.priority_drop_label()) {
+                (true, Some(label)) => label,
+                _ => "mailbox_full",
+            };
+
             // Room-tagged forensic series (kept for per-room drill-down). The
             // `transport="nats_delivery"` here is the publish-side identity, not
             // the receiver's transport.
             RELAY_PACKET_DROPS_TOTAL
-                .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .with_label_values(&[&room, "nats_delivery", drop_reason])
                 .inc();
             // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
             // room-wide-freeze signature, labeled by the RECEIVER's transport so
             // an SRE can rate() it without scraping per-room series and can tell
-            // which transport's mailbox is overflowing.
+            // which transport's mailbox is overflowing. This counts EVERY
+            // inbound-mailbox drop regardless of attributed kind, so the #1057
+            // freeze signature (sum over transport) is unchanged by the new
+            // per-room `drop_reason` split.
             RELAY_INBOUND_MAILBOX_DROPS_TOTAL
                 .with_label_values(&[&transport])
                 .inc();
+            // The `Dropping inbound message for session <id> ... (mailbox full)`
+            // line is a STABLE CONTRACT consumed by
+            // `scripts/parse_meeting_console_logs.sh` (`--relay-ws`), which
+            // greps it per session to reconstruct mailbox-drop counts. It is
+            // kept VERBATIM (same text + WARN level) for every drop so the
+            // analyzer is not silently corrupted — the priority attribution
+            // added by this change lives entirely on the `drop_reason` metric
+            // label above, not in the log line. Do NOT edge-trigger or demote
+            // this line without updating the parse script in lock-step.
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
                 session, e

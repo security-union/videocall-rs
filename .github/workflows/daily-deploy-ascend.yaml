@@ -461,10 +461,11 @@ jobs:
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
             --set-string "runtimeConfig.consoleLogUploadEnabled=true" \
+            --set-string "runtimeConfig.logLevel=info" \
             --set resources.requests.cpu=50m \
-            --set resources.requests.memory=32Mi \
-            --set resources.limits.cpu=100m \
-            --set resources.limits.memory=64Mi \
+            --set resources.requests.memory=64Mi \
+            --set resources.limits.cpu=200m \
+            --set resources.limits.memory=128Mi \
             --set ingress.enabled=true \
             --set "ingress.hosts[0].host=app.videocall.conceptcar7.com" \
             --set "ingress.hosts[0].paths[0].path=/" \

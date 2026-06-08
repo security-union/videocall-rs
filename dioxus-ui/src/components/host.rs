@@ -268,6 +268,9 @@ pub fn Host(
             screen.shared_tier_transitions(),
             camera.shared_climb_limiter_snapshot(),
             camera.shared_dwell_samples(),
+            // #1143: send-side simulcast layer counts (camera encoder atoms).
+            camera.shared_effective_layer_count(),
+            camera.shared_active_layer_count(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a

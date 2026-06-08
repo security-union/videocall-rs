@@ -203,6 +203,14 @@ pub struct HealthReporter {
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
     encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #1143: camera encoder EFFECTIVE simulcast layer count (ladder depth the
+    /// publisher is configured to encode/send). Wrapped for late binding like the
+    /// other encoder sources; swapped in by `set_encoder_metric_sources`. Reads as
+    /// 0 (field omitted) until the encoder atom is wired.
+    effective_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1143: camera encoder ACTIVE simulcast layer count (layers presently
+    /// encoded + sent; `<=` effective, the gap being AQ-shed layers).
+    active_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
     /// Climb-rate limiter snapshot, updated by the encoder each tick.
@@ -407,6 +415,10 @@ impl HealthReporter {
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
             encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
+            // #1143: 0 until the encoder atoms are wired by
+            // `set_encoder_metric_sources`; a 0 effective count omits the field.
+            effective_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            active_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
                 ClimbLimiterSnapshot::default(),
@@ -520,6 +532,8 @@ impl HealthReporter {
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+        effective_video_layers: Rc<AtomicU32>,
+        active_video_layers: Rc<AtomicU32>,
     ) {
         *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
         *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
@@ -531,6 +545,8 @@ impl HealthReporter {
         *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
         *self.climb_limiter_snapshot.borrow_mut() = climb_limiter_snapshot;
         *self.dwell_samples.borrow_mut() = dwell_samples;
+        *self.effective_video_layers.borrow_mut() = effective_video_layers;
+        *self.active_video_layers.borrow_mut() = active_video_layers;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -1041,6 +1057,9 @@ impl HealthReporter {
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
         let encoder_output_fps = self.encoder_output_fps.clone();
+        // #1143: send-side simulcast layer counts (camera encoder).
+        let effective_video_layers = self.effective_video_layers.clone();
+        let active_video_layers = self.active_video_layers.clone();
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
@@ -1135,6 +1154,11 @@ impl HealthReporter {
                         let screen_active_val =
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+                        // #1143: live send-side simulcast layer counts.
+                        let effective_layers_val =
+                            effective_video_layers.borrow().load(Ordering::Relaxed);
+                        let active_layers_val =
+                            active_video_layers.borrow().load(Ordering::Relaxed);
 
                         // Drain tier transitions from all encoder buffers.
                         let mut drained_transitions = Vec::new();
@@ -1215,6 +1239,8 @@ impl HealthReporter {
                             screen_tier_val,
                             screen_active_val,
                             output_fps_val,
+                            effective_layers_val,
+                            active_layers_val,
                             drained_transitions,
                             limiter_snap,
                             drained_dwells,
@@ -1274,6 +1300,9 @@ impl HealthReporter {
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
         encoder_output_fps: u32,
+        // #1143: send-side simulcast layer counts (camera). 0 = unwired/omitted.
+        effective_video_layers: u32,
+        active_video_layers: u32,
         tier_transitions: Vec<TierTransitionRecord>,
         climb_limiter: ClimbLimiterSnapshot,
         dwell_samples: Vec<(String, f64)>,
@@ -1358,6 +1387,18 @@ impl HealthReporter {
         if encoder_output_fps > 0 {
             pb.encoder_output_fps = Some(encoder_output_fps);
         }
+
+        // #1143: send-side simulcast layer counts (camera). Gated on > 0 (same
+        // convention as encoder_output_fps): 0 means the encoder atoms have not
+        // been wired yet, which is not diagnostic — omit rather than emit a
+        // misleading 0. A wired single-stream publisher reports 1 (the
+        // inert-simulcast signal the dashboard alerts on). active is clamped to
+        // effective defensively so the gap can never read negative.
+        if effective_video_layers > 0 {
+            pb.effective_video_layers = Some(effective_video_layers);
+            pb.active_video_layers = Some(active_video_layers.min(effective_video_layers));
+        }
+
         if encoder_target_bitrate_kbps.is_finite() {
             pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
         }
@@ -1516,6 +1557,12 @@ impl HealthReporter {
             if db.override_mode == 2 {
                 pb_db.override_fixed_n = db.override_fixed_n;
             }
+            // #1143: tiles ACTUALLY being decoded right now. `effective_cap` is
+            // the budget ceiling and `natural` is the unconstrained layout count;
+            // the realized decode set is the smaller of the two (a 10-tile cap
+            // with only 3 peers decodes 3, not 10). This is the per-client
+            // "videos showing" signal the observability issue asks for.
+            pb_db.active_set = db.effective_cap.min(db.natural);
             pb.decode_budget = ::protobuf::MessageField::some(pb_db);
         }
 
@@ -2028,6 +2075,8 @@ mod tests {
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2106,6 +2155,8 @@ mod tests {
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2160,6 +2211,8 @@ mod tests {
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2227,6 +2280,8 @@ mod tests {
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),

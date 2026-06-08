@@ -35,7 +35,7 @@ use crate::client::RefreshRoomTokenCallback;
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -3037,7 +3037,11 @@ impl ConnectionManager {
 
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
     pub fn trigger_diagnostics_report(&mut self) {
-        debug!(
+        // PER-TICK hot path: fires once per connection on every 1 Hz diagnostics
+        // report (O(connections) churn during reconnection waves). Demoted
+        // debug!->trace! so it stays off even when console-log collection bumps
+        // the ceiling to Debug (#1100 follow-up). Not on the analyzer keep-list.
+        trace!(
             "ConnectionManager::trigger_diagnostics_report called - state: {:?}",
             self.election_state
         );
@@ -3185,7 +3189,9 @@ impl ConnectionManager {
 
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
-        debug!(
+        // PER-TICK hot path: fires on every 1 Hz diagnostics report. Demoted
+        // debug!->trace! (#1100 follow-up) — see trigger_diagnostics_report.
+        trace!(
             "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
             self.active_connection_id.borrow(),
             self.election_state
@@ -3194,7 +3200,7 @@ impl ConnectionManager {
         let metrics = self.build_main_diagnostic_metrics();
 
         // Send overall connection manager state
-        debug!(
+        trace!(
             "ConnectionManager: Prepared {} metrics for main event: {:?}",
             metrics.len(),
             metrics
@@ -3207,12 +3213,12 @@ impl ConnectionManager {
                 metrics,
             };
 
-            debug!(
+            trace!(
                 "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
             match global_sender().try_broadcast(event) {
                 Ok(_) => {
-                    debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
+                    trace!("ConnectionManager: Successfully sent main connection manager diagnostics event");
                 }
                 Err(e) => {
                     error!(
@@ -3283,7 +3289,7 @@ impl ConnectionManager {
 
             match global_sender().try_broadcast(event) {
                 Ok(_) => {
-                    debug!(
+                    trace!(
                         "ConnectionManager: Successfully sent server diagnostics for {}",
                         measurement.connection_id
                     );

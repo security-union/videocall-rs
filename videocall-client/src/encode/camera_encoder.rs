@@ -1522,7 +1522,11 @@ impl CameraEncoder {
                                     if now - last_chunk_time >= 1000.0 {
                                         let fps = chunks_in_last_second;
                                         current_fps.store(fps, Ordering::Relaxed);
-                                        log::debug!("Encoder output FPS: {fps}");
+                                        // PER-TICK telemetry: fires ~1 Hz while
+                                        // encoding (layer 0). Demoted debug!->trace!
+                                        // so it stays off even when console-log
+                                        // collection bumps to Debug (#1100 follow-up).
+                                        log::trace!("Encoder output FPS: {fps}");
                                         chunks_in_last_second = 0;
                                         last_chunk_time = now;
                                     }

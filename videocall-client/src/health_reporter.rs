@@ -1235,7 +1235,12 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
-                            debug!("Sent health packet for session: {session_id_val}");
+                            // PER-TICK hot path: fires on every health-report
+                            // interval (~1 Hz per session). Demoted debug!->trace!
+                            // so it stays off even when console-log collection
+                            // bumps to Debug (#1100 follow-up). Not on the analyzer
+                            // keep-list.
+                            trace!("Sent health packet for session: {session_id_val}");
                         }
                     }
                 } else {

@@ -533,10 +533,21 @@ pub fn Host(
         }
         s.prev_device_settings_open = device_settings_open;
 
-        log::info!(
-            "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
-            s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
-        );
+        // Edge-triggered: log only when video/mic/screen state actually CHANGES,
+        // not on every Host re-render. This component re-renders many times per
+        // second, so an unconditional log here was the dominant console-log line
+        // after the #1100/#1129 per-tick demotions (~65% of all lines in a
+        // captured preview session). The `prev_*` fields are still updated below
+        // (lines further down), so this comparison sees the prior render's state.
+        if video_enabled != s.prev_video_enabled
+            || mic_enabled != s.prev_mic_enabled
+            || share_screen != s.prev_share_screen
+        {
+            log::info!(
+                "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
+                s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
+            );
+        }
 
         // Screen share
         if s.prev_share_screen != share_screen {

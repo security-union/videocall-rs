@@ -1185,7 +1185,11 @@ impl ConnectionManager {
         // packets_received already counts inbound RTT echoes; excluding probes from
         // packets_sent made the two rates incomparable (ratio was meaningless).
         self.packets_sent.set(self.packets_sent.get() + 1);
-        debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
+        // PER-PROBE hot path: fires on every RTT probe (~1 Hz per connection,
+        // O(connections) during election). Demoted debug!->trace! (#1100/#1129
+        // follow-up); not on the meeting-analyzer keep-list (the analyzer reads
+        // the "RTT response received ..." line, not this send-side probe log).
+        trace!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
 

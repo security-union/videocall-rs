@@ -74,6 +74,11 @@ pub struct PeerHealthData {
     pub last_screen_update_ms: u64,
     /// Cumulative decode error count across the session lifetime.
     pub decode_errors_total: u64,
+    /// Last audio jitter-buffer depth (ms) that was logged via the
+    /// "Updated audio health (buffer: …)" line. `None` = never logged.
+    /// Used to edge-trigger that log so it fires only on a meaningful change
+    /// rather than on every ~1 Hz NetEQ tick (see the emit site below).
+    pub last_logged_audio_buffer_ms: Option<u64>,
 }
 
 impl PeerHealthData {
@@ -90,6 +95,7 @@ impl PeerHealthData {
             last_camera_update_ms: 0,
             last_screen_update_ms: 0,
             decode_errors_total: 0,
+            last_logged_audio_buffer_ms: None,
         }
     }
 
@@ -729,9 +735,22 @@ impl HealthReporter {
                         }
                         "audio_buffer_ms" => {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
-                                debug!(
-                                    "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
-                                );
+                                // Edge-triggered: this fires on every ~1 Hz NetEQ
+                                // tick per peer (~47k lines in an 8-min meeting —
+                                // the largest remaining contributor). Log only the
+                                // first sample and changes of >=10ms so the
+                                // analyzer's `Buf med` column still sees the buffer
+                                // distribution shape (including drops to 0ms) while
+                                // identical back-to-back ticks are dropped.
+                                let prev = peer_data.last_logged_audio_buffer_ms;
+                                let changed =
+                                    prev.map(|p| p.abs_diff(*buffer_ms) >= 10).unwrap_or(true);
+                                if changed {
+                                    peer_data.last_logged_audio_buffer_ms = Some(*buffer_ms);
+                                    debug!(
+                                        "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
+                                    );
+                                }
                             }
                         }
                         "packets_awaiting_decode" => {

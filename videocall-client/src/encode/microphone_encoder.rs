@@ -772,7 +772,7 @@ impl MicrophoneEncoder {
                         let _ = codec_n.send_message(&CodecMessages::Init {
                             options: Some(EncoderInitOptions {
                                 encoder_frame_size: Some(20),
-                                original_sample_rate: Some(input_rate),
+                                original_sample_rate: Some(context_rate),
                                 encoder_bit_rate: Some(layer_kbps * 1000),
                                 encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                                 encoder_fec: Some(initial_tier.enable_fec),

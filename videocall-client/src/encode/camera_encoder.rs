@@ -674,9 +674,13 @@ impl CameraEncoder {
         // clone the client (its inner is an `Rc<RefCell<…>>`, and the encode
         // loop already holds a strong clone for `send_media_packet`, so this is
         // the established lifetime pattern). `sorted_peer_keys()` is a
-        // non-blocking `try_borrow` read — it returns an empty Vec if the inner
-        // is momentarily busy, which simply holds the previous gate state for
-        // one tick rather than blocking the loop.
+        // non-blocking `try_borrow` read — if the inner is momentarily busy it
+        // returns an empty Vec, so `other_peers == 0` and the gate stores
+        // `false` (pin released) for that tick rather than blocking the loop;
+        // the next tick (≤1s later) re-reads the real count and self-corrects.
+        // In practice the borrow never fails here: all `inner` borrows are
+        // short and non-blocking and none is held across an `.await`, so on
+        // single-threaded wasm no borrow is active mid-tick.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {

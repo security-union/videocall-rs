@@ -1095,7 +1095,9 @@ impl CameraEncoder {
 
     /// Returns the EFFECTIVE simulcast layer-count atomic (#1143): how many
     /// layers this publisher is currently configured to encode/send. Cloned into
-    /// the health reporter so the metric tracks the live value.
+    /// the health reporter, which reads the current atomic value each packet.
+    /// (At this tip the atomic is written once at construction — see the field
+    /// doc on `shared_effective_layer_count`; #1135/#1136 will update it.)
     pub fn shared_effective_layer_count(&self) -> Rc<AtomicU32> {
         self.shared_effective_layer_count.clone()
     }

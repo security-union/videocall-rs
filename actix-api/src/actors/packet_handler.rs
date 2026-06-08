@@ -823,6 +823,23 @@ mod tests {
     // =====================================================================
 
     #[test]
+    fn test_keyframe_target_from_request_prefers_session_then_user() {
+        // The production builder (used at session_logic.rs's KEYFRAME_REQUEST
+        // branch): a non-zero target_session_id keys by Session; 0 (older
+        // client) falls back to User. Pins both branches directly.
+        assert_eq!(
+            KeyframeTarget::from_request(b"alice", 7),
+            KeyframeTarget::Session(7),
+            "a non-zero target_session_id must key by Session (#1124)"
+        );
+        assert_eq!(
+            KeyframeTarget::from_request(b"alice", 0),
+            KeyframeTarget::User(b"alice".to_vec()),
+            "target_session_id == 0 (older client) must fall back to User"
+        );
+    }
+
+    #[test]
     fn test_keyframe_limiter_concurrent_sessions_same_user_have_independent_budgets() {
         // #1124: two concurrent publishing SESSIONS of the SAME participant
         // must NOT collide into one rate-limit bucket. With per-session keying

@@ -26,7 +26,10 @@ use crate::actors::priority_drop::{
     evaluate as evaluate_priority_drop, OutboundPriority, PriorityDropDecision,
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
-use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY};
+use crate::constants::{
+    CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, INBOUND_MAILBOX_HEADROOM_FACTOR,
+    WS_OUTBOUND_CHANNEL_CAPACITY,
+};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::metrics::{
@@ -192,17 +195,30 @@ impl Actor for WsChatSession {
         // drops in one meeting while `relay_outbound_queue_depth` stayed 0,
         // proving the smart channel never filled).
         //
-        // Setting the mailbox capacity equal to the outbound channel
-        // capacity does NOT add meaningful buffering — it *relocates* the
-        // overflow point to `outbound_tx`, which is policy-aware: it sheds
-        // VIDEO/SCREEN first, protects AUDIO to ~95%, never preempts
-        // CONTROL/CONGESTION/MEETING, and fires CONGESTION back to the
-        // sender via `on_outbound_drop`. So a genuine overflow becomes
-        // video-first + audio-protected + sender-throttled instead of a
-        // total stall. The value is derived from the same constant the
-        // channel is built with (`WS_OUTBOUND_CHANNEL_CAPACITY`) so the two
-        // stay in lock-step.
-        ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY);
+        // Sizing the mailbox AT the outbound channel capacity (issue #1057)
+        // relocates a *steady-state* overflow onto `outbound_tx`, which is
+        // policy-aware: it sheds VIDEO/SCREEN first, protects AUDIO to ~95%,
+        // never preempts CONTROL/CONGESTION/MEETING, and fires CONGESTION back
+        // to the sender via `on_outbound_drop`. So a genuine overflow becomes
+        // video-first + audio-protected + sender-throttled instead of a total
+        // stall.
+        //
+        // BUT a publisher-join fan-out BURST (issue #1144) overflows even a
+        // mailbox sized AT the channel: #1144 saw 303 `mailbox_full` drops in
+        // one second on a build that already had #1057's mailbox=128, because
+        // the keyframe/join spike arrives in a tight sub-second window before
+        // the actor is next scheduled to drain. So we add a modest
+        // `INBOUND_MAILBOX_HEADROOM_FACTOR` (2×) of slack: enough to absorb a
+        // single join wave across one scheduling gap and let it SPILL onto the
+        // policy-aware `outbound_tx` (the shedding surface) rather than being
+        // dropped indiscriminately at the dumb mailbox. The mailbox→channel
+        // hand-off in `Handler<Message>` is CPU-bound (it does NOT block on the
+        // socket write), so the actor drains this slack quickly; the headroom
+        // is burst-absorption, NOT a deep buffer for a slow receiver (the
+        // outbound channel — unchanged at 128 — still enforces fail-fast video
+        // staleness bounds). Both values derive from the SAME
+        // `WS_OUTBOUND_CHANNEL_CAPACITY` constant so they stay in lock-step.
+        ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR);
 
         // Register the outbound drain stream. Packets enqueued via
         // outbound_tx are pulled here and written as WS binary frames.
@@ -574,16 +590,22 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     // ----------------------------------------------------------------------
-    // Issue #1057: mailbox capacity must match the outbound channel.
+    // Issue #1057 (+ #1144 headroom): mailbox capacity must be the outbound
+    // channel capacity TIMES the burst-headroom factor.
     //
     // `WsChatSession::started` calls
-    // `ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY)` so the actor
-    // mailbox stops being the (default 16-slot) overflow point in front of
-    // the policy-aware `outbound_tx`. We cannot read the capacity back off a
-    // live `WebsocketContext` without standing up NATS, so this guards the
-    // invariant the fix relies on at the value level:
-    //   * the mailbox capacity is derived from the SAME constant the channel
-    //     is built with (no hardcoded duplicate that could drift), and
+    // `ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY *
+    //  INBOUND_MAILBOX_HEADROOM_FACTOR)` so the actor mailbox (a) stops being
+    // the (default 16-slot) overflow point in front of the policy-aware
+    // `outbound_tx` (#1057), and (b) has modest burst slack so a publisher-
+    // join fan-out spike spills onto that policy-aware channel instead of
+    // being dropped indiscriminately at the mailbox (#1144). We cannot read
+    // the capacity back off a live `WebsocketContext` without standing up
+    // NATS, so this guards the invariant at the value level:
+    //   * the mailbox capacity is derived from the SAME constants the channel
+    //     is built with (no hardcoded duplicate that could drift),
+    //   * it is >= the outbound channel capacity (#1057: never smaller than
+    //     the smart channel, or the dumb mailbox becomes the bottleneck), and
     //   * it is strictly larger than actix's `DEFAULT_CAPACITY` (16) so a
     //     future accidental revert to the tiny default mailbox fails CI.
     // ----------------------------------------------------------------------
@@ -593,20 +615,35 @@ mod tests {
     /// ever becomes the overflow point again (issue #1057).
     const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
 
+    /// The value `started()` feeds to `set_mailbox_capacity`. Must mirror the
+    /// `started()` expression exactly so a drift between the two fails CI.
+    const WS_MAILBOX_CAPACITY: usize =
+        WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR;
+
     #[test]
-    fn ws_mailbox_capacity_matches_outbound_channel() {
-        // The value fed to `set_mailbox_capacity` in `started()` is exactly
-        // this constant, which is also the `outbound_tx` channel capacity.
-        // Relocating overflow to that policy-aware channel is the whole fix.
+    fn ws_mailbox_capacity_is_channel_times_headroom() {
+        // Sentinel: the outbound channel capacity itself. Relocating overflow
+        // to this policy-aware channel is the #1057 fix.
         assert_eq!(
             WS_OUTBOUND_CHANNEL_CAPACITY, 128,
-            "WS outbound channel/mailbox capacity changed; update issue #1057 \
+            "WS outbound channel capacity changed; update issue #1057 \
              rationale and any operator docs before changing this sentinel",
         );
-        // Compile-time guard: issue #1057 requires the WS mailbox capacity
-        // to exceed actix's dumb default (16) so overflow lands on the
-        // policy-aware outbound channel, not the indiscriminate mailbox.
-        const _: () = assert!(WS_OUTBOUND_CHANNEL_CAPACITY > ACTIX_DEFAULT_MAILBOX_CAPACITY);
+        // Sentinel: the documented burst-headroom factor (#1144). If this
+        // changes, update the `INBOUND_MAILBOX_HEADROOM_FACTOR` burst math.
+        assert_eq!(
+            INBOUND_MAILBOX_HEADROOM_FACTOR, 2,
+            "inbound mailbox headroom factor changed; re-validate the #1144 \
+             join-burst absorption math before changing this sentinel",
+        );
+        // The mailbox is channel × headroom (256 by default). This pins the
+        // exact `started()` expression so the WS fix can't silently drift.
+        assert_eq!(WS_MAILBOX_CAPACITY, 256);
+        // #1057 invariant: the mailbox must be >= the smart channel, never
+        // smaller (a smaller mailbox would re-create the dumb-bottleneck).
+        const _: () = assert!(WS_MAILBOX_CAPACITY >= WS_OUTBOUND_CHANNEL_CAPACITY);
+        // Compile-time guard: well clear of actix's dumb 16-slot default.
+        const _: () = assert!(WS_MAILBOX_CAPACITY > ACTIX_DEFAULT_MAILBOX_CAPACITY);
     }
 
     // ----------------------------------------------------------------------

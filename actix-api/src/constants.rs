@@ -183,6 +183,80 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 
 // ---------------------------------------------------------------------------
+// Inbound fan-out mailbox headroom (issues #1144 / #1145)
+// ---------------------------------------------------------------------------
+
+/// Multiplier applied to the per-receiver outbound-channel capacity when
+/// sizing the actor MAILBOX that fronts it (issues #1144, #1145).
+///
+/// ## Background — the two-queue path
+///
+/// A fan-out packet to one receiver passes through two bounded producer-side
+/// queues drained on the SAME single actor event loop:
+///
+/// ```text
+/// NATS fan-out --try_send--> [actor MAILBOX] --Handler<Message>--> try_send--> [outbound channel] --> socket
+///                            ^ dumb: indiscriminate                            ^ policy-aware: priority_drop
+///                              drop on Full, no CONGESTION                       (video-first) + CONGESTION
+/// ```
+///
+/// Issue #1057 sized the mailbox EQUAL to the outbound channel so the mailbox
+/// stopped being the overflow point in front of the dumb-vs-smart asymmetry —
+/// at mailbox == channel, a *steady-state* overflow lands on the policy-aware
+/// channel instead of the indiscriminate mailbox.
+///
+/// ## Why #1057's equal sizing is still not enough for a publisher-join burst
+///
+/// Issue #1144 reproduced (on a build that ALREADY had the #1057 fix, WS
+/// mailbox = 128) a transient where enabling ONE camera in a 3-person WS call
+/// produced **303 `mailbox_full` drops in a single second** (then cleared
+/// within ~10 s once the room settled). Adding a publisher triggers a
+/// keyframe / join fan-out SPIKE: every receiver requests a keyframe from the
+/// new sender and the burst arrives in a tight sub-second window — faster than
+/// the actor is next scheduled to drain its mailbox. The mailbox fills during
+/// that scheduling gap and drops indiscriminately, *before* the policy-aware
+/// channel (whose `priority_drop` only runs at the channel-enqueue hop) ever
+/// sees the traffic.
+///
+/// Critically, the mailbox→channel hand-off in `Handler<Message>` is
+/// CPU-bound (parse + classify + `try_send` into the channel); it does NOT
+/// block on the socket write (that happens separately in the outbound-drain
+/// `StreamHandler`). So once the actor IS scheduled it drains the mailbox
+/// quickly into the channel. The mailbox therefore only needs enough slack to
+/// hold the burst across one scheduling gap and let it SPILL onto the
+/// policy-aware channel — which then sheds video-first, protects audio, and
+/// fires CONGESTION. This is the "relocate overflow onto the shedding surface"
+/// direction #1145 calls for, NOT "buffer for a slow receiver" (the deep-queue
+/// anti-pattern the [`WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT`] doc warns against —
+/// that hazard is on the *channel*, which is unchanged here and still enforces
+/// fail-fast video staleness bounds).
+///
+/// ## Sizing
+///
+/// `2×` doubles the burst-absorption slack while staying modest:
+/// * WS: mailbox 128 → **256** (channel stays 128).
+/// * WT: mailbox `unistream + datagram` (default 1024) → **2048**
+///   (each channel stays 512; the deep-stale-video bound is on the channel,
+///   so a 2048 mailbox does NOT create a 2048-deep stale-video buffer).
+///
+/// The factor is intentionally NOT large: this absorbs a single join-fan-out
+/// wave for our target room sizes (10–15 meetings × ≤20 users), not unbounded
+/// buffering. It does NOT, on its own, guarantee zero drops for the full
+/// 303/s burst — a sustained over-arrival that exceeds the actor's drain
+/// cadence will still spill, but it spills onto the SHEDDING channel
+/// (video-first + CONGESTION) instead of the dumb mailbox. Fully eliminating
+/// the transient requires the orthogonal follow-up of letting the socket
+/// writer progress independently of `Handler<Message>` (out of scope for
+/// #1144/#1145).
+///
+/// `2` is a FIRST, conservative value: validate against a multi-bot
+/// publisher-join repro (sample the actor's intra-second drain cadence) before
+/// raising it. Raising the mailbox far above the channel would re-introduce
+/// the mailbox as a deep dumb buffer in front of the smart channel — the exact
+/// thing #1057 removed — so keep this small.
+pub const INBOUND_MAILBOX_HEADROOM_FACTOR: usize = 2;
+
+// ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------
 

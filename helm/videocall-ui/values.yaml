@@ -55,7 +55,6 @@ runtimeConfig:
   screenBitrateKbps: 1000
   vadThreshold: 0.02
   consoleLogUploadEnabled: "false"
-  logLevel: "info"
   imageTag: "latest"
 
 ingress:

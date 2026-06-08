@@ -461,7 +461,6 @@ jobs:
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
             --set-string "runtimeConfig.consoleLogUploadEnabled=true" \
-            --set-string "runtimeConfig.logLevel=info" \
             --set resources.requests.cpu=50m \
             --set resources.requests.memory=64Mi \
             --set resources.limits.cpu=200m \

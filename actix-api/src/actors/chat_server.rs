@@ -52,7 +52,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
     RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
@@ -356,6 +357,28 @@ fn normalize_pref_media_kind(raw: i32) -> i32 {
         2 => 2, // AUDIO
         3 => 3, // SCREEN
         _ => 1, // VIDEO (covers UNSPECIFIED=0, VIDEO=1, and any unknown)
+    }
+}
+
+/// Bucket a wire `simulcast_layer_id` into the BOUNDED label set used by the
+/// per-layer forwarded counter (`relay_layer_forwarded_by_layer_total`, #1105).
+///
+/// The wire `simulcast_layer_id` is a forgeable `u32` that lives OUTSIDE the
+/// AEAD seal (#993), so it MUST NOT be used as a metric label verbatim — a
+/// malicious or buggy client could otherwise emit arbitrary ids and explode the
+/// series count. Today every kind ships at most three layers (ids 0..=2; see
+/// `LAYER_PREFERENCE_MAX_LAYER_ID`), so we map 0/1/2 to their own bucket and
+/// collapse EVERYTHING else (3..=u32::MAX) into a single `"other"` bucket. This
+/// caps the `layer_id` label to EXACTLY 4 distinct values regardless of what
+/// arrives on the wire — the cardinality bound is enforced HERE, not merely
+/// asserted in a comment. `"other"` doubles as the early-warning signal that a
+/// real >3-layer ladder has shipped without this bucketer being widened.
+fn layer_id_bucket(layer_id: u32) -> &'static str {
+    match layer_id {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        _ => "other",
     }
 }
 
@@ -3930,6 +3953,23 @@ fn handle_msg(
                 // layer-filtered counter (#989).
                 RELAY_LAYER_FORWARDED_TOTAL
                     .with_label_values(&[&room])
+                    .inc();
+            }
+
+            // Per-LAYER distribution (#1105). Counts EVERY filterable media
+            // packet that SURVIVED both filters above — i.e. every drop path
+            // (`viewport`, `layer`) has already `return`ed, so reaching here
+            // means this packet is about to be forwarded. Unlike
+            // RELAY_LAYER_FORWARDED_TOTAL (the non-base, has-prefs denominator),
+            // this covers ALL forwarded layers including base 0 and the
+            // no-prefs fail-open case, giving the true layer MIX per room.
+            //
+            // `layer_id_bucket` clamps the forgeable wire `simulcast_layer_id`
+            // (#993) into one of exactly 4 bounded buckets (0|1|2|other) BEFORE
+            // it becomes a label — the cardinality bound is enforced there.
+            if is_layer_filterable {
+                RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                    .with_label_values(&[&room, layer_id_bucket(pw.simulcast_layer_id)])
                     .inc();
             }
         }
@@ -10614,6 +10654,198 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "AUDIO must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    // ===== Per-layer forwarded distribution counter (#1105) =====
+
+    /// `layer_id_bucket` MUST clamp the forgeable wire id into EXACTLY the four
+    /// bounded label values 0|1|2|other. This is the cardinality guarantee — if
+    /// it ever returns anything else (or stops collapsing large ids), the
+    /// counter's series count becomes unbounded. The asserts pin the real
+    /// boundaries (2 stays "2", 3 and u32::MAX both collapse to "other"), so the
+    /// test fails if the match arms are widened or the catch-all is removed.
+    #[test]
+    fn test_layer_id_bucket_is_bounded() {
+        assert_eq!(layer_id_bucket(0), "0");
+        assert_eq!(layer_id_bucket(1), "1");
+        assert_eq!(layer_id_bucket(2), "2");
+        // The whole point: everything above the real 0..=2 ladder — including
+        // the next ladder rung (3) and a forged u32::MAX — collapses to ONE
+        // bucket, so the label set can never exceed 4 distinct values.
+        assert_eq!(layer_id_bucket(3), "other");
+        assert_eq!(layer_id_bucket(7), "other");
+        assert_eq!(layer_id_bucket(u32::MAX), "other");
+
+        // The complete set of buckets the function can EVER emit is exactly 4.
+        // Sample a wide range and prove no fifth value appears.
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for id in 0u32..1000 {
+            seen.insert(layer_id_bucket(id));
+        }
+        seen.insert(layer_id_bucket(u32::MAX));
+        assert_eq!(
+            seen.len(),
+            4,
+            "layer_id_bucket must emit exactly 4 bounded label values, got {seen:?}"
+        );
+    }
+
+    /// A forwarded media packet increments the per-layer distribution counter on
+    /// the bucket matching its `simulcast_layer_id`. Uses a UNIQUE room so the
+    /// process-global lazy_static counter is isolated from other tests (we read
+    /// the absolute value of a freshly-created series).
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_records_forwarded_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Unique room → fresh, isolated counter series.
+        let room = "per-layer-room-l2";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 2 from source 999 → a layer-2 packet matches
+            // and is forwarded.
+            layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "matching-layer VIDEO must be forwarded"
+        );
+        // The forwarded packet was layer 2 → the "2" bucket is incremented once,
+        // and the other buckets stay at zero for this room.
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            1,
+            "forwarding a layer-2 packet must increment the layer_id=2 bucket"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "1"])
+                .get() as u64,
+            0,
+            "layer-2 forward must NOT touch the layer_id=1 bucket"
+        );
+    }
+
+    /// A LAYER-FILTERED (dropped) packet must NOT increment the per-layer
+    /// distribution counter — the counter reflects only what is actually
+    /// forwarded. This pins the increment to the post-filter forward path: if
+    /// the increment were moved BEFORE the layer drop gate, the dropped layer's
+    /// bucket would wrongly read 1 and this test would fail.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_skips_filtered_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-drop";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 0 from source 999, so a layer-2 packet is
+            // DROPPED by the layer filter.
+            layer_prefs_with(&[(999, 0)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "non-matching-layer VIDEO must be dropped"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            0,
+            "a layer-FILTERED packet must NOT increment any forwarded-by-layer bucket"
+        );
+    }
+
+    /// A forwarded packet whose wire layer id is ABOVE the real 0..=2 ladder
+    /// (here a forged large id) lands in the bounded "other" bucket, never in a
+    /// per-id series. This is the runtime proof of the cardinality clamp on the
+    /// real forwarding path (not just the unit test of `layer_id_bucket`). The
+    /// receiver has no prefs (fail-open forward), so the high-id packet is
+    /// forwarded and counted.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_buckets_forged_layer_into_other() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-other";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // No recorded preference → fail-open: every layer forwards, so the
+            // forged-id packet reaches the per-layer counter.
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // A forged layer id well above the real ladder.
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, u32::MAX),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "no-prefs fail-open must forward the packet"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "other"])
+                .get() as u64,
+            1,
+            "a forged out-of-ladder layer id must land in the bounded \"other\" bucket"
         );
     }
 

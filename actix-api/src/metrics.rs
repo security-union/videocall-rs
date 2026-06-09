@@ -846,6 +846,37 @@ lazy_static! {
     )
     .expect("Failed to create relay_layer_forwarded_total metric");
 
+    /// Per-LAYER distribution of forwarded simulcast media packets, per room
+    /// (#1105). Unlike [`RELAY_LAYER_FORWARDED_TOTAL`] (which counts only the
+    /// non-base, has-prefs slice and is the filter denominator), this counts
+    /// EVERY filterable media packet (VIDEO/SCREEN/AUDIO) that survives both the
+    /// viewport (#988) and layer (#989) filters and is about to be forwarded —
+    /// including base layer 0 and the no-prefs fail-open case. It therefore
+    /// answers "what is the LAYER MIX flowing in this room?" (e.g. 80% L0 / 15%
+    /// L1 / 5% L2 → most receivers are constrained to the base layer).
+    ///
+    /// Increment site is the actual forward path: a packet counted here passed
+    /// every drop gate (it was not viewport-dropped, not layer-dropped, and is a
+    /// forwardable MEDIA packet). It is NOT incremented for control packets,
+    /// self-echo drops, observer drops, or any dropped media.
+    ///
+    /// CARDINALITY: bounded — `room` × exactly 4 `layer_id` buckets
+    /// (`"0"`, `"1"`, `"2"`, `"other"`). The wire `simulcast_layer_id` is a
+    /// forgeable `u32` OUTSIDE the AEAD seal (#993), so it is BUCKETED in code
+    /// before becoming a label: ids 0/1/2 map to their own bucket and EVERY
+    /// other value (3..=u32::MAX, including a forged `u32::MAX`) collapses into
+    /// the single `"other"` bucket. This makes it IMPOSSIBLE for an attacker (or
+    /// a future >3-layer ladder) to create unbounded series via this label. NO
+    /// per-source/session/peer label is ever added (session ids churn on
+    /// reconnect — that per-client granularity is #1105 item 3, deliberately
+    /// deferred).
+    pub static ref RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL: CounterVec = register_counter_vec!(
+        "relay_layer_forwarded_by_layer_total",
+        "Per-layer distribution of forwarded simulcast media packets per room; layer_id bucketed to 0|1|2|other (#1105)",
+        &["room", "layer_id"]
+    )
+    .expect("Failed to create relay_layer_forwarded_by_layer_total metric");
+
     /// LAYER_PREFERENCE control-packet update outcomes, per room (#989).
     ///
     /// Mirrors [`RELAY_VIEWPORT_UPDATES_TOTAL`]: makes the DoS guards in

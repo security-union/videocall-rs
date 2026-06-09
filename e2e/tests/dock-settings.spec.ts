@@ -323,14 +323,7 @@ test.describe("Dock settings", () => {
     ).toBeVisible({ timeout: 5_000 });
 
     // Close the modal
-    const closeBtn = page.locator(
-      '.device-settings-modal button[aria-label="Close"], .device-settings-modal .close-button',
-    );
-    if ((await closeBtn.count()) > 0) {
-      await closeBtn.first().click();
-    } else {
-      await page.keyboard.press("Escape");
-    }
+    await page.locator('.device-settings-modal button[aria-label="Close settings"]').click();
     await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
 
     // Action bar should now be dock-right

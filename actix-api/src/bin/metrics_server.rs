@@ -1029,16 +1029,23 @@ fn process_health_packet_to_metrics_pb(
                         reporter_display_name.as_str(),
                         &peer_dn,
                     );
-                    // NOTE: PEER_CONNECTIONS_TOTAL is deliberately NOT removed here.
-                    // It is keyed only (meeting_id, to_peer) — i.e. SHARED across all
-                    // reporters in the meeting — so deleting it because ONE reporter
-                    // stopped seeing the peer would wrongly drop a peer that other
-                    // reporters still observe. It is removed only on whole-session
-                    // cleanup (remove_session_metrics), matching its meeting-scoped
-                    // semantics; per-reporter it is the per-pair series below that leak.
+                    // Prune ONLY the per-pair tracking sets. `to_peers` and
+                    // `to_peer_display_names` key the per-pair series that
+                    // `remove_per_peer_metrics` just deleted; dropping the peer from
+                    // them stops those 23 series from being re-written on the next
+                    // packet and lets a future re-appearance re-register cleanly.
+                    //
+                    // `peer_ids` is DELIBERATELY retained. It is the lifetime-of-session
+                    // set that drives PEER_CONNECTIONS_TOTAL cleanup in
+                    // remove_session_metrics: that gauge is keyed only
+                    // (meeting_id, peer_id) — i.e. SHARED across all reporters in the
+                    // meeting — so it must NOT be removed when ONE reporter stops seeing
+                    // the peer (other reporters may still observe it). It is removed only
+                    // on whole-session reap, iterating `peer_ids`. Removing the peer from
+                    // `peer_ids` here would silently disable that cleanup and re-leak the
+                    // gauge (the exact #1092 class, for PEER_CONNECTIONS_TOTAL).
                     info.to_peers.remove(peer_id);
                     info.to_peer_display_names.remove(peer_id);
-                    info.peer_ids.remove(peer_id);
                 }
                 if !departed.is_empty() {
                     debug!(
@@ -2777,7 +2784,23 @@ mod tests {
             "peer_a series must be retained while still reported"
         );
 
-        // The session tracker must no longer track peer_b (so it isn't re-pruned).
+        // Regression guard: the meeting-scoped PEER_CONNECTIONS_TOTAL{meeting, peer_b}
+        // must SURVIVE the per-reporter prune. It is keyed (meeting_id, peer_id) and is
+        // shared across reporters, so it is cleaned up ONLY on whole-session reap (which
+        // iterates `peer_ids`). If the prune block re-adds `info.peer_ids.remove(peer_id)`,
+        // peer_b drops out of every live reporter's `peer_ids` and this gauge is orphaned
+        // forever — the exact frozen-gauge leak class #1092 fixes. This assertion fails
+        // if that line is re-introduced.
+        let conn_labels_b = [("meeting_id", meeting_id), ("peer_id", "peer_b_1092")];
+        assert!(
+            series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must survive the per-reporter prune \
+             (removed only on whole-session reap, which iterates peer_ids)"
+        );
+
+        // The session tracker must no longer track peer_b in the per-pair sets (so its
+        // per-pair series aren't re-written), but MUST retain it in `peer_ids` so the
+        // whole-session reap still removes PEER_CONNECTIONS_TOTAL{meeting, peer_b}.
         {
             let key = format!("{meeting_id}_{session_id}_{reporter}");
             let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -2791,7 +2814,11 @@ mod tests {
                 "peer_a must remain in to_peers"
             );
             assert!(!info.to_peer_display_names.contains_key("peer_b_1092"));
-            assert!(!info.peer_ids.contains("peer_b_1092"));
+            assert!(
+                info.peer_ids.contains("peer_b_1092"),
+                "peer_b must REMAIN in peer_ids so whole-session reap removes \
+                 PEER_CONNECTIONS_TOTAL{{meeting, peer_b}}"
+            );
         }
 
         // Packet 3: reporter sees NOBODY (empty peer_stats). peer_a must be pruned
@@ -2803,7 +2830,7 @@ mod tests {
             !series_exists("videocall_neteq_packets_awaiting_decode", &labels_a),
             "peer_a series must be pruned when the reporter sees nobody (empty peer_stats)"
         );
-        {
+        let session_snapshot = {
             let key = format!("{meeting_id}_{session_id}_{reporter}");
             let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
             let info = guard.get(&key).expect("session must still be tracked");
@@ -2811,6 +2838,36 @@ mod tests {
                 info.to_peers.is_empty(),
                 "all peers must be pruned after an empty packet"
             );
-        }
+            // Even with every per-pair set emptied, `peer_ids` still holds the peers
+            // this session ever connected to — that is what drives the meeting-scoped
+            // PEER_CONNECTIONS_TOTAL cleanup at reap.
+            assert!(
+                info.peer_ids.contains("peer_b_1092") && info.peer_ids.contains("peer_a_1092"),
+                "peer_ids must retain all ever-seen peers across per-packet prunes"
+            );
+            info.clone()
+        };
+
+        // PEER_CONNECTIONS_TOTAL{meeting, peer_b} is STILL present after all per-packet
+        // prunes (it is removed only on whole-session reap).
+        assert!(
+            series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must persist until whole-session reap"
+        );
+
+        // End-to-end reap: removing the session must now delete PEER_CONNECTIONS_TOTAL
+        // for BOTH peers — proving the retained `peer_ids` actually drives that cleanup.
+        // Under the #1092 prune-block bug (peer_ids.remove in the prune), peer_b would
+        // have been dropped from peer_ids before this point and this gauge would leak.
+        remove_session_metrics(&session_snapshot);
+        assert!(
+            !series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must be removed on whole-session reap"
+        );
+        let conn_labels_a = [("meeting_id", meeting_id), ("peer_id", "peer_a_1092")];
+        assert!(
+            !series_exists("videocall_peer_connections_total", &conn_labels_a),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_a}} must be removed on whole-session reap"
+        );
     }
 }

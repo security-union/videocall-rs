@@ -133,8 +133,11 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
 ///   device is at all marginal: `cores < 6` (this absorbs the old StrongWarn
 ///   floor, and the old Block floor of `cores < 4` / unknown cores `== 0`
 ///   collapses into it), OR an older Intel Mac (see [`is_older_intel_mac`]), OR
-///   a benchmark `score < 5000`.
-/// * **2 layers** for a non-marginal device with `5000 <= score < 30000`.
+///   a benchmark `score < 1000`. The score threshold is deliberately low
+///   (#1135) so the score gate is near-inert — `cores < 6` and the
+///   older-Intel-Mac rule are the real multi-layer guards (see the const
+///   rationale below); the fleet-minimum score is ~1126.
+/// * **2 layers** for a non-marginal device with `1000 <= score < 30000`.
 /// * **3 layers** for a non-marginal device with `score >= 30000`.
 ///
 /// Note this is only the *capability ceiling*. The effective layer count the
@@ -149,7 +152,16 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
 /// dead code on wasm or in the host test build.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn max_simulcast_layers(cores: u32, platform: &str, score: u32) -> u32 {
-    const SCORE_FOR_2_LAYERS: u32 = 5000;
+    // Intentionally low so the score gate is *near-inert* (#1135). The 5000
+    // threshold gated ~87% of the fleet down to a single video layer, flooding
+    // every receiver's decoder with one medium-quality stream from each
+    // publisher. The fleet-minimum benchmark score is ~1126, so 1000 lets
+    // virtually every device that is otherwise non-marginal emit 2 layers. The
+    // REAL multi-layer guards are now `cores < 6` and the older-Intel-Mac rule
+    // (the catastrophic main-thread-stall profiles from #890 / #562) — not the
+    // benchmark. `score < 1000` only catches a device so slow it would stall on
+    // any encode workload regardless of layer count.
+    const SCORE_FOR_2_LAYERS: u32 = 1000;
     const SCORE_FOR_3_LAYERS: u32 = 30000;
 
     // `cores == 0` means navigator.hardwareConcurrency was unavailable /
@@ -166,7 +178,7 @@ pub fn max_simulcast_layers(cores: u32, platform: &str, score: u32) -> u32 {
     if score >= SCORE_FOR_3_LAYERS {
         3
     } else {
-        // Not marginal, 5000 <= score < 30000.
+        // Not marginal, 1000 <= score < 30000 (#1135).
         2
     }
 }
@@ -384,13 +396,21 @@ mod tests {
     #[test]
     fn simulcast_low_score_is_one_layer() {
         // Capable cores but score just below the 2-layer threshold → 1.
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 4999), 1);
+        // Pinned to the #1135 threshold (1000): 999 is the highest score that
+        // still gates to a single layer. If SCORE_FOR_2_LAYERS were reverted to
+        // 5000 this would (wrongly) return 2 and FAIL — that is the guard.
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 999), 1);
     }
 
     #[test]
     fn simulcast_mid_score_is_two_layers() {
-        // Lower boundary of the 2-layer band (inclusive).
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 5000), 2);
+        // Lower boundary of the 2-layer band (inclusive) — #1135 lowered this to
+        // 1000. score == 1000 MUST yield 2 layers; this is the load-bearing pin
+        // for the lowered threshold (it FAILS if the const reverts to 5000,
+        // because 1000 would then be marginal → 1 layer).
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 1000), 2);
+        // A representative fleet-minimum score (~1126) also yields 2 layers.
+        assert_eq!(max_simulcast_layers(8, "Windows 10", 1126), 2);
         // Just below the 3-layer threshold stays at 2.
         assert_eq!(max_simulcast_layers(8, "Windows 10", 29_999), 2);
     }
@@ -430,8 +450,10 @@ mod tests {
             "older Intel Mac gated to 1"
         );
 
-        // Low-benchmark capable device → ceiling 1 → effective 1.
-        let low_score = max_simulcast_layers(8, "Windows 10", 4999);
+        // Low-benchmark capable device → ceiling 1 → effective 1. Below the
+        // #1135 threshold (1000): only a device this slow still gates to 1 on
+        // score alone.
+        let low_score = max_simulcast_layers(8, "Windows 10", 999);
         assert_eq!(
             DEFAULT_FLAG.min(low_score),
             1,
@@ -439,7 +461,8 @@ mod tests {
         );
 
         // Mid device → ceiling 2 → effective 2 (default flag does not force 3).
-        let mid = max_simulcast_layers(8, "Windows 10", 5000);
+        // At the #1135 lower boundary (1000).
+        let mid = max_simulcast_layers(8, "Windows 10", 1000);
         assert_eq!(DEFAULT_FLAG.min(mid), 2, "mid device runs 2 layers");
 
         // Capable device → ceiling 3 → effective 3 (default-ON delivers full ladder).

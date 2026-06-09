@@ -445,6 +445,21 @@ pub struct CameraEncoder {
     /// count hits 0 and the loop exits cleanly — restoring the pre-#1108 lifetime
     /// where the loop ended when the diagnostics channel closed.
     control_loop_liveness: Rc<()>,
+    /// Single-layer "pin to the `low` rung" gate (issue #1136). `true` when this
+    /// publisher is in single-stream mode (`effective_layers == 1`) AND the call
+    /// has **more than 3 other peers** — the flooding regime where one adaptive
+    /// (medium-tier) stream is heavy on every receiver's decoder. When set, the
+    /// single-stream encode path caps resolution/bitrate to the `low` rung
+    /// (640×360 + low ideal) instead of the adaptive tier; when clear it keeps
+    /// the existing adaptive behavior (≤3 peers, or any simulcast publisher).
+    ///
+    /// Borrow-safe bridge (atomic) between the AQ control-loop task — which
+    /// reads the LIVE peer count each tick and owns the gate decision — and the
+    /// encode-loop task, which reads it per frame and applies it. The decision
+    /// is re-evaluated every tick, so the pin engages/releases as peers join or
+    /// leave mid-call (it is NOT latched at cold start). In simulcast mode
+    /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
+    single_layer_low_pin: Rc<AtomicBool>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -483,6 +498,33 @@ fn clamp_layer_count(max_layers: u32) -> u32 {
 #[inline]
 fn frame_is_healthy(base_ok: bool) -> bool {
     base_ok
+}
+
+/// Threshold (number of OTHER peers) above which a single-layer publisher is
+/// pinned to the `low` rung (issue #1136).
+///
+/// `> 3 others` means the local publisher plus more than 3 remote participants —
+/// i.e. a call of 5+ where one adaptive medium-tier stream from each single-layer
+/// publisher is heavy on every receiver's decoder.
+const SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD: usize = 3;
+
+/// Decide whether a single-layer publisher should pin its lone stream to the
+/// `low` rung (issue #1136).
+///
+/// Pins iff BOTH hold:
+/// * the publisher is in single-stream mode (`effective_layers == 1`) — a
+///   simulcast publisher already lets each receiver pull the cheapest rung its
+///   downlink can sustain, so the pin would be redundant and is suppressed; and
+/// * the call has **more than 3 other peers** (`other_peer_count >
+///   SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD`). `other_peer_count` is the number of
+///   REMOTE peers (the relay never echoes the sender's own packets, so the local
+///   publisher is NOT counted) — exactly the ">3 others" semantics #1136 wants.
+///
+/// Pure function (no atomics / DOM) so the threshold is host-testable and a
+/// mutation of the comparison or the layer gate fails a unit test.
+#[inline]
+fn should_pin_single_layer_low(effective_layers: u32, other_peer_count: usize) -> bool {
+    effective_layers == 1 && other_peer_count > SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD
 }
 
 impl CameraEncoder {
@@ -560,6 +602,10 @@ impl CameraEncoder {
             // sole strong owner; the self-tick loop holds a Weak and exits when
             // this drops (encoder torn down on Host unmount).
             control_loop_liveness: Rc::new(()),
+            // Single-layer low-rung pin (issue #1136). Starts cleared; the AQ
+            // control loop sets it once it observes single-stream mode + >3
+            // peers. No effect in simulcast mode.
+            single_layer_low_pin: Rc::new(AtomicBool::new(false)),
         }
     }
 
@@ -622,6 +668,21 @@ impl CameraEncoder {
         // CameraEncoder is dropped (Host unmount). Without this, the
         // `spawn_local` future is immortal and leaks per remount.
         let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
+        // Single-layer low-rung pin gate (issue #1136). The loop reads the LIVE
+        // peer count from the client each tick (single-stream mode only) and
+        // writes the gate decision into this atomic for the encode loop. We
+        // clone the client (its inner is an `Rc<RefCell<…>>`, and the encode
+        // loop already holds a strong clone for `send_media_packet`, so this is
+        // the established lifetime pattern). `sorted_peer_keys()` is a
+        // non-blocking `try_borrow` read — if the inner is momentarily busy it
+        // returns an empty Vec, so `other_peers == 0` and the gate stores
+        // `false` (pin released) for that tick rather than blocking the loop;
+        // the next tick (≤1s later) re-reads the real count and self-corrects.
+        // In practice the borrow never fails here: all `inner` borrows are
+        // short and non-blocking and none is held across an `.await`, so on
+        // single-threaded wasm no borrow is active mid-tick.
+        let peer_count_client = self.client.clone();
+        let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -678,6 +739,28 @@ impl CameraEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+
+                // Single-layer low-rung pin gate (issue #1136). ONLY meaningful
+                // in single-stream mode (n_layers == 1): a lone adaptive
+                // (medium-tier) stream is heavy on every receiver's decoder, so
+                // once the call has more than 3 OTHER peers we pin this
+                // publisher's single stream to the `low` rung (640×360) instead.
+                // `sorted_peer_keys()` returns REMOTE peers only (the relay never
+                // echoes our own packets back, and session_id 0 / self is never
+                // inserted into the peer decode manager), so its length is the
+                // count of OTHERS — exactly the ">3 others" semantics #1136 wants
+                // (a 5+-participant call). Read LIVE each tick so the pin engages
+                // when peers grow past 3 and releases when they drop back. In
+                // simulcast mode (n_layers > 1) the pin stays cleared — the
+                // receiver-driven layer chooser already sheds cost there.
+                if n_layers == 1 {
+                    let other_peers = peer_count_client.sorted_peer_keys().len();
+                    single_layer_low_pin.store(
+                        should_pin_single_layer_low(n_layers as u32, other_peers),
+                        Ordering::Relaxed,
+                    );
+                }
+
                 // Check for screen sharing state transitions and coordinate
                 // camera quality to avoid bandwidth contention.
                 let screen_active = screen_sharing_active.load(Ordering::Acquire);
@@ -1247,6 +1330,11 @@ impl CameraEncoder {
         // Sender encoder backpressure (issue #1108, Phase B): the encode loop
         // WRITES the max active-layer encode_queue_size() here each frame.
         let shared_encoder_queue_depth = self.shared_encoder_queue_depth.clone();
+        // Single-layer low-rung pin (issue #1136): the AQ control loop WRITES
+        // this gate (single-stream + >3 peers); the single-stream encode path
+        // READS it per frame to cap resolution/bitrate to the `low` rung. Always
+        // `false` in simulcast mode, so the read is a no-op there.
+        let single_layer_low_pin = self.single_layer_low_pin.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
@@ -1664,6 +1752,16 @@ impl CameraEncoder {
                 // single shared tier atomics (the AQ controller is per-publisher
                 // in PR A; per-layer AQ lands in PR B).
 
+                // The `low` simulcast rung (640×360 / ideal 400 kbps), sourced
+                // from the AQ ladder's single source of truth — `simulcast_layers(1)`
+                // resolves to exactly `[low]`. Used by the single-layer >3-peer
+                // pin (issue #1136) below as the ceiling on the single stream; no
+                // magic numbers. Only meaningful for n_layers == 1.
+                let low_rung = &simulcast_layers(1)[0];
+                let low_rung_w = low_rung.max_width;
+                let low_rung_h = low_rung.max_height;
+                let low_rung_bitrate_bps = low_rung.ideal_bitrate_kbps * 1000;
+
                 // Cache tier-controlled values (shared across layers).
                 let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
                 let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
@@ -1729,9 +1827,29 @@ impl CameraEncoder {
                     // Single-stream tier dims + shared bitrate (only meaningful
                     // when NOT simulcast — the adaptive single-stream resolution
                     // path is preserved verbatim for n_layers == 1).
-                    let new_tier_w = tier_max_width.load(Ordering::Relaxed);
-                    let new_tier_h = tier_max_height.load(Ordering::Relaxed);
-                    let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+                    let mut new_tier_w = tier_max_width.load(Ordering::Relaxed);
+                    let mut new_tier_h = tier_max_height.load(Ordering::Relaxed);
+                    let mut new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+
+                    // Single-layer low-rung pin (issue #1136). When this lone
+                    // stream is in the flooding regime (single-stream + >3 peers,
+                    // decided LIVE by the AQ control loop), cap the effective tier
+                    // ceiling and bitrate to the `low` rung so every receiver
+                    // decodes 640×360 instead of an adaptive medium-tier stream.
+                    // Applied as a `min` CEILING, not a hard pin: if the network
+                    // already drove the adaptive tier BELOW `low` we keep the
+                    // smaller value (never force quality back UP). Reading the
+                    // gate per frame means a peer count crossing 3 mid-call
+                    // changes the effective dims here, which trips
+                    // `tier_dims_changed` below and reconfigures the encoder —
+                    // and dropping back to ≤3 peers restores the adaptive tier.
+                    // No-op in simulcast mode (pin stays cleared).
+                    if !simulcast && single_layer_low_pin.load(Ordering::Relaxed) {
+                        new_tier_w = new_tier_w.min(low_rung_w);
+                        new_tier_h = new_tier_h.min(low_rung_h);
+                        new_current_bitrate = new_current_bitrate.min(low_rung_bitrate_bps);
+                    }
+
                     let tier_dims_changed = !simulcast
                         && (new_tier_w != local_tier_max_width
                             || new_tier_h != local_tier_max_height);
@@ -2226,7 +2344,8 @@ impl CameraEncoder {
 mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, frame_is_healthy,
-        is_fatal_encoder_error_message, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        is_fatal_encoder_error_message, should_pin_single_layer_low, SimulcastLayerInfo,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD,
     };
 
     #[test]
@@ -2385,6 +2504,61 @@ mod tests {
         let n_layers = clamp_layer_count(1) as usize;
         let ids: Vec<u32> = (0..n_layers).map(|i| i as u32).collect();
         assert_eq!(ids, vec![0]);
+    }
+
+    // --- single-layer low-rung pin gate (issue #1136) -------------------
+
+    #[test]
+    fn single_layer_low_pin_engages_only_above_three_other_peers() {
+        // Single-stream (effective_layers == 1): the pin engages strictly ABOVE
+        // 3 other peers. These assertions pin the boundary so a mutation of the
+        // comparison (`>` → `>=`, or the threshold 3 → 2/4) FAILS the test.
+        assert!(
+            !should_pin_single_layer_low(1, 0),
+            "no peers → no pin (solo call)"
+        );
+        assert!(
+            !should_pin_single_layer_low(1, 3),
+            "exactly 3 other peers (4-party call) → NOT yet pinned"
+        );
+        assert!(
+            should_pin_single_layer_low(1, 4),
+            "4 other peers (5-party call) → pinned"
+        );
+        assert!(should_pin_single_layer_low(1, 50), "large call → pinned");
+    }
+
+    #[test]
+    fn single_layer_low_pin_never_engages_in_simulcast_mode() {
+        // effective_layers > 1: the receiver-driven layer chooser already sheds
+        // cost, so the pin must NEVER engage regardless of peer count. A mutation
+        // dropping the `effective_layers == 1` guard FAILS here.
+        for layers in [2u32, 3] {
+            for peers in [0usize, 4, 100] {
+                assert!(
+                    !should_pin_single_layer_low(layers, peers),
+                    "simulcast ({layers} layers) must never pin (peers={peers})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_layer_low_pin_threshold_is_three_others() {
+        // The threshold value itself: ">3 others" == "publisher + 4+ others" ==
+        // a 5+-participant call. Pin this constant so the documented semantics
+        // and the gate stay in lockstep.
+        assert_eq!(SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD, 3);
+        // Lockstep with the gate: threshold is the largest peer count that does
+        // NOT pin, and threshold+1 is the smallest that does.
+        assert!(!should_pin_single_layer_low(
+            1,
+            SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD
+        ));
+        assert!(should_pin_single_layer_low(
+            1,
+            SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD + 1
+        ));
     }
 }
 

@@ -24,6 +24,15 @@ import { chromium } from "@playwright/test";
  *
  * In Playwright every browser defaults to "Auto" -> WebTransport, so the
  * remote peer should always report WT in this configuration.
+ *
+ * This spec ALSO covers the popup's per-peer "Layers" section, which surfaces
+ * the SAME per-peer simulcast RECEIVE breakdown the Performance dialog's
+ * per-peer receive rows expose (issue: tile signal-meter popup ↔ perf dialog
+ * layer parity). It reuses the perf-dialog markup verbatim — `.perf-peer-row`,
+ * `.perf-q-dot--{optimal|medium|low}`, `.perf-peer-row__metric` ("L i / n",
+ * 1-based), and the optional `.perf-reason-chip--{network|setting|sender}`. We
+ * assert the video layer row appears for the receiving host, carries a shared
+ * quality-dot modifier class, and shows the 1-based "L i / n" metric.
  */
 
 const DEFAULT_UI_URL = "http://localhost:3001";
@@ -197,6 +206,42 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
 
       // The E2E stack may have WebTransport disabled; accept either transport.
       await expect(badge).toHaveText(expectedTransports);
+
+      // ── Layers section (per-peer simulcast RECEIVE breakdown) ──────────
+      // The popup now surfaces the SAME per-peer layer rows the Performance
+      // dialog's per-peer receive section exposes — quality dot + metric +
+      // (when below optimal) a reason chip. The host is receiving the guest's
+      // camera, so the video layer row must appear once decode + the ~1 Hz
+      // diagnostics refresh have populated `per_peer_received_snapshots`.
+      const layers = popup.locator(".signal-popup-layers");
+      await expect(layers).toBeVisible({ timeout: 30_000 });
+
+      // The video layer row, reusing the perf-dialog `.perf-peer-row` markup.
+      const videoRow = layers.locator(".signal-popup-layer-row").filter({
+        has: hostPage.locator('[data-testid$="-layer-video-metric"]'),
+      });
+      await expect(videoRow).toHaveCount(1, { timeout: 30_000 });
+
+      // Quality dot carries one of the shared perf-panel state modifiers —
+      // the SAME classes the perf dialog uses, proving identical look.
+      const videoDot = videoRow.locator(".perf-q-dot");
+      await expect(videoDot).toBeVisible();
+      const dotClass = (await videoDot.getAttribute("class")) || "";
+      expect(dotClass).toMatch(/\bperf-q-dot--(optimal|medium|low)\b/);
+
+      // Metric text is 1-based "L i / n" (e.g. "540p · ~600k · L2/3"), the
+      // exact shape `peer_row_metric` produces for the perf dialog.
+      const videoMetric = videoRow.locator(".perf-peer-row__metric");
+      await expect(videoMetric).toHaveText(/L\d+\/\d+/, { timeout: 30_000 });
+
+      // When the row is below the full-ladder top a tinted reason chip appears,
+      // again reusing the perf-dialog chip classes. The chip is optional (an
+      // optimal stream has none), so assert the class shape only when present.
+      const reasonChip = videoRow.locator(".perf-reason-chip");
+      if ((await reasonChip.count()) > 0) {
+        const chipClass = (await reasonChip.first().getAttribute("class")) || "";
+        expect(chipClass).toMatch(/\bperf-reason-chip--(network|setting|sender)\b/);
+      }
     } finally {
       for (const m of members) {
         if (m.page) {

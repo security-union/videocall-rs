@@ -6498,6 +6498,38 @@ html[data-theme="light"]
 .legend-help-text p {
   margin: 3px 0;
 }
+/* ── Per-peer simulcast RECEIVE "Layers" section ──────────────────────────
+   Renders the SAME per-peer rows as the Performance dialog (the `.perf-peer-row`
+   / `.perf-q-dot` / `.perf-reason-chip` classes are shared verbatim, so the
+   quality dot, metric, and reason chip look identical across both surfaces).
+   Only the section wrapper + header are popup-specific layout. All color comes
+   from the reused classes' `--perf-q-*` / `--text-*` tokens — no raw literals. */
+.signal-popup-layers {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--signal-popup-border);
+}
+.signal-popup-layers__head {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.signal-popup-layers__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* The kind label ("video" / "audio" / "shared content") sits where the perf
+   dialog puts the peer name; capitalize the first letter for readability. */
+.signal-popup-layer-row__kind {
+  text-transform: capitalize;
+}
 .signal-chart-tooltip {
   position: fixed;
   background: var(--tooltip-bg);

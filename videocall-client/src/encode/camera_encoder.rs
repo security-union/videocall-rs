@@ -455,19 +455,26 @@ pub struct CameraEncoder {
     /// count hits 0 and the loop exits cleanly — restoring the pre-#1108 lifetime
     /// where the loop ended when the diagnostics channel closed.
     control_loop_liveness: Rc<()>,
-    /// Single-layer "pin to the `low` rung" gate (issue #1136). `true` when this
-    /// publisher is in single-stream mode (`effective_layers == 1`) AND the call
-    /// has **more than 3 other peers** — the flooding regime where one adaptive
-    /// (medium-tier) stream is heavy on every receiver's decoder. When set, the
-    /// single-stream encode path caps resolution/bitrate to the `low` rung
-    /// (640×360 + low ideal) instead of the adaptive tier; when clear it keeps
-    /// the existing adaptive behavior (≤3 peers, or any simulcast publisher).
+    /// Single-layer "pin to the `low` rung" gate (issue #1136, hysteretic per
+    /// #1156). `true` when this publisher is in single-stream mode
+    /// (`effective_layers == 1`) AND the call has **more than 3 other peers** —
+    /// the flooding regime where one adaptive (medium-tier) stream is heavy on
+    /// every receiver's decoder. When set, the single-stream encode path caps
+    /// resolution/bitrate to the `low` rung (640×360 + low ideal) instead of the
+    /// adaptive tier; when clear it keeps the existing adaptive behavior.
     ///
-    /// Borrow-safe bridge (atomic) between the AQ control-loop task — which
-    /// reads the LIVE peer count each tick and owns the gate decision — and the
-    /// encode-loop task, which reads it per frame and applies it. The decision
-    /// is re-evaluated every tick, so the pin engages/releases as peers join or
-    /// leave mid-call (it is NOT latched at cold start). In simulcast mode
+    /// **Hysteresis (#1156):** the gate ENGAGES at `> 3` others and RELEASES at
+    /// `< 3` others, HOLDING its prior value at exactly 3. The AQ loop feeds this
+    /// atomic's current value back into the decision so a participant count
+    /// oscillating 3 ↔ 4 cannot flip the pin every tick — each flip would change
+    /// the effective tier dims and force a keyframe-emitting reconfigure (up to
+    /// 1/sec on a weak uplink).
+    ///
+    /// Borrow-safe bridge (atomic) between the AQ control-loop task — which reads
+    /// the LIVE peer count each tick and owns the gate decision — and the
+    /// encode-loop task, which reads it per frame and applies it. The decision is
+    /// re-evaluated every tick, so the pin engages/releases as peers join or leave
+    /// mid-call (it is NOT latched at cold start). In simulcast mode
     /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
     single_layer_low_pin: Rc<AtomicBool>,
 }
@@ -600,31 +607,67 @@ fn format_layer_transition(prev: usize, cur: usize, layers: &[LayerView]) -> Str
     format!("Simulcast layer change: active {prev}->{cur} (reason={reason}) | {detail}")
 }
 
-/// Threshold (number of OTHER peers) above which a single-layer publisher is
-/// pinned to the `low` rung (issue #1136).
+/// Peer-count threshold at/above which the single-layer low-rung pin ENGAGES
+/// (issue #1136). `> 3 others` means the local publisher plus more than 3 remote
+/// participants — i.e. a call of 5+ where one adaptive medium-tier stream from
+/// each single-layer publisher is heavy on every receiver's decoder.
+const SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD: usize = 3;
+
+/// Peer-count threshold below which the single-layer low-rung pin RELEASES
+/// (issue #1156 hysteresis). The pin engages at `> ENGAGE` (≥ 4 others) and only
+/// releases at `< RELEASE` (≤ 2 others); at exactly 3 it HOLDS its current state.
 ///
-/// `> 3 others` means the local publisher plus more than 3 remote participants —
-/// i.e. a call of 5+ where one adaptive medium-tier stream from each single-layer
-/// publisher is heavy on every receiver's decoder.
-const SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD: usize = 3;
+/// Equal to the engage threshold, which yields a one-peer-wide dead-band at
+/// exactly 3 others. Without it the gate flips every AQ tick (1 Hz) when the
+/// participant count oscillates 3 ↔ 4 — each flip changes the effective
+/// `new_tier_w/h`, trips `tier_dims_changed`, and forces a full
+/// `VideoEncoder.configure()` + keyframe, so sustained boundary churn could emit
+/// up to one keyframe burst PER SECOND on a weak uplink (#1156). The band makes
+/// exact-boundary oscillation a no-op for the pin.
+const SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD: usize = 3;
 
 /// Decide whether a single-layer publisher should pin its lone stream to the
-/// `low` rung (issue #1136).
+/// `low` rung (issue #1136), with engage/release hysteresis (issue #1156).
 ///
-/// Pins iff BOTH hold:
-/// * the publisher is in single-stream mode (`effective_layers == 1`) — a
-///   simulcast publisher already lets each receiver pull the cheapest rung its
-///   downlink can sustain, so the pin would be redundant and is suppressed; and
-/// * the call has **more than 3 other peers** (`other_peer_count >
-///   SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD`). `other_peer_count` is the number of
-///   REMOTE peers (the relay never echoes the sender's own packets, so the local
-///   publisher is NOT counted) — exactly the ">3 others" semantics #1136 wants.
+/// Returns the NEXT pin state given the CURRENT state and live inputs. Pins iff
+/// the publisher is in single-stream mode (`effective_layers == 1`) — a simulcast
+/// publisher already lets each receiver pull the cheapest rung its downlink can
+/// sustain, so the pin would be redundant and is suppressed — AND the peer count
+/// crosses the hysteresis band:
 ///
-/// Pure function (no atomics / DOM) so the threshold is host-testable and a
-/// mutation of the comparison or the layer gate fails a unit test.
+/// * `other_peer_count > SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD` (≥ 4) → ENGAGE.
+/// * `other_peer_count < SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD` (≤ 2) → RELEASE.
+/// * in between (exactly 3) → HOLD `currently_pinned` (the dead-band that stops
+///   3 ↔ 4 oscillation from flipping the pin every tick — issue #1156).
+///
+/// `other_peer_count` is the number of REMOTE peers (the relay never echoes the
+/// sender's own packets, so the local publisher is NOT counted) — exactly the
+/// ">3 others" engage semantics #1136 wants. In simulcast mode the result is
+/// always `false` regardless of `currently_pinned`, so a publisher that gains
+/// layers releases the pin cleanly.
+///
+/// Pure function (no atomics / DOM) so the band is host-testable and a mutation
+/// of either threshold, the comparison direction, or the layer gate fails a unit
+/// test.
 #[inline]
-fn should_pin_single_layer_low(effective_layers: u32, other_peer_count: usize) -> bool {
-    effective_layers == 1 && other_peer_count > SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD
+fn should_pin_single_layer_low(
+    effective_layers: u32,
+    other_peer_count: usize,
+    currently_pinned: bool,
+) -> bool {
+    if effective_layers != 1 {
+        // Simulcast publisher: the pin never applies — release unconditionally.
+        return false;
+    }
+    if other_peer_count > SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD {
+        true
+    } else if other_peer_count < SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD {
+        false
+    } else {
+        // Dead-band (exactly at the boundary): hold the prior decision so a
+        // count oscillating across the boundary cannot flip the pin per-tick.
+        currently_pinned
+    }
 }
 
 impl CameraEncoder {
@@ -783,19 +826,20 @@ impl CameraEncoder {
         // CameraEncoder is dropped (Host unmount). Without this, the
         // `spawn_local` future is immortal and leaks per remount.
         let control_loop_liveness = Rc::downgrade(&self.control_loop_liveness);
-        // Single-layer low-rung pin gate (issue #1136). The loop reads the LIVE
-        // peer count from the client each tick (single-stream mode only) and
-        // writes the gate decision into this atomic for the encode loop. We
-        // clone the client (its inner is an `Rc<RefCell<…>>`, and the encode
-        // loop already holds a strong clone for `send_media_packet`, so this is
-        // the established lifetime pattern). `sorted_peer_keys()` is a
-        // non-blocking `try_borrow` read — if the inner is momentarily busy it
-        // returns an empty Vec, so `other_peers == 0` and the gate stores
-        // `false` (pin released) for that tick rather than blocking the loop;
-        // the next tick (≤1s later) re-reads the real count and self-corrects.
-        // In practice the borrow never fails here: all `inner` borrows are
-        // short and non-blocking and none is held across an `.await`, so on
-        // single-threaded wasm no borrow is active mid-tick.
+        // Single-layer low-rung pin gate (issue #1136, hysteretic per #1156). The
+        // loop reads the LIVE peer count from the client each tick (single-stream
+        // mode only) and writes the gate decision into this atomic for the encode
+        // loop. We clone the client (its inner is an `Rc<RefCell<…>>`, and the
+        // encode loop already holds a strong clone for `send_media_packet`, so
+        // this is the established lifetime pattern). `peer_count()` is a
+        // non-blocking `try_borrow` read that counts off the cached key Rc WITHOUT
+        // cloning it (#1156) — if the inner is momentarily busy it returns `0`, so
+        // `other_peers == 0` is below the release threshold and the gate stores
+        // `false` (pin released) for that tick rather than blocking the loop; the
+        // next tick (≤1s later) re-reads the real count and self-corrects. In
+        // practice the borrow never fails here: all `inner` borrows are short and
+        // non-blocking and none is held across an `.await`, so on single-threaded
+        // wasm no borrow is active mid-tick.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -837,6 +881,14 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
+            // Independent sliding window for the WebTransport uplink-backpressure
+            // self-trigger (#1104). Kept SEPARATE from the WS window above so the
+            // two transports' signals never interfere; on a WS connection the WT
+            // counter stays flat at 0 (no unistream sends) and this block is a
+            // no-op, symmetric to how the WS block is a no-op under WebTransport.
+            let mut last_wt_drop_snapshot: u64 =
+                videocall_transport::webtransport::unistream_drop_count();
+            let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder: this `spawn_local` future is NOT bound
@@ -862,23 +914,33 @@ impl CameraEncoder {
                 }
                 let now = js_sys::Date::now();
 
-                // Single-layer low-rung pin gate (issue #1136). ONLY meaningful
-                // in single-stream mode (n_layers == 1): a lone adaptive
-                // (medium-tier) stream is heavy on every receiver's decoder, so
-                // once the call has more than 3 OTHER peers we pin this
+                // Single-layer low-rung pin gate (issue #1136 + #1156 hysteresis).
+                // ONLY meaningful in single-stream mode (n_layers == 1): a lone
+                // adaptive (medium-tier) stream is heavy on every receiver's
+                // decoder, so once the call has more than 3 OTHER peers we pin this
                 // publisher's single stream to the `low` rung (640×360) instead.
-                // `sorted_peer_keys()` returns REMOTE peers only (the relay never
-                // echoes our own packets back, and session_id 0 / self is never
-                // inserted into the peer decode manager), so its length is the
-                // count of OTHERS — exactly the ">3 others" semantics #1136 wants
-                // (a 5+-participant call). Read LIVE each tick so the pin engages
-                // when peers grow past 3 and releases when they drop back. In
-                // simulcast mode (n_layers > 1) the pin stays cleared — the
-                // receiver-driven layer chooser already sheds cost there.
+                // `peer_count()` returns the count of REMOTE peers only (the relay
+                // never echoes our own packets back, and session_id 0 / self is
+                // never inserted into the peer decode manager) — exactly the
+                // ">3 others" engage semantics #1136 wants (a 5+-participant call).
+                // It reads `.len()` off the cached `Rc<Vec<String>>` WITHOUT
+                // cloning it, so this 1 Hz hot loop no longer allocates a
+                // `Vec<String>` per tick just to count peers (#1156).
+                //
+                // The decision is hysteretic (#1156): the pin engages at > 3 and
+                // releases at < 3, holding its prior state at exactly 3. Feeding
+                // the CURRENT atomic value as `currently_pinned` gives the dead-band
+                // its memory, so a participant count oscillating 3 ↔ 4 cannot flip
+                // the pin every tick (each flip would change `new_tier_w/h`, trip
+                // `tier_dims_changed`, and force a keyframe-emitting reconfigure —
+                // up to 1 keyframe/sec on a weak uplink). In simulcast mode
+                // (n_layers > 1) the pin stays cleared — the receiver-driven layer
+                // chooser already sheds cost there.
                 if n_layers == 1 {
-                    let other_peers = peer_count_client.sorted_peer_keys().len();
+                    let other_peers = peer_count_client.peer_count();
+                    let currently_pinned = single_layer_low_pin.load(Ordering::Relaxed);
                     single_layer_low_pin.store(
-                        should_pin_single_layer_low(n_layers as u32, other_peers),
+                        should_pin_single_layer_low(n_layers as u32, other_peers, currently_pinned),
                         Ordering::Relaxed,
                     );
                 }
@@ -956,6 +1018,55 @@ impl CameraEncoder {
                         }
                         last_ws_drop_snapshot = current_ws_drops;
                         ws_drop_window_start_ms = now;
+                    }
+                }
+
+                // Client-side WebTransport uplink-backpressure detection
+                // (issue #1104, 2026-06-09 meeting_sync analysis).
+                //
+                // The WS block above is a no-op for WebTransport users
+                // (websocket_drop_count() is always 0 on WT). On WebTransport,
+                // audio/video/screen ride PERSISTENT unidirectional QUIC
+                // streams; when a media-frame write fails (stream reset / fatal
+                // backpressure) the frame is dropped and unistream_drop_count()
+                // increments. That is the true client-side WT analogue of the
+                // WS send-buffer drop — a real media frame that did not leave
+                // the uplink. (Datagrams carry only heartbeats/RTT probes, so
+                // datagram_drop_count() is NOT used here.) When a SUSTAINED
+                // cluster of drops accumulates within the window we self-shed a
+                // layer without waiting for the slower, indirect server
+                // CONGESTION signal. The window/snapshot are independent of the
+                // WS window and the server-congestion flag, and each axis sheds
+                // at most one layer per window, so the paths cannot compound
+                // into a runaway double step-down. For WebSocket users this
+                // counter stays flat at 0, so the block is a true no-op.
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                    };
+                    let current_wt_drops =
+                        videocall_transport::webtransport::unistream_drop_count();
+                    let elapsed_ms = now - wt_drop_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_drops,
+                        last_wt_drop_snapshot,
+                        elapsed_ms,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                        WT_SELF_CONGESTION_DROP_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "CameraEncoder: client WT uplink backpressure detected ({} unistream \
+                             media-frame drops in {:.0}ms), forcing video step-down",
+                            current_wt_drops.saturating_sub(last_wt_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_drop_snapshot = decision.new_snapshot;
+                        wt_drop_window_start_ms = now;
                     }
                 }
 
@@ -2349,16 +2460,24 @@ impl CameraEncoder {
                                     &video_encoder_encode_options,
                                 ) {
                                     Ok(_) => {
-                                        // Raw per-layer submission counter. NOTE: for
-                                        // N>1 this aggregates ALL layers, so it can
-                                        // overcount relative to delivered/usable frames
-                                        // (only the base layer is decoded today — see
-                                        // the `experimental_simulcast_max_layers` knob
-                                        // docs). Left as-is intentionally; it is a
-                                        // submission counter, not a health gate.
-                                        CAMERA_ENCODER_FRAMES_SUBMITTED_OK
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        // Per-frame submission counter, anchored to the
+                                        // BASE layer (`layer_id == 0`) only (#1067). At
+                                        // N>1 every source frame is encoded once per
+                                        // active simulcast layer; counting each layer's
+                                        // submission would inflate this by ~N× relative
+                                        // to the actual delivered-frame cadence (one
+                                        // logical frame per capture). Gating on the base
+                                        // layer makes the counter track real frame
+                                        // cadence regardless of N, and keeps the metric
+                                        // a single series — existing dashboards that
+                                        // `rate()` it continue to read the true fps at
+                                        // both N=1 (unchanged: the only layer IS layer 0)
+                                        // and N>1. A per-layer label was rejected because
+                                        // it would change cardinality and break those
+                                        // single-series panels.
                                         if layer.layer_id == 0 {
+                                            CAMERA_ENCODER_FRAMES_SUBMITTED_OK
+                                                .fetch_add(1, Ordering::Relaxed);
                                             base_ok = true;
                                         }
                                     }
@@ -2481,7 +2600,7 @@ mod tests {
         build_simulcast_layers, clamp_layer_count, format_layer_transition, frame_is_healthy,
         initial_active_layer_count, is_fatal_encoder_error_message, shed_reason,
         should_pin_single_layer_low, LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -2805,58 +2924,120 @@ mod tests {
         assert_eq!(ids, vec![0]);
     }
 
-    // --- single-layer low-rung pin gate (issue #1136) -------------------
+    // --- single-layer low-rung pin gate (issue #1136 + #1156 hysteresis) ----
 
     #[test]
     fn single_layer_low_pin_engages_only_above_three_other_peers() {
-        // Single-stream (effective_layers == 1): the pin engages strictly ABOVE
-        // 3 other peers. These assertions pin the boundary so a mutation of the
-        // comparison (`>` → `>=`, or the threshold 3 → 2/4) FAILS the test.
+        // Single-stream (effective_layers == 1): the pin ENGAGES strictly ABOVE 3
+        // other peers, regardless of prior state. Below the release threshold it
+        // RELEASES regardless of prior state. These pin the comparison directions
+        // and thresholds (a mutation of `>`→`>=`, the engage 3→2/4, or the release
+        // direction FAILS the test). `currently_pinned` is varied to prove the
+        // engage/release decisions are NOT prior-state-dependent.
+        for prior in [false, true] {
+            assert!(
+                !should_pin_single_layer_low(1, 0, prior),
+                "no peers → release (solo call), prior={prior}"
+            );
+            assert!(
+                !should_pin_single_layer_low(1, 2, prior),
+                "2 other peers (< release) → release, prior={prior}"
+            );
+            assert!(
+                should_pin_single_layer_low(1, 4, prior),
+                "4 other peers (> engage) → pin, prior={prior}"
+            );
+            assert!(
+                should_pin_single_layer_low(1, 50, prior),
+                "large call → pin, prior={prior}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_layer_low_pin_holds_state_in_dead_band() {
+        // #1156 hysteresis: at EXACTLY the boundary (3 others) the pin HOLDS its
+        // prior state — it neither engages nor releases. This is the property that
+        // stops 3 ↔ 4 oscillation from flipping the pin every tick. A mutation
+        // that drops the dead-band (e.g. returns a fixed bool at 3, or compares
+        // `>=`/`<=` so 3 forces a decision) FAILS one of these.
         assert!(
-            !should_pin_single_layer_low(1, 0),
-            "no peers → no pin (solo call)"
+            !should_pin_single_layer_low(1, 3, false),
+            "at the boundary while UNPINNED → stay unpinned"
         );
         assert!(
-            !should_pin_single_layer_low(1, 3),
-            "exactly 3 other peers (4-party call) → NOT yet pinned"
+            should_pin_single_layer_low(1, 3, true),
+            "at the boundary while PINNED → stay pinned"
+        );
+    }
+
+    #[test]
+    fn single_layer_low_pin_does_not_flip_on_boundary_oscillation() {
+        // #1156 ACCEPTANCE: simulate the participant count oscillating 3 ↔ 4 each
+        // AQ tick and assert the pin does NOT flip every tick. Once engaged at 4,
+        // dropping back to 3 must HOLD the pin (dead-band), so across the whole
+        // oscillation the pin flips at most ONCE (the initial engage) — not once
+        // per tick. Without the hysteresis (release == engage band) the value
+        // would toggle true/false/true/false and `flips` would equal the tick
+        // count. This is the regression guard for the per-second keyframe storm.
+        let mut pinned = false;
+        let mut flips = 0usize;
+        // Start at 3 (unpinned), then alternate 4,3,4,3,… for many ticks.
+        let counts = std::iter::once(3usize).chain((0..20).map(|i| if i % 2 == 0 { 4 } else { 3 }));
+        for c in counts {
+            let next = should_pin_single_layer_low(1, c, pinned);
+            if next != pinned {
+                flips += 1;
+            }
+            pinned = next;
+        }
+        assert_eq!(
+            flips, 1,
+            "across a sustained 3↔4 oscillation the pin must flip exactly once \
+             (the initial engage at 4), then hold — got {flips} flips"
         );
         assert!(
-            should_pin_single_layer_low(1, 4),
-            "4 other peers (5-party call) → pinned"
+            pinned,
+            "the pin must be ENGAGED after the oscillation (last high was 4)"
         );
-        assert!(should_pin_single_layer_low(1, 50), "large call → pinned");
     }
 
     #[test]
     fn single_layer_low_pin_never_engages_in_simulcast_mode() {
         // effective_layers > 1: the receiver-driven layer chooser already sheds
-        // cost, so the pin must NEVER engage regardless of peer count. A mutation
-        // dropping the `effective_layers == 1` guard FAILS here.
+        // cost, so the pin must NEVER engage regardless of peer count OR prior
+        // state. A mutation dropping the `effective_layers == 1` guard FAILS here.
         for layers in [2u32, 3] {
-            for peers in [0usize, 4, 100] {
-                assert!(
-                    !should_pin_single_layer_low(layers, peers),
-                    "simulcast ({layers} layers) must never pin (peers={peers})"
-                );
+            for peers in [0usize, 3, 4, 100] {
+                for prior in [false, true] {
+                    assert!(
+                        !should_pin_single_layer_low(layers, peers, prior),
+                        "simulcast ({layers} layers) must never pin (peers={peers}, prior={prior})"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn single_layer_low_pin_threshold_is_three_others() {
-        // The threshold value itself: ">3 others" == "publisher + 4+ others" ==
-        // a 5+-participant call. Pin this constant so the documented semantics
-        // and the gate stay in lockstep.
-        assert_eq!(SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD, 3);
-        // Lockstep with the gate: threshold is the largest peer count that does
-        // NOT pin, and threshold+1 is the smallest that does.
+        // The threshold values themselves: ">3 others" engage == "publisher + 4+
+        // others" == a 5+-participant call. Pin both constants so the documented
+        // semantics and the gate stay in lockstep. The band is one-peer-wide
+        // (engage == release == 3), so 3 is the sole dead-band count.
+        assert_eq!(SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, 3);
+        assert_eq!(SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD, 3);
+        // Lockstep with the gate at the band edges. Use prior=false so the
+        // boundary count (3) does not pin and engage(+1) does.
         assert!(!should_pin_single_layer_low(
             1,
-            SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD
+            SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+            false
         ));
         assert!(should_pin_single_layer_low(
             1,
-            SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD + 1
+            SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD + 1,
+            false
         ));
     }
 }

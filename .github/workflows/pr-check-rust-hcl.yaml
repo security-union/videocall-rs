@@ -8,13 +8,23 @@ on:
       - 'videocall-codecs/**'
       - 'videocall-types/**'
       - 'videocall-meeting-types/**'
+      - 'videocall-meeting-client/**'
       - 'videocall-transport/**'
       - 'videocall-diagnostics/**'
+      - 'videocall-aq/**'
+      - 'videocall-netsim/**'
+      - 'videocall-sdk/**'
+      - 'videocall-cli/**'
+      - 'bot/**'
+      - 'vcprobe/**'
       - 'dioxus-ui/**'
       - 'neteq/**'
       - 'protobuf/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # Trigger on edits to this workflow itself so a PR changing the Rust gate
+      # is validated by the gate it changes (matches pr-check-backend-hcl.yaml).
+      - '.github/workflows/pr-check-rust-hcl.yaml'
 
 concurrency:
   group: pr-check-rust-${{ github.event.pull_request.number }}
@@ -100,6 +110,18 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: wasm-pack test --node
+      # `wasm-pack test --node` ONLY discovers `#[wasm_bindgen_test]`. The
+      # connection-manager regression suite (reconnection, re-election,
+      # self-filter, CPU-stall RTT suppression) is ~160 plain libtest
+      # `#[test]` fns that wasm-pack silently skips. videocall-client DOES
+      # compile on the native host target (verified: `cargo test -p
+      # videocall-client --lib --no-run` builds; 279 lib tests, incl. 118
+      # connection_manager tests, pass), so run them natively here. (#1005)
+      - name: cargo test videocall-client (native libtest)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-client --lib
       - name: cargo test videocall-codecs
         working-directory: rust-repo/videocall-codecs
         env:
@@ -110,3 +132,13 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test --no-default-features --features web
+      # videocall-aq is pure host-testable arithmetic (p75 aggregation,
+      # hysteresis, layer-shed, PID). Its 180+ regression tests are plain
+      # libtest `#[test]` (only 4 are `#[wasm_bindgen_test]`), so wasm-pack
+      # would silently skip them. Run them natively here so AQ gets a real
+      # test gate, not just `cargo clippy --all`.
+      - name: cargo test videocall-aq (native)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-aq --lib

@@ -256,6 +256,64 @@ pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 /// thing #1057 removed — so keep this small.
 pub const INBOUND_MAILBOX_HEADROOM_FACTOR: usize = 2;
 
+/// The actix actor-mailbox capacity a `WsChatSession` installs in `started()`
+/// via `ctx.set_mailbox_capacity(...)` (issues #1057 + #1144).
+///
+/// SINGLE SOURCE OF TRUTH (issue #1062): `WsChatSession::started` calls THIS
+/// function, and the guard test asserts properties of THIS function — not a
+/// parallel hand-copied constant. So altering the value passed to
+/// `set_mailbox_capacity` means editing this one binding, which the test then
+/// tracks. (The guard test cannot read the capacity back off a live
+/// `WebsocketContext` without standing up NATS, so it pins the value the call
+/// site feeds; this removes the prior drift hazard where a duplicated
+/// `WS_MAILBOX_CAPACITY` test constant could diverge from `started()`.)
+pub const fn ws_mailbox_capacity() -> usize {
+    WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
+/// The actix actor-mailbox capacity a `WtChatSession` installs in `started()`
+/// via `ctx.set_mailbox_capacity(...)` (issues #1057 + PR #1060 review +
+/// #1144).
+///
+/// SINGLE SOURCE OF TRUTH (issue #1062): `WtChatSession::started` calls THIS
+/// function, so the value fed to `set_mailbox_capacity` is defined in exactly
+/// one place. The WT mailbox fronts TWO policy-aware channels (unistream +
+/// datagram) and a `Message` only splits between them AFTER leaving the
+/// mailbox, so it is sized to the SUM of both channel capacities (not `max()`)
+/// times the burst-headroom factor — see [`INBOUND_MAILBOX_HEADROOM_FACTOR`].
+///
+/// This reads the memoised, env-tunable [`wt_outbound_channel_capacity`]
+/// (via the shared pure resolver [`resolve_wt_mailbox_capacity`]), so it
+/// reflects any `WT_OUTBOUND_CHANNEL_CAPACITY` override the operator set. The
+/// guard test exercises env-override behaviour through that same pure resolver
+/// to avoid racing the `OnceLock`, and pins the default-env value against THIS
+/// function.
+pub fn wt_mailbox_capacity() -> usize {
+    // Built from the SAME memoised getter the outbound channels are sized with
+    // (`wt_outbound_channel_capacity()`), so the mailbox stays in lock-step with
+    // the channel under any env override. The guard test asserts this equals
+    // `resolve_wt_mailbox_capacity(None)` at the default env so the memoised
+    // call-site path and the pure test path cannot drift (issue #1062).
+    (wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY)
+        * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
+/// Pure resolver mirror of [`wt_mailbox_capacity`]: maps a raw optional
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` env string to the same mailbox capacity
+/// `started()` would install, WITHOUT touching the memoised `OnceLock`.
+///
+/// The guard test verifies the env-override path (`Some("1024")`, etc.)
+/// deterministically here, and separately asserts
+/// `resolve_wt_mailbox_capacity(None) == wt_mailbox_capacity()` so this resolver
+/// and the memoised call site [`wt_mailbox_capacity`] cannot drift — both apply
+/// the identical `(unistream + datagram) × headroom` formula. Test-only: the
+/// production call site uses the memoised [`wt_mailbox_capacity`].
+#[cfg(test)]
+pub(crate) fn resolve_wt_mailbox_capacity(raw: Option<&str>) -> usize {
+    (resolve_wt_outbound_channel_capacity(raw) + WT_DATAGRAM_CHANNEL_CAPACITY)
+        * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------
@@ -326,6 +384,37 @@ pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
 /// Cleanup runs every N requests (where N = this value) to amortize the
 /// O(n) `retain()` cost. Mirrors the strategy used by `CongestionTracker`.
 pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
+
+/// Upper bound on the simulcast `layer` dimension of the KEYFRAME_REQUEST
+/// limiter key (#1068, defense-in-depth).
+///
+/// The per-pair limiter keys on `(target_sender, layer)` so a receiver that
+/// deliberately switches the simulcast layer it wants from a sender gets a
+/// fresh per-layer budget instead of being throttled as a duplicate (#989,
+/// Phase 1b). The `layer` comes from the cleartext, attacker-controllable
+/// `PacketWrapper.simulcast_layer_id`, which is an unbounded `u32`. Without a
+/// bound, a malicious receiver could cycle DISTINCT layer ids against a SINGLE
+/// sender to open an unbounded number of fresh `(target, layer)` buckets — each
+/// with its own [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] budget — and so
+/// concentrate up to the GLOBAL per-receiver cap ([`KEYFRAME_REQUEST_MAX_PER_SEC`],
+/// ~32/sec) of keyframe pressure on that one victim sender, amplifying the
+/// PLI/keyframe-storm risk (OSS #814).
+///
+/// Clamping the layer component to `0..=this` (via `min`) bounds the number of
+/// distinct per-layer buckets per target to `this + 1`, so per-victim keyframe
+/// pressure is capped at `(this + 1) × KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`
+/// per window regardless of how many distinct layer ids an attacker cycles.
+/// Ids above the bound collapse onto the top bucket (they share its budget)
+/// rather than each opening a new one.
+///
+/// `2` matches the production ladder: every kind ships at most 3 simulcast
+/// layers (ids 0,1,2 — see [`LAYER_PREFERENCE_MAX_LAYER_ID`]'s note), so all
+/// REAL layer switches still get an independent bucket and the fix is invisible
+/// to legitimate clients; only ids beyond the real ladder are clamped. This is
+/// the keyframe-pressure bound, NOT the layer-preference value bound
+/// ([`LAYER_PREFERENCE_MAX_LAYER_ID`]) — they protect different subsystems and
+/// are intentionally separate constants.
+pub const KEYFRAME_REQUEST_MAX_LAYER_ID: u32 = 2;
 
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).

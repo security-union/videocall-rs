@@ -260,7 +260,7 @@ pub fn capability_max_simulcast_layers() -> u32 {
     let layers = max_simulcast_layers(cores, &platform);
     log::info!(
         "simulcast capability ceiling: {layers} layer(s) (cores={cores} platform={platform:?} \
-         older_intel={older_intel}); capability_score={score} (observability only — NOT a layer gate, issue #1140)"
+         older_intel={older_intel}); capability_score={score} (observability only — NOT a layer gate, issue 1140)"
     );
     layers
 }

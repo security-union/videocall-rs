@@ -256,6 +256,64 @@ pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 /// thing #1057 removed — so keep this small.
 pub const INBOUND_MAILBOX_HEADROOM_FACTOR: usize = 2;
 
+/// The actix actor-mailbox capacity a `WsChatSession` installs in `started()`
+/// via `ctx.set_mailbox_capacity(...)` (issues #1057 + #1144).
+///
+/// SINGLE SOURCE OF TRUTH (issue #1062): `WsChatSession::started` calls THIS
+/// function, and the guard test asserts properties of THIS function — not a
+/// parallel hand-copied constant. So altering the value passed to
+/// `set_mailbox_capacity` means editing this one binding, which the test then
+/// tracks. (The guard test cannot read the capacity back off a live
+/// `WebsocketContext` without standing up NATS, so it pins the value the call
+/// site feeds; this removes the prior drift hazard where a duplicated
+/// `WS_MAILBOX_CAPACITY` test constant could diverge from `started()`.)
+pub const fn ws_mailbox_capacity() -> usize {
+    WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
+/// The actix actor-mailbox capacity a `WtChatSession` installs in `started()`
+/// via `ctx.set_mailbox_capacity(...)` (issues #1057 + PR #1060 review +
+/// #1144).
+///
+/// SINGLE SOURCE OF TRUTH (issue #1062): `WtChatSession::started` calls THIS
+/// function, so the value fed to `set_mailbox_capacity` is defined in exactly
+/// one place. The WT mailbox fronts TWO policy-aware channels (unistream +
+/// datagram) and a `Message` only splits between them AFTER leaving the
+/// mailbox, so it is sized to the SUM of both channel capacities (not `max()`)
+/// times the burst-headroom factor — see [`INBOUND_MAILBOX_HEADROOM_FACTOR`].
+///
+/// This reads the memoised, env-tunable [`wt_outbound_channel_capacity`]
+/// (via the shared pure resolver [`resolve_wt_mailbox_capacity`]), so it
+/// reflects any `WT_OUTBOUND_CHANNEL_CAPACITY` override the operator set. The
+/// guard test exercises env-override behaviour through that same pure resolver
+/// to avoid racing the `OnceLock`, and pins the default-env value against THIS
+/// function.
+pub fn wt_mailbox_capacity() -> usize {
+    // Built from the SAME memoised getter the outbound channels are sized with
+    // (`wt_outbound_channel_capacity()`), so the mailbox stays in lock-step with
+    // the channel under any env override. The guard test asserts this equals
+    // `resolve_wt_mailbox_capacity(None)` at the default env so the memoised
+    // call-site path and the pure test path cannot drift (issue #1062).
+    (wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY)
+        * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
+/// Pure resolver mirror of [`wt_mailbox_capacity`]: maps a raw optional
+/// `WT_OUTBOUND_CHANNEL_CAPACITY` env string to the same mailbox capacity
+/// `started()` would install, WITHOUT touching the memoised `OnceLock`.
+///
+/// The guard test verifies the env-override path (`Some("1024")`, etc.)
+/// deterministically here, and separately asserts
+/// `resolve_wt_mailbox_capacity(None) == wt_mailbox_capacity()` so this resolver
+/// and the memoised call site [`wt_mailbox_capacity`] cannot drift — both apply
+/// the identical `(unistream + datagram) × headroom` formula. Test-only: the
+/// production call site uses the memoised [`wt_mailbox_capacity`].
+#[cfg(test)]
+pub(crate) fn resolve_wt_mailbox_capacity(raw: Option<&str>) -> usize {
+    (resolve_wt_outbound_channel_capacity(raw) + WT_DATAGRAM_CHANNEL_CAPACITY)
+        * INBOUND_MAILBOX_HEADROOM_FACTOR
+}
+
 // ---------------------------------------------------------------------------
 // KEYFRAME_REQUEST Rate Limiting
 // ---------------------------------------------------------------------------

@@ -1217,12 +1217,15 @@ impl ChatServer {
             if members.is_empty() {
                 self.room_members.remove(room);
                 self.room_policy.remove(room);
-                // Drop the per-room viewport set-size gauge series (HCL #988).
-                // GaugeVec series persist until explicitly removed; without
-                // this a drained room would read its last set size forever.
-                // `remove_label_values` errors only when no series exists, so
-                // the unused-result is intentionally discarded.
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Bound room-labeled relay series to LIVE rooms (issue #996):
+                // remove every `{room=...}` CounterVec/GaugeVec series for this
+                // drained room (was previously just the #988 viewport gauge).
+                // CounterVec series otherwise persist for the process lifetime,
+                // so each distinct meeting would leak a permanent series. We
+                // keep the `room` label (the meeting-investigation dashboard and
+                // RelayPacketDrops alert depend on it) and instead expire it on
+                // room drain — see `metrics::forget_room_metrics`.
+                crate::metrics::forget_room_metrics(room);
             }
         }
     }
@@ -1257,10 +1260,10 @@ impl ChatServer {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
                 self.room_members.remove(room);
-                // Mirror forget_room_if_empty: release the per-room viewport
-                // set-size gauge series so the eviction teardown path also
-                // cannot leak a stale series for a drained room (HCL #988).
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Mirror forget_room_if_empty: release ALL per-room relay series
+                // so the eviction teardown path also cannot leak room-labeled
+                // series for a drained room (HCL #988 + #996).
+                crate::metrics::forget_room_metrics(room);
             } else {
                 room_still_populated = true;
             }
@@ -2840,7 +2843,10 @@ impl Handler<JoinRoom> for ChatServer {
                 // (It also predates the mailbox-drop counters and intentionally
                 // stays a plain warn on this one-shot setup path.)
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    // `build_peer_joined_packet` returns an owned `Vec<u8>`;
+                    // wrap it in `Bytes` (a one-time move into the refcounted
+                    // buffer, no copy) to match `Message.msg`'s type (#1063).
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: member.session,
                 }) {
                     warn!(
@@ -3542,7 +3548,9 @@ fn try_intercept_display_name_change(
     match forwarded {
         Ok(sanitized) => {
             let message = Message {
-                msg: sanitized,
+                // `sanitized` is a freshly-serialized `Vec<u8>` (rare rename
+                // path); move it into `Bytes` to match `Message.msg` (#1063).
+                msg: bytes::Bytes::from(sanitized),
                 session,
             };
             if let Err(e) = recipient.try_send(message) {
@@ -4007,7 +4015,15 @@ fn handle_msg(
         }
 
         let message = Message {
-            msg: msg.payload.to_vec(),
+            // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
+            // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
+            // bump that SHARES the single NATS payload allocation across every
+            // receiver in this room's fan-out — replacing the previous
+            // `.to_vec()` that deep-copied the multi-KB frame once per
+            // recipient. The per-receiver materialization back to owned bytes
+            // (for the outbound channel) still happens at most once, later, in
+            // `SessionLogic::handle_outbound`; delivery is byte-identical.
+            msg: msg.payload.clone(),
             session,
         };
 
@@ -4705,10 +4721,12 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        // `Message.msg` is now `bytes::Bytes` (#1063); capture the shared
+        // handles directly. `&Bytes` derefs to `&[u8]` for the parse below.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;

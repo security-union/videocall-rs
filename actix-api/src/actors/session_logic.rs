@@ -238,15 +238,6 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
-    /// Set of `kind` label values this session has incremented on
-    /// `relay_session_drops_total` (dashboard audit Tier B #1). Tracked so the
-    /// exact `(room, transport, session_id, kind)` series can be GC'd via
-    /// `remove_label_values` in [`on_stopping`], keeping that high-cardinality
-    /// counter bounded to live sessions. `RefCell` because `record_session_drop`
-    /// is reached from `&mut self` handlers while cleanup runs from `&self`
-    /// `on_stopping`; the per-actor event loop is single-threaded so there is no
-    /// cross-thread contention.
-    session_drop_kinds: std::cell::RefCell<std::collections::HashSet<&'static str>>,
 }
 
 impl SessionLogic {
@@ -290,27 +281,28 @@ impl SessionLogic {
             end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
-            session_drop_kinds: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 
     /// Record a per-session outbound drop on `relay_session_drops_total`
-    /// (dashboard audit Tier B #1) and remember the `kind` so the series can be
-    /// removed on session teardown.
+    /// (dashboard audit Tier B #1).
     ///
     /// Called from both transport actors' drop sites (priority-preempt and
     /// real channel-full) with the same `kind` label they pass to the
     /// protocol-wide `videocall_outbound_channel_drops_total` counter, so the
     /// two stay in lock-step. `kind` MUST be a `'static` string from the bounded
-    /// drop-kind taxonomy (the actors only ever pass string literals / the
-    /// `priority_drop.rs` reason labels), which keeps the tracked set — and the
-    /// number of series GC'd on close — bounded to that small fixed taxonomy.
+    /// drop-kind taxonomy ([`crate::metrics::RELAY_DROP_KINDS`]); the actors
+    /// only ever pass string literals / the `priority_drop.rs` reason labels.
+    ///
+    /// No per-session bookkeeping of which kinds were emitted is needed:
+    /// [`on_stopping`] GCs the FULL fixed taxonomy unconditionally (issue #1090),
+    /// so the cleanup is leak-proof regardless of which subset this session
+    /// happened to increment.
     pub fn record_session_drop(&self, kind: &'static str) {
         let session_id = self.id.to_string();
         crate::metrics::RELAY_SESSION_DROPS_TOTAL
             .with_label_values(&[&self.room, &self.transport, &session_id, kind])
             .inc();
-        self.session_drop_kinds.borrow_mut().insert(kind);
     }
 
     // =========================================================================
@@ -416,12 +408,20 @@ impl SessionLogic {
 
         // GC the per-session drop series (Tier B #1). `relay_session_drops_total`
         // carries an unbounded-over-time `session_id` label; removing every
-        // `(room, transport, session_id, kind)` tuple this session touched the
-        // moment it disconnects keeps the live series count bounded to active
-        // sessions. Mirrors the metrics-server `remove_label_values` cleanup
-        // pattern. No-op for sessions that never dropped (empty set).
+        // `(room, transport, session_id, kind)` tuple the moment this session
+        // disconnects keeps the live series count bounded to active sessions.
+        //
+        // LEAK-PROOF (issue #1090): we iterate the FULL fixed `kind` taxonomy
+        // [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY rather than a
+        // per-session "kinds I emitted" tracking set. `remove_label_values` on a
+        // `(…, kind)` tuple that was never created returns a benign `Err`, so
+        // the discarded result is intentional. This removes the dependency on
+        // tracking-set completeness: even if a future drop site introduces a new
+        // `kind`, adding it to `RELAY_DROP_KINDS` (the single source of truth the
+        // emit sites are documented against) keeps cleanup exhaustive — there is
+        // no second bookkeeping structure that could silently fall out of sync.
         let session_id = self.id.to_string();
-        for kind in self.session_drop_kinds.borrow().iter() {
+        for kind in crate::metrics::RELAY_DROP_KINDS {
             let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
                 &self.room,
                 &self.transport,
@@ -560,7 +560,13 @@ impl SessionLogic {
             .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
-        msg.msg.clone()
+        // `msg.msg` is a shared `bytes::Bytes` (#1063): the single NATS payload
+        // allocation is refcounted across all fan-out receivers. The
+        // per-transport outbound channel (`Sender<Vec<u8>>` for WS, or
+        // `Sender<Bytes>` for WT via `send_auto`) still needs owned bytes, so
+        // materialize ONCE here per receiver — the same single copy that used
+        // to live at the fan-out `Message` construction, just moved downstream.
+        msg.msg.to_vec()
     }
 
     // =========================================================================

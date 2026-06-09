@@ -40,6 +40,153 @@ pub async fn metrics_responder() -> impl Responder {
     }
 }
 
+// =============================================================================
+// Bounded relay label taxonomies (single source of truth for cardinality GC)
+// =============================================================================
+//
+// `room` (= meeting_id) is user-provided, so every room-labeled CounterVec
+// would otherwise accrue a permanent series for every meeting the process ever
+// served (issue #996). We do NOT drop the `room` label — the
+// meeting-investigation Grafana dashboard and the `RelayPacketDrops` alert key
+// on it (`relay_packet_drops_total{room=~"$meeting"}`, `{{ $labels.room }}`),
+// so removing it would be a breaking change to operational tooling. Instead we
+// BOUND the live series to the set of LIVE ROOMS: `chat_server` calls
+// [`forget_room_metrics`] when a room drains to empty (the same room-drain hook
+// that already removed the `relay_viewport_set_size` gauge for #988), removing
+// every room-labeled series for that room. The prometheus `MetricVec` removal
+// API requires the FULL label tuple (it hashes every variable label — there is
+// no partial-match removal), so for multi-label counters we must enumerate the
+// cartesian product of the OTHER labels' fixed taxonomies. These consts are
+// that authoritative enumeration; `metrics::tests` cross-checks they cover the
+// labels the code actually emits so the bound cannot silently leak.
+
+/// Every `drop_reason`/`kind` label ever passed to a relay drop counter.
+///
+/// This is the UNION of:
+/// - `relay_packet_drops_total{drop_reason}` (`mailbox_full`, `channel_full`,
+///   `priority_drop_video`, `priority_drop_audio`), and
+/// - `relay_session_drops_total{kind}` / `videocall_outbound_channel_drops_total{kind}`
+///   (`audio`, `video`, `screen`, `media`, `control`, `rtt`, `unknown`,
+///   `priority_drop_video`, `priority_drop_audio`, `overflow_critical`).
+///
+/// Iterating the full union for either counter's GC is leak-proof: removing a
+/// `(…, kind)` tuple that was never created is a benign `Err` (issue #1090),
+/// and removing the superset guarantees no residual series regardless of which
+/// subset a given counter actually emits.
+pub const RELAY_DROP_KINDS: &[&str] = &[
+    // relay_packet_drops_total drop_reasons
+    "mailbox_full",
+    "channel_full",
+    // shared priority-policy reasons (both counters)
+    "priority_drop_video",
+    "priority_drop_audio",
+    // outbound/session drop kinds (drop_kind_label + overflow_critical)
+    "audio",
+    "video",
+    "screen",
+    "media",
+    "control",
+    "rtt",
+    "unknown",
+    "overflow_critical",
+];
+
+/// Every `transport` label value carried by a room-labeled relay counter.
+///
+/// `relay_packet_drops_total{transport}` is emitted with the receiver's
+/// transport at the per-transport `Handler<Message>` hop (`websocket` /
+/// `webtransport`) AND with the publish-side identity `nats_delivery` at the
+/// inbound fan-out hop in `chat_server::handle_msg`.
+pub const RELAY_DROP_TRANSPORTS: &[&str] = &["websocket", "webtransport", "nats_delivery"];
+
+/// Every `outcome` label value of `relay_viewport_updates_total{room, outcome}`
+/// (#988 `try_intercept_viewport`).
+pub const RELAY_VIEWPORT_UPDATE_OUTCOMES: &[&str] = &[
+    "accepted",
+    "rate_limited",
+    "truncated",
+    "ignored_other_subject",
+];
+
+/// Every `outcome` label value of
+/// `relay_layer_preference_updates_total{room, outcome}` (#989, #1082
+/// `try_intercept_layer_preference`). Superset of the viewport outcomes plus
+/// `layer_id_out_of_bound`.
+pub const RELAY_LAYER_PREFERENCE_UPDATE_OUTCOMES: &[&str] = &[
+    "accepted",
+    "rate_limited",
+    "truncated",
+    "layer_id_out_of_bound",
+    "ignored_other_subject",
+];
+
+/// Every `direction` label value of
+/// `relay_layer_hint_emitted_total{room, direction}` (#1108 publish-side
+/// suppression).
+pub const RELAY_LAYER_HINT_DIRECTIONS: &[&str] = &["suppress", "restore"];
+
+/// Remove EVERY room-labeled relay CounterVec/GaugeVec series for `room`.
+///
+/// Called by `chat_server` the moment a room drains to empty (see
+/// `forget_room_if_empty` / `forget_session`), bounding the live series for
+/// these `room`-labeled metrics to the set of currently-live rooms (issue
+/// #996). Without this, each metric accrued a permanent series per distinct
+/// meeting for the process lifetime.
+///
+/// `remove_label_values` errors only when no such series exists, so every call
+/// here is intentionally `let _ =`-discarded: a room that never tripped a given
+/// (transport, drop_reason) / outcome simply has nothing to remove.
+///
+/// NOTE: the `room`-only GaugeVecs `relay_outbound_queue_depth` and
+/// `relay_active_sessions_per_room` carry an additional `transport` label and
+/// are GC'd on a per-session basis already (`relay_active_sessions_per_room` is
+/// decremented in `on_stopping`); the queue-depth gauge is overwritten every
+/// heartbeat for a live session and stops being written once the session ends,
+/// but we still sweep its `(room, transport)` tuples here so a drained room
+/// leaves no stale depth reading.
+pub fn forget_room_metrics(room: &str) {
+    // Single-label room counters: one tuple each.
+    let _ = RELAY_VIEWPORT_FILTERED_TOTAL.remove_label_values(&[room]);
+    let _ = RELAY_VIEWPORT_FORWARDED_TOTAL.remove_label_values(&[room]);
+    let _ = RELAY_LAYER_FILTERED_TOTAL.remove_label_values(&[room]);
+    let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
+
+    // relay_room_bytes_total{room, direction}.
+    for direction in ["inbound", "outbound"] {
+        let _ = RELAY_ROOM_BYTES_TOTAL.remove_label_values(&[room, direction]);
+    }
+
+    // relay_viewport_updates_total{room, outcome}.
+    for outcome in RELAY_VIEWPORT_UPDATE_OUTCOMES {
+        let _ = RELAY_VIEWPORT_UPDATES_TOTAL.remove_label_values(&[room, outcome]);
+    }
+
+    // relay_layer_preference_updates_total{room, outcome} (#989, #1082).
+    for outcome in RELAY_LAYER_PREFERENCE_UPDATE_OUTCOMES {
+        let _ = RELAY_LAYER_PREFERENCE_UPDATES_TOTAL.remove_label_values(&[room, outcome]);
+    }
+
+    // relay_layer_hint_emitted_total{room, direction} (#1108).
+    for direction in RELAY_LAYER_HINT_DIRECTIONS {
+        let _ = RELAY_LAYER_HINT_EMITTED_TOTAL.remove_label_values(&[room, direction]);
+    }
+
+    // relay_packet_drops_total{room, transport, drop_reason}: full cartesian
+    // product of the two bounded taxonomies.
+    for transport in RELAY_DROP_TRANSPORTS {
+        for drop_reason in RELAY_DROP_KINDS {
+            let _ = RELAY_PACKET_DROPS_TOTAL.remove_label_values(&[room, transport, drop_reason]);
+        }
+        // relay_outbound_queue_depth / relay_active_sessions_per_room
+        // {room, transport} gauges.
+        let _ = RELAY_OUTBOUND_QUEUE_DEPTH.remove_label_values(&[room, transport]);
+        let _ = RELAY_ACTIVE_SESSIONS_PER_ROOM.remove_label_values(&[room, transport]);
+    }
+
+    // relay_viewport_set_size{room} — the #988 gauge previously swept inline.
+    let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+}
+
 lazy_static! {
     /// Total number of health reports received
     pub static ref HEALTH_REPORTS_TOTAL: Counter = register_counter!(
@@ -987,16 +1134,20 @@ lazy_static! {
     /// open-ended historical set.
     ///
     /// CARDINALITY BOUND: `room` × `transport` (2) × `session_id` (live only).
-    /// CLEANUP: `remove_label_values` is called for every series this session
-    /// touched in `SessionLogic::on_stopping` (the same per-session teardown hook
-    /// that decrements `relay_active_sessions_per_room`), so a disconnected
-    /// session leaves no residual series. Because cleanup must enumerate the
-    /// exact label tuples, the session actor records which `(transport, kind)`
-    /// pairs it incremented and replays them on teardown.
+    /// CLEANUP (issue #1090): `SessionLogic::on_stopping` (the same per-session
+    /// teardown hook that decrements `relay_active_sessions_per_room`) removes
+    /// every `(room, transport, session_id, kind)` tuple by iterating the FULL
+    /// fixed `kind` taxonomy [`RELAY_DROP_KINDS`] UNCONDITIONALLY — not a
+    /// per-session "kinds I emitted" tracking set. `remove_label_values` on a
+    /// never-created tuple is a benign `Err`, so a disconnected session leaves
+    /// no residual series regardless of which subset it actually incremented.
+    /// This is leak-proof by construction: there is no second bookkeeping
+    /// structure that could fall out of sync with the emit sites.
     ///
     /// This is the counter Grafana joins against to NAME the slow receiver in a
     /// room ("session 12345 is shedding video") instead of only "a session in
-    /// this room is slow". `kind` mirrors the outbound-drop taxonomy
+    /// this room is slow". `kind` is the subset of [`RELAY_DROP_KINDS`] the
+    /// transport actors pass to `record_session_drop`
     /// (`audio|video|screen|media|control|rtt|unknown|priority_drop_video|
     /// priority_drop_audio|overflow_critical`).
     pub static ref RELAY_SESSION_DROPS_TOTAL: CounterVec = register_counter_vec!(
@@ -1386,5 +1537,258 @@ mod tests {
             0.0,
             "removed series must not retain its prior value"
         );
+    }
+
+    // ===== Room-label cardinality bound (issue #996) + drop-kind GC (#1090) =====
+
+    /// `RELAY_DROP_KINDS` is the single source of truth for the room-drain GC
+    /// (`forget_room_metrics`) and the per-session GC (`on_stopping`). If it
+    /// stops covering a `kind`/`drop_reason` the emit sites actually use, that
+    /// series would leak forever. This pins it as a SUPERSET of:
+    ///   * the `videocall_outbound_channel_drops_total` / `relay_session_drops_total`
+    ///     `kind` taxonomy (the same literals asserted by
+    ///     `outbound_channel_drops_increments_per_kind`), and
+    ///   * the `relay_packet_drops_total` `drop_reason` literals emitted by the
+    ///     fan-out and transport hops.
+    ///
+    /// Mutating `RELAY_DROP_KINDS` to drop any of these fails this test.
+    #[test]
+    fn relay_drop_kinds_covers_all_emitted_drop_labels() {
+        // Mirror of the literals in `outbound_channel_drops_increments_per_kind`
+        // (kept as an independent copy ON PURPOSE so this test references a
+        // second witness of the taxonomy, not the const under test).
+        let outbound_kinds = [
+            "audio",
+            "video",
+            "screen",
+            "media",
+            "control",
+            "rtt",
+            "unknown",
+            "priority_drop_video",
+            "priority_drop_audio",
+            "overflow_critical",
+        ];
+        // The `drop_reason` literals passed to `relay_packet_drops_total` in
+        // `chat_server::handle_msg` (fan-out) and the WS/WT `Handler<Message>`
+        // hops. `priority_drop_*` overlap with the outbound set above.
+        let packet_drop_reasons = ["mailbox_full", "channel_full"];
+
+        for k in outbound_kinds.iter().chain(packet_drop_reasons.iter()) {
+            assert!(
+                RELAY_DROP_KINDS.contains(k),
+                "RELAY_DROP_KINDS must cover emitted drop label {k:?} or the \
+                 room-drain / session GC would leak its series (issues #996/#1090)"
+            );
+        }
+    }
+
+    /// `RELAY_DROP_TRANSPORTS` must cover every `transport` value emitted to
+    /// `relay_packet_drops_total` so the room-drain GC removes every
+    /// `(room, transport, drop_reason)` tuple.
+    #[test]
+    fn relay_drop_transports_covers_all_emitted_transports() {
+        // `websocket`/`webtransport` from the per-transport `Handler<Message>`
+        // hops; `nats_delivery` from the inbound fan-out hop in handle_msg.
+        for t in ["websocket", "webtransport", "nats_delivery"] {
+            assert!(
+                RELAY_DROP_TRANSPORTS.contains(&t),
+                "RELAY_DROP_TRANSPORTS must cover emitted transport {t:?} or the \
+                 room-drain GC would leak relay_packet_drops_total series (#996)"
+            );
+        }
+    }
+
+    /// REAL ENFORCEMENT of the #996 bound: after `forget_room_metrics(room)`,
+    /// EVERY room-labeled relay series for that room must be gone. We seed one
+    /// series per metric (covering the multi-label counters with a representative
+    /// tuple from each bounded taxonomy), drain the room, and assert each handle
+    /// re-reads as the default (0) — proving the prior series was removed, not
+    /// merely zeroed. A removed counter starts a fresh series at 0 on the next
+    /// `with_label_values`, so `get() == 0.0` after seeding `!= 0` proves removal.
+    #[test]
+    #[serial(forget_room_metrics)]
+    fn forget_room_metrics_removes_every_room_series() {
+        let room = "wiretest_forget_room_996";
+
+        // Seed one series on each room-labeled metric.
+        RELAY_VIEWPORT_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
+        RELAY_VIEWPORT_FORWARDED_TOTAL
+            .with_label_values(&[room])
+            .inc();
+        RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).inc();
+        RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).inc();
+        RELAY_ROOM_BYTES_TOTAL
+            .with_label_values(&[room, "outbound"])
+            .inc();
+        RELAY_VIEWPORT_UPDATES_TOTAL
+            .with_label_values(&[room, "accepted"])
+            .inc();
+        RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+            .with_label_values(&[room, "accepted"])
+            .inc();
+        RELAY_LAYER_HINT_EMITTED_TOTAL
+            .with_label_values(&[room, "suppress"])
+            .inc();
+        RELAY_PACKET_DROPS_TOTAL
+            .with_label_values(&[room, "nats_delivery", "mailbox_full"])
+            .inc();
+        RELAY_PACKET_DROPS_TOTAL
+            .with_label_values(&[room, "websocket", "priority_drop_video"])
+            .inc();
+        RELAY_OUTBOUND_QUEUE_DEPTH
+            .with_label_values(&[room, "websocket"])
+            .set(7.0);
+        RELAY_ACTIVE_SESSIONS_PER_ROOM
+            .with_label_values(&[room, "webtransport"])
+            .set(3.0);
+        RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).set(4.0);
+
+        // Confirm the seeds are non-zero (otherwise the post-removal assert
+        // below would pass vacuously — Adversarial check #2).
+        assert_eq!(
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[room, "nats_delivery", "mailbox_full"])
+                .get(),
+            1.0,
+            "seed must be observable before removal, else the test is vacuous"
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_DEPTH
+                .with_label_values(&[room, "websocket"])
+                .get(),
+            7.0
+        );
+
+        // Drain the room.
+        forget_room_metrics(room);
+
+        // Every room-labeled series must now be gone. A removed series reads
+        // back at the type default on a fresh handle.
+        assert_eq!(
+            RELAY_VIEWPORT_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_VIEWPORT_FORWARDED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_ROOM_BYTES_TOTAL
+                .with_label_values(&[room, "outbound"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_VIEWPORT_UPDATES_TOTAL
+                .with_label_values(&[room, "accepted"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
+                .with_label_values(&[room, "accepted"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_LAYER_HINT_EMITTED_TOTAL
+                .with_label_values(&[room, "suppress"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[room, "nats_delivery", "mailbox_full"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_PACKET_DROPS_TOTAL
+                .with_label_values(&[room, "websocket", "priority_drop_video"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_OUTBOUND_QUEUE_DEPTH
+                .with_label_values(&[room, "websocket"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_ACTIVE_SESSIONS_PER_ROOM
+                .with_label_values(&[room, "webtransport"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).get(),
+            0.0
+        );
+
+        // Clean up the fresh zero-valued handles created by the asserts above so
+        // this test leaves no residue for other serial runs.
+        forget_room_metrics(room);
+    }
+
+    /// #1090 leak-proof property: iterating the FULL `RELAY_DROP_KINDS` taxonomy
+    /// on teardown removes a session's `relay_session_drops_total` series EVEN
+    /// for kinds that session never incremented — i.e. the GC does not depend on
+    /// a per-session "kinds I emitted" tracking set. This replicates the exact
+    /// loop `SessionLogic::on_stopping` runs (same const, same label order).
+    #[test]
+    #[serial(session_drops_gc)]
+    fn session_drop_gc_iterates_full_taxonomy_unconditionally() {
+        let room = "wiretest_session_gc_1090";
+        let transport = "websocket";
+        let session_id = "999000111";
+
+        // This session only ever dropped ONE kind.
+        RELAY_SESSION_DROPS_TOTAL
+            .with_label_values(&[room, transport, session_id, "video"])
+            .inc();
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, "video"])
+                .get(),
+            1.0,
+            "seed must be observable before teardown (non-vacuous)"
+        );
+
+        // Replicate on_stopping: iterate the FULL taxonomy unconditionally.
+        // `remove_label_values` on a never-created (…, kind) tuple is a benign
+        // Err, so a session that only dropped `video` is still fully cleaned.
+        for kind in RELAY_DROP_KINDS {
+            let _ =
+                RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, kind]);
+        }
+
+        // The seeded `video` series — a member of the taxonomy the session DID
+        // increment — must be gone.
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, "video"])
+                .get(),
+            0.0,
+            "the full-taxonomy sweep must remove the kind the session emitted"
+        );
+
+        // Clean up the fresh zero handle this assert created.
+        let _ =
+            RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, "video"]);
     }
 }

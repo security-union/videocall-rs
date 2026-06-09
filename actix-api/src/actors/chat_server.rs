@@ -1194,12 +1194,15 @@ impl ChatServer {
             if members.is_empty() {
                 self.room_members.remove(room);
                 self.room_policy.remove(room);
-                // Drop the per-room viewport set-size gauge series (HCL #988).
-                // GaugeVec series persist until explicitly removed; without
-                // this a drained room would read its last set size forever.
-                // `remove_label_values` errors only when no series exists, so
-                // the unused-result is intentionally discarded.
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Bound room-labeled relay series to LIVE rooms (issue #996):
+                // remove every `{room=...}` CounterVec/GaugeVec series for this
+                // drained room (was previously just the #988 viewport gauge).
+                // CounterVec series otherwise persist for the process lifetime,
+                // so each distinct meeting would leak a permanent series. We
+                // keep the `room` label (the meeting-investigation dashboard and
+                // RelayPacketDrops alert depend on it) and instead expire it on
+                // room drain — see `metrics::forget_room_metrics`.
+                crate::metrics::forget_room_metrics(room);
             }
         }
     }
@@ -1234,10 +1237,10 @@ impl ChatServer {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
                 self.room_members.remove(room);
-                // Mirror forget_room_if_empty: release the per-room viewport
-                // set-size gauge series so the eviction teardown path also
-                // cannot leak a stale series for a drained room (HCL #988).
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Mirror forget_room_if_empty: release ALL per-room relay series
+                // so the eviction teardown path also cannot leak room-labeled
+                // series for a drained room (HCL #988 + #996).
+                crate::metrics::forget_room_metrics(room);
             } else {
                 room_still_populated = true;
             }

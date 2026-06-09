@@ -376,6 +376,37 @@ impl VideoPeerDecoder {
         video_frame.close();
     }
 
+    /// Clear the canvas backing bitmap to transparent (issue #1183).
+    ///
+    /// Called when a peer leaves the active decode set (its tile transitions
+    /// `visible: true -> false`). At that edge `decode()` starts returning
+    /// `SKIPPED` synchronously, so no further `VideoFrame` is ever drawn — but
+    /// the `<canvas>` element is only removed from the DOM later, when Dioxus
+    /// commits the layout diff. In the window between decode-stop and DOM
+    /// unmount (or indefinitely if the commit stalls / the budget re-pressures
+    /// before the tile unmounts) the canvas keeps showing its LAST PAINTED
+    /// FRAME — the "1 live + N frozen tiles" symptom.
+    ///
+    /// We clear through the SAME cached `CanvasRenderingContext2d` the painter
+    /// (`render_to_canvas_cached`) draws into, so we are guaranteed to be
+    /// clearing the exact backing bitmap that holds the stale frame — not a
+    /// stale DOM lookup by id. The clear region uses the canvas element's
+    /// current backing dimensions (`width()`/`height()`), which the painter
+    /// keeps in sync with the decoded frame size via `set_width`/`set_height`.
+    ///
+    /// No-op when no canvas is wired yet (`canvas_renderer` is `None`), which is
+    /// also the state of the `noop()` decoder used in host unit tests — so this
+    /// is safe to call from non-wasm test code.
+    pub fn clear_canvas(&self) {
+        if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
+            let width = renderer.canvas.width();
+            let height = renderer.canvas.height();
+            renderer
+                .context
+                .clear_rect(0.0, 0.0, width as f64, height as f64);
+        }
+    }
+
     fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
         match packet.frame_type.as_str() {
             "key" => FrameType::KeyFrame,

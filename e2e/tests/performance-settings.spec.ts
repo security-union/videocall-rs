@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Page, Locator } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 import { enableSimulcastFlag } from "../helpers/simulcast-config";
@@ -311,6 +311,28 @@ async function setRangeValue(page: Page, testid: string, value: number): Promise
   }, value);
 }
 
+/**
+ * Assert a SEND layer slider's PINNED FLOOR (min thumb) contract.
+ *
+ * WEBKIT REGRESSION GUARD: the floor must be non-interactive WITHOUT the HTML
+ * `disabled` attribute. A `disabled`, full-width, on-top range input swallows the
+ * pointer-down meant for the max (ceiling) thumb beneath it in WebKit/Safari
+ * (WebKit doesn't reliably pass `pointer-events:none` through a disabled control),
+ * making the ceiling undraggable. So the floor is pinned via `tabindex=-1` (no
+ * keyboard) + `aria-disabled` (SR) + CSS `pointer-events:none` (no pointer) +
+ * `z-index:0` (below the max) — but is NOT `disabled`. If a regression re-adds
+ * `disabled`, the `toBeEnabled()` here fails (Playwright treats `disabled` as the
+ * not-enabled state). Pinned at position 0 (the always-sent base layer).
+ */
+async function expectPinnedFloor(minInput: Locator): Promise<void> {
+  // NOT `disabled` — the WebKit fix. (`toBeEnabled` asserts the absence of the
+  // disabled state on a form control.)
+  await expect(minInput).toBeEnabled();
+  await expect(minInput).toHaveAttribute("tabindex", "-1");
+  await expect(minInput).toHaveAttribute("aria-disabled", "true");
+  await expect(minInput).toHaveValue("0");
+}
+
 test.describe("Performance settings panel (#961)", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -367,10 +389,10 @@ test.describe("Performance settings panel (#961)", () => {
       await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveCount(0);
       const minInput = panel.locator(`[data-testid="perf-${stream}-range-min"]`);
       const maxInput = panel.locator(`[data-testid="perf-${stream}-range-max"]`);
-      // FLOOR thumb is PINNED (disabled) at the base layer (position 0): the base
-      // layer is always published and cannot be dragged off.
-      await expect(minInput).toBeDisabled();
-      await expect(minInput).toHaveValue("0");
+      // FLOOR thumb is PINNED at the base layer (position 0): the base is always
+      // published. Non-interactive WITHOUT the `disabled` attr (WebKit fix — see
+      // expectPinnedFloor).
+      await expectPinnedFloor(minInput);
       // CEILING thumb is interactive and defaults to the TOP position = full
       // ladder. Read the rendered top position (the `max` attr) and assert the
       // default value matches it — works for a 1-, 2-, or 3-layer ladder.
@@ -430,14 +452,13 @@ test.describe("Performance settings panel (#961)", () => {
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-video-range-max"]');
 
-    // VIDEO SEND is now a LAYER-COUNT control: the floor (min) thumb is PINNED
-    // (disabled) at the base layer (position 0 — always published), and only the
-    // ceiling (max) thumb moves. Default = full ladder (ceiling at the top
-    // position) → Reset is ABSENT.
+    // VIDEO SEND is now a LAYER-COUNT control: the floor (min) thumb is PINNED at
+    // the base layer (position 0 — always published, non-interactive but NOT
+    // `disabled`; see expectPinnedFloor / the WebKit fix), and only the ceiling
+    // (max) thumb moves. Default = full ladder (ceiling at the top) → Reset ABSENT.
     await expect(resetBtn).toHaveCount(0);
-    await expect(minInput).toBeDisabled();
+    await expectPinnedFloor(minInput);
     await expect(maxInput).toBeEnabled();
-    await expect(minInput).toHaveValue("0");
     // CAPABILITY-ADAPTIVE: read the rendered top position (== effective layers - 1).
     const topPosStr = await maxInput.getAttribute("max");
     expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
@@ -466,12 +487,12 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(resetBtn).not.toHaveAttribute("aria-pressed", /.*/);
 
     // Click Reset → ceiling snaps back to the full ladder (top), Reset DISAPPEARS,
-    // the floor stays pinned/disabled, and the ceiling stays enabled throughout.
+    // the floor stays pinned (non-interactive, not `disabled`), and the ceiling
+    // stays enabled throughout.
     await resetBtn.click();
-    await expect(minInput).toHaveValue("0");
     await expect(maxInput).toHaveValue(String(topPos));
     await expect(resetBtn).toHaveCount(0);
-    await expect(minInput).toBeDisabled();
+    await expectPinnedFloor(minInput);
     await expect(maxInput).toBeEnabled();
   });
 
@@ -547,14 +568,14 @@ test.describe("Performance settings panel (#961)", () => {
     const panel = page.locator("#settings-panel-performance");
 
     // VIDEO SEND is a LAYER-COUNT control: the floor (min) thumb is PINNED at the
-    // base layer (disabled), and lowering the CEILING (max) thumb publishes fewer
-    // top layers. CAPABILITY-ADAPTIVE: read the rendered top position (== effective
-    // layers - 1); on a single-layer runner (<6-core CI, topPos === 0) there is no
-    // ceiling to lower, so skip the drag/persist/reload assertions there (the
-    // capability ceiling is documented in helpers/simulcast-config.ts).
+    // base layer (non-interactive, NOT `disabled` — WebKit fix), and lowering the
+    // CEILING (max) thumb publishes fewer top layers. CAPABILITY-ADAPTIVE: read the
+    // rendered top position (== effective layers - 1); on a single-layer runner
+    // (<6-core CI, topPos === 0) there is no ceiling to lower, so skip the
+    // drag/persist/reload assertions there (see helpers/simulcast-config.ts).
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInputLoc = panel.locator('[data-testid="perf-video-range-max"]');
-    await expect(minInput).toBeDisabled();
+    await expectPinnedFloor(minInput);
     const topPosStr = await maxInputLoc.getAttribute("max");
     expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
     const topPos = Number(topPosStr);
@@ -632,9 +653,9 @@ test.describe("Performance settings panel (#961)", () => {
 
     // Lowered ceiling restored (not the full ladder) → the Reset button is
     // RENDERED, the ceiling thumb is back at the lowered position, and the base
-    // floor is still pinned (disabled).
+    // floor is still pinned (non-interactive, not `disabled`).
     await expect(panelAfter.locator('[data-testid="perf-video-auto"]')).toBeVisible();
-    await expect(panelAfter.locator('[data-testid="perf-video-range-min"]')).toBeDisabled();
+    await expectPinnedFloor(panelAfter.locator('[data-testid="perf-video-range-min"]'));
     await expect(panelAfter.locator('[data-testid="perf-video-range-max"]')).toHaveValue(
       String(lowered),
     );
@@ -693,12 +714,77 @@ test.describe("Performance settings panel (#961)", () => {
     // layer-count sliders with a fixed base-layer floor and an adjustable ceiling
     // — there is no tier-pinning and therefore no SEND "Fixed" badge for any kind.
     // Guard that none renders (a regression that revived the tier slider would
-    // bring the badge back). The audio floor is also pinned/disabled like the
-    // others (it is no longer a draggable tier min).
+    // bring the badge back). The floor for every kind is pinned (non-interactive
+    // but NOT `disabled` — the WebKit fix) rather than a draggable tier min.
     for (const stream of ["video", "audio", "screen"] as const) {
       await expect(panel.locator(`[data-testid="perf-${stream}-fixed-badge"]`)).toHaveCount(0);
-      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeDisabled();
+      await expectPinnedFloor(panel.locator(`[data-testid="perf-${stream}-range-min"]`));
     }
+  });
+
+  test("SEND ceiling thumb is grabbable (WebKit pinned-floor regression): max draggable + value-settable; floor non-interactive without `disabled`", async ({
+    page,
+  }) => {
+    // REGRESSION GUARD for the WebKit pinned-floor bug: a `disabled`, on-top,
+    // full-width range input (the old way of pinning the floor) swallowed the
+    // pointer-down meant for the max (ceiling) thumb in WebKit/Safari, so the
+    // ceiling could not be dragged. The fix pins the floor via tabindex=-1 +
+    // aria-disabled + CSS pointer-events:none + z-index:0 (below the max) and does
+    // NOT set `disabled`. We use AUDIO because its effective ladder is
+    // `min(flag, 3)` and is NOT CPU-clamped, so it always has ≥2 ceiling positions
+    // on any runner (no skip-guard needed) — the deterministic drag target.
+    await enableSimulcastFlag(page.context(), 3);
+    await joinMeeting(page, "send_ceiling_grabbable");
+    await openPerformanceTab(page);
+    await selectSendDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    const minInput = panel.locator('[data-testid="perf-audio-range-min"]');
+    const maxInput = panel.locator('[data-testid="perf-audio-range-max"]');
+
+    // (a) DOM contract: the max is interactive/enabled and the floor is pinned
+    // WITHOUT `disabled` (the WebKit fix). If a regression re-adds `disabled` to
+    // the floor, expectPinnedFloor's toBeEnabled() fails here.
+    await expect(maxInput).toBeEnabled();
+    await expectPinnedFloor(minInput);
+    // Audio is capability-independent (~3 layers), so the ceiling starts at the
+    // top with at least one position to lower into.
+    const topPos = Number(await maxInput.getAttribute("max"));
+    expect(topPos, "audio ceiling must have ≥1 position to drag").toBeGreaterThanOrEqual(1);
+    await expect(maxInput).toHaveValue(String(topPos));
+
+    // (b) REAL POINTER DRAG on the max thumb's pixels — this is what the bug broke.
+    // The thumb sits at the far right (value == max). Press at the right edge of
+    // the track and drag left toward the track centre; the drag must reach the max
+    // input (nothing disabled/opaque above it now) and lower the value. If the
+    // pinned floor were still swallowing the pointer, the value would not change.
+    const box = await maxInput.boundingBox();
+    expect(box, "max input has a layout box").not.toBeNull();
+    const b = box as { x: number; y: number; width: number; height: number };
+    const y = b.y + b.height / 2;
+    await page.mouse.move(b.x + b.width - 6, y); // near the right-edge thumb
+    await page.mouse.down();
+    await page.mouse.move(b.x + b.width * 0.4, y, { steps: 12 }); // drag left
+    await page.mouse.up();
+
+    // The ceiling value must have DROPPED below the top (the drag landed on the
+    // max thumb). Poll because Dioxus's controlled re-render is async to the event.
+    await expect
+      .poll(async () => Number(await maxInput.getAttribute("value")), { timeout: 5_000 })
+      .toBeLessThan(topPos);
+    // The floor never moved (stayed pinned at the base).
+    await expect(minInput).toHaveValue("0");
+
+    // (c) Value-settable fallback (independent of pointer hit-testing): driving the
+    // max input updates the persisted audio layer count + the caption, proving the
+    // control is live-wired regardless of the drag path.
+    await setRangeValue(page, "perf-audio-range-max", 0);
+    await expect
+      .poll(async () => (await readPerfPref(page))?.audio_layers, { timeout: 10_000 })
+      .toBe(1); // position 0 → 1 layer (base only)
+    await expect(panel.locator('[data-testid="perf-audio-range-value"]')).toContainText(
+      "Sending 1 of",
+    );
   });
 
   test("send rung strip + directional arrows render (#1131)", async ({ page }) => {

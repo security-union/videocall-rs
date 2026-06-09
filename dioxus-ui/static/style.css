@@ -7995,10 +7995,22 @@ details.perf-peers[open] .perf-peers__chev {
 /* ── Pinned floor thumb (the always-on base layer) ──
    A visibly FIXED end: a small filled --success dot, default cursor, no shadow
    and no hover/focus grow. The distinct shape (small filled dot vs. the large
-   hollow accent ring of a movable thumb) is the non-color "this end can't move"
-   cue, so the affordance reads correctly regardless of color perception. */
+   hollow accent ring of a movable thumb) is the non-color "this can't move"
+   cue, so the affordance reads correctly regardless of color perception.
+
+   WEBKIT HIT-TEST: this input must NOT sit above the max input, or — even with
+   pointer-events:none — WebKit can intercept the pointer-down meant for the max
+   thumb. The default `.perf-range-input-min { z-index: 2 }` puts the min ON TOP
+   (correct for the Receive/tier slider where the min is a real draggable thumb);
+   in pinned mode we OVERRIDE it to `z-index: 0` (below `.perf-range-input-max`'s
+   z-index 1). `.perf-range-input.is-pinned` (two classes, specificity 0,2,0)
+   beats `.perf-range-input-min` (0,1,0), so this override wins. Result: the max
+   (ceiling) thumb is the topmost interactive layer and always grabbable. The
+   Receive slider (no `.is-pinned`) is unaffected. This is the belt-and-suspenders
+   companion to dropping the HTML `disabled` attribute in the Rust markup. */
 .perf-range-input.is-pinned {
   pointer-events: none; /* the floor never accepts drags */
+  z-index: 0; /* below .perf-range-input-max (z-index 1) — max stays on top */
 }
 .perf-range-input.is-pinned::-webkit-slider-thumb {
   width: 12px;

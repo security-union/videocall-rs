@@ -1784,7 +1784,26 @@ fn DualRangeSlider(
                     // When pinned (SEND layer sliders), the floor is fixed at the
                     // base layer (position 0) and the input is non-interactive.
                     value: if pin_min { "0".to_string() } else { format!("{min_value}") },
-                    disabled: pin_min,
+                    // WEBKIT BUG FIX: do NOT use the HTML `disabled` attribute to
+                    // pin the floor. A `disabled`, full-width, on-top range input
+                    // SWALLOWS pointer-down events meant for the max thumb beneath
+                    // it in WebKit/Safari — WebKit does not reliably let
+                    // `pointer-events: none` fall THROUGH a disabled form control,
+                    // so the ceiling thumb below never receives the drag (the SEND
+                    // max thumb became undraggable; the Receive slider was fine
+                    // because its min is enabled + `pointer-events:none` on the
+                    // track, letting events reach the max thumb). Instead make the
+                    // floor immovable WITHOUT `disabled`:
+                    //   - `.is-pinned { pointer-events: none }` (CSS) — no pointer,
+                    //   - `tabindex=-1` — not keyboard-focusable, so arrows can't
+                    //     move it,
+                    //   - `aria-disabled=true` — conveyed to screen readers,
+                    //   - the `oninput` early-return guard below — defensive no-op.
+                    // The `.is-pinned` CSS also drops this input BELOW the max
+                    // (z-index 0 < max's 1) so the ceiling thumb is the topmost
+                    // interactive layer and always grabbable. See the ux memory
+                    // `pattern_perf_send_pinned_floor_slider.md`.
+                    tabindex: if pin_min { "-1" } else { "0" },
                     "aria-disabled": if pin_min { "true" } else { "false" },
                     "aria-label": if pin_min {
                         format!("Base {stream_noun} layer — always sent (fixed)")
@@ -1793,8 +1812,10 @@ fn DualRangeSlider(
                     },
                     "aria-valuetext": "{min_valuetext}",
                     oninput: move |evt| {
-                        // Pinned floor never moves: ignore any input (defensive —
-                        // a disabled input emits no oninput, but keep the guard).
+                        // Pinned floor never moves: ignore any input. (It is no
+                        // longer `disabled`, so guard here AND rely on
+                        // `pointer-events:none` + `tabindex=-1` to make a stray
+                        // input impossible in practice.)
                         if pin_min {
                             return;
                         }

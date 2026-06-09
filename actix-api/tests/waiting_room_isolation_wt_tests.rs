@@ -376,40 +376,57 @@ async fn wt_read_length_prefixed_frame(
     Some(payload)
 }
 
-/// Read one packet from the WT session, trying the persistent stream first,
-/// then falling back to accepting a new uni-stream or datagram.
+/// Read one packet from the WT session, racing the persistent uni-stream
+/// against datagrams (and, if no persistent stream exists, against
+/// `accept_uni` for a new one).
 ///
-/// Takes ownership of the persistent stream and returns it (possibly updated)
-/// to avoid borrow issues in `tokio::select!`.
+/// The server may deliver a given packet via either the persistent
+/// uni-stream or a datagram depending on media type and size — so the
+/// reader must always race both channels, not prefer one over the other.
+///
+/// Takes ownership of the persistent stream and returns it (possibly
+/// updated) to avoid borrow issues in `tokio::select!`.
 async fn wt_read_one(
     session: &web_transport_quinn::Session,
     persistent: Option<web_transport_quinn::RecvStream>,
     timeout: Duration,
 ) -> (Option<Vec<u8>>, Option<web_transport_quinn::RecvStream>) {
-    if let Some(mut stream) = persistent {
-        match tokio::time::timeout(timeout, wt_read_length_prefixed_frame(&mut stream)).await {
-            Ok(Some(payload)) => return (Some(payload), Some(stream)),
-            Ok(None) => return (None, None),       // stream finished
-            Err(_) => return (None, Some(stream)), // timeout, stream still alive
-        }
-    }
-
-    // No persistent stream — accept a new one or read a datagram.
-    match tokio::time::timeout(timeout, async {
-        tokio::select! {
-            Ok(mut stream) = session.accept_uni() => {
-                let payload = wt_read_length_prefixed_frame(&mut stream).await;
-                (payload, Some(stream))
+    // The inner future always returns the (possibly updated) stream handle so
+    // the caller can reuse it. On timeout the future is dropped and the
+    // stream is lost — which is fine: the caller's collect loop will accept
+    // a fresh one on the next iteration.
+    let result = tokio::time::timeout(timeout, async {
+        if let Some(mut stream) = persistent {
+            // Race: read next frame from persistent stream vs. datagram.
+            tokio::select! {
+                frame = wt_read_length_prefixed_frame(&mut stream) => {
+                    match frame {
+                        Some(payload) => (Some(payload), Some(stream)),
+                        None => (None, None), // stream finished
+                    }
+                }
+                Ok(datagram) = session.read_datagram() => {
+                    (Some(datagram.to_vec()), Some(stream))
+                }
             }
-            Ok(datagram) = session.read_datagram() => {
-                (Some(datagram.to_vec()), None)
+        } else {
+            // No persistent stream — accept a new one or read a datagram.
+            tokio::select! {
+                Ok(mut stream) = session.accept_uni() => {
+                    let payload = wt_read_length_prefixed_frame(&mut stream).await;
+                    (payload, Some(stream))
+                }
+                Ok(datagram) = session.read_datagram() => {
+                    (Some(datagram.to_vec()), None)
+                }
             }
         }
     })
-    .await
-    {
+    .await;
+
+    match result {
         Ok((payload, stream)) => (payload, stream),
-        Err(_) => (None, None), // timeout
+        Err(_) => (None, None), // timeout — stream dropped with the future
     }
 }
 

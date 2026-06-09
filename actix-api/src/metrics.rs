@@ -856,9 +856,11 @@ lazy_static! {
     /// L1 / 5% L2 → most receivers are constrained to the base layer).
     ///
     /// Increment site is the actual forward path: a packet counted here passed
-    /// every drop gate (it was not viewport-dropped, not layer-dropped, and is a
-    /// forwardable MEDIA packet). It is NOT incremented for control packets,
-    /// self-echo drops, observer drops, or any dropped media.
+    /// every drop gate that APPLIES to it and is a forwardable MEDIA packet
+    /// (VIDEO survives both the viewport (#988) and layer (#989) filters; AUDIO
+    /// and SCREEN are never viewport-gated — VIDEO-only — so they reach the
+    /// increment by passing the layer filter alone). It is NOT incremented for
+    /// control packets, self-echo drops, observer drops, or any dropped media.
     ///
     /// CARDINALITY: bounded — `room` × exactly 4 `layer_id` buckets
     /// (`"0"`, `"1"`, `"2"`, `"other"`). The wire `simulcast_layer_id` is a

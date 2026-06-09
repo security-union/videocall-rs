@@ -161,9 +161,13 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     )
 }
 
-/// Format one SEND simulcast layer line, e.g. `"L0 640×360 · 400 kbps"`. Pure.
+/// Format one SEND simulcast layer line, e.g. `"L1 640×360 · 400 kbps"`. The
+/// `layer_id` is the internal 0-based id; the DISPLAYED layer number is 1-based
+/// (`layer_id + 1`) to match the receive side's `L1/3` convention — users count
+/// layers from 1, not 0. Pure.
 pub fn format_send_layer(layer_id: u32, width: u32, height: u32, bitrate_kbps: u32) -> String {
-    format!("L{layer_id} {width}×{height} · {bitrate_kbps} kbps")
+    let layer_num = layer_id + 1;
+    format!("L{layer_num} {width}×{height} · {bitrate_kbps} kbps")
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
@@ -309,10 +313,10 @@ pub fn format_kbps_compact(kbps: u32) -> String {
     format!("{s}M")
 }
 
-/// Format the RECEIVE per-kind layer spread across peers, e.g. `"L0–L2"`, or
+/// Format the RECEIVE per-kind layer spread across peers, e.g. `"L1–L3"`, or
 /// `"L3"` when every peer is on the same layer. `layers` is the list of
-/// `layer_index` values (1-indexed for display via `+1`) for the peers receiving
-/// this kind. Empty → empty string (caller renders the "not receiving" state).
+/// 0-based `layer_index` values; the DISPLAYED numbers are 1-based (via `+1`).
+/// Empty → empty string (caller renders the "not receiving" state).
 /// Pure / host-tested.
 pub fn format_receive_spread(layers: &[u32]) -> String {
     let Some(&first) = layers.first() else {
@@ -508,14 +512,26 @@ pub fn format_audio_receive_summary(n_peers: usize) -> String {
 /// `layer_max` is the effective audio ladder depth. Derived from the SAME
 /// per-kind ladder labels the slider + rung strip use
 /// ([`send_layer_labels`] for `Audio`, lowest-first `["24k","32k","50k"]`), so the
-/// summary's top-layer label can never drift from the rungs. The summary names the
-/// TOP currently-published layer (the best quality flowing): the full ladder reads
-/// "Sending up to {top}" and a single base layer reads "Sending {base} only".
-/// Pure / host-tested.
-pub fn format_audio_send_layer_summary(layers: Option<u32>, layer_max: usize) -> String {
+/// summary's top-layer label can never drift from the rungs.
+///
+/// STATE-AWARE (mirrors [`format_send_layer_caption`]): when the mic is ACTIVE the
+/// summary names the TOP currently-published layer (the best quality flowing) —
+/// the full ladder reads "Sending up to {top}", a single base layer reads
+/// "Sending {base} only". When the mic is OFF it switches to the future form
+/// "Will send up to {top} when the mic is on" so it never claims to be sending
+/// while nothing is captured. Pure / host-tested.
+pub fn format_audio_send_layer_summary(
+    layers: Option<u32>,
+    layer_max: usize,
+    source_active: bool,
+) -> String {
     let labels = send_layer_labels(PrefMediaKind::Audio, layer_max);
     if labels.is_empty() {
-        return "Sending audio".to_string();
+        return if source_active {
+            "Sending audio".to_string()
+        } else {
+            "Will send audio when the mic is on".to_string()
+        };
     }
     // Active layers are L0..=ceiling_pos; the top published label is at ceiling_pos.
     let ceiling_pos = layer_ceiling_to_thumb_pos(layers, labels.len());
@@ -523,11 +539,59 @@ pub fn format_audio_send_layer_summary(layers: Option<u32>, layer_max: usize) ->
         .get(ceiling_pos)
         .copied()
         .unwrap_or(labels[labels.len() - 1]);
-    if ceiling_pos == 0 {
-        // Only the base layer is published.
-        format!("Sending {top} only")
+    match (source_active, ceiling_pos == 0) {
+        // Mic on, only the base layer published.
+        (true, true) => format!("Sending {top} only"),
+        // Mic on, multiple layers.
+        (true, false) => format!("Sending up to {top}"),
+        // Mic off, base only.
+        (false, true) => format!("Will send {top} only when the mic is on"),
+        // Mic off, multiple layers.
+        (false, false) => format!("Will send up to {top} when the mic is on"),
+    }
+}
+
+/// The per-kind phrase describing when an OFF source will start sending, e.g.
+/// "when the camera is on". Pure (a `match`); shared by the caption + summary so
+/// the wording can't drift between them.
+fn source_on_phrase(kind: PrefMediaKind) -> &'static str {
+    match kind {
+        PrefMediaKind::Video => "when the camera is on",
+        PrefMediaKind::Screen => "when sharing",
+        PrefMediaKind::Audio => "when the mic is on",
+    }
+}
+
+/// The SEND layer count caption ("range value" line) — STATE-AWARE about whether
+/// the source is actually capturing.
+///
+/// - Source ACTIVE (camera on / sharing / mic on): the present-tense
+///   "Sending {active} of {total} layers" (or "Sending 1 layer" for a 1-rung
+///   ladder) — the live count.
+/// - Source OFF: a future/conditional form using the CONFIGURED count so we never
+///   claim to be "sending" when nothing is captured, e.g.
+///   "Will send {active} layers when the camera is on" (the configured ceiling is
+///   known from the persisted pref regardless of source state). A 1-layer ladder
+///   reads "Will send 1 layer {phrase}".
+///
+/// `active`/`total` are layer COUNTS (`active <= total`, both ≥ 1). Pure /
+/// host-tested.
+pub fn format_send_layer_caption(
+    kind: PrefMediaKind,
+    active: usize,
+    total: usize,
+    source_active: bool,
+) -> String {
+    let layers_word = if active == 1 { "layer" } else { "layers" };
+    if source_active {
+        if total <= 1 {
+            "Sending 1 layer".to_string()
+        } else {
+            format!("Sending {active} of {total} layers")
+        }
     } else {
-        format!("Sending up to {top}")
+        let phrase = source_on_phrase(kind);
+        format!("Will send {active} {layers_word} {phrase}")
     }
 }
 
@@ -1011,6 +1075,25 @@ pub fn auto_thumbs(tier_count: usize) -> RangeSel {
 /// both the send (`usize`) and receive (`u32`, cast) sliders share it.
 pub fn at_full_range(min_pos: usize, max_pos: usize, last_position: usize) -> bool {
     min_pos == 0 && max_pos == last_position
+}
+
+/// Percent offsets (0.0..=100.0) for the discrete tick marks on a range slider
+/// track, one per step position `0..=max_pos` where `max_pos = step_count - 1`.
+///
+/// Tick `i` sits at `i / max_pos * 100%`, aligning with where the native range
+/// thumb snaps (a `<input type=range min=0 max=N step=1>` thumb at value `v`
+/// centres at `v/N` of the track). A single-step slider (`step_count <= 1`)
+/// returns one tick at 0% (the lone stop). Returned left→right (ascending).
+/// Pure so the positions are host-tested (and shared by the SEND + RECEIVE
+/// sliders).
+pub fn tick_offsets(step_count: usize) -> Vec<f32> {
+    if step_count <= 1 {
+        return vec![0.0];
+    }
+    let max_pos = (step_count - 1) as f32;
+    (0..step_count)
+        .map(|i| i as f32 / max_pos * 100.0)
+        .collect()
 }
 
 // ── SEND layer-count model (video + screen) ────────────────────────
@@ -1757,6 +1840,8 @@ fn DualRangeSlider(
             sel.max_pos as f32 / max_pos as f32 * 100.0,
         )
     };
+    // Decorative tick marks — one per discrete step (aligned to the thumb stops).
+    let ticks = tick_offsets(labels.len());
 
     rsx! {
         div { class: "{range_class}",
@@ -1764,6 +1849,24 @@ fn DualRangeSlider(
             span { class: "perf-range-end-label", "{left_label}" }
             div { class: "perf-range-track-wrap",
                 div { class: "perf-range-track",
+                    // Tick marks: notch per step position. Rendered INSIDE the
+                    // track (so they inherit its low stacking + below the fill and
+                    // the input thumbs) and `pointer-events: none` + aria-hidden —
+                    // purely decorative, and MUST NOT intercept pointer drags (the
+                    // WebKit pinned-floor fix in commit 603c7354 depends on nothing
+                    // over the track swallowing pointer-down for the thumbs). The
+                    // labels/caption convey the values to AT.
+                    div {
+                        class: "perf-range-ticks",
+                        "aria-hidden": "true",
+                        "data-testid": "{id_prefix}-range-ticks",
+                        for off in ticks.iter() {
+                            span {
+                                class: "perf-range-tick",
+                                style: "left: {off}%;",
+                            }
+                        }
+                    }
                     div {
                         class: "perf-range-fill",
                         style: "left: {fill_left}%; right: {100.0 - fill_right}%;",
@@ -1981,6 +2084,13 @@ fn SendLayerCell(
     layer_max: usize,
     /// The persisted layer-ceiling COUNT (`None` = Auto / full ladder).
     layers: Option<u32>,
+    /// Whether the SOURCE is actually capturing (camera on / sharing / mic on).
+    /// Threaded from the panel's existing per-kind state (the same signal that
+    /// drives the "not sharing" consequence). Switches the caption/summary from
+    /// the present-tense "Sending N of M layers" to the future "Will send N layers
+    /// {when …}" so we never claim to be sending while the source is off. The
+    /// slider + ticks still render the configured ceiling (it is a setting).
+    source_active: bool,
     /// Live summary line (flowing rates), shown under the strip caption.
     summary_line: String,
     open_help: Signal<Option<&'static str>>,
@@ -2001,12 +2111,10 @@ fn SendLayerCell(
     let rungs = layer_send_rungs(&labels, ceiling_pos);
     let rungs_aria = send_rungs_aria(&rungs);
     let active_count = ceiling_pos + 1;
-    // Human caption: "Sending N of M layers".
-    let count_caption = if labels.len() <= 1 {
-        "Sending 1 layer".to_string()
-    } else {
-        format!("Sending {active_count} of {} layers", labels.len())
-    };
+    // Human caption: present-tense "Sending N of M layers" when the source is
+    // capturing, else the future "Will send N layers {when …}" using the
+    // configured count (source-aware, pure / host-tested).
+    let count_caption = format_send_layer_caption(kind, active_count, labels.len(), source_active);
     // Count-aware aria-valuetext for the ceiling thumb (screen-reader announces
     // "2 of 3 layers", not a bare resolution). Single-layer ladders announce the
     // lone layer.
@@ -2128,6 +2236,12 @@ pub struct PeerKindSnap {
 
 // ── help-popover bodies (§3 copy) ──────────────────────────────────
 
+/// The panel intro, collapsed behind the header `(i)` info icon (it used to be an
+/// always-visible paragraph that ate vertical space / the no-scroll budget). Plain
+/// text (the popover body is a `&'static str`); the emphasis the old inline
+/// `<span>`s carried is conveyed by the wording instead.
+const HELP_PERF_INTRO: &str = "Each stream adapts to your connection automatically. Limit what you RECEIVE (saves your download) and what you SEND (saves your upload + CPU). For sending, the base layer is always sent so every viewer can see you; the right handle sets the highest layer you publish — how many layers you send. For receiving, the two handles bound the quality you'll accept. Reset returns to the full automatic range. The meter shows what's flowing right now.";
+
 const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The base layer is ALWAYS sent (so every viewer can always see you); the right handle sets the HIGHEST layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload + CPU); raise it to send more, up to your device's limit. The encoder still adapts quality within what you allow. Reset returns to the full automatic ladder.";
 const HELP_AUDIO_SEND: &str = "Your mic sends several audio quality versions ('layers') so each listener gets the best one their connection can handle. The base layer is ALWAYS sent (so everyone can always hear you); the right handle sets the HIGHEST audio layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload); raise it to send more, up to the audio ladder's limit. Reset returns to the full automatic ladder.";
 const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is ALWAYS sent so every viewer can follow along. The right handle sets the HIGHEST layer you publish — how many sharpness layers you send. Lower it to send fewer top layers when your upload is tight; raise it for text-heavy screens, up to your device's limit. Reset returns to the full automatic ladder.";
@@ -2174,6 +2288,14 @@ pub fn PerformanceSettingsPanel(
     /// typically the full audio ladder even on weak runners.
     #[props(default = 1)]
     audio_layer_max: usize,
+    /// Whether the MIC is currently capturing (threaded from `host.rs`'s
+    /// `mic_enabled` prop). Audio has no per-layer SEND snapshot to infer this from
+    /// (unlike video/screen, whose source-active state is the snapshot being
+    /// `Some`), so the panel takes the mic state explicitly. Drives the audio
+    /// caption's present-tense vs. "will send … when the mic is on" form. Default
+    /// `false` so call sites / tests that don't wire it render the off-state copy.
+    #[props(default)]
+    audio_source_active: bool,
 ) -> Element {
     // First-paint SEND meter values (before the rAF driver ticks). The same pure
     // mapper drives the live loop, so first paint and live updates agree.
@@ -2244,7 +2366,8 @@ pub fn PerformanceSettingsPanel(
     // lowers the audio layer count — consistent with the "N of M layers" caption
     // the SendLayerCell renders. (The old bare-tier `format_audio_send_summary`
     // read "Sending high quality" regardless, contradicting the rungs.)
-    let audio_send_line = format_audio_send_layer_summary(pref.audio_layers, audio_layer_max);
+    let audio_send_line =
+        format_audio_send_layer_summary(pref.audio_layers, audio_layer_max, audio_source_active);
     let audio_recv_line = format_audio_receive_summary(recv_audio_peers.len());
     let content_send_line = format_content_send_summary(send_screen_snap.as_ref());
     // Top-layer screen-share peer (highest layer_index) for the content receive line.
@@ -2272,6 +2395,18 @@ pub fn PerformanceSettingsPanel(
         // Header row: title left, Diagnostics cross-nav button right (§4a).
         div { class: "perf-header-row",
             h3 { class: "settings-section-title", "Performance" }
+            // The intro explanation is now COLLAPSED behind this (i) info icon
+            // (reusing the shared HelpPopover: single-open signal, aria-expanded,
+            // Escape/outside-click, focus return) — it used to be an always-visible
+            // paragraph that ate vertical space / the no-scroll budget. The content
+            // is unchanged, just on-demand.
+            HelpPopover {
+                key_id: "perf-intro",
+                help_testid: "perf-intro-help",
+                help_label: "About the Performance panel",
+                help_body: HELP_PERF_INTRO,
+                open_help,
+            }
             button {
                 r#type: "button",
                 class: "perf-nav-button",
@@ -2293,17 +2428,6 @@ pub fn PerformanceSettingsPanel(
                 }
                 span { class: "perf-nav-button__label", "Diagnostics" }
             }
-        }
-        p { class: "settings-section-description",
-            "Each stream adapts to your connection automatically. Limit what you "
-            span { class: "perf-emph-recv", "receive" }
-            " (saves your download) and what you "
-            span { class: "perf-emph-send", "send" }
-            " (saves your upload + CPU). For sending, the base layer is always "
-            "sent so every viewer can see you; the right handle sets the highest "
-            "layer you publish — how many layers you send. For receiving, the two "
-            "handles bound the quality you'll accept. Reset returns to the full "
-            "automatic range. The meter shows what's flowing right now."
         }
 
         // Global effective-setting strip with an (i) tooltip. Compact copy; full
@@ -2350,6 +2474,10 @@ pub fn PerformanceSettingsPanel(
                     kind: PrefMediaKind::Video,
                     layer_max: video_layer_max,
                     layers: pref.video_layers,
+                    // Camera active iff the live SEND snapshot is Some (gated on the
+                    // camera being enabled — the same signal as the "Camera — off"
+                    // meter + the diagnostics reader).
+                    source_active: send_video_snap.is_some(),
                     summary_line: video_send_line,
                     open_help,
                     on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_video_layers(c)),
@@ -2394,6 +2522,9 @@ pub fn PerformanceSettingsPanel(
                     kind: PrefMediaKind::Audio,
                     layer_max: audio_layer_max,
                     layers: pref.audio_layers,
+                    // Mic active iff the mic is enabled (threaded from host —
+                    // audio has no per-layer SEND snapshot to infer it from).
+                    source_active: audio_source_active,
                     summary_line: audio_send_line,
                     open_help,
                     on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_audio_layers(c)),
@@ -2438,6 +2569,9 @@ pub fn PerformanceSettingsPanel(
                     kind: PrefMediaKind::Screen,
                     layer_max: screen_layer_max,
                     layers: pref.screen_layers,
+                    // Sharing iff the live screen SEND snapshot is Some (the same
+                    // signal as the "not sharing" consequence above).
+                    source_active: send_screen_snap.is_some(),
                     summary_line: content_send_line,
                     open_help,
                     on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_screen_layers(c)),
@@ -2503,7 +2637,7 @@ pub mod receive {
     use super::{
         format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
         quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
-        reason_chip_title, write_meter_level, write_readout_text, PeerKindSnap,
+        reason_chip_title, tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
     };
     use dioxus::prelude::*;
     use std::rc::Rc;
@@ -3004,12 +3138,29 @@ pub mod receive {
                 sel.max_pos as f32 / top as f32 * 100.0,
             )
         };
+        // Decorative tick marks — one per step position (`0..=top`, so `top + 1`
+        // ticks), aligned to the receive thumb stops.
+        let ticks = tick_offsets((top + 1) as usize);
 
         rsx! {
             div { class: "perf-range",
                 span { class: "perf-range-end-label", "{index_label(kind, 0)}" }
                 div { class: "perf-range-track-wrap",
                     div { class: "perf-range-track",
+                        // Tick marks: see DualRangeSlider — inside the track, below
+                        // fill/thumbs, `pointer-events: none` + aria-hidden so they
+                        // never intercept a thumb drag (preserves the WebKit fix).
+                        div {
+                            class: "perf-range-ticks",
+                            "aria-hidden": "true",
+                            "data-testid": "{id_prefix}-range-ticks",
+                            for off in ticks.iter() {
+                                span {
+                                    class: "perf-range-tick",
+                                    style: "left: {off}%;",
+                                }
+                            }
+                        }
                         div {
                             class: "perf-range-fill",
                             style: "left: {fill_left}%; right: {100.0 - fill_right}%;",
@@ -3680,10 +3831,13 @@ mod tests {
 
     #[test]
     fn send_layer_and_header_formatting() {
-        assert_eq!(format_send_layer(0, 640, 360, 400), "L0 640×360 · 400 kbps");
+        // DISPLAY 1-based: internal layer_id 0 (the base) renders "L1"; id 2
+        // renders "L3" — matching the receive side's L{i}/n convention. (The
+        // internal id stays 0-based; only the rendered number is +1.)
+        assert_eq!(format_send_layer(0, 640, 360, 400), "L1 640×360 · 400 kbps");
         assert_eq!(
             format_send_layer(2, 1280, 720, 1500),
-            "L2 1280×720 · 1500 kbps"
+            "L3 1280×720 · 1500 kbps"
         );
         // Header: active/effective vs single-stream.
         let multi = SimulcastSendSnapshot {
@@ -3980,28 +4134,50 @@ mod tests {
     #[test]
     fn audio_send_layer_summary_is_count_aware() {
         use PrefMediaKind::Audio;
-        // Audio ladder lowest-first is ["24k","32k","50k"] (see send_layer_labels).
-        // Full ladder (Auto / None) → top published layer = "50k".
+        // MIC ON. Audio ladder lowest-first is ["24k","32k","50k"]. Full ladder
+        // (Auto / None) → top published layer = "50k".
         assert_eq!(
-            format_audio_send_layer_summary(None, 3),
+            format_audio_send_layer_summary(None, 3, true),
             "Sending up to 50k"
         );
         // Ceiling 2 → top published layer = "32k" (the rung strip would show 2 of
         // 3 active); MUST differ from the full-ladder summary so a lowered ceiling
         // visibly changes the line.
         assert_eq!(
-            format_audio_send_layer_summary(Some(2), 3),
+            format_audio_send_layer_summary(Some(2), 3, true),
             "Sending up to 32k"
         );
         // Ceiling 1 → only the base (24k) publishes → the "only" phrasing.
         assert_eq!(
-            format_audio_send_layer_summary(Some(1), 3),
+            format_audio_send_layer_summary(Some(1), 3, true),
             "Sending 24k only"
         );
         // Sanity: the summary's top label is exactly the top ACTIVE rung label, so
         // the summary can never drift from the rung strip.
         let labels = send_layer_labels(Audio, 3);
         assert_eq!(labels.last().copied(), Some("50k"));
+    }
+
+    #[test]
+    fn audio_send_layer_summary_is_source_aware_when_mic_off() {
+        // MIC OFF: the future "will send … when the mic is on" form (never claims
+        // to be sending while the mic is muted). Still count-aware (names the top
+        // configured layer), and MUST differ from the mic-on copy at the same
+        // ceiling so the state change is visible.
+        assert_eq!(
+            format_audio_send_layer_summary(None, 3, false),
+            "Will send up to 50k when the mic is on"
+        );
+        assert_ne!(
+            format_audio_send_layer_summary(None, 3, false),
+            format_audio_send_layer_summary(None, 3, true),
+            "mic-off copy must differ from mic-on"
+        );
+        // Base-only, mic off.
+        assert_eq!(
+            format_audio_send_layer_summary(Some(1), 3, false),
+            "Will send 24k only when the mic is on"
+        );
     }
 
     #[test]
@@ -4841,6 +5017,69 @@ mod tests {
         assert_eq!(
             reset.screen_layers, None,
             "reset clears to full ladder (None)"
+        );
+    }
+
+    #[test]
+    fn tick_offsets_one_per_step_aligned_to_stops() {
+        // A 3-step slider → 3 ticks at 0% / 50% / 100% (aligned to where a
+        // <input type=range max=2> thumb snaps: 0/2, 1/2, 2/2).
+        let three = tick_offsets(3);
+        assert_eq!(three.len(), 3, "one tick per step position");
+        assert_eq!(three[0], 0.0);
+        assert_eq!(three[1], 50.0);
+        assert_eq!(three[2], 100.0);
+        // A 4-step receive slider → 4 ticks at 0/33.3/66.6/100.
+        assert_eq!(tick_offsets(4).len(), 4);
+        // Endpoints are always 0 and 100 for >1 step.
+        let four = tick_offsets(4);
+        assert_eq!(four[0], 0.0);
+        assert_eq!(*four.last().unwrap(), 100.0);
+        // Single-step (or zero) → one tick at the lone stop, never empty/NaN.
+        assert_eq!(tick_offsets(1), vec![0.0]);
+        assert_eq!(tick_offsets(0), vec![0.0]);
+    }
+
+    #[test]
+    fn send_layer_caption_is_source_aware() {
+        use PrefMediaKind::{Audio, Screen, Video};
+        // SOURCE ON: present-tense "Sending N of M layers".
+        assert_eq!(
+            format_send_layer_caption(Video, 2, 3, true),
+            "Sending 2 of 3 layers"
+        );
+        // Single-layer ladder, on → "Sending 1 layer".
+        assert_eq!(
+            format_send_layer_caption(Video, 1, 1, true),
+            "Sending 1 layer"
+        );
+        // SOURCE OFF: future form using the CONFIGURED count + per-kind phrase;
+        // never claims to be "sending". Each kind names its own trigger.
+        assert_eq!(
+            format_send_layer_caption(Video, 2, 3, false),
+            "Will send 2 layers when the camera is on"
+        );
+        assert_eq!(
+            format_send_layer_caption(Screen, 3, 3, false),
+            "Will send 3 layers when sharing"
+        );
+        assert_eq!(
+            format_send_layer_caption(Audio, 1, 3, false),
+            "Will send 1 layer when the mic is on"
+        );
+        // The off-state copy MUST differ from the on-state copy AND name the
+        // count (the core requirement: don't claim "sending" when the source is
+        // off, but still convey N).
+        let on = format_send_layer_caption(Video, 2, 3, true);
+        let off = format_send_layer_caption(Video, 2, 3, false);
+        assert_ne!(on, off, "off-state copy must differ from on-state");
+        assert!(
+            off.contains('2'),
+            "off-state copy must name the configured count"
+        );
+        assert!(
+            !off.contains("Sending"),
+            "off-state must NOT claim to be sending"
         );
     }
 

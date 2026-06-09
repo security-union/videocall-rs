@@ -365,6 +365,13 @@ pub fn DeviceSettingsModal(
     /// so typically the full audio ladder even on weak runners.
     #[props(default = 1)]
     audio_layer_max: usize,
+    /// Whether the mic is currently capturing — drives the audio SEND caption's
+    /// "Sending …" vs. "Will send … when the mic is on" form (audio has no SEND
+    /// snapshot to infer it from, unlike video/screen). From `host.rs`'s
+    /// `mic_enabled`. Default `false` so call sites that don't wire it read the
+    /// off-state copy.
+    #[props(default)]
+    audio_source_active: bool,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -628,6 +635,8 @@ pub fn DeviceSettingsModal(
                                         video_layer_max,
                                         screen_layer_max,
                                         audio_layer_max,
+                                        // Mic capture state for the audio SEND caption.
+                                        audio_source_active,
                                     }
                                 }
                             },

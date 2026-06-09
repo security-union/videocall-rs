@@ -1127,10 +1127,10 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
         div { class: "diagnostics-section",
             h3 { "Simulcast layers" }
             p { class: "simulcast-effective", "{summary_line}" }
-            // The SEND ladder labels rungs 0-based (L0 = base) while the RECEIVE
-            // breakdown labels layers 1-based ("L1/3"); a one-line hint reconciles
-            // the two conventions under this single heading (#10).
-            p { class: "simulcast-note", "Send rungs are 0-based (L0 = base); receive layers are 1-based." }
+            // Both the SEND ladder and the RECEIVE breakdown now label layers
+            // 1-based ("L1" = base), so they read consistently under this single
+            // heading. A one-line hint states the shared convention (#10).
+            p { class: "simulcast-note", "Layers are numbered from 1 (L1 = base)." }
             SimulcastSendLadder {
                 title: "Video (sending)",
                 not_sharing_text: "Camera — off",
@@ -1221,13 +1221,17 @@ fn SimulcastSendLadder(
                         );
                         let res_short = format_send_layer_short(layer.width, layer.height);
                         let kbps_short = format_kbps_compact(layer.bitrate_kbps);
+                        // DISPLAY 1-based (L1 = base) to match the receive side; the
+                        // internal `layer_id` (and the data-testid suffix) stays
+                        // 0-based so e2e selectors / protobuf don't churn.
+                        let layer_num = layer.layer_id + 1;
                         rsx! {
                             div {
                                 class: chip_class,
                                 "data-testid": "diag-simulcast-rung-{layer.layer_id}",
                                 title: "{full}",
                                 style: "flex-grow: {grow};",
-                                span { class: "simulcast-rung-id", "L{layer.layer_id}" }
+                                span { class: "simulcast-rung-id", "L{layer_num}" }
                                 span { class: "simulcast-rung-res", "{res_short}" }
                                 span { class: "simulcast-rung-kbps", "{kbps_short}" }
                             }

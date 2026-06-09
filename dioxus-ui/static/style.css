@@ -7326,20 +7326,9 @@ html[data-theme="light"] .settings-divider {
   color: var(--text-secondary);
 }
 
-/* Receive / Send emphasis in the intro paragraph — bold + direction accent
-   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
-.perf-emph-recv,
-.perf-emph-send {
-  font-weight: 700;
-}
-
-.perf-emph-recv {
-  color: var(--accent);
-}
-
-.perf-emph-send {
-  color: var(--success);
-}
+/* (The `.perf-emph-recv` / `.perf-emph-send` intro-emphasis rules were removed
+   when the always-visible intro paragraph was collapsed behind the header `(i)`
+   info popover — the plain-text popover body carries the wording instead.) */
 
 /* ── Live simulcast effective-setting strip (issue #1095 redesign). The
    expandable per-layer detail moved to the Diagnostics panel's "Simulcast
@@ -7903,6 +7892,31 @@ details.perf-peers[open] .perf-peers__chev {
   background: var(--accent);
   border-radius: var(--radius-pill);
   transition: left 0.3s ease, right 0.3s ease;
+}
+
+/* ── Discrete tick marks (decorative notches at each step stop) ──
+   Rendered INSIDE .perf-range-track and BEFORE .perf-range-fill in the DOM, so
+   the fill (and the input thumbs, which sit in higher layers) paint OVER the
+   ticks. CRITICAL: `pointer-events: none` (+ aria-hidden in markup) so they
+   never intercept a pointer-down meant for a thumb — this preserves the WebKit
+   pinned-floor drag fix (commit 603c7354): nothing over the track may swallow
+   thumb drags. A theme-token notch in --text-secondary (theme-aware light+dark,
+   clearly contrasting against the --border track) that protrudes past the 6px
+   track height so the step stops read at a glance; centred on its `left:%`
+   offset. */
+.perf-range-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.perf-range-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  background: var(--text-secondary);
+  border-radius: 1.5px;
 }
 
 .perf-range-input {

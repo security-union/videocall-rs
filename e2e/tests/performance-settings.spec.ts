@@ -400,6 +400,13 @@ test.describe("Performance settings panel (#961)", () => {
       const topPos = await maxInput.getAttribute("max");
       expect(topPos, "ceiling slider exposes its max position").not.toBeNull();
       await expect(maxInput).toHaveValue(topPos as string);
+      // TICK MARKS: one decorative notch per step position (0..=max → max+1
+      // ticks), aligned to the thumb stops. The ticks layer is aria-hidden +
+      // pointer-events:none (must never block the drag — the WebKit fix).
+      const expectedTicks = Number(topPos) + 1;
+      const ticksLayer = panel.locator(`[data-testid="perf-${stream}-range-ticks"]`);
+      await expect(ticksLayer).toHaveAttribute("aria-hidden", "true");
+      await expect(ticksLayer.locator(".perf-range-tick")).toHaveCount(expectedTicks);
     }
   });
 
@@ -558,6 +565,46 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(popover).toHaveCount(0);
   });
 
+  test("panel intro is collapsed behind a header info (i) icon that reveals the explanation on click", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "intro_collapsed");
+    await openPerformanceTab(page);
+    await selectSendDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    // The big always-visible intro paragraph (it used to be a
+    // `.settings-section-description` in the panel) is GONE — collapsed behind a
+    // header (i) info button (the shared HelpPopover). Guard the always-visible
+    // intro prose is not rendered, and the explanation is reachable on demand.
+    const introBtn = panel.locator('[data-testid="perf-intro-help"]');
+    const introPopover = page.locator("#perf-intro-help-popover");
+
+    // The intro icon exists; the popover is closed by default (copy not visible).
+    await expect(introBtn).toBeVisible();
+    await expect(introBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(introPopover).toHaveCount(0);
+    // The distinctive intro phrasing is NOT shown as always-visible body text.
+    await expect(panel).not.toContainText("Each stream adapts to your connection");
+
+    // Click the (i) → the explanation appears in the popover with the intro copy
+    // (source of truth: HELP_PERF_INTRO in performance_settings.rs). Match the
+    // distinctive opening + the "meter shows what's flowing" tail.
+    await introBtn.click();
+    await expect(introBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(introPopover).toBeVisible();
+    await expect(introPopover).toContainText(
+      /Each stream adapts to your connection automatically/i,
+    );
+    await expect(introPopover).toContainText(/the meter shows what's flowing right now/i);
+
+    // Escape closes it (keyboard-operable) and returns aria-expanded to false.
+    await page.keyboard.press("Escape");
+    await expect(introBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(introPopover).toHaveCount(0);
+  });
+
   test("setting a video threshold persists to localStorage and restores after reload", async ({
     page,
   }) => {
@@ -587,11 +634,10 @@ test.describe("Performance settings panel (#961)", () => {
     );
 
     // Drag the ceiling DOWN by one → publish (topPos) layers (L0..=L{topPos-1}).
-    // The stored layer COUNT is `lowered + 1` (position+1); the total ladder is
-    // `topPos + 1`. With the standard 3-layer ladder this is position 1 → 2 of 3.
+    // The stored layer COUNT is `lowered + 1` (position+1). With the standard
+    // 3-layer ladder this is position 1 → count 2.
     const lowered = topPos - 1;
     const expectedCount = lowered + 1;
-    const totalLayers = topPos + 1;
     await setRangeValue(page, "perf-video-range-max", lowered);
     await expect(maxInputLoc).toHaveValue(String(lowered));
     // Floor stays pinned at the base throughout.
@@ -617,13 +663,17 @@ test.describe("Performance settings panel (#961)", () => {
     expect(pref?.screen_layers ?? null).toBeNull();
 
     // Capture the visible count caption to compare after reload. The SEND layer
-    // range-value reads "Sending {N} of {M} layers"; it must read the adaptive
-    // count and never the "Auto" word.
+    // range-value caption is SOURCE-AWARE: with the camera ON it reads
+    // "Sending {N} of {M} layers"; with the camera OFF (this test doesn't drive
+    // the camera) it reads "Will send {N} layers when the camera is on". Either
+    // way it must (a) name the configured count N, (b) never read "Auto", and
+    // (c) survive the reload unchanged. We assert on the COUNT (the persistence
+    // contract), not the present/future verb.
     const rangeValueBefore = await panel
       .locator('[data-testid="perf-video-range-value"]')
       .textContent();
     expect(rangeValueBefore).not.toBeNull();
-    expect(rangeValueBefore).toContain(`Sending ${expectedCount} of ${totalLayers} layers`);
+    expect(rangeValueBefore).toMatch(new RegExp(`\\b${expectedCount}\\b.*layer`));
     expect(rangeValueBefore).not.toContain("Auto");
 
     // ── Reload and rejoin; the preference must restore from localStorage ──
@@ -782,8 +832,11 @@ test.describe("Performance settings panel (#961)", () => {
     await expect
       .poll(async () => (await readPerfPref(page))?.audio_layers, { timeout: 10_000 })
       .toBe(1); // position 0 → 1 layer (base only)
+    // The caption reflects the new count of 1. It is SOURCE-AWARE: mic on →
+    // "Sending 1 layer"; mic off (this single-page test) → "Will send 1 layer when
+    // the mic is on". Assert on the COUNT (the wiring contract), not the verb.
     await expect(panel.locator('[data-testid="perf-audio-range-value"]')).toContainText(
-      "Sending 1 of",
+      /\b1 layer/,
     );
   });
 
@@ -817,6 +870,33 @@ test.describe("Performance settings panel (#961)", () => {
     const arrows = panel.locator(".perf-dir-arrow");
     expect(await arrows.count()).toBeGreaterThanOrEqual(2);
     await expect(arrows.first()).toHaveAttribute("aria-hidden", "true");
+  });
+
+  test("SEND caption is source-aware: OFF sources read 'Will send …' (not 'Sending')", async ({
+    page,
+  }) => {
+    // This is a single-page meeting with no media driven (no ensureCameraOn, mic
+    // off), so all three SEND sources are OFF. The caption must NOT falsely claim
+    // to be "Sending" — it reads the future "Will send {N} … when {…}" form using
+    // the configured count, and names each kind's trigger.
+    await enableSimulcastFlag(page.context(), 3);
+    await joinMeeting(page, "caption_source_aware");
+    await openPerformanceTab(page);
+    await selectSendDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+    // Per-kind trigger phrase in the OFF-state caption.
+    const triggers: Record<string, RegExp> = {
+      video: /Will send \d+ layers? when the camera is on/,
+      screen: /Will send \d+ layers? when sharing/,
+      audio: /Will send \d+ layers? when the mic is on/,
+    };
+    for (const stream of ["video", "audio", "screen"] as const) {
+      const caption = panel.locator(`[data-testid="perf-${stream}-range-value"]`);
+      // Future form present; never the present-tense "Sending …" while OFF.
+      await expect(caption).toHaveText(triggers[stream]);
+      await expect(caption).not.toContainText("Sending");
+    }
   });
 });
 
@@ -1231,5 +1311,13 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
         timeout: 15_000,
       })
       .toBeGreaterThanOrEqual(1);
+
+    // 1-BASED DISPLAY: the BASE rung's data-testid stays 0-based
+    // (`diag-simulcast-rung-0`, so selectors/protobuf don't churn) but its visible
+    // id label is 1-based "L1" (matching the receive side). The ladder must NEVER
+    // render a "L0" label.
+    const baseRung = ladder.locator('[data-testid="diag-simulcast-rung-0"]');
+    await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L1");
+    await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
   });
 });

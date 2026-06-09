@@ -1050,6 +1050,10 @@ pub fn Host(
                     video_layer_max: send_layer_max,
                     screen_layer_max: send_layer_max,
                     audio_layer_max,
+                    // Mic capture state → the audio SEND caption's present-tense
+                    // vs. "will send … when the mic is on" form. `mic_enabled` is
+                    // the Host prop; audio has no SEND snapshot to infer it from.
+                    audio_source_active: mic_enabled,
                 }
             }
         }

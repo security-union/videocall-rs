@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Meeting-level "videos paused" banner + its anti-flap damper (issue #1142,
+//! Meeting-level "tiles paused" banner + its anti-flap damper (issue #1142,
 //! Phase 1).
 //!
 //! When the adaptive decode-budget controller (see [`crate::components::decode_budget`])
@@ -10,7 +10,7 @@
 //! back in. This module supplies:
 //!
 //! 1. [`DecodeBudgetBanner`] — a slim, dismissible glass bar pinned top-centre of
-//!    the grid area. It announces how many videos are paused and offers a
+//!    the grid area. It announces how many visible tiles are paused and offers a
 //!    one-click "Show all videos" escape hatch that flips the decode-budget
 //!    override to `Fixed(natural)` (reusing the exact machinery the appearance
 //!    settings panel uses).
@@ -289,7 +289,7 @@ impl BannerDamper {
 // Dioxus component (thin driver over the pure damper).
 // ──────────────────────────────────────────────────────────────────────────
 
-/// The slim "videos paused" banner.
+/// The slim "tiles paused" banner.
 ///
 /// Props are the live render-scope signals from `attendants.rs`. The component
 /// owns the [`BannerDamper`] and a `dismissed` latch; it renders the bar only
@@ -365,14 +365,14 @@ pub fn DecodeBudgetBanner(
         }
     });
 
-    let show_banner = visible() && !dismissed();
+    let show_banner = visible() && !dismissed() && avatar_count > 0;
 
     if !show_banner {
         return rsx! {};
     }
 
     let count = avatar_count;
-    let plural = if count == 1 { "video" } else { "videos" };
+    let plural = if count == 1 { "tile" } else { "tiles" };
     let full_text =
         format!("{count} {plural} paused — your device is keeping up with audio first.");
     // Compact phrase shown ≤639px in place of the long text. "N paused" (not a
@@ -432,8 +432,8 @@ pub fn DecodeBudgetBanner(
                     let target = DecodeBudgetOverride::Fixed(natural.max(1));
                     decode_budget_ctx.0.set(target);
                     save_decode_budget_override(target);
-                    // Hide immediately; the override clears pressure so the damper
-                    // will settle to Idle on subsequent ticks.
+                    // Hide immediately; the override drives avatar_count to 0, so
+                    // the damper's >0 trigger gate settles it to Idle on later ticks.
                     dismissed.set(true);
                 },
                 "Show all videos"

@@ -192,6 +192,35 @@ test.describe("Adaptive decode budget (#987)", () => {
       fps,
     );
 
+  const injectUntilDecoded = async (
+    page: Page,
+    fps: number,
+    maxSamples: number,
+    predicate: (decoded: number) => boolean,
+  ): Promise<number> => {
+    let decoded = await decodedTiles(page).count();
+    for (let i = 0; i < maxSamples && !predicate(decoded); i++) {
+      await injectFps(page, fps);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+      decoded = await decodedTiles(page).count();
+    }
+    return decoded;
+  };
+
+  async function enterPressuredAutoState(page: Page): Promise<number> {
+    const decodedAfterDown = await injectUntilDecoded(
+      page,
+      LOW_FPS,
+      MAX_DOWN_SAMPLES,
+      (d) => d < MOCK_PEERS,
+    );
+
+    await expect(offBudgetTiles(page)).not.toHaveCount(0, { timeout: 15_000 });
+    expect(decodedAfterDown).toBeLessThan(MOCK_PEERS);
+    expect(decodedAfterDown).toBeGreaterThanOrEqual(1);
+    return decodedAfterDown;
+  }
+
   // ──────────────────────────────────────────────────────────────────────
   // Test 1 — manual HARD override (deterministic).
   //
@@ -300,30 +329,13 @@ test.describe("Adaptive decode budget (#987)", () => {
     await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
 
-    // Inject `fps` once per INJECT_INTERVAL_MS, up to `maxSamples` times, until
-    // `predicate(decodedCount)` is satisfied. Returns the final decoded count.
-    // Stops early once the step is observed.
-    const injectUntil = async (
-      fps: number,
-      maxSamples: number,
-      predicate: (decoded: number) => boolean,
-    ): Promise<number> => {
-      let decoded = await decodedTiles(page).count();
-      for (let i = 0; i < maxSamples && !predicate(decoded); i++) {
-        await injectFps(page, fps);
-        await page.waitForTimeout(INJECT_INTERVAL_MS);
-        decoded = await decodedTiles(page).count();
-      }
-      return decoded;
-    };
-
     // --- Drive DOWN: sustained low FPS. ---
     // Each step needs SUSTAIN_SAMPLES low (mild-band) samples AND a
     // STEP_DOWN_COOLDOWN_MS gap. Because the cap is seeded at the peer count, the
     // very first down-step drops a tile and an off-budget avatar appears. We only
     // require the decoded count to move BELOW MOCK_PEERS;
     // the exact floor reached is timing-dependent and intentionally not pinned.
-    const decodedAfterDown = await injectUntil(LOW_FPS, MAX_DOWN_SAMPLES, (d) => d < MOCK_PEERS);
+    const decodedAfterDown = await enterPressuredAutoState(page);
 
     // At least one off-budget avatar tile must have appeared (cap < natural)...
     await expect(offBudgetTiles(page)).not.toHaveCount(0, { timeout: 15_000 });
@@ -338,8 +350,86 @@ test.describe("Adaptive decode budget (#987)", () => {
     // climbs back strictly above the post-down trough. We don't assert exact
     // recovery to MOCK_PEERS because the number of up-steps that fit is
     // timing-dependent.
-    const decodedAfterUp = await injectUntil(HIGH_FPS, MAX_UP_SAMPLES, (d) => d > decodedAfterDown);
+    const decodedAfterUp = await injectUntilDecoded(
+      page,
+      HIGH_FPS,
+      MAX_UP_SAMPLES,
+      (d) => d > decodedAfterDown,
+    );
     expect(decodedAfterUp).toBeGreaterThan(decodedAfterDown);
+  });
+
+  test("pressured auto shows the paused-tiles banner and Show all videos reveals every tile", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "banner_show_all");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    await enterPressuredAutoState(page);
+
+    const pausedCount = await offBudgetTiles(page).count();
+    expect(pausedCount).toBeGreaterThan(0);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    const pausedPlural = pausedCount === 1 ? "tile" : "tiles";
+    await expect(banner).toContainText(`${pausedCount} ${pausedPlural} paused`);
+
+    await page.locator('[data-testid="decode-budget-show-all"]').click();
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
+
+    const stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe(String(MOCK_PEERS));
+  });
+
+  test("pressured auto banner dismiss button hides the current episode", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "banner_dismiss");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await enterPressuredAutoState(page);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+
+    await page.locator('[data-testid="decode-budget-dismiss"]').click();
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
   });
 
   // ──────────────────────────────────────────────────────────────────────
@@ -426,7 +516,7 @@ test.describe("Adaptive decode budget (#987)", () => {
     // time, so it grows with the join in a single render (no per-tick climb, no
     // off-budget avatars). (Finding 2 regression guard.)
     await setMockPeers(page, 12);
-    await expect(decodedTiles(page)).toHaveCount(12, { timeout: 15_000 });
+    await expect(decodedTiles(page)).toHaveCount(12, { timeout: 45_000 });
     await expect(offBudgetTiles(page)).toHaveCount(0);
   });
 

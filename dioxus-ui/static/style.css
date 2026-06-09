@@ -3948,7 +3948,7 @@ select {
   stroke: currentColor;
 }
 
-/* ── Decode-budget "videos paused" banner (#1142 Phase 1) ─────────────
+/* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
    A slim, dismissible glass bar pinned top-centre of the grid area. It is
    NOT a modal: it overlays the grid (absolute within #grid-container) and
    does not block interaction with the tiles below. The glass treatment

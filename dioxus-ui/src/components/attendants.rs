@@ -472,6 +472,9 @@ pub fn AttendantsComponent(
     let mut dock_menu_open = use_signal(|| false);
     let mut autohide_enabled = use_signal(load_dock_autohide);
     let encoder_settings = use_signal(|| None::<String>);
+    // Last peer count logged by the meeting-view render log below — lets that
+    // log fire only on changes (edge-trigger) instead of every re-render.
+    let mut last_logged_peer_count = use_signal(|| None::<usize>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
     // Peers that spoke recently sort higher in the grid.
@@ -3385,7 +3388,20 @@ pub fn AttendantsComponent(
     // self until the assignment arrives.
     let my_session_id: Option<String> = client.get_own_session_id();
 
-    info!("Rendering meeting view with {} peers", display_peers.len());
+    // Edge-triggered: log only when the peer count CHANGES, not on every render.
+    // This component re-renders many times per second (signals, speech priority,
+    // layout), so an unconditional log here emitted ~44k lines in an 8-min
+    // meeting — the single largest console-log contributor after the #1100/#1129
+    // per-tick demotions. Logging on transitions preserves the documented
+    // `Rendering meeting view with 0 peers` failure signature (the drop to zero
+    // is still emitted) while cutting volume to a handful of lines.
+    {
+        let peer_count = display_peers.len();
+        if last_logged_peer_count() != Some(peer_count) {
+            last_logged_peer_count.set(Some(peer_count));
+            info!("Rendering meeting view with {peer_count} peers");
+        }
+    }
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
     // that is_speaking_suppressed() no longer suppresses glow for everyone.

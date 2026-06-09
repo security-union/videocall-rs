@@ -69,14 +69,7 @@ test.describe("Dock Settings section switching", () => {
   }
 
   async function closeSettingsModal(page: Page): Promise<void> {
-    const closeBtn = page.locator(
-      '.device-settings-modal button[aria-label="Close settings"], .device-settings-modal .settings-modal-close',
-    );
-    if ((await closeBtn.count()) > 0) {
-      await closeBtn.first().click();
-    } else {
-      await page.keyboard.press("Escape");
-    }
+    await page.locator('.device-settings-modal button[aria-label="Close settings"]').click();
     await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
   }
 

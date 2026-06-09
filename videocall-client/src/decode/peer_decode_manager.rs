@@ -1757,8 +1757,10 @@ impl PeerDecodeManager {
     /// and screen decode. Audio remains decoded for all peers.
     pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
         let session_ids = self.connected_peers.ordered_keys().clone();
-        let mut screen_keyframe_requests: Vec<String> = Vec::new();
-        let mut video_keyframe_requests: Vec<String> = Vec::new();
+        // Carry (user_id, session_id) so the KEYFRAME_REQUEST can target the
+        // specific session for per-session rate limiting (#1124).
+        let mut screen_keyframe_requests: Vec<(String, u64)> = Vec::new();
+        let mut video_keyframe_requests: Vec<(String, u64)> = Vec::new();
         for session_id in session_ids {
             let visible = active_session_ids.contains(&session_id);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
@@ -1770,7 +1772,7 @@ impl PeerDecodeManager {
                     session_id, peer.visible, visible
                 );
                 if visible && peer.screen_enabled {
-                    screen_keyframe_requests.push(peer.user_id.clone());
+                    screen_keyframe_requests.push((peer.user_id.clone(), session_id));
                 }
                 // Send a proactive video PLI when a video tile becomes visible
                 // so the decoder gets a keyframe immediately instead of waiting
@@ -1778,16 +1780,16 @@ impl PeerDecodeManager {
                 // Gated on video_enabled so we don't send spurious PLIs for
                 // peers that have their camera off.
                 if visible && peer.video_enabled {
-                    video_keyframe_requests.push(peer.user_id.clone());
+                    video_keyframe_requests.push((peer.user_id.clone(), session_id));
                 }
                 peer.visible = visible;
             }
         }
-        for user_id in &screen_keyframe_requests {
-            self.send_keyframe_request(user_id, MediaType::SCREEN);
+        for (user_id, session_id) in &screen_keyframe_requests {
+            self.send_keyframe_request(user_id, *session_id, MediaType::SCREEN);
         }
-        for user_id in &video_keyframe_requests {
-            self.send_keyframe_request(user_id, MediaType::VIDEO);
+        for (user_id, session_id) in &video_keyframe_requests {
+            self.send_keyframe_request(user_id, *session_id, MediaType::VIDEO);
         }
     }
 
@@ -1858,7 +1860,8 @@ impl PeerDecodeManager {
         if let Some(peer) = self.connected_peers.get(&peer_id) {
             peer.screen.set_canvas(canvas)?;
             if peer.screen_enabled {
-                self.send_keyframe_request(&peer.user_id, MediaType::SCREEN);
+                // `peer_id` is the target's relay session_id (#1124).
+                self.send_keyframe_request(&peer.user_id, peer_id, MediaType::SCREEN);
             }
             Ok(())
         } else {
@@ -2216,8 +2219,14 @@ impl PeerDecodeManager {
                     }
 
                     // Now we can immutably borrow self for sending.
+                    // `peer_session_id` is the target peer's relay session (the
+                    // map key above) — the per-session limiter key (#1124).
                     if let Some((peer_uid, requested_media_type)) = kf_info {
-                        self.send_keyframe_request(&peer_uid, requested_media_type);
+                        self.send_keyframe_request(
+                            &peer_uid,
+                            peer_session_id,
+                            requested_media_type,
+                        );
                     }
 
                     Ok(())
@@ -2245,9 +2254,16 @@ impl PeerDecodeManager {
 
     /// Send a KEYFRAME_REQUEST packet to a specific peer.
     ///
-    /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`
-    /// and `user_id` set to the target peer. The `data` field encodes
-    /// which stream (VIDEO or SCREEN) needs the keyframe.
+    /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`,
+    /// `user_id` set to the target participant, and `target_session_id` set to
+    /// the target's relay session (#1124). The `data` field encodes which
+    /// stream (VIDEO or SCREEN) needs the keyframe.
+    ///
+    /// `target_session_id` lets the relay's keyframe rate-limiter key per
+    /// SESSION rather than per participant, so two concurrent publishing
+    /// sessions of the same identity get independent budgets (#1124). The relay
+    /// still routes by `user_id`; the session_id is purely the limiter key, and
+    /// the relay falls back to `user_id` when it is 0 (older clients).
     ///
     /// IMPORTANT: This uses `send_packet` (reliable stream), NOT
     /// `send_media_packet` (datagrams). KEYFRAME_REQUEST is a control
@@ -2255,8 +2271,14 @@ impl PeerDecodeManager {
     ///
     /// The packet is sent unencrypted (raw MediaPacket, not AES-encrypted)
     /// because this is a signaling/control packet, not user media data.
-    /// The server needs to read the target `user_id` to route it correctly.
-    fn send_keyframe_request(&self, peer_user_id: &str, requested_media_type: MediaType) {
+    /// The server needs to read the target `user_id` / `target_session_id` to
+    /// route and rate-limit it correctly.
+    fn send_keyframe_request(
+        &self,
+        peer_user_id: &str,
+        target_session_id: u64,
+        requested_media_type: MediaType,
+    ) {
         let Some(send_packet) = &self.send_packet else {
             debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");
             return;
@@ -2271,6 +2293,7 @@ impl PeerDecodeManager {
         let media_packet = MediaPacket {
             media_type: MediaType::KEYFRAME_REQUEST.into(),
             user_id: peer_user_id.as_bytes().to_vec(),
+            target_session_id,
             data: media_type_byte,
             ..Default::default()
         };
@@ -2292,8 +2315,9 @@ impl PeerDecodeManager {
 
         KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
         log::info!(
-            "Sending KEYFRAME_REQUEST to {} for {:?}",
+            "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
             peer_user_id,
+            target_session_id,
             requested_media_type
         );
         send_packet.emit(wrapper);
@@ -5690,8 +5714,8 @@ mod tests {
         // Clear the send counter baseline.
         let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
 
-        // Manually invoke send_keyframe_request for a specific peer.
-        manager.send_keyframe_request("alice@example.com", MediaType::VIDEO);
+        // Manually invoke send_keyframe_request for a specific peer + session.
+        manager.send_keyframe_request("alice@example.com", 4242, MediaType::VIDEO);
 
         // One PLI should have been sent.
         assert_eq!(
@@ -5722,6 +5746,13 @@ mod tests {
             inner.user_id,
             b"me@example.com".to_vec(),
             "PLI must not target the local user"
+        );
+        // #1124: the target session_id must be stamped so the relay can key its
+        // keyframe limiter per-session (not per-user). Pins the fix: a revert
+        // that stops setting target_session_id makes this assertion fail.
+        assert_eq!(
+            inner.target_session_id, 4242,
+            "PLI must carry the target peer's session_id for per-session rate limiting"
         );
         drop(collector);
     }

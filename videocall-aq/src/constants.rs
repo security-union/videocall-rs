@@ -251,9 +251,14 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// driven entirely by the ladder length — for the current 3-rung ladder:
 ///
 /// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
-///   device is too weak; the AQ controller treats this exactly like today's
-///   single-stream path, so this tier is *not* used to override the adaptive
-///   single-stream resolution — see `camera_encoder.rs`).
+///   device is too weak). The AQ controller still drives the single stream's
+///   resolution/bitrate ADAPTIVELY in the common case, so this `low` tier is not
+///   an unconditional override. **Exception (issue #1136):** when a single-layer
+///   publisher is in a call with **more than 3 other peers**, `camera_encoder.rs`
+///   pins the single stream to THIS `low` rung (640×360 / low ideal) as a
+///   ceiling — one adaptive medium-tier stream is too heavy on every receiver's
+///   decoder at that scale. With ≤3 peers the single stream stays fully
+///   adaptive. See the single-layer low-rung pin in `camera_encoder.rs`.
 /// - `n == 2` → `[low, hd]` (skip the middle `standard` tier so the two layers
 ///   are well separated in resolution/bitrate).
 /// - `n == 3` → `[low, standard, hd]` (full ladder).
@@ -767,6 +772,73 @@ pub const ENCODER_BACKPRESSURE_SUSTAIN_MS: f64 = 1500.0;
 /// their effective behavior.
 pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 
+// ---------------------------------------------------------------------------
+// Runtime simulcast layer ramp-up (issue #1140 / #1141)
+// ---------------------------------------------------------------------------
+// The cold CPU benchmark no longer gates simulcast layer count. Every camera
+// publisher starts at 1 active layer (the legacy single-stream path) and the
+// `EncoderBitrateController` *earns* additional layers up to the device ceiling
+// at runtime, based on observed encoder-queue backpressure headroom + uplink
+// budget. These constants govern that conservative, self-limiting probe.
+
+/// How long (milliseconds) the encoder queue depth must stay sustained-CLEAR
+/// (at/below [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`]) before the controller probes
+/// adding ONE simulcast layer (issue #1141).
+///
+/// **Deliberately asymmetric**: this dwell is LONGER than both the shed sustain
+/// ([`ENCODER_BACKPRESSURE_SUSTAIN_MS`] = 1.5 s) and the tier step-up window
+/// ([`STEP_UP_STABILIZATION_WINDOW_MS`] = 5 s). Adding a layer is ~N× the encode
+/// CPU + uplink of a tier-bitrate step, so a wrong add is far more expensive to
+/// recover from than a wrong tier nudge — we want the device to prove it has
+/// been comfortably idle for a stable window before committing more CPU.
+/// 6 s is 4× the shed sustain (still add-slow / shed-fast) and exceeds the 5 s
+/// tier step-up window, while keeping the cold-start ramp brisk: ~one rung every
+/// 6 s rather than every 12 s, so a capable publisher reaches 2 layers in ~11 s
+/// and 3 in ~17 s instead of stalling on the base rung for ~half a minute.
+pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
+
+/// Headroom (fraction, 0.0–1.0) the summed active-layer uplink budget must have
+/// below the budget for the layer that would be ADDED before a probe-up is
+/// allowed (issue #1141).
+///
+/// `encode_queue_size()` backpressure detects CPU/encoder saturation, NOT "my
+/// uplink cannot carry another rung even though my CPU is bored". A probe-up is
+/// only permitted when the uplink budget for `active + 1` layers exceeds the
+/// budget for `active` layers by at least this fraction — i.e. there is genuine
+/// uplink room for the new rung. (The budget is the sum of active tier ideals;
+/// adding a layer raises it by that layer's ideal, so this is effectively
+/// "would the next rung's nominal cost fit".) See [`uplink_budget_kbps`].
+pub const LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC: f64 = 0.0;
+
+/// Window (milliseconds) after a probe-added layer within which a shed of that
+/// layer counts as an OSCILLATION, arming the anti-flap penalty box (issue
+/// #1141). A probe that survives longer than this is considered a good bet and
+/// does NOT lengthen the next backoff.
+///
+/// Sized just above the probe clear window (which is now 6 s) so "added, then
+/// almost immediately shed" is caught while a layer that held for a meaningful
+/// span is not penalized. A compile-time invariant below pins
+/// `LAYER_PROBE_OSCILLATION_WINDOW_MS >= LAYER_PROBE_CLEAR_WINDOW_MS` so the two
+/// can never drift apart silently if the clear window is retuned.
+pub const LAYER_PROBE_OSCILLATION_WINDOW_MS: f64 = 8_000.0;
+
+/// Initial penalty-box backoff (milliseconds) imposed after a probed-up layer
+/// is shed within [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] (issue #1141). The next
+/// probe-up is suppressed until this long after the shed; each subsequent
+/// oscillation doubles it (capped at [`LAYER_PROBE_PENALTY_MAX_MS`]), so a
+/// device that flaps repeatedly settles low for the session.
+pub const LAYER_PROBE_PENALTY_BASE_MS: f64 = 15_000.0;
+
+/// Exponential backoff multiplier for the layer-probe penalty box on each repeat
+/// oscillation (issue #1141): 15 s → 30 s → 60 s (capped). Mirrors the
+/// climb-rate limiter's `CLIMB_COOLDOWN_BACKOFF`.
+pub const LAYER_PROBE_PENALTY_BACKOFF: f64 = 2.0;
+
+/// Maximum penalty-box backoff (milliseconds) for the layer probe (issue
+/// #1141). Caps the 15 → 30 → 60 s escalation so a flapping device retries at
+/// most once a minute rather than locking out forever.
+pub const LAYER_PROBE_PENALTY_MAX_MS: f64 = 60_000.0;
+
 // --- Compile-time invariants (issue #1108) ---
 // These relationships are load-bearing for the backpressure hysteresis and the
 // degrade-faster-than-recover asymmetry; assert them at COMPILE time so a bad
@@ -793,6 +865,39 @@ const _: () = assert!(
 const _: () = assert!(
     STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
     "step-up stabilization window must exceed step-down reaction time"
+);
+
+/// Adding a simulcast layer must require a LONGER clear dwell than shedding one
+/// requires of sustained HIGH backpressure (issue #1141): the add is asymmetric
+/// — far more expensive to get wrong — so it must be the slower direction.
+const _: () = assert!(
+    LAYER_PROBE_CLEAR_WINDOW_MS > ENCODER_BACKPRESSURE_SUSTAIN_MS,
+    "layer-probe clear window must exceed the backpressure shed sustain (add slower than shed)"
+);
+
+/// A probe add must also dwell longer than a tier step-up (a layer add commits
+/// ~N× more CPU/uplink than a within-tier bitrate nudge), so it is the most
+/// conservative climb of all (issue #1141).
+const _: () = assert!(
+    LAYER_PROBE_CLEAR_WINDOW_MS >= STEP_UP_STABILIZATION_WINDOW_MS as f64,
+    "layer-probe clear window must be at least the tier step-up window"
+);
+
+/// The oscillation window must be at least the clear window (issue #1141): a
+/// probe that is shed before it even completed a fresh clear dwell is, by
+/// definition, an oscillation. Keeping OSCILLATION >= CLEAR ensures the two stay
+/// in the documented "oscillation window sits just above the clear window"
+/// relationship and cannot silently drift apart when either is retuned.
+const _: () = assert!(
+    LAYER_PROBE_OSCILLATION_WINDOW_MS >= LAYER_PROBE_CLEAR_WINDOW_MS,
+    "layer-probe oscillation window must be >= the clear window"
+);
+
+/// The penalty-box escalation must actually grow (issue #1141), and the base
+/// must not already exceed the cap.
+const _: () = assert!(
+    LAYER_PROBE_PENALTY_BACKOFF > 1.0 && LAYER_PROBE_PENALTY_BASE_MS <= LAYER_PROBE_PENALTY_MAX_MS,
+    "layer-probe penalty must escalate and start at/below its cap"
 );
 
 // --- Constant-relationship invariants (compile-time) ---

@@ -52,7 +52,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::AudioContext;
-use web_sys::AudioContextOptions;
 use web_sys::EncodedAudioChunkType;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
@@ -619,11 +618,13 @@ impl MicrophoneEncoder {
                 );
             }
 
-            // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
-            let options = AudioContextOptions::new();
-            options.set_sample_rate(input_rate as f32);
-
-            let context = match AudioContext::new_with_context_options(&options) {
+            // Let the browser choose the AudioContext sample rate rather than
+            // forcing it to the mic's native rate. Forcing a specific rate can
+            // cause the browser to reconfigure the audio device, interrupting
+            // microphone streams in other tabs/apps (e.g. Google Meet).
+            // The encoder handles resampling from the context rate to Opus's
+            // 48 kHz internally via original_sample_rate.
+            let context = match AudioContext::new() {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     if let Some(cb) = &on_error {
@@ -632,7 +633,10 @@ impl MicrophoneEncoder {
                     return;
                 }
             };
-            log::info!("Created AudioContext with sample rate: {input_rate} Hz");
+            let context_rate = context.sample_rate() as u32;
+            log::info!(
+                "Created AudioContext: context rate={context_rate} Hz, mic native rate={input_rate} Hz"
+            );
 
             let analyser = match context.create_analyser() {
                 Ok(a) => a,
@@ -689,7 +693,7 @@ impl MicrophoneEncoder {
             let _ = base_codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
-                    original_sample_rate: Some(input_rate),
+                    original_sample_rate: Some(context_rate),
                     encoder_bit_rate: Some(base_bitrate_bps),
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                     encoder_fec: Some(initial_tier.enable_fec),
@@ -768,7 +772,7 @@ impl MicrophoneEncoder {
                         let _ = codec_n.send_message(&CodecMessages::Init {
                             options: Some(EncoderInitOptions {
                                 encoder_frame_size: Some(20),
-                                original_sample_rate: Some(input_rate),
+                                original_sample_rate: Some(context_rate),
                                 encoder_bit_rate: Some(layer_kbps * 1000),
                                 encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                                 encoder_fec: Some(initial_tier.enable_fec),

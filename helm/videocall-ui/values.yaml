@@ -12,11 +12,11 @@ imagePullSecrets: []
 
 resources:
   limits:
-    cpu: "50m"
-    memory: "10Mi"
+    cpu: "200m"
+    memory: "128Mi"
   requests:
-    cpu: "20m"
-    memory: "10Mi"
+    cpu: "50m"
+    memory: "64Mi"
 
 podAnnotations: {}
 podSecurityContext: {}

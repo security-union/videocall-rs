@@ -65,7 +65,22 @@ jobs:
           if ! command -v cargo-mutants >/dev/null 2>&1; then
             cargo install cargo-mutants --version 25.0.0 --locked
           fi
-          cargo mutants --version
+          # ASSERT the running version is exactly 25.0.0. The install above is
+          # GUARDED by `command -v` — a self-hosted runner with a DIFFERENT
+          # cargo-mutants preinstalled skips the pinned install and runs that
+          # other version. The exit-code classification below (0/2 trustworthy,
+          # 3 timeout, 1/4/other tooling error) was verified against 25.0.0's
+          # src/exit_code.rs, so a version drift could silently invalidate it.
+          # `cargo mutants --version` prints exactly "cargo-mutants 25.0.0"
+          # (verified: the bare `cargo-mutants --version` form errors — the
+          # subcommand form is required). Fail loudly on mismatch.
+          EXPECTED_VERSION="cargo-mutants 25.0.0"
+          ACTUAL_VERSION="$(cargo mutants --version)"
+          echo "cargo-mutants version: ${ACTUAL_VERSION}"
+          if [ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]; then
+            echo "::error::cargo-mutants version mismatch: expected '${EXPECTED_VERSION}', got '${ACTUAL_VERSION}'. The exit-code classification in this workflow is pinned to 25.0.0; a different version may use different exit codes and produce a false result. Refusing to run." >&2
+            exit 1
+          fi
 
       # Compute the diff of THIS PR against its base branch, restricted to the
       # AQ crate, and feed it to --in-diff so only changed lines are mutated.
@@ -74,9 +89,35 @@ jobs:
         run: |
           BASE="origin/${{ github.event.pull_request.base.ref }}"
           git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
-          # Diff base...HEAD limited to the crate; if empty, the run step no-ops.
-          git diff "${BASE}...HEAD" -- videocall-aq/ > /tmp/aq.diff || true
-          echo "Diff lines: $(wc -l < /tmp/aq.diff)"
+
+          # Distinguish a genuinely EMPTY diff (PR doesn't touch videocall-aq —
+          # legitimate skip) from a BROKEN diff command (bad base ref, missing
+          # fetch, git error — which would ALSO yield an empty file and silently
+          # skip mutation forever). The previous `git diff ... || true` masked
+          # both into "empty", so a permanently-broken diff would look like a
+          # clean skip on every PR. Capture the exit code explicitly.
+          #
+          # First confirm the base ref actually resolves; if not, the `base...HEAD`
+          # range is meaningless and any "empty" result is untrustworthy.
+          if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+            echo "::error::base ref '${BASE}' did not resolve after fetch — cannot compute a trustworthy diff. This is a BROKEN diff, not an empty one; failing so the skip below can't false-green." >&2
+            exit 1
+          fi
+
+          set +e
+          git diff "${BASE}...HEAD" -- videocall-aq/ > /tmp/aq.diff
+          diff_rc=$?
+          set -e
+          if [ "${diff_rc}" -ne 0 ]; then
+            echo "::error::'git diff ${BASE}...HEAD' exited ${diff_rc} — the diff command itself FAILED. Treating as broken (not empty); failing the step so a real-but-empty diff stays distinguishable from a broken one in the log." >&2
+            exit 1
+          fi
+
+          LINES="$(wc -l < /tmp/aq.diff)"
+          echo "Diff lines: ${LINES}"
+          if [ "${LINES}" -eq 0 ]; then
+            echo "Diff is EMPTY (git diff succeeded, base ref resolved): this PR does not touch videocall-aq/. The mutation run will be skipped — this is a legitimate no-op, NOT a broken diff."
+          fi
 
       # ADVISORY: never fail the PR. Surviving mutants are reported, not gated.
       - name: Run cargo-mutants (diff-scoped, advisory)

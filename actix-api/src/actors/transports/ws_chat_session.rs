@@ -27,8 +27,7 @@ use crate::actors::priority_drop::{
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
-    CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, INBOUND_MAILBOX_HEADROOM_FACTOR,
-    WS_OUTBOUND_CHANNEL_CAPACITY,
+    ws_mailbox_capacity, CLIENT_TIMEOUT, HEARTBEAT_INTERVAL, WS_OUTBOUND_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -216,9 +215,12 @@ impl Actor for WsChatSession {
         // socket write), so the actor drains this slack quickly; the headroom
         // is burst-absorption, NOT a deep buffer for a slow receiver (the
         // outbound channel — unchanged at 128 — still enforces fail-fast video
-        // staleness bounds). Both values derive from the SAME
-        // `WS_OUTBOUND_CHANNEL_CAPACITY` constant so they stay in lock-step.
-        ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR);
+        // staleness bounds). The argument is the shared `ws_mailbox_capacity()`
+        // binding (issue #1062) — the SINGLE source of truth that the guard
+        // test also asserts, so editing the value here is tracked by the test
+        // (the prior duplicated `WS_MAILBOX_CAPACITY` test constant could drift
+        // from this call site silently).
+        ctx.set_mailbox_capacity(ws_mailbox_capacity());
 
         // Register the outbound drain stream. Packets enqueued via
         // outbound_tx are pulled here and written as WS binary frames.
@@ -578,6 +580,7 @@ impl WsChatSession {
 mod tests {
     use super::*;
     use crate::actors::chat_server::ChatServer;
+    use crate::constants::INBOUND_MAILBOX_HEADROOM_FACTOR;
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
     use actix::Actor;
@@ -590,35 +593,39 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     // ----------------------------------------------------------------------
-    // Issue #1057 (+ #1144 headroom): mailbox capacity must be the outbound
-    // channel capacity TIMES the burst-headroom factor.
+    // Issue #1057 (+ #1144 headroom + #1062 shared binding): mailbox capacity
+    // must be the outbound channel capacity TIMES the burst-headroom factor.
     //
-    // `WsChatSession::started` calls
-    // `ctx.set_mailbox_capacity(WS_OUTBOUND_CHANNEL_CAPACITY *
-    //  INBOUND_MAILBOX_HEADROOM_FACTOR)` so the actor mailbox (a) stops being
-    // the (default 16-slot) overflow point in front of the policy-aware
-    // `outbound_tx` (#1057), and (b) has modest burst slack so a publisher-
-    // join fan-out spike spills onto that policy-aware channel instead of
-    // being dropped indiscriminately at the mailbox (#1144). We cannot read
-    // the capacity back off a live `WebsocketContext` without standing up
-    // NATS, so this guards the invariant at the value level:
-    //   * the mailbox capacity is derived from the SAME constants the channel
-    //     is built with (no hardcoded duplicate that could drift),
-    //   * it is >= the outbound channel capacity (#1057: never smaller than
-    //     the smart channel, or the dumb mailbox becomes the bottleneck), and
-    //   * it is strictly larger than actix's `DEFAULT_CAPACITY` (16) so a
-    //     future accidental revert to the tiny default mailbox fails CI.
+    // `WsChatSession::started` calls `ctx.set_mailbox_capacity(
+    // ws_mailbox_capacity())` so the actor mailbox (a) stops being the (default
+    // 16-slot) overflow point in front of the policy-aware `outbound_tx`
+    // (#1057), and (b) has modest burst slack so a publisher-join fan-out spike
+    // spills onto that policy-aware channel instead of being dropped
+    // indiscriminately at the mailbox (#1144).
+    //
+    // #1062: the value `started()` installs is the SHARED `ws_mailbox_capacity()`
+    // binding, and this test asserts properties of THAT SAME function — not a
+    // parallel hand-copied constant. We still cannot read the capacity back off
+    // a live `WebsocketContext` without standing up NATS, so the test pins the
+    // value the call site feeds; because both the call site and the test now go
+    // through `ws_mailbox_capacity()`, altering that one binding's value is
+    // necessarily reflected in both. (Previously a duplicated
+    // `WS_MAILBOX_CAPACITY` test constant could silently diverge from the
+    // `started()` expression — the drift hazard #1062 closes.)
+    //
+    // The invariants pinned:
+    //   * `ws_mailbox_capacity()` == channel × headroom (the exact `started()`
+    //     argument),
+    //   * it is >= the outbound channel capacity (#1057: never smaller than the
+    //     smart channel, or the dumb mailbox becomes the bottleneck), and
+    //   * it is strictly larger than actix's `DEFAULT_CAPACITY` (16) so a future
+    //     accidental revert to the tiny default mailbox fails CI.
     // ----------------------------------------------------------------------
 
     /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
     /// Re-declared here so the test fails loudly if the dumb default mailbox
     /// ever becomes the overflow point again (issue #1057).
     const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
-
-    /// The value `started()` feeds to `set_mailbox_capacity`. Must mirror the
-    /// `started()` expression exactly so a drift between the two fails CI.
-    const WS_MAILBOX_CAPACITY: usize =
-        WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR;
 
     #[test]
     fn ws_mailbox_capacity_is_channel_times_headroom() {
@@ -636,14 +643,21 @@ mod tests {
             "inbound mailbox headroom factor changed; re-validate the #1144 \
              join-burst absorption math before changing this sentinel",
         );
-        // The mailbox is channel × headroom (256 by default). This pins the
-        // exact `started()` expression so the WS fix can't silently drift.
-        assert_eq!(WS_MAILBOX_CAPACITY, 256);
+        // #1062: assert against the SHARED binding `started()` actually calls,
+        // so changing the call-site value is tracked here. The mailbox is
+        // channel × headroom (256 by default).
+        assert_eq!(
+            ws_mailbox_capacity(),
+            WS_OUTBOUND_CHANNEL_CAPACITY * INBOUND_MAILBOX_HEADROOM_FACTOR,
+            "ws_mailbox_capacity() must equal channel × headroom — this is the \
+             exact argument WsChatSession::started feeds set_mailbox_capacity",
+        );
+        assert_eq!(ws_mailbox_capacity(), 256);
         // #1057 invariant: the mailbox must be >= the smart channel, never
         // smaller (a smaller mailbox would re-create the dumb-bottleneck).
-        const _: () = assert!(WS_MAILBOX_CAPACITY >= WS_OUTBOUND_CHANNEL_CAPACITY);
-        // Compile-time guard: well clear of actix's dumb 16-slot default.
-        const _: () = assert!(WS_MAILBOX_CAPACITY > ACTIX_DEFAULT_MAILBOX_CAPACITY);
+        assert!(ws_mailbox_capacity() >= WS_OUTBOUND_CHANNEL_CAPACITY);
+        // Guard: well clear of actix's dumb 16-slot default.
+        assert!(ws_mailbox_capacity() > ACTIX_DEFAULT_MAILBOX_CAPACITY);
     }
 
     // ----------------------------------------------------------------------

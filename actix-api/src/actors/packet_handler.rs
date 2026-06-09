@@ -28,7 +28,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::constants::{
-    KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_PER_SEC,
+    KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_LAYER_ID, KEYFRAME_REQUEST_MAX_PER_SEC,
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
     KEYFRAME_REQUEST_WINDOW_MS,
 };
@@ -258,6 +258,12 @@ pub struct KeyframeRequestLimiter {
     /// (not the participant) means two concurrent sessions of one identity get
     /// independent budgets (#1124). The global per-receiver cap (below) is
     /// unaffected, so total fan-out stays bounded (OSS #814).
+    ///
+    /// #1068: the `u32` layer component is CLAMPED to
+    /// `0..=KEYFRAME_REQUEST_MAX_LAYER_ID` before it becomes a key, so the
+    /// number of distinct per-layer buckets per target is bounded (an attacker
+    /// cycling out-of-ladder layer ids cannot open unbounded buckets). See
+    /// `allow_with_congestion`.
     per_target: HashMap<(KeyframeTarget, u32), WindowCounter>,
     /// Total `allow()` calls since the last cleanup. Cleanup runs every
     /// [`KEYFRAME_LIMITER_CLEANUP_INTERVAL`] calls.
@@ -339,7 +345,20 @@ impl KeyframeRequestLimiter {
         // Per-(pair, layer) check first: this is the dimension that actually
         // discriminates a 16-sender fan-out — and a deliberate layer switch
         // (#989) — from sustained abuse.
-        let key = (target, layer);
+        //
+        // #1068: CLAMP the layer dimension of the key to the realistic ladder
+        // ceiling. `layer` is the cleartext, attacker-controllable
+        // `simulcast_layer_id` (an unbounded `u32`), so without this a malicious
+        // receiver could cycle DISTINCT ids against ONE sender to open unbounded
+        // fresh per-layer buckets — each with its own per-pair budget — and
+        // concentrate up to the global cap of keyframe pressure on that single
+        // victim. Clamping to `0..=KEYFRAME_REQUEST_MAX_LAYER_ID` bounds the
+        // buckets per target to `MAX + 1`; ids beyond the real ladder share the
+        // top bucket's budget rather than opening new ones. Every REAL layer
+        // switch (ids 0..=2 today) still gets its own bucket, so legitimate
+        // clients are unaffected. The global per-receiver cap is unchanged.
+        let key_layer = layer.min(KEYFRAME_REQUEST_MAX_LAYER_ID);
+        let key = (target, key_layer);
         let per_pair_entry = self
             .per_target
             .entry(key.clone())
@@ -913,6 +932,67 @@ mod tests {
         assert!(
             limiter.allow(user_target(b"sender-a"), 0),
             "base layer 0 of the same sender must admit a fresh request"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_layer_clamp_bounds_per_victim_pressure() {
+        // #1068: a malicious receiver must NOT be able to cycle distinct
+        // out-of-ladder `simulcast_layer_id`s against ONE sender to open
+        // unbounded fresh per-layer buckets and drive per-victim keyframe
+        // pressure up toward the global cap. The layer dimension of the key is
+        // clamped to `0..=KEYFRAME_REQUEST_MAX_LAYER_ID`, so a single target has
+        // at most `KEYFRAME_REQUEST_MAX_LAYER_ID + 1` distinct buckets — well
+        // below the global cap of `KEYFRAME_REQUEST_MAX_PER_SEC` (~32).
+        //
+        // Sanity-check the test's own premise: without the clamp this attack
+        // WOULD reach the global cap, so the constants must leave headroom for
+        // the clamp to be the binding limit.
+        let realistic_buckets = KEYFRAME_REQUEST_MAX_LAYER_ID + 1;
+        assert!(
+            realistic_buckets < KEYFRAME_REQUEST_MAX_PER_SEC,
+            "clamp must bind BELOW the global cap, else this test proves nothing"
+        );
+
+        let mut limiter = KeyframeRequestLimiter::new();
+        let victim = user_target(b"victim-sender");
+
+        // Each distinct CLAMPED layer (0..=MAX) admits exactly one request in
+        // the window (per-pair budget is 1/sec). All of these are real ladder
+        // ids, so they map to distinct buckets and must all be admitted.
+        let mut admitted = 0u32;
+        for layer in 0..=KEYFRAME_REQUEST_MAX_LAYER_ID {
+            assert!(
+                limiter.allow(victim.clone(), layer),
+                "first request for clamped layer {layer} of the victim must be admitted"
+            );
+            admitted += 1;
+        }
+
+        // Now cycle MANY distinct OUT-OF-LADDER layer ids against the same
+        // victim. Every one of these clamps onto the top bucket
+        // (KEYFRAME_REQUEST_MAX_LAYER_ID), whose 1/sec budget was just consumed
+        // above — so they must ALL be denied. Without the clamp each distinct id
+        // would open a fresh bucket and admit, marching toward the global cap.
+        for forged_layer in
+            (KEYFRAME_REQUEST_MAX_LAYER_ID + 1)..=(KEYFRAME_REQUEST_MAX_LAYER_ID + 100)
+        {
+            assert!(
+                !limiter.allow(victim.clone(), forged_layer),
+                "forged out-of-ladder layer {forged_layer} must collapse onto the clamped \
+                 top bucket and be denied (no new per-layer budget)"
+            );
+        }
+
+        // Per-victim pressure is therefore bounded to the clamped bucket count,
+        // NOT the global cap.
+        assert_eq!(
+            admitted, realistic_buckets,
+            "exactly KEYFRAME_REQUEST_MAX_LAYER_ID + 1 distinct layer buckets may admit per victim"
+        );
+        assert!(
+            admitted < KEYFRAME_REQUEST_MAX_PER_SEC,
+            "per-victim keyframe pressure must stay well under the global per-receiver cap"
         );
     }
 

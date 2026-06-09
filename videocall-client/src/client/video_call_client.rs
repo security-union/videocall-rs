@@ -1355,6 +1355,28 @@ impl VideoCallClient {
         }
     }
 
+    /// Number of OTHER (remote) peers currently in the call — the count of
+    /// [`sorted_peer_keys`](Self::sorted_peer_keys) WITHOUT cloning the key Vec.
+    ///
+    /// Callers that only need the COUNT (e.g. the camera encoder's AQ control
+    /// loop deciding the single-layer low-rung pin, issue #1136) should use this
+    /// instead of `sorted_peer_keys().len()`: that path clones the entire cached
+    /// `Rc<Vec<String>>` just to read `.len()`, allocating a fresh `Vec<String>`
+    /// on a 1 Hz hot loop (issue #1156). Here we read `.len()` off the same cached
+    /// `Rc<Vec<String>>` — the `Rc` deref is free and nothing is cloned.
+    ///
+    /// The relay never echoes the local publisher's own packets and the local
+    /// session is never inserted into the peer decode manager, so this is the
+    /// count of OTHERS, not including self. A momentarily-busy `inner` borrow
+    /// returns `0` (same fail-safe as `sorted_peer_keys`), which the caller treats
+    /// as "no remote peers this tick" and self-corrects on the next read.
+    pub fn peer_count(&self) -> usize {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.sorted_string_keys().len(),
+            Err(_) => 0,
+        }
+    }
+
     /// Get the local session ID assigned by the server, if available.
     pub fn get_own_session_id(&self) -> Option<String> {
         match self.inner.try_borrow() {

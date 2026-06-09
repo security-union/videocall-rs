@@ -251,9 +251,14 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// driven entirely by the ladder length — for the current 3-rung ladder:
 ///
 /// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
-///   device is too weak; the AQ controller treats this exactly like today's
-///   single-stream path, so this tier is *not* used to override the adaptive
-///   single-stream resolution — see `camera_encoder.rs`).
+///   device is too weak). The AQ controller still drives the single stream's
+///   resolution/bitrate ADAPTIVELY in the common case, so this `low` tier is not
+///   an unconditional override. **Exception (issue #1136):** when a single-layer
+///   publisher is in a call with **more than 3 other peers**, `camera_encoder.rs`
+///   pins the single stream to THIS `low` rung (640×360 / low ideal) as a
+///   ceiling — one adaptive medium-tier stream is too heavy on every receiver's
+///   decoder at that scale. With ≤3 peers the single stream stays fully
+///   adaptive. See the single-layer low-rung pin in `camera_encoder.rs`.
 /// - `n == 2` → `[low, hd]` (skip the middle `standard` tier so the two layers
 ///   are well separated in resolution/bitrate).
 /// - `n == 3` → `[low, standard, hd]` (full ladder).

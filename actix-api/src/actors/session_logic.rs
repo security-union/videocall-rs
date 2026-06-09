@@ -23,7 +23,9 @@
 //! adapters while all business logic lives here.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::{classify_packet, KeyframeRequestLimiter, PacketKind};
+use crate::actors::packet_handler::{
+    classify_packet, KeyframeRequestLimiter, KeyframeTarget, PacketKind,
+};
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
@@ -490,6 +492,7 @@ impl SessionLogic {
             }
             PacketKind::KeyframeRequest {
                 target_user_id,
+                target_session_id,
                 layer,
             } => {
                 if self.observer {
@@ -513,15 +516,21 @@ impl SessionLogic {
                 // is unchanged, so the keyframe-storm risk (OSS #814) stays
                 // bounded — the cap is relaxed, not removed.
                 let congested = self.congestion_tracker.is_actively_congested();
+                // #1124: key the limiter by the target SESSION when the client
+                // populated it (independent budgets for concurrent sessions of
+                // one identity), else fall back to the target user_id (older
+                // clients). `KeyframeTarget::from_request` encodes that choice.
+                let target = KeyframeTarget::from_request(&target_user_id, target_session_id);
                 if !self
                     .keyframe_limiter
-                    .allow_with_congestion(&target_user_id, layer, congested)
+                    .allow_with_congestion(target, layer, congested)
                 {
                     warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting {}",
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {}",
                         self.id,
                         self.user_id,
                         String::from_utf8_lossy(&target_user_id),
+                        target_session_id,
                     );
                     return InboundAction::Processed;
                 }

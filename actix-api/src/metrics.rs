@@ -569,6 +569,58 @@ lazy_static! {
     )
     .expect("Failed to create decode_budget_override_fixed_n metric");
 
+    /// Tiles ACTUALLY being decoded right now = min(effective_cap, natural)
+    /// (#1143). The per-client "how many videos is this client showing" signal:
+    /// `effective_cap` is the ceiling and `natural` is the unconstrained layout
+    /// count, but neither alone answers it when the layout has fewer tiles than
+    /// the cap allows. Pairs with the existing `videocall_decode_budget_effective_cap`
+    /// (the cap itself, already exported) — this is the realized count.
+    pub static ref DECODE_ACTIVE_SET_SIZE: GaugeVec = register_gauge_vec!(
+        "videocall_decode_active_set_size",
+        "Tiles actually being decoded right now (min of decode-budget cap and natural layout count)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create decode_active_set_size metric");
+
+    // ===== CAPABILITY & SIMULCAST-LAYER GAUGES (#1143) =====
+
+    /// Client capability score as a NUMERIC gauge (#1143). The TELEM-6 benchmark
+    /// iteration count already rides as a string label on `videocall_client_info`,
+    /// but a label cannot be thresholded/averaged/quantiled in PromQL without
+    /// `label_replace` hacks — answering "how many clients scored <5000?" required
+    /// pulling every series and computing client-side. This exposes the same value
+    /// as a real measurement so the distribution is a one-line query / dashboard
+    /// panel. Same value, same label set as the other per-reporter client gauges.
+    pub static ref CAPABILITY_SCORE: GaugeVec = register_gauge_vec!(
+        "videocall_capability_score",
+        "Client TELEM-6 capability-benchmark score as a numeric value (also a label on videocall_client_info; this form is queryable)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create capability_score metric");
+
+    /// Effective simulcast layer count the publisher is configured to encode/send
+    /// (#1143). p90==1 across a meeting is the inert-simulcast signal that the
+    /// cc7tp analysis could only see in console logs. `media_kind` distinguishes
+    /// camera vs screen; the client currently reports the CAMERA encoder's state
+    /// (`media_kind="camera"`).
+    pub static ref ENCODER_EFFECTIVE_LAYERS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_effective_layers",
+        "Number of simulcast video layers the publisher is configured to encode/send (ladder depth); p90==1 over a meeting = inert simulcast",
+        &["meeting_id", "session_id", "peer_id", "display_name", "media_kind"]
+    )
+    .expect("Failed to create encoder_effective_layers metric");
+
+    /// Currently-ACTIVE simulcast layer count (#1143): how many of the effective
+    /// layers are presently encoded + sent. The AQ controller sheds the top
+    /// layer(s) under congestion, so this can be `<` effective; the gap is the
+    /// shed depth. `media_kind` as above.
+    pub static ref ENCODER_ACTIVE_LAYERS: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_active_layers",
+        "Number of simulcast video layers currently active (encoded + sent); < effective_layers when the AQ controller has shed the top layer(s)",
+        &["meeting_id", "session_id", "peer_id", "display_name", "media_kind"]
+    )
+    .expect("Failed to create encoder_active_layers metric");
+
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
     /// Audio concealment percentage from NetEQ expand events (0.0-100.0)
@@ -642,6 +694,27 @@ lazy_static! {
     /// filtering) are tracked on their own metric so backpressure dashboards
     /// and alerts that sum across labels are not polluted. See
     /// [`RELAY_VIEWPORT_FILTERED_TOTAL`].
+    ///
+    /// `drop_reason` values:
+    /// - `mailbox_full`: a fan-out `try_send` into a receiver's actor mailbox
+    ///   failed (the #1057 room-wide-freeze signature). Emitted at the inbound
+    ///   fan-out hop (`chat_server.rs` `handle_msg`) for Critical/Control
+    ///   packets, packets the relay could not classify (unparseable wrapper /
+    ///   UNSPECIFIED `media_kind`), and `Closed`-mailbox drops.
+    /// - `channel_full`: a `try_send` into the policy-aware outbound channel
+    ///   failed (emitted at the per-transport `Handler<Message>` hop).
+    /// - `priority_drop_video` / `priority_drop_audio`: a droppable MEDIA frame
+    ///   (VIDEO/SCREEN → `_video`, AUDIO → `_audio`) was the kind SACRIFICED on
+    ///   overflow. Emitted BOTH at the outbound-channel hop (a true preemptive
+    ///   priority drop, keyed on channel fill) AND, as of #1145, at the inbound
+    ///   fan-out hop when a `Full` mailbox forced a media drop — there the
+    ///   label is ATTRIBUTION ONLY (the actix mailbox exposes no preemption
+    ///   API, so the packet could not be enqueued regardless; the label records
+    ///   WHICH kind was sacrificed so a fan-out burst reads as "video shed"
+    ///   rather than undifferentiated `mailbox_full`). Classified off the OUTER
+    ///   cleartext `media_kind` (E2EE-safe), never the inner MediaType.
+    /// The label set mirrors the OUTBOUND taxonomy on
+    /// [`OUTBOUND_CHANNEL_DROPS_TOTAL`] so one dashboard query spans both hops.
     pub static ref RELAY_PACKET_DROPS_TOTAL: CounterVec = register_counter_vec!(
         "relay_packet_drops_total",
         "Total packets dropped due to full outbound queue or mailbox (backpressure loss only; intentional viewport drops are counted by relay_viewport_filtered_total)",
@@ -937,12 +1010,23 @@ lazy_static! {
     ///
     /// This is the room-wide-freeze signature: when `ChatServer`'s NATS fan-out
     /// does `session_recipient.try_send(Message)` and the receiving session
-    /// actor's mailbox is full, the packet is shed indiscriminately (audio,
-    /// video, control alike) with NO CONGESTION feedback to the sender — the
-    /// failure mode diagnosed in #1057. Pre-#1057 the mailbox was the actix
+    /// actor's mailbox is full, the packet cannot be enqueued and is dropped
+    /// with NO CONGESTION feedback to the sender at THIS hop (CONGESTION is
+    /// owned by the downstream outbound-channel hop via `on_outbound_drop`) —
+    /// the failure mode diagnosed in #1057. Pre-#1057 the mailbox was the actix
     /// default (16 slots); post-#1057 it is sized to the outbound channel(s),
-    /// but this counter must still exist so a FUTURE mailbox overflow remains
-    /// visible the instant it recurs.
+    /// and post-#1144 to that × a small burst-headroom factor — but this
+    /// counter must still exist so a FUTURE mailbox overflow remains visible
+    /// the instant it recurs.
+    ///
+    /// NOTE (#1145): the DROP itself is no longer attributed indiscriminately.
+    /// The room-tagged `relay_packet_drops_total{drop_reason}` now records
+    /// WHICH KIND was sacrificed on a `Full` mailbox (`priority_drop_video` /
+    /// `priority_drop_audio` for droppable media, `mailbox_full` for
+    /// Critical/Control/unclassifiable). THIS aggregate counter, by contrast,
+    /// still increments on EVERY inbound-mailbox drop regardless of kind, so
+    /// the fleet-wide freeze signature (`rate()` summed over transport) is
+    /// unchanged by that per-room attribution split.
     ///
     /// DISTINCT FROM `relay_packet_drops_total{drop_reason="mailbox_full"}`:
     /// that existing series is room-tagged (unbounded `room` label, good for
@@ -964,6 +1048,35 @@ lazy_static! {
         &["transport"]
     )
     .expect("Failed to create relay_inbound_mailbox_drops_total metric");
+
+    /// Inbound WebTransport BRIDGE drops at the socket -> actor-mailbox hop (#1146).
+    ///
+    /// DISTINCT from `relay_inbound_mailbox_drops_total`: that counter covers the
+    /// `ChatServer` NATS-fan-out -> receiving-session-actor mailbox hop (and is
+    /// cardinality-bound to exactly the two receiver transports). THIS counter
+    /// covers the OTHER inbound hop unique to WebTransport — the per-session
+    /// bridge readers (`webtransport/bridge.rs`) that `try_send` freshly read
+    /// frames INTO the `WtChatSession` actor's mailbox. Unlike the WS inbound
+    /// path (which streams via `StreamHandler`, bypassing the bounded `try_send`),
+    /// WT inbound `try_send`s and so can drop. Before #1146 the datagram/audio
+    /// path discarded the result entirely (`let _ =`) and the unistream path only
+    /// `warn!`ed — both invisible to dashboards/alerts.
+    ///
+    /// `path` distinguishes `datagram` (carries audio + control) from `unistream`
+    /// (media frames) so an inbound-side storm can be attributed to the right
+    /// QUIC delivery mode. `transport` is always `webtransport` here (the WS path
+    /// cannot hit this site), kept for label-shape parity with the sibling
+    /// counters and so a single `relay_inbound_bridge_drops_total` query reads
+    /// naturally alongside them.
+    ///
+    /// CARDINALITY BOUND: at most 2 series (`webtransport` x {datagram,unistream}).
+    /// Safe for indefinite retention; no cleanup required.
+    pub static ref RELAY_INBOUND_BRIDGE_DROPS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_inbound_bridge_drops_total",
+        "Inbound WebTransport bridge drops at the socket->actor-mailbox hop, by transport and QUIC path (datagram|unistream) (#1146)",
+        &["transport", "path"]
+    )
+    .expect("Failed to create relay_inbound_bridge_drops_total metric");
 
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///

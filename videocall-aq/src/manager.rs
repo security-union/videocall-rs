@@ -1599,10 +1599,19 @@ mod tests {
     // as a proxy for "degrade" / "recover". This shim translates those FPS/bitrate
     // arguments into the new boolean decision using the HISTORICAL thresholds so
     // those tests keep their meaning without touching the production API. The
-    // `_effective_peer_count` arg is ignored on purpose: the small-peer-count
-    // lenient threshold was removed (a receiver's link no longer affects the
-    // sender), so the dedicated lenient/peer-count tests were deleted rather than
-    // shimmed.
+    // `_effective_peer_count` arg is ignored on purpose: the old small-peer-count
+    // *lenient backpressure threshold* was removed (a receiver's link no longer
+    // affects the sender's degrade/recover decision), so the dedicated
+    // lenient/peer-count tests were deleted rather than shimmed.
+    //
+    // NOTE (issue #1136): peer count IS used again as a publisher signal, but for
+    // a different decision and in a different place — the single-layer "pin to the
+    // `low` rung when >3 other peers" gate. That gate lives in
+    // `videocall-client`'s `camera_encoder.rs` (its AQ control loop reads the LIVE
+    // peer count from the client each tick), NOT in this manager: it caps the
+    // single stream's resolution/bitrate, it does not feed the tier state machine.
+    // So this manager still takes no peer count in production, and this shim's
+    // `_effective_peer_count` remains deliberately unused.
     impl AdaptiveQualityManager {
         fn update(
             &mut self,

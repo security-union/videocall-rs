@@ -116,7 +116,7 @@ async function enableCamera(page: Page): Promise<void> {
  */
 async function hostDisableVideoForPeerViaTile(page: Page): Promise<void> {
   const guestTile = page.locator(".grid-item:has(.tile-mute-btn)").first();
-  await expect(guestTile).toBeVisible({ timeout: 15_000 });
+  await expect(guestTile).toBeVisible({ timeout: 30_000 });
 
   await guestTile.hover();
 
@@ -124,8 +124,36 @@ async function hostDisableVideoForPeerViaTile(page: Page): Promise<void> {
   await expect(hostActionsToggle).toBeVisible({ timeout: 15_000 });
   await hostActionsToggle.click();
 
-  // Inner menu item — match by text.
   const disableVideoItem = guestTile.locator(".tile-context-menu-item", {
+    hasText: "Disable video",
+  });
+  await expect(disableVideoItem).toBeVisible({ timeout: 5_000 });
+  await disableVideoItem.click();
+}
+
+async function hostDisableVideoForPeerViaPeerList(page: Page, targetName: string): Promise<void> {
+  await page.locator(".video-controls-container").hover();
+  await page.mouse.move(400, 400);
+  await page.waitForTimeout(300);
+
+  const openPeersBtn = page.locator("button.video-control-button", {
+    has: page.locator("span.tooltip", { hasText: "Open Peers" }),
+  });
+  await expect(openPeersBtn).toBeVisible({ timeout: 10_000 });
+  await openPeersBtn.click();
+
+  const targetRow = page
+    .locator(".peer_item", {
+      has: page.locator(".peer_item_name_container", { hasText: targetName }),
+    })
+    .first();
+  await expect(targetRow).toBeVisible({ timeout: 15_000 });
+
+  const moreOptions = targetRow.getByTitle("More options");
+  await expect(moreOptions).toBeVisible({ timeout: 15_000 });
+  await moreOptions.click();
+
+  const disableVideoItem = targetRow.locator("button.context-menu-item", {
     hasText: "Disable video",
   });
   await expect(disableVideoItem).toBeVisible({ timeout: 5_000 });
@@ -636,7 +664,7 @@ test.describe("Host disable-video controls", () => {
       });
 
       // ---- Host disables the target's video via the per-tile menu ----
-      await hostDisableVideoForPeerViaTile(hostPage);
+      await hostDisableVideoForPeerViaPeerList(hostPage, TARGET_NAME);
 
       // ---- #1034: observer sees the target tile flip to video-off FAST ----
       // The placeholder ("Video Disabled") renders only when

@@ -1682,6 +1682,8 @@ impl VideoCallClient {
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+        effective_video_layers: Rc<AtomicU32>,
+        active_video_layers: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -1698,6 +1700,8 @@ impl VideoCallClient {
                         screen_transitions,
                         climb_limiter_snapshot,
                         dwell_samples,
+                        effective_video_layers,
+                        active_video_layers,
                     );
                 }
             }
@@ -2019,7 +2023,10 @@ impl VideoCallClient {
                 if let Err(e) = controller.set_video_enabled(enabled) {
                     debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set video enabled: {enabled}");
+                    // Re-applied frequently (state re-sync on render/tick), so this
+                    // accumulated thousands of lines per meeting. Demoted
+                    // debug!->trace! (#1100/#1129 follow-up); not analyzer-consumed.
+                    trace!("Successfully set video enabled: {enabled}");
                     if let Ok(inner) = self.inner.try_borrow() {
                         if let Some(hr) = &inner.health_reporter {
                             if let Ok(hrb) = hr.try_borrow() {
@@ -2042,7 +2049,10 @@ impl VideoCallClient {
                 if let Err(e) = controller.set_audio_enabled(enabled) {
                     debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set audio enabled: {enabled}");
+                    // Re-applied frequently (state re-sync on render/tick), so this
+                    // accumulated thousands of lines per meeting. Demoted
+                    // debug!->trace! (#1100/#1129 follow-up); not analyzer-consumed.
+                    trace!("Successfully set audio enabled: {enabled}");
                     if let Ok(inner) = self.inner.try_borrow() {
                         if let Some(hr) = &inner.health_reporter {
                             if let Ok(hrb) = hr.try_borrow() {

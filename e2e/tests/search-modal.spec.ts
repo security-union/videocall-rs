@@ -136,7 +136,7 @@ test.describe("Search modal (Cmd-K)", () => {
     // Type a distinctive fragment — the whole timestamp — so the server-side
     // ILIKE can't match any other meeting leaked in from previous tests.
     const fragment = meetingId.split("-").slice(-1)[0];
-    await input.pressSequentially(fragment, { delay: 40 });
+    await input.fill(fragment);
 
     // Result row is an <a href="/meeting/<id>"> — assert it appears and
     // points at the meeting we just created.
@@ -156,7 +156,7 @@ test.describe("Search modal (Cmd-K)", () => {
     const input = page.getByPlaceholder(SEARCH_PLACEHOLDER);
     await expect(input).toBeVisible({ timeout: 5_000 });
 
-    await input.pressSequentially(meetingId.split("-").slice(-1)[0], { delay: 40 });
+    await input.fill(meetingId.split("-").slice(-1)[0]);
 
     const resultLink = page.locator(`a[href="/meeting/${meetingId}"]`);
     await expect(resultLink).toBeVisible({ timeout: 10_000 });
@@ -189,7 +189,7 @@ test.describe("Search modal (Cmd-K)", () => {
     await expect(input).toBeVisible({ timeout: 5_000 });
 
     // A string that cannot match any meeting id in any test run.
-    await input.pressSequentially("zzz-no-such-meeting-zzz", { delay: 30 });
+    await input.fill("zzz-no-such-meeting-zzz");
     await expect(page.getByText("No meetings found")).toBeVisible({ timeout: 10_000 });
   });
 

@@ -1,6 +1,11 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+  createAuthenticatedContext,
+} from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -88,6 +93,7 @@ async function guestJoinsToGrid(
   uiURL: string,
 ): Promise<Page> {
   const ctx = await browser.newContext({ baseURL: uiURL, ignoreHTTPSErrors: true });
+  await ctx.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
   const page = await ctx.newPage();
 
   await page.goto(`/meeting/${meetingId}/guest`);
@@ -101,10 +107,13 @@ async function guestJoinsToGrid(
   const joinButton = page.getByRole("button", { name: /Join Meeting|Start Meeting/ });
   const grid = page.locator("#grid-container");
 
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 25_000 }).then(() => "join-button" as const),
-    grid.waitFor({ timeout: 25_000 }).then(() => "grid" as const),
-  ]);
+  const result = await waitForVisibleState(
+    [
+      { name: "join-button", locator: joinButton },
+      { name: "grid", locator: grid },
+    ],
+    25_000,
+  );
 
   if (result === "join-button") {
     await page.waitForTimeout(1000);

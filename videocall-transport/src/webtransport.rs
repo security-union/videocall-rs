@@ -32,6 +32,32 @@ pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Cumulative count of frames dropped on the persistent unidirectional QUIC
+/// streams (`send_on_persistent_stream`) because the write failed and the
+/// stream had to be evicted.
+///
+/// This is the client-side WebTransport analogue of
+/// [`crate::websocket::websocket_drop_count`]: on WebTransport, audio / video /
+/// screen — and the Control stream — all ride persistent unistreams (see
+/// `videocall-client/src/connection/webtransport.rs::send_bytes`), so a write
+/// failure here means a real frame (overwhelmingly media, since media frames
+/// dominate the uplink) was dropped — the genuine uplink-saturation signal.
+/// Datagrams, by contrast, carry only periodic control traffic (heartbeats /
+/// RTT probes), so [`datagram_drop_count`] is a far sparser, indirect signal.
+/// The sender AQ self-congestion trigger (#1104) keys off THIS counter for
+/// that reason.
+///
+/// Note: a unistream write fails on QUIC stream reset / fatal backpressure, not
+/// on every momentarily-full send buffer, so each increment is a meaningful
+/// "this frame did not make it out" event rather than a transient blip.
+static UNISTREAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of persistent-unistream frames dropped since
+/// process start. See [`UNISTREAM_DROP_COUNT`].
+pub fn unistream_drop_count() -> u64 {
+    UNISTREAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
 /// Name of the JS global that, when set to a non-empty array of base64
 /// strings BEFORE the wasm boots, opts the WebTransport constructor into the
 /// `serverCertificateHashes` path (W3C WebTransport spec).
@@ -844,6 +870,13 @@ impl WebTransportTask {
             .await;
 
             if let Err(e) = result {
+                // A media frame just failed to go out on this uplink. Count it
+                // so the sender AQ can self-trigger a step-down on WebTransport
+                // (#1104) — the unistream analogue of the WebSocket send-buffer
+                // drop counter. Incremented before eviction so the count
+                // reflects the dropped frame regardless of the eviction race
+                // outcome below.
+                UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
                 // identity tokens to defeat the concurrent-eviction race

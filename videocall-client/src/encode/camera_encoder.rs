@@ -807,6 +807,14 @@ impl CameraEncoder {
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
+            // Independent sliding window for the WebTransport uplink-backpressure
+            // self-trigger (#1104). Kept SEPARATE from the WS window above so the
+            // two transports' signals never interfere; on a WS connection the WT
+            // counter stays flat at 0 (no unistream sends) and this block is a
+            // no-op, symmetric to how the WS block is a no-op under WebTransport.
+            let mut last_wt_drop_snapshot: u64 =
+                videocall_transport::webtransport::unistream_drop_count();
+            let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder: this `spawn_local` future is NOT bound
@@ -936,6 +944,55 @@ impl CameraEncoder {
                         }
                         last_ws_drop_snapshot = current_ws_drops;
                         ws_drop_window_start_ms = now;
+                    }
+                }
+
+                // Client-side WebTransport uplink-backpressure detection
+                // (issue #1104, 2026-06-09 meeting_sync analysis).
+                //
+                // The WS block above is a no-op for WebTransport users
+                // (websocket_drop_count() is always 0 on WT). On WebTransport,
+                // audio/video/screen ride PERSISTENT unidirectional QUIC
+                // streams; when a media-frame write fails (stream reset / fatal
+                // backpressure) the frame is dropped and unistream_drop_count()
+                // increments. That is the true client-side WT analogue of the
+                // WS send-buffer drop — a real media frame that did not leave
+                // the uplink. (Datagrams carry only heartbeats/RTT probes, so
+                // datagram_drop_count() is NOT used here.) When a SUSTAINED
+                // cluster of drops accumulates within the window we self-shed a
+                // layer without waiting for the slower, indirect server
+                // CONGESTION signal. The window/snapshot are independent of the
+                // WS window and the server-congestion flag, and each axis sheds
+                // at most one layer per window, so the paths cannot compound
+                // into a runaway double step-down. For WebSocket users this
+                // counter stays flat at 0, so the block is a true no-op.
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                    };
+                    let current_wt_drops =
+                        videocall_transport::webtransport::unistream_drop_count();
+                    let elapsed_ms = now - wt_drop_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_drops,
+                        last_wt_drop_snapshot,
+                        elapsed_ms,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                        WT_SELF_CONGESTION_DROP_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "CameraEncoder: client WT uplink backpressure detected ({} unistream \
+                             media-frame drops in {:.0}ms), forcing video step-down",
+                            current_wt_drops.saturating_sub(last_wt_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_drop_snapshot = decision.new_snapshot;
+                        wt_drop_window_start_ms = now;
                     }
                 }
 

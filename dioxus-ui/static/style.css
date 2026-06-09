@@ -3953,8 +3953,17 @@ select {
    NOT a modal: it overlays the grid (absolute within #grid-container) and
    does not block interaction with the tiles below. The glass treatment
    mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
-   accent is the shared amber `--warning` token. Contrast: amber-on-dark and
-   the white body text both clear 4.5:1 on the ~0.9-opacity dark surface. */
+   accent is the shared amber `--warning` token.
+
+   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   themes), so its foreground colours MUST be literal light-on-dark — NOT the
+   `--text-on-glass-strong` token, which flips to near-black under
+   html[data-theme="light"] and would render the text + ✕ invisible on the dark
+   surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
+   dismiss glyph, matching how the amber accent is already a literal. Contrast on
+   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
+   (range = page background showing through the ~0.9-opacity surface) — both well
+   past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -3973,7 +3982,11 @@ select {
   border: 1px solid var(--btn-warning-border, rgba(255, 159, 10, 0.25));
   border-radius: var(--radius-lg, 14px);
   box-shadow: 0 8px 32px var(--shadow-card-deep, rgba(0, 0, 0, 0.4));
-  color: var(--text-on-glass-strong, rgba(255, 255, 255, 0.95));
+  /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
+     themes, so the theme-flipping --text-on-glass-strong token must NOT be used
+     here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
+     dark surface. */
+  color: rgba(255, 255, 255, 0.95);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -4033,7 +4046,9 @@ select {
 .decode-budget-banner-dismiss {
   min-width: 44px;
   padding: 0;
-  color: var(--text-on-glass-strong, rgba(255, 255, 255, 0.95));
+  /* @token-exempt: literal light-on-dark to stay visible on the hardcoded dark
+     banner surface in light mode (see the banner's color note above). */
+  color: rgba(255, 255, 255, 0.95);
   background: transparent;
   border: 1px solid transparent;
 }
@@ -4074,7 +4089,8 @@ select {
   }
 }
 
-/* Mobile ≤639px: icon + count + ✕ only (hide the long message). */
+/* Mobile ≤639px: icon + "N paused" + actions only (hide the long message). The
+   compact phrase keeps minimal context since the tooltip is hover-only. */
 @media (max-width: 639px) {
   .decode-budget-banner {
     gap: 8px;

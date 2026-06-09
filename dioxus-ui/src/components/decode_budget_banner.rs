@@ -191,15 +191,15 @@ impl BannerDamper {
 
     /// Advance the machine to `now_ms` and return whether the banner is visible.
     ///
-    /// `pressured` is the raw trigger (the caller passes
-    /// `decode_budget_pressured && avatar_count > 0`); `avatar_count` is supplied
-    /// for completeness/extension but the caller is expected to fold the
-    /// `> 0` check into `pressured` so a zero-avatar "pressured" state never
-    /// shows a banner that claims "0 videos paused".
+    /// `pressured` is the raw decode-budget pressure flag and `avatar_count` is
+    /// the off-budget tile count. The machine triggers only when BOTH hold
+    /// (`pressured && avatar_count > 0`): a banner that announces "N videos
+    /// paused" is meaningless with N == 0, so the count is a real input to the
+    /// trigger, not a cosmetic knob. The caller passes the two raw signals
+    /// straight through — the `> 0` gate lives HERE so it is covered by the
+    /// host tests (see `zero_avatar_count_never_shows_even_when_pressured`),
+    /// which `#[wasm_bindgen_test]` could not protect in this crate's CI.
     pub fn tick(&mut self, now_ms: f64, pressured: bool, avatar_count: usize) -> bool {
-        // Defensive: a banner that announces "N videos paused" is meaningless
-        // with N == 0, so treat a zero count as not-triggered regardless of the
-        // raw pressure flag.
         let triggered = pressured && avatar_count > 0;
 
         self.prune_episodes(now_ms);
@@ -375,6 +375,10 @@ pub fn DecodeBudgetBanner(
     let plural = if count == 1 { "video" } else { "videos" };
     let full_text =
         format!("{count} {plural} paused — your device is keeping up with audio first.");
+    // Compact phrase shown ≤639px in place of the long text. "N paused" (not a
+    // lone digit) keeps minimal context on touch, where the hover-only tooltip /
+    // long text are unavailable.
+    let compact_text = format!("{count} paused");
     let aria = format!(
         "{count} {plural} paused to keep the call smooth. Click Show all videos to override."
     );
@@ -400,15 +404,24 @@ pub fn DecodeBudgetBanner(
                 }
             }
 
-            // Full message on wider viewports; compact "N" on mobile (CSS hides
-            // the long text and reveals `.decode-budget-banner-count` ≤639px).
+            // Full message on wider viewports; compact "N paused" on mobile (CSS
+            // hides the long text and reveals `.decode-budget-banner-count`
+            // ≤639px). The aria-label on the root still carries the full message,
+            // so this short form is aria-hidden to avoid double announcement.
             span { class: "decode-budget-banner-text", "{full_text}" }
-            span { class: "decode-budget-banner-count", aria_hidden: "true", "{count}" }
+            span { class: "decode-budget-banner-count", aria_hidden: "true", "{compact_text}" }
 
             button {
                 r#type: "button",
                 class: "decode-budget-banner-action",
                 "data-testid": "decode-budget-show-all",
+                // Convey the trade-off: forcing all tiles to decode can stutter
+                // on a device that is already CPU-bound (which is why the budget
+                // paused them). `title` for pointer users; aria-label mirrors it
+                // so screen-reader users hear the same caveat as the visible
+                // button name plus the consequence.
+                title: "Show all videos (may stutter on a busy device)",
+                "aria-label": "Show all videos — may stutter on a busy device",
                 onclick: move |_| {
                     // One-click escape hatch: pin the decode budget to the natural
                     // tile count so EVERY present peer decodes. This is the exact

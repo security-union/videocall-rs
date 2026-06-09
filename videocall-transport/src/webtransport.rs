@@ -873,10 +873,24 @@ impl WebTransportTask {
                 // A media frame just failed to go out on this uplink. Count it
                 // so the sender AQ can self-trigger a step-down on WebTransport
                 // (#1104) — the unistream analogue of the WebSocket send-buffer
-                // drop counter. Incremented before eviction so the count
-                // reflects the dropped frame regardless of the eviction race
-                // outcome below.
-                UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                // drop counter.
+                //
+                // ONLY count failures at the write stage (`writer.ready()` /
+                // `write_with_chunk`), i.e. after a writer was acquired
+                // (`captured_token.is_some()`). Failures BEFORE the writer
+                // existed (`transport.ready()` or
+                // `create_unidirectional_stream()`) are transport teardown /
+                // re-election artifacts, NOT uplink saturation: during a WT
+                // reconnect the old session enters QUIC draining while frames
+                // are still dispatched, and counting those would spuriously
+                // trip the self-shed right after a reconnect on flaky /
+                // high-latency links. Gating on `captured_token` keeps the
+                // signal to genuine send-path backpressure/reset events.
+                // Incremented before eviction so the count reflects the dropped
+                // frame regardless of the eviction race outcome below.
+                if captured_token.is_some() {
+                    UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
                 // identity tokens to defeat the concurrent-eviction race

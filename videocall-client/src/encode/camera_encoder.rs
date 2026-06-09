@@ -465,6 +465,22 @@ fn clamp_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
 
+/// The number of simulcast layers a camera publisher starts ACTIVE at, before
+/// the runtime ramp earns more (issue #1140 / #1141).
+///
+/// Every camera publisher cold-starts at the BASE layer only (1 active layer =
+/// the legacy single-stream path), regardless of how many layers the device's
+/// CEILING permits. The `videocall-aq` `EncoderBitrateController` then *earns*
+/// additional layers up to that ceiling at runtime, gated on observed
+/// encoder-queue backpressure headroom + uplink budget. The cold CPU benchmark
+/// no longer gates the active layer count at startup — it sets the ceiling only.
+///
+/// `const fn` so it is a compile-time constant; free function so it can be
+/// unit-tested without a live `CameraEncoder`.
+const fn initial_active_layer_count() -> u32 {
+    1
+}
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -544,10 +560,16 @@ impl CameraEncoder {
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
             quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
-            // Simulcast active-layer state (issue #989, PR B). Initialized to the
-            // effective layer count so the encode loop knows how many layers to
-            // build; the control loop adjusts it down/up under congestion.
-            shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
+            // Simulcast active-layer state (issue #989 / #1140 / #1141). Cold-start
+            // at the BASE layer only (`initial_active_layer_count()` == 1), NOT the
+            // device ceiling: the publisher's ENCODE/EGRESS OUTPUT is byte-identical
+            // to the legacy single-stream path at startup, and the AQ control loop
+            // *earns* more layers up to `max_layers` at runtime from observed
+            // backpressure headroom + uplink budget. (All `ceiling` VideoEncoders
+            // are still constructed at setup; lazy per-layer construction is a
+            // tracked follow-up — so this is byte-identical OUTPUT, not byte-
+            // identical memory.)
+            shared_active_layer_count: Rc::new(AtomicU32::new(initial_active_layer_count())),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
@@ -640,10 +662,17 @@ impl CameraEncoder {
             };
 
             // Enable simulcast on the controller when the effective layer count
-            // is > 1 (issue #989, PR B). n_layers == 1 leaves the controller in
-            // single-stream mode (no-op) — byte-identical to the legacy path.
+            // is > 1 (issue #989 / #1140 / #1141). Configure the device CEILING to
+            // `n_layers` but START the active count at the BASE layer (1): the
+            // publisher emits a single legacy-equivalent stream at startup and the
+            // headroom-probe ramp in `EncoderBitrateController::tick` earns layers
+            // up to the ceiling only when backpressure + uplink budget allow. The
+            // controller's `is_simulcast()` keys off the CEILING (not the active
+            // count), so the ramp logic runs even while active == 1. n_layers == 1
+            // leaves the controller in single-stream mode (no-op) — byte-identical
+            // to the legacy path.
             if n_layers > 1 {
-                encoder_control.set_simulcast_layers(n_layers);
+                encoder_control.set_simulcast_ceiling_start_at_base(n_layers);
                 // Pre-size the per-layer bitrate atomics (lowest layer first).
                 let mut atomics = shared_layer_bitrates_bps.borrow_mut();
                 if atomics.len() != n_layers {
@@ -2221,7 +2250,7 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_simulcast_layers, clamp_layer_count, frame_is_healthy,
+        build_simulcast_layers, clamp_layer_count, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
 
@@ -2371,6 +2400,22 @@ mod tests {
         // frame healthy — byte-identical to the pre-fix `any_ok` behavior.
         let sole_layer_ok = true; // single-layer encode succeeded
         assert_eq!(frame_is_healthy(sole_layer_ok), sole_layer_ok);
+    }
+
+    #[test]
+    fn initial_active_layer_count_is_one() {
+        // Issue #1140 / #1141: every camera publisher cold-starts ACTIVE at the
+        // base layer only (1), regardless of the device ceiling. This preserves
+        // byte-identical ENCODE/EGRESS OUTPUT vs the legacy single-stream path at
+        // startup; the runtime ramp earns more layers up to the ceiling.
+        assert_eq!(initial_active_layer_count(), 1);
+        // And it must be strictly below the full ladder so there is genuinely room
+        // to ramp (this would fail if someone "fixed" the cold-start back to the
+        // ceiling).
+        assert!(
+            initial_active_layer_count() < clamp_layer_count(SIMULCAST_MAX_SUPPORTED_LAYERS),
+            "the cold-start active count must be below the full ladder so the ramp has room"
+        );
     }
 
     #[test]

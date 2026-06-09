@@ -7977,6 +7977,48 @@ details.perf-peers[open] .perf-peers__chev {
   outline-offset: 2px;
 }
 
+/* ── SEND layer-count slider (video/screen): distinct from the Receive slider ──
+   The SEND control publishes layers; its MOVING (ceiling/max) thumb and fill use
+   the semantic --success (green) treatment so it reads as a different widget from
+   the full-range --accent Receive slider beside it. The FLOOR (min) thumb is
+   pinned at the base layer and styled as a fixed dot (see .is-pinned below). */
+.perf-range--send-layer .perf-range-fill {
+  background: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-webkit-slider-thumb {
+  border-color: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-moz-range-thumb {
+  border-color: var(--success);
+}
+
+/* ── Pinned floor thumb (the always-on base layer) ──
+   A visibly FIXED end: a small filled --success dot, default cursor, no shadow
+   and no hover/focus grow. The distinct shape (small filled dot vs. the large
+   hollow accent ring of a movable thumb) is the non-color "this end can't move"
+   cue, so the affordance reads correctly regardless of color perception. */
+.perf-range-input.is-pinned {
+  pointer-events: none; /* the floor never accepts drags */
+}
+.perf-range-input.is-pinned::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+.perf-range-input.is-pinned::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+
 .perf-range-value {
   margin: 0;
   font-size: 12px;

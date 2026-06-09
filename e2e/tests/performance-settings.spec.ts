@@ -18,27 +18,38 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *      literal placeholder "Screen — not sharing" while no screen share is active.
  *      (#1095 redesign — the VU NEEDLE gauge was replaced by the bar-meter; the
  *      `perf-vu-*` testids were KEPT on the new container so selectors resolve.)
- *   2. A dual-thumb range slider (two overlaid native `<input type="range">`:
- *      min/left = worst quality, max/right = best quality) plus a per-stream
- *      "?" help button and a small "Reset" button (#1131 §D — REPLACES the former
- *      "Auto" toggle; the `perf-{kind}-auto` testid was REPURPOSED onto Reset, so
- *      selectors resolve unchanged).
+ *   2. A dual-thumb range slider (two overlaid native `<input type="range">`)
+ *      plus a per-stream "?" help button and a small "Reset" button (#1131 §D —
+ *      REPLACES the former "Auto" toggle; the `perf-{kind}-auto` testid was
+ *      REPURPOSED onto Reset, so selectors resolve unchanged).
  *
- * The full automatic range is the default for all three streams. At the full
- * range the Reset button is **disabled** (nothing to reset) and the slider is
- * **fully interactive** (NOT disabled) with both thumbs pinned at the extremes
- * (min at position 0, max at the top position) so it visibly shows the full
- * ladder span. Dragging a thumb inward sets manual limits (leaving the full
- * range) and ENABLES Reset; clicking Reset clears both limits back to the full
- * automatic range (thumbs snap to the extremes, Reset goes disabled again). The
- * Reset button is NOT a toggle, so it carries no `aria-pressed`. There is no
- * `disabled` state on the slider inputs.
+ * The SEND control is a LAYER-COUNT control for ALL THREE kinds (the "layers
+ * published" feature): the track ticks are the kind's simulcast rungs, the FLOOR
+ * (min/left) thumb is **PINNED + DISABLED** at the base layer (position 0 — the
+ * base is always published), and only the CEILING (max/right) thumb moves to set
+ * how many layers you publish. Default = full ladder (ceiling at the top position
+ * == effective max layers). Lowering the ceiling sets the persisted `*_layers`
+ * COUNT (and frees that stream's tier bounds to Auto); Reset clears it back to the
+ * full ladder. The min input IS disabled on all three.
+ *   - VIDEO + SCREEN effective depth is CPU-clamped: `min(flag, capability)`, so
+ *     it can be 1 on weak (<6-core) runners (tests read the rendered `max` attr
+ *     and skip drag assertions at 1 layer — see helpers/simulcast-config.ts).
+ *   - AUDIO effective depth is `min(flag, 3)` and is NOT CPU-clamped (audio Opus
+ *     encode is cheap, off the main thread), so audio typically shows the full
+ *     3-layer ladder even on weak runners; the publish-gate runs at runtime in the
+ *     mic encoder (no restart). There is NO SEND "Fixed" badge for any kind now.
+ *
+ * At the full default the Reset button is ABSENT (nothing to reset). Lowering any
+ * ceiling shows Reset; clicking it clears back to full. Reset is NOT a toggle (no
+ * `aria-pressed`).
  *
  * Choices persist to `localStorage["vc_performance_quality"]` as a
  * `PerformancePreference` JSON object:
  *   { video_max, video_min, audio_max, audio_min, screen_max, screen_min:
- *     usize|null, video_auto, audio_auto, screen_auto: bool }
- * Default = all-Auto (every `*_auto` true, every bound null).
+ *     usize|null, video_auto, audio_auto, screen_auto: bool,
+ *     video_layers, screen_layers, audio_layers: usize|null (SEND layer count) }
+ * Default = all-Auto (every `*_auto` true, every bound null, every `*_layers`
+ * null = full ladder).
  *
  * ─── Stable testids (from the Rust implementation) ───────────────────────────
  *
@@ -56,7 +67,8 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
  *                   readouts: perf-vu-{video,audio,screen}-readout (by id)
  *   Range inputs:   perf-{video,audio,screen}-range-min / -range-max
- *                   (native <input type=range>; always enabled)
+ *                   (native <input type=range>; audio both enabled, video/screen
+ *                   min is DISABLED — the pinned base-layer floor)
  *   Auto toggles:   perf-{video,audio,screen}-auto (have aria-pressed)
  *   Help buttons:   perf-{video,audio,screen}-help (aria-expanded popover)
  *   Range value:    perf-{video,audio,screen}-range-value
@@ -108,6 +120,15 @@ interface PerformancePreference {
   video_auto: boolean;
   audio_auto: boolean;
   screen_auto: boolean;
+  // SEND layer-count ceilings (the "layers published" control). A layer COUNT,
+  // or null = Auto / full ladder. ALL THREE kinds (video, screen, audio) are
+  // driven by the layer-count slider; audio applies its ceiling at RUNTIME via the
+  // mic encoder's per-layer publish-gate (base always sent). `#[serde(default)]` on
+  // the Rust side → these keys may be absent in prefs persisted before the control
+  // existed, hence optional here.
+  video_layers?: number | null;
+  screen_layers?: number | null;
+  audio_layers?: number | null;
 }
 
 /**
@@ -326,20 +347,37 @@ test.describe("Performance settings panel (#961)", () => {
     }
 
     // ── Default = full automatic range: the Reset button is ABSENT (nothing to
-    //    reset → the slot is empty), the sliders are ENABLED, and both thumbs are
-    //    pinned at the extremes (min at 0, max at the top position).
-    const topPos = { video: 7, audio: 3, screen: 2 } as const;
-    for (const stream of ["video", "audio", "screen"] as const) {
-      // Reset not rendered while at the full default range.
+    //    reset → the slot is empty). ALL THREE SEND controls (video, screen, AND
+    //    audio) are now LAYER-COUNT controls: the base-layer floor is PINNED (min
+    //    thumb DISABLED at position 0 — the base is always published), and only the
+    //    ceiling (max) thumb moves, defaulting to the top position = the full
+    //    ladder.
+    //
+    // CAPABILITY note: video/screen's effective depth is
+    // `min(flag, capability_max_simulcast_layers())` and clamps to 1 on weak
+    // (<6-core) runners; AUDIO's is `min(flag, 3)` and is NOT CPU-clamped (audio
+    // encode is cheap, off the main thread), so audio typically stays 3 even on
+    // weak runners. We read each ceiling thumb's `max` attribute (== effective
+    // layers - 1) from the DOM and assert the DEFAULT ceiling == that max (the
+    // "default == effective max" guarantee), so the single loop is correct for all
+    // three regardless of runner capability. The pinned-floor assertions are
+    // capability-independent.
+    for (const stream of ["video", "screen", "audio"] as const) {
+      // Reset not rendered while at the full default ladder.
       await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveCount(0);
       const minInput = panel.locator(`[data-testid="perf-${stream}-range-min"]`);
       const maxInput = panel.locator(`[data-testid="perf-${stream}-range-max"]`);
-      // Sliders are interactive at the full range (never disabled).
-      await expect(minInput).toBeEnabled();
-      await expect(maxInput).toBeEnabled();
-      // Thumbs span the full ladder: min at position 0, max at the top position.
+      // FLOOR thumb is PINNED (disabled) at the base layer (position 0): the base
+      // layer is always published and cannot be dragged off.
+      await expect(minInput).toBeDisabled();
       await expect(minInput).toHaveValue("0");
-      await expect(maxInput).toHaveValue(String(topPos[stream]));
+      // CEILING thumb is interactive and defaults to the TOP position = full
+      // ladder. Read the rendered top position (the `max` attr) and assert the
+      // default value matches it — works for a 1-, 2-, or 3-layer ladder.
+      await expect(maxInput).toBeEnabled();
+      const topPos = await maxInput.getAttribute("max");
+      expect(topPos, "ceiling slider exposes its max position").not.toBeNull();
+      await expect(maxInput).toHaveValue(topPos as string);
     }
   });
 
@@ -392,28 +430,48 @@ test.describe("Performance settings panel (#961)", () => {
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-video-range-max"]');
 
-    // Default: full automatic range → Reset is ABSENT, sliders ENABLED, thumbs at
-    // the extremes (0 and 7).
+    // VIDEO SEND is now a LAYER-COUNT control: the floor (min) thumb is PINNED
+    // (disabled) at the base layer (position 0 — always published), and only the
+    // ceiling (max) thumb moves. Default = full ladder (ceiling at the top
+    // position) → Reset is ABSENT.
     await expect(resetBtn).toHaveCount(0);
-    await expect(minInput).toBeEnabled();
+    await expect(minInput).toBeDisabled();
     await expect(maxInput).toBeEnabled();
     await expect(minInput).toHaveValue("0");
-    await expect(maxInput).toHaveValue("7");
+    // CAPABILITY-ADAPTIVE: read the rendered top position (== effective layers - 1).
+    const topPosStr = await maxInput.getAttribute("max");
+    expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
+    const topPos = Number(topPosStr);
+    await expect(maxInput).toHaveValue(String(topPos));
 
-    // Drag a thumb inward → manual limits → Reset APPEARS as a live button.
-    await setRangeValue(page, "perf-video-range-max", 5);
-    await expect(maxInput).toHaveValue("5");
+    // On a runner whose capability ceiling clamped the publisher to a SINGLE layer
+    // (topPos === 0, <6-core CI — see helpers/simulcast-config.ts), there is no
+    // ceiling to lower: the drag is impossible and Reset can never appear. Skip the
+    // drag/clear assertions there (the pinned-floor + default-ceiling assertions
+    // above already ran and are capability-independent).
+    test.skip(
+      topPos < 1,
+      "runner capability ceiling clamped the publisher to a single layer; the SEND " +
+        "ceiling has only one position and cannot be lowered (see helpers/simulcast-config.ts)",
+    );
+
+    // Lower the ceiling by one (publish fewer top layers) → Reset APPEARS as a live
+    // button. (The base floor stays pinned at 0 throughout.)
+    const lowered = topPos - 1;
+    await setRangeValue(page, "perf-video-range-max", lowered);
+    await expect(maxInput).toHaveValue(String(lowered));
+    await expect(minInput).toHaveValue("0");
     await expect(resetBtn).toBeVisible();
     await expect(resetBtn).toHaveText("Reset");
     await expect(resetBtn).not.toHaveAttribute("aria-pressed", /.*/);
 
-    // Click Reset → thumbs snap back to the extremes, Reset DISAPPEARS again, and
-    // the inputs stay enabled throughout.
+    // Click Reset → ceiling snaps back to the full ladder (top), Reset DISAPPEARS,
+    // the floor stays pinned/disabled, and the ceiling stays enabled throughout.
     await resetBtn.click();
     await expect(minInput).toHaveValue("0");
-    await expect(maxInput).toHaveValue("7");
+    await expect(maxInput).toHaveValue(String(topPos));
     await expect(resetBtn).toHaveCount(0);
-    await expect(minInput).toBeEnabled();
+    await expect(minInput).toBeDisabled();
     await expect(maxInput).toBeEnabled();
   });
 
@@ -445,12 +503,19 @@ test.describe("Performance settings panel (#961)", () => {
     await helpBtn.click();
     await expect(helpBtn).toHaveAttribute("aria-expanded", "true");
     await expect(popover).toBeVisible();
-    await expect(popover).toContainText(
-      /the left handle sets the lowest version you'll send \(floor\), the right handle the highest \(ceiling\)/i,
-    );
-    await expect(popover).toContainText(/reset returns to the full automatic range/i);
+    // The SEND video help body (`HELP_VIDEO_SEND` in performance_settings.rs) now
+    // describes the LAYER-COUNT ceiling model: the base layer is ALWAYS sent and
+    // the right handle sets the highest layer you publish (how many layers you
+    // send). Match that distinctive phrasing AND the "Reset returns to the full
+    // automatic ladder" tail so a copy regression — or a relapse to the old
+    // draggable-floor wording — breaks this test.
+    await expect(popover).toContainText(/the base layer is ALWAYS sent/i);
+    await expect(popover).toContainText(/the right handle sets the HIGHEST layer you publish/i);
+    await expect(popover).toContainText(/reset returns to the full automatic ladder/i);
     // The retired "Auto" toggle wording must NOT resurface in the help copy.
     await expect(popover).not.toContainText(/\bAuto\b/);
+    // The old draggable-floor wording must NOT resurface (the floor is pinned now).
+    await expect(popover).not.toContainText(/lowest version you'll send/i);
 
     // Escape closes it.
     await page.keyboard.press("Escape");
@@ -481,43 +546,63 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Enter manual mode by dragging thumbs inward (the former "Auto" toggle is now
-    // a Reset button, disabled at the full range — dragging is what leaves Auto).
-    // Move both thumbs to a non-extreme range. Slider positions are in "position
-    // space" (0 = worst/left … max = best/right); 8 video tiers ⇒ positions 0..7.
-    // Pick min=position 2, max=position 5 — strictly interior so neither bound is
-    // an Auto-extreme (the panel maps an extreme back to null).
-    await setRangeValue(page, "perf-video-range-min", 2);
-    await setRangeValue(page, "perf-video-range-max", 5);
-    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
-    // With manual bounds set, the Reset button is now RENDERED (it is absent at
-    // the full default range and only appears when constrained).
+    // VIDEO SEND is a LAYER-COUNT control: the floor (min) thumb is PINNED at the
+    // base layer (disabled), and lowering the CEILING (max) thumb publishes fewer
+    // top layers. CAPABILITY-ADAPTIVE: read the rendered top position (== effective
+    // layers - 1); on a single-layer runner (<6-core CI, topPos === 0) there is no
+    // ceiling to lower, so skip the drag/persist/reload assertions there (the
+    // capability ceiling is documented in helpers/simulcast-config.ts).
+    const minInput = panel.locator('[data-testid="perf-video-range-min"]');
+    const maxInputLoc = panel.locator('[data-testid="perf-video-range-max"]');
+    await expect(minInput).toBeDisabled();
+    const topPosStr = await maxInputLoc.getAttribute("max");
+    expect(topPosStr, "ceiling slider exposes its max position").not.toBeNull();
+    const topPos = Number(topPosStr);
+    test.skip(
+      topPos < 1,
+      "runner capability ceiling clamped the publisher to a single layer; the SEND " +
+        "ceiling cannot be lowered, so there is nothing to persist (see " +
+        "helpers/simulcast-config.ts)",
+    );
+
+    // Drag the ceiling DOWN by one → publish (topPos) layers (L0..=L{topPos-1}).
+    // The stored layer COUNT is `lowered + 1` (position+1); the total ladder is
+    // `topPos + 1`. With the standard 3-layer ladder this is position 1 → 2 of 3.
+    const lowered = topPos - 1;
+    const expectedCount = lowered + 1;
+    const totalLayers = topPos + 1;
+    await setRangeValue(page, "perf-video-range-max", lowered);
+    await expect(maxInputLoc).toHaveValue(String(lowered));
+    // Floor stays pinned at the base throughout.
+    await expect(minInput).toHaveValue("0");
+    // With the ceiling below full, the Reset button is now RENDERED.
     await expect(panel.locator('[data-testid="perf-video-auto"]')).toBeVisible();
 
-    // localStorage must reflect: video no longer Auto, and concrete bounds set.
+    // localStorage must reflect the chosen layer COUNT.
     // Poll because the controlled-component write is async to the event.
     await expect
-      .poll(async () => (await readPerfPref(page))?.video_auto, { timeout: 10_000 })
-      .toBe(false);
+      .poll(async () => (await readPerfPref(page))?.video_layers, { timeout: 10_000 })
+      .toBe(expectedCount);
 
     const pref = await readPerfPref(page);
     expect(pref, "vc_performance_quality must be written").not.toBeNull();
-    // With video off Auto and interior thumbs, both bounds are concrete (the
-    // max/best maps to a lower tier index, the min/worst to a higher index).
-    expect(pref?.video_max, "video_max (best bound) is a concrete tier index").not.toBeNull();
-    expect(pref?.video_min, "video_min (worst bound) is a concrete tier index").not.toBeNull();
-    // The other streams stay on Auto (we only touched video).
-    expect(pref?.audio_auto).toBe(true);
-    expect(pref?.screen_auto).toBe(true);
+    // The SEND layer control OWNS the video send axis: it forces the tier bounds
+    // to Auto so the AQ adapts each layer's bitrate freely (no competing slider).
+    expect(pref?.video_layers, "video_layers persisted as a layer count").toBe(expectedCount);
+    expect(pref?.video_auto, "tier axis freed to Auto").toBe(true);
+    expect(pref?.video_max, "tier max cleared").toBeNull();
+    expect(pref?.video_min, "tier min cleared").toBeNull();
+    // The other streams' layer ceilings stay on Auto (we only touched video).
+    expect(pref?.screen_layers ?? null).toBeNull();
 
-    // Capture the visible range text to compare after reload.
+    // Capture the visible count caption to compare after reload. The SEND layer
+    // range-value reads "Sending {N} of {M} layers"; it must read the adaptive
+    // count and never the "Auto" word.
     const rangeValueBefore = await panel
       .locator('[data-testid="perf-video-range-value"]')
       .textContent();
     expect(rangeValueBefore).not.toBeNull();
-    // The send range-value reads "Sending: {worst – best}". With a manual bound
-    // set it shows a concrete tier range; it must never read the "Auto" word
-    // (span_text emits tier labels, not "Auto").
+    expect(rangeValueBefore).toContain(`Sending ${expectedCount} of ${totalLayers} layers`);
     expect(rangeValueBefore).not.toContain("Auto");
 
     // ── Reload and rejoin; the preference must restore from localStorage ──
@@ -545,18 +630,23 @@ test.describe("Performance settings panel (#961)", () => {
     await selectSendDirection(page);
     const panelAfter = page.locator("#settings-panel-performance");
 
-    // Manual bounds restored (not the full range) → the Reset button is RENDERED.
+    // Lowered ceiling restored (not the full ladder) → the Reset button is
+    // RENDERED, the ceiling thumb is back at the lowered position, and the base
+    // floor is still pinned (disabled).
     await expect(panelAfter.locator('[data-testid="perf-video-auto"]')).toBeVisible();
-    await expect(panelAfter.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
+    await expect(panelAfter.locator('[data-testid="perf-video-range-min"]')).toBeDisabled();
+    await expect(panelAfter.locator('[data-testid="perf-video-range-max"]')).toHaveValue(
+      String(lowered),
+    );
 
-    // The restored range text matches what was set before the reload.
+    // The restored count caption matches what was set before the reload.
     await expect(panelAfter.locator('[data-testid="perf-video-range-value"]')).toHaveText(
       rangeValueBefore as string,
     );
-    // And localStorage still carries the persisted, non-Auto video preference.
+    // And localStorage still carries the persisted layer-count ceiling.
     await expect
-      .poll(async () => (await readPerfPref(page))?.video_auto, { timeout: 10_000 })
-      .toBe(false);
+      .poll(async () => (await readPerfPref(page))?.video_layers, { timeout: 10_000 })
+      .toBe(expectedCount);
   });
 
   test("bar-meters are live: video readout shows a real value, screen shows 'Screen — not sharing'", async ({
@@ -589,35 +679,33 @@ test.describe("Performance settings panel (#961)", () => {
     });
   });
 
-  test("fixed badge appears when a stream's two thumbs collapse to the same tier", async ({
+  test("no SEND 'Fixed' badge: all three SEND controls are pinned-floor layer-count sliders", async ({
     page,
   }) => {
-    await joinMeeting(page, "fixed_badge");
+    await joinMeeting(page, "no_fixed_badge");
     await openPerformanceTab(page);
     await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Pin both thumbs to the SAME interior position so best == worst (a single
-    // fixed tier). Dragging a thumb leaves the full automatic range (no toggle
-    // click needed — the former Auto toggle is now a Reset button). The thumbs
-    // cannot cross, so set min first then max to the same position. Position 3 is
-    // interior for the 8-tier video slider.
-    await setRangeValue(page, "perf-video-range-min", 3);
-    await setRangeValue(page, "perf-video-range-max", 3);
-    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
-
-    // The "Fixed" badge for the video stream becomes visible once both bounds
-    // resolve to the same tier.
-    await expect(panel.locator('[data-testid="perf-video-fixed-badge"]')).toBeVisible({
-      timeout: 10_000,
-    });
+    // The "Fixed" badge was a TIER-slider concept (both thumbs pinned to one
+    // tier). ALL THREE SEND controls (video, screen, AND audio) are now
+    // layer-count sliders with a fixed base-layer floor and an adjustable ceiling
+    // — there is no tier-pinning and therefore no SEND "Fixed" badge for any kind.
+    // Guard that none renders (a regression that revived the tier slider would
+    // bring the badge back). The audio floor is also pinned/disabled like the
+    // others (it is no longer a draggable tier min).
+    for (const stream of ["video", "audio", "screen"] as const) {
+      await expect(panel.locator(`[data-testid="perf-${stream}-fixed-badge"]`)).toHaveCount(0);
+      await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeDisabled();
+    }
   });
 
   test("send rung strip + directional arrows render (#1131)", async ({ page }) => {
-    // §2: AUDIO always renders a single-pip SEND rung strip (it has no per-layer
-    // encoder snapshot, so the pip comes from the user's best-allowed tier). That
-    // pip is present even single-page with no peers, so it is the deterministic
+    // §2: AUDIO now renders a SELECTION-DRIVEN multi-pip SEND rung strip (the
+    // layer-count control builds one pip per effective audio layer from the user's
+    // ceiling, like video/screen — no dependence on a live encoder snapshot). The
+    // strip is present even single-page with no peers, so it is the deterministic
     // anchor for the strip markup. §1: each side title is prefixed with an
     // aria-hidden directional arrow (`.perf-dir-arrow`).
     await joinMeeting(page, "send_rungs");
@@ -630,10 +718,13 @@ test.describe("Performance settings panel (#961)", () => {
     const audioStrip = panel.locator('[data-testid="perf-audio-send-rungs"]');
     await expect(audioStrip).toBeVisible({ timeout: 5_000 });
     await expect(audioStrip).toHaveAttribute("role", "img");
-    // Exactly one pip for audio (single conceptual rung). Its testid is
-    // `perf-audio-send-rung-{tier-index}`; match the prefix.
+    // SHAPE assertion: >= 1 pip (one per effective audio layer). Do NOT hard-code
+    // the count — audio's effective ladder is `min(flag, 3)`; the base pip is
+    // always present. Its testid is `perf-audio-send-rung-{layer-id}`.
     const audioPips = panel.locator('[data-testid^="perf-audio-send-rung-"]');
-    await expect(audioPips).toHaveCount(1);
+    expect(await audioPips.count()).toBeGreaterThanOrEqual(1);
+    // The base pip (layer 0) is always rendered + always active (the pinned floor).
+    await expect(panel.locator('[data-testid="perf-audio-send-rung-0"]')).toBeVisible();
 
     // §1 directional arrows: present on BOTH a Sending and a Receiving title, and
     // aria-hidden so they are decorative (the title text is the a11y label).

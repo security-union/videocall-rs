@@ -307,6 +307,19 @@ pub fn Host(
         );
         // Screen share bounds live on the separate ScreenEncoder (issue #961).
         screen.set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+        // User SEND layer-ceiling ("layers published" control): cap how many
+        // simulcast layers each publisher emits. None = Auto / full ladder. Like
+        // the bounds above, the value persists in the encoder's shared atomic and
+        // is re-read by the AQ control loop on every (re)start, so this single
+        // call survives camera/screen restarts + reconnect.
+        camera.set_user_layer_ceiling(perf_pref.video_layers);
+        screen.set_user_layer_ceiling(perf_pref.screen_layers);
+        // Audio's published layer count is adjustable too (runtime publish-gate in
+        // the mic encoder — no restart). Same persist/reapply contract: the value
+        // lives in the mic encoder's shared atomic (cloned into every layer's
+        // publish handler), so it survives reconnect and this re-applies it from
+        // the persisted preference on re-init.
+        microphone.set_user_layer_ceiling(perf_pref.audio_layers);
 
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();
@@ -740,6 +753,18 @@ pub fn Host(
             // Screen share is a separate encoder object (issue #961).
             s.screen
                 .set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+            // User SEND layer-ceiling: apply LIVE as the user drags the "layers
+            // published" thumb. The encoder stores the count in a shared atomic
+            // the AQ control loop reads each tick (≤1s), composing it as a further
+            // `min` with the union hint + ramp — so lowering it sheds the top
+            // layer(s) at once and raising it re-earns them. None = Auto.
+            s.camera.set_user_layer_ceiling(pref.video_layers);
+            s.screen.set_user_layer_ceiling(pref.screen_layers);
+            // Audio layer ceiling applies LIVE too: the mic encoder's per-layer
+            // publish handlers read the shared atomic at publish time, so lowering
+            // it stops sending the top audio layer(s) on the next frame and raising
+            // it resumes them — no mic restart, no audio interruption.
+            s.microphone.set_user_layer_ceiling(pref.audio_layers);
         })
     };
 
@@ -895,6 +920,30 @@ pub fn Host(
         });
     }
 
+    // Effective VIDEO/SCREEN simulcast ladder depth for the SEND layer-count
+    // sliders. Computed ONCE per Host mount via `use_hook` (not every render):
+    // `capability_max_simulcast_layers()` allocates a UA string + emits an info
+    // log, and the value is deterministic per session (runtime flag + CPU core
+    // count are stable), so a per-render recompute is pure waste. This is the same
+    // formula the encoder setup uses (host.rs ~L134); both kinds share the
+    // CPU-derived ceiling (each extra video encoder is ~N× main-thread cost).
+    let send_layer_max: usize = use_hook(|| {
+        experimental_simulcast_max_layers()
+            .min(crate::components::capability_check::capability_max_simulcast_layers())
+            as usize
+    });
+
+    // Effective AUDIO ladder depth for the SEND audio layer-count slider. UNLIKE
+    // video/screen this is NOT CPU-clamped: audio Opus encode runs off the main
+    // thread and is cheap, so the ceiling is just `min(flag, audio ladder size)`
+    // (`max_layers_for_kind(Audio)` == 3). So audio typically shows the full
+    // 3-layer ladder even on weak runners that clamp video to 1. Same formula as
+    // the mic encoder setup (host.rs ~L146). Computed once per mount.
+    let audio_layer_max: usize = use_hook(|| {
+        experimental_simulcast_max_layers()
+            .min(videocall_client::max_layers_for_kind(PrefMediaKind::Audio)) as usize
+    });
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -967,6 +1016,9 @@ pub fn Host(
             let on_recv = on_receive_change.clone();
             let recv_reader = received_reader.clone();
             let diag_reader = diagnostics_reader.clone();
+            // `send_layer_max` (computed once per mount above via use_hook) is a
+            // `usize: Copy`, captured directly by the rsx below for both the video
+            // and screen SEND layer sliders.
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -992,6 +1044,12 @@ pub fn Host(
                     received_reader: recv_reader.clone(),
                     diagnostics_reader: diag_reader.clone(),
                     on_open_diagnostics: move |_| on_open_diagnostics.call(()),
+                    // SEND layer-count ceilings (real ladder depth). Video and
+                    // screen share the CPU-derived effective ceiling; audio uses
+                    // its own (non-CPU-clamped) ladder depth.
+                    video_layer_max: send_layer_max,
+                    screen_layer_max: send_layer_max,
+                    audio_layer_max,
                 }
             }
         }

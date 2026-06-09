@@ -411,53 +411,13 @@ pub struct SendRung {
     pub kbps_label: Option<String>,
 }
 
-/// Build the §2 SEND rung strip from a video/screen SEND snapshot (issue #1131),
-/// lowest layer first. Pure / host-tested.
+/// The §2 SEND rung strip for AUDIO when it was a single-pip tier control.
 ///
-///   * Simulcast active → one pip per EFFECTIVE layer; `active` is
-///     `layer_id < active_layers` (the AQ controller sheds the TOP layers under
-///     congestion, so shed pips are the high ones). The kbps label lands on the
-///     highest active pip only.
-///   * Single-stream (non-simulcast) video/screen → the producers
-///     (`CameraEncoder`/`ScreenEncoder::live_simulcast_snapshot`) emit an EMPTY
-///     `layers` Vec, so this returns an empty Vec and the caller renders NO strip
-///     and keeps the plain summary line instead. (There is intentionally no
-///     single-pip fallback for these kinds — single-stream carries no per-layer
-///     ladder to draw.)
-///
-/// AUDIO has no per-layer encoder snapshot at all and never reaches this fn; the
-/// panel builds its single send pip from the user's cap via [`audio_send_rung`].
-///
-/// Returns an EMPTY Vec when there are no layers (single-stream / atomics not yet
-/// ticked), so the caller falls back to the summary line and renders no empty
-/// strip.
-pub fn send_rungs(snap: &SimulcastSendSnapshot) -> Vec<SendRung> {
-    if snap.layers.is_empty() {
-        return Vec::new();
-    }
-    // The highest ACTIVE layer id (for the single kbps label). active_layers is a
-    // count of the lowest-N active layers, so the top active id is count-1.
-    let top_active_id = snap.active_layers.saturating_sub(1);
-    snap.layers
-        .iter()
-        .map(|l| {
-            let active = l.layer_id < snap.active_layers;
-            SendRung {
-                layer_id: l.layer_id,
-                active,
-                res_label: format_send_layer_short(l.width, l.height),
-                // kbps only on the top ACTIVE pip, and only once a bitrate exists.
-                kbps_label: (active && l.layer_id == top_active_id && l.bitrate_kbps > 0)
-                    .then(|| format_kbps_compact(l.bitrate_kbps)),
-            }
-        })
-        .collect()
-}
-
-/// The §2 SEND rung strip for AUDIO, which has no per-layer encoder snapshot:
-/// render a SINGLE filled pip at the user's best-allowed send tier, labeled from
-/// [`AUDIO_TIER_LABELS`] (send-side inverted index: 0 = best). `best` is the
+/// Test-only now: audio moved to the layer-count control (`SendLayerCell`), which
+/// builds its own multi-pip selection-driven strip via [`layer_send_rungs`] like
+/// video/screen. Retained as the tested single-pip mapper. `best` is the
 /// best-allowed tier index (`None`/Auto → tier 0 = best). Pure / host-tested.
+#[allow(dead_code)]
 pub fn audio_send_rung(best: Option<usize>) -> SendRung {
     let idx = match best {
         Some(i) if i < AUDIO_TIER_LABELS.len() => i,
@@ -470,6 +430,31 @@ pub fn audio_send_rung(best: Option<usize>) -> SendRung {
         res_label: AUDIO_TIER_LABELS[idx].to_string(),
         kbps_label: None,
     }
+}
+
+/// Build the SEND rung strip for a VIDEO/SCREEN layer-count slider directly from
+/// the user's CEILING selection (not the live encoder snapshot), so dragging the
+/// ceiling thumb updates the active/shed pips IMMEDIATELY rather than waiting for
+/// the next AQ tick + snapshot.
+///
+/// `labels` is the kind's lowest-first rung labels (one per effective layer);
+/// `ceiling_pos` is the ceiling thumb position (0-based layer index). A pip is
+/// `active` iff `layer_id <= ceiling_pos` — i.e. layers `L0..=L{ceiling_pos}` are
+/// published and the rest are shown shed. The base (L0) is always active (the
+/// ceiling floors at 0). No kbps labels here (this strip reflects the user's
+/// chosen COUNT, not live bitrate — the live summary line carries flowing rates).
+/// Pure / host-tested.
+pub fn layer_send_rungs(labels: &[&'static str], ceiling_pos: usize) -> Vec<SendRung> {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| SendRung {
+            layer_id: i as u32,
+            active: i <= ceiling_pos,
+            res_label: (*label).to_string(),
+            kbps_label: None,
+        })
+        .collect()
 }
 
 /// The strip's `role="img"` aria-label summarizing the rung state for SR users
@@ -513,22 +498,36 @@ pub fn format_audio_receive_summary(n_peers: usize) -> String {
     }
 }
 
-/// AUDIO SEND summary, derived from the user's bounds (the audio row has no
-/// per-layer encoder snapshot, so unlike video/content this reads the *intent*,
-/// not the live wire). On Auto or full-range → `"Sending high quality"`; with a
-/// manual cap → `"Sending up to {best-tier kbps}"` so a lowered cap is reflected
-/// rather than claiming "high quality" falsely (#5). `best` is the best-allowed
-/// SEND tier index (0 = best); `None` = no cap. Pure / host-tested.
-pub fn format_audio_send_summary(is_auto: bool, best: Option<usize>) -> String {
-    // Auto, or no upper cap, or the cap is already the best tier (index 0) →
-    // we're sending the full-quality top tier.
-    match best {
-        _ if is_auto => "Sending high quality".to_string(),
-        None | Some(0) => "Sending high quality".to_string(),
-        Some(idx) => {
-            let label = AUDIO_TIER_LABELS.get(idx).copied().unwrap_or("?");
-            format!("Sending up to {label}")
-        }
+/// AUDIO SEND summary line for the LAYER-COUNT control — count-aware, so it tracks
+/// the chosen audio layer ceiling (the bare-tier [`format_audio_send_summary`]
+/// always read "Sending high quality" post-migration since audio is always Auto
+/// on the tier axis now, contradicting the rung strip when the user lowers the
+/// ceiling).
+///
+/// `layers` is the persisted audio layer COUNT (`None` = Auto / full ladder);
+/// `layer_max` is the effective audio ladder depth. Derived from the SAME
+/// per-kind ladder labels the slider + rung strip use
+/// ([`send_layer_labels`] for `Audio`, lowest-first `["24k","32k","50k"]`), so the
+/// summary's top-layer label can never drift from the rungs. The summary names the
+/// TOP currently-published layer (the best quality flowing): the full ladder reads
+/// "Sending up to {top}" and a single base layer reads "Sending {base} only".
+/// Pure / host-tested.
+pub fn format_audio_send_layer_summary(layers: Option<u32>, layer_max: usize) -> String {
+    let labels = send_layer_labels(PrefMediaKind::Audio, layer_max);
+    if labels.is_empty() {
+        return "Sending audio".to_string();
+    }
+    // Active layers are L0..=ceiling_pos; the top published label is at ceiling_pos.
+    let ceiling_pos = layer_ceiling_to_thumb_pos(layers, labels.len());
+    let top = labels
+        .get(ceiling_pos)
+        .copied()
+        .unwrap_or(labels[labels.len() - 1]);
+    if ceiling_pos == 0 {
+        // Only the base layer is published.
+        format!("Sending {top} only")
+    } else {
+        format!("Sending up to {top}")
     }
 }
 
@@ -760,6 +759,23 @@ pub struct PerformancePreference {
     /// Screen-share stream on Auto. Default `true`.
     #[serde(default = "default_true")]
     pub screen_auto: bool,
+    /// User SEND layer-ceiling for VIDEO — the maximum number of simulcast
+    /// layers this publisher emits (the "layers published" control). `None` =
+    /// Auto / no user cap (the full backpressure-governed ladder). A layer COUNT
+    /// in `1..=effective_max_layers`. `#[serde(default)]` (= `None`) so prefs
+    /// persisted before this control existed load as Auto — no behavior change
+    /// until the user drags it.
+    #[serde(default)]
+    pub video_layers: Option<u32>,
+    /// User SEND layer-ceiling for SCREEN. `None` = Auto. See `video_layers`.
+    #[serde(default)]
+    pub screen_layers: Option<u32>,
+    /// User SEND layer-ceiling for AUDIO. `None` = Auto. See `video_layers`.
+    /// Applied LIVE via the mic encoder's per-layer publish-gate (no restart): the
+    /// base layer is always sent, and audio layers at/above this count are dropped
+    /// at publish time. See `MicrophoneEncoder::set_user_layer_ceiling`.
+    #[serde(default)]
+    pub audio_layers: Option<u32>,
 }
 
 /// serde default for the `*_auto` flags (a fn because serde needs a path).
@@ -779,6 +795,9 @@ impl Default for PerformancePreference {
             video_auto: true,
             audio_auto: true,
             screen_auto: true,
+            video_layers: None,
+            screen_layers: None,
+            audio_layers: None,
         }
     }
 }
@@ -884,6 +903,11 @@ pub fn position_to_tier_index(position: usize, tier_count: usize) -> usize {
 }
 
 /// Inverse of [`position_to_tier_index`]: tier index → slider position.
+///
+/// Test-only since all SEND cells moved to the layer-count control (the tier
+/// slider that consumed this is gone); retained as the tested inverse and the
+/// documented half of the position↔index mapping.
+#[allow(dead_code)]
 pub fn tier_index_to_position(tier_index: usize, tier_count: usize) -> usize {
     let max_idx = tier_count.saturating_sub(1);
     max_idx.saturating_sub(tier_index.min(max_idx))
@@ -896,6 +920,11 @@ pub fn tier_index_to_position(tier_index: usize, tier_count: usize) -> usize {
 /// - `worst = None` → left thumb fully left (position 0).
 ///
 /// The result always satisfies `min_pos <= max_pos`.
+///
+/// Test-only since all SEND cells moved to the layer-count control; retained as
+/// the tested SEND tier-bounds↔thumbs mapping (the receive side has its own
+/// `receive::bounds_to_thumbs`).
+#[allow(dead_code)]
 pub fn bounds_to_thumbs(best: Option<usize>, worst: Option<usize>, tier_count: usize) -> RangeSel {
     let max_idx = tier_count.saturating_sub(1);
     // Right thumb (best quality). Auto = far right.
@@ -984,43 +1013,205 @@ pub fn at_full_range(min_pos: usize, max_pos: usize, last_position: usize) -> bo
     min_pos == 0 && max_pos == last_position
 }
 
+// ── SEND layer-count model (video + screen) ────────────────────────
+//
+// The SEND control for video/screen is a LAYER-COUNT slider, NOT a tier slider.
+// The track ticks are the kind's simulcast rungs, lowest-first (video: L0 360p /
+// L1 540p / L2 720p; screen: its ladder). The FLOOR thumb is pinned at L0 (the
+// base layer is always published — the base-present invariant), and the CEILING
+// thumb is the published layer COUNT: position `p` (0-based layer index) means
+// "publish layers L0..=Lp", i.e. a count of `p + 1`.
+//
+// The persisted value is `PerformancePreference::{video,screen}_layers`, an
+// `Option<u32>` layer COUNT in `1..=layer_max`, where `None` == Auto == the full
+// ladder (so the migration default and the "Reset" both land on `None`). These
+// pure mappers convert between the stored count and the ceiling thumb position,
+// and are host-tested so a wording/positioning regression breaks a test.
+
+/// The rung labels to render for a SEND layer slider, lowest layer first
+/// (index == `layer_id`), for an `layer_max`-rung ladder.
+///
+/// VIDEO mirrors the AQ camera ladder selection over `[low 360p, standard 540p,
+/// hd 720p]`: `[low]`, `[low, hd]`, `[low, standard, hd]` for n = 1/2/3 — note
+/// n=2 SKIPS the middle, matching the AQ `spaced_ladder_positions` rule — so we
+/// special-case the count rather than taking a naive prefix.
+///
+/// SCREEN mirrors the AQ `simulcast_screen_layers` selection: 1→`[low]`,
+/// 2→`[low, high]` (skips medium), 3→`[low, medium, high]`. The screen tiers use
+/// QUALITATIVE labels (not resolution) because the AQ screen `low` and `medium`
+/// rungs are BOTH 1280×720 (they differ in fps/bitrate, see `SCREEN_QUALITY_TIERS`),
+/// so a resolution label would be ambiguous — the qualitative names match the AQ
+/// tier labels and read consistently.
+///
+/// AUDIO mirrors the publisher's CONTIGUOUS audio ladder (`AUDIO_LAYER_KBPS =
+/// [24, 32, 50]` kbps, lowest-first — the mic encoder publishes layers
+/// `0..n` with NO skip, unlike the spaced video/screen ladders): 1→`[24k]`,
+/// 2→`[24k, 32k]`, 3→`[24k, 32k, 50k]`.
+///
+/// Kept in lockstep with the AQ / publisher ladders here (the AQ tables are behind
+/// a wasm-only crate); a reviewer must keep them in sync. Pure / host-tested.
+pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static str> {
+    let n = layer_max.clamp(1, 3);
+    match kind {
+        PrefMediaKind::Screen => {
+            // SCREEN_QUALITY_TIERS = [high, medium, low]; simulcast_screen_layers
+            // picks lowest-first: 1→[low], 2→[low, high] (skip medium), 3→full.
+            match n {
+                1 => vec!["low"],
+                2 => vec!["low", "high"],
+                _ => vec!["low", "medium", "high"],
+            }
+        }
+        PrefMediaKind::Audio => {
+            // AUDIO_LAYER_KBPS = [24, 32, 50] kbps, CONTIGUOUS lowest-first (no
+            // skip): the publisher emits layers 0..n in order.
+            match n {
+                1 => vec!["24k"],
+                2 => vec!["24k", "32k"],
+                _ => vec!["24k", "32k", "50k"],
+            }
+        }
+        PrefMediaKind::Video => {
+            // Camera ladder via spaced_ladder_positions over [low, standard, hd]:
+            // 1→[low], 2→[low, hd] (skip standard), 3→[low, standard, hd].
+            match n {
+                1 => vec!["360p"],
+                2 => vec!["360p", "720p"],
+                _ => vec!["360p", "540p", "720p"],
+            }
+        }
+    }
+}
+
+/// Map a stored SEND layer-ceiling (`Option<u32>` COUNT; `None` = Auto/full) to
+/// the ceiling thumb POSITION (0-based layer index) for a `layer_max`-rung track.
+///
+/// - `None` (Auto) → the top position (`layer_max - 1`) = full ladder.
+/// - `Some(count)` → `count - 1`, clamped into `0..=layer_max-1` (a stored count
+///   of 0 is meaningless — the base is always sent — so it floors at position 0;
+///   an over-large count saturates at the top). Pure / host-tested.
+pub fn layer_ceiling_to_thumb_pos(ceiling: Option<u32>, layer_max: usize) -> usize {
+    let top = layer_max.saturating_sub(1);
+    match ceiling {
+        None => top,
+        Some(count) => (count.max(1) as usize - 1).min(top),
+    }
+}
+
+/// Inverse of [`layer_ceiling_to_thumb_pos`]: map a ceiling thumb POSITION to the
+/// stored layer-ceiling value. The TOP position (full ladder) stores `None`
+/// (Auto), so the migration default and Reset agree and a user at full never
+/// pins a finite cap. Any lower position stores `Some(position + 1)` (the layer
+/// COUNT). Pure / host-tested.
+pub fn thumb_pos_to_layer_ceiling(pos: usize, layer_max: usize) -> Option<u32> {
+    let top = layer_max.saturating_sub(1);
+    if pos >= top {
+        None
+    } else {
+        Some(pos as u32 + 1)
+    }
+}
+
 impl PerformancePreference {
     /// Return a copy with any out-of-range index collapsed to `None` (Auto).
     ///
-    /// Defends against a `localStorage` value written by a future/older build
-    /// with a different number of tiers: a stored index that no longer maps to a
-    /// valid tier silently falls back to Auto rather than producing an
-    /// out-of-bounds bound. `video_len` / `audio_len` / `screen_len` are the
-    /// current tier counts.
-    pub fn sanitized(self, video_len: usize, audio_len: usize, screen_len: usize) -> Self {
-        let clamp = |v: Option<usize>, len: usize| v.filter(|&i| i < len);
+    /// ONE-SHOT MIGRATION (SEND tier slider → layer-count control): ALL THREE SEND
+    /// tier sliders (video, screen, AND now audio) were removed — each replaced by
+    /// the layer-count control that drives `*_layers`. A returning user with
+    /// persisted manual tier bounds (`*_max`/`*_min`) would otherwise keep them
+    /// applied to the encoder INVISIBLY (no UI surfaces them anymore), silently
+    /// pinning their send quality. So we clear all three streams' `*_max`/`*_min`
+    /// to `None` and set `*_auto = true` on load. This is safe and idempotent: a
+    /// fresh/Auto pref is already in this state, so re-running it is a no-op; only
+    /// legacy manual bounds are reset.
+    ///
+    /// (The `*_len` tier-count params are retained for API stability — the prior
+    /// implementation clamped stale indices against them — but the migration now
+    /// hard-clears all tier bounds, so they are unused.)
+    pub fn sanitized(self, _video_len: usize, _audio_len: usize, _screen_len: usize) -> Self {
         PerformancePreference {
-            video_max: clamp(self.video_max, video_len),
-            video_min: clamp(self.video_min, video_len),
-            audio_max: clamp(self.audio_max, audio_len),
-            audio_min: clamp(self.audio_min, audio_len),
-            screen_max: clamp(self.screen_max, screen_len),
-            screen_min: clamp(self.screen_min, screen_len),
-            // The auto flags carry no index, so they pass through unchanged.
-            video_auto: self.video_auto,
-            audio_auto: self.audio_auto,
-            screen_auto: self.screen_auto,
+            // All three SEND tier sliders are gone (see fn doc): clear any
+            // persisted manual bound and set Auto so no returning user is silently
+            // pinned. The layer-count control owns each send axis via `*_layers`.
+            video_max: None,
+            video_min: None,
+            video_auto: true,
+            screen_max: None,
+            screen_min: None,
+            screen_auto: true,
+            audio_max: None,
+            audio_min: None,
+            audio_auto: true,
+            // Layer-ceiling counts carry no TIER index (they are layer counts in
+            // `1..=effective_max_layers`, validated/clamped on the encoder side),
+            // so they pass through unchanged here.
+            video_layers: self.video_layers,
+            screen_layers: self.screen_layers,
+            audio_layers: self.audio_layers,
         }
+    }
+
+    /// Set the VIDEO SEND layer-ceiling COUNT (`None` = Auto / full ladder).
+    ///
+    /// The SEND control is purely layer-count now, so this ALSO forces the video
+    /// tier bounds to Auto (`video_auto = true`, `video_max/min = None`): the
+    /// AQ adapts each published layer's bitrate freely, and there is no second
+    /// tier slider competing with the layer-count control. Pure.
+    pub fn with_video_layers(mut self, layers: Option<u32>) -> Self {
+        self.video_layers = layers;
+        self.video_auto = true;
+        self.video_max = None;
+        self.video_min = None;
+        self
+    }
+
+    /// Set the SCREEN SEND layer-ceiling COUNT (`None` = Auto). Same Auto-tier
+    /// semantics as [`Self::with_video_layers`]. Pure.
+    pub fn with_screen_layers(mut self, layers: Option<u32>) -> Self {
+        self.screen_layers = layers;
+        self.screen_auto = true;
+        self.screen_max = None;
+        self.screen_min = None;
+        self
+    }
+
+    /// Set the AUDIO SEND layer-ceiling COUNT (`None` = Auto). Same Auto-tier
+    /// semantics as [`Self::with_video_layers`]: the audio SEND control is now a
+    /// layer-count slider too, so this frees the audio tier bounds to Auto
+    /// (`audio_auto = true`, `audio_max/min = None`) — the AQ adapts the published
+    /// audio layers' bitrate freely and there is no competing tier slider. Pure.
+    pub fn with_audio_layers(mut self, layers: Option<u32>) -> Self {
+        self.audio_layers = layers;
+        self.audio_auto = true;
+        self.audio_max = None;
+        self.audio_min = None;
+        self
     }
 
     /// `true` when adaptation is pinned to a single tier ("Fixed" badge): the
     /// stream is NOT on Auto and both bounds are set to the same tier. A stream
     /// on Auto is never "fixed" (it is fully automatic).
+    ///
+    /// NONE of the SEND streams render a tier slider anymore (all three — video,
+    /// screen, AND audio — moved to the layer-count control), so this whole
+    /// `*_is_fixed` family is now exercised only by unit tests: retained as the
+    /// tested predicate over the persisted `*_max/*_min` fields (kept for the
+    /// migration). `allow(dead_code)` for the bin target.
+    #[allow(dead_code)]
     pub fn video_is_fixed(&self) -> bool {
         !self.video_auto && matches!((self.video_max, self.video_min), (Some(a), Some(b)) if a == b)
     }
 
-    /// See [`Self::video_is_fixed`].
+    /// See [`Self::video_is_fixed`]. Test-only since audio also moved to the
+    /// layer-count control.
+    #[allow(dead_code)]
     pub fn audio_is_fixed(&self) -> bool {
         !self.audio_auto && matches!((self.audio_max, self.audio_min), (Some(a), Some(b)) if a == b)
     }
 
-    /// See [`Self::video_is_fixed`].
+    /// See [`Self::video_is_fixed`]. Test-only since the SEND screen tier slider
+    /// was replaced by the layer-count control.
+    #[allow(dead_code)]
     pub fn screen_is_fixed(&self) -> bool {
         !self.screen_auto
             && matches!((self.screen_max, self.screen_min), (Some(a), Some(b)) if a == b)
@@ -1029,6 +1220,11 @@ impl PerformancePreference {
     /// Toggle the video stream's Auto flag. Turning Auto ON snaps both thumbs to
     /// the extremes (bounds → `None/None`). Turning Auto OFF leaves the stored
     /// thumb indices (which are extremes/`None` until the user drags). Pure.
+    ///
+    /// Test-only since the SEND video tier slider was replaced by the layer-count
+    /// control (`with_video_layers` now owns the video send axis); retained as the
+    /// tested mutator over the persisted `video_*` fields.
+    #[allow(dead_code)]
     pub fn set_video_auto(mut self, on: bool) -> Self {
         self.video_auto = on;
         if on {
@@ -1038,17 +1234,9 @@ impl PerformancePreference {
         self
     }
 
-    /// See [`Self::set_video_auto`].
-    pub fn set_audio_auto(mut self, on: bool) -> Self {
-        self.audio_auto = on;
-        if on {
-            self.audio_max = None;
-            self.audio_min = None;
-        }
-        self
-    }
-
-    /// See [`Self::set_video_auto`].
+    /// See [`Self::set_video_auto`]. Test-only since the SEND screen tier slider
+    /// was replaced by the layer-count control.
+    #[allow(dead_code)]
     pub fn set_screen_auto(mut self, on: bool) -> Self {
         self.screen_auto = on;
         if on {
@@ -1061,6 +1249,10 @@ impl PerformancePreference {
     /// Return a copy with the video stream's bounds replaced by those derived
     /// from `sel` (slider-position space). A thumb drag implies manual mode, so
     /// this also clears the Auto flag. Pure.
+    ///
+    /// Test-only since the SEND video tier slider was replaced by the layer-count
+    /// control (`with_video_layers`). Retained as the tested tier-bound mutator.
+    #[allow(dead_code)]
     pub fn with_video_thumbs(mut self, sel: RangeSel) -> Self {
         let (best, worst) = thumbs_to_bounds(sel, VIDEO_TIER_LABELS.len());
         self.video_max = best;
@@ -1071,6 +1263,10 @@ impl PerformancePreference {
 
     /// Return a copy with the audio stream's bounds replaced by those derived
     /// from `sel`. Clears the Auto flag. Pure.
+    ///
+    /// Test-only since audio moved to the layer-count control (`with_audio_layers`
+    /// now owns the audio send axis). Retained as the tested tier-bound mutator.
+    #[allow(dead_code)]
     pub fn with_audio_thumbs(mut self, sel: RangeSel) -> Self {
         let (best, worst) = thumbs_to_bounds(sel, AUDIO_TIER_LABELS.len());
         self.audio_max = best;
@@ -1081,6 +1277,10 @@ impl PerformancePreference {
 
     /// Return a copy with the screen stream's bounds replaced by those derived
     /// from `sel`. Clears the Auto flag. Pure.
+    ///
+    /// Test-only since the SEND screen tier slider was replaced by the layer-count
+    /// control (`with_screen_layers`). Retained as the tested tier-bound mutator.
+    #[allow(dead_code)]
     pub fn with_screen_thumbs(mut self, sel: RangeSel) -> Self {
         let (best, worst) = thumbs_to_bounds(sel, SCREEN_TIER_LABELS.len());
         self.screen_max = best;
@@ -1095,6 +1295,11 @@ impl PerformancePreference {
 /// regardless of Auto state — it describes what the slider visibly shows, not
 /// the encoder bound semantics. When both thumbs sit on the same tier it
 /// collapses to a single label. Pure so it is host-tested.
+///
+/// Test-only since all SEND cells moved to the layer-count control (whose caption
+/// is "N of M layers", not a tier span); retained as the tested SEND span
+/// renderer (the receive side has its own `receive::span_text`).
+#[allow(dead_code)]
 pub fn span_text(sel: RangeSel, labels: &[&str]) -> String {
     let label_at = |pos: usize| position_label(pos, labels);
     let worst = label_at(sel.min_pos); // left thumb = worst end
@@ -1486,14 +1691,62 @@ fn DualRangeSlider(
     sel: RangeSel,
     /// Called with the corrected [`RangeSel`] whenever a thumb moves.
     on_change: EventHandler<RangeSel>,
+    /// When `true`, the slider operates in SEND LAYER-COUNT mode (video/screen):
+    ///
+    /// - the MIN (left) thumb is PINNED at position 0 and rendered non-interactive
+    ///   (`disabled` + `aria-disabled`): the base layer (L0) is ALWAYS published,
+    ///   so the floor is fixed and only the ceiling (max) thumb moves;
+    /// - end-labels are SEMANTIC ("Base" left / "Max" right) because the `labels`
+    ///   list is lowest-layer-first (NOT the worst→best tier order the default
+    ///   end-labels assume), so the raw first/last would read inverted;
+    /// - the moving (ceiling) thumb + fill use `--success` (the SEND treatment)
+    ///   via the `perf-range--send-layer` container class, distinguishing it from
+    ///   the full-range `--accent` Receive slider beside it.
+    ///
+    /// Defaults to `false` (the audio tier slider keeps both thumbs draggable,
+    /// tier end-labels, and the default coloring).
+    #[props(default)]
+    layer_mode: bool,
+    /// Optional override for the MAX-thumb `aria-valuetext` (SEND layer mode uses
+    /// a count-aware string like "2 of 3 layers" instead of a resolution label).
+    /// `None` → the default resolution/tier label. Ignored when not `layer_mode`.
+    #[props(default)]
+    max_valuetext_override: Option<String>,
 ) -> Element {
+    // In layer mode the floor thumb is pinned (see prop doc); historically a
+    // separate `pin_min` flag, now folded into `layer_mode` (they were always set
+    // together).
+    let pin_min = layer_mode;
     let max_pos = labels.len().saturating_sub(1);
     let min_value = sel.min_pos;
     let max_value = sel.max_pos;
     let min_id = format!("{id_prefix}-range-min");
     let max_id = format!("{id_prefix}-range-max");
     let min_valuetext = position_label(sel.min_pos, &labels).to_string();
-    let max_valuetext = position_label(sel.max_pos, &labels).to_string();
+    // Max-thumb aria-valuetext: in layer mode use the count-aware override when
+    // provided; otherwise the tier/resolution label.
+    let max_valuetext = match (layer_mode, max_valuetext_override.as_ref()) {
+        (true, Some(s)) => s.clone(),
+        _ => position_label(sel.max_pos, &labels).to_string(),
+    };
+    // Container modifier: SEND layer sliders get the `--success` thumb/fill
+    // treatment + semantic end-labels.
+    let range_class = if layer_mode {
+        "perf-range perf-range--send-layer"
+    } else {
+        "perf-range"
+    };
+    // End-labels. Tier mode: worst (labels.last) LEFT, best (labels.first) RIGHT.
+    // Layer mode: semantic "Base" (lowest, the pinned floor) LEFT, "Max" (highest)
+    // RIGHT — the `labels` list is lowest-first so raw first/last would invert.
+    let (left_label, right_label) = if layer_mode {
+        ("Base", "Max")
+    } else {
+        (
+            labels.last().copied().unwrap_or(""),
+            labels.first().copied().unwrap_or(""),
+        )
+    };
 
     // Fill highlight between the thumbs (percent of track).
     let (fill_left, fill_right) = if max_pos == 0 {
@@ -1506,9 +1759,9 @@ fn DualRangeSlider(
     };
 
     rsx! {
-        div { class: "perf-range",
-            // Worst-end (left) tier label.
-            span { class: "perf-range-end-label", "{labels.last().copied().unwrap_or(\"\")}" }
+        div { class: "{range_class}",
+            // Left end-label: worst tier (tier mode) or "Base" (layer mode).
+            span { class: "perf-range-end-label", "{left_label}" }
             div { class: "perf-range-track-wrap",
                 div { class: "perf-range-track",
                     div {
@@ -1518,16 +1771,33 @@ fn DualRangeSlider(
                 }
                 input {
                     id: "{min_id}",
-                    class: "perf-range-input perf-range-input-min",
+                    class: if pin_min {
+                        "perf-range-input perf-range-input-min is-pinned"
+                    } else {
+                        "perf-range-input perf-range-input-min"
+                    },
                     "data-testid": min_testid,
                     r#type: "range",
                     min: "0",
                     max: "{max_pos}",
                     step: "1",
-                    value: "{min_value}",
-                    "aria-label": "Worst {stream_noun} send quality",
+                    // When pinned (SEND layer sliders), the floor is fixed at the
+                    // base layer (position 0) and the input is non-interactive.
+                    value: if pin_min { "0".to_string() } else { format!("{min_value}") },
+                    disabled: pin_min,
+                    "aria-disabled": if pin_min { "true" } else { "false" },
+                    "aria-label": if pin_min {
+                        format!("Base {stream_noun} layer — always sent (fixed)")
+                    } else {
+                        format!("Worst {stream_noun} send quality")
+                    },
                     "aria-valuetext": "{min_valuetext}",
                     oninput: move |evt| {
+                        // Pinned floor never moves: ignore any input (defensive —
+                        // a disabled input emits no oninput, but keep the guard).
+                        if pin_min {
+                            return;
+                        }
                         if let Ok(p) = evt.value().parse::<usize>() {
                             on_change.call(set_min_thumb(sel, p));
                         }
@@ -1542,7 +1812,11 @@ fn DualRangeSlider(
                     max: "{max_pos}",
                     step: "1",
                     value: "{max_value}",
-                    "aria-label": "Best {stream_noun} send quality",
+                    "aria-label": if layer_mode {
+                        format!("Highest {stream_noun} layer to publish")
+                    } else {
+                        format!("Best {stream_noun} send quality")
+                    },
                     "aria-valuetext": "{max_valuetext}",
                     oninput: move |evt| {
                         if let Ok(p) = evt.value().parse::<usize>() {
@@ -1551,8 +1825,8 @@ fn DualRangeSlider(
                     },
                 }
             }
-            // Best-end (right) tier label.
-            span { class: "perf-range-end-label", "{labels.first().copied().unwrap_or(\"\")}" }
+            // Right end-label: best tier (tier mode) or "Max" (layer mode).
+            span { class: "perf-range-end-label", "{right_label}" }
         }
     }
 }
@@ -1636,24 +1910,39 @@ fn HelpPopover(
     }
 }
 
-/// One kind's SEND column inside a [`KindCard`]: a "Sending" head (consequence +
-/// "?" help + Auto/Fixed), a bar-meter, a dual-thumb slider, and a live summary
-/// line (#1095 redesign — replaces the old `SendRow` + diagnostics footer).
+// (The former `SendCell` tier-slider component was removed once ALL THREE SEND
+// kinds — video, screen, and audio — moved to the layer-count control
+// `SendLayerCell`. The inverse-index tier model it used (`bounds_to_thumbs` /
+// `span_text` / `tier_index_to_position` / the `*_audio_*` tier mutators) is
+// retained below for its unit tests + as documentation of the convention, marked
+// `#[allow(dead_code)]`.)
+
+/// The VIDEO/SCREEN SEND column: a LAYER-COUNT control (not a tier slider).
 ///
-/// Send uses the inverted tier convention (0 = best) and bounds what this peer
-/// publishes; the counterpart [`receive::ReceiveCell`] uses the direct layer
-/// convention (0 = lowest). Distinct testids / meter ids keep them from crossing.
+/// Reuses [`DualRangeSlider`] in layer space (`layer_mode: true`): the track
+/// ticks are the kind's simulcast rungs (lowest-first), the FLOOR thumb is PINNED
+/// at the base layer (L0 is always published), the end-labels read "Base"→"Max"
+/// left→right, and the CEILING thumb is the published layer COUNT. Dragging the
+/// ceiling maps to
+/// [`thumb_pos_to_layer_ceiling`] and calls `on_ceiling_change` with the stored
+/// value (`None` at full = Auto), which the parent writes into
+/// `PerformancePreference::{video,screen}_layers` → the encoder's
+/// `set_user_layer_ceiling` path. The rung strip is selection-driven
+/// ([`layer_send_rungs`]) so the active/shed pips update as the user drags.
+///
+/// The AQ per-layer bitrate adaptation is left fully automatic on this path (the
+/// parent sends `*_min/*_max = None`); this control governs the COUNT only.
 #[allow(clippy::too_many_arguments)]
 #[component]
-fn SendCell(
-    /// Accessible noun for the kind, e.g. "video" / "audio" / "screen share".
+fn SendLayerCell(
+    /// Accessible noun, e.g. "video" / "screen share".
     stream_noun: &'static str,
-    /// Send id prefix, e.g. "perf-video".
+    /// Send id prefix, e.g. "perf-video" / "perf-screen".
     id_prefix: &'static str,
     min_testid: &'static str,
     max_testid: &'static str,
+    /// Reset button testid (reuses the former Auto testid — surface unchanged).
     auto_testid: &'static str,
-    fixed_testid: &'static str,
     help_testid: &'static str,
     help_body: &'static str,
     vu_testid: &'static str,
@@ -1662,50 +1951,57 @@ fn SendCell(
     vu_label: &'static str,
     vu_initial_level: u8,
     vu_initial_readout: String,
-    /// The "your upload" / "not sharing" consequence text right of the side title.
     consequence: String,
-    /// The always-visible summary line under the slider (filled live by the
-    /// parent from the SEND snapshot). When a §2 rung strip is present it
-    /// SUPERSEDES this line (the strip carries the live per-layer state); the
-    /// summary is only shown when there is no strip (camera off / atomics not
-    /// ticked / not sharing). Folding the strip over the summary protects the
-    /// no-scroll budget (§7) — this applies to ALL kinds, including the single
-    /// audio pip (whose label already states the tier the summary would repeat).
+    /// Which media kind this cell drives — selects the per-kind ladder labels
+    /// (video / screen / audio).
+    kind: PrefMediaKind,
+    /// The kind's EFFECTIVE max simulcast layers (the real ladder depth from
+    /// `host.rs`). Drives the number of ticks AND the full/default ceiling.
+    layer_max: usize,
+    /// The persisted layer-ceiling COUNT (`None` = Auto / full ladder).
+    layers: Option<u32>,
+    /// Live summary line (flowing rates), shown under the strip caption.
     summary_line: String,
-    /// The §2 SEND rung strip (issue #1131), lowest layer first. Empty → render
-    /// no strip and keep the summary line (e.g. camera off / atomics not ticked).
-    #[props(default)]
-    rungs: Vec<SendRung>,
-    /// `role="img"` aria-label for the rung strip (e.g. "Sending 2 of 3 layers").
-    #[props(default)]
-    rungs_aria: String,
-    labels: Vec<&'static str>,
-    best: Option<usize>,
-    worst: Option<usize>,
-    is_fixed: bool,
-    /// Shared single-open help signal (opening any popover closes the others).
     open_help: Signal<Option<&'static str>>,
-    on_change: EventHandler<RangeSel>,
-    /// Clears the stream back to the full automatic range (Reset). Named
-    /// `on_auto_toggle` for continuity with the prior Auto control; always called
-    /// with `true` now (full range).
-    on_auto_toggle: EventHandler<bool>,
+    /// Called with the new stored ceiling (`None` = Auto/full) on a ceiling drag.
+    on_ceiling_change: EventHandler<Option<u32>>,
+    /// Reset → clears to full (`None`). Same testid as the former Auto control.
+    on_reset: EventHandler<()>,
 ) -> Element {
-    let sel = bounds_to_thumbs(best, worst, labels.len());
-    let range_str = span_text(sel, &labels);
-    // Reset is shown IFF the thumbs are NOT at both extremes (#1131 §D). Driven by
-    // POSITIONS (not the `auto` flag) so dragging both thumbs back to the ends
-    // hides it live, and it reacts on every drag.
-    let show_reset = !at_full_range(sel.min_pos, sel.max_pos, labels.len().saturating_sub(1));
+    let labels = send_layer_labels(kind, layer_max);
+    let last_pos = labels.len().saturating_sub(1);
+    // Ceiling thumb position from the stored count; floor is always 0 (base).
+    let ceiling_pos = layer_ceiling_to_thumb_pos(layers, labels.len());
+    let sel = RangeSel {
+        min_pos: 0,
+        max_pos: ceiling_pos,
+    };
+    // Selection-driven rung strip: active up to the ceiling, immediate feedback.
+    let rungs = layer_send_rungs(&labels, ceiling_pos);
+    let rungs_aria = send_rungs_aria(&rungs);
+    let active_count = ceiling_pos + 1;
+    // Human caption: "Sending N of M layers".
+    let count_caption = if labels.len() <= 1 {
+        "Sending 1 layer".to_string()
+    } else {
+        format!("Sending {active_count} of {} layers", labels.len())
+    };
+    // Count-aware aria-valuetext for the ceiling thumb (screen-reader announces
+    // "2 of 3 layers", not a bare resolution). Single-layer ladders announce the
+    // lone layer.
+    let ceiling_valuetext = if labels.len() <= 1 {
+        "1 layer".to_string()
+    } else {
+        format!("{active_count} of {} layers", labels.len())
+    };
+    // Reset shown IFF not at the full ladder (ceiling below the top). At full the
+    // slot is empty so the head reads clean (mirrors SendCell's rule).
+    let show_reset = ceiling_pos < last_pos;
 
     rsx! {
         div { class: "perf-side perf-side--send",
-            // Head row: the bar-meter sits INLINE here (not on its own line) to
-            // keep the per-side height down for the no-scroll budget (#2d).
             div { class: "perf-side__head",
                 span { class: "perf-side__title",
-                    // §1 directional arrow (arrow-up-right, green --success),
-                    // aria-hidden — the "Sending" text remains the a11y label.
                     svg {
                         class: "perf-dir-arrow",
                         xmlns: "http://www.w3.org/2000/svg",
@@ -1734,29 +2030,14 @@ fn SendCell(
                     help_body,
                     open_help,
                 }
-                if is_fixed {
-                    span {
-                        class: "perf-fixed-badge",
-                        "data-testid": fixed_testid,
-                        title: "Send quality is pinned to a single tier — this stream won't adapt",
-                        "aria-label": "{stream_noun} send quality pinned to a single tier — adaptation disabled",
-                        "Fixed"
-                    }
-                }
-                // Reset clears the two handles back to the full automatic range
-                // (auto = true → bounds cleared, thumbs snap to the extremes, which
-                // re-hides this button). Rendered ONLY when the thumbs are off the
-                // extremes (`show_reset`); at the full default range the slot is
-                // EMPTY so the head reads clean (#1131 §D). Repurposes the former
-                // Auto testid so the testid surface is unchanged.
                 if show_reset {
                     button {
                         r#type: "button",
                         class: "perf-reset-button",
                         "data-testid": auto_testid,
-                        "aria-label": "Reset {stream_noun} quality limits",
-                        title: "Clear both limits — back to the full automatic range",
-                        onclick: move |_| on_auto_toggle.call(true),
+                        "aria-label": "Reset {stream_noun} layers — publish the full ladder",
+                        title: "Publish all layers (automatic)",
+                        onclick: move |_| on_reset.call(()),
                         "Reset"
                     }
                 }
@@ -1768,52 +2049,41 @@ fn SendCell(
                 stream_noun,
                 labels: labels.clone(),
                 sel,
-                on_change: move |s: RangeSel| on_change.call(s),
+                layer_mode: true,
+                max_valuetext_override: ceiling_valuetext,
+                on_change: move |s: RangeSel| {
+                    // Only the ceiling (max) thumb is interactive; map its position
+                    // to the stored layer-ceiling (None at full = Auto).
+                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, labels.len()));
+                },
             }
-            // §2 SEND rung strip (always-visible). When present it carries the
-            // live per-layer state; the summary line is then folded into the strip
-            // caption to protect the no-scroll budget (kept separate only when
-            // there is no strip — e.g. camera off / atomics not ticked).
-            if !rungs.is_empty() {
-                div {
-                    class: "perf-rungs",
-                    "data-testid": "{id_prefix}-send-rungs",
-                    role: "img",
-                    "aria-label": "{rungs_aria}",
-                    for rung in rungs.iter() {
-                        span {
-                            key: "{rung.layer_id}",
-                            class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
-                            "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
-                            title: if rung.active {
-                                format!("Layer {} — sending {}", rung.layer_id + 1, rung.res_label)
-                            } else {
-                                format!("Layer {} — shed (not sending under current conditions)", rung.layer_id + 1)
-                            },
-                            span { class: "perf-rung__bar", "aria-hidden": "true" }
-                            span { class: "perf-rung__label",
-                                "{rung.res_label}"
-                                if let Some(k) = rung.kbps_label.as_ref() {
-                                    " · {k}"
-                                }
-                            }
-                        }
+            div {
+                class: "perf-rungs",
+                "data-testid": "{id_prefix}-send-rungs",
+                role: "img",
+                "aria-label": "{rungs_aria}",
+                for rung in rungs.iter() {
+                    span {
+                        key: "{rung.layer_id}",
+                        class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
+                        "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
+                        title: if rung.active {
+                            format!("Layer {} — publishing {}", rung.layer_id + 1, rung.res_label)
+                        } else {
+                            format!("Layer {} — not published (ceiling lowered)", rung.layer_id + 1)
+                        },
+                        span { class: "perf-rung__bar", "aria-hidden": "true" }
+                        span { class: "perf-rung__label", "{rung.res_label}" }
                     }
                 }
             }
-            // The slider range readout + (for the no-strip case) the live summary
-            // share ONE flex line to save vertical space (#2e). The range-value
-            // keeps its own testid and stable `span_text` content (no aria-live —
-            // #4: a native range input already announces on change).
             div { class: "perf-side__caption",
                 p {
                     class: "perf-range-value",
                     "data-testid": "{id_prefix}-range-value",
-                    "Sending: {range_str}"
+                    "{count_caption}"
                 }
-                if rungs.is_empty() {
-                    p { class: "perf-summary-line", "{summary_line}" }
-                }
+                p { class: "perf-summary-line", "{summary_line}" }
             }
         }
     }
@@ -1837,9 +2107,9 @@ pub struct PeerKindSnap {
 
 // ── help-popover bodies (§3 copy) ──────────────────────────────────
 
-const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The left handle sets the lowest version you'll send (floor), the right handle the highest (ceiling); it adapts within that band. More layers = more upload. Reset returns to the full automatic range.";
-const HELP_AUDIO_SEND: &str = "Your mic sends one or more audio quality versions. The left handle sets the lowest you'll send (floor), the right handle the highest (ceiling). Higher = clearer voice but more upload. Reset returns to the full automatic range.";
-const HELP_CONTENT_SEND: &str = "When you share your screen, the left handle sets the lowest sharpness you publish (floor) and the right handle the highest (ceiling); it adapts within that band. Text-heavy screens benefit from a higher ceiling; video benefits from a lower one if your upload is tight. Reset returns to the full automatic range.";
+const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The base layer is ALWAYS sent (so every viewer can always see you); the right handle sets the HIGHEST layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload + CPU); raise it to send more, up to your device's limit. The encoder still adapts quality within what you allow. Reset returns to the full automatic ladder.";
+const HELP_AUDIO_SEND: &str = "Your mic sends several audio quality versions ('layers') so each listener gets the best one their connection can handle. The base layer is ALWAYS sent (so everyone can always hear you); the right handle sets the HIGHEST audio layer you publish — i.e. how many layers you send. Lower it to send fewer top layers (saves your upload); raise it to send more, up to the audio ladder's limit. Reset returns to the full automatic ladder.";
+const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is ALWAYS sent so every viewer can follow along. The right handle sets the HIGHEST layer you publish — how many sharpness layers you send. Lower it to send fewer top layers when your upload is tight; raise it for text-heavy screens, up to your device's limit. Reset returns to the full automatic ladder.";
 
 /// The unified Performance settings panel body (#1095 redesign). Three stacked
 /// per-kind cards (Video / Audio / Content), each split into a **Sending** column
@@ -1871,11 +2141,19 @@ pub fn PerformanceSettingsPanel(
     // Cross-nav: open the Call Diagnostics panel (closes settings). Defaults to a
     // no-op so call sites / tests that don't wire it still compile. (#1095 §4a)
     #[props(default)] on_open_diagnostics: EventHandler<()>,
+    // Effective simulcast layer ceilings for the SEND layer-count sliders
+    // (sourced from `host.rs` where `effective_max_layers` is computed). These
+    // set the slider's tick count AND its full/default ceiling so the control
+    // reflects the REAL current ladder, not an abstract range. Default 1
+    // (single-stream) so existing call sites / tests that don't wire them still
+    // compile and render a 1-rung (no-op) layer control.
+    #[props(default = 1)] video_layer_max: usize,
+    #[props(default = 1)] screen_layer_max: usize,
+    /// Audio's effective ladder depth (NOT CPU-clamped — audio encode is cheap),
+    /// typically the full audio ladder even on weak runners.
+    #[props(default = 1)]
+    audio_layer_max: usize,
 ) -> Element {
-    let video_fixed = pref.video_is_fixed();
-    let audio_fixed = pref.audio_is_fixed();
-    let screen_fixed = pref.screen_is_fixed();
-
     // First-paint SEND meter values (before the rAF driver ticks). The same pure
     // mapper drives the live loop, so first paint and live updates agree.
     let initial = read_snapshot.read();
@@ -1940,10 +2218,12 @@ pub fn PerformanceSettingsPanel(
             .map(|p| p.snap.layer_index)
             .collect::<Vec<_>>(),
     );
-    // Audio has no per-layer snapshot; derive its send summary from the user's
-    // bounds so a lowered cap is reflected rather than always claiming "high
-    // quality" (#5).
-    let audio_send_line = format_audio_send_summary(pref.audio_auto, pref.audio_max);
+    // Audio has no per-layer encoder snapshot; derive its send summary from the
+    // chosen LAYER CEILING (count-aware) so it tracks the rung strip when the user
+    // lowers the audio layer count — consistent with the "N of M layers" caption
+    // the SendLayerCell renders. (The old bare-tier `format_audio_send_summary`
+    // read "Sending high quality" regardless, contradicting the rungs.)
+    let audio_send_line = format_audio_send_layer_summary(pref.audio_layers, audio_layer_max);
     let audio_recv_line = format_audio_receive_summary(recv_audio_peers.len());
     let content_send_line = format_content_send_summary(send_screen_snap.as_ref());
     // Top-layer screen-share peer (highest layer_index) for the content receive line.
@@ -1953,18 +2233,10 @@ pub fn PerformanceSettingsPanel(
         .map(|p| p.snap);
     let content_recv_line = format_content_receive_summary(content_top.as_ref());
 
-    // §2 SEND rung strips (issue #1131). Video/content build per-layer pips from
-    // the live encoder snapshot (empty Vec → no strip, summary line shown);
-    // audio has no per-layer snapshot, so a single pip at the user's best cap.
-    let video_send_rungs = send_video_snap.as_ref().map(send_rungs).unwrap_or_default();
-    let video_send_rungs_aria = send_rungs_aria(&video_send_rungs);
-    let content_send_rungs = send_screen_snap
-        .as_ref()
-        .map(send_rungs)
-        .unwrap_or_default();
-    let content_send_rungs_aria = send_rungs_aria(&content_send_rungs);
-    let audio_send_rungs = vec![audio_send_rung(pref.audio_max)];
-    let audio_send_rungs_aria = send_rungs_aria(&audio_send_rungs);
+    // §2 SEND rung strips: ALL THREE kinds (video, screen, AND audio) now use the
+    // SEND layer-count control (`SendLayerCell`), which builds its OWN selection-
+    // driven rung strip from the user's ceiling so the pips update as the ceiling
+    // thumb drags (no dependence on the live snapshot for the active/shed boundary).
 
     // Receive-side consequence strings (peer counts; "not sharing" for content).
     let video_recv_consequence = consequence_from_peers(recv_video_peers.len());
@@ -2006,11 +2278,11 @@ pub fn PerformanceSettingsPanel(
             span { class: "perf-emph-recv", "receive" }
             " (saves your download) and what you "
             span { class: "perf-emph-send", "send" }
-            " (saves your upload + CPU) by dragging the two handles: the "
-            "left handle is the lowest quality the stream may use (floor), the "
-            "right handle the highest (ceiling), and it adapts within that band. "
-            "Reset clears both handles back to the full range. The meter shows "
-            "what's flowing right now."
+            " (saves your upload + CPU). For sending, the base layer is always "
+            "sent so every viewer can see you; the right handle sets the highest "
+            "layer you publish — how many layers you send. For receiving, the two "
+            "handles bound the quality you'll accept. Reset returns to the full "
+            "automatic range. The meter shows what's flowing right now."
         }
 
         // Global effective-setting strip with an (i) tooltip. Compact copy; full
@@ -2039,13 +2311,12 @@ pub fn PerformanceSettingsPanel(
         div { class: "perf-kind-card",
             div { class: "perf-kind-card__title", "Video" }
             div { class: "perf-card-cols",
-                SendCell {
+                SendLayerCell {
                     stream_noun: "video",
                     id_prefix: "perf-video",
                     min_testid: TESTID_VIDEO_RANGE_MIN,
                     max_testid: TESTID_VIDEO_RANGE_MAX,
                     auto_testid: TESTID_VIDEO_AUTO,
-                    fixed_testid: "perf-video-fixed-badge",
                     help_testid: "perf-video-help",
                     help_body: HELP_VIDEO_SEND,
                     vu_testid: TESTID_VU_VIDEO,
@@ -2055,16 +2326,13 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_level: g.video_level,
                     vu_initial_readout: g.video_text.clone(),
                     consequence: "your upload".to_string(),
+                    kind: PrefMediaKind::Video,
+                    layer_max: video_layer_max,
+                    layers: pref.video_layers,
                     summary_line: video_send_line,
-                    rungs: video_send_rungs,
-                    rungs_aria: video_send_rungs_aria,
-                    labels: VIDEO_TIER_LABELS.to_vec(),
-                    best: pref.video_max,
-                    worst: pref.video_min,
-                    is_fixed: video_fixed,
                     open_help,
-                    on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
-                    on_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
+                    on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_video_layers(c)),
+                    on_reset: move |_| on_change.call(pref.with_video_layers(None)),
                 }
                 receive::ReceiveCell {
                     kind: PrefMediaKind::Video,
@@ -2087,13 +2355,12 @@ pub fn PerformanceSettingsPanel(
         div { class: "perf-kind-card",
             div { class: "perf-kind-card__title", "Audio" }
             div { class: "perf-card-cols",
-                SendCell {
+                SendLayerCell {
                     stream_noun: "audio",
                     id_prefix: "perf-audio",
                     min_testid: TESTID_AUDIO_RANGE_MIN,
                     max_testid: TESTID_AUDIO_RANGE_MAX,
                     auto_testid: TESTID_AUDIO_AUTO,
-                    fixed_testid: "perf-audio-fixed-badge",
                     help_testid: "perf-audio-help",
                     help_body: HELP_AUDIO_SEND,
                     vu_testid: TESTID_VU_AUDIO,
@@ -2103,16 +2370,13 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_level: g.audio_level,
                     vu_initial_readout: g.audio_text.clone(),
                     consequence: "your upload".to_string(),
+                    kind: PrefMediaKind::Audio,
+                    layer_max: audio_layer_max,
+                    layers: pref.audio_layers,
                     summary_line: audio_send_line,
-                    rungs: audio_send_rungs,
-                    rungs_aria: audio_send_rungs_aria,
-                    labels: AUDIO_TIER_LABELS.to_vec(),
-                    best: pref.audio_max,
-                    worst: pref.audio_min,
-                    is_fixed: audio_fixed,
                     open_help,
-                    on_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
-                    on_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
+                    on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_audio_layers(c)),
+                    on_reset: move |_| on_change.call(pref.with_audio_layers(None)),
                 }
                 receive::ReceiveCell {
                     kind: PrefMediaKind::Audio,
@@ -2135,13 +2399,12 @@ pub fn PerformanceSettingsPanel(
         div { class: "perf-kind-card",
             div { class: "perf-kind-card__title", "Content" }
             div { class: "perf-card-cols",
-                SendCell {
+                SendLayerCell {
                     stream_noun: "screen share",
                     id_prefix: "perf-screen",
                     min_testid: TESTID_SCREEN_RANGE_MIN,
                     max_testid: TESTID_SCREEN_RANGE_MAX,
                     auto_testid: TESTID_SCREEN_AUTO,
-                    fixed_testid: "perf-screen-fixed-badge",
                     help_testid: "perf-screen-help",
                     help_body: HELP_CONTENT_SEND,
                     vu_testid: TESTID_VU_SCREEN,
@@ -2151,16 +2414,13 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_level: g.screen_level,
                     vu_initial_readout: g.screen_text.clone(),
                     consequence: if send_screen_snap.is_some() { "your upload".to_string() } else { "not sharing".to_string() },
+                    kind: PrefMediaKind::Screen,
+                    layer_max: screen_layer_max,
+                    layers: pref.screen_layers,
                     summary_line: content_send_line,
-                    rungs: content_send_rungs,
-                    rungs_aria: content_send_rungs_aria,
-                    labels: SCREEN_TIER_LABELS.to_vec(),
-                    best: pref.screen_max,
-                    worst: pref.screen_min,
-                    is_fixed: screen_fixed,
                     open_help,
-                    on_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
-                    on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
+                    on_ceiling_change: move |c: Option<u32>| on_change.call(pref.with_screen_layers(c)),
+                    on_reset: move |_| on_change.call(pref.with_screen_layers(None)),
                 }
                 receive::ReceiveCell {
                     kind: PrefMediaKind::Screen,
@@ -3697,32 +3957,30 @@ mod tests {
     }
 
     #[test]
-    fn audio_send_summary_reflects_a_lowered_cap() {
-        // Auto → the full-quality phrase regardless of stored index.
+    fn audio_send_layer_summary_is_count_aware() {
+        use PrefMediaKind::Audio;
+        // Audio ladder lowest-first is ["24k","32k","50k"] (see send_layer_labels).
+        // Full ladder (Auto / None) → top published layer = "50k".
         assert_eq!(
-            format_audio_send_summary(true, Some(2)),
-            "Sending high quality"
+            format_audio_send_layer_summary(None, 3),
+            "Sending up to 50k"
         );
-        // Manual, no cap / best-tier cap → full quality.
+        // Ceiling 2 → top published layer = "32k" (the rung strip would show 2 of
+        // 3 active); MUST differ from the full-ladder summary so a lowered ceiling
+        // visibly changes the line.
         assert_eq!(
-            format_audio_send_summary(false, None),
-            "Sending high quality"
+            format_audio_send_layer_summary(Some(2), 3),
+            "Sending up to 32k"
         );
+        // Ceiling 1 → only the base (24k) publishes → the "only" phrasing.
         assert_eq!(
-            format_audio_send_summary(false, Some(0)),
-            "Sending high quality"
+            format_audio_send_layer_summary(Some(1), 3),
+            "Sending 24k only"
         );
-        // Manual with a lowered cap → reflects the capped tier (not "high
-        // quality"). AUDIO_TIER_LABELS[2] == "24 kbps".
-        assert_eq!(
-            format_audio_send_summary(false, Some(2)),
-            "Sending up to 24 kbps"
-        );
-        // Out-of-range index degrades gracefully rather than panicking.
-        assert_eq!(
-            format_audio_send_summary(false, Some(99)),
-            "Sending up to ?"
-        );
+        // Sanity: the summary's top label is exactly the top ACTIVE rung label, so
+        // the summary can never drift from the rung strip.
+        let labels = send_layer_labels(Audio, 3);
+        assert_eq!(labels.last().copied(), Some("50k"));
     }
 
     #[test]
@@ -3854,6 +4112,7 @@ mod tests {
             video_auto: false,
             audio_auto: false,
             screen_auto: false,
+            ..Default::default()
         }
     }
 
@@ -3897,6 +4156,7 @@ mod tests {
             video_auto: true,
             audio_auto: true,
             screen_auto: true,
+            ..Default::default()
         };
         let b = preference_to_encoder_bounds(&pref);
         assert_eq!(b, EncoderQualityBounds::default());
@@ -4189,32 +4449,39 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_drops_stale_indices_and_keeps_auto_flags() {
+    fn sanitized_migrates_all_send_tier_bounds_to_auto() {
+        // A returning user with manual tier bounds on ALL THREE streams.
         let stale = PerformancePreference {
-            video_max: Some(10),
-            video_min: Some(3),
-            audio_max: Some(9),
-            audio_min: Some(2),
-            screen_max: Some(5),
+            video_max: Some(10), // out-of-range stale index
+            video_min: Some(3),  // a once-valid manual video bound
+            audio_max: Some(9),  // out-of-range stale audio index
+            audio_min: Some(2),  // a valid manual audio bound
+            screen_max: Some(2), // a once-valid manual screen bound
             screen_min: Some(1),
             video_auto: false,
             audio_auto: false,
             screen_auto: false,
+            ..Default::default()
         };
         let clean = stale.sanitized(
             VIDEO_TIER_LABELS.len(),
             AUDIO_TIER_LABELS.len(),
             SCREEN_TIER_LABELS.len(),
         );
-        assert_eq!(clean.video_max, None);
-        assert_eq!(clean.video_min, Some(3));
-        assert_eq!(clean.audio_max, None);
-        assert_eq!(clean.audio_min, Some(2));
-        assert_eq!(clean.screen_max, None);
-        assert_eq!(clean.screen_min, Some(1));
-        assert!(!clean.video_auto);
-        assert!(!clean.audio_auto);
-        assert!(!clean.screen_auto);
+        // MIGRATION: ALL THREE streams' SEND tier bounds are CLEARED to None and
+        // set to Auto — every SEND tier slider is gone (video, screen, AND audio
+        // are now layer-count controls), so a returning user is never silently
+        // pinned. Even once-VALID bounds (video_min=Some(3), audio_min=Some(2),
+        // the screen bounds) are cleared, not just the out-of-range ones.
+        assert_eq!(clean.video_max, None, "video tier bound migrated to None");
+        assert_eq!(clean.video_min, None, "video tier bound migrated to None");
+        assert!(clean.video_auto, "video migrated to Auto");
+        assert_eq!(clean.screen_max, None, "screen tier bound migrated to None");
+        assert_eq!(clean.screen_min, None, "screen tier bound migrated to None");
+        assert!(clean.screen_auto, "screen migrated to Auto");
+        assert_eq!(clean.audio_max, None, "audio tier bound migrated to None");
+        assert_eq!(clean.audio_min, None, "audio tier bound migrated to None");
+        assert!(clean.audio_auto, "audio migrated to Auto");
     }
 
     #[test]
@@ -4409,6 +4676,11 @@ mod tests {
             video_auto: false,
             audio_auto: true,
             screen_auto: false,
+            // Exercise the layer-ceiling fields' serde round-trip too (one set,
+            // one Auto/None) so a missing #[serde] attr or field rename is caught.
+            video_layers: Some(2),
+            screen_layers: None,
+            audio_layers: Some(1),
         };
         let json = serde_json::to_string(&pref).unwrap();
         let back: PerformancePreference = serde_json::from_str(&json).unwrap();
@@ -4422,10 +4694,174 @@ mod tests {
         assert!(p.video_auto);
         assert!(p.audio_auto);
         assert!(p.screen_auto);
+        // Migration safety: prefs persisted before the layer-ceiling control
+        // existed have no `*_layers` keys and MUST default to None (Auto / full
+        // ladder), so an upgrade never silently caps a user's published layers.
+        assert_eq!(p.video_layers, None);
+        assert_eq!(p.screen_layers, None);
+        assert_eq!(p.audio_layers, None);
         assert_eq!(
             preference_to_encoder_bounds(&p),
             EncoderQualityBounds::default()
         );
+    }
+
+    // ── SEND layer-count control (video + screen) ──────────────────────
+
+    #[test]
+    fn default_ceiling_thumb_is_at_effective_max() {
+        // Default (Auto / None) must place the ceiling thumb at the TOP position
+        // = effective_max - 1, i.e. the full ladder. This is the "default ceiling
+        // == effective max" guarantee. Checked across 1/2/3-layer ladders.
+        assert_eq!(
+            layer_ceiling_to_thumb_pos(None, 3),
+            2,
+            "3-layer full → top pos 2"
+        );
+        assert_eq!(
+            layer_ceiling_to_thumb_pos(None, 2),
+            1,
+            "2-layer full → top pos 1"
+        );
+        assert_eq!(
+            layer_ceiling_to_thumb_pos(None, 1),
+            0,
+            "1-layer → only pos 0"
+        );
+    }
+
+    #[test]
+    fn ceiling_thumb_maps_to_stored_layer_count() {
+        // The ceiling thumb POSITION → stored layer COUNT (the value that flows to
+        // pref.video_layers → encoder set_user_layer_ceiling). On a 3-rung ladder:
+        //  - top pos (2) = full ladder → None (Auto), so a user at full never pins.
+        //  - pos 1 → Some(2) (publish L0+L1 = 2 layers).
+        //  - pos 0 → Some(1) (base only).
+        assert_eq!(
+            thumb_pos_to_layer_ceiling(2, 3),
+            None,
+            "full ladder stores Auto/None"
+        );
+        assert_eq!(thumb_pos_to_layer_ceiling(1, 3), Some(2), "mid → 2 layers");
+        assert_eq!(
+            thumb_pos_to_layer_ceiling(0, 3),
+            Some(1),
+            "base only → 1 layer"
+        );
+    }
+
+    #[test]
+    fn ceiling_round_trips_count_to_pos_to_count() {
+        // Storing a count, deriving the thumb, and reading it back must be stable
+        // for every count on a 3-layer ladder (the drag→store→re-render cycle).
+        for layer_max in 1..=3usize {
+            for count in 1..=layer_max as u32 {
+                let stored = if count as usize == layer_max {
+                    None // full normalizes to Auto
+                } else {
+                    Some(count)
+                };
+                let pos = layer_ceiling_to_thumb_pos(stored, layer_max);
+                assert_eq!(
+                    thumb_pos_to_layer_ceiling(pos, layer_max),
+                    stored,
+                    "count {count} of {layer_max} must round-trip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_video_layers_sets_count_and_frees_tier_bounds() {
+        // The SEND layer control owns the send axis: setting a layer count must
+        // ALSO force the video tier bounds to Auto so the AQ adapts bitrate freely
+        // (no competing tier slider). MUTATION CHECK: if with_video_layers stops
+        // clearing the tier bounds (drop the video_max/min/auto resets), the
+        // tier-bound assertions below fail.
+        let manual = PerformancePreference {
+            video_max: Some(2),
+            video_min: Some(5),
+            video_auto: false,
+            ..Default::default()
+        };
+        let p = manual.with_video_layers(Some(2));
+        assert_eq!(p.video_layers, Some(2), "layer count stored");
+        assert!(p.video_auto, "tier axis freed to Auto");
+        assert_eq!(p.video_max, None, "tier max cleared");
+        assert_eq!(p.video_min, None, "tier min cleared");
+    }
+
+    #[test]
+    fn with_audio_layers_sets_count_and_frees_tier_bounds() {
+        // Audio's SEND layer control owns the audio send axis (mirror of video):
+        // setting a layer count must ALSO force the audio tier bounds to Auto so
+        // the AQ adapts the published layers' bitrate freely. MUTATION CHECK: if
+        // with_audio_layers stops clearing the audio tier bounds, the tier-bound
+        // assertions below fail.
+        let manual = PerformancePreference {
+            audio_max: Some(1),
+            audio_min: Some(3),
+            audio_auto: false,
+            ..Default::default()
+        };
+        let p = manual.with_audio_layers(Some(2));
+        assert_eq!(p.audio_layers, Some(2), "audio layer count stored");
+        assert!(p.audio_auto, "audio tier axis freed to Auto");
+        assert_eq!(p.audio_max, None, "audio tier max cleared");
+        assert_eq!(p.audio_min, None, "audio tier min cleared");
+    }
+
+    #[test]
+    fn with_screen_layers_reset_to_none_is_full_ladder() {
+        // Reset → with_screen_layers(None) clears the cap to the full ladder.
+        let capped = PerformancePreference::default().with_screen_layers(Some(1));
+        assert_eq!(capped.screen_layers, Some(1));
+        let reset = capped.with_screen_layers(None);
+        assert_eq!(
+            reset.screen_layers, None,
+            "reset clears to full ladder (None)"
+        );
+    }
+
+    #[test]
+    fn send_layer_labels_match_per_kind_ladders() {
+        use PrefMediaKind::{Audio, Screen, Video};
+        // VIDEO ladder (spaced): 1→[360p], 2→[360p,720p] (skip 540p), 3→full.
+        assert_eq!(send_layer_labels(Video, 1), vec!["360p"]);
+        assert_eq!(send_layer_labels(Video, 2), vec!["360p", "720p"]);
+        assert_eq!(send_layer_labels(Video, 3), vec!["360p", "540p", "720p"]);
+        // SCREEN ladder differs: qualitative labels (low/medium are both 720p so
+        // resolution would be ambiguous). 1→[low], 2→[low, high] (skip medium),
+        // 3→[low, medium, high]. The base differs from video (proves per-kind
+        // routing, not a shared prefix).
+        assert_eq!(send_layer_labels(Screen, 1), vec!["low"]);
+        assert_eq!(send_layer_labels(Screen, 2), vec!["low", "high"]);
+        assert_eq!(send_layer_labels(Screen, 3), vec!["low", "medium", "high"]);
+        // AUDIO ladder is CONTIGUOUS (no skip — AUDIO_LAYER_KBPS = [24,32,50]):
+        // 1→[24k], 2→[24k,32k], 3→[24k,32k,50k]. n=2 keeps the MIDDLE rung (32k),
+        // unlike video/screen which skip it — proves the audio arm isn't a copy of
+        // the spaced ladder.
+        assert_eq!(send_layer_labels(Audio, 1), vec!["24k"]);
+        assert_eq!(send_layer_labels(Audio, 2), vec!["24k", "32k"]);
+        assert_eq!(send_layer_labels(Audio, 3), vec!["24k", "32k", "50k"]);
+    }
+
+    #[test]
+    fn layer_send_rungs_active_up_to_ceiling_base_always_active() {
+        // The selection-driven strip: pips L0..=ceiling are active, the rest shed,
+        // and L0 (base) is ALWAYS active (the pinned-floor invariant). On a 3-rung
+        // video ladder with ceiling at pos 1: [L0 active, L1 active, L2 shed].
+        let labels = send_layer_labels(PrefMediaKind::Video, 3);
+        let rungs = layer_send_rungs(&labels, 1);
+        assert_eq!(rungs.len(), 3);
+        assert!(rungs[0].active, "base layer always active");
+        assert!(rungs[1].active, "up to the ceiling is active");
+        assert!(!rungs[2].active, "above the ceiling is shed");
+        // Ceiling at the base (pos 0): only L0 active.
+        let base_only = layer_send_rungs(&labels, 0);
+        assert!(base_only[0].active);
+        assert!(!base_only[1].active);
+        assert!(!base_only[2].active);
     }
 
     // ── issue #1131: per-peer receive row + send rung helpers ──────────
@@ -4446,20 +4882,6 @@ mod tests {
             height,
             kbps,
             reason,
-        }
-    }
-
-    fn layer_info(
-        layer_id: u32,
-        bitrate_kbps: u32,
-        width: u32,
-        height: u32,
-    ) -> videocall_client::SimulcastLayerInfo {
-        videocall_client::SimulcastLayerInfo {
-            layer_id,
-            bitrate_kbps,
-            width,
-            height,
         }
     }
 
@@ -4543,47 +4965,6 @@ mod tests {
             limited,
             "Ana Ruiz, receiving video, low quality, 360p, layer 1 of 3, limited by your network"
         );
-    }
-
-    #[test]
-    fn send_rungs_marks_shed_top_layers_and_labels_top_active() {
-        // 3 effective layers, only the bottom 2 active (top shed under congestion).
-        let s = SimulcastSendSnapshot {
-            simulcast_active: true,
-            effective_layers: 3,
-            active_layers: 2,
-            layers: vec![
-                layer_info(0, 300, 640, 360),
-                layer_info(1, 600, 960, 540),
-                layer_info(2, 0, 1280, 720), // shed (bitrate 0)
-            ],
-        };
-        let rungs = send_rungs(&s);
-        assert_eq!(rungs.len(), 3);
-        assert!(rungs[0].active && rungs[1].active, "bottom two active");
-        assert!(!rungs[2].active, "top layer shed");
-        // kbps label only on the TOP ACTIVE pip (layer 1), not on base or shed.
-        assert_eq!(rungs[0].kbps_label, None);
-        assert_eq!(rungs[1].kbps_label, Some("600k".to_string()));
-        assert_eq!(rungs[2].kbps_label, None);
-        // res label under every pip.
-        assert_eq!(rungs[0].res_label, "360p");
-        assert_eq!(rungs[2].res_label, "720p");
-        assert_eq!(send_rungs_aria(&rungs), "Sending 2 of 3 layers");
-    }
-
-    #[test]
-    fn send_rungs_empty_when_no_layers() {
-        // Single-stream / atomics-not-ticked → no layers → empty Vec (caller then
-        // renders no strip and keeps the summary line).
-        let s = SimulcastSendSnapshot {
-            simulcast_active: false,
-            effective_layers: 1,
-            active_layers: 1,
-            layers: vec![],
-        };
-        assert!(send_rungs(&s).is_empty());
-        assert_eq!(send_rungs_aria(&[]), "Sending 1 layer");
     }
 
     #[test]

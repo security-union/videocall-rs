@@ -354,6 +354,17 @@ pub fn DeviceSettingsModal(
     /// Defaults to a no-op so call sites that don't wire it still compile. (#1095 §4a)
     #[props(default)]
     on_open_diagnostics: EventHandler<()>,
+    /// Effective simulcast layer ceilings for the SEND "layers published"
+    /// controls, sourced from `host.rs` (`effective_max_layers`). Drives the
+    /// layer slider's tick count + full/default ceiling. Default 1 (single-stream)
+    /// so call sites that don't wire them render a 1-rung (no-op) control.
+    #[props(default = 1)]
+    video_layer_max: usize,
+    #[props(default = 1)] screen_layer_max: usize,
+    /// Audio's effective ladder depth — NOT CPU-clamped (audio encode is cheap),
+    /// so typically the full audio ladder even on weak runners.
+    #[props(default = 1)]
+    audio_layer_max: usize,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum.
@@ -613,6 +624,10 @@ pub fn DeviceSettingsModal(
                                         diagnostics_reader: diagnostics_reader.clone(),
                                         // Cross-nav to the Diagnostics panel (#1095 §4a).
                                         on_open_diagnostics: move |_| on_open_diagnostics.call(()),
+                                        // SEND layer-count ceilings (real ladder depth from host).
+                                        video_layer_max,
+                                        screen_layer_max,
+                                        audio_layer_max,
                                     }
                                 }
                             },

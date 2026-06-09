@@ -2165,8 +2165,21 @@ impl PeerDecodeManager {
     /// `.retain()` to evict stale per-layer observations. The eviction is benign
     /// here (≤3 entries, and the decode path evicts on its own cadence anyway),
     /// but callers must hold `&mut self`.
-    pub fn per_peer_received_snapshots(&mut self, now_ms: u64) -> Vec<PeerReceiveDiag> {
-        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+    ///
+    /// `bounds` is the client's GLOBAL per-kind receive-layer preference (the
+    /// user's `max` caps). It is passed in rather than re-read here so the
+    /// degradation-reason attribution (issue #1131) uses the SAME persisted bound
+    /// the decode path clamps with — no duplicated/stale copy. The user `max` of
+    /// `None` (Auto) means "uncapped" for the `Setting` attribution.
+    pub fn per_peer_received_snapshots(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> Vec<PeerReceiveDiag> {
+        use crate::decode::layer_chooser::{received_layer_snapshot_with_reason, PrefMediaKind};
+        let video_max = bounds.for_kind(PrefMediaKind::Video).max;
+        let screen_max = bounds.for_kind(PrefMediaKind::Screen).max;
+        let audio_max = bounds.for_kind(PrefMediaKind::Audio).max;
         let keys = self.connected_peers.ordered_keys().clone();
         let mut out = Vec::with_capacity(keys.len());
         for sid in keys {
@@ -2175,18 +2188,46 @@ impl PeerDecodeManager {
             };
             // Resolve each kind's snapshot only when that kind is enabled for the
             // peer; otherwise the panel would show stale base-layer rows for
-            // streams that aren't flowing.
+            // streams that aren't flowing. The per-kind `reason` is attributed
+            // from the live availability + this peer's chooser-constrained flag +
+            // the user's `max` bound (issue #1131).
+            //
+            // IMPORTANT (issue #1131 follow-up B): the reason is derived from the
+            // CLAMPED decoded layer (`min(selected, avail_top)`), not the raw
+            // `selected_*_layer` — otherwise a receive `min` above a base-only
+            // sender's offering would render a Low/red dot (clamped index) with NO
+            // reason chip (raw sel >= full top → None), a self-contradictory row.
+            // `received_layer_snapshot_with_reason` (host-tested) does the clamp +
+            // reason from ONE consistent layer.
             let video = peer.video_enabled.then(|| {
-                let count = peer.video_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Video, peer.selected_video_layer, count)
+                let avail_top = peer.video_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Video,
+                    peer.selected_video_layer,
+                    avail_top,
+                    video_max,
+                    peer.video_layer_chooser.is_constrained(),
+                )
             });
             let screen = peer.screen_enabled.then(|| {
-                let count = peer.screen_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Screen, peer.selected_screen_layer, count)
+                let avail_top = peer.screen_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Screen,
+                    peer.selected_screen_layer,
+                    avail_top,
+                    screen_max,
+                    peer.screen_layer_chooser.is_constrained(),
+                )
             });
             let audio = peer.audio_enabled.then(|| {
-                let count = peer.audio_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Audio, peer.selected_audio_layer, count)
+                let avail_top = peer.audio_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Audio,
+                    peer.selected_audio_layer,
+                    avail_top,
+                    audio_max,
+                    peer.audio_layer_chooser.is_constrained(),
+                )
             });
             // Skip peers with nothing flowing so the list stays compact.
             if video.is_none() && screen.is_none() && audio.is_none() {

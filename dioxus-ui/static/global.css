@@ -150,6 +150,20 @@ html[data-theme="dark"] {
   --warning: #ff9f0a;
   --error: #ff453a;
   /*
+   * Receive-quality tokens for the Performance panel's per-peer rows (issue
+   * #1131). Optimal == --success (green), Medium == amber, Low == --error (red).
+   * Dark-theme values: the amber is brightened for contrast on the dark glass.
+   */
+  --perf-q-optimal: var(--success);
+  --perf-q-medium: #ffc14d;
+  --perf-q-low: var(--error);
+  /*
+   * Unlit (at-rest, level-0) Performance bar-meter track. A faint translucent
+   * fill so the meter still reads as "a meter", not an empty gap (#9). Dark
+   * theme: translucent WHITE over the dark glass surface.
+   */
+  --perf-meter-track: rgba(255, 255, 255, 0.16);
+  /*
    * Higher-luminance error red for use as foreground TEXT on the glass
    * surface (--glass-bg over --surface composites to ≈ #2D2D2F).  At that
    * background, the saturated --error #FF453A computes a contrast ratio of
@@ -218,6 +232,20 @@ html[data-theme="light"] {
   --warning: #ff9f0a;
   --error: #ff3b30;
   --error-text: #d70015;
+  /*
+   * Receive-quality tokens (issue #1131), light theme. The amber is darkened to
+   * an AA-safe ochre (#9a6a00) since the chip background is faint over a light
+   * surface; optimal/low track the light --success/--error.
+   */
+  --perf-q-optimal: #1e9e44;
+  --perf-q-medium: #9a6a00;
+  --perf-q-low: var(--error);
+  /*
+   * Unlit (at-rest, level-0) Performance bar-meter track (#9). Light theme:
+   * translucent BLACK over the light surface, so the at-rest meter still reads
+   * as a faint track (the dark-theme translucent white would vanish here).
+   */
+  --perf-meter-track: rgba(0, 0, 0, 0.14);
 
   /* Liquid Glass material — light theme uses much lighter, more transparent glass */
   --glass-bg: rgba(255, 255, 255, 0.08);
@@ -1374,9 +1402,14 @@ html[data-theme="light"] #invite-overlay p {
   --accent-2: #8e66ff;
   --accent-3: #bf5af2;
 
-  /* Settings modal geometry */
+  /* Settings modal geometry. Height bumped 720→760 / 92→94vh so the Performance
+     tab's three per-kind cards fit the modal body without scrolling on a 768px
+     display (the #1095 no-scroll requirement). Applied to the SHARED token, not
+     just the Performance tab, so switching tabs never resizes the modal (no
+     resize-on-tab-switch jank). On a 768px screen the body is now ~634px usable
+     vs ~622px of Performance content. */
   --settings-modal-width: min(880px, 92vw);
-  --settings-modal-height: min(720px, 92vh);
+  --settings-modal-height: min(760px, 94vh);
   --settings-modal-radius: 16px;
   --settings-panel-radius: 16px;
   --settings-sidebar-width: 250px;

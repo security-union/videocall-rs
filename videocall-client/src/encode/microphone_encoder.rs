@@ -94,6 +94,22 @@ fn clamp_audio_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS)
 }
 
+/// Decide whether a given audio `layer_id` should be PUBLISHED under the user's
+/// SEND layer-ceiling (the perf-panel "layers published" control).
+///
+/// `ceiling_atomic` is the raw shared-atomic value (`u32::MAX` = Auto / no cap).
+/// It is mapped to a layer COUNT via the shared
+/// [`camera_encoder::layer_ceiling_to_count`] (sentinel-safe) and FLOORED at 1,
+/// so the base layer (`layer_id == 0`) is ALWAYS published regardless of the
+/// ceiling — mirroring the video/screen base-present invariant. A layer is
+/// published iff `layer_id < ceiling_count`. Pure free function so the gate is
+/// host-testable without a `MicrophoneEncoder` / AudioWorklet.
+fn audio_layer_is_published(layer_id: u32, ceiling_atomic: u32) -> bool {
+    let ceiling_count =
+        crate::encode::camera_encoder::layer_ceiling_to_count(ceiling_atomic).max(1);
+    (layer_id as usize) < ceiling_count
+}
+
 /// Holds the previous audio frame for RED-style redundancy.
 pub(crate) struct PreviousAudioFrame {
     data: Vec<u8>,
@@ -226,6 +242,21 @@ pub struct MicrophoneEncoder {
     /// When true AND `AUDIO_REDUNDANCY_ENABLED`, each packet carries the
     /// previous frame as redundant data for loss recovery.
     tier_enable_fec: Rc<AtomicBool>,
+    /// User SEND audio layer-ceiling (perf-panel "layers published" thumb). The
+    /// performance panel lets the user bound how many audio simulcast layers this
+    /// publisher emits; the UI writes the chosen layer COUNT here (via
+    /// [`Self::set_user_layer_ceiling`]), and each per-layer publish handler reads
+    /// it LIVE at publish time and skips layers whose `layer_id >= ceiling_count`.
+    /// The base layer (`layer_id == 0`, 24 kbps) is ALWAYS published (the ceiling
+    /// floors at 1) — mirroring the video/screen base-present invariant.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (Auto / no user cap):** until the
+    /// user drags the thumb below full, every configured layer publishes. The
+    /// value is mapped through `camera_encoder::layer_ceiling_to_count` (the
+    /// `u32::MAX` sentinel → `usize::MAX` fail-open) at read time. NOT reset on
+    /// reconnect — the user's explicit choice persists; `Host` re-applies it from
+    /// the persisted preference on encoder (re)start regardless.
+    shared_user_layer_ceiling: Rc<AtomicU32>,
 }
 
 impl MicrophoneEncoder {
@@ -267,6 +298,39 @@ impl MicrophoneEncoder {
                 .unwrap_or_else(|| Rc::new(AtomicU32::new(default_audio_bitrate_bps))),
             tier_enable_fec: shared_audio_tier_fec
                 .unwrap_or_else(|| Rc::new(AtomicBool::new(default_enable_fec))),
+            // User SEND audio layer-ceiling (perf-panel). Fail-open: u32::MAX =
+            // Auto / no user cap until the panel writes a layer count.
+            shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
+        }
+    }
+
+    /// Set the user's SEND audio layer-ceiling from the performance panel — the
+    /// "layers published" control (mirror of
+    /// [`CameraEncoder::set_user_layer_ceiling`](crate::CameraEncoder::set_user_layer_ceiling)).
+    ///
+    /// `ceiling` is the maximum number of audio simulcast layers the user wants
+    /// this publisher to emit, as a layer COUNT (1 = base only / 24 kbps, up to
+    /// the audio ladder depth). `None` = Auto / no user cap. Applied LIVE with NO
+    /// mic-encoder restart: each per-layer publish handler reads this atomic at
+    /// publish time and skips layers above the ceiling, so lowering it stops
+    /// sending the top audio layer(s) on the very next frame and raising it
+    /// resumes them — no audio interruption. The base layer (layer 0) is always
+    /// published (the read-side floors the count at 1).
+    ///
+    /// Valid whether or not the encoder is running; the value persists in the
+    /// shared atomic (cloned into every handler), so it survives across reconnect
+    /// and `Host` re-applies it from the persisted preference on re-init.
+    pub fn set_user_layer_ceiling(&self, ceiling: Option<u32>) {
+        self.shared_user_layer_ceiling
+            .store(ceiling.unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
+    /// The current user SEND audio layer-ceiling (layer COUNT), or `None` for Auto
+    /// / no user cap. For the UI to render its current selection.
+    pub fn user_layer_ceiling(&self) -> Option<u32> {
+        match self.shared_user_layer_ceiling.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            n => Some(n),
         }
     }
 
@@ -381,6 +445,12 @@ impl MicrophoneEncoder {
             let aes = aes.clone();
             let enabled_for_handler = enabled.clone();
             let enable_fec_for_handler = self.tier_enable_fec.clone();
+            // User SEND audio layer-ceiling (perf-panel). Each handler reads it
+            // LIVE at publish time and self-gates: a handler for a layer at or
+            // above the ceiling count drops its packet (and resets its redundancy
+            // buffer) instead of sending. The base (layer 0) is always published
+            // because the read-side count floors at 1.
+            let user_layer_ceiling = self.shared_user_layer_ceiling.clone();
             // Buffer for RED-style redundancy: stores the previous frame's
             // encoded data and sequence number so it can be included in the
             // next packet for loss recovery.
@@ -409,6 +479,28 @@ impl MicrophoneEncoder {
 
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
+                    // User SEND audio layer-ceiling gate (perf-panel "layers
+                    // published"). Map the atomic (u32::MAX = Auto) to a layer
+                    // COUNT via the shared sentinel mapper; floor at 1 so the base
+                    // layer (layer_id 0) is ALWAYS published. A layer at or above
+                    // the ceiling count is NOT sent. We DROP this packet entirely
+                    // (publish-gate) rather than encode-gate: the Opus encode
+                    // already ran on the AudioWorklet thread (cheap, off the main
+                    // thread — see the ROLLOUT NOTE on `codecs`), so the win here
+                    // is the uplink saving; skipping the encode would require
+                    // tearing down the worklet node, which is exactly the restart
+                    // we are avoiding. Also reset this layer's redundancy buffer so
+                    // that, if the ceiling is later raised, the resumed layer
+                    // starts a fresh RED chain rather than carrying a stale
+                    // previous frame across the gap.
+                    if !audio_layer_is_published(
+                        layer_id,
+                        user_layer_ceiling.load(Ordering::Relaxed),
+                    ) {
+                        previous_frame = None;
+                        return;
+                    }
+
                     // Decide whether to include redundancy based on the
                     // AUDIO_REDUNDANCY_ENABLED constant and the current tier's
                     // enable_fec flag.
@@ -929,7 +1021,8 @@ impl MicrophoneEncoder {
 #[cfg(test)]
 mod layer_count_tests {
     use super::{
-        clamp_audio_layer_count, AUDIO_SIMULCAST_LAYER_KBPS, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
+        audio_layer_is_published, clamp_audio_layer_count, AUDIO_SIMULCAST_LAYER_KBPS,
+        AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS,
     };
 
     #[test]
@@ -969,6 +1062,54 @@ mod layer_count_tests {
             assert!(
                 w[1] > w[0],
                 "audio layer bitrates must ascend: {AUDIO_SIMULCAST_LAYER_KBPS:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_publish_gate_respects_user_ceiling() {
+        // Ceiling count 2 (raw atomic value 2): layers 0 and 1 publish, layer 2 is
+        // gated off. This is the runtime publish-gate the perf-panel drives.
+        assert!(
+            audio_layer_is_published(0, 2),
+            "base always under any ceiling"
+        );
+        assert!(audio_layer_is_published(1, 2), "layer 1 within ceiling 2");
+        assert!(
+            !audio_layer_is_published(2, 2),
+            "layer 2 gated by ceiling 2"
+        );
+        // Ceiling count 1 → only the base publishes.
+        assert!(audio_layer_is_published(0, 1));
+        assert!(
+            !audio_layer_is_published(1, 1),
+            "layer 1 gated by ceiling 1"
+        );
+    }
+
+    #[test]
+    fn audio_publish_gate_always_publishes_base_even_at_zero_ceiling() {
+        // A degenerate ceiling of 0 must still publish the base layer (the count
+        // floors at 1) — the base-present invariant, mirroring video/screen.
+        assert!(
+            audio_layer_is_published(0, 0),
+            "base layer must publish even at a 0 ceiling"
+        );
+        assert!(
+            !audio_layer_is_published(1, 0),
+            "no higher layer at ceiling 0"
+        );
+    }
+
+    #[test]
+    fn audio_publish_gate_auto_sentinel_publishes_all() {
+        // u32::MAX (Auto / no user cap) maps to the usize::MAX fail-open count, so
+        // EVERY layer publishes — the default, byte-identical to the pre-control
+        // behaviour.
+        for layer_id in 0u32..=2 {
+            assert!(
+                audio_layer_is_published(layer_id, u32::MAX),
+                "layer {layer_id} must publish under the Auto sentinel"
             );
         }
     }

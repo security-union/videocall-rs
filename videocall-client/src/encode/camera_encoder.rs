@@ -444,6 +444,22 @@ pub struct CameraEncoder {
     /// (atomic) between the inbound-packet task and the control-loop task, exactly
     /// like `shared_encoder_queue_depth`.
     shared_union_requested_layer: Rc<AtomicU32>,
+    /// User SEND layer-ceiling for this publisher's VIDEO ladder (perf-panel
+    /// "layers published" thumb). The performance panel lets the user explicitly
+    /// bound how many simulcast layers this publisher emits; the UI writes the
+    /// chosen layer COUNT here (via [`Self::set_user_layer_ceiling`]), and the AQ
+    /// control loop reads it each tick and feeds it to
+    /// [`EncoderBitrateController::observe_user_layer_ceiling`], which caps the
+    /// published ladder as a further `min` alongside the relay union hint and the
+    /// runtime ramp.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (Auto / no user cap):** until the
+    /// user drags the thumb below full, the controller keeps its full
+    /// backpressure-governed ladder. Borrow-safe bridge (atomic) between the UI's
+    /// setter and the control-loop task, exactly like `shared_union_requested_layer`.
+    /// The base layer is ALWAYS published — the AQ side floors this cap at 1, so
+    /// this never touches the floor / base-present invariant.
+    shared_user_layer_ceiling: Rc<AtomicU32>,
     /// Liveness token whose sole purpose is to bound the lifetime of the AQ
     /// control-loop `spawn_local` future (issue #1108). The encoder holds the
     /// only strong reference; `set_encoder_control` captures a [`Weak`] and
@@ -495,6 +511,27 @@ const SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = videocall_aq::constants::SIMULCAST_M
 /// needs a live `VideoCallClient`).
 fn clamp_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SIMULCAST_MAX_SUPPORTED_LAYERS)
+}
+
+/// Convert the user SEND layer-ceiling atomic (a `u32` layer COUNT, with
+/// [`u32::MAX`] as the Auto / no-cap sentinel) into the `usize` count the AQ
+/// controller's [`observe_user_layer_ceiling`] expects.
+///
+/// [`u32::MAX`] maps to [`usize::MAX`] (fail-open) explicitly rather than via
+/// `as usize`, which is target-dependent: on 64-bit (native test target)
+/// `u32::MAX as usize` is `2^32 - 1`, NOT `usize::MAX`, so an explicit check
+/// keeps the fail-open mapping identical on wasm32 and native. Any other value
+/// widens losslessly (usize is ≥ 32 bits on every supported target). The AQ side
+/// re-clamps to `[1, device_ceiling]`, so an out-of-range count is harmless here.
+///
+/// Free function so it is unit-testable without a live `CameraEncoder`; shared
+/// with the screen encoder (same atomic→count contract).
+pub(crate) fn layer_ceiling_to_count(ceiling: u32) -> usize {
+    if ceiling == u32::MAX {
+        usize::MAX
+    } else {
+        ceiling as usize
+    }
 }
 
 /// The number of simulcast layers a camera publisher starts ACTIVE at, before
@@ -756,6 +793,9 @@ impl CameraEncoder {
             // (fail-open / no cap): the controller keeps its full ladder until a
             // LAYER_HINT arrives. Reset to u32::MAX on reconnect.
             shared_union_requested_layer: Rc::new(AtomicU32::new(u32::MAX)),
+            // User SEND layer-ceiling (perf-panel). Fail-open: u32::MAX = Auto /
+            // no user cap until the panel writes a layer count.
+            shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
             // AQ control-loop liveness token (issue #1108). The encoder is the
             // sole strong owner; the self-tick loop holds a Weak and exits when
             // this drops (encoder torn down on Host unmount).
@@ -821,6 +861,10 @@ impl CameraEncoder {
         // the max-layer the client wrote (from a LAYER_HINT packet) and forwards
         // it to the controller's union cap each tick.
         let shared_union_requested_layer = self.shared_union_requested_layer.clone();
+        // User SEND layer-ceiling (perf-panel): the control loop READS the layer
+        // count the UI wrote and forwards it to the controller's user cap each
+        // tick, composed as a further `min` alongside the union cap and the ramp.
+        let shared_user_layer_ceiling = self.shared_user_layer_ceiling.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token.
         // The loop below breaks as soon as this fails to upgrade, i.e. when the
         // CameraEncoder is dropped (Host unmount). Without this, the
@@ -1086,6 +1130,14 @@ impl CameraEncoder {
                 encoder_control.observe_union_requested_layer(
                     shared_union_requested_layer.load(Ordering::Relaxed),
                 );
+                // User SEND layer-ceiling (perf-panel): feed the latest user-
+                // selected layer COUNT (u32::MAX = Auto / no cap → usize::MAX
+                // fail-open). Applied right before `tick` so the cap composes with
+                // the union hint and backpressure as a further `min`. The base
+                // layer is always published (the AQ side floors at 1).
+                encoder_control.observe_user_layer_ceiling(layer_ceiling_to_count(
+                    shared_user_layer_ceiling.load(Ordering::Relaxed),
+                ));
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
@@ -1516,6 +1568,39 @@ impl CameraEncoder {
     /// Returns the current user-configured quality tier bounds (issue #961).
     pub fn quality_tier_bounds(&self) -> QualityTierBounds {
         self.quality_bounds.borrow().bounds
+    }
+
+    /// Set the user's SEND layer-ceiling from the performance panel — the
+    /// "layers published" control.
+    ///
+    /// `ceiling` is the maximum number of simulcast layers the user wants this
+    /// camera publisher to emit, as a layer COUNT (1 = base only, 2 = base + one,
+    /// up to the device ceiling). `None` = Auto / no user cap (the full
+    /// backpressure-governed ladder). Applied LIVE: the AQ control loop reads this
+    /// atomic each tick (≤1s) and caps the published set as a further `min`
+    /// alongside the relay union hint and the runtime ramp; AQ shedding stays
+    /// authoritative on the down side and the base layer (layer 0) is always
+    /// published (the AQ side floors the cap at 1).
+    ///
+    /// Valid whether or not the encoder is currently running; the value persists
+    /// in the shared atomic and is re-read by the control loop on every
+    /// (re)start, so it survives an encoder restart / reconnect with no re-arming
+    /// (the atomic is owned by the `CameraEncoder`, which the Host re-applies its
+    /// stored preference to after re-init).
+    pub fn set_user_layer_ceiling(&self, ceiling: Option<u32>) {
+        // None (Auto) → the u32::MAX fail-open sentinel; otherwise the layer
+        // count. `layer_ceiling_to_count` maps the sentinel back on the read side.
+        self.shared_user_layer_ceiling
+            .store(ceiling.unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
+    /// The current user SEND layer-ceiling (layer COUNT), or `None` for Auto /
+    /// no user cap. For the UI to render its current selection.
+    pub fn user_layer_ceiling(&self) -> Option<u32> {
+        match self.shared_user_layer_ceiling.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            n => Some(n),
+        }
     }
 
     // The next three methods delegate to self.state
@@ -2598,9 +2683,10 @@ impl CameraEncoder {
 mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, format_layer_transition, frame_is_healthy,
-        initial_active_layer_count, is_fatal_encoder_error_message, shed_reason,
-        should_pin_single_layer_low, LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        initial_active_layer_count, is_fatal_encoder_error_message, layer_ceiling_to_count,
+        shed_reason, should_pin_single_layer_low, LayerView, SimulcastLayerInfo,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -2869,6 +2955,23 @@ mod tests {
              [0] 640x360 ~400kbps ACTIVE | [1] 960x540 ~900kbps ACTIVE | \
              [2] 1280x720 ~1500kbps ACTIVE"
         );
+    }
+
+    #[test]
+    fn layer_ceiling_to_count_maps_sentinel_to_fail_open() {
+        // u32::MAX (Auto / no cap) must map to usize::MAX (fail-open) on EVERY
+        // target — not `u32::MAX as usize` (== 2^32-1 on 64-bit native), which
+        // would be a finite cap of ~4 billion layers and (harmlessly, but
+        // incorrectly) not the sentinel. This guards the explicit-check mapping.
+        assert_eq!(layer_ceiling_to_count(u32::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn layer_ceiling_to_count_passes_through_real_counts() {
+        // A real user selection (a layer count) widens losslessly.
+        assert_eq!(layer_ceiling_to_count(1), 1);
+        assert_eq!(layer_ceiling_to_count(2), 2);
+        assert_eq!(layer_ceiling_to_count(3), 3);
     }
 
     #[test]

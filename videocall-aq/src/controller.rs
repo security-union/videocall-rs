@@ -168,6 +168,32 @@ pub struct EncoderBitrateController {
     /// always published). No-op in single-stream mode (floored at 1).
     union_requested_layer_cap: usize,
 
+    // --- User SEND layer-ceiling cap (perf-panel "layers published" thumb) ---
+    /// Active-layer COUNT cap derived from the user's Sending "layers published"
+    /// selection in the performance panel. The control operates directly in
+    /// layer-count space: the perf panel's ceiling thumb position maps to a layer
+    /// count via the UI mappers (`performance_settings::thumb_pos_to_layer_ceiling`
+    /// → the persisted `{video,screen}_layers` count), the encoder stores that
+    /// count in a shared atomic and converts it for this controller via
+    /// `videocall-client`'s `camera_encoder::layer_ceiling_to_count` (the
+    /// `u32::MAX` Auto sentinel → the `usize::MAX` fail-open value), which is fed
+    /// in here via [`observe_user_layer_ceiling`](Self::observe_user_layer_ceiling).
+    ///
+    /// **Same shape as [`union_requested_layer_cap`]:** a FURTHER top-side `min`
+    /// in [`tick`](Self::tick), composed as
+    /// `min(backpressure_ceiling, union_cap, user_ceiling).max(1)`. It can only
+    /// LOWER active toward the base (lowering the user's ceiling drops the top
+    /// layer(s) at once, saving sender CPU + uplink) or RAISE it back toward the
+    /// backpressure/earned ceiling as the user re-raises it. It NEVER raises
+    /// active above what backpressure/budget allows, and NEVER below 1 (the base
+    /// layer is always published — this cap does not touch the floor).
+    ///
+    /// **Fail-open:** [`usize::MAX`] means "no user cap" (Auto / full quality).
+    /// This is the default and the value an absent/Auto selection maps to, so it
+    /// suppresses nothing until the user drags the thumb below full. No-op in
+    /// single-stream mode (floored at 1).
+    user_layer_ceiling_cap: usize,
+
     // --- Runtime simulcast layer ramp-up (issue #1140 / #1141) ---
     /// Timestamp (ms) at which the encoder queue depth most recently became
     /// sustained-CLEAR (at/below [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`]) and has
@@ -311,6 +337,10 @@ impl EncoderBitrateController {
             // until a LAYER_HINT arrives and observe_union_requested_layer() is
             // called. usize::MAX => inert (full ladder).
             union_requested_layer_cap: usize::MAX,
+            // User SEND layer-ceiling cap (perf-panel "layers published" thumb).
+            // Fail-open: no user cap until the panel writes one via
+            // observe_user_layer_ceiling(). usize::MAX => inert (full ladder).
+            user_layer_ceiling_cap: usize::MAX,
             // Runtime simulcast layer ramp (issue #1140 / #1141). No clear dwell
             // armed yet, no probe-add in flight, penalty box open, backoff at its
             // base. `earned_active_ceiling` starts at 1 — every controller begins
@@ -453,6 +483,13 @@ impl EncoderBitrateController {
         // fail-open: an absent hint never blocks the probe.
         if self.union_requested_layer_cap != usize::MAX && active >= self.union_requested_layer_cap
         {
+            return false;
+        }
+        // Within the user SEND layer-ceiling cap, same shape as the union cap:
+        // the headroom probe must NEVER climb a layer the user has explicitly
+        // capped off, otherwise the same-tick suppress→probe would re-add the very
+        // layer the user just dropped. usize::MAX is fail-open (Auto / no cap).
+        if self.user_layer_ceiling_cap != usize::MAX && active >= self.user_layer_ceiling_cap {
             return false;
         }
         // Never probe-up while actively shedding or draining a congestion buffer.
@@ -629,64 +666,80 @@ impl EncoderBitrateController {
         // shed below.
         let active_after_backpressure = self.quality_manager.active_layer_count();
 
-        // --- Relay layer-union suppression cap (issue #1108, Stage 3) ---
+        // --- Top-side layer-cap suppression (relay union hint #1108 Stage 3 +
+        //     user SEND ceiling) ---
         //
         // The backpressure block above has just settled `active_layer_count()` to
-        // the backpressure axis's decision for THIS tick. The union cap is a
-        // FURTHER `min` restriction layered on top of that: the relay tells each
-        // publisher the MAX layer ANY receiver currently wants (the union), and we
-        // stop encoding layers above it so no CPU/uplink is spent on a top layer
-        // nobody will decode.
+        // the backpressure axis's decision for THIS tick. TWO independent top-side
+        // caps may further restrict it, and they compose as a single `min`:
         //
-        // INVARIANTS (see the field doc): the cap may only LOWER active below the
-        // backpressure ceiling (suppress) or RAISE it back toward that ceiling
-        // when the union grows (restore). It must NEVER raise active above what
-        // backpressure/budget allows (backpressure wins on the down side), and
-        // NEVER below 1 (the base layer is always published). The `usize::MAX`
-        // fail-open sentinel makes the whole block inert (no hint → full ladder,
-        // byte-identical to Stage 2).
+        //  * the RELAY UNION cap (`union_requested_layer_cap`): the relay tells
+        //    each publisher the MAX layer ANY receiver currently wants, so we stop
+        //    encoding layers above it (no CPU/uplink on a top layer nobody will
+        //    decode); and
+        //  * the USER SEND ceiling (`user_layer_ceiling_cap`): the performance
+        //    panel's "layers published" thumb — the user explicitly bounds how
+        //    many top layers this publisher emits (lowering it sheds the top
+        //    layer(s) at once to save the user's own uplink/CPU).
         //
-        // No second publisher-side debounce: the RELAY debounces the down
-        // direction, so we apply the union cap eagerly each tick (suppress-lazy /
-        // restore-eager). The restore reuses the SAME min-interval gate the
-        // explicit force_* layer-shed paths use (`forced_transition_guards_clear`).
-        // Because `add_top_layer` does not arm `last_transition_time_ms`, a pure
-        // union restore (no tier movement) keeps that gate clear, so it climbs one
-        // layer per qualifying tick (~1 Hz) — not one per
-        // `MIN_TIER_TRANSITION_INTERVAL_MS` — matching the `wanted_degrade_at_floor`
-        // precedent (see the inline note below). No parallel timer state.
+        // Both are top-side caps with identical semantics, so we take the tighter
+        // (`min`) of the two as a single `cap` and run ONE suppress/restore pass
+        // against it. `usize::MAX` is the fail-open sentinel for each; when BOTH
+        // are `usize::MAX` the combined cap is `usize::MAX` and the whole block is
+        // inert (full ladder, byte-identical to before this change).
+        //
+        // INVARIANTS (see both field docs): the combined cap may only LOWER active
+        // below the backpressure ceiling (suppress) or RAISE it back toward that
+        // ceiling when the cap grows (restore). It must NEVER raise active above
+        // what backpressure/budget allows (backpressure wins on the down side),
+        // and NEVER below 1 (the base layer is always published — neither cap
+        // touches the floor).
+        //
+        // No second publisher-side debounce: the RELAY debounces the union down
+        // direction, and the USER cap is a deliberate human action, so we apply
+        // the combined cap eagerly each tick (suppress-eager / restore-gated). The
+        // restore reuses the SAME min-interval gate the explicit force_* layer-
+        // shed paths use (`forced_transition_guards_clear`). Because
+        // `add_top_layer` does not arm `last_transition_time_ms`, a pure cap
+        // restore (no tier movement) keeps that gate clear, so it climbs one layer
+        // per qualifying tick (~1 Hz) — not one per `MIN_TIER_TRANSITION_INTERVAL_MS`
+        // — matching the `wanted_degrade_at_floor` precedent. No parallel timer
+        // state.
         let union_count = self.union_requested_layer_cap;
-        if self.quality_manager.is_simulcast() && union_count != usize::MAX {
+        let user_cap = self.user_layer_ceiling_cap;
+        let cap = union_count.min(user_cap);
+        if self.quality_manager.is_simulcast() && cap != usize::MAX {
             // The backpressure ceiling this tick: when backpressure is actively
             // shedding (`degrade`), it owns the down direction, so the ceiling is
-            // wherever it just left active (the union must not re-add against an
+            // wherever it just left active (the cap must not re-add against an
             // active degrade). Otherwise backpressure is healthy/recovering and
-            // would, over time, restore — so the union may restore up to the
-            // EARNED active ceiling (issue #1140 / #1141), NOT the full device
-            // ladder. Clamping to `earned_active_ceiling` is what keeps the union
-            // restore from vaulting active straight to the device max without the
-            // headroom probe re-earning each rung: the union can only re-fill
-            // layers the ramp has already proven this device can carry. This keeps
-            // backpressure authoritative on the down side while letting a grown
-            // union climb back toward what has been earned.
+            // would, over time, restore — so the cap may restore up to the EARNED
+            // active ceiling (issue #1140 / #1141), NOT the full device ladder.
+            // Clamping to `earned_active_ceiling` is what keeps the cap restore
+            // from vaulting active straight to the device max without the headroom
+            // probe re-earning each rung: the cap can only re-fill layers the ramp
+            // has already proven this device can carry. This keeps backpressure
+            // authoritative on the down side while letting a grown cap climb back
+            // toward what has been earned.
             let backpressure_ceiling = if degrade {
                 self.quality_manager.active_layer_count()
             } else {
                 self.earned_active_ceiling
             };
-            // desired = min(backpressure ceiling, union cap), floored at 1. Both
+            // desired = min(backpressure ceiling, combined cap), floored at 1. All
             // terms are ≤ the ladder, so the ladder is implicit. `desired` can
             // never exceed `backpressure_ceiling`, which is the invariant that
-            // keeps the union cap from raising active above backpressure.
-            let desired = backpressure_ceiling.min(union_count).max(1);
+            // keeps the cap from raising active above backpressure.
+            let desired = backpressure_ceiling.min(cap).max(1);
 
-            // Suppress (eager, ungated): drop the whole excess this tick. The
-            // relay already debounced the down direction, so there is no second
-            // publisher-side debounce. `drop_top_layer` floors at 1.
-            let mut union_acted = false;
+            // Suppress (eager, ungated): drop the whole excess this tick. Both the
+            // relay (union) and the human (user cap) are authoritative on the down
+            // direction, so there is no second publisher-side debounce.
+            // `drop_top_layer` floors at 1.
+            let mut cap_acted = false;
             while self.quality_manager.active_layer_count() > desired {
                 if self.quality_manager.drop_top_layer() {
-                    union_acted = true;
+                    cap_acted = true;
                 } else {
                     break;
                 }
@@ -696,16 +749,16 @@ impl EncoderBitrateController {
             // min-interval guard is clear — the same gate the force_* layer sheds
             // use. One layer per qualifying tick throttles the climb to the tier
             // transition cadence without any parallel timer (restore-eager: a
-            // grown union re-adds within ~1 eligible tick). Backpressure permits
-            // it because `desired ≤ backpressure_ceiling`.
+            // grown cap re-adds within ~1 eligible tick). Backpressure permits it
+            // because `desired ≤ backpressure_ceiling`.
             if self.quality_manager.active_layer_count() < desired
                 && self.quality_manager.forced_transition_guards_clear(now)
                 && self.quality_manager.add_top_layer()
             {
-                union_acted = true;
+                cap_acted = true;
             }
 
-            if union_acted {
+            if cap_acted {
                 self.tier_changed = true;
             }
         }
@@ -1100,6 +1153,34 @@ impl EncoderBitrateController {
     /// Test/observability accessor.
     pub fn union_requested_layer_cap(&self) -> usize {
         self.union_requested_layer_cap
+    }
+
+    /// Set the user's SEND layer-ceiling cap from the performance panel (the
+    /// "layers published" thumb).
+    ///
+    /// `cap_count` is the maximum number of simulcast layers the user wants this
+    /// publisher to keep active, in layer-COUNT terms (1 = base only, 2 = base +
+    /// one, …). Pass [`usize::MAX`] for Auto / no user cap (fail-open). Out-of-
+    /// range values are tolerated: the `min` composition in [`tick`](Self::tick)
+    /// re-clamps against the device ceiling and floors at 1, so a `0` behaves as
+    /// 1 (base always published) and an oversized value is harmlessly capped by
+    /// the backpressure/earned ceiling.
+    ///
+    /// Applied by the next [`tick`](Self::tick) as a further `min` on the
+    /// backpressure decision, composed identically to the relay union cap (see
+    /// the [`user_layer_ceiling_cap`](Self::user_layer_ceiling_cap) field doc):
+    /// `active = min(backpressure_ceiling, union_cap, user_cap).max(1)`. It can
+    /// only suppress active toward the base or restore it back toward the
+    /// backpressure/earned ceiling — never above what backpressure allows, never
+    /// below 1.
+    pub fn observe_user_layer_ceiling(&mut self, cap_count: usize) {
+        self.user_layer_ceiling_cap = cap_count;
+    }
+
+    /// The current user SEND layer-ceiling cap (layer COUNT). [`usize::MAX`] =
+    /// fail-open (Auto / no user cap). Test/observability accessor.
+    pub fn user_layer_ceiling_cap(&self) -> usize {
+        self.user_layer_ceiling_cap
     }
 
     /// Force an immediate video quality step-down due to server congestion.
@@ -1933,6 +2014,235 @@ mod tests {
             controller.active_layer_count(),
             1,
             "single-stream mode is floored at 1 and unaffected by the union cap"
+        );
+    }
+
+    // =====================================================================
+    // tick(): user SEND layer-ceiling cap (perf-panel "layers published")
+    // =====================================================================
+
+    /// A user ceiling of 2 on a 3-layer controller must, after one tick, cap the
+    /// published set to 2 layers — eager suppress, floored at the device ladder.
+    /// This is the user's "decrease the number of layers I send" control.
+    #[test]
+    fn test_user_ceiling_caps_layer_count() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // User drags the "layers published" thumb to 2.
+        controller.observe_user_layer_ceiling(2);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "user ceiling 2 must cap the published set to 2 layers"
+        );
+    }
+
+    /// The user ceiling floors at 1 (never drops the base): even a ceiling of 0
+    /// leaves the base layer published. The base-present invariant from Option A.
+    #[test]
+    fn test_user_ceiling_never_below_one() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        controller.observe_user_layer_ceiling(0);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "user ceiling 0 must floor at the base layer (count 1), never 0"
+        );
+    }
+
+    /// CORE COMPOSITION (the mandate): active settles at
+    /// `min(ramp/backpressure_ceiling, union_cap, user_cap).max(1)`. Here the
+    /// union allows 3 and backpressure is healthy (ceiling 3), but the USER cap of
+    /// 2 is the tighter bound, so active must settle at 2 — proving the user cap
+    /// composes as a further `min`, not as an override of the other two.
+    ///
+    /// MUTATION CHECK: drop `.min(user_cap)` (or `.min(cap)`) from `tick`'s
+    /// `desired` and this asserts 3 instead of 2 → fails. Confirmed by hand.
+    #[test]
+    fn test_user_ceiling_composes_as_min_with_union_and_ramp() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3); // ramp/backpressure ceiling = 3 (full)
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Union allows the full ladder (count 3); user caps at 2. The tighter
+        // (min) of the two wins, and backpressure is healthy so the ramp ceiling
+        // is the full 3 — isolating the user cap as the binding constraint.
+        controller.observe_union_requested_layer(2); // count 3 (non-binding)
+        controller.observe_user_layer_ceiling(2); // the binding cap
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "active must be min(ramp=3, union=3, user=2).max(1) == 2"
+        );
+
+        // And the symmetric case: a union TIGHTER than the user cap wins. Reset
+        // the user cap wide open, tighten the union to count 1.
+        controller.observe_user_layer_ceiling(usize::MAX);
+        controller.observe_union_requested_layer(0); // count 1
+        let t2 = t + union_step_ms() * 2.0;
+        tick_at(&mut controller, &clock, t2, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "active must be min(ramp=3, union=1, user=MAX).max(1) == 1 (union now tighter)"
+        );
+    }
+
+    /// Fail-open default: a fresh controller that NEVER receives
+    /// `observe_user_layer_ceiling` keeps its full ladder (the cap starts at the
+    /// `usize::MAX` sentinel = inert), exactly like the union cap default.
+    #[test]
+    fn test_user_ceiling_fail_open_default_full_ladder() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(
+            controller.user_layer_ceiling_cap(),
+            usize::MAX,
+            "a fresh controller must default to the fail-open (no user cap) sentinel"
+        );
+
+        let mut t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        for _ in 0..10 {
+            tick_at(&mut controller, &clock, t, 0);
+            t += union_step_ms();
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "with no user ceiling ever observed the full ladder must stay active"
+        );
+    }
+
+    /// Restore-eager: from a user-capped `active == 1`, RAISING the user ceiling
+    /// back to the full ladder must climb active back toward the backpressure/earned
+    /// ceiling over subsequent ticks. This is the user's "increase the number of
+    /// layers I send" direction.
+    #[test]
+    fn test_user_ceiling_restore_eager_climbs_back() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // User caps to the base.
+        controller.observe_user_layer_ceiling(1);
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "precondition: capped to base"
+        );
+
+        // User re-raises the ceiling to the full ladder.
+        controller.observe_user_layer_ceiling(3);
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert!(
+            controller.active_layer_count() > 1,
+            "a raised user ceiling must begin restoring within one eligible tick (got {})",
+            controller.active_layer_count()
+        );
+
+        let mut restored_full = controller.active_layer_count() == 3;
+        for _ in 0..6 {
+            t += union_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                restored_full = true;
+                break;
+            }
+        }
+        assert!(
+            restored_full,
+            "user-ceiling restore must climb back to the full ladder (active {})",
+            controller.active_layer_count()
+        );
+    }
+
+    /// The user ceiling must NEVER raise active above the backpressure ceiling:
+    /// with backpressure holding active at 2, a user ceiling of 3 must NOT re-add
+    /// the layer backpressure shed — AQ shedding stays authoritative downward.
+    #[test]
+    fn test_user_ceiling_never_raises_above_backpressure() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        for _ in 0..8 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() <= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: backpressure shed one layer (ceiling 2)"
+        );
+
+        // User ceiling allows the FULL ladder. While backpressure remains HIGH the
+        // user cap must NOT re-add the shed layer (shedding wins on the down side).
+        controller.observe_user_layer_ceiling(3);
+        for _ in 0..6 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            assert!(
+                controller.active_layer_count() <= 2,
+                "user ceiling 3 must not raise active above the backpressure ceiling of 2 \
+                 while backpressure is degrading (active {})",
+                controller.active_layer_count()
+            );
+        }
+    }
+
+    /// Single-stream mode is unaffected by the user ceiling: even ceiling 0 leaves
+    /// the sole (base) layer active (count 1, floored).
+    #[test]
+    fn test_user_ceiling_single_stream_unaffected() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        // No set_simulcast_layers → single-stream (count 1).
+        assert!(!controller.is_simulcast());
+
+        controller.observe_user_layer_ceiling(0);
+        let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "single-stream mode is floored at 1 and unaffected by the user ceiling"
         );
     }
 

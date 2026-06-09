@@ -362,6 +362,10 @@ pub fn generate_for_peer(
     // through the bundle.
     let signal_transport = signal_info.transport;
     let signal_meter_mode = signal_info.meter_mode;
+    // Per-peer RECEIVE layer diag for this peer (resolved upstream in
+    // `peer_tile` by `session_id == peer_id`). Cloned per popup call site
+    // below so the popup's Layers section matches the perf dialog.
+    let signal_receive_diag = signal_info.receive_diag;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -523,6 +527,7 @@ pub fn generate_for_peer(
                         let popup_peer_id = key.clone();
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
+                        let popup_receive_diag = signal_receive_diag.clone();
                         let popup_anchor = ss_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -533,6 +538,7 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
+                                receive_diag: popup_receive_diag,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -787,6 +793,7 @@ pub fn generate_for_peer(
                         let popup_peer_id = key.clone();
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
+                        let popup_receive_diag = signal_receive_diag.clone();
                         let popup_anchor = split_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -797,6 +804,7 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
+                                receive_diag: popup_receive_diag,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1043,6 +1051,7 @@ pub fn generate_for_peer(
                         let popup_peer_id = key.clone();
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
+                        let popup_receive_diag = signal_receive_diag.clone();
                         let popup_anchor = fb_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -1053,6 +1062,7 @@ pub fn generate_for_peer(
                                 transport: popup_transport,
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
+                                receive_diag: popup_receive_diag,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1381,6 +1391,7 @@ pub fn generate_for_peer(
                             let popup_peer_id = key.clone();
                             let popup_peer_name = peer_display_name.clone();
                             let popup_transport = signal_transport.clone();
+                            let popup_receive_diag = signal_receive_diag.clone();
                             let popup_anchor = grid_anchor_id.clone();
                             rsx! {
                                 SignalQualityPopup {
@@ -1391,6 +1402,7 @@ pub fn generate_for_peer(
                                     transport: popup_transport,
                                     anchor_id: popup_anchor,
                                     meter_mode: signal_meter_mode,
+                                    receive_diag: popup_receive_diag,
                                     free_position: signal_free_position,
                                     on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                     on_reanchor: move |_| on_reanchor_signal_popup.call(()),

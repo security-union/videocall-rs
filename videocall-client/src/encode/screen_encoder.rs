@@ -374,6 +374,18 @@ pub struct ScreenEncoder {
     /// `u32::MAX` on reconnect so a stale cap from the old relay cannot suppress
     /// against a new session.
     shared_union_requested_layer: Rc<AtomicU32>,
+    /// User SEND layer-ceiling for this publisher's SCREEN ladder (perf-panel
+    /// "layers published" thumb). Mirror of
+    /// `CameraEncoder::shared_user_layer_ceiling` for the SCREEN media-kind: the
+    /// performance panel writes the user-selected layer COUNT here (via
+    /// [`Self::set_user_layer_ceiling`]) and the screen AQ control loop reads it
+    /// each tick and feeds [`EncoderBitrateController::observe_user_layer_ceiling`]
+    /// to cap the published screen ladder as a further `min` alongside the union
+    /// hint.
+    ///
+    /// **Initialized to [`u32::MAX`] = fail-open (Auto / no user cap).** The base
+    /// layer is always published (the AQ side floors the cap at 1).
+    shared_user_layer_ceiling: Rc<AtomicU32>,
     /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
     /// #1108). The encoder holds the only strong reference; `set_encoder_control`
     /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
@@ -441,6 +453,9 @@ impl ScreenEncoder {
             // Relay layer-union hint (issue #1108, Stage 3). Starts at u32::MAX
             // (fail-open / no cap); reset to u32::MAX on reconnect.
             shared_union_requested_layer: Rc::new(AtomicU32::new(u32::MAX)),
+            // User SEND layer-ceiling (perf-panel). Fail-open: u32::MAX = Auto /
+            // no user cap until the panel writes a layer count.
+            shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
             // AQ control-loop liveness token (issue #1108). Sole strong owner;
             // the self-tick loop holds a Weak and exits when this drops.
             control_loop_liveness: Rc::new(()),
@@ -512,6 +527,35 @@ impl ScreenEncoder {
     /// Returns the current user-configured screen quality tier bounds.
     pub fn quality_tier_bounds(&self) -> ScreenQualityTierBounds {
         self.quality_bounds.borrow().bounds
+    }
+
+    /// Set the user's SEND layer-ceiling for SCREEN from the performance panel —
+    /// the "layers published" control.
+    ///
+    /// `ceiling` is the maximum number of SCREEN simulcast layers the user wants
+    /// this publisher to emit, as a layer COUNT (1 = base only, up to the screen
+    /// device ceiling). `None` = Auto / no user cap. Applied LIVE: the screen AQ
+    /// control loop reads this atomic each tick (≤1s) and caps the published
+    /// screen set as a further `min` alongside the relay union hint; AQ shedding
+    /// stays authoritative on the down side and the base layer (layer 0) is always
+    /// published (the AQ side floors the cap at 1).
+    ///
+    /// Valid whether or not screen sharing is currently active; the value persists
+    /// in the shared atomic and is re-read by the control loop on every (re)start
+    /// of the screen encoder, so it survives a restart / reconnect / re-share with
+    /// no re-arming.
+    pub fn set_user_layer_ceiling(&self, ceiling: Option<u32>) {
+        self.shared_user_layer_ceiling
+            .store(ceiling.unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
+    /// The current user SEND layer-ceiling for SCREEN (layer COUNT), or `None`
+    /// for Auto / no user cap. For the UI to render its current selection.
+    pub fn user_layer_ceiling(&self) -> Option<u32> {
+        match self.shared_user_layer_ceiling.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            n => Some(n),
+        }
     }
 
     /// Real-time screen adaptive-quality snapshot for the UI VU meter needle
@@ -641,6 +685,10 @@ impl ScreenEncoder {
         // the max-layer the client wrote (from a LAYER_HINT packet) and forwards
         // it to the controller's union cap each tick.
         let shared_union_requested_layer = self.shared_union_requested_layer.clone();
+        // User SEND layer-ceiling (perf-panel): the control loop READS the layer
+        // count the UI wrote and forwards it to the controller's user cap each
+        // tick, composed as a further `min` alongside the union cap and the ramp.
+        let shared_user_layer_ceiling = self.shared_user_layer_ceiling.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
         // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
         // unmount), so the immortal `spawn_local` future doesn't leak per remount.
@@ -719,6 +767,16 @@ impl ScreenEncoder {
                 // so it composes with the just-observed backpressure decision.
                 encoder_control.observe_union_requested_layer(
                     shared_union_requested_layer.load(Ordering::Relaxed),
+                );
+                // User SEND layer-ceiling (perf-panel): feed the latest user-
+                // selected layer COUNT for SCREEN (u32::MAX = Auto / no cap →
+                // usize::MAX fail-open). Applied right before `tick` so the cap
+                // composes with the union hint and backpressure as a further
+                // `min`. The base layer is always published (AQ floors at 1).
+                encoder_control.observe_user_layer_ceiling(
+                    crate::encode::camera_encoder::layer_ceiling_to_count(
+                        shared_user_layer_ceiling.load(Ordering::Relaxed),
+                    ),
                 );
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());

@@ -1682,6 +1682,8 @@ impl VideoCallClient {
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+        effective_video_layers: Rc<AtomicU32>,
+        active_video_layers: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -1698,6 +1700,8 @@ impl VideoCallClient {
                         screen_transitions,
                         climb_limiter_snapshot,
                         dwell_samples,
+                        effective_video_layers,
+                        active_video_layers,
                     );
                 }
             }

@@ -48,14 +48,15 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
+    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CAPABILITY_SCORE,
+    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
     CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
     CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
     CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
-    CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_BUDGET_EFFECTIVE_CAP,
-    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
-    DECODE_BUDGET_PRESSURED, ENCODER_BITRATE_RATIO, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
+    CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
+    DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
+    DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
+    ENCODER_BITRATE_RATIO, ENCODER_EFFECTIVE_LAYERS, ENCODER_FPS_RATIO, ENCODER_OUTPUT_FPS,
     ENCODER_P75_PEER_FPS, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
@@ -266,6 +267,21 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DECODE_BUDGET_PRESSURED.remove_label_values(&reporter_labels);
     let _ = DECODE_BUDGET_OVERRIDE_MODE.remove_label_values(&reporter_labels);
     let _ = DECODE_BUDGET_OVERRIDE_FIXED_N.remove_label_values(&reporter_labels);
+    // #1143 gauges: same per-session GC so the high-cardinality session_id
+    // label leaves no residual series on disconnect.
+    let _ = DECODE_ACTIVE_SET_SIZE.remove_label_values(&reporter_labels);
+    let _ = CAPABILITY_SCORE.remove_label_values(&reporter_labels);
+    // Layer gauges carry an extra media_kind label; the client only reports the
+    // camera encoder, so the single series GC'd is media_kind="camera".
+    let layer_labels: [&str; 5] = [
+        &session_info.meeting_id,
+        &session_info.session_id,
+        &session_info.reporting_user_id,
+        &session_info.display_name,
+        "camera",
+    ];
+    let _ = ENCODER_EFFECTIVE_LAYERS.remove_label_values(&layer_labels);
+    let _ = ENCODER_ACTIVE_LAYERS.remove_label_values(&layer_labels);
 
     // TELEM-8/9 cleanup (3-label: meeting_id, session_id, display_name)
     let telem_labels: [&str; 3] = [
@@ -801,6 +817,38 @@ fn process_health_packet_to_metrics_pb(
             DECODE_BUDGET_OVERRIDE_FIXED_N
                 .with_label_values(&reporter_labels)
                 .set(db.override_fixed_n as f64);
+            // #1143: tiles ACTUALLY decoding right now (the "videos showing"
+            // count). The client stamps active_set = min(effective_cap, natural);
+            // this gauge is the realized companion to the effective_cap ceiling.
+            DECODE_ACTIVE_SET_SIZE
+                .with_label_values(&reporter_labels)
+                .set(db.active_set as f64);
+        }
+
+        // Send-side simulcast layer counts (#1143). p90==1 across a meeting is
+        // the inert-simulcast signal. The proto currently carries the CAMERA
+        // encoder's state, so these are labeled media_kind="camera".
+        if let Some(layers) = health_packet.effective_video_layers {
+            ENCODER_EFFECTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "camera",
+                ])
+                .set(layers as f64);
+        }
+        if let Some(layers) = health_packet.active_video_layers {
+            ENCODER_ACTIVE_LAYERS
+                .with_label_values(&[
+                    meeting_id,
+                    session_id,
+                    reporting_user_id,
+                    reporter_display_name.as_str(),
+                    "camera",
+                ])
+                .set(layers as f64);
         }
 
         // Tier transition events (P2): increment counter for each transition
@@ -893,6 +941,17 @@ fn process_health_packet_to_metrics_pb(
                     &score,
                 ])
                 .set(1.0);
+
+            // #1143: also export the capability score as a NUMERIC gauge so it
+            // can be thresholded/averaged/quantiled in PromQL directly, instead
+            // of only riding as a string label on CLIENT_INFO above. Only set
+            // when actually reported, so absent scores stay absent (not a
+            // misleading 0). Same per-reporter label set as the sibling gauges.
+            if let Some(cap) = health_packet.client_capability_score {
+                CAPABILITY_SCORE
+                    .with_label_values(&reporter_labels)
+                    .set(cap as f64);
+            }
         }
 
         // TELEM-8: longtask histogram observations

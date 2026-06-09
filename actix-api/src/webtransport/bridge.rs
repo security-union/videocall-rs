@@ -70,6 +70,7 @@
 
 use crate::actors::transports::wt_chat_session::{WtInbound, WtInboundSource};
 use crate::constants::MAX_FRAME_SIZE;
+use crate::metrics::RELAY_INBOUND_BRIDGE_DROPS_TOTAL;
 use actix::Addr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -198,10 +199,21 @@ impl WebTransportBridge {
     {
         join_set.spawn(async move {
             while let Ok(buf) = session.read_datagram().await {
-                let _ = actor_addr.try_send(WtInbound {
+                let len = buf.len();
+                // #1146: this is the WT audio/control path. Previously the
+                // try_send result was discarded (`let _ =`), so an inbound
+                // mailbox overflow here was completely invisible. Count every
+                // drop; keep the per-drop log at debug since datagrams are
+                // high-rate (the counter is the durable, alertable signal).
+                if let Err(e) = actor_addr.try_send(WtInbound {
                     data: buf,
                     source: WtInboundSource::Datagram,
-                });
+                }) {
+                    RELAY_INBOUND_BRIDGE_DROPS_TOTAL
+                        .with_label_values(&["webtransport", "datagram"])
+                        .inc();
+                    debug!("Dropped inbound WT datagram ({} bytes): {}", len, e);
+                }
             }
             info!("WebTransport Datagram reader ended");
         });
@@ -454,6 +466,12 @@ async fn read_framed_packets_loop<A>(
                     data: Bytes::from(payload),
                     source: WtInboundSource::UniStream,
                 }) {
+                    // #1146: count the drop so a sustained inbound-media drop is
+                    // visible on dashboards/alerts, not just in the warn log
+                    // (which at volume is itself noise/cost).
+                    RELAY_INBOUND_BRIDGE_DROPS_TOTAL
+                        .with_label_values(&["webtransport", "unistream"])
+                        .inc();
                     warn!("Dropped UniStream frame ({} bytes): {}", payload_len, e);
                 }
             }

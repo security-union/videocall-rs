@@ -227,6 +227,25 @@ message HealthPacket {
   optional uint64 reelection_aborted_total = 72;
   optional uint64 reelection_preserved_total = 73;
   optional uint64 reelection_failed_total = 74;
+
+  // Send-side simulcast layer counts (#1143). Today the "is simulcast actually
+  // engaging?" question is answerable only from console logs; these surface the
+  // publisher's live layer state so a dashboard can alert when p90==1 (inert
+  // simulcast). Mirrors the SimulcastSendSnapshot the #1095 UI panel already
+  // reads from the camera encoder's shared atomics. Camera/screen are folded
+  // into one number per kind via media_kind on the server gauge; the camera is
+  // the primary signal so these report the CAMERA encoder's state. Absent in
+  // single-stream builds is fine — a value of 1 is itself the inert signal.
+  //
+  // effective_video_layers = the number of simulcast video layers the publisher
+  // is currently configured to encode/send (the ladder depth, min(flag,
+  // capability)). Stable across PR #1135/#1136's threshold retune, which changes
+  // WHEN this is >1, not its meaning.
+  optional uint32 effective_video_layers = 75;
+  // active_video_layers = how many of those layers are CURRENTLY active
+  // (encoded + sent). The AQ controller sheds the top layer(s) under congestion,
+  // so this can be < effective_video_layers. The gap is the shed depth.
+  optional uint32 active_video_layers = 76;
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the
@@ -240,6 +259,14 @@ message DecodeBudget {
   OverrideMode override_mode = 4;  // Auto vs Fixed
   // Set only when override_mode == OVERRIDE_MODE_FIXED: the user's hard tile cap.
   uint32 override_fixed_n = 5;
+
+  // Tiles actually being decoded right now = min(effective_cap, natural)
+  // (#1143). `effective_cap` is the BUDGET ceiling and `natural` is what the
+  // layout WOULD show unconstrained; neither alone answers "how many videos is
+  // this client actually decoding?" when the layout has fewer tiles than the
+  // cap allows. This is that number — the per-client "videos showing" signal the
+  // observability issue asks for.
+  uint32 active_set = 6;
 
   // Manual override mode for the controller.
   enum OverrideMode {

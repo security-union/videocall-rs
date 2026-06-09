@@ -402,6 +402,16 @@ pub struct CameraEncoder {
     /// layers with `layer_id < active_layer_count`, so dropping the top layer
     /// cuts both egress and sender encode CPU.
     shared_active_layer_count: Rc<AtomicU32>,
+    /// Number of simulcast layers this publisher is currently configured to
+    /// encode/send — the EFFECTIVE ladder depth (#1143 observability). Published
+    /// as a shared atomic (not derived from `max_layers` on the fly) so the
+    /// health reporter can read the live value without holding the encoder, and
+    /// so it tracks dynamic changes: today it is written once at construction to
+    /// [`effective_layer_count`]; PR #1135/#1136 retunes WHEN it is >1 and will
+    /// update this atomic when the effective count changes mid-call. Distinct
+    /// from `shared_active_layer_count`, which is the shed-aware count of layers
+    /// presently active (<= effective).
+    shared_effective_layer_count: Rc<AtomicU32>,
     /// Per-layer target bitrate (bps), one atomic per ladder layer (lowest
     /// first, index == `layer_id`). Written by the AQ control loop in simulcast
     /// mode; read by the encode loop to reconfigure each layer's encoder. Empty
@@ -590,6 +600,10 @@ impl CameraEncoder {
             // effective layer count so the encode loop knows how many layers to
             // build; the control loop adjusts it down/up under congestion.
             shared_active_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
+            // #1143: effective ladder depth. Same initial value as the active
+            // count; PR #1135/#1136 will write this when the effective count
+            // changes mid-call (see field doc).
+            shared_effective_layer_count: Rc::new(AtomicU32::new(clamp_layer_count(max_layers))),
             shared_layer_bitrates_bps: Rc::new(RefCell::new(Vec::new())),
             // Sender encoder backpressure (issue #1108, Phase B). Starts at 0
             // (no frames queued); the encode loop publishes the live depth.
@@ -1160,6 +1174,23 @@ impl CameraEncoder {
     /// no cap); the controller converts it to an active-layer count.
     pub fn shared_union_requested_layer(&self) -> Rc<AtomicU32> {
         self.shared_union_requested_layer.clone()
+    }
+
+    /// Returns the EFFECTIVE simulcast layer-count atomic (#1143): how many
+    /// layers this publisher is currently configured to encode/send. Cloned into
+    /// the health reporter, which reads the current atomic value each packet.
+    /// (At this tip the atomic is written once at construction — see the field
+    /// doc on `shared_effective_layer_count`; #1135/#1136 will update it.)
+    pub fn shared_effective_layer_count(&self) -> Rc<AtomicU32> {
+        self.shared_effective_layer_count.clone()
+    }
+
+    /// Returns the ACTIVE simulcast layer-count atomic (#1143): how many of the
+    /// effective layers are presently active (encoded + sent). The AQ control
+    /// loop writes this; it is `<=` the effective count, the gap being shed
+    /// layers. Cloned into the health reporter for the active-layers metric.
+    pub fn shared_active_layer_count(&self) -> Rc<AtomicU32> {
+        self.shared_active_layer_count.clone()
     }
 
     /// Returns the shared tier transitions buffer for health reporting.

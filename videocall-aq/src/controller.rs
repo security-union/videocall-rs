@@ -727,24 +727,13 @@ impl EncoderBitrateController {
             // union-only shed means no receiver wants the rung, which is not a flap
             // and must NOT lengthen the backoff.
             let backpressure_shed = active_after_backpressure < active_before_tick;
-            if backpressure_shed
-                && self
-                    .last_probe_add_at_ms
-                    .is_some_and(|added| now - added < LAYER_PROBE_OSCILLATION_WINDOW_MS)
-            {
-                // A layer we probed-up was shed by backpressure within the
-                // oscillation window → arm/extend the penalty box and escalate the
-                // backoff (capped). The device proved it cannot yet sustain that
-                // rung.
-                self.layer_probe_penalty_until_ms = now + self.layer_probe_penalty_ms;
-                log::info!(
-                    "AQ_LAYER_PROBE: oscillation detected (probed layer shed by backpressure within {:.0}ms) — penalty box armed for {:.0}ms",
-                    LAYER_PROBE_OSCILLATION_WINDOW_MS,
-                    self.layer_probe_penalty_ms,
-                );
-                self.layer_probe_penalty_ms = (self.layer_probe_penalty_ms
-                    * LAYER_PROBE_PENALTY_BACKOFF)
-                    .min(LAYER_PROBE_PENALTY_MAX_MS);
+            if backpressure_shed {
+                // A backpressure shed of a freshly-probed layer is an oscillation.
+                // The helper arms/escalates the penalty box iff this shed fell
+                // within the oscillation window of the last probe-add. Shared with
+                // `force_congestion_cut`'s out-of-band shed (issue #1159) so both
+                // flap paths classify identically and stay in lockstep.
+                self.arm_probe_penalty_if_oscillation(now, "backpressure");
             }
             // Any shed clears the in-flight probe marker: a union-only shed is not
             // an oscillation (so we did not arm above), but the probed layer is
@@ -840,6 +829,51 @@ impl EncoderBitrateController {
                 union_cap_str,
             );
         }
+    }
+
+    /// Arm/escalate the anti-flap penalty box if the just-observed top-layer
+    /// shed is an oscillation of a recently-probed layer (issue #1141 / #1159).
+    ///
+    /// "Oscillation" = a layer the headroom probe ADDED was shed again within
+    /// [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] of that add — the device proved it
+    /// cannot yet sustain the rung, so the next probe-up is suppressed for the
+    /// current (exponentially-escalating) backoff. Returns `true` iff the penalty
+    /// was armed this call.
+    ///
+    /// Callers MUST have already confirmed a shed happened (active dropped); this
+    /// only decides whether that shed counts as a flap. It does NOT clear
+    /// `last_probe_add_at_ms` — the caller owns that, because the `tick` path
+    /// clears it on ANY shed (backpressure or union) while the out-of-band
+    /// `force_congestion_cut` path clears it on the cut it just performed.
+    ///
+    /// Two call sites share this so they cannot drift apart (issue #1159):
+    /// 1. `tick`'s in-band backpressure shed, and
+    /// 2. `force_congestion_cut`'s OUT-OF-BAND top-layer drop. Before #1159 the
+    ///    cut path touched no `layer_probe_*` field, so an uplink-driven cut of a
+    ///    probed layer never escalated the backoff and re-flapped every
+    ///    ~`CONGESTION_HOLD_MS`; routing it here fixes that.
+    ///
+    /// `cause` is a short label for the log line (e.g. `"backpressure"` or
+    /// `"congestion_cut"`) identifying which path detected the flap.
+    fn arm_probe_penalty_if_oscillation(&mut self, now: f64, cause: &str) -> bool {
+        let is_oscillation = self
+            .last_probe_add_at_ms
+            .is_some_and(|added| now - added < LAYER_PROBE_OSCILLATION_WINDOW_MS);
+        if !is_oscillation {
+            return false;
+        }
+        // A layer we probed-up was shed within the oscillation window → arm/extend
+        // the penalty box and escalate the backoff (capped).
+        self.layer_probe_penalty_until_ms = now + self.layer_probe_penalty_ms;
+        log::info!(
+            "AQ_LAYER_PROBE: oscillation detected (probed layer shed by {} within {:.0}ms) — penalty box armed for {:.0}ms",
+            cause,
+            LAYER_PROBE_OSCILLATION_WINDOW_MS,
+            self.layer_probe_penalty_ms,
+        );
+        self.layer_probe_penalty_ms = (self.layer_probe_penalty_ms * LAYER_PROBE_PENALTY_BACKOFF)
+            .min(LAYER_PROBE_PENALTY_MAX_MS);
+        true
     }
 
     /// Compute and store per-layer target bitrates for the active simulcast
@@ -1157,6 +1191,23 @@ impl EncoderBitrateController {
             // the tier floor). The next tick recomputes the per-layer bitrates
             // against the just-armed drain hold.
             self.tier_changed = true;
+
+            // Anti-flap penalty box (issue #1159): this is an OUT-OF-BAND top-layer
+            // shed — it bypasses `tick`'s backpressure block entirely, so without
+            // this the penalty box never saw it. If the layer we just dropped was
+            // one the headroom probe recently ADDED (within the oscillation
+            // window), classify it as an oscillation exactly as an in-band
+            // backpressure shed would: a self-targeted CONGESTION cut means the
+            // relay is dropping our packets, i.e. the uplink could not carry the
+            // probed rung — the same "device/path cannot sustain this layer yet"
+            // signal the backpressure path arms on. Routing it through the shared
+            // helper escalates the 15→30→60 s backoff so an uplink-driven flap that
+            // recurs every ~CONGESTION_HOLD_MS (2.5 s) backs off instead of
+            // re-probing on the same cadence forever. Mirror the `tick` path and
+            // clear the in-flight probe marker afterward: the probed layer is gone,
+            // so a LATER shed must not be penalized against this same add.
+            self.arm_probe_penalty_if_oscillation(now, "congestion_cut");
+            self.last_probe_add_at_ms = None;
         }
         if changed {
             self.tier_changed = true;
@@ -2758,6 +2809,128 @@ mod tests {
             "a union-only shed must not penalize the probe — it must re-climb on the FIRST \
              eligible window (got {}), not wait out a (wrongly-armed) penalty backoff",
             controller.active_layer_count(),
+        );
+    }
+
+    /// Issue #1159 regression: an OUT-OF-BAND `force_congestion_cut` shed of a
+    /// recently-probed layer must arm the anti-flap penalty box exactly like an
+    /// in-`tick` backpressure shed does, so an uplink-driven flap escalates the
+    /// 15→30→60 s backoff instead of re-probing every ~CONGESTION_HOLD_MS forever.
+    ///
+    /// `test_probe_blocked_by_congestion_hold` only covers suppression DURING the
+    /// 2.5 s drain hold; this covers the POST-hold re-flap. The fix is what wires
+    /// `force_congestion_cut`'s layer shed into the shared penalty helper — if
+    /// that wiring is removed, the cut touches no `layer_probe_*` field, the
+    /// penalty stays open, and BOTH assertions below fail.
+    #[test]
+    fn test_congestion_cut_of_probed_layer_arms_penalty() {
+        use crate::constants::CONGESTION_HOLD_MS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn the 2nd layer under sustained clear so `last_probe_add_at_ms` is set
+        // and we are inside the oscillation window when we cut below.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: probe earned the 2nd layer"
+        );
+
+        // The cut must land WITHIN the oscillation window of the probe-add so it
+        // classifies as a flap. `probe_step_ms()` (>= the 6 s clear window) is
+        // smaller than the 8 s oscillation window, so the LAST probe-add (one
+        // `probe_step_ms()` before `t`) is still in-window. Pin that precondition
+        // so a future retune of either constant can't silently void this test.
+        assert!(
+            probe_step_ms() < LAYER_PROBE_OSCILLATION_WINDOW_MS,
+            "test precondition: the most-recent probe-add must still be inside the \
+             oscillation window when the cut fires (probe_step={} osc_window={})",
+            probe_step_ms(),
+            LAYER_PROBE_OSCILLATION_WINDOW_MS,
+        );
+
+        // OUT-OF-BAND congestion cut: the relay is dropping our packets. This
+        // drops the top layer without going through `tick`'s backpressure block.
+        t += 1100.0; // > MIN_TIER_TRANSITION_INTERVAL_MS so the cut takes effect
+        clock.set_ms(t as u64);
+        controller.force_congestion_cut();
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the congestion cut must shed the probed top layer to the base"
+        );
+        let cut_at = t;
+
+        // DIRECT source-of-truth assertion: the cut of a probed layer MUST have
+        // armed the penalty box. Mirrors `test_union_suppression_does_not_arm_...`
+        // but in the opposite direction. If the #1159 wiring is removed this field
+        // stays at its 0.0 default (<= now) and this fails.
+        assert!(
+            controller.layer_probe_penalty_until_ms > cut_at,
+            "a congestion cut of a recently-probed layer MUST arm the anti-flap penalty box \
+             (penalty_until={} should be > now {})",
+            controller.layer_probe_penalty_until_ms,
+            cut_at,
+        );
+        // The armed window must be the base backoff measured from the shed.
+        assert!(
+            (controller.layer_probe_penalty_until_ms - (cut_at + LAYER_PROBE_PENALTY_BASE_MS))
+                .abs()
+                < 1.0,
+            "penalty must be armed for the base backoff from the shed (got until={}, expected ~{})",
+            controller.layer_probe_penalty_until_ms,
+            cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+        );
+
+        // BEHAVIORAL assertion: past the 2.5 s drain hold but still inside the 15 s
+        // penalty window, the probe must remain suppressed. Without the penalty the
+        // probe would re-add the layer as soon as the hold cleared (~2.5 s) — the
+        // exact ~CONGESTION_HOLD_MS re-flap #1159 fixes. Tick clear at a point that
+        // is past the hold yet before the penalty expires.
+        let probe_window = cut_at + CONGESTION_HOLD_MS + probe_step_ms();
+        assert!(
+            probe_window > cut_at + CONGESTION_HOLD_MS
+                && probe_window < cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+            "test precondition: the probe attempt must sit AFTER the drain hold but BEFORE the \
+             penalty expires (probe_at={} hold_until={} penalty_until={})",
+            probe_window,
+            cut_at + CONGESTION_HOLD_MS,
+            cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+        );
+        t = probe_window;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the penalty box must keep the probe suppressed after the drain hold clears — \
+             without it the probed layer would re-flap every ~CONGESTION_HOLD_MS"
+        );
+
+        // Finally, well past the penalty window, the probe is allowed again — the
+        // backoff is a delay, not a permanent lockout.
+        let mut recovered = false;
+        for _ in 0..40 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "after the penalty window the probe must be allowed to re-add the layer"
         );
     }
 }

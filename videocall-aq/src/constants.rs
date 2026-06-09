@@ -795,6 +795,13 @@ pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 /// tier step-up window, while keeping the cold-start ramp brisk: ~one rung every
 /// 6 s rather than every 12 s, so a capable publisher reaches 2 layers in ~11 s
 /// and 3 in ~17 s instead of stalling on the base rung for ~half a minute.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** The 6 s value is
+/// derived from the constant-relationship invariants above (it must exceed the
+/// shed sustain and the tier step-up window), NOT from a multi-device capture of
+/// real ramp behavior on weak uplinks / low-power CPUs. Treat it as a first cut
+/// pending a performance-reviewer pass with field data; do not mistake the
+/// detailed rationale for empirical validation.
 pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
 
 /// Headroom (fraction, 0.0–1.0) the summed active-layer uplink budget must have
@@ -820,6 +827,10 @@ pub const LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC: f64 = 0.0;
 /// span is not penalized. A compile-time invariant below pins
 /// `LAYER_PROBE_OSCILLATION_WINDOW_MS >= LAYER_PROBE_CLEAR_WINDOW_MS` so the two
 /// can never drift apart silently if the clear window is retuned.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** The 8 s value is
+/// chosen relative to the clear window, not from a capture of real add-then-shed
+/// intervals. First-guess pending a performance-reviewer pass.
 pub const LAYER_PROBE_OSCILLATION_WINDOW_MS: f64 = 8_000.0;
 
 /// Initial penalty-box backoff (milliseconds) imposed after a probed-up layer
@@ -827,6 +838,12 @@ pub const LAYER_PROBE_OSCILLATION_WINDOW_MS: f64 = 8_000.0;
 /// probe-up is suppressed until this long after the shed; each subsequent
 /// oscillation doubles it (capped at [`LAYER_PROBE_PENALTY_MAX_MS`]), so a
 /// device that flaps repeatedly settles low for the session.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** 15 s mirrors the
+/// climb-rate limiter's escalation shape (15→30→60 s) rather than a measured flap
+/// period; it is comfortably longer than the [`CONGESTION_HOLD_MS`] (2.5 s) drain
+/// hold so an uplink-driven cut backs off instead of re-flapping each hold.
+/// First-guess pending a performance-reviewer pass with field data.
 pub const LAYER_PROBE_PENALTY_BASE_MS: f64 = 15_000.0;
 
 /// Exponential backoff multiplier for the layer-probe penalty box on each repeat

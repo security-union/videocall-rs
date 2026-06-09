@@ -526,6 +526,80 @@ fn frame_is_healthy(base_ok: bool) -> bool {
     base_ok
 }
 
+/// A minimal, decoder-free view of one simulcast layer for formatting the
+/// event-driven `Simulcast layer change:` log line (issue #1106).
+///
+/// Decouples the log-string builder from the live `LayerEncoder` (which owns a
+/// `VideoEncoder` and JS closures and cannot be constructed off-wasm) so the
+/// formatting is host-testable. The encode loop projects each live
+/// `LayerEncoder` into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerView {
+    /// Simulcast layer id (== ladder position, lowest layer first).
+    id: u32,
+    /// Current encoder width for this layer.
+    w: u32,
+    /// Current encoder height for this layer.
+    h: u32,
+    /// Last bitrate (bps) applied to this layer's encoder. Displayed in kbps
+    /// for ACTIVE layers; ignored for SHED layers.
+    bitrate_bps: u32,
+}
+
+/// Classify the direction of an active-layer-count transition for the
+/// `Simulcast layer change:` log (issue #1106).
+///
+/// Returns `"shed-under-load"` when the active count fell (`cur < prev`) and
+/// `"restore"` otherwise (it rose). The caller only emits the log when
+/// `prev != cur`, so the `prev == cur` case never reaches this in practice; it
+/// is folded into `"restore"` so the function is total. Pure free function so
+/// the directional reason is host-testable and a mutation of the comparison
+/// fails a unit test.
+fn shed_reason(prev: usize, cur: usize) -> &'static str {
+    if cur < prev {
+        "shed-under-load"
+    } else {
+        "restore"
+    }
+}
+
+/// Build the human-readable message for the event-driven
+/// `Simulcast layer change:` log line (issue #1106).
+///
+/// Renders one ` | `-joined rung per layer in `layers`. A layer is ACTIVE when
+/// its `id` is below `cur` (the new active-layer count) and SHED otherwise —
+/// the same `layer_id < active` boundary the receiver/UI use. ACTIVE rungs show
+/// the live bitrate in kbps (`bitrate_bps / 1000`); SHED rungs show only the
+/// resolution (their bitrate is the zero shed marker and is not meaningful).
+///
+/// The returned string is the full log message, e.g.
+/// `Simulcast layer change: active 3->2 (reason=shed-under-load) | [0] 640x360 ~390kbps ACTIVE | ...`.
+///
+/// Pure function (no atomics / DOM / `LayerEncoder`) so the exact emitted text
+/// is host-testable and byte-stable against the encode loop. `prev`/`cur` are
+/// the previous and new active-layer counts.
+fn format_layer_transition(prev: usize, cur: usize, layers: &[LayerView]) -> String {
+    let reason = shed_reason(prev, cur);
+    let detail = layers
+        .iter()
+        .map(|l| {
+            if (l.id as usize) < cur {
+                format!(
+                    "[{}] {}x{} ~{}kbps ACTIVE",
+                    l.id,
+                    l.w,
+                    l.h,
+                    l.bitrate_bps / 1000
+                )
+            } else {
+                format!("[{}] {}x{} SHED", l.id, l.w, l.h)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("Simulcast layer change: active {prev}->{cur} (reason={reason}) | {detail}")
+}
+
 /// Threshold (number of OTHER peers) above which a single-layer publisher is
 /// pinned to the `low` rung (issue #1136).
 ///
@@ -2107,34 +2181,30 @@ impl CameraEncoder {
                         // (congestion / degrade / recover) from the controller
                         // via a small shared enum atomic so this can read e.g.
                         // reason=congestion instead of the directional fallback.
-                        let reason = if local_active_layers < prev_active_layers {
-                            "shed-under-load"
-                        } else {
-                            "restore"
-                        };
-                        let detail = layers
+                        //
+                        // The directional reason classification and the per-layer
+                        // detail formatting are extracted into host-testable pure
+                        // helpers (`shed_reason` / `format_layer_transition`,
+                        // issue #1106) so the exact emitted string is covered by a
+                        // unit test off-wasm. We project each live `LayerEncoder`
+                        // into a decoder-free `LayerView` here; the helper produces
+                        // the byte-identical message the inline block did.
+                        let layer_views: Vec<LayerView> = layers
                             .iter()
-                            .map(|l| {
-                                if (l.layer_id as usize) < local_active_layers {
-                                    format!(
-                                        "[{}] {}x{} ~{}kbps ACTIVE",
-                                        l.layer_id,
-                                        l.current_w,
-                                        l.current_h,
-                                        l.local_bitrate / 1000
-                                    )
-                                } else {
-                                    format!("[{}] {}x{} SHED", l.layer_id, l.current_w, l.current_h)
-                                }
+                            .map(|l| LayerView {
+                                id: l.layer_id,
+                                w: l.current_w,
+                                h: l.current_h,
+                                bitrate_bps: l.local_bitrate,
                             })
-                            .collect::<Vec<_>>()
-                            .join(" | ");
+                            .collect();
                         log::info!(
-                            "Simulcast layer change: active {}->{} (reason={}) | {}",
-                            prev_active_layers,
-                            local_active_layers,
-                            reason,
-                            detail
+                            "{}",
+                            format_layer_transition(
+                                prev_active_layers,
+                                local_active_layers,
+                                &layer_views
+                            )
                         );
                         prev_active_layers = local_active_layers;
                     }
@@ -2408,10 +2478,12 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_simulcast_layers, clamp_layer_count, frame_is_healthy, initial_active_layer_count,
-        is_fatal_encoder_error_message, should_pin_single_layer_low, SimulcastLayerInfo,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD,
+        build_simulcast_layers, clamp_layer_count, format_layer_transition, frame_is_healthy,
+        initial_active_layer_count, is_fatal_encoder_error_message, shed_reason,
+        should_pin_single_layer_low, LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_PEER_THRESHOLD,
     };
+    use videocall_aq::constants::simulcast_layers;
 
     #[test]
     fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {
@@ -2532,6 +2604,152 @@ mod tests {
     fn clamp_layer_count_caps_at_max_supported() {
         assert_eq!(clamp_layer_count(4), SIMULCAST_MAX_SUPPORTED_LAYERS);
         assert_eq!(clamp_layer_count(99), SIMULCAST_MAX_SUPPORTED_LAYERS);
+    }
+
+    // --- simulcast layer-transition log formatting (issue #1106) ----------
+
+    #[test]
+    fn shed_reason_is_directional() {
+        // Falling active count == a layer was shed under load; rising == restore.
+        // Pins the comparison so flipping `<` to `>`/`<=` FAILS here.
+        assert_eq!(shed_reason(3, 2), "shed-under-load");
+        assert_eq!(shed_reason(1, 3), "restore");
+        // Caller only emits on prev != cur; the equal case folds into "restore".
+        assert_eq!(shed_reason(2, 2), "restore");
+    }
+
+    #[test]
+    fn format_layer_transition_matches_canonical_shed_example() {
+        // Canonical example from issue #1106 (a 3->2 shed). The resolutions are
+        // sourced from the SAME ladder the encode loop builds layers from
+        // (`simulcast_layers(3)` == [low, standard, hd]), so they can never drift
+        // from a hand-hardcoded copy. The per-layer bitrates are RUNTIME values
+        // (the AQ controller's live `local_bitrate`, here below the tier ideals
+        // 400/900) — they are an input to the helper, not a ladder constant, so
+        // we pass them explicitly. The shed top layer (id 2) shows no bitrate.
+        let ladder = simulcast_layers(3);
+        assert_eq!(
+            ladder.len(),
+            3,
+            "canonical example assumes the 3-rung ladder"
+        );
+        let layers = [
+            LayerView {
+                id: 0,
+                w: ladder[0].max_width,
+                h: ladder[0].max_height,
+                bitrate_bps: 390_000,
+            },
+            LayerView {
+                id: 1,
+                w: ladder[1].max_width,
+                h: ladder[1].max_height,
+                bitrate_bps: 870_000,
+            },
+            LayerView {
+                id: 2,
+                w: ladder[2].max_width,
+                h: ladder[2].max_height,
+                // SHED: bitrate is the zero shed marker and must NOT be rendered.
+                bitrate_bps: 0,
+            },
+        ];
+
+        // Build the expected string from the ladder constants the code uses, so
+        // tuning the ladder updates the expectation in lockstep rather than
+        // silently diverging from a literal.
+        let expected = format!(
+            "Simulcast layer change: active 3->2 (reason=shed-under-load) | \
+             [0] {w0}x{h0} ~390kbps ACTIVE | \
+             [1] {w1}x{h1} ~870kbps ACTIVE | \
+             [2] {w2}x{h2} SHED",
+            w0 = ladder[0].max_width,
+            h0 = ladder[0].max_height,
+            w1 = ladder[1].max_width,
+            h1 = ladder[1].max_height,
+            w2 = ladder[2].max_width,
+            h2 = ladder[2].max_height,
+        );
+        // Spot-check the literal too: with today's ladder this is exactly the
+        // string in the issue. (If the ladder changes, the `expected` above is
+        // the authority; this literal documents the current shape.)
+        assert_eq!(
+            expected,
+            "Simulcast layer change: active 3->2 (reason=shed-under-load) | \
+             [0] 640x360 ~390kbps ACTIVE | [1] 960x540 ~870kbps ACTIVE | [2] 1280x720 SHED"
+        );
+
+        assert_eq!(format_layer_transition(3, 2, &layers), expected);
+    }
+
+    #[test]
+    fn format_layer_transition_active_shed_boundary_is_layer_id_lt_active() {
+        // The ACTIVE/SHED split is `layer_id < active`. With active == 2, layer 1
+        // is the last ACTIVE rung and layer 2 is the first SHED rung. This pins
+        // the boundary at `id == active`: a mutation to `<=` would flip layer 2
+        // to ACTIVE (and render a bitrate for it) and FAIL here.
+        let layers = [
+            LayerView {
+                id: 0,
+                w: 640,
+                h: 360,
+                bitrate_bps: 400_000,
+            },
+            LayerView {
+                id: 1,
+                w: 960,
+                h: 540,
+                bitrate_bps: 900_000,
+            },
+            LayerView {
+                id: 2,
+                w: 1280,
+                h: 720,
+                bitrate_bps: 0,
+            },
+        ];
+        let s = format_layer_transition(3, 2, &layers);
+        assert!(
+            s.contains("[1] 960x540 ~900kbps ACTIVE"),
+            "id 1 < 2 is ACTIVE"
+        );
+        assert!(s.contains("[2] 1280x720 SHED"), "id 2 == active is SHED");
+        assert!(
+            !s.contains("[2] 1280x720 ~"),
+            "the shed layer must not render a bitrate"
+        );
+    }
+
+    #[test]
+    fn format_layer_transition_restore_direction() {
+        // A rising active count (2 -> 3) is a restore: all three rungs ACTIVE,
+        // reason=restore. Pins the directional reason through the full formatter.
+        let layers = [
+            LayerView {
+                id: 0,
+                w: 640,
+                h: 360,
+                bitrate_bps: 400_000,
+            },
+            LayerView {
+                id: 1,
+                w: 960,
+                h: 540,
+                bitrate_bps: 900_000,
+            },
+            LayerView {
+                id: 2,
+                w: 1280,
+                h: 720,
+                bitrate_bps: 1_500_000,
+            },
+        ];
+        assert_eq!(
+            format_layer_transition(2, 3, &layers),
+            "Simulcast layer change: active 2->3 (reason=restore) | \
+             [0] 640x360 ~400kbps ACTIVE | [1] 960x540 ~900kbps ACTIVE | \
+             [2] 1280x720 ~1500kbps ACTIVE"
+        );
     }
 
     #[test]

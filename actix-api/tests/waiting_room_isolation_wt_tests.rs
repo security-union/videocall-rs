@@ -348,9 +348,7 @@ async fn wt_send_via_unistream(session: &web_transport_quinn::Session, bytes: Ve
 
 /// Send a packet over WT via a datagram.
 fn wt_send_via_datagram(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
-    session
-        .send_datagram(bytes.into())
-        .expect("send datagram");
+    session.send_datagram(bytes.into()).expect("send datagram");
 }
 
 /// Read one length-prefix framed packet from a WT `RecvStream`.
@@ -387,7 +385,7 @@ async fn wt_read_one(
     if let Some(mut stream) = persistent {
         match tokio::time::timeout(timeout, wt_read_length_prefixed_frame(&mut stream)).await {
             Ok(Some(payload)) => return (Some(payload), Some(stream)),
-            Ok(None) => return (None, None), // stream finished
+            Ok(None) => return (None, None),       // stream finished
             Err(_) => return (None, Some(stream)), // timeout, stream still alive
         }
     }
@@ -667,9 +665,7 @@ async fn test_wt_observer_inbound_media_via_unistream_is_dropped() {
     let packets = ws_collect_packets_for(&mut ws_admitted, Duration::from_secs(2)).await;
     let observer_media: Vec<_> = packets
         .iter()
-        .filter(|p| {
-            p.packet_type == PacketType::MEDIA.into() && p.user_id == b"observer@test.com"
-        })
+        .filter(|p| p.packet_type == PacketType::MEDIA.into() && p.user_id == b"observer@test.com")
         .collect();
 
     assert!(
@@ -724,9 +720,7 @@ async fn test_wt_observer_inbound_media_via_datagram_is_dropped() {
     let packets = ws_collect_packets_for(&mut ws_admitted, Duration::from_secs(2)).await;
     let observer_media: Vec<_> = packets
         .iter()
-        .filter(|p| {
-            p.packet_type == PacketType::MEDIA.into() && p.user_id == b"observer@test.com"
-        })
+        .filter(|p| p.packet_type == PacketType::MEDIA.into() && p.user_id == b"observer@test.com")
         .collect();
 
     assert!(

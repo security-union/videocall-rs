@@ -451,6 +451,19 @@ impl Connection {
         conn
     }
 
+    /// Build a test connection with an explicit transport type so transport-gated
+    /// logic (e.g. the #1179 local-WT early-seed gate) can be exercised without a
+    /// browser. `new_for_test` defaults to WEBSOCKET.
+    pub(crate) fn new_for_test_with_transport(webtransport: bool) -> Self {
+        let mut conn = Self::new_for_test();
+        conn.transport_type = if webtransport {
+            TransportType::TRANSPORT_WEBTRANSPORT
+        } else {
+            TransportType::TRANSPORT_WEBSOCKET
+        };
+        conn
+    }
+
     pub(crate) fn state_resend_is_pending(&self) -> bool {
         self.state_resend.borrow().is_some()
     }

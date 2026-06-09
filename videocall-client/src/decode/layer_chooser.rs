@@ -40,9 +40,14 @@
 //! The receive path tracks per peer-stream loss/PLI rates, which the client
 //! folds into the chooser once per **monitor tick — every 5s**
 //! (`connection.rs`'s `heartbeat_monitor = Interval::new(5000, …)` drives
-//! `run_peer_monitor` → `tick_layer_choosers`). Each `DownlinkSample` therefore
-//! represents ~5s of reception, NOT ~1s; the constants below are tuned for that
-//! 5s cadence (e.g. `STEP_UP_CLEAN_WINDOWS = 3` ≈ 15s of sustained headroom).
+//! `run_peer_monitor` → `tick_layer_choosers`). The loss/PLI window itself rolls
+//! over every ~1s (`peer_decode_manager.rs`'s `observe_window`), and
+//! `last_video_downlink` is OVERWRITTEN with each new ~1s window's rates — it is
+//! NOT accumulated. So the chooser is fed the LATEST ~1s sample once per 5s tick
+//! (it does not aggregate 5s of reception). The constants below are still tuned
+//! for that 5s decision cadence because `choose` is CALLED every 5s — e.g.
+//! `STEP_UP_CLEAN_WINDOWS = 3` requires 3 consecutive clean ticks ≈ 15s of
+//! sustained headroom.
 //! The two per-window rate signals are:
 //!   * `loss_per_sec` — packets that shifted off the reorder window unseen.
 //!     Direct evidence the downlink is dropping this source's video.

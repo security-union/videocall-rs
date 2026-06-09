@@ -664,20 +664,26 @@ fn send_layer_preference_via(
 ///   * `try_borrow_mut`s `Inner`; on a transient borrow conflict it SKIPS this
 ///     cycle (the next tick retries) and never triggers a reconnect — same
 ///     discipline as the `peer_monitor` closure;
-///   * drives [`PeerDecodeManager::seed_early_congestion_for_wt_peers`] (WT-only,
-///     transport evaluated live inside the tick) and then publishes the
+///   * gates on THIS client's LOCAL active transport via
+///     [`ConnectionController::active_is_webtransport`] — the deciding signal for
+///     #1179 is "am I (the receiver) on WebTransport", a single client-wide
+///     boolean, NOT a per-peer property. When the local transport is not WT (or
+///     no connection is active yet) the tick returns early and seeds nothing,
+///     preserving the M2 healthy cold-start for WS clients;
+///   * otherwise drives [`PeerDecodeManager::seed_early_congestion_for_wt_peers`]
+///     (which now seeds purely on the per-peer congestion gate — the WT decision
+///     has already been made on the local transport) and then publishes the
 ///     READ-ONLY [`PeerDecodeManager::current_desired_preferences`] map through
 ///     the existing [`LayerPreferenceSender`], so `last_sent`/`last_sent_ms` stay
 ///     coherent and the next 5s tick does not re-send a redundant packet.
 ///
 /// LIFECYCLE DECISION (issue #1179): the timer runs the FULL window and seeds any
-/// WT peer that shows early congestion, rather than cancelling after the first
-/// seed. Rationale: at the scale target (~20 users) peers arrive in a join WAVE;
-/// a peer's `transport_type` is UNKNOWN at add and only populates after its first
-/// heartbeat, so several WT peers can become eligible at staggered times within
-/// the window. Cancelling on the first seed would leave later WT joiners
-/// unseeded for up to a full 5s tick — exactly the stall this fix removes. The
-/// window is still strictly bounded, so this is not an unbounded loop.
+/// congested peer rather than cancelling after the first seed. Rationale: at the
+/// scale target (~20 users) peers arrive in a join WAVE and become congested at
+/// staggered times within the window. Cancelling on the first seed would leave
+/// later joiners unseeded for up to a full 5s tick — exactly the stall this fix
+/// removes. The window is still strictly bounded, so this is not an unbounded
+/// loop.
 fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Option<Interval>>>) {
     // Guard: exactly one timer. If already armed (Some), do nothing.
     let mut slot_borrow = match slot.try_borrow_mut() {
@@ -724,13 +730,38 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
             return;
         };
 
-        // WT-only early seed (transport evaluated live inside the manager).
+        // WT-only gate, evaluated on THIS client's LOCAL active transport — NOT
+        // per-peer. #1179's root cause is the local DOWNLINK being WebTransport
+        // (reliable-unistream flow-control pinning under simulcast fan-out), so
+        // the deciding signal is "am I on WT", a single client-wide boolean. The
+        // relay is a broadcast relay: each client elects exactly one transport.
+        // A peer's announced `transport_type` (its own uplink) is the wrong
+        // signal — it could differ from this receiver's downlink. If no
+        // connection is active yet (cold start / pre-election) the accessor
+        // returns false → no seed (matches the M2 healthy cold-start).
+        let local_is_wt = match inner.connection_controller.try_borrow() {
+            Ok(slot) => slot
+                .as_ref()
+                .map(|cc| cc.active_is_webtransport())
+                .unwrap_or(false),
+            // Controller cell momentarily borrowed → treat as not-WT and skip
+            // this cycle; the next tick (within the bounded window) retries.
+            Err(_) => false,
+        };
+        if !local_is_wt {
+            return;
+        }
+
+        // Seed any peer showing early congestion. The WT decision was already
+        // made above on the local transport, so this loop no longer reads any
+        // per-peer transport — it seeds purely on the congestion gate inside
+        // `observe_early_congestion`.
         inner
             .peer_decode_manager
             .seed_early_congestion_for_wt_peers(now_ms);
 
         // Publish the resulting (read-only) desired map through the existing
-        // sender so dedup/rate-limit invariants hold. A clean WT join seeds
+        // sender so dedup/rate-limit invariants hold. A clean join seeds
         // nothing → empty/unchanged map → sender suppresses → no packet (M2).
         let desired = inner.peer_decode_manager.current_desired_preferences();
         if let Some(entries) = inner

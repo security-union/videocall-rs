@@ -2065,31 +2065,34 @@ impl PeerDecodeManager {
         desired
     }
 
-    /// Early-seed congestion across every WEBTRANSPORT peer (issue #1179, Part B).
+    /// Early-seed congestion across every peer showing an early-congested sample
+    /// (issue #1179, Part B).
     ///
-    /// Drives [`Peer::seed_early_congestion`] for each peer whose LIVE
-    /// `transport_type` is [`TransportType::TRANSPORT_WEBTRANSPORT`]. WS / UNKNOWN
-    /// peers are skipped entirely so the M2 healthy cold-start is preserved for
-    /// them — the WT gate is evaluated HERE, per tick, not at install time,
-    /// because `transport_type` is UNKNOWN when a peer is first added and only
-    /// populates once the peer's first heartbeat lands (well within the seed
-    /// window). The early-seed primitive is itself a no-op on a clean sample, so
-    /// even a WT peer that is healthy at join is seeded nothing.
+    /// Drives [`Peer::seed_early_congestion`] for each connected peer; the
+    /// primitive is itself a no-op on a clean sample, so a peer healthy at join
+    /// is seeded nothing. The early-seed primitive's `observe_early_congestion`
+    /// congestion gate is the only thing deciding whether a given peer flips to
+    /// constrained.
     ///
-    /// Returns `true` if any WT peer was actually seeded (a congested early
-    /// sample flipped it to constrained). The caller still emits the resulting
+    /// NOTE — the WebTransport gate is NOT here. #1179's root cause is THIS
+    /// client's own downlink being WebTransport (reliable-unistream flow-control
+    /// pinning), which is a single client-wide boolean — NOT a per-peer property.
+    /// A peer's announced `transport_type` describes that *remote sender's*
+    /// uplink and is the wrong signal for a downlink-pinning bug. The local-WT
+    /// decision is therefore made ONCE by the caller
+    /// ([`crate::client::video_call_client`]'s early-seed timer tick) on the
+    /// client's active connection transport, and this loop is only ever reached
+    /// when that gate has passed. Keeping the gate at the call site makes the
+    /// WT-only semantics explicit and removes any per-peer transport read here.
+    ///
+    /// Returns `true` if any peer was actually seeded (a congested early sample
+    /// flipped it to constrained). The caller still emits the resulting
     /// preference through the normal [`LayerPreferenceSender`] path via
     /// [`Self::current_desired_preferences`].
     pub fn seed_early_congestion_for_wt_peers(&mut self, now_ms: u64) -> bool {
         let mut seeded = false;
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
-                // WT-ONLY: evaluate the live transport at tick time. UNKNOWN at
-                // peer-add → only WT peers whose heartbeat has populated the
-                // field are seeded; WS/UNKNOWN get nothing.
-                if peer.transport_type != TransportType::TRANSPORT_WEBTRANSPORT {
-                    continue;
-                }
                 if peer.seed_early_congestion(now_ms) {
                     seeded = true;
                 }
@@ -5071,15 +5074,17 @@ mod tests {
         peer
     }
 
-    /// WT-ONLY: the early seed constrains a congested WEBTRANSPORT peer but must
-    /// leave a WEBSOCKET (and UNKNOWN) peer with the SAME congested downlink
-    /// completely untouched (M2 cold-start preserved for non-WT).
+    /// The early seed constrains EVERY congested peer regardless of the peer's
+    /// announced (remote-uplink) `transport_type`. The WebTransport gate is NOT
+    /// per-peer — it lives at the call site (the early-seed timer tick), keyed on
+    /// THIS client's LOCAL active transport. So at this layer a congested WS- or
+    /// UNKNOWN-announcing peer must be seeded exactly like a WT-announcing one.
     ///
-    /// MUTATION CHECK: fails if the `transport_type != TRANSPORT_WEBTRANSPORT`
-    /// gate in `seed_early_congestion_for_wt_peers` is removed/inverted — then the
-    /// WS peer would be seeded too and its desired map would be non-empty.
+    /// MUTATION CHECK: fails if a per-peer `transport_type` gate is (re)introduced
+    /// into `seed_early_congestion_for_wt_peers` — then the WS/UNKNOWN peers would
+    /// NOT be seeded and their desired entries would be missing.
     #[wasm_bindgen_test]
-    fn early_seed_is_wt_only() {
+    fn early_seed_constrains_congested_peers_regardless_of_peer_transport() {
         use crate::decode::layer_chooser::PrefMediaKind;
         let mut manager = PeerDecodeManager::new();
         manager.connected_peers.insert(
@@ -5096,33 +5101,24 @@ mod tests {
         );
 
         let seeded = manager.seed_early_congestion_for_wt_peers(2000);
-        assert!(
-            seeded,
-            "the WT peer's congested sample must seed a constrain"
-        );
+        assert!(seeded, "the congested peers' samples must seed a constrain");
 
         let desired = manager.current_desired_preferences();
-        // WT peer (100): video constrained from top (2) down to 1, audio proxied
-        // by the same congested video window also drops to 1.
-        assert_eq!(
-            desired.get(&(100, PrefMediaKind::Video)),
-            Some(&1),
-            "WT peer must be constrained to layer 1 by the early seed"
-        );
-        assert_eq!(
-            desired.get(&(100, PrefMediaKind::Audio)),
-            Some(&1),
-            "WT peer audio (video-proxied) must also constrain"
-        );
-        // WS + UNKNOWN peers must NOT appear — they were never seeded.
-        assert!(
-            !desired.keys().any(|(sid, _)| *sid == 200),
-            "WS peer must NOT be seeded (M2 cold-start preserved): {desired:?}"
-        );
-        assert!(
-            !desired.keys().any(|(sid, _)| *sid == 300),
-            "UNKNOWN-transport peer must NOT be seeded: {desired:?}"
-        );
+        // Every congested peer (any announced transport): video constrained from
+        // top (2) down to 1, audio proxied by the same congested video window.
+        for sid in [100u64, 200, 300] {
+            assert_eq!(
+                desired.get(&(sid, PrefMediaKind::Video)),
+                Some(&1),
+                "peer {sid} must be constrained to layer 1 by the early seed \
+                 (per-peer transport must NOT gate the seed): {desired:?}"
+            );
+            assert_eq!(
+                desired.get(&(sid, PrefMediaKind::Audio)),
+                Some(&1),
+                "peer {sid} audio (video-proxied) must also constrain: {desired:?}"
+            );
+        }
     }
 
     /// M2 non-regression: a HEALTHY WT joiner (clean downlink) must be seeded

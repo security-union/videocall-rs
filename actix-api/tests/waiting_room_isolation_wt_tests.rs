@@ -343,7 +343,11 @@ async fn wt_send_via_unistream(session: &web_transport_quinn::Session, bytes: Ve
         .await
         .expect("write length header");
     s.write_all(&bytes).await.expect("write payload");
-    let _ = s.finish();
+    // Await finish to ensure the framed packet is fully flushed before the
+    // server's per-stream reader runs. Swallowing the error (the prior
+    // `let _ = s.finish()` pattern) risks the reader seeing a truncated
+    // frame under load, making inbound tests flaky.
+    s.finish().expect("finish uni-stream");
 }
 
 /// Send a packet over WT via a datagram.
@@ -569,15 +573,137 @@ async fn test_wt_admitted_receives_media_from_ws_admitted() {
     drop(wt_session);
 }
 
+/// Inbound positive control (uni-stream): an admitted WT participant sends
+/// VIDEO media via uni-stream and the admitted WS participant receives it.
+///
+/// This is the load-bearing control for `test_wt_observer_inbound_media_via
+/// _unistream_is_dropped`: without it, a broken uni-stream inbound path would
+/// make the negative test pass vacuously ("nobody received anything").
+#[actix_rt::test]
+#[serial]
+async fn test_wt_admitted_inbound_unistream_reaches_ws_peer() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 1;
+    let wt_port = WT_ISO_WT_PORT_BASE + 1;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+
+    let room = "wt-iso-inbound-uni-ctrl";
+
+    // Admitted participant connects via WS.
+    let token_ws = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws = ws_connect_with_token(ws_port, &token_ws).await;
+    let _sid_ws = ws_wait_for_session_assigned(&mut ws).await;
+    ws_wait_for_meeting_started(&mut ws).await;
+
+    // Admitted participant connects via WT.
+    let token_wt = make_admitted_token("bob@test.com", room, "Bob");
+    let wt_session = connect_wt_with_token(&token_wt, wt_port)
+        .await
+        .expect("WT admitted connection should succeed");
+    let _persistent = wt_wait_for_session_assigned(&wt_session).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bob (WT) sends VIDEO media via uni-stream. VIDEO routes through the
+    // uni-stream inbound path (bridge.rs accept_uni → read_framed_packets_loop).
+    let media_bytes = make_media_packet_typed("bob@test.com", MediaType::VIDEO);
+    wt_send_via_unistream(&wt_session, media_bytes).await;
+
+    // Alice (WS) should receive the MEDIA packet.
+    let packets = ws_collect_packets_for(&mut ws, Duration::from_secs(3)).await;
+    let media_packets: Vec<_> = packets
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+
+    assert!(
+        !media_packets.is_empty(),
+        "Admitted WS session Alice MUST receive MEDIA sent by admitted WT session Bob \
+         via uni-stream. Got {} total packets but none were MEDIA. Packet types: {:?}. \
+         If this fails, the WT uni-stream inbound path is broken — the observer \
+         inbound uni-stream test is unreliable.",
+        packets.len(),
+        packets
+            .iter()
+            .map(|p| p.packet_type.enum_value())
+            .collect::<Vec<_>>()
+    );
+
+    drop(ws);
+    drop(wt_session);
+}
+
+/// Inbound positive control (datagram): an admitted WT participant sends AUDIO
+/// media via datagram and the admitted WS participant receives it.
+///
+/// This is the load-bearing control for `test_wt_observer_inbound_media_via
+/// _datagram_is_dropped`. No other test in the repo exercises the WT datagram
+/// inbound path for media delivery — the only prior `send_datagram` usage is
+/// the 4-byte keep-alive ping, which is short-circuited at
+/// `wt_chat_session.rs:776` before `handle_inbound` runs.
+#[actix_rt::test]
+#[serial]
+async fn test_wt_admitted_inbound_datagram_reaches_ws_peer() {
+    let ws_port = WT_ISO_WS_PORT_BASE + 2;
+    let wt_port = WT_ISO_WT_PORT_BASE + 2;
+    setup_ws_and_wt_server(ws_port, wt_port).await;
+
+    let room = "wt-iso-inbound-dgram-ctrl";
+
+    // Admitted participant connects via WS.
+    let token_ws = make_admitted_token("alice@test.com", room, "Alice");
+    let mut ws = ws_connect_with_token(ws_port, &token_ws).await;
+    let _sid_ws = ws_wait_for_session_assigned(&mut ws).await;
+    ws_wait_for_meeting_started(&mut ws).await;
+
+    // Admitted participant connects via WT.
+    let token_wt = make_admitted_token("bob@test.com", room, "Bob");
+    let wt_session = connect_wt_with_token(&token_wt, wt_port)
+        .await
+        .expect("WT admitted connection should succeed");
+    let _persistent = wt_wait_for_session_assigned(&wt_session).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bob (WT) sends AUDIO media via datagram. The packet is small enough to
+    // fit within QUIC datagram MTU and routes through the datagram inbound
+    // path (bridge.rs read_datagram → WtInbound { source: Datagram }).
+    let media_bytes = make_media_packet("bob@test.com");
+    wt_send_via_datagram(&wt_session, media_bytes);
+
+    // Alice (WS) should receive the MEDIA packet.
+    let packets = ws_collect_packets_for(&mut ws, Duration::from_secs(3)).await;
+    let media_packets: Vec<_> = packets
+        .iter()
+        .filter(|p| p.packet_type == PacketType::MEDIA.into())
+        .collect();
+
+    assert!(
+        !media_packets.is_empty(),
+        "Admitted WS session Alice MUST receive MEDIA sent by admitted WT session Bob \
+         via datagram. Got {} total packets but none were MEDIA. Packet types: {:?}. \
+         If this fails, the WT datagram inbound path is broken — the observer \
+         inbound datagram test is unreliable.",
+        packets.len(),
+        packets
+            .iter()
+            .map(|p| p.packet_type.enum_value())
+            .collect::<Vec<_>>()
+    );
+
+    drop(ws);
+    drop(wt_session);
+}
+
 /// An observer connected via WebTransport MUST NOT receive MEDIA packets sent
 /// by an admitted participant connected via WebSocket. This exercises the
-/// outbound allowlist in `chat_server.rs::handle_msg` on the WT delivery path,
-/// proving cross-transport isolation.
+/// outbound allowlist in `chat_server.rs::handle_msg` on the WT outbound
+/// delivery/serialization path — the same shared allowlist the WS tests cover,
+/// but now verified through the WT writer leg.
 #[actix_rt::test]
 #[serial]
 async fn test_wt_observer_does_not_receive_media() {
-    let ws_port = WT_ISO_WS_PORT_BASE + 1;
-    let wt_port = WT_ISO_WT_PORT_BASE + 1;
+    let ws_port = WT_ISO_WS_PORT_BASE + 3;
+    let wt_port = WT_ISO_WT_PORT_BASE + 3;
     setup_ws_and_wt_server(ws_port, wt_port).await;
 
     let room = "wt-iso-outbound-media";
@@ -635,8 +761,8 @@ async fn test_wt_observer_does_not_receive_media() {
 #[actix_rt::test]
 #[serial]
 async fn test_wt_observer_inbound_media_via_unistream_is_dropped() {
-    let ws_port = WT_ISO_WS_PORT_BASE + 2;
-    let wt_port = WT_ISO_WT_PORT_BASE + 2;
+    let ws_port = WT_ISO_WS_PORT_BASE + 4;
+    let wt_port = WT_ISO_WT_PORT_BASE + 4;
     setup_ws_and_wt_server(ws_port, wt_port).await;
 
     let room = "wt-iso-inbound-uni";
@@ -690,8 +816,8 @@ async fn test_wt_observer_inbound_media_via_unistream_is_dropped() {
 #[actix_rt::test]
 #[serial]
 async fn test_wt_observer_inbound_media_via_datagram_is_dropped() {
-    let ws_port = WT_ISO_WS_PORT_BASE + 3;
-    let wt_port = WT_ISO_WT_PORT_BASE + 3;
+    let ws_port = WT_ISO_WS_PORT_BASE + 5;
+    let wt_port = WT_ISO_WT_PORT_BASE + 5;
     setup_ws_and_wt_server(ws_port, wt_port).await;
 
     let room = "wt-iso-inbound-dgram";
@@ -740,13 +866,16 @@ async fn test_wt_observer_inbound_media_via_datagram_is_dropped() {
 /// (SESSION_ASSIGNED, MEETING). All other packet types — MEDIA, AES_KEY,
 /// RSA_PUB_KEY, DIAGNOSTICS, etc. — must be dropped by the outbound filter.
 ///
-/// This is the completeness check for the outbound allowlist across the
-/// WT transport boundary.
+/// The allowlist itself (`chat_server.rs:3693-3711`) is transport-agnostic
+/// shared code already covered by the WS tests. This test verifies the WT
+/// outbound delivery/serialization leg — that packets which pass the
+/// allowlist are correctly delivered over the WT writer, and those that
+/// don't are not.
 #[actix_rt::test]
 #[serial]
 async fn test_wt_observer_receives_only_allowlisted_packets() {
-    let ws_port = WT_ISO_WS_PORT_BASE + 4;
-    let wt_port = WT_ISO_WT_PORT_BASE + 4;
+    let ws_port = WT_ISO_WS_PORT_BASE + 6;
+    let wt_port = WT_ISO_WT_PORT_BASE + 6;
     setup_ws_and_wt_server(ws_port, wt_port).await;
 
     let room = "wt-iso-allowlist";

@@ -20,14 +20,19 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *      `perf-vu-*` testids were KEPT on the new container so selectors resolve.)
  *   2. A dual-thumb range slider (two overlaid native `<input type="range">`:
  *      min/left = worst quality, max/right = best quality) plus a per-stream
- *      "?" help button and an "Auto" toggle button (`aria-pressed`).
+ *      "?" help button and a small "Reset" button (#1131 §D — REPLACES the former
+ *      "Auto" toggle; the `perf-{kind}-auto` testid was REPURPOSED onto Reset, so
+ *      selectors resolve unchanged).
  *
- * Auto is the default for all three streams. While Auto is ON the toggle is
- * `aria-pressed="true"` (green `is-active`) AND the slider is **fully
- * interactive** (NOT disabled) with both thumbs pinned at the extremes (min at
- * position 0, max at the top position) so it visibly shows the full ladder span.
- * Turning Auto off flips the toggle to `aria-pressed="false"`; dragging a thumb
- * inward also turns Auto off. There is no `disabled` state on the inputs.
+ * The full automatic range is the default for all three streams. At the full
+ * range the Reset button is **disabled** (nothing to reset) and the slider is
+ * **fully interactive** (NOT disabled) with both thumbs pinned at the extremes
+ * (min at position 0, max at the top position) so it visibly shows the full
+ * ladder span. Dragging a thumb inward sets manual limits (leaving the full
+ * range) and ENABLES Reset; clicking Reset clears both limits back to the full
+ * automatic range (thumbs snap to the extremes, Reset goes disabled again). The
+ * Reset button is NOT a toggle, so it carries no `aria-pressed`. There is no
+ * `disabled` state on the slider inputs.
  *
  * Choices persist to `localStorage["vc_performance_quality"]` as a
  * `PerformancePreference` JSON object:
@@ -310,25 +315,26 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(panel.locator('[data-testid="perf-vu-audio"]')).toBeVisible();
     await expect(panel.locator('[data-testid="perf-vu-screen"]')).toBeVisible();
 
-    // ── Three threshold groups: assert each stream's slider pair + Auto + help ──
+    // ── Three threshold groups: assert each stream's slider pair + help ──
+    // (#1131 §D: the former "Auto" toggle was replaced by a "Reset" button that is
+    // CONDITIONALLY RENDERED — absent at the default full range, present only when
+    // constrained. The `perf-{stream}-auto` testid was REPURPOSED onto Reset.)
     for (const stream of ["video", "audio", "screen"] as const) {
       await expect(panel.locator(`[data-testid="perf-${stream}-range-min"]`)).toBeVisible();
       await expect(panel.locator(`[data-testid="perf-${stream}-range-max"]`)).toBeVisible();
-      await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toBeVisible();
       await expect(panel.locator(`[data-testid="perf-${stream}-help"]`)).toBeVisible();
     }
 
-    // ── Default = all-Auto: every toggle pressed, but sliders stay ENABLED with
-    //    both thumbs pinned at the extremes (min at 0, max at the top position).
+    // ── Default = full automatic range: the Reset button is ABSENT (nothing to
+    //    reset → the slot is empty), the sliders are ENABLED, and both thumbs are
+    //    pinned at the extremes (min at 0, max at the top position).
     const topPos = { video: 7, audio: 3, screen: 2 } as const;
     for (const stream of ["video", "audio", "screen"] as const) {
-      await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveAttribute(
-        "aria-pressed",
-        "true",
-      );
+      // Reset not rendered while at the full default range.
+      await expect(panel.locator(`[data-testid="perf-${stream}-auto"]`)).toHaveCount(0);
       const minInput = panel.locator(`[data-testid="perf-${stream}-range-min"]`);
       const maxInput = panel.locator(`[data-testid="perf-${stream}-range-max"]`);
-      // Sliders are interactive while Auto (the refinement: never disabled).
+      // Sliders are interactive at the full range (never disabled).
       await expect(minInput).toBeEnabled();
       await expect(maxInput).toBeEnabled();
       // Thumbs span the full ladder: min at position 0, max at the top position.
@@ -371,44 +377,44 @@ test.describe("Performance settings panel (#961)", () => {
     ).toBeLessThanOrEqual(1);
   });
 
-  test("Auto toggle: flips aria-pressed and snaps thumbs to extremes; slider stays enabled throughout", async ({
+  test("Reset button: absent at the full range, appears after a thumb drag, and clears back to the full range when clicked (#1131)", async ({
     page,
   }) => {
-    await joinMeeting(page, "auto_toggle");
+    await joinMeeting(page, "reset_button");
     await openPerformanceTab(page);
     await selectSendDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
-    const autoBtn = panel.locator('[data-testid="perf-video-auto"]');
+    // The former "Auto" toggle is now a conditionally-rendered "Reset" button; the
+    // `perf-video-auto` testid was repurposed onto it. It is not a toggle (no
+    // aria-pressed) and is only present while the stream is constrained.
+    const resetBtn = panel.locator('[data-testid="perf-video-auto"]');
     const minInput = panel.locator('[data-testid="perf-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-video-range-max"]');
 
-    // Default: Auto on → pressed, inputs ENABLED, thumbs at extremes (0 and 7).
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
+    // Default: full automatic range → Reset is ABSENT, sliders ENABLED, thumbs at
+    // the extremes (0 and 7).
+    await expect(resetBtn).toHaveCount(0);
     await expect(minInput).toBeEnabled();
     await expect(maxInput).toBeEnabled();
     await expect(minInput).toHaveValue("0");
     await expect(maxInput).toHaveValue("7");
 
-    // Turn Auto OFF via the button → pressed flips false; inputs stay enabled.
-    await autoBtn.click();
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
-    await expect(minInput).toBeEnabled();
-    await expect(maxInput).toBeEnabled();
-
-    // Drag a thumb inward → range narrows and Auto remains off.
+    // Drag a thumb inward → manual limits → Reset APPEARS as a live button.
     await setRangeValue(page, "perf-video-range-max", 5);
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
     await expect(maxInput).toHaveValue("5");
+    await expect(resetBtn).toBeVisible();
+    await expect(resetBtn).toHaveText("Reset");
+    await expect(resetBtn).not.toHaveAttribute("aria-pressed", /.*/);
 
-    // Turn Auto back ON → pressed true, thumbs snap back to the extremes, and the
-    // inputs are STILL enabled (never disabled by Auto).
-    await autoBtn.click();
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
-    await expect(minInput).toBeEnabled();
-    await expect(maxInput).toBeEnabled();
+    // Click Reset → thumbs snap back to the extremes, Reset DISAPPEARS again, and
+    // the inputs stay enabled throughout.
+    await resetBtn.click();
     await expect(minInput).toHaveValue("0");
     await expect(maxInput).toHaveValue("7");
+    await expect(resetBtn).toHaveCount(0);
+    await expect(minInput).toBeEnabled();
+    await expect(maxInput).toBeEnabled();
   });
 
   test("help popover: '?' opens an explanation, Escape and outside-click dismiss it", async ({
@@ -466,20 +472,18 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Turn video Auto off so the stream is in manual mode (bounds persist).
-    await panel.locator('[data-testid="perf-video-auto"]').click();
-    await expect(panel.locator('[data-testid="perf-video-auto"]')).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
-    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
-
-    // Move both thumbs inward to a non-extreme range. Slider positions are in
-    // "position space" (0 = worst/left … max = best/right); 8 video tiers ⇒
-    // positions 0..7. Pick min=position 2, max=position 5 — strictly interior so
-    // neither bound is an Auto-extreme (the panel maps an extreme back to null).
+    // Enter manual mode by dragging thumbs inward (the former "Auto" toggle is now
+    // a Reset button, disabled at the full range — dragging is what leaves Auto).
+    // Move both thumbs to a non-extreme range. Slider positions are in "position
+    // space" (0 = worst/left … max = best/right); 8 video tiers ⇒ positions 0..7.
+    // Pick min=position 2, max=position 5 — strictly interior so neither bound is
+    // an Auto-extreme (the panel maps an extreme back to null).
     await setRangeValue(page, "perf-video-range-min", 2);
     await setRangeValue(page, "perf-video-range-max", 5);
+    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
+    // With manual bounds set, the Reset button is now RENDERED (it is absent at
+    // the full default range and only appears when constrained).
+    await expect(panel.locator('[data-testid="perf-video-auto"]')).toBeVisible();
 
     // localStorage must reflect: video no longer Auto, and concrete bounds set.
     // Poll because the controlled-component write is async to the event.
@@ -532,11 +536,8 @@ test.describe("Performance settings panel (#961)", () => {
     await selectSendDirection(page);
     const panelAfter = page.locator("#settings-panel-performance");
 
-    // Auto still off after restore.
-    await expect(panelAfter.locator('[data-testid="perf-video-auto"]')).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
+    // Manual bounds restored (not the full range) → the Reset button is RENDERED.
+    await expect(panelAfter.locator('[data-testid="perf-video-auto"]')).toBeVisible();
     await expect(panelAfter.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
 
     // The restored range text matches what was set before the reload.
@@ -588,25 +589,48 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Turn video Auto off so the stream is in manual mode (bounds persist).
-    await panel.locator('[data-testid="perf-video-auto"]').click();
-    await expect(panel.locator('[data-testid="perf-video-auto"]')).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
-    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
-
     // Pin both thumbs to the SAME interior position so best == worst (a single
-    // fixed tier). The thumbs cannot cross, so set min first then max to the
-    // same position. Position 3 is interior for the 8-tier video slider.
+    // fixed tier). Dragging a thumb leaves the full automatic range (no toggle
+    // click needed — the former Auto toggle is now a Reset button). The thumbs
+    // cannot cross, so set min first then max to the same position. Position 3 is
+    // interior for the 8-tier video slider.
     await setRangeValue(page, "perf-video-range-min", 3);
     await setRangeValue(page, "perf-video-range-max", 3);
+    await expect(panel.locator('[data-testid="perf-video-range-min"]')).toBeEnabled();
 
     // The "Fixed" badge for the video stream becomes visible once both bounds
     // resolve to the same tier.
     await expect(panel.locator('[data-testid="perf-video-fixed-badge"]')).toBeVisible({
       timeout: 10_000,
     });
+  });
+
+  test("send rung strip + directional arrows render (#1131)", async ({ page }) => {
+    // §2: AUDIO always renders a single-pip SEND rung strip (it has no per-layer
+    // encoder snapshot, so the pip comes from the user's best-allowed tier). That
+    // pip is present even single-page with no peers, so it is the deterministic
+    // anchor for the strip markup. §1: each side title is prefixed with an
+    // aria-hidden directional arrow (`.perf-dir-arrow`).
+    await joinMeeting(page, "send_rungs");
+    await openPerformanceTab(page);
+    await selectSendDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    // The audio send rung strip is a role=img container with at least one pip.
+    const audioStrip = panel.locator('[data-testid="perf-audio-send-rungs"]');
+    await expect(audioStrip).toBeVisible({ timeout: 5_000 });
+    await expect(audioStrip).toHaveAttribute("role", "img");
+    // Exactly one pip for audio (single conceptual rung). Its testid is
+    // `perf-audio-send-rung-{tier-index}`; match the prefix.
+    const audioPips = panel.locator('[data-testid^="perf-audio-send-rung-"]');
+    await expect(audioPips).toHaveCount(1);
+
+    // §1 directional arrows: present on BOTH a Sending and a Receiving title, and
+    // aria-hidden so they are decorative (the title text is the a11y label).
+    const arrows = panel.locator(".perf-dir-arrow");
+    expect(await arrows.count()).toBeGreaterThanOrEqual(2);
+    await expect(arrows.first()).toHaveAttribute("aria-hidden", "true");
   });
 });
 
@@ -675,7 +699,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toBeVisible();
   });
 
-  test("receive row renders a range slider, Auto toggle, and needle for each kind", async ({
+  test("receive row renders a range slider, needle, and help for each kind (Reset absent at full range)", async ({
     page,
   }) => {
     await joinMeeting(page, "recv_render");
@@ -701,10 +725,13 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
         panel.locator(`[data-testid="perf-recv-${kind}-range-max"]`),
         `${kind} receive max thumb present`,
       ).toBeVisible();
+      // The Reset button is conditionally rendered (#1131 §D): ABSENT at the
+      // default full range, present only when constrained. This block joins
+      // single-page with no manual bounds, so it must be absent here.
       await expect(
         panel.locator(`[data-testid="perf-recv-${kind}-auto"]`),
-        `${kind} receive Auto toggle present`,
-      ).toBeVisible();
+        `${kind} receive Reset button absent at the full default range`,
+      ).toHaveCount(0);
       await expect(
         panel.locator(`[data-testid="perf-recv-${kind}-help"]`),
         `${kind} receive help button present`,
@@ -712,7 +739,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     }
   });
 
-  test("receive row defaults to Auto with both thumbs at the extremes", async ({ page }) => {
+  test("receive row defaults to the full range with the Reset button absent and thumbs at the extremes", async ({
+    page,
+  }) => {
     await joinMeeting(page, "recv_auto_default");
     await openPerformanceTab(page);
     await selectReceiveDirection(page);
@@ -720,12 +749,11 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     const panel = page.locator("#settings-panel-performance");
 
     for (const kind of ["video", "audio", "screen"] as const) {
-      // Default = Auto ON (aria-pressed="true"), slider fully interactive with
-      // thumbs pinned to the extremes (min at 0, max at the ladder top).
-      await expect(panel.locator(`[data-testid="perf-recv-${kind}-auto"]`)).toHaveAttribute(
-        "aria-pressed",
-        "true",
-      );
+      // Default = full automatic range: the Reset button (repurposed from the
+      // former Auto toggle, same `perf-recv-{kind}-auto` testid) is ABSENT, the
+      // slider is fully interactive, and thumbs are pinned to the extremes (min at
+      // 0, max at the ladder top).
+      await expect(panel.locator(`[data-testid="perf-recv-${kind}-auto"]`)).toHaveCount(0);
 
       const minInput = panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`);
       const maxInput = panel.locator(`[data-testid="perf-recv-${kind}-range-max"]`);
@@ -738,23 +766,35 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     }
   });
 
-  test("receive Auto toggle flips aria-pressed and keeps the slider interactive", async ({
+  test("receive Reset button appears after a thumb drag and clears back to the full range (#1131)", async ({
     page,
   }) => {
-    await joinMeeting(page, "recv_auto_toggle");
+    await joinMeeting(page, "recv_reset_button");
     await openPerformanceTab(page);
     await selectReceiveDirection(page);
 
     const panel = page.locator("#settings-panel-performance");
-    const autoBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
+    const resetBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
     const minInput = panel.locator('[data-testid="perf-recv-video-range-min"]');
+    const maxInput = panel.locator('[data-testid="perf-recv-video-range-max"]');
 
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "true");
-    await autoBtn.click();
-    await expect(autoBtn).toHaveAttribute("aria-pressed", "false");
-    // The slider is never disabled (Auto is conveyed by the toggle + thumb
-    // positions, not a disabled state) — mirrors the send-side behavior.
+    // Default full range → Reset ABSENT (only rendered when constrained).
+    await expect(resetBtn).toHaveCount(0);
+
+    // Drag the max thumb inward → manual limits → Reset APPEARS as a live button
+    // (not a toggle, so no aria-pressed); the slider is never disabled.
+    await setRangeValue(page, "perf-recv-video-range-max", 0);
+    await expect(maxInput).toHaveValue("0");
+    await expect(resetBtn).toBeVisible();
+    await expect(resetBtn).not.toHaveAttribute("aria-pressed", /.*/);
     await expect(minInput).toBeEnabled();
+
+    // Click Reset → thumbs snap back to the full range and Reset DISAPPEARS.
+    await resetBtn.click();
+    await expect(minInput).toHaveValue("0");
+    const top = await maxInput.getAttribute("max");
+    await expect(maxInput).toHaveValue(String(top));
+    await expect(resetBtn).toHaveCount(0);
   });
 
   test("receive needle readout shows a valid received-layer line or the placeholder", async ({
@@ -800,14 +840,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 
     const panel = page.locator("#settings-panel-performance");
 
-    // Turn the video RECEIVE Auto off (manual mode), then pin both thumbs to the
-    // same interior layer so min == max → the receive Fixed badge appears.
-    await panel.locator('[data-testid="perf-recv-video-auto"]').click();
-    await expect(panel.locator('[data-testid="perf-recv-video-auto"]')).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
-
+    // Pin both video RECEIVE thumbs to the same interior layer so min == max →
+    // the receive Fixed badge appears. Dragging a thumb leaves the full automatic
+    // range (no toggle click — the former Auto toggle is now a Reset button).
     await setRangeValue(page, "perf-recv-video-range-min", 1);
     await setRangeValue(page, "perf-recv-video-range-max", 1);
 

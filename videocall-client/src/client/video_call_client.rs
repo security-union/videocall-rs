@@ -1585,9 +1585,13 @@ impl VideoCallClient {
             .try_borrow_mut()
             .ok()
             .map(|mut inner| {
+                // Pass the SAME persisted receive bounds the decode path clamps
+                // with so the per-peer `Setting` reason attribution (issue #1131)
+                // uses the real user `max`, not a stale/duplicated copy.
+                let bounds = inner.receive_layer_bounds;
                 inner
                     .peer_decode_manager
-                    .per_peer_received_snapshots(now_ms)
+                    .per_peer_received_snapshots(now_ms, &bounds)
             })
             .unwrap_or_default()
     }

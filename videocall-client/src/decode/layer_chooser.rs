@@ -272,6 +272,18 @@ impl LayerChooser {
         self.current
     }
 
+    /// Whether the chooser is ACTIVELY holding `current` BELOW the highest
+    /// available layer because of observed downlink congestion (issue #1079 M2).
+    ///
+    /// This is the same `constrained` flag that gates [`Self::desired_preference`]
+    /// (which returns `Some` iff constrained), exposed under a self-documenting
+    /// name for the degradation-reason derivation (issue #1131): a `Network`
+    /// reason is only attributable when the chooser is genuinely holding down due
+    /// to congestion, not when the user/sender capped quality. Cheap getter.
+    pub fn is_constrained(&self) -> bool {
+        self.constrained
+    }
+
     /// The layer to advertise to the relay as a `LAYER_PREFERENCE`, or `None`
     /// when the chooser has no preference (issue #1079 M1/M2).
     ///
@@ -493,6 +505,131 @@ pub struct ReceivedLayerSnapshot {
     pub height: u32,
     /// Approximate bitrate of the decoded layer in kbps, from the ladder.
     pub kbps: u32,
+    /// Why this stream is below the FULL-ladder top, when it is (issue #1131).
+    /// `None` when the reception is optimal (top of the full ladder, or a
+    /// single-rung ladder). Set by the snapshot producers via [`degrade_reason`];
+    /// the bare [`received_layer_snapshot`] resolver leaves it `None` (callers
+    /// that know the user bound / chooser state fill it in). The UI shows a tinted
+    /// reason chip only when this is `Some`.
+    pub reason: Option<DegradeReason>,
+}
+
+/// Why a received stream is below the full simulcast ladder's top layer (issue
+/// #1131). Mutually exclusive; the *tightest binding limit* wins, with an exact
+/// tie broken by [`degrade_reason`]'s precedence (Setting > Network > Sender).
+///
+/// Only meaningful when the reception is NOT optimal — see [`quality_state`]; an
+/// optimal stream carries `reason == None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradeReason {
+    /// Your downlink can't sustain a higher layer right now (chooser is actively
+    /// constrained below what the sender offers).
+    Network,
+    /// You capped receive quality below the maximum for this stream (your own
+    /// receive `max` bound is the binding limit).
+    Setting,
+    /// The sender simply isn't publishing a higher layer; you are taking
+    /// everything offered. Includes non-simulcast peers (you genuinely receive
+    /// low quality from them — not your fault).
+    Sender,
+}
+
+/// Absolute reception quality of a decoded layer relative to the FULL simulcast
+/// ladder for its kind (issue #1131). "Full ladder" means
+/// [`max_layers_for_kind`] — NOT the empirically-learned `highest_available + 1`
+/// — so a stream a sender pins to base still reads as `Low` (red), matching the
+/// issue's "low quality in red" intent rather than going green just because the
+/// sender's offered top happens to coincide with what you decode.
+///
+/// * top of the full ladder (`layer_index >= full_ladder_len - 1`) → `Optimal`
+/// * base of a multi-rung ladder (`layer_index == 0 && full_ladder_len > 1`) → `Low`
+/// * anything between → `Medium`
+/// * a single-rung ladder (`full_ladder_len <= 1`) → `Optimal` (nothing better exists)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityState {
+    Optimal,
+    Medium,
+    Low,
+}
+
+/// Classify a decoded layer's absolute quality against the full ladder length.
+/// Pure / panic-safe; see [`QualityState`] for the rules. Single source of truth
+/// for the receive quality color in the perf panel.
+pub fn quality_state(layer_index: u32, full_ladder_len: u32) -> QualityState {
+    if full_ladder_len <= 1 {
+        // Nothing better exists; decoding the only rung is optimal.
+        return QualityState::Optimal;
+    }
+    let top = full_ladder_len - 1;
+    if layer_index >= top {
+        QualityState::Optimal
+    } else if layer_index == 0 {
+        QualityState::Low
+    } else {
+        QualityState::Medium
+    }
+}
+
+/// Derive the [`DegradeReason`] for a received stream that is below the full
+/// ladder top (issue #1131). Returns `None` when the reception is optimal
+/// (caller should pass the real state in; this fn also returns `None` when no
+/// limit is attributable). PURE — host-tested — so the heuristic is not duplicated
+/// inline at the two snapshot producers.
+///
+/// Inputs (all on the DIRECT layer-index convention, 0 = base/lowest):
+///   * `sel` — the post-clamp selected/decoded layer.
+///   * `avail_top` — highest layer the sender is currently offering
+///     (`highest_available`).
+///   * `full_ladder_top` — `max_layers_for_kind(kind) - 1`.
+///   * `user_max` — the user's receive `max` bound for this kind (`None` =
+///     Auto/uncapped).
+///   * `constrained` — the chooser's [`LayerChooser::is_constrained`] flag.
+///
+/// Precedence: the TIGHTEST binding limit wins; on an exact tie prefer
+/// **Setting > Network > Sender** (an explicit user choice is the most
+/// informative attribution, then your network, then the sender). Concretely:
+///   * **Setting** — `user_max == Some(m)`, `m < full_ladder_top`, and `sel == m`
+///     (your own cap is what's holding you down).
+///   * **Network** — `constrained` AND `sel < avail_top` (downlink is holding you
+///     below what the sender offers).
+///   * **Sender** — `avail_top < full_ladder_top` AND `sel == avail_top` (you're
+///     taking everything offered; the sender just isn't publishing higher). A
+///     non-simulcast peer (`avail_top == 0`) decoded at base lands here.
+pub fn degrade_reason(
+    sel: u32,
+    avail_top: u32,
+    full_ladder_top: u32,
+    user_max: Option<u32>,
+    constrained: bool,
+) -> Option<DegradeReason> {
+    // Already at (or above) the full ladder top → optimal, no reason.
+    if sel >= full_ladder_top {
+        return None;
+    }
+
+    // Setting wins outright when the user's own cap is the binding limit, since a
+    // tie must resolve Setting > Network > Sender and this is the only branch that
+    // attributes the user's explicit choice.
+    let setting = matches!(user_max, Some(m) if m < full_ladder_top && sel == m);
+    if setting {
+        return Some(DegradeReason::Setting);
+    }
+
+    // Network: the chooser is actively holding below what the sender offers.
+    if constrained && sel < avail_top {
+        return Some(DegradeReason::Network);
+    }
+
+    // Sender: you're taking everything offered and the sender isn't publishing
+    // higher (covers non-simulcast peers where avail_top == 0 and sel == 0).
+    if avail_top < full_ladder_top && sel == avail_top {
+        return Some(DegradeReason::Sender);
+    }
+
+    // Below the top but none of the specific limits is attributable (e.g. a
+    // transient state where the chooser sits below both the user cap and the
+    // sender's top without being flagged constrained). Leave unattributed.
+    None
 }
 
 /// Audio simulcast bitrates (kbps) by layer, lowest-first (issue #989, Phase 3c
@@ -576,6 +713,9 @@ pub fn received_layer_snapshot(
             width: 0,
             height: 0,
             kbps,
+            // The bare resolver doesn't know the user bound / chooser state, so it
+            // leaves the reason unset; the snapshot producers fill it in.
+            reason: None,
         };
     }
 
@@ -597,7 +737,43 @@ pub fn received_layer_snapshot(
         width: tier.max_width,
         height: tier.max_height,
         kbps: tier.ideal_bitrate_kbps,
+        // The bare resolver doesn't know the user bound / chooser state, so it
+        // leaves the reason unset; the snapshot producers fill it in.
+        reason: None,
     }
+}
+
+/// Build a [`ReceivedLayerSnapshot`] for a peer's `kind` AND attach its
+/// degradation `reason` from one consistent layer (issue #1131 follow-up B).
+///
+/// This is the exact assembly the per-peer snapshot producer performs, lifted to
+/// a PURE fn so the "derive the reason from the CLAMPED decoded layer, not the
+/// raw selected layer" contract is host-testable without constructing a full
+/// `Peer`. `raw_selected` is the peer's `selected_*_layer` (which a receive `min`
+/// can raise ABOVE what the sender offers); the resolver clamps it to
+/// `min(raw_selected, avail_top)` (its `count` is `avail_top + 1`), and the
+/// reason is derived from THAT clamped `layer_index` so the row's quality dot and
+/// its reason chip always agree. `user_max` / `constrained` feed
+/// [`degrade_reason`].
+pub fn received_layer_snapshot_with_reason(
+    kind: PrefMediaKind,
+    raw_selected: u32,
+    avail_top: u32,
+    user_max: Option<u32>,
+    constrained: bool,
+) -> ReceivedLayerSnapshot {
+    let mut snap = received_layer_snapshot(kind, raw_selected, avail_top + 1);
+    let full_ladder_top = max_layers_for_kind(kind).saturating_sub(1);
+    // Derive from the CLAMPED layer the snapshot actually carries, never the raw
+    // selected layer — see the fn doc.
+    snap.reason = degrade_reason(
+        snap.layer_index,
+        avail_top,
+        full_ladder_top,
+        user_max,
+        constrained,
+    );
+    snap
 }
 
 #[cfg(test)]
@@ -1046,6 +1222,231 @@ mod tests {
             assert_eq!(s.layer_index, 0);
             assert_eq!(s.layer_count, 1);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1131: quality_state (absolute, full-ladder) + degrade_reason
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn quality_state_full_ladder_boundaries() {
+        // 3-rung full ladder: top (2) optimal, base (0) low, middle (1) medium.
+        assert_eq!(quality_state(2, 3), QualityState::Optimal);
+        assert_eq!(quality_state(1, 3), QualityState::Medium);
+        assert_eq!(quality_state(0, 3), QualityState::Low);
+        // Above-top index still clamps to optimal (panic-safe).
+        assert_eq!(quality_state(9, 3), QualityState::Optimal);
+        // Single-rung ladder: the only rung is optimal (nothing better exists),
+        // so a non-simulcast peer's color is NOT red.
+        assert_eq!(quality_state(0, 1), QualityState::Optimal);
+        // 2-rung ladder: base is low, top is optimal, no medium band.
+        assert_eq!(quality_state(0, 2), QualityState::Low);
+        assert_eq!(quality_state(1, 2), QualityState::Optimal);
+    }
+
+    #[test]
+    fn degrade_reason_optimal_is_none() {
+        // At the full-ladder top → optimal → no reason, regardless of inputs.
+        assert_eq!(degrade_reason(2, 2, 2, Some(1), true), None);
+        assert_eq!(degrade_reason(3, 2, 2, None, true), None);
+    }
+
+    #[test]
+    fn degrade_reason_setting_in_isolation() {
+        // User capped receive at layer 1 of a 3-rung ladder (top=2); decoding
+        // exactly at the cap, sender offers more (avail_top=2), NOT constrained.
+        // Only the user's own setting is binding.
+        assert_eq!(
+            degrade_reason(1, 2, 2, Some(1), false),
+            Some(DegradeReason::Setting)
+        );
+    }
+
+    #[test]
+    fn degrade_reason_network_in_isolation() {
+        // Chooser is constrained and holding below what the sender offers
+        // (sel 1 < avail_top 2), no user cap. Network owns it.
+        assert_eq!(
+            degrade_reason(1, 2, 2, None, true),
+            Some(DegradeReason::Network)
+        );
+    }
+
+    #[test]
+    fn degrade_reason_sender_in_isolation() {
+        // Sender only offers up to layer 1 (avail_top=1 < top=2); we take all of
+        // it (sel==avail_top), not constrained, no user cap. Sender owns it.
+        assert_eq!(
+            degrade_reason(1, 1, 2, None, false),
+            Some(DegradeReason::Sender)
+        );
+    }
+
+    #[test]
+    fn degrade_reason_sender_for_non_simulcast_peer() {
+        // Non-simulcast peer: avail_top == 0, decoded at base (sel == 0), full
+        // ladder top is 2. You genuinely receive low quality from them — that is
+        // the SENDER's doing, not your network or setting.
+        assert_eq!(
+            degrade_reason(0, 0, 2, None, false),
+            Some(DegradeReason::Sender)
+        );
+        // And the absolute color for that is Low (red) on a 3-rung full ladder.
+        assert_eq!(quality_state(0, 3), QualityState::Low);
+    }
+
+    #[test]
+    fn degrade_reason_tiebreak_setting_beats_network_and_sender() {
+        // All three limits coincide at sel == 1 (a 3-rung ladder, top=2):
+        //   * user_max == 1 == sel        → Setting candidate
+        //   * constrained AND sel<avail   → would be Network if avail_top>1...
+        //   * avail_top == 1 == sel       → Sender candidate
+        // To make all three genuinely live at once, the sender must offer above
+        // sel (so Network's `sel < avail_top` holds) AND equal sel (so Sender's
+        // `sel == avail_top` holds) — impossible simultaneously. So we test the
+        // documented precedence in the two realistic tie shapes:
+
+        // (a) Setting vs Network tie: user cap == sel AND chooser constrained
+        // below a higher offered top. Setting must win.
+        assert_eq!(
+            degrade_reason(1, 2, 2, Some(1), true),
+            Some(DegradeReason::Setting),
+            "Setting beats Network when the user cap coincides with a constrained hold"
+        );
+
+        // (b) Setting vs Sender tie: user cap == sel == avail_top (sender's top
+        // also sits at the cap). Setting must win over Sender.
+        assert_eq!(
+            degrade_reason(1, 1, 2, Some(1), false),
+            Some(DegradeReason::Setting),
+            "Setting beats Sender when the user cap coincides with the sender's top"
+        );
+
+        // (c) Network vs Sender: chooser constrained below a higher offered top —
+        // Network wins because Setting isn't binding (no/Auto cap) and Sender's
+        // `sel == avail_top` is false (sel < avail_top).
+        assert_eq!(
+            degrade_reason(1, 2, 2, None, true),
+            Some(DegradeReason::Network),
+            "Network beats Sender when the chooser holds below what the sender offers"
+        );
+    }
+
+    #[test]
+    fn degrade_reason_user_max_at_or_above_top_is_not_setting() {
+        // A user cap that is NOT below the full-ladder top is not a binding
+        // setting; if we're at the top it's optimal (None), and if below the top
+        // for another reason the Setting branch must not fire spuriously.
+        assert_eq!(degrade_reason(2, 2, 2, Some(2), false), None);
+        // sel below top, user_max == top (not < top) → Setting must NOT claim it;
+        // sender attribution applies instead (avail_top==sel<top).
+        assert_eq!(
+            degrade_reason(1, 1, 2, Some(2), false),
+            Some(DegradeReason::Sender)
+        );
+    }
+
+    #[test]
+    fn dot_and_reason_agree_on_the_clamped_layer() {
+        // Issue #1131 follow-up B: the row's dot color and its reason chip must be
+        // computed from the SAME clamped layer the snapshot is built with.
+        //
+        // Scenario: a user sets receive `min` = 2, so the chooser's selected layer
+        // is raised to 2, but the sender is BASE-ONLY (avail_top = 0). The snapshot
+        // resolver clamps the decoded layer to `min(2, avail_top) = 0`, so the row
+        // shows a base/Low (red) dot. The reason MUST therefore be derived from the
+        // clamped 0 — yielding a Sender chip — NOT from the raw 2 (which is >= the
+        // full top and would wrongly produce `None`, a red dot with no explanation).
+        let full_ladder_top = max_layers_for_kind(PrefMediaKind::Video) - 1; // 2
+        let avail_top = 0u32;
+        let raw_selected = 2u32; // raised by the user's receive `min`
+
+        // The resolver clamps exactly as the producer feeds it: count = avail_top+1.
+        let snap = received_layer_snapshot(PrefMediaKind::Video, raw_selected, avail_top + 1);
+        assert_eq!(snap.layer_index, 0, "decoded layer is clamped to the base");
+
+        // Color from the clamped layer: Low on a 3-rung full ladder.
+        assert_eq!(
+            quality_state(snap.layer_index, max_layers_for_kind(PrefMediaKind::Video)),
+            QualityState::Low
+        );
+
+        // Reason from the SAME clamped layer → Sender (a chip IS present).
+        // Deriving from the RAW selected (2 >= full_ladder_top) would give None —
+        // the contradictory "red dot, no reason" the fix removes.
+        assert_eq!(
+            degrade_reason(snap.layer_index, avail_top, full_ladder_top, None, false),
+            Some(DegradeReason::Sender),
+            "clamped layer must yield a reason so the dot is explained"
+        );
+        assert_eq!(
+            degrade_reason(raw_selected, avail_top, full_ladder_top, None, false),
+            None,
+            "raw (unclamped) selected layer would wrongly drop the reason — this is the bug guarded against"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_reason_uses_clamped_layer_for_dot_and_reason() {
+        // Issue #1131 follow-up B, at the PRODUCER seam: the assembled snapshot's
+        // `layer_index` (the dot's color basis) and its `reason` must come from the
+        // SAME clamped layer. Receive `min`=2 raises the raw selected to 2, but a
+        // base-only sender (avail_top=0) clamps the decoded layer to 0.
+        let s = received_layer_snapshot_with_reason(
+            PrefMediaKind::Video,
+            2, // raw_selected (raised by the user's receive min)
+            0, // avail_top (base-only sender)
+            None,
+            false,
+        );
+        // Clamped to base — the dot will be Low, and the reason explains it.
+        assert_eq!(
+            s.layer_index, 0,
+            "decoded layer clamped to the sender's offering"
+        );
+        assert_eq!(
+            s.reason,
+            Some(DegradeReason::Sender),
+            "reason derived from the clamped layer → Sender (a chip is present)"
+        );
+
+        // A healthy full-quality stream: top of the full ladder, no reason.
+        let top = received_layer_snapshot_with_reason(PrefMediaKind::Video, 2, 2, None, false);
+        assert_eq!(top.layer_index, 2);
+        assert_eq!(top.reason, None, "optimal reception carries no reason chip");
+
+        // A user cap at the decoded layer below the full top → Setting.
+        let capped =
+            received_layer_snapshot_with_reason(PrefMediaKind::Video, 1, 2, Some(1), false);
+        assert_eq!(capped.layer_index, 1);
+        assert_eq!(capped.reason, Some(DegradeReason::Setting));
+    }
+
+    #[test]
+    fn degrade_reason_setting_requires_sel_at_cap_not_merely_a_cap() {
+        // GUARD on the Setting branch's `&& sel == m`: a user cap exists and is
+        // below the full top, but the DECODED layer sits BELOW that cap — so the
+        // cap is NOT the binding limit and Setting must NOT be attributed. These
+        // cases fail if `&& sel == m` is dropped (the branch would wrongly fire on
+        // "any cap below top" and steal the attribution from Network/Sender).
+
+        // (a) Network is the real limit: the chooser is constrained and holding
+        // sel=0 BELOW what the sender offers (avail_top=2), even though the user
+        // also set a cap at 1. Network owns it, NOT Setting.
+        assert_eq!(
+            degrade_reason(0, 2, 2, Some(1), true),
+            Some(DegradeReason::Network),
+            "sel below the user cap (not AT it) must attribute Network, not Setting"
+        );
+
+        // (b) Sender is the real limit: sel=0 == avail_top=0 (base-only sender),
+        // user cap at 1 is above what's offered so it isn't binding. Sender owns
+        // it, NOT Setting.
+        assert_eq!(
+            degrade_reason(0, 0, 2, Some(1), false),
+            Some(DegradeReason::Sender),
+            "sel below the user cap with a base-only sender must attribute Sender, not Setting"
+        );
     }
 
     // -----------------------------------------------------------------

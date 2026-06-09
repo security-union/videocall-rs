@@ -150,6 +150,14 @@ html[data-theme="dark"] {
   --warning: #ff9f0a;
   --error: #ff453a;
   /*
+   * Receive-quality tokens for the Performance panel's per-peer rows (issue
+   * #1131). Optimal == --success (green), Medium == amber, Low == --error (red).
+   * Dark-theme values: the amber is brightened for contrast on the dark glass.
+   */
+  --perf-q-optimal: var(--success);
+  --perf-q-medium: #ffc14d;
+  --perf-q-low: var(--error);
+  /*
    * Higher-luminance error red for use as foreground TEXT on the glass
    * surface (--glass-bg over --surface composites to ≈ #2D2D2F).  At that
    * background, the saturated --error #FF453A computes a contrast ratio of
@@ -218,6 +226,14 @@ html[data-theme="light"] {
   --warning: #ff9f0a;
   --error: #ff3b30;
   --error-text: #d70015;
+  /*
+   * Receive-quality tokens (issue #1131), light theme. The amber is darkened to
+   * an AA-safe ochre (#9a6a00) since the chip background is faint over a light
+   * surface; optimal/low track the light --success/--error.
+   */
+  --perf-q-optimal: #1e9e44;
+  --perf-q-medium: #9a6a00;
+  --perf-q-low: var(--error);
 
   /* Liquid Glass material — light theme uses much lighter, more transparent glass */
   --glass-bg: rgba(255, 255, 255, 0.08);

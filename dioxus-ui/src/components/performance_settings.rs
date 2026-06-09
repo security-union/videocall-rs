@@ -49,8 +49,8 @@
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::{
-    LiveQualitySnapshot, PeerReceiveDiag, PrefMediaKind, ReceivedLayerSnapshot,
-    ScreenQualitySnapshot, SimulcastSendSnapshot,
+    DegradeReason, LiveQualitySnapshot, PeerReceiveDiag, PrefMediaKind, QualityState,
+    ReceivedLayerSnapshot, ScreenQualitySnapshot, SimulcastSendSnapshot,
 };
 use wasm_bindgen::JsCast;
 
@@ -394,6 +394,97 @@ pub fn send_layer_res_span(snap: &SimulcastSendSnapshot) -> String {
     }
 }
 
+/// One SEND-side rung pip for the §2 always-visible rung strip (issue #1131).
+/// Lowest layer first. `active` distinguishes a filled (publishing) pip from a
+/// shed (bitrate-0, ghosted/dashed) one. `res_label` sits under every pip;
+/// `kbps_label` is `Some` ONLY on the top ACTIVE pip (so the strip shows the
+/// uplink of the best layer currently flowing, without repeating it per rung).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendRung {
+    /// This layer's simulcast id (0 = base / lowest).
+    pub layer_id: u32,
+    /// `true` when the layer is being encoded + sent; `false` for a shed layer.
+    pub active: bool,
+    /// Short resolution label under the pip, e.g. `"540p"`.
+    pub res_label: String,
+    /// Compact bitrate label, present only on the top active pip, e.g. `"600k"`.
+    pub kbps_label: Option<String>,
+}
+
+/// Build the §2 SEND rung strip from a video/screen SEND snapshot (issue #1131),
+/// lowest layer first. Pure / host-tested.
+///
+///   * Simulcast active → one pip per EFFECTIVE layer; `active` is
+///     `layer_id < active_layers` (the AQ controller sheds the TOP layers under
+///     congestion, so shed pips are the high ones). The kbps label lands on the
+///     highest active pip only.
+///   * Single-stream (non-simulcast) video/screen → the producers
+///     (`CameraEncoder`/`ScreenEncoder::live_simulcast_snapshot`) emit an EMPTY
+///     `layers` Vec, so this returns an empty Vec and the caller renders NO strip
+///     and keeps the plain summary line instead. (There is intentionally no
+///     single-pip fallback for these kinds — single-stream carries no per-layer
+///     ladder to draw.)
+///
+/// AUDIO has no per-layer encoder snapshot at all and never reaches this fn; the
+/// panel builds its single send pip from the user's cap via [`audio_send_rung`].
+///
+/// Returns an EMPTY Vec when there are no layers (single-stream / atomics not yet
+/// ticked), so the caller falls back to the summary line and renders no empty
+/// strip.
+pub fn send_rungs(snap: &SimulcastSendSnapshot) -> Vec<SendRung> {
+    if snap.layers.is_empty() {
+        return Vec::new();
+    }
+    // The highest ACTIVE layer id (for the single kbps label). active_layers is a
+    // count of the lowest-N active layers, so the top active id is count-1.
+    let top_active_id = snap.active_layers.saturating_sub(1);
+    snap.layers
+        .iter()
+        .map(|l| {
+            let active = l.layer_id < snap.active_layers;
+            SendRung {
+                layer_id: l.layer_id,
+                active,
+                res_label: format_send_layer_short(l.width, l.height),
+                // kbps only on the top ACTIVE pip, and only once a bitrate exists.
+                kbps_label: (active && l.layer_id == top_active_id && l.bitrate_kbps > 0)
+                    .then(|| format_kbps_compact(l.bitrate_kbps)),
+            }
+        })
+        .collect()
+}
+
+/// The §2 SEND rung strip for AUDIO, which has no per-layer encoder snapshot:
+/// render a SINGLE filled pip at the user's best-allowed send tier, labeled from
+/// [`AUDIO_TIER_LABELS`] (send-side inverted index: 0 = best). `best` is the
+/// best-allowed tier index (`None`/Auto → tier 0 = best). Pure / host-tested.
+pub fn audio_send_rung(best: Option<usize>) -> SendRung {
+    let idx = match best {
+        Some(i) if i < AUDIO_TIER_LABELS.len() => i,
+        _ => 0,
+    };
+    SendRung {
+        // A single conceptual rung; its id is the tier index for a stable testid.
+        layer_id: idx as u32,
+        active: true,
+        res_label: AUDIO_TIER_LABELS[idx].to_string(),
+        kbps_label: None,
+    }
+}
+
+/// The strip's `role="img"` aria-label summarizing the rung state for SR users
+/// (the individual pips are decorative). E.g. `"Sending 2 of 3 layers"`, or
+/// `"Sending 1 layer"` for a single pip. Pure / host-tested.
+pub fn send_rungs_aria(rungs: &[SendRung]) -> String {
+    let total = rungs.len();
+    let active = rungs.iter().filter(|r| r.active).count();
+    if total <= 1 {
+        "Sending 1 layer".to_string()
+    } else {
+        format!("Sending {active} of {total} layers")
+    }
+}
+
 /// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L1–L3 across 4
 /// peers"`. No peers → `"Not receiving video"`. `layers` is the per-peer
 /// `layer_index` list (1-indexed for display via [`format_receive_spread`]).
@@ -469,6 +560,130 @@ pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> St
             s.width,
             s.height
         ),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Issue #1131 — per-peer RECEIVE row rendering (pure / host-tested). The
+// degradation REASON and the absolute quality come from the client
+// (`snap.reason`, `quality_state(layer_index, full_ladder_len)`); these fns map
+// them to the spec's markup data (CSS modifier, glyph, chip copy, metric text,
+// and the full aria-label sentence). Kept pure so the §3/§4/§5 copy is testable
+// without a DOM.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// CSS modifier suffix for a quality state (`"optimal"|"medium"|"low"`), used in
+/// both `.perf-q-dot--{m}` and the metric tinting. Pure.
+pub fn quality_state_modifier(q: QualityState) -> &'static str {
+    match q {
+        QualityState::Optimal => "optimal",
+        QualityState::Medium => "medium",
+        QualityState::Low => "low",
+    }
+}
+
+/// Non-color glyph for a quality state (§4): Optimal `●`, Medium `◐`, Low `○`.
+/// The dot is `aria-hidden`; the state is also in the row's aria-label, so the
+/// glyph is a redundant non-color cue, never the sole signal. Pure.
+pub fn quality_state_glyph(q: QualityState) -> &'static str {
+    match q {
+        QualityState::Optimal => "●",
+        QualityState::Medium => "◐",
+        QualityState::Low => "○",
+    }
+}
+
+/// Human phrase for a quality state, used inside the row aria-label sentence
+/// (e.g. "optimal quality"). Pure.
+pub fn quality_state_word(q: QualityState) -> &'static str {
+    match q {
+        QualityState::Optimal => "optimal",
+        QualityState::Medium => "medium",
+        QualityState::Low => "low",
+    }
+}
+
+/// The reason chip's CSS modifier suffix (`"network"|"setting"|"sender"`). Pure.
+pub fn reason_chip_modifier(r: DegradeReason) -> &'static str {
+    match r {
+        DegradeReason::Network => "network",
+        DegradeReason::Setting => "setting",
+        DegradeReason::Sender => "sender",
+    }
+}
+
+/// The reason chip's short visible TEXT (§5). Pure.
+pub fn reason_chip_text(r: DegradeReason) -> &'static str {
+    match r {
+        DegradeReason::Network => "Your network",
+        DegradeReason::Setting => "Your setting",
+        DegradeReason::Sender => "Sender",
+    }
+}
+
+/// The reason chip's hover `title` (full explanation, §5). Pure.
+pub fn reason_chip_title(r: DegradeReason) -> &'static str {
+    match r {
+        DegradeReason::Network => {
+            "Your download can't sustain a higher layer right now (packet loss or congestion)."
+        }
+        DegradeReason::Setting => "You capped receive quality below the maximum for this stream.",
+        DegradeReason::Sender => "The sender isn't publishing a higher layer right now.",
+    }
+}
+
+/// The reason clause appended to the row aria-label (§5: "limited by …"). Pure.
+pub fn reason_aria_clause(r: DegradeReason) -> &'static str {
+    match r {
+        DegradeReason::Network => "limited by your network",
+        DegradeReason::Setting => "limited by your setting",
+        DegradeReason::Sender => "limited by the sender",
+    }
+}
+
+/// The per-peer row metric text (§3). video/screen `"{res} · ~{kbps} · L{i}/{n}"`;
+/// audio `"{kbps}k · {label} · L{i}/{n}"`. `n` is the FULL-ladder length (so the
+/// "L i / n" denominator matches the color basis). `audio_label` is the receive
+/// audio rung label (e.g. "mid (32k)") supplied by the caller (the receive
+/// submodule owns that mapping). Pure / host-tested.
+pub fn peer_row_metric(
+    snap: &ReceivedLayerSnapshot,
+    full_ladder_len: u32,
+    audio_label: &str,
+) -> String {
+    let i = snap.layer_index + 1;
+    if matches!(snap.kind, PrefMediaKind::Audio) {
+        format!("{}k · {} · L{i}/{full_ladder_len}", snap.kbps, audio_label)
+    } else {
+        let res = format_send_layer_short(snap.width, snap.height);
+        format!(
+            "{res} · ~{} · L{i}/{full_ladder_len}",
+            format_kbps_compact(snap.kbps)
+        )
+    }
+}
+
+/// The full per-peer row aria-label sentence (§3). Color is never the sole
+/// signal — this sentence carries label, kind, state, the res/bitrate, the layer
+/// fraction, and (when present) the reason clause. `kind_noun` is the spoken kind
+/// ("video"/"audio"/"shared content"); `res_or_bitrate` is the human detail
+/// ("540p" or "32k"). Pure / host-tested.
+pub fn peer_row_aria_label(
+    label: &str,
+    kind_noun: &str,
+    q: QualityState,
+    res_or_bitrate: &str,
+    layer_1indexed: u32,
+    full_ladder_len: u32,
+    reason: Option<DegradeReason>,
+) -> String {
+    let base = format!(
+        "{label}, receiving {kind_noun}, {} quality, {res_or_bitrate}, layer {layer_1indexed} of {full_ladder_len}",
+        quality_state_word(q)
+    );
+    match reason {
+        Some(r) => format!("{base}, {}", reason_aria_clause(r)),
+        None => base,
     }
 }
 
@@ -757,6 +972,16 @@ pub fn auto_thumbs(tier_count: usize) -> RangeSel {
         min_pos: 0,
         max_pos: tier_count.saturating_sub(1),
     }
+}
+
+/// Whether a dual-thumb selection sits at BOTH extremes (`min` at position 0 and
+/// `max` at `last_position`) — i.e. the full default range, nothing constrained
+/// (issue #1131 §D). Drives the Reset button's visibility: it is shown IFF this
+/// is `false`, so dragging both thumbs back to the ends hides it live even when
+/// the persisted `auto` flag is still false. Pure / host-tested; usize-based so
+/// both the send (`usize`) and receive (`u32`, cast) sliders share it.
+pub fn at_full_range(min_pos: usize, max_pos: usize, last_position: usize) -> bool {
+    min_pos == 0 && max_pos == last_position
 }
 
 impl PerformancePreference {
@@ -1070,7 +1295,10 @@ pub const TESTID_AUDIO_RANGE_MIN: &str = "perf-audio-range-min";
 pub const TESTID_AUDIO_RANGE_MAX: &str = "perf-audio-range-max";
 pub const TESTID_SCREEN_RANGE_MIN: &str = "perf-screen-range-min";
 pub const TESTID_SCREEN_RANGE_MAX: &str = "perf-screen-range-max";
-/// Per-stream SEND "Auto" toggle buttons.
+/// Per-stream SEND "Reset" buttons (clear the thumbs back to the full range).
+/// The `_AUTO` constant names are retained so existing #1095 e2e selectors keep
+/// resolving even though the element is now a Reset button, not an Auto toggle,
+/// and is only rendered when the stream is constrained off its extremes.
 pub const TESTID_VIDEO_AUTO: &str = "perf-video-auto";
 pub const TESTID_AUDIO_AUTO: &str = "perf-audio-auto";
 pub const TESTID_SCREEN_AUTO: &str = "perf-screen-auto";
@@ -1437,32 +1665,59 @@ fn SendCell(
     /// The "your upload" / "not sharing" consequence text right of the side title.
     consequence: String,
     /// The always-visible summary line under the slider (filled live by the
-    /// parent from the SEND snapshot).
+    /// parent from the SEND snapshot). When a §2 rung strip is present it
+    /// SUPERSEDES this line (the strip carries the live per-layer state); the
+    /// summary is only shown when there is no strip (camera off / atomics not
+    /// ticked / not sharing). Folding the strip over the summary protects the
+    /// no-scroll budget (§7) — this applies to ALL kinds, including the single
+    /// audio pip (whose label already states the tier the summary would repeat).
     summary_line: String,
+    /// The §2 SEND rung strip (issue #1131), lowest layer first. Empty → render
+    /// no strip and keep the summary line (e.g. camera off / atomics not ticked).
+    #[props(default)]
+    rungs: Vec<SendRung>,
+    /// `role="img"` aria-label for the rung strip (e.g. "Sending 2 of 3 layers").
+    #[props(default)]
+    rungs_aria: String,
     labels: Vec<&'static str>,
     best: Option<usize>,
     worst: Option<usize>,
     is_fixed: bool,
-    is_auto: bool,
     /// Shared single-open help signal (opening any popover closes the others).
     open_help: Signal<Option<&'static str>>,
     on_change: EventHandler<RangeSel>,
+    /// Clears the stream back to the full automatic range (Reset). Named
+    /// `on_auto_toggle` for continuity with the prior Auto control; always called
+    /// with `true` now (full range).
     on_auto_toggle: EventHandler<bool>,
 ) -> Element {
     let sel = bounds_to_thumbs(best, worst, labels.len());
     let range_str = span_text(sel, &labels);
-    let auto_class = if is_auto {
-        "perf-auto-button is-active"
-    } else {
-        "perf-auto-button"
-    };
+    // Reset is shown IFF the thumbs are NOT at both extremes (#1131 §D). Driven by
+    // POSITIONS (not the `auto` flag) so dragging both thumbs back to the ends
+    // hides it live, and it reacts on every drag.
+    let show_reset = !at_full_range(sel.min_pos, sel.max_pos, labels.len().saturating_sub(1));
 
     rsx! {
         div { class: "perf-side perf-side--send",
             // Head row: the bar-meter sits INLINE here (not on its own line) to
             // keep the per-side height down for the no-scroll budget (#2d).
             div { class: "perf-side__head",
-                span { class: "perf-side__title", "Sending" }
+                span { class: "perf-side__title",
+                    // §1 directional arrow (arrow-up-right, green --success),
+                    // aria-hidden — the "Sending" text remains the a11y label.
+                    svg {
+                        class: "perf-dir-arrow",
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "14", height: "14", view_box: "0 0 24 24",
+                        fill: "none", stroke: "currentColor", stroke_width: "2",
+                        stroke_linecap: "round", stroke_linejoin: "round",
+                        "aria-hidden": "true",
+                        path { d: "M7 17 17 7" }
+                        path { d: "M7 7h10v10" }
+                    }
+                    "Sending"
+                }
                 span { class: "perf-side__consequence", "{consequence}" }
                 PerfMeter {
                     testid: vu_testid,
@@ -1488,19 +1743,22 @@ fn SendCell(
                         "Fixed"
                     }
                 }
-                button {
-                    r#type: "button",
-                    class: auto_class,
-                    "data-testid": auto_testid,
-                    "aria-pressed": if is_auto { "true" } else { "false" },
-                    "aria-label": "Automatic {stream_noun} send quality",
-                    title: if is_auto {
-                        "Automatic (full range) — click to set manual send limits"
-                    } else {
-                        "Manual limits — click for fully automatic send quality"
-                    },
-                    onclick: move |_| on_auto_toggle.call(!is_auto),
-                    "Auto"
+                // Reset clears the two handles back to the full automatic range
+                // (auto = true → bounds cleared, thumbs snap to the extremes, which
+                // re-hides this button). Rendered ONLY when the thumbs are off the
+                // extremes (`show_reset`); at the full default range the slot is
+                // EMPTY so the head reads clean (#1131 §D). Repurposes the former
+                // Auto testid so the testid surface is unchanged.
+                if show_reset {
+                    button {
+                        r#type: "button",
+                        class: "perf-reset-button",
+                        "data-testid": auto_testid,
+                        "aria-label": "Reset {stream_noun} quality limits",
+                        title: "Clear both limits — back to the full automatic range",
+                        onclick: move |_| on_auto_toggle.call(true),
+                        "Reset"
+                    }
                 }
             }
             DualRangeSlider {
@@ -1512,17 +1770,50 @@ fn SendCell(
                 sel,
                 on_change: move |s: RangeSel| on_change.call(s),
             }
-            // The slider range readout + the live summary share ONE flex line to
-            // save vertical space (#2e). The range-value keeps its own testid and
-            // stable `span_text` content (no aria-live — #4: a native range input
-            // already announces on change; two live regions/side were SR chatter).
+            // §2 SEND rung strip (always-visible). When present it carries the
+            // live per-layer state; the summary line is then folded into the strip
+            // caption to protect the no-scroll budget (kept separate only when
+            // there is no strip — e.g. camera off / atomics not ticked).
+            if !rungs.is_empty() {
+                div {
+                    class: "perf-rungs",
+                    "data-testid": "{id_prefix}-send-rungs",
+                    role: "img",
+                    "aria-label": "{rungs_aria}",
+                    for rung in rungs.iter() {
+                        span {
+                            key: "{rung.layer_id}",
+                            class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
+                            "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
+                            title: if rung.active {
+                                format!("Layer {} — sending {}", rung.layer_id + 1, rung.res_label)
+                            } else {
+                                format!("Layer {} — shed (not sending under current conditions)", rung.layer_id + 1)
+                            },
+                            span { class: "perf-rung__bar", "aria-hidden": "true" }
+                            span { class: "perf-rung__label",
+                                "{rung.res_label}"
+                                if let Some(k) = rung.kbps_label.as_ref() {
+                                    " · {k}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // The slider range readout + (for the no-strip case) the live summary
+            // share ONE flex line to save vertical space (#2e). The range-value
+            // keeps its own testid and stable `span_text` content (no aria-live —
+            // #4: a native range input already announces on change).
             div { class: "perf-side__caption",
                 p {
                     class: "perf-range-value",
                     "data-testid": "{id_prefix}-range-value",
                     "Sending: {range_str}"
                 }
-                p { class: "perf-summary-line", "{summary_line}" }
+                if rungs.is_empty() {
+                    p { class: "perf-summary-line", "{summary_line}" }
+                }
             }
         }
     }
@@ -1546,10 +1837,9 @@ pub struct PeerKindSnap {
 
 // ── help-popover bodies (§3 copy) ──────────────────────────────────
 
-const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') at once so each viewer gets the best one their connection can handle. More layers = more upload. The slider caps the best and worst versions you'll send.";
-const HELP_AUDIO_SEND: &str =
-    "Your mic sends one or more audio quality versions. Higher = clearer voice but more upload.";
-const HELP_CONTENT_SEND: &str = "When you share your screen, this caps the sharpness and frame detail you publish. Text-heavy screens benefit from a higher cap; video benefits from a lower one if your upload is tight.";
+const HELP_VIDEO_SEND: &str = "Your camera sends several quality versions ('layers') so each viewer gets the best one their connection can handle. The left handle sets the lowest version you'll send (floor), the right handle the highest (ceiling); it adapts within that band. More layers = more upload. Reset returns to the full automatic range.";
+const HELP_AUDIO_SEND: &str = "Your mic sends one or more audio quality versions. The left handle sets the lowest you'll send (floor), the right handle the highest (ceiling). Higher = clearer voice but more upload. Reset returns to the full automatic range.";
+const HELP_CONTENT_SEND: &str = "When you share your screen, the left handle sets the lowest sharpness you publish (floor) and the right handle the highest (ceiling); it adapts within that band. Text-heavy screens benefit from a higher ceiling; video benefits from a lower one if your upload is tight. Reset returns to the full automatic range.";
 
 /// The unified Performance settings panel body (#1095 redesign). Three stacked
 /// per-kind cards (Video / Audio / Content), each split into a **Sending** column
@@ -1663,6 +1953,19 @@ pub fn PerformanceSettingsPanel(
         .map(|p| p.snap);
     let content_recv_line = format_content_receive_summary(content_top.as_ref());
 
+    // §2 SEND rung strips (issue #1131). Video/content build per-layer pips from
+    // the live encoder snapshot (empty Vec → no strip, summary line shown);
+    // audio has no per-layer snapshot, so a single pip at the user's best cap.
+    let video_send_rungs = send_video_snap.as_ref().map(send_rungs).unwrap_or_default();
+    let video_send_rungs_aria = send_rungs_aria(&video_send_rungs);
+    let content_send_rungs = send_screen_snap
+        .as_ref()
+        .map(send_rungs)
+        .unwrap_or_default();
+    let content_send_rungs_aria = send_rungs_aria(&content_send_rungs);
+    let audio_send_rungs = vec![audio_send_rung(pref.audio_max)];
+    let audio_send_rungs_aria = send_rungs_aria(&audio_send_rungs);
+
     // Receive-side consequence strings (peer counts; "not sharing" for content).
     let video_recv_consequence = consequence_from_peers(recv_video_peers.len());
     let audio_recv_consequence = consequence_from_peers(recv_audio_peers.len());
@@ -1699,12 +2002,15 @@ pub fn PerformanceSettingsPanel(
             }
         }
         p { class: "settings-section-description",
-            "Limit what you "
+            "Each stream adapts to your connection automatically. Limit what you "
             span { class: "perf-emph-recv", "receive" }
             " (saves your download) and what you "
             span { class: "perf-emph-send", "send" }
-            " (saves your upload + CPU). Each control adapts within its "
-            "range; the meter shows what's flowing right now."
+            " (saves your upload + CPU) by dragging the two handles: the "
+            "left handle is the lowest quality the stream may use (floor), the "
+            "right handle the highest (ceiling), and it adapts within that band. "
+            "Reset clears both handles back to the full range. The meter shows "
+            "what's flowing right now."
         }
 
         // Global effective-setting strip with an (i) tooltip. Compact copy; full
@@ -1750,11 +2056,12 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: g.video_text.clone(),
                     consequence: "your upload".to_string(),
                     summary_line: video_send_line,
+                    rungs: video_send_rungs,
+                    rungs_aria: video_send_rungs_aria,
                     labels: VIDEO_TIER_LABELS.to_vec(),
                     best: pref.video_max,
                     worst: pref.video_min,
                     is_fixed: video_fixed,
-                    is_auto: pref.video_auto,
                     open_help,
                     on_change: move |sel: RangeSel| on_change.call(pref.with_video_thumbs(sel)),
                     on_auto_toggle: move |on: bool| on_change.call(pref.set_video_auto(on)),
@@ -1766,6 +2073,7 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: rgv.text.clone(),
                     consequence: video_recv_consequence,
                     summary_line: video_recv_line,
+                    peers: recv_video_peers,
                     sub: receive_pref.video,
                     open_help,
                     on_change: move |sub: KindReceivePref| {
@@ -1796,11 +2104,12 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: g.audio_text.clone(),
                     consequence: "your upload".to_string(),
                     summary_line: audio_send_line,
+                    rungs: audio_send_rungs,
+                    rungs_aria: audio_send_rungs_aria,
                     labels: AUDIO_TIER_LABELS.to_vec(),
                     best: pref.audio_max,
                     worst: pref.audio_min,
                     is_fixed: audio_fixed,
-                    is_auto: pref.audio_auto,
                     open_help,
                     on_change: move |sel: RangeSel| on_change.call(pref.with_audio_thumbs(sel)),
                     on_auto_toggle: move |on: bool| on_change.call(pref.set_audio_auto(on)),
@@ -1812,6 +2121,7 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: rga.text.clone(),
                     consequence: audio_recv_consequence,
                     summary_line: audio_recv_line,
+                    peers: recv_audio_peers,
                     sub: receive_pref.audio,
                     open_help,
                     on_change: move |sub: KindReceivePref| {
@@ -1842,11 +2152,12 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: g.screen_text.clone(),
                     consequence: if send_screen_snap.is_some() { "your upload".to_string() } else { "not sharing".to_string() },
                     summary_line: content_send_line,
+                    rungs: content_send_rungs,
+                    rungs_aria: content_send_rungs_aria,
                     labels: SCREEN_TIER_LABELS.to_vec(),
                     best: pref.screen_max,
                     worst: pref.screen_min,
                     is_fixed: screen_fixed,
-                    is_auto: pref.screen_auto,
                     open_help,
                     on_change: move |sel: RangeSel| on_change.call(pref.with_screen_thumbs(sel)),
                     on_auto_toggle: move |on: bool| on_change.call(pref.set_screen_auto(on)),
@@ -1858,6 +2169,7 @@ pub fn PerformanceSettingsPanel(
                     vu_initial_readout: rgs.text.clone(),
                     consequence: content_recv_consequence,
                     summary_line: content_recv_line,
+                    peers: recv_screen_peers,
                     sub: receive_pref.screen,
                     open_help,
                     on_change: move |sub: KindReceivePref| {
@@ -1907,10 +2219,16 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ones above.
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
-    use super::{level_from_fraction, write_meter_level, write_readout_text};
+    use super::{
+        format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
+        quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
+        reason_chip_title, write_meter_level, write_readout_text, PeerKindSnap,
+    };
     use dioxus::prelude::*;
     use std::rc::Rc;
-    use videocall_client::{PrefMediaKind, ReceivedLayerSnapshot};
+    use videocall_client::{
+        max_layers_for_kind, quality_state, PrefMediaKind, ReceivedLayerSnapshot,
+    };
     use wasm_bindgen::JsCast;
 
     /// A cloneable, `PartialEq`-able handle around the per-kind received-snapshot
@@ -2294,7 +2612,7 @@ pub mod receive {
                 help_testid: TESTID_VIDEO_HELP,
                 vu_testid: TESTID_VU_VIDEO,
                 vu_label: "Receiving video",
-                help_body: "You pull the quality layer each sender offers that best fits your download. 'L2 of 3' means you're getting the highest of three versions. Lower the cap to save your download.",
+                help_body: "You pull the quality layer each sender offers that best fits your download. 'L2 of 3' means the highest of three versions. The left handle sets the lowest quality you'll accept (floor), the right handle the highest (ceiling); it adapts within that band. Lower the ceiling to save your download. Reset returns to the full automatic range.",
                 id_prefix: "perf-recv-video",
             },
             PrefMediaKind::Audio => RecvMeta {
@@ -2305,7 +2623,7 @@ pub mod receive {
                 help_testid: TESTID_AUDIO_HELP,
                 vu_testid: TESTID_VU_AUDIO,
                 vu_label: "Receiving audio",
-                help_body: "You pull the clearest audio each speaker offers that fits your download.",
+                help_body: "You pull the clearest audio each speaker offers that fits your download. The left handle sets the lowest quality you'll accept (floor), the right handle the highest (ceiling). Reset returns to the full automatic range.",
                 id_prefix: "perf-recv-audio",
             },
             PrefMediaKind::Screen => RecvMeta {
@@ -2316,7 +2634,7 @@ pub mod receive {
                 help_testid: TESTID_SCREEN_HELP,
                 vu_testid: TESTID_VU_SCREEN,
                 vu_label: "Receiving shared content",
-                help_body: "You pull the sharpest screen-share layer the presenter offers that fits your download.",
+                help_body: "You pull the sharpest screen-share layer the presenter offers that fits your download. The left handle sets the lowest quality you'll accept (floor), the right handle the highest (ceiling); it adapts within that band. Reset returns to the full automatic range.",
                 id_prefix: "perf-recv-screen",
             },
         }
@@ -2473,6 +2791,10 @@ pub mod receive {
         /// The always-visible summary line under the slider (filled live by the
         /// parent from the per-peer snapshots).
         summary_line: String,
+        /// The peers receiving THIS kind (issue #1131), for the §3 expandable
+        /// per-peer breakdown. Empty → render the "No senders" empty state.
+        #[props(default)]
+        peers: Vec<PeerKindSnap>,
         sub: KindReceivePref,
         open_help: Signal<Option<&'static str>>,
         on_change: EventHandler<KindReceivePref>,
@@ -2482,17 +2804,49 @@ pub mod receive {
         let range_str = span_text(kind, sel);
         // Fixed = manual (not Auto) AND both thumbs collapsed to one layer.
         let is_fixed = !sub.auto && sel.min_pos == sel.max_pos;
-        let auto_button_class = if sub.auto {
-            "perf-auto-button is-active"
-        } else {
-            "perf-auto-button"
-        };
+        // Reset is shown IFF the thumbs are NOT at both extremes (#1131 §D), driven
+        // by POSITIONS (not the `auto` flag), so dragging both back to the ends
+        // hides it live. `top_index` is the receive ladder's last position.
+        let show_reset = !super::at_full_range(
+            sel.min_pos as usize,
+            sel.max_pos as usize,
+            top_index(kind) as usize,
+        );
         let (vu_meter_id, vu_readout_id) = meter_ids(kind);
+
+        // §3 per-peer disclosure data (issue #1131). `full_ladder_len` is the
+        // FULL ladder size for this kind (the color basis + the `L i / n`
+        // denominator), NOT the empirically-learned per-peer count. The aggregate
+        // summary reuses `format_receive_spread` over the per-peer layer indices.
+        let full_ladder_len = max_layers_for_kind(kind);
+        let peer_count = peers.len();
+        let spread =
+            format_receive_spread(&peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>());
+        let agg = if peer_count == 1 {
+            format!("1 peer · {spread}")
+        } else {
+            format!("{peer_count} peers · {spread}")
+        };
+        let id_prefix = meta.id_prefix;
 
         rsx! {
             div { class: "perf-side perf-side--recv",
                 div { class: "perf-side__head",
-                    span { class: "perf-side__title", "Receiving" }
+                    span { class: "perf-side__title",
+                        // §1 directional arrow (arrow-down-left, blue --accent),
+                        // aria-hidden — "Receiving" remains the a11y label.
+                        svg {
+                            class: "perf-dir-arrow",
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "14", height: "14", view_box: "0 0 24 24",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            stroke_linecap: "round", stroke_linejoin: "round",
+                            "aria-hidden": "true",
+                            path { d: "M17 7 7 17" }
+                            path { d: "M17 17H7V7" }
+                        }
+                        "Receiving"
+                    }
                     span { class: "perf-side__consequence", "{consequence}" }
                     super::PerfMeter {
                         testid: meta.vu_testid,
@@ -2518,26 +2872,24 @@ pub mod receive {
                             "Fixed"
                         }
                     }
-                    button {
-                        r#type: "button",
-                        class: auto_button_class,
-                        "data-testid": meta.auto_testid,
-                        "aria-pressed": if sub.auto { "true" } else { "false" },
-                        "aria-label": "Automatic received {stream_noun} quality",
-                        title: if sub.auto {
-                            "Automatic (full range) — click to set manual receive limits"
-                        } else {
-                            "Manual limits — click for fully automatic receive quality"
-                        },
-                        onclick: move |_| {
-                            let next = if sub.auto {
-                                KindReceivePref { auto: false, ..sub }
-                            } else {
-                                KindReceivePref { min: None, max: None, auto: true }
-                            };
-                            on_change.call(next);
-                        },
-                        "Auto"
+                    // Reset clears both receive handles back to the full automatic
+                    // range (which snaps the thumbs to the extremes and re-hides
+                    // this button). Rendered ONLY when the thumbs are off the
+                    // extremes (`show_reset`); at the full default range the slot is
+                    // EMPTY (#1131 §D). Repurposes the former Auto testid so the
+                    // testid surface is unchanged.
+                    if show_reset {
+                        button {
+                            r#type: "button",
+                            class: "perf-reset-button",
+                            "data-testid": meta.auto_testid,
+                            "aria-label": "Reset {stream_noun} quality limits",
+                            title: "Clear both limits — back to the full automatic range",
+                            onclick: move |_| {
+                                on_change.call(KindReceivePref { min: None, max: None, auto: true });
+                            },
+                            "Reset"
+                        }
                     }
                 }
                 DualRangeSlider {
@@ -2561,6 +2913,113 @@ pub mod receive {
                         "Receiving: {range_str}"
                     }
                     p { class: "perf-summary-line", "{summary_line}" }
+                }
+                // §3 per-peer expandable breakdown. Native <details> gives free
+                // aria-expanded + keyboard toggle; COLLAPSED by default to protect
+                // the no-scroll budget (§7). EMPTY case is intentionally NOT given a
+                // separate "No senders" line: the always-visible summary line above
+                // already states it ("Not receiving …" / "Nobody is sharing"), so a
+                // second empty line would be redundant copy AND net-new vertical
+                // height against the tight no-scroll budget. The disclosure only
+                // renders once at least one peer is receiving this kind.
+                if !peers.is_empty() {
+                    details {
+                        class: "perf-peers",
+                        "data-testid": "{id_prefix}-peers",
+                        summary {
+                            class: "perf-peers__summary",
+                            "data-testid": "{id_prefix}-peers-summary",
+                            svg {
+                                class: "perf-peers__chev",
+                                xmlns: "http://www.w3.org/2000/svg",
+                                width: "12", height: "12", view_box: "0 0 24 24",
+                                fill: "none", stroke: "currentColor", stroke_width: "2",
+                                stroke_linecap: "round", stroke_linejoin: "round",
+                                "aria-hidden": "true",
+                                path { d: "m9 18 6-6-6-6" }
+                            }
+                            span { class: "perf-peers__agg", "{agg}" }
+                        }
+                        ul { class: "perf-peers__list", role: "list",
+                            for p in peers.iter() {
+                                PeerRow {
+                                    key: "{p.session_id}",
+                                    id_prefix,
+                                    kind,
+                                    stream_noun,
+                                    full_ladder_len,
+                                    peer: p.clone(),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One peer row inside the §3 receive disclosure (issue #1131): a quality dot
+    /// (color + non-color glyph), the ellipsized peer label, the metric text, and
+    /// — only when the reception is below the full-ladder top — a tinted reason
+    /// chip. The whole row carries a full-sentence `aria-label` so color is never
+    /// the sole signal.
+    #[component]
+    fn PeerRow(
+        id_prefix: &'static str,
+        kind: PrefMediaKind,
+        stream_noun: &'static str,
+        full_ladder_len: u32,
+        peer: PeerKindSnap,
+    ) -> Element {
+        let snap = peer.snap;
+        let q = quality_state(snap.layer_index, full_ladder_len);
+        let q_mod = quality_state_modifier(q);
+        let q_glyph = quality_state_glyph(q);
+        // Audio rung label for the metric ("low (24k)"/"mid (32k)"/"high (50k)").
+        let audio_label = index_label(PrefMediaKind::Audio, snap.layer_index);
+        let metric = peer_row_metric(&snap, full_ladder_len, audio_label);
+        // The human res/bitrate detail used inside the aria sentence.
+        let res_or_bitrate = if matches!(kind, PrefMediaKind::Audio) {
+            format!("{}k", snap.kbps)
+        } else {
+            super::format_send_layer_short(snap.width, snap.height)
+        };
+        let aria = peer_row_aria_label(
+            &peer.label,
+            // `stream_noun` is the spoken kind ("video"/"audio"/"shared content").
+            stream_noun,
+            q,
+            &res_or_bitrate,
+            snap.layer_index + 1,
+            full_ladder_len,
+            snap.reason,
+        );
+        let session_id = peer.session_id;
+
+        rsx! {
+            li {
+                class: "perf-peer-row",
+                "data-testid": "{id_prefix}-peer-{session_id}",
+                "aria-label": "{aria}",
+                span {
+                    class: "perf-q-dot perf-q-dot--{q_mod}",
+                    "data-testid": "{id_prefix}-peer-{session_id}-q",
+                    "aria-hidden": "true",
+                    "{q_glyph}"
+                }
+                span {
+                    class: "perf-peer-row__label",
+                    title: "{peer.label}",
+                    "{peer.label}"
+                }
+                span { class: "perf-peer-row__metric", "{metric}" }
+                if let Some(r) = snap.reason {
+                    span {
+                        class: "perf-reason-chip perf-reason-chip--{reason_chip_modifier(r)}",
+                        "data-testid": "{id_prefix}-peer-{session_id}-reason",
+                        title: "{reason_chip_title(r)}",
+                        "{reason_chip_text(r)}"
+                    }
                 }
             }
         }
@@ -2811,6 +3270,7 @@ pub mod receive {
                 width: 960,
                 height: 540,
                 kbps: 900,
+                reason: None,
             };
             assert_eq!(format_readout(&v), "L2/3 · 960x540");
             let a = ReceivedLayerSnapshot {
@@ -2820,6 +3280,7 @@ pub mod receive {
                 width: 0,
                 height: 0,
                 kbps: 24,
+                reason: None,
             };
             assert_eq!(format_readout(&a), "L1/3 · 24 kbps");
             let s = ReceivedLayerSnapshot {
@@ -2829,6 +3290,7 @@ pub mod receive {
                 width: 1920,
                 height: 1080,
                 kbps: 2500,
+                reason: None,
             };
             assert_eq!(format_readout(&s), "L3/3 · 1920x1080");
         }
@@ -2842,6 +3304,7 @@ pub mod receive {
                 width: 1280,
                 height: 720,
                 kbps: 1500,
+                reason: None,
             };
             let st = gauge_state(Some(&snap));
             // top layer → all bars
@@ -2968,6 +3431,7 @@ mod tests {
             width: 1280,
             height: 720,
             kbps: 1500,
+            reason: None,
         };
         assert_eq!(
             format_peer_kind_line("video", Some(&v)),
@@ -2981,6 +3445,7 @@ mod tests {
             width: 0,
             height: 0,
             kbps: 24,
+            reason: None,
         };
         assert_eq!(
             format_peer_kind_line("audio", Some(&a)),
@@ -3285,6 +3750,7 @@ mod tests {
             width: 1920,
             height: 1080,
             kbps: 2500,
+            reason: None,
         };
         assert_eq!(
             format_content_receive_summary(Some(&top)),
@@ -3312,6 +3778,7 @@ mod tests {
                     width: 1280,
                     height: 720,
                     kbps: 1500,
+                    reason: None,
                 }),
                 screen: None,
                 audio: Some(ReceivedLayerSnapshot {
@@ -3321,6 +3788,7 @@ mod tests {
                     width: 0,
                     height: 0,
                     kbps: 24,
+                    reason: None,
                 }),
             },
             videocall_client::PeerReceiveDiag {
@@ -3333,6 +3801,7 @@ mod tests {
                     width: 960,
                     height: 540,
                     kbps: 900,
+                    reason: None,
                 }),
                 screen: None,
                 audio: None,
@@ -3473,6 +3942,42 @@ mod tests {
         let pref = PerformancePreference::default().with_video_thumbs(auto_thumbs(8));
         assert_eq!(pref.video_max, None);
         assert_eq!(pref.video_min, None);
+    }
+
+    #[test]
+    fn at_full_range_drives_reset_visibility_from_positions() {
+        // #1131 §D: the Reset button is shown IFF NOT at_full_range — driven by the
+        // thumb POSITIONS, not the `auto` flag.
+        // Both thumbs at the extremes (0 .. last) → full range → Reset hidden.
+        assert!(
+            at_full_range(0, 7, 7),
+            "both extremes (8-tier send) is full range"
+        );
+        assert!(
+            at_full_range(0, 2, 2),
+            "both extremes (3-rung receive) is full range"
+        );
+        // Any thumb off its extreme → NOT full range → Reset shown. This is the
+        // case the refinement requires: a user who DRAGGED to the ends hides it,
+        // but a narrowed range (even one end) shows it.
+        assert!(
+            !at_full_range(0, 5, 7),
+            "right thumb moved in → not full range"
+        );
+        assert!(
+            !at_full_range(2, 7, 7),
+            "left thumb moved in → not full range"
+        );
+        assert!(
+            !at_full_range(3, 3, 7),
+            "both collapsed interior → not full range"
+        );
+        // Dragging BOTH back to the extremes returns to full range (Reset hides),
+        // even though the persisted bounds may still read as manual.
+        assert!(
+            at_full_range(0, 7, 7),
+            "dragged back to both ends → full range again"
+        );
     }
 
     #[test]
@@ -3921,5 +4426,178 @@ mod tests {
             preference_to_encoder_bounds(&p),
             EncoderQualityBounds::default()
         );
+    }
+
+    // ── issue #1131: per-peer receive row + send rung helpers ──────────
+
+    fn snap(
+        kind: PrefMediaKind,
+        layer_index: u32,
+        width: u32,
+        height: u32,
+        kbps: u32,
+        reason: Option<DegradeReason>,
+    ) -> ReceivedLayerSnapshot {
+        ReceivedLayerSnapshot {
+            kind,
+            layer_index,
+            layer_count: layer_index + 1,
+            width,
+            height,
+            kbps,
+            reason,
+        }
+    }
+
+    fn layer_info(
+        layer_id: u32,
+        bitrate_kbps: u32,
+        width: u32,
+        height: u32,
+    ) -> videocall_client::SimulcastLayerInfo {
+        videocall_client::SimulcastLayerInfo {
+            layer_id,
+            bitrate_kbps,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn quality_state_helpers_map_each_state() {
+        // Distinct modifier/glyph/word per state — a swap would break a row's
+        // class, its non-color cue, or its spoken quality word.
+        assert_eq!(quality_state_modifier(QualityState::Optimal), "optimal");
+        assert_eq!(quality_state_modifier(QualityState::Medium), "medium");
+        assert_eq!(quality_state_modifier(QualityState::Low), "low");
+        assert_eq!(quality_state_glyph(QualityState::Optimal), "●");
+        assert_eq!(quality_state_glyph(QualityState::Medium), "◐");
+        assert_eq!(quality_state_glyph(QualityState::Low), "○");
+        assert_eq!(quality_state_word(QualityState::Low), "low");
+    }
+
+    #[test]
+    fn reason_chip_copy_per_reason() {
+        // Each reason has its own modifier/text/title/aria — these are the §5
+        // user-facing strings and must not collapse together.
+        assert_eq!(reason_chip_modifier(DegradeReason::Network), "network");
+        assert_eq!(reason_chip_modifier(DegradeReason::Setting), "setting");
+        assert_eq!(reason_chip_modifier(DegradeReason::Sender), "sender");
+        assert_eq!(reason_chip_text(DegradeReason::Network), "Your network");
+        assert_eq!(reason_chip_text(DegradeReason::Setting), "Your setting");
+        assert_eq!(reason_chip_text(DegradeReason::Sender), "Sender");
+        assert!(reason_chip_title(DegradeReason::Network).contains("download"));
+        assert!(reason_chip_title(DegradeReason::Setting).contains("capped"));
+        assert!(reason_chip_title(DegradeReason::Sender).contains("publishing"));
+        assert_eq!(
+            reason_aria_clause(DegradeReason::Network),
+            "limited by your network"
+        );
+        assert_eq!(
+            reason_aria_clause(DegradeReason::Sender),
+            "limited by the sender"
+        );
+    }
+
+    #[test]
+    fn peer_row_metric_video_and_audio_shapes() {
+        // Video/screen: "{res} · ~{kbps} · L{i}/{n}". n is the FULL ladder length
+        // passed in (3), not the snapshot's own layer_count.
+        let v = snap(PrefMediaKind::Video, 1, 960, 540, 600, None);
+        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · L2/3");
+        // Audio: "{kbps}k · {label} · L{i}/{n}".
+        let a = snap(PrefMediaKind::Audio, 1, 0, 0, 32, None);
+        assert_eq!(
+            peer_row_metric(&a, 3, "mid (32k)"),
+            "32k · mid (32k) · L2/3"
+        );
+    }
+
+    #[test]
+    fn peer_row_aria_label_with_and_without_reason() {
+        // No reason (optimal) → no trailing clause.
+        let optimal = peer_row_aria_label(
+            "Ana Ruiz",
+            "video",
+            QualityState::Optimal,
+            "720p",
+            3,
+            3,
+            None,
+        );
+        assert_eq!(
+            optimal,
+            "Ana Ruiz, receiving video, optimal quality, 720p, layer 3 of 3"
+        );
+        // With a reason → appends the §5 clause.
+        let limited = peer_row_aria_label(
+            "Ana Ruiz",
+            "video",
+            QualityState::Low,
+            "360p",
+            1,
+            3,
+            Some(DegradeReason::Network),
+        );
+        assert_eq!(
+            limited,
+            "Ana Ruiz, receiving video, low quality, 360p, layer 1 of 3, limited by your network"
+        );
+    }
+
+    #[test]
+    fn send_rungs_marks_shed_top_layers_and_labels_top_active() {
+        // 3 effective layers, only the bottom 2 active (top shed under congestion).
+        let s = SimulcastSendSnapshot {
+            simulcast_active: true,
+            effective_layers: 3,
+            active_layers: 2,
+            layers: vec![
+                layer_info(0, 300, 640, 360),
+                layer_info(1, 600, 960, 540),
+                layer_info(2, 0, 1280, 720), // shed (bitrate 0)
+            ],
+        };
+        let rungs = send_rungs(&s);
+        assert_eq!(rungs.len(), 3);
+        assert!(rungs[0].active && rungs[1].active, "bottom two active");
+        assert!(!rungs[2].active, "top layer shed");
+        // kbps label only on the TOP ACTIVE pip (layer 1), not on base or shed.
+        assert_eq!(rungs[0].kbps_label, None);
+        assert_eq!(rungs[1].kbps_label, Some("600k".to_string()));
+        assert_eq!(rungs[2].kbps_label, None);
+        // res label under every pip.
+        assert_eq!(rungs[0].res_label, "360p");
+        assert_eq!(rungs[2].res_label, "720p");
+        assert_eq!(send_rungs_aria(&rungs), "Sending 2 of 3 layers");
+    }
+
+    #[test]
+    fn send_rungs_empty_when_no_layers() {
+        // Single-stream / atomics-not-ticked → no layers → empty Vec (caller then
+        // renders no strip and keeps the summary line).
+        let s = SimulcastSendSnapshot {
+            simulcast_active: false,
+            effective_layers: 1,
+            active_layers: 1,
+            layers: vec![],
+        };
+        assert!(send_rungs(&s).is_empty());
+        assert_eq!(send_rungs_aria(&[]), "Sending 1 layer");
+    }
+
+    #[test]
+    fn audio_send_rung_uses_best_cap_label() {
+        // Auto / no cap → best tier (index 0) label, single active pip, no kbps.
+        let auto = audio_send_rung(None);
+        assert!(auto.active);
+        assert_eq!(auto.kbps_label, None);
+        assert_eq!(auto.res_label, AUDIO_TIER_LABELS[0]);
+        // A manual cap at tier 2 → that tier's label.
+        let capped = audio_send_rung(Some(2));
+        assert_eq!(capped.res_label, AUDIO_TIER_LABELS[2]);
+        // Out-of-range index falls back to best tier (panic-safe).
+        let oob = audio_send_rung(Some(999));
+        assert_eq!(oob.res_label, AUDIO_TIER_LABELS[0]);
     }
 }

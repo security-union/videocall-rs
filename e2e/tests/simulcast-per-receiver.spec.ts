@@ -181,10 +181,9 @@ async function pinTransport(context: BrowserContext, t: Transport) {
  * Stage 3 describe block header for the `live_simulcast_snapshot` blocker.
  */
 async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "screen" = "video") {
-  const autoToggle = page.locator(`[data-testid="perf-recv-${kind}-auto"]`);
-  if ((await autoToggle.getAttribute("aria-pressed")) === "true") {
-    await autoToggle.click();
-  }
+  // Dragging the max thumb to 0 sets a manual bound (leaving the full automatic
+  // range) — no toggle click needed (#1131 §D removed the Auto toggle; the Reset
+  // button is conditionally rendered and only appears once constrained).
   const maxThumb = page.locator(`[data-testid="perf-recv-${kind}-range-max"]`);
   await expect(maxThumb).toBeVisible({ timeout: 10_000 });
   await maxThumb.focus();
@@ -537,16 +536,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           "to clamp on this runner (capability ceiling). See helpers/simulcast-config.ts",
       );
 
-      // Turn Auto OFF (so the manual range applies) then drag the max thumb to
-      // the lowest layer (index 0 = "360p"). The slider is an <input type=range>
-      // with min=0 / max=top; setting value to 0 pins max → layer 0.
-      const autoToggle = rxPage.locator('[data-testid="perf-recv-video-auto"]');
-      // The toggle reports state via aria-pressed; only click it off if on.
-      const autoPressed = await autoToggle.getAttribute("aria-pressed");
-      if (autoPressed === "true") {
-        await autoToggle.click();
-      }
-
+      // Drag the max thumb to the lowest layer (index 0 = "360p"); this alone sets
+      // a manual bound and leaves the full automatic range (#1131 §D removed the
+      // Auto toggle). The slider is an <input type=range> with min=0 / max=top;
+      // setting value to 0 pins max → layer 0.
       const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
       await expect(maxThumb).toBeVisible({ timeout: 10_000 });
       // Set the range input to its lowest position and fire input so Dioxus's
@@ -630,10 +623,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       const panel = await openPerformancePanel(rxPage);
 
-      // Default state: video Auto is ON (aria-pressed="true"), and both thumbs
-      // sit at the extremes (min=0, max=top) = full range = Auto.
-      const autoToggle = rxPage.locator('[data-testid="perf-recv-video-auto"]');
-      await expect(autoToggle).toHaveAttribute("aria-pressed", "true");
+      // Default state: full automatic range — both thumbs sit at the extremes
+      // (min=0, max=top). The Reset button (#1131 §D) is ABSENT at the full range
+      // (it only renders once constrained), so its testid resolves to 0 elements.
+      await expect(rxPage.locator('[data-testid="perf-recv-video-auto"]')).toHaveCount(0);
 
       const minThumb = rxPage.locator('[data-testid="perf-recv-video-range-min"]');
       const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
@@ -894,13 +887,30 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //      `[data-testid="diag-simulcast-recv-more-video"]` reads /\+\d+ more/.
   //   5. Capability-gate the per-peer LAYER assertions (rung/layer counts) on the
   //      received ladder size, mirroring the send-side single-layer skip.
+  //
+  // #1131 ADDENDUM — the Performance panel now ALSO renders a per-peer RECEIVE
+  // disclosure (independent of the Diagnostics breakdown above), so the same
+  // multi-peer harness will additionally exercise, in the perf panel:
+  //   * `[data-testid="perf-recv-{kind}-peers"]` — a native <details> (collapsed
+  //     by default) whose `[data-testid="perf-recv-{kind}-peers-summary"]` shows
+  //     "{n} peers · L{lo}–L{hi}". After expanding it:
+  //   * one `[data-testid="perf-recv-{kind}-peer-{sessionId}"]` row per peer, each
+  //     carrying a quality dot `…-peer-{sessionId}-q` (class
+  //     `perf-q-dot--{optimal|medium|low}`) and — only when the peer is below the
+  //     full-ladder top — a reason chip `…-peer-{sessionId}-reason` (class
+  //     `perf-reason-chip--{network|setting|sender}`).
+  //   * INTENDED reason assertion: cap the receiver via
+  //     `perf-recv-video-range-max` → 0, then assert the degraded peer's row shows
+  //     a `perf-reason-chip--setting` chip ("Your setting"); a network-impaired
+  //     peer (via the @impair infra) shows `perf-reason-chip--network`.
   // -------------------------------------------------------------------------
   test.fixme("receive diagnostics list per-peer rows and a '+N more' tail with multiple publishers", async () => {
     // Blocked on #1093 (multi-peer harness): see the block comment above for the
     // intended multi-publisher flow and the `diag-simulcast-recv-peer-{id}` /
     // `diag-simulcast-recv-more-{kind}` assertions this will perform (the breakdown
     // moved to the Diagnostics panel in #1095; the old `perf-recv-*-diag-*` footer
-    // testids no longer exist).
+    // testids no longer exist), PLUS the #1131 perf-panel `perf-recv-{kind}-peers`
+    // disclosure + quality-dot + reason-chip assertions documented above.
   });
 
   // -------------------------------------------------------------------------

@@ -2862,7 +2862,7 @@ mod tests {
 
         // OUT-OF-BAND congestion cut: the relay is dropping our packets. This
         // drops the top layer without going through `tick`'s backpressure block.
-        t += 1100.0; // > MIN_TIER_TRANSITION_INTERVAL_MS so the cut takes effect
+        t += 1100.0; // cut takes effect: last tier transition was the probe-add ~6.5s earlier (>MIN_TIER_TRANSITION_INTERVAL_MS), not because of this bump
         clock.set_ms(t as u64);
         controller.force_congestion_cut();
         assert_eq!(

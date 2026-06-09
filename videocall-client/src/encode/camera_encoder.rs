@@ -2279,16 +2279,24 @@ impl CameraEncoder {
                                     &video_encoder_encode_options,
                                 ) {
                                     Ok(_) => {
-                                        // Raw per-layer submission counter. NOTE: for
-                                        // N>1 this aggregates ALL layers, so it can
-                                        // overcount relative to delivered/usable frames
-                                        // (only the base layer is decoded today — see
-                                        // the `experimental_simulcast_max_layers` knob
-                                        // docs). Left as-is intentionally; it is a
-                                        // submission counter, not a health gate.
-                                        CAMERA_ENCODER_FRAMES_SUBMITTED_OK
-                                            .fetch_add(1, Ordering::Relaxed);
+                                        // Per-frame submission counter, anchored to the
+                                        // BASE layer (`layer_id == 0`) only (#1067). At
+                                        // N>1 every source frame is encoded once per
+                                        // active simulcast layer; counting each layer's
+                                        // submission would inflate this by ~N× relative
+                                        // to the actual delivered-frame cadence (one
+                                        // logical frame per capture). Gating on the base
+                                        // layer makes the counter track real frame
+                                        // cadence regardless of N, and keeps the metric
+                                        // a single series — existing dashboards that
+                                        // `rate()` it continue to read the true fps at
+                                        // both N=1 (unchanged: the only layer IS layer 0)
+                                        // and N>1. A per-layer label was rejected because
+                                        // it would change cardinality and break those
+                                        // single-series panels.
                                         if layer.layer_id == 0 {
+                                            CAMERA_ENCODER_FRAMES_SUBMITTED_OK
+                                                .fetch_add(1, Ordering::Relaxed);
                                             base_ok = true;
                                         }
                                     }

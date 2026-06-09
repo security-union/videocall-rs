@@ -327,6 +327,37 @@ pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
 /// O(n) `retain()` cost. Mirrors the strategy used by `CongestionTracker`.
 pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
 
+/// Upper bound on the simulcast `layer` dimension of the KEYFRAME_REQUEST
+/// limiter key (#1068, defense-in-depth).
+///
+/// The per-pair limiter keys on `(target_sender, layer)` so a receiver that
+/// deliberately switches the simulcast layer it wants from a sender gets a
+/// fresh per-layer budget instead of being throttled as a duplicate (#989,
+/// Phase 1b). The `layer` comes from the cleartext, attacker-controllable
+/// `PacketWrapper.simulcast_layer_id`, which is an unbounded `u32`. Without a
+/// bound, a malicious receiver could cycle DISTINCT layer ids against a SINGLE
+/// sender to open an unbounded number of fresh `(target, layer)` buckets — each
+/// with its own [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] budget — and so
+/// concentrate up to the GLOBAL per-receiver cap ([`KEYFRAME_REQUEST_MAX_PER_SEC`],
+/// ~32/sec) of keyframe pressure on that one victim sender, amplifying the
+/// PLI/keyframe-storm risk (OSS #814).
+///
+/// Clamping the layer component to `0..=this` (via `min`) bounds the number of
+/// distinct per-layer buckets per target to `this + 1`, so per-victim keyframe
+/// pressure is capped at `(this + 1) × KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`
+/// per window regardless of how many distinct layer ids an attacker cycles.
+/// Ids above the bound collapse onto the top bucket (they share its budget)
+/// rather than each opening a new one.
+///
+/// `2` matches the production ladder: every kind ships at most 3 simulcast
+/// layers (ids 0,1,2 — see [`LAYER_PREFERENCE_MAX_LAYER_ID`]'s note), so all
+/// REAL layer switches still get an independent bucket and the fix is invisible
+/// to legitimate clients; only ids beyond the real ladder are clamped. This is
+/// the keyframe-pressure bound, NOT the layer-preference value bound
+/// ([`LAYER_PREFERENCE_MAX_LAYER_ID`]) — they protect different subsystems and
+/// are intentionally separate constants.
+pub const KEYFRAME_REQUEST_MAX_LAYER_ID: u32 = 2;
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///

@@ -3242,6 +3242,16 @@ fn try_intercept_layer_preference(
                 ))
             })
             .collect();
+        // These two SHAPING-step outcomes are emitted BEFORE the rate-limit /
+        // write-lock decision below, so they record malformed-shape *attempts*
+        // and are NOT conditioned on the packet being applied (#1069). A packet
+        // can therefore record `truncated`/`layer_id_out_of_bound` and then be
+        // `rate_limited` rather than `accepted` — the metric doc on
+        // `RELAY_LAYER_PREFERENCE_UPDATES_TOTAL` spells out this co-occurrence.
+        // Left here (rather than moved into the accepted branch) deliberately:
+        // relocating them onto the post-lock path would change behaviour on a
+        // DoS-sensitive hot path for no observability gain, and "attempt rate"
+        // is the more useful guard signal.
         if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
             RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
                 .with_label_values(&[room, "truncated"])
@@ -10805,6 +10815,163 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "a source with no recorded layer preference MUST fail open (forward)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_screen_not_filtered_by_video_preference() {
+        // #1070: per-kind independence (Phase 3). A SCREEN packet whose layer
+        // does NOT match must STILL be forwarded when the receiver's only
+        // recorded preference is VIDEO-keyed for the same source — the layer
+        // filter keys on (source, media_kind), so a (999, VIDEO) preference can
+        // never drop a (999, SCREEN) packet. (Mirrors the AUDIO-vs-VIDEO test;
+        // proves SCREEN is not collaterally filtered by a camera preference. A
+        // SCREEN packet IS filtered only by a SCREEN-keyed preference, which is
+        // covered by `test_handle_msg_drops_non_matching_screen_layer`.)
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO) only
+            "websocket".to_string(),
+        );
+
+        // SCREEN layer 2 with only a VIDEO preference for 999 → forward (the
+        // (999, SCREEN) key has no entry, so the SCREEN packet fails open). If
+        // SCREEN were ever filtered by the VIDEO key this would drop (count 0).
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "SCREEN must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_desired_layer_zero_is_base_only() {
+        // #1070: a recorded preference of `desired_layer = 0` for a source means
+        // "base layer only" — any NON-zero layer from that source is dropped,
+        // and the layer-0 (base) packet is forwarded. This pins the exact
+        // base-only contract: it is the recorded preference VALUE (0), not the
+        // absence of a preference, that drives the drop of higher layers.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 0)]), // (999, VIDEO) → desired layer 0 (base only)
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999 must be DROPPED (preference selects base 0, layer 2 != 0).
+        let layer2_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let l2parsed = parse_pw(&layer2_msg);
+        handler(layer2_msg, l2parsed.as_ref()).expect("handler should not return Err");
+
+        // Layer 0 from 999 must be FORWARDED (base is always forwarded; the
+        // non-zero-layer gate excludes it before the preference is even read).
+        let layer0_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 0),
+        );
+        let l0parsed = parse_pw(&layer0_msg);
+        handler(layer0_msg, l0parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "desired_layer=0 must drop the layer-2 packet and forward only the base (layer-0) packet"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_poisoned_layer_prefs_lock_fails_open() {
+        // #1070: a POISONED LayerPrefs RwLock must FAIL OPEN — a video packet
+        // that the recorded preference would otherwise DROP is forwarded
+        // instead, because the read-lock `.map(...).unwrap_or(false)` on the
+        // forwarding path treats a lock error as "do not drop". The fast-path
+        // hint (`has_any()`) is still `true` (it is a separate AtomicBool, not
+        // affected by poisoning), so the forwarding path DOES take the read
+        // lock — exercising exactly the `unwrap_or(false)` fail-open arm.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver wants layer 1 from 999 → a layer-2 packet would normally drop.
+        let prefs = layer_prefs_with(&[(999, 1)]);
+
+        // Poison the prefs lock by panicking while holding the write guard.
+        let poison_target = prefs.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.state.write().unwrap();
+            panic!("intentional panic to poison the LayerPrefs lock");
+        }));
+        assert!(
+            prefs.state.read().is_err(),
+            "precondition: the LayerPrefs lock must be poisoned"
+        );
+        assert!(
+            prefs.has_any(),
+            "precondition: the non_empty hint must still be true so the forwarding \
+             path takes the read lock and exercises the fail-open arm"
+        );
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            prefs,
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999: the preference selects layer 1, so WITHOUT the
+        // poison this packet would be dropped. With the lock poisoned it must
+        // fail open and be forwarded.
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a poisoned LayerPrefs lock MUST fail open (forward the packet it would otherwise drop)"
         );
     }
 

@@ -3595,6 +3595,15 @@ fn handle_msg(
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
 
+        // LAYER_HINT is, like CONGESTION, a RELAY-authored self-addressed
+        // control packet: the relay emits it on the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) with the publisher's `session_id` stamped
+        // (see `emit_layer_hint`). It must survive the self-echo guard below for
+        // the same reason CONGESTION does. (#1108 delivery gap.)
+        let is_layer_hint = parsed
+            .map(|pw| pw.packet_type == PacketType::LAYER_HINT.into())
+            .unwrap_or(false);
+
         let is_meeting = parsed
             .as_ref()
             .map(|pw| pw.packet_type == PacketType::MEETING.into())
@@ -3617,12 +3626,25 @@ fn handle_msg(
         // meeting — the reporter received 5224 self-DIAGNOSTICS packets
         // back from the relay despite the subject-only filter being in
         // place. Applying the filter uniformly to every packet type
-        // (with the CONGESTION carve-out below) closes the leak.
+        // (with the CONGESTION and LAYER_HINT carve-outs below) closes the
+        // leak.
         //
-        // CONGESTION signals are intentionally exempted: a congested
-        // receiver publishes them onto the throttled sender's own subject
-        // with the sender's session_id embedded, and they MUST still
-        // reach the sender so the client can step down its quality tier.
+        // CONGESTION and LAYER_HINT are intentionally exempted: both are
+        // RELAY-authored, self-ADDRESSED control packets. A congested receiver
+        // (CONGESTION) or the relay's per-source layer aggregator (LAYER_HINT,
+        // `emit_layer_hint`) publishes them onto the target publisher's OWN
+        // subject with that publisher's session_id embedded, and they MUST
+        // still reach the publisher so the client can step down its quality
+        // tier (CONGESTION) or cap its encoded simulcast ladder (LAYER_HINT).
+        // Without the LAYER_HINT carve-out the publish-side layer suppression
+        // built in #1108 is inert: the hint is generated but the self-echo
+        // guard drops it before it leaves the relay (the #1108 delivery gap).
+        //
+        // NOTE: the carve-out below trusts the packet TYPE only because the
+        // relay authors these packets itself. Hardening against a *forged*
+        // client-sent CONGESTION/LAYER_HINT (anti-reflection) is a separate,
+        // still-open concern tracked in #1119 and is orthogonal to delivery —
+        // do not conflate the two here.
         let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
@@ -3642,7 +3664,7 @@ fn handle_msg(
         } else {
             subject_self || inner_session_self
         };
-        if drop_self_echo && !is_congestion {
+        if drop_self_echo && !is_congestion && !is_layer_hint {
             return Ok(());
         }
 
@@ -5970,6 +5992,137 @@ mod tests {
             1,
             "CONGESTION must pass the inner-session-id self-filter so the \
              throttle signal still reaches the sender after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_subject() {
+        // #1108 delivery-gap carve-out. `emit_layer_hint` publishes the
+        // relay-authored LAYER_HINT onto the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) so the publisher can cap its encoded
+        // simulcast ladder. The subject-self match must NOT block it — exactly
+        // like CONGESTION. Before the `&& !is_layer_hint` carve-out this packet
+        // was dropped as a self-echo, leaving the #1108 publish-side suppression
+        // inert.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject == the receiver's own self-subject, mirroring the real
+        // `emit_layer_hint` publish target (`room.{room}.{publisher}`).
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes(PacketType::LAYER_HINT),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the subject-self filter so the relay-authored \
+             hint reaches the publisher (#1108 delivery gap)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_inner_session_id() {
+        // #1108 carve-out applied to the inner-session check too.
+        // `emit_layer_hint` stamps `wrapper.session_id = publisher` (the
+        // publisher's own session) onto the LAYER_HINT packet. The
+        // inner-session self-skip must NOT suppress it just because the inner
+        // session_id matches — otherwise a post-reconnect window (stale
+        // subscription whose subject differs from the current session) would
+        // swallow the hint even though the embedded session_id targets us.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-inner-room".to_string(),
+            6161,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject points at a DIFFERENT session id; embedded session_id is ours
+        // (the publisher the relay addressed). Must still be delivered.
+        let nats_msg = make_nats_message(
+            "room.layerhint-inner-room.424242",
+            make_packet_bytes_with_session(PacketType::LAYER_HINT, 6161),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the inner-session-id self-filter so the \
+             relay-authored hint still reaches the publisher after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_self_media_still_dropped_alongside_layer_hint() {
+        // Regression guard paired with the two LAYER_HINT carve-out tests
+        // above: the carve-out must be TYPE-scoped. A self-addressed plain
+        // MEDIA packet — same self-subject AND same embedded session_id as the
+        // LAYER_HINT cases — must STILL be dropped as a self-echo. If this ever
+        // forwards, the carve-out has leaked into ordinary media traffic
+        // (re-opening the 2026-05-08 self-echo leak).
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Identical addressing to test_handle_msg_layer_hint_passes_self_filter_*
+        // (self-subject + own embedded session_id) but packet_type == MEDIA.
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes_with_session(PacketType::MEDIA, 5151),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-addressed MEDIA must STILL be dropped — the LAYER_HINT \
+             carve-out must not leak into ordinary media traffic"
         );
     }
 

@@ -157,9 +157,7 @@ test.describe("Adaptive decode budget (#987)", () => {
   }
 
   async function closeSettingsModal(page: Page): Promise<void> {
-    await page
-      .locator('.device-settings-modal button[aria-label="Close settings"]')
-      .click();
+    await page.locator('.device-settings-modal button[aria-label="Close settings"]').click();
     await expect(page.locator(".device-settings-modal")).not.toBeVisible({ timeout: 5_000 });
   }
 

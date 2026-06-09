@@ -830,18 +830,38 @@ lazy_static! {
     )
     .expect("Failed to create relay_layer_filtered_total metric");
 
-    /// Simulcast VIDEO packets that PASSED the layer filter and were forwarded —
-    /// the denominator complement of `relay_layer_filtered_total` (#989). Counts
-    /// VIDEO packets that reached the layer filter (i.e. already passed the
-    /// viewport filter) and were forwarded, whether because no preference was
-    /// recorded (no-op / fail-open), the layer matched, or the layer id was 0
-    /// (base). The "% layer-filtered" panel is `filtered / (filtered + forwarded)`.
+    /// Simulcast media packets that ENTERED the per-receiver layer filter and
+    /// were forwarded — the denominator complement of `relay_layer_filtered_total`
+    /// (#989), measured over EXACTLY the same population as the filtered counter.
+    ///
+    /// IMPORTANT — counted population (matches the increment in `handle_msg`):
+    /// both this counter and `relay_layer_filtered_total` are incremented ONLY
+    /// inside the layer-filter gate, which requires ALL of:
+    ///   * a layer-filterable media kind (VIDEO / SCREEN / AUDIO), AND
+    ///   * a NON-ZERO cleartext `simulcast_layer_id` (layer 0 / base is forwarded
+    ///     BEFORE this gate and is therefore NOT counted here), AND
+    ///   * `LayerPrefs::has_any()` true (this receiver has recorded at least one
+    ///     LAYER_PREFERENCE — the no-preference / empty-map fast path forwards
+    ///     WITHOUT entering the gate and is therefore NOT counted here).
+    /// Within that population a packet lands in THIS counter when it is forwarded:
+    /// the layer matched the recorded preference, OR there is no recorded entry
+    /// for this specific (source, kind) (per-source fail-open), OR the prefs lock
+    /// was poisoned / the source was unparseable (fail-open). It lands in
+    /// `relay_layer_filtered_total` only when a recorded (source, kind) entry
+    /// selects a DIFFERENT layer.
+    ///
+    /// Because both counters share the identical gate, the "% layer-filtered"
+    /// panel `filtered / (filtered + forwarded)` is the fraction of
+    /// layer-filterable, non-zero-layer, has-prefs traffic that was dropped — it
+    /// deliberately does NOT include layer-0 or no-preference forwards in the
+    /// denominator (those never enter either counter), which is what makes the
+    /// ratio a clean drop rate over the population the filter actually acts on.
     ///
     /// CARDINALITY: `room` only. No per-source/session label (session IDs churn
     /// on reconnect).
     pub static ref RELAY_LAYER_FORWARDED_TOTAL: CounterVec = register_counter_vec!(
         "relay_layer_forwarded_total",
-        "Total simulcast VIDEO packets forwarded after passing per-receiver layer selection (matched, base layer 0, or fail-open). Denominator complement of relay_layer_filtered_total (#989)",
+        "Simulcast media packets forwarded by the per-receiver layer filter (non-zero layer + receiver has prefs; matched, no entry for this source/kind, or fail-open). Denominator complement of relay_layer_filtered_total over the SAME gated population — layer-0 and no-preference forwards are NOT counted (#989, doc #1069)",
         &["room"]
     )
     .expect("Failed to create relay_layer_forwarded_total metric");
@@ -886,17 +906,30 @@ lazy_static! {
     /// would otherwise fire silently) and gives plain "LAYER_PREFERENCE
     /// received" visibility via the `accepted` outcome.
     ///
-    /// `outcome` is bounded — exactly 5 values:
+    /// `outcome` is bounded — exactly 5 values. NOTE on co-occurrence (doc #1069):
+    /// `truncated` and `layer_id_out_of_bound` are emitted from the SHAPING step
+    /// that runs BEFORE the rate-limit / write-lock decision, so they count
+    /// shaping *attempts* and are NOT conditioned on the packet being applied.
+    /// `accepted` and `rate_limited` are mutually exclusive and emitted from the
+    /// later decision. A single packet therefore records at most one of
+    /// {`accepted`, `rate_limited`} PLUS, independently, zero or more of
+    /// {`truncated`, `layer_id_out_of_bound`}. In particular a packet may record
+    /// `truncated` together with `rate_limited` (its shape was over-cap but it
+    /// arrived too soon to be applied) — these do NOT imply `accepted`. Treat
+    /// `truncated` / `layer_id_out_of_bound` as "malformed-shape attempt rate",
+    /// not as "applied with truncation".
     /// - `accepted`:              update was applied to the receiver's map.
     /// - `rate_limited`:          arrived within
     ///   `LAYER_PREFERENCE_MIN_UPDATE_INTERVAL` of the last accepted update;
     ///   consumed but ignored.
     /// - `truncated`:             the entries list exceeded
-    ///   `LAYER_PREFERENCE_MAX_ENTRIES` and was capped (fail-open on the
-    ///   excess). Counted in ADDITION to `accepted` for the same packet.
+    ///   `LAYER_PREFERENCE_MAX_ENTRIES` and the excess was dropped (fail-open).
+    ///   Emitted from the pre-lock shaping step regardless of whether the packet
+    ///   is then accepted or rate-limited (see the co-occurrence note above).
     /// - `layer_id_out_of_bound`: at least one entry's `desired_layer` exceeded
     ///   `LAYER_PREFERENCE_MAX_LAYER_ID` and was skipped (fail-open per source,
-    ///   #1082). Counted in ADDITION to `accepted` for the same packet.
+    ///   #1082). Emitted from the same pre-lock shaping step, regardless of
+    ///   whether the packet is then accepted or rate-limited.
     /// - `ignored_other_subject`: arrived on a subject other than the receiver's
     ///   own; expected for normal NATS fan-out and dropped without mutating state.
     ///

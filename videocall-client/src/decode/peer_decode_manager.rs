@@ -39,7 +39,7 @@ use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, TransportType};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
@@ -1114,6 +1114,92 @@ impl Peer {
         // boundary call (which ran even with simulcast off).
         let now = now_ms();
 
+        // ---- CLEARTEXT layer gate, BEFORE AES-decrypt (#1066) -----------------
+        //
+        // The simulcast layer-drop decision needs only CLEARTEXT envelope fields
+        // (`media_kind` field 6 and `simulcast_layer_id` field 5 on the outer
+        // `PacketWrapper`), both of which live OUTSIDE the AEAD seal. Deciding the
+        // drop here — before `aes.decrypt(...)` and `parse_media_packet(...)`
+        // below — means a receiver that has narrowed to one layer pays NO
+        // AES-decrypt and NO protobuf-parse cost on the layers it discards, so a
+        // receiver's CPU stops scaling with the publisher's layer count (the
+        // perf goal of #1066). Previously this guard keyed on the DECRYPTED inner
+        // `media_type`, so every non-selected layer was decrypted and parsed only
+        // to be dropped a few lines later.
+        //
+        // This is PERF-ONLY — NOT a trust/authz change. `media_kind` and
+        // `simulcast_layer_id` were already trusted, un-sealed routing hints (the
+        // relay filters on the very same fields); a forged value only changes
+        // which layer the FORGER's own receiver decodes. A non-key-holder still
+        // cannot decrypt anything: the drop returns SKIPPED without ever touching
+        // `self.aes`, and a kept packet still goes through the unchanged decrypt
+        // path below.
+        //
+        // N=1 INERT (preserved exactly): pre-simulcast / single-layer publishers
+        // send `simulcast_layer_id == 0`, and every `selected_*_layer` defaults to
+        // 0, so `incoming_video_layer != selected` is false → nothing is dropped
+        // and we fall through to the identical decrypt+decode path. The
+        // availability `observe` records layer 0, exactly as before.
+        //
+        // FALL-THROUGH for UNSPECIFIED: a packet whose cleartext `media_kind` is
+        // UNSPECIFIED (older client that predates field 6 — which also predates
+        // simulcast, so its layer id is always 0) is NOT gated here; it falls
+        // through and the per-arm observe+drop below runs against the decrypted
+        // `media_type` exactly as it did before this change.
+        let cleartext_kind = packet
+            .media_kind
+            .enum_value()
+            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
+        // True once the cleartext gate has taken ownership of the observe+drop
+        // for this kind, so the matching post-decrypt arm skips its now-redundant
+        // (and otherwise double-counting) observe+drop.
+        let mut cleartext_gate_handled = false;
+        match cleartext_kind {
+            MediaKind::VIDEO => {
+                self.video_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Video,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_video_layer {
+                    return Ok((MediaType::VIDEO, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::SCREEN => {
+                self.screen_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Screen,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_screen_layer {
+                    return Ok((MediaType::SCREEN, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::AUDIO => {
+                self.audio_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Audio,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_audio_layer {
+                    return Ok((MediaType::AUDIO, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::MEDIA_KIND_UNSPECIFIED => {
+                // Older / non-layered client: fall through to the post-decrypt
+                // per-arm observe+drop, unchanged.
+            }
+        }
+
         let packet = match self.aes {
             Some(aes) => {
                 let data = aes
@@ -1130,39 +1216,43 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
-                // Phase 2 (#989): learn which layers this source produces from
-                // EVERY arriving VIDEO packet — including ones we are about to
-                // drop below — so the chooser knows how high it may climb. This
-                // MUST run before the drop guard, otherwise we would only ever
-                // observe the layer we already selected and could never learn a
-                // higher layer exists. Observing a non-selected layer here costs
-                // a hashmap insert; the packet is still dropped below.
+                // Phase 2 (#989): learn which layers this source produces and
+                // drop non-selected layers. NOTE (#1066): when the CLEARTEXT gate
+                // above already handled this kind (the common path for current
+                // clients that stamp `media_kind`), the observe+drop ran there
+                // BEFORE decrypt, so a surviving packet here is guaranteed to be
+                // the selected layer. We therefore skip this redundant block to
+                // avoid a double `observe`. This per-arm path now runs ONLY for
+                // the cleartext-UNSPECIFIED fall-through (older clients), for
+                // which it behaves exactly as before.
                 //
                 // Security (#989): clamp the raw, attacker-controllable
                 // (un-sealed) layer id to the ladder range BEFORE observing, so a
                 // malicious publisher cycling unbounded unique ids cannot inflate
                 // availability cardinality between prunes.
-                self.video_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Video,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.video_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Video,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Simulcast layer-select guard (issue #989). Drop any VIDEO
-                // packet that is not the layer this receiver is decoding for
-                // this peer — BEFORE sequence tracking and BEFORE decode.
-                //
-                // This MUST run before `track_sequence`: each simulcast layer
-                // carries an independent dense sequence, so feeding a
-                // non-selected layer's sequence into our single per-peer
-                // `video_seq_tracker` would manufacture phantom loss
-                // (~(N-1)/N) and trigger spurious PLI storms. For
-                // pre-simulcast publishers `incoming_video_layer` is 0 and
-                // `selected_video_layer` defaults to 0, so nothing is dropped.
-                if incoming_video_layer != self.selected_video_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Simulcast layer-select guard (issue #989). Drop any VIDEO
+                    // packet that is not the layer this receiver is decoding for
+                    // this peer — BEFORE sequence tracking and BEFORE decode.
+                    //
+                    // This MUST run before `track_sequence`: each simulcast layer
+                    // carries an independent dense sequence, so feeding a
+                    // non-selected layer's sequence into our single per-peer
+                    // `video_seq_tracker` would manufacture phantom loss
+                    // (~(N-1)/N) and trigger spurious PLI storms. For
+                    // pre-simulcast publishers `incoming_video_layer` is 0 and
+                    // `selected_video_layer` defaults to 0, so nothing is dropped.
+                    if incoming_video_layer != self.selected_video_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // Track sequence numbers for gap detection (PLI) and windowed
@@ -1222,28 +1312,30 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
-                // Phase 3 (#989): learn AUDIO layer availability from arriving
-                // audio packets' layer ids. Audio simulcast is a small ladder
-                // (low/high); the chooser uses this to know whether a higher
-                // audio layer even exists before climbing. Single-layer audio
-                // publishers send 0, so availability stays {0} and the chooser
-                // never climbs — a no-op for them. Must run before any drop.
+                // Phase 3 (#989): learn AUDIO layer availability and drop
+                // non-selected audio layers. Skipped here when the CLEARTEXT gate
+                // (#1066) already handled this kind before decrypt — see the
+                // VIDEO arm for the full rationale; this per-arm block now runs
+                // only for the cleartext-UNSPECIFIED fall-through.
                 //
                 // Security (#989): clamp the raw (un-sealed) layer id to the
                 // audio ladder range before observing (see the VIDEO arm).
-                self.audio_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Audio,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.audio_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Audio,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop audio
-                // packets whose layer != the selected audio layer. Default
-                // selected_audio_layer is 0, matching single-layer publishers.
-                if incoming_video_layer != self.selected_audio_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop
+                    // audio packets whose layer != the selected audio layer.
+                    // Default selected_audio_layer is 0, matching single-layer
+                    // publishers.
+                    if incoming_video_layer != self.selected_audio_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // HCL bug #1: stamp audio freshness regardless of the
@@ -1272,29 +1364,33 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
-                // Phase 3 (#989): learn SCREEN layer availability from EVERY
-                // arriving screen packet (incl. ones about to be dropped) so the
-                // screen chooser knows how high it may climb — independent of the
-                // camera VIDEO availability. Must run before the drop guard.
+                // Phase 3 (#989): learn SCREEN layer availability and drop
+                // non-selected screen layers. Skipped here when the CLEARTEXT
+                // gate (#1066) already handled this kind before decrypt — see the
+                // VIDEO arm for the full rationale; this per-arm block now runs
+                // only for the cleartext-UNSPECIFIED fall-through.
                 //
                 // Security (#989): clamp the raw (un-sealed) layer id to the
                 // screen ladder range before observing (see the VIDEO arm).
-                self.screen_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Screen,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.screen_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Screen,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop any
-                // SCREEN packet that is not the layer this receiver selected for
-                // this peer's screen — BEFORE sequence tracking and decode, for
-                // the same phantom-loss reason as the VIDEO guard. Pre-simulcast
-                // / single-layer screen publishers send layer 0 and the default
-                // selected_screen_layer is 0, so nothing is dropped for them.
-                if incoming_video_layer != self.selected_screen_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop
+                    // any SCREEN packet that is not the layer this receiver
+                    // selected for this peer's screen — BEFORE sequence tracking
+                    // and decode, for the same phantom-loss reason as the VIDEO
+                    // guard. Pre-simulcast / single-layer screen publishers send
+                    // layer 0 and the default selected_screen_layer is 0, so
+                    // nothing is dropped for them.
+                    if incoming_video_layer != self.selected_screen_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // Track sequence numbers for gap detection (PLI) and windowed
@@ -4286,6 +4382,97 @@ mod tests {
             peer.video_seq_tracker.high_seq,
             Some(2),
             "selecting the already-selected layer must be a no-op (no spurious reset)"
+        );
+    }
+
+    /// #1066: build a MEDIA `PacketWrapper` with a CLEARTEXT outer `media_kind`
+    /// and `simulcast_layer_id`, but with `data` that is NOT validly AES-encrypted
+    /// (raw bytes). When the peer has an enabled AES key, `aes.decrypt` of this
+    /// `data` FAILS — so reaching the decrypt step at all surfaces as
+    /// `Err(AesDecryptError)`. Tests use this to prove the cleartext layer gate
+    /// early-returns BEFORE decrypt for dropped layers.
+    fn cleartext_kind_wrap(
+        media_kind: MediaKind,
+        layer_id: u32,
+        session_id: u64,
+    ) -> Arc<PacketWrapper> {
+        Arc::new(PacketWrapper {
+            // Deliberately NOT a valid ciphertext: short, non-block-aligned bytes
+            // so an enabled-AES `decrypt` errors if it is ever attempted.
+            data: vec![1u8, 2, 3, 4, 5],
+            user_id: "test@test.com".into(),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            simulcast_layer_id: layer_id,
+            media_kind: media_kind.into(),
+            ..Default::default()
+        })
+    }
+
+    /// #1066: a non-selected simulcast layer must be DROPPED on the CLEARTEXT
+    /// envelope BEFORE AES-decrypt. With an enabled AES key and intentionally
+    /// invalid ciphertext, a layer the gate drops returns `Ok(SKIPPED)` (decrypt
+    /// never ran); if the drop had keyed on the DECRYPTED inner media_type as
+    /// before, the same packet would have hit `aes.decrypt` first and returned
+    /// `Err(AesDecryptError)`. This is the regression that pins the perf fix.
+    #[wasm_bindgen_test]
+    fn cleartext_layer_gate_drops_before_decrypt() {
+        let (mut peer, _muted) = make_test_peer(970);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        // Enabled AES: any decrypt attempt on the invalid ciphertext below errors.
+        peer.aes = Some(Aes128State::new(true));
+        // Receiver decodes only the base layer (the N=1 default), so layer 2 is
+        // a non-selected layer that must be dropped.
+        assert_eq!(peer.selected_video_layer(), 0);
+
+        let dropped = cleartext_kind_wrap(MediaKind::VIDEO, 2, 970);
+        let result = peer.decode(&dropped, "local@test.com");
+
+        // The gate fired BEFORE decrypt: a clean SKIPPED, not an AES error.
+        match result {
+            Ok((MediaType::VIDEO, status, kf)) => {
+                assert!(!status.rendered, "dropped layer must not render");
+                assert!(kf.is_none(), "dropped layer must not request a keyframe");
+            }
+            Ok(other) => panic!("expected Ok((VIDEO, SKIPPED, None)), got {other:?}"),
+            Err(e) => panic!(
+                "non-selected layer must be dropped on the cleartext envelope BEFORE \
+                 decrypt — reaching decrypt produced {e:?}"
+            ),
+        }
+
+        // Availability was still observed pre-decrypt (the chooser must learn a
+        // higher layer exists even though we dropped this packet).
+        assert_eq!(
+            peer.video_layer_availability.highest_available(now_ms()),
+            2,
+            "the dropped layer's id must still be observed for the chooser"
+        );
+    }
+
+    /// #1066: at the N=1 default (selected layer 0, publisher layer 0) the gate
+    /// must be INERT — a layer-0 packet is NOT dropped pre-decrypt, so it
+    /// proceeds to the (here intentionally failing) decrypt. With an enabled AES
+    /// key and invalid ciphertext that surfaces as `Err(AesDecryptError)`,
+    /// proving the gate did NOT short-circuit the base layer.
+    #[wasm_bindgen_test]
+    fn cleartext_layer_gate_is_inert_for_base_layer() {
+        let (mut peer, _muted) = make_test_peer(971);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.aes = Some(Aes128State::new(true));
+        assert_eq!(peer.selected_video_layer(), 0);
+
+        // Layer 0 == selected layer 0 → the gate forwards (does NOT drop), so the
+        // packet reaches decrypt. The invalid ciphertext then errors, which is
+        // exactly the signal that the base layer was NOT short-circuited.
+        let base = cleartext_kind_wrap(MediaKind::VIDEO, 0, 971);
+        let result = peer.decode(&base, "local@test.com");
+        assert!(
+            matches!(result, Err(PeerDecodeError::AesDecryptError)),
+            "base layer (N=1) must fall through the gate to decrypt unchanged \
+             (got {result:?})"
         );
     }
 

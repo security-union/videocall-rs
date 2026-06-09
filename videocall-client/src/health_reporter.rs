@@ -729,6 +729,17 @@ impl HealthReporter {
                         }
                         "audio_buffer_ms" => {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
+                                // NOTE: kept as a PERIODIC sample (logged every ~1 Hz
+                                // NetEQ tick per peer), NOT edge-triggered. The meeting
+                                // analyzer (`scripts/parse_meeting_console_logs.sh`)
+                                // computes n_samples / n_nonzero / median / median_nonzero
+                                // from this line as a uniform sample stream — change-point
+                                // logging would bias all four (a stable 150ms buffer would
+                                // report n=1, median=150 instead of the true distribution).
+                                // The large per-tick offenders demoted in this PR are
+                                // elsewhere (MEDIA receive, heartbeat, ConnectionManager,
+                                // Rendering-meeting-view, Host-render); this analyzer-
+                                // critical sample is left intact at debug!.
                                 debug!(
                                     "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
                                 );
@@ -1235,7 +1246,12 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
-                            debug!("Sent health packet for session: {session_id_val}");
+                            // PER-TICK hot path: fires on every health-report
+                            // interval (~1 Hz per session). Demoted debug!->trace!
+                            // so it stays off even when console-log collection
+                            // bumps to Debug (#1100 follow-up). Not on the analyzer
+                            // keep-list.
+                            trace!("Sent health packet for session: {session_id_val}");
                         }
                     }
                 } else {

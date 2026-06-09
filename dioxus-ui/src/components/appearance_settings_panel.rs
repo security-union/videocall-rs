@@ -9,7 +9,7 @@ use crate::context::{
     load_custom_colors_from_storage, save_custom_colors_to_storage, save_decode_budget_override,
     save_density_mode, save_dock_autohide, save_dock_position, AppearanceSettings,
     AppearanceSettingsCtx, AutohideCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
-    DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx,
+    DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx, MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
 use dioxus::prelude::*;
@@ -421,6 +421,45 @@ pub fn AppearanceSettingsPanel() -> Element {
                                                                 }
                                                             }
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if custom_colors().len() < MAX_CUSTOM_COLORS {
+                                            button {
+                                                id: "add-custom-color-btn",
+                                                class: "color-swatch add-color-btn",
+                                                r#type: "button",
+                                                "aria-label": "Add custom color",
+                                                title: "Add custom color",
+                                                onclick: move |evt: Event<MouseData>| {
+                                                    evt.stop_propagation();
+                                                    color_input.set(String::new());
+                                                    input_error.set(false);
+                                                    show_picker.set(!show_picker());
+                                                },
+                                                svg {
+                                                    xmlns: "http://www.w3.org/2000/svg",
+                                                    width: "14",
+                                                    height: "14",
+                                                    view_box: "0 0 24 24",
+                                                    fill: "none",
+                                                    stroke: "currentColor",
+                                                    stroke_width: "2.5",
+                                                    stroke_linecap: "round",
+                                                    stroke_linejoin: "round",
+                                                    "aria-hidden": "true",
+                                                    line {
+                                                        x1: "12",
+                                                        y1: "5",
+                                                        x2: "12",
+                                                        y2: "19",
+                                                    }
+                                                    line {
+                                                        x1: "5",
+                                                        y1: "12",
+                                                        x2: "19",
+                                                        y2: "12",
                                                     }
                                                 }
                                             }

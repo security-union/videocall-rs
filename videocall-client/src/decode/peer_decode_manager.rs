@@ -956,6 +956,104 @@ impl Peer {
         desired
     }
 
+    /// Early-seed this peer's per-kind choosers from a sample taken OUTSIDE the
+    /// 5s monitor tick (issue #1179, Part B).
+    ///
+    /// Runs the pure [`LayerChooser::observe_early_congestion`] for VIDEO, SCREEN
+    /// and AUDIO using the SAME inputs the normal tick would
+    /// ([`Self::tick_layer_chooser`] et al.): each kind's most-recent windowed
+    /// downlink sample + its empirically-learned availability cap. Because the
+    /// early-seed primitive only acts while a chooser is still UNCONSTRAINED and
+    /// only on a congested sample, this is a no-op for a healthy cold-start join
+    /// (M2 preserved) and a no-op once the 5s loop has already constrained — the
+    /// 5s loop then owns adaptation.
+    ///
+    /// Unlike `tick_layer_chooser`, this does NOT advance the chooser's hysteresis
+    /// (`choose`/clean-window/score/sticky are untouched): the only state it can
+    /// change is flipping an unconstrained chooser to constrained + one step down,
+    /// exactly mirroring the unconstrained-congested arm of `choose`. On an actual
+    /// seed it re-anchors the matching sequence tracker and updates the decode
+    /// guard so decode follows the seeded layer immediately (same as the tick).
+    ///
+    /// Returns `true` if ANY kind was seeded (so the caller can log it); the
+    /// caller still emits the resulting preference via the normal sender path.
+    ///
+    /// NOTE on availability: like the tick this calls `highest_available`, which
+    /// prunes the rolling availability map. That is a read of "what layers exist
+    /// right now", NOT chooser-hysteresis state, and it is exactly what the next
+    /// tick would do anyway — it does not advance any clean-window / sticky state.
+    pub fn seed_early_congestion(&mut self, now_ms: u64) -> bool {
+        let mut seeded = false;
+
+        // VIDEO — same inputs as `tick_layer_chooser`.
+        let vh = self.video_layer_availability.highest_available(now_ms);
+        if self
+            .video_layer_chooser
+            .observe_early_congestion(self.last_video_downlink, vh, now_ms)
+        {
+            let layer = self.video_layer_chooser.current();
+            if layer != self.selected_video_layer {
+                self.video_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_video_layer = layer;
+            seeded = true;
+        }
+
+        // SCREEN — same inputs as `tick_screen_layer_chooser`.
+        let sh = self.screen_layer_availability.highest_available(now_ms);
+        if self
+            .screen_layer_chooser
+            .observe_early_congestion(self.last_screen_downlink, sh, now_ms)
+        {
+            let layer = self.screen_layer_chooser.current();
+            if layer != self.selected_screen_layer {
+                self.screen_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_screen_layer = layer;
+            seeded = true;
+        }
+
+        // AUDIO — proxied by the VIDEO downlink, same as `tick_audio_layer_chooser`.
+        let ah = self.audio_layer_availability.highest_available(now_ms);
+        if self
+            .audio_layer_chooser
+            .observe_early_congestion(self.last_video_downlink, ah, now_ms)
+        {
+            self.selected_audio_layer = self.audio_layer_chooser.current();
+            seeded = true;
+        }
+
+        seeded
+    }
+
+    /// READ-ONLY snapshot of the layer this peer would advertise for each kind
+    /// RIGHT NOW, without advancing the chooser (issue #1179, Part B).
+    ///
+    /// Mirrors what [`PeerDecodeManager::tick_layer_choosers`] would emit but does
+    /// NOT call `choose` / `tick_*`: it reads each chooser's
+    /// [`LayerChooser::desired_preference`] (which returns `Some(layer)` only while
+    /// the chooser is actively constrained below the top, `None` otherwise). It
+    /// therefore touches no hysteresis state, no clean-window/score/sticky counter,
+    /// and no availability map — it is a pure read used by the early-seed timer to
+    /// feed the existing [`LayerPreferenceSender`] without disturbing the 5s loop's
+    /// cadence. Pushes each present `(kind, layer)` into `out`.
+    fn collect_desired_preferences(
+        &self,
+        session_id: u64,
+        out: &mut HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
+    ) {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        if let Some(layer) = self.video_layer_chooser.desired_preference() {
+            out.insert((session_id, PrefMediaKind::Video), layer);
+        }
+        if let Some(layer) = self.screen_layer_chooser.desired_preference() {
+            out.insert((session_id, PrefMediaKind::Screen), layer);
+        }
+        if let Some(layer) = self.audio_layer_chooser.desired_preference() {
+            out.insert((session_id, PrefMediaKind::Audio), layer);
+        }
+    }
+
     /// The simulcast layer this receiver currently decodes for this peer's audio
     /// stream.
     pub fn selected_audio_layer(&self) -> u32 {
@@ -1962,6 +2060,64 @@ impl PeerDecodeManager {
                 if audio < ah {
                     desired.insert((session_id, PrefMediaKind::Audio), audio);
                 }
+            }
+        }
+        desired
+    }
+
+    /// Early-seed congestion across every WEBTRANSPORT peer (issue #1179, Part B).
+    ///
+    /// Drives [`Peer::seed_early_congestion`] for each peer whose LIVE
+    /// `transport_type` is [`TransportType::TRANSPORT_WEBTRANSPORT`]. WS / UNKNOWN
+    /// peers are skipped entirely so the M2 healthy cold-start is preserved for
+    /// them — the WT gate is evaluated HERE, per tick, not at install time,
+    /// because `transport_type` is UNKNOWN when a peer is first added and only
+    /// populates once the peer's first heartbeat lands (well within the seed
+    /// window). The early-seed primitive is itself a no-op on a clean sample, so
+    /// even a WT peer that is healthy at join is seeded nothing.
+    ///
+    /// Returns `true` if any WT peer was actually seeded (a congested early
+    /// sample flipped it to constrained). The caller still emits the resulting
+    /// preference through the normal [`LayerPreferenceSender`] path via
+    /// [`Self::current_desired_preferences`].
+    pub fn seed_early_congestion_for_wt_peers(&mut self, now_ms: u64) -> bool {
+        let mut seeded = false;
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // WT-ONLY: evaluate the live transport at tick time. UNKNOWN at
+                // peer-add → only WT peers whose heartbeat has populated the
+                // field are seeded; WS/UNKNOWN get nothing.
+                if peer.transport_type != TransportType::TRANSPORT_WEBTRANSPORT {
+                    continue;
+                }
+                if peer.seed_early_congestion(now_ms) {
+                    seeded = true;
+                }
+            }
+        }
+        seeded
+    }
+
+    /// READ-ONLY per-(peer, kind) desired-layer map (issue #1179, Part B).
+    ///
+    /// Mirrors the shape of [`Self::tick_layer_choosers`]'s return value but does
+    /// NOT advance any chooser: it only reads each peer's
+    /// [`LayerChooser::desired_preference`] (see
+    /// [`Peer::collect_desired_preferences`]). It touches no hysteresis,
+    /// clean-window, score, sticky, or availability state, so feeding its result
+    /// to the [`LayerPreferenceSender`] after an early seed cannot perturb what the
+    /// next 5s monitor tick computes (the early-seed `observe_early_congestion`
+    /// mutation on a genuinely-congested WT peer is the ONLY state change in the
+    /// seed path). Used to publish the early seed through the existing sender so
+    /// `last_sent` / `last_sent_ms` stay coherent and the next tick does not
+    /// re-send a redundant packet.
+    pub fn current_desired_preferences(
+        &self,
+    ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
+        let mut desired = HashMap::new();
+        for session_id in self.connected_peers.ordered_keys() {
+            if let Some(peer) = self.connected_peers.get(session_id) {
+                peer.collect_desired_preferences(*session_id, &mut desired);
             }
         }
         desired
@@ -4882,6 +5038,181 @@ mod tests {
             "fresh peers must advertise no preference (cold start = forward all): {desired:?}"
         );
         let _ = PrefMediaKind::Video; // keep the import used regardless of asserts
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1179, Part B: early-seed wiring (manager level)
+    //
+    // These exercise the two glue methods the early-seed timer drives:
+    //   * seed_early_congestion_for_wt_peers — WT-ONLY, and a no-op on a
+    //     clean WT join (M2 preserved);
+    //   * current_desired_preferences — READ-ONLY (advances no hysteresis).
+    // -----------------------------------------------------------------
+
+    /// Mark a peer's VIDEO downlink congested and learn a 3-layer ladder so a
+    /// constrain has somewhere to step down to. Mirrors the inputs the decode
+    /// path would have populated for a real congested WT join.
+    fn make_congested_top_peer(session_id: u64, transport: TransportType) -> Peer {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.transport_type = transport;
+        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+            peer.screen_layer_availability.observe(layer, 1000);
+            peer.audio_layer_availability.observe(layer, 1000);
+        }
+        // A congested video window (over the loss step-down threshold). Screen has
+        // its own window; leave it clean so only VIDEO/AUDIO can seed for this peer
+        // (audio is proxied by the video downlink).
+        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+        peer
+    }
+
+    /// WT-ONLY: the early seed constrains a congested WEBTRANSPORT peer but must
+    /// leave a WEBSOCKET (and UNKNOWN) peer with the SAME congested downlink
+    /// completely untouched (M2 cold-start preserved for non-WT).
+    ///
+    /// MUTATION CHECK: fails if the `transport_type != TRANSPORT_WEBTRANSPORT`
+    /// gate in `seed_early_congestion_for_wt_peers` is removed/inverted — then the
+    /// WS peer would be seeded too and its desired map would be non-empty.
+    #[wasm_bindgen_test]
+    fn early_seed_is_wt_only() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut manager = PeerDecodeManager::new();
+        manager.connected_peers.insert(
+            100,
+            make_congested_top_peer(100, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        manager.connected_peers.insert(
+            200,
+            make_congested_top_peer(200, TransportType::TRANSPORT_WEBSOCKET),
+        );
+        manager.connected_peers.insert(
+            300,
+            make_congested_top_peer(300, TransportType::TRANSPORT_UNKNOWN),
+        );
+
+        let seeded = manager.seed_early_congestion_for_wt_peers(2000);
+        assert!(
+            seeded,
+            "the WT peer's congested sample must seed a constrain"
+        );
+
+        let desired = manager.current_desired_preferences();
+        // WT peer (100): video constrained from top (2) down to 1, audio proxied
+        // by the same congested video window also drops to 1.
+        assert_eq!(
+            desired.get(&(100, PrefMediaKind::Video)),
+            Some(&1),
+            "WT peer must be constrained to layer 1 by the early seed"
+        );
+        assert_eq!(
+            desired.get(&(100, PrefMediaKind::Audio)),
+            Some(&1),
+            "WT peer audio (video-proxied) must also constrain"
+        );
+        // WS + UNKNOWN peers must NOT appear — they were never seeded.
+        assert!(
+            !desired.keys().any(|(sid, _)| *sid == 200),
+            "WS peer must NOT be seeded (M2 cold-start preserved): {desired:?}"
+        );
+        assert!(
+            !desired.keys().any(|(sid, _)| *sid == 300),
+            "UNKNOWN-transport peer must NOT be seeded: {desired:?}"
+        );
+    }
+
+    /// M2 non-regression: a HEALTHY WT joiner (clean downlink) must be seeded
+    /// NOTHING — no constrain, no preference, no HD dip.
+    ///
+    /// MUTATION CHECK: fails if `observe_early_congestion` ever constrains on a
+    /// clean sample (the `!sample.is_congested()` guard in the primitive).
+    #[wasm_bindgen_test]
+    fn early_seed_noop_on_clean_wt_join() {
+        let mut manager = PeerDecodeManager::new();
+        // Clean WT peer: top layers learned, but downlink is the default clean
+        // sample (loss 0 / kf 0).
+        let (mut peer, _muted) = make_test_peer(101);
+        peer.transport_type = TransportType::TRANSPORT_WEBTRANSPORT;
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+        }
+        manager.connected_peers.insert(101, peer);
+
+        let seeded = manager.seed_early_congestion_for_wt_peers(2000);
+        assert!(!seeded, "a clean WT join must seed nothing (M2)");
+        let desired = manager.current_desired_preferences();
+        assert!(
+            desired.is_empty(),
+            "clean WT join advertises no preference: {desired:?}"
+        );
+    }
+
+    /// READ-ONLY: `current_desired_preferences` must not advance ANY chooser
+    /// state. After seeding a WT peer (constrained at layer 1, clean-window streak
+    /// reset to 0 by the step-down), we call the accessor 50 times with a CLEAN
+    /// downlink loaded — the exact condition under which a real `choose`/`tick`
+    /// WOULD accumulate clean windows and eventually climb. The peer's decode
+    /// layer and advertised preference must be byte-for-byte unchanged across all
+    /// 50 reads, AND the map each read returns must be identical (idempotent).
+    ///
+    /// This is mutation-sensitive WITHOUT relying on top-convergence: the seeded
+    /// state is held at layer 1, so any climb (which a `choose` mutation would
+    /// eventually cause once the streak/dwell are met) moves it OFF 1 and the
+    /// assertion fires. It is also belt-and-suspenders to the compile-time
+    /// guarantee that `current_desired_preferences`/`collect_desired_preferences`
+    /// take `&self` (a `choose` call needs `&mut self` and would not compile).
+    ///
+    /// MUTATION CHECK: fails if the accessor is changed to drive `choose`/`tick_*`
+    /// (the seeded layer would climb away from 1 / the returned map would change),
+    /// or to clear `constrained` (the preference would vanish).
+    #[wasm_bindgen_test]
+    fn current_desired_preferences_is_read_only() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+
+        let mut mgr = PeerDecodeManager::new();
+        mgr.connected_peers.insert(
+            1,
+            make_congested_top_peer(1, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        // Seed: constrains video 2 -> 1 (and audio, video-proxied).
+        assert!(mgr.seed_early_congestion_for_wt_peers(2000));
+
+        // Load a CLEAN downlink so that IF the accessor (incorrectly) advanced the
+        // chooser, the clean-window streak would build and eventually climb.
+        if let Some(p) = mgr.connected_peers.get_mut(&1) {
+            p.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+
+        // Snapshot the post-seed state, then hammer the read-only accessor.
+        let baseline = mgr.current_desired_preferences();
+        assert_eq!(
+            baseline.get(&(1, PrefMediaKind::Video)),
+            Some(&1),
+            "seeded WT peer advertises layer 1 before any reads"
+        );
+        let baseline_layer = mgr.connected_peers.get(&1).unwrap().selected_video_layer();
+        assert_eq!(baseline_layer, 1, "seeded decode layer is 1");
+
+        for i in 0..50 {
+            let map = mgr.current_desired_preferences();
+            assert_eq!(
+                map, baseline,
+                "read #{i}: current_desired_preferences must be idempotent (read-only)"
+            );
+            let layer = mgr.connected_peers.get(&1).unwrap().selected_video_layer();
+            assert_eq!(
+                layer, baseline_layer,
+                "read #{i}: the accessor must not advance the chooser — decode layer \
+                 moved from {baseline_layer} to {layer} (hysteresis advanced off-cadence)"
+            );
+        }
     }
 
     /// Phase 4 (#989): the user's receive-layer bounds clamp each peer's chosen

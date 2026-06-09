@@ -526,9 +526,9 @@ h3 {
   align-items: center;
   justify-content: center;
   border-radius: var(--radius-pill, 999px);
-  background: var(--btn-warning-bg, rgba(255, 159, 10, 0.18));
-  color: var(--warning, #ff9f0a);
-  box-shadow: 0 0 0 1px var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+  background: var(--btn-warning-bg);
+  color: var(--warning);
+  box-shadow: 0 0 0 1px var(--btn-warning-border);
   pointer-events: none;
 }
 
@@ -3979,9 +3979,9 @@ select {
     /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
   backdrop-filter: saturate(180%) blur(14px);
   -webkit-backdrop-filter: saturate(180%) blur(14px);
-  border: 1px solid var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+  border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg, 14px);
-  box-shadow: 0 8px 32px var(--shadow-card-deep, rgba(0, 0, 0, 0.4));
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
   /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
      themes, so the theme-flipping --text-on-glass-strong token must NOT be used
      here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
@@ -4001,7 +4001,7 @@ select {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--warning, #ff9f0a);
+  color: var(--warning);
 }
 
 .decode-budget-banner-text {
@@ -4033,14 +4033,14 @@ select {
   padding: 0 14px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--warning, #ff9f0a);
-  background: var(--btn-warning-bg, rgba(255, 159, 10, 0.18));
-  border: 1px solid var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
 }
 
 .decode-budget-banner-action:hover {
-  background: var(--btn-warning-bg-hover, rgba(255, 159, 10, 0.28));
-  border-color: var(--btn-warning-border-hover, rgba(255, 159, 10, 0.4));
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
 }
 
 .decode-budget-banner-dismiss {
@@ -4054,12 +4054,12 @@ select {
 }
 
 .decode-budget-banner-dismiss:hover {
-  background: var(--glass-bg-hover, rgba(255, 255, 255, 0.1));
+  background: var(--glass-bg-hover);
 }
 
 .decode-budget-banner-action:focus-visible,
 .decode-budget-banner-dismiss:focus-visible {
-  outline: 2px solid var(--warning, #ff9f0a);
+  outline: 2px solid var(--warning);
   outline-offset: 2px;
 }
 

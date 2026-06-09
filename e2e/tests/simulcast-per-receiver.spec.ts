@@ -125,7 +125,11 @@
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
  *       text format: `L{idx+1}/{count} · {kbps} kbps` or "Not receiving"
  *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
- *   - `[data-testid="perf-recv-video-auto"]`        video Auto toggle (aria-pressed)
+ *   - `[data-testid="perf-recv-video-auto"]`        video "Reset" button (#1131 §D
+ *       REPURPOSED this testid off the former Auto TOGGLE; it is now a plain
+ *       button — NO aria-pressed — rendered ONLY while the stream is constrained
+ *       and ABSENT at the full default range. Clicking it clears both bounds back
+ *       to the full automatic range.)
  */
 
 import { test, expect, chromium, Browser, BrowserContext, Page } from "@playwright/test";
@@ -708,8 +712,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 
       const panel = await openPerformancePanel(rxPage);
 
-      // Every kind must expose its full RECEIVE control set: needle gauge, Auto
-      // toggle, and dual-thumb range (min + max). The unified panel (#1078) puts
+      // Every kind must expose its full RECEIVE control set: needle gauge, help
+      // button, and dual-thumb range (min + max). The unified panel (#1078) puts
       // the receive controls under the `perf-recv-*` / `perf-vu-recv-*`
       // namespace. Content === Screen kind (testid prefix `perf-recv-screen`,
       // labelled "Shared content" in the UI).
@@ -718,9 +722,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           panel.locator(`[data-testid="perf-vu-recv-${kind}"]`),
           `${kind} receive needle gauge present`,
         ).toBeVisible();
+        // #1131 §D: the former per-kind "Auto" TOGGLE is now a conditionally
+        // rendered "Reset" button (same `perf-recv-{kind}-auto` testid). On this
+        // fresh join no manual bound is set → the stream is at the full default
+        // range → Reset is ABSENT. (The always-present per-kind control is the
+        // help button, asserted below.)
         await expect(
           panel.locator(`[data-testid="perf-recv-${kind}-auto"]`),
-          `${kind} receive Auto toggle present`,
+          `${kind} receive Reset button absent at the full default range`,
+        ).toHaveCount(0);
+        await expect(
+          panel.locator(`[data-testid="perf-recv-${kind}-help"]`),
+          `${kind} receive help button present`,
         ).toBeVisible();
         await expect(
           panel.locator(`[data-testid="perf-recv-${kind}-range-min"]`),
@@ -1625,15 +1638,31 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
           })
           .toBe(0);
 
-        // PHASE 3 — RESTORE-EAGER: one receiver requests a higher layer again
-        // (un-pin: Auto back ON = full range). The relay's union grows past base,
-        // and because restore is EAGER (no debounce) the publisher must re-enable
-        // the top rung PROMPTLY — assert within a couple of seconds.
-        const rxAAuto = rxAPage.locator('[data-testid="perf-recv-video-auto"]');
-        if ((await rxAAuto.getAttribute("aria-pressed")) !== "true") {
-          await rxAAuto.click();
-        }
-        await expect(rxAAuto).toHaveAttribute("aria-pressed", "true", { timeout: 5_000 });
+        // PHASE 3 — RESTORE-EAGER: one receiver requests a higher layer again by
+        // un-pinning back to the full automatic range. #1131 §D replaced the old
+        // per-stream "Auto" TOGGLE with a "Reset" button (same
+        // `perf-recv-video-auto` testid, but NO aria-pressed and only rendered
+        // while the stream is constrained). `pinReceiverToBaseLayer` above left
+        // the max thumb at 0, so the receiver IS constrained → the Reset button is
+        // present. Clicking it clears both bounds back to the full range (auto =
+        // true), which grows the relay's union past base. Because restore is EAGER
+        // (no debounce) the publisher must re-enable the top rung PROMPTLY. After
+        // the click the bounds are cleared, so the Reset button hides itself
+        // (count → 0) — that is the post-condition we assert instead of a stale
+        // aria-pressed read.
+        const rxAReset = rxAPage.locator('[data-testid="perf-recv-video-auto"]');
+        await expect(
+          rxAReset,
+          "Reset button present while the receiver is pinned to base",
+        ).toBeVisible({ timeout: 5_000 });
+        await expect(rxAReset).not.toHaveAttribute("aria-pressed", /.*/);
+        await rxAReset.click();
+        // Cleared back to the full range → the Reset button is no longer rendered,
+        // and the max thumb snaps back to the ladder top.
+        await expect(rxAReset).toHaveCount(0, { timeout: 5_000 });
+        const rxAMaxThumb = rxAPage.locator('[data-testid="perf-recv-video-range-max"]');
+        const rxATop = await rxAMaxThumb.getAttribute("max");
+        await expect(rxAMaxThumb).toHaveValue(String(rxATop));
 
         // The publisher restores the top rung promptly (restore-eager). ~6 s budget
         // covers the LAYER_PREFERENCE round-trip + one AQ restore tick; the relay

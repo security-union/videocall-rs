@@ -433,15 +433,24 @@ test.describe("Performance settings panel (#961)", () => {
     await expect(popover).toHaveCount(0);
 
     // Click "?" → popover opens with the explanation copy. The SEND video help
-    // body (`HELP_VIDEO_SEND` in performance_settings.rs) reads "Your camera
-    // sends several quality versions ('layers') … The slider caps the best and
-    // worst versions you'll send." Match the distinctive "best and worst …
-    // send" tail so a copy change here breaks the test (the source of truth is
-    // the Rust constant, not this regex).
+    // body (`HELP_VIDEO_SEND` in performance_settings.rs) now reads "Your camera
+    // sends several quality versions ('layers') … The left handle sets the lowest
+    // version you'll send (floor), the right handle the highest (ceiling); it
+    // adapts within that band. … Reset returns to the full automatic range."
+    // (#1131 §D rewrote this copy: the old "caps the best and worst versions
+    // you'll send" / Auto-toggle wording is GONE — the source of truth is the
+    // Rust constant.) Match the distinctive floor/ceiling-handle phrasing AND the
+    // "Reset returns to the full automatic range" tail so a copy regression — or a
+    // relapse to "Auto" wording — breaks this test.
     await helpBtn.click();
     await expect(helpBtn).toHaveAttribute("aria-expanded", "true");
     await expect(popover).toBeVisible();
-    await expect(popover).toContainText(/best and worst versions you'll send/i);
+    await expect(popover).toContainText(
+      /the left handle sets the lowest version you'll send \(floor\), the right handle the highest \(ceiling\)/i,
+    );
+    await expect(popover).toContainText(/reset returns to the full automatic range/i);
+    // The retired "Auto" toggle wording must NOT resurface in the help copy.
+    await expect(popover).not.toContainText(/\bAuto\b/);
 
     // Escape closes it.
     await page.keyboard.press("Escape");
@@ -736,6 +745,43 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
         panel.locator(`[data-testid="perf-recv-${kind}-help"]`),
         `${kind} receive help button present`,
       ).toBeVisible();
+    }
+  });
+
+  test("receive per-peer disclosure: the empty state renders NO <details> for any kind (#1131 §3)", async ({
+    page,
+  }) => {
+    // §3: the receive side renders a native <details> per-peer disclosure
+    // (`perf-recv-{kind}-peers`) ONLY when at least one peer is decoding that
+    // kind — the Rust source gates it behind `if !peers.is_empty()`
+    // (performance_settings.rs). This test joins single-page (no peers), so the
+    // EMPTY state must render zero disclosures for EVERY kind. The populated
+    // disclosure + per-peer quality-dot / reason-chip assertions need a real
+    // multi-peer meeting and live in simulcast-per-receiver.spec.ts (blocked on
+    // the #1093 multi-peer harness). This is the single-context half of §3 and is
+    // a real regression guard: if the empty-state gate regressed (a stray
+    // disclosure rendered with no peers), this fails.
+    await joinMeeting(page, "recv_peers_empty");
+    await openPerformanceTab(page);
+    await selectReceiveDirection(page);
+
+    const panel = page.locator("#settings-panel-performance");
+
+    for (const kind of ["video", "audio", "screen"] as const) {
+      // No <details> disclosure…
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-peers"]`),
+        `${kind} receive per-peer disclosure absent in the empty (no-peer) state`,
+      ).toHaveCount(0);
+      // …and therefore no summary and no per-peer rows / dots / reason chips.
+      await expect(
+        panel.locator(`[data-testid="perf-recv-${kind}-peers-summary"]`),
+        `${kind} receive per-peer summary absent in the empty state`,
+      ).toHaveCount(0);
+      await expect(
+        panel.locator(`[data-testid^="perf-recv-${kind}-peer-"]`),
+        `${kind} receive per-peer rows absent in the empty state`,
+      ).toHaveCount(0);
     }
   });
 

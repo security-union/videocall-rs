@@ -533,6 +533,51 @@ impl LayerChooser {
         self.current
     }
 
+    /// Early-seed a constrain from a sample taken OUTSIDE the normal 5s monitor
+    /// tick (issue #1179, Part B).
+    ///
+    /// ## Why
+    /// `choose` is only fed every 5s (`connection.rs` `Interval::new(5000, …)`).
+    /// A freshly-joined peer whose downlink is already congested therefore
+    /// decodes the FULL-quality top layer for up to ~5s before the first monitor
+    /// tick can react — long enough to stall a constrained receiver at join. For
+    /// WebTransport peers (where reliable-unistream fan-out makes the join spike
+    /// worst, per the 2026-06-09 simulcast-congestion meeting analysis), a
+    /// short-lived fast sampler calls this on a fresh downlink sample so the FIRST
+    /// congested sample constrains immediately instead of waiting for the tick.
+    ///
+    /// ## Semantics (pure)
+    /// * Only acts while **unconstrained** (the cold-start decode-best state): if
+    ///   `choose` has already constrained, the normal loop now owns adaptation and
+    ///   this is a no-op (returns `false`).
+    /// * A **congested** sample flips to constrained and steps down ONE rung from
+    ///   the current top — identical to the unconstrained-congested arm of
+    ///   `choose`, so the two entry points converge on the same state. Returns
+    ///   `true` (the caller should emit the resulting preference and stop sampling).
+    /// * A **clean / neutral** sample is a no-op (returns `false`): the seed only
+    ///   reacts to actual early congestion; it never pre-emptively lowers a healthy
+    ///   join (M2 cold-start is preserved untouched).
+    ///
+    /// Does NOT touch the congestion score or sticky machinery — a single early
+    /// sample must not by itself latch sticky; that remains the job of sustained
+    /// congestion observed by `choose`.
+    pub fn observe_early_congestion(
+        &mut self,
+        sample: DownlinkSample,
+        highest_available: u32,
+        now_ms: u64,
+    ) -> bool {
+        if self.constrained || !sample.is_congested() {
+            return false;
+        }
+        self.constrained = true;
+        let from = self.current.min(highest_available);
+        let dropped = from.saturating_sub(1);
+        self.set_layer(dropped, now_ms);
+        self.clean_windows = 0;
+        true
+    }
+
     /// Apply a layer change and reset the dwell/clean bookkeeping.
     fn set_layer(&mut self, layer: u32, now_ms: u64) {
         if layer != self.current {
@@ -1320,6 +1365,75 @@ mod tests {
         assert!(!c.is_sticky(), "a clean cold-join must never latch sticky");
         assert_eq!(c.current(), 2, "decodes the top");
         assert_eq!(c.desired_preference(), None, "advertises no preference");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1179, Part B: observe_early_congestion early seed
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn early_congestion_seeds_constrain_on_congested_sample() {
+        // A congested early sample on an unconstrained (cold-join) chooser must
+        // constrain immediately and step down one rung, returning true so the
+        // glue knows to emit a preference and stop sampling — instead of waiting
+        // up to 5s for the first monitor tick.
+        //
+        // MUTATION CHECK: fails if `observe_early_congestion` returns false on a
+        // congested sample, or does not set `constrained` / step down.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        // Cold start: decode-best at the top, no preference.
+        c.choose(clean(), avail, 1000);
+        assert_eq!(c.current(), 2);
+        assert_eq!(c.desired_preference(), None);
+        // Early congested sample seeds the constrain.
+        let seeded = c.observe_early_congestion(congested(), avail, 1500);
+        assert!(seeded, "congested early sample must seed a constrain");
+        assert_eq!(
+            c.current(),
+            1,
+            "early seed steps down one rung from the top"
+        );
+        assert_eq!(
+            c.desired_preference(),
+            Some(1),
+            "seeded constrain advertises the held layer"
+        );
+        // A single early sample must NOT latch sticky.
+        assert!(!c.is_sticky(), "one early sample never latches sticky");
+    }
+
+    #[test]
+    fn early_congestion_is_noop_on_clean_or_already_constrained() {
+        // A clean early sample is a no-op (cold-start decode-best preserved), and
+        // once the chooser is already constrained the normal loop owns adaptation
+        // so the early seed must not fire again.
+        //
+        // MUTATION CHECK: fails if the `self.constrained || !is_congested()` guard
+        // is removed (then a clean sample would constrain, or it would re-fire
+        // after the chooser is already constrained).
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 1000); // decode-best at top
+                                        // Clean early sample → no-op.
+        let seeded_clean = c.observe_early_congestion(clean(), avail, 1200);
+        assert!(!seeded_clean, "clean early sample must not constrain");
+        assert_eq!(c.current(), 2, "healthy join keeps full quality");
+        assert_eq!(c.desired_preference(), None);
+        // Now constrain via a real congested sample…
+        assert!(c.observe_early_congestion(congested(), avail, 1400));
+        assert_eq!(c.current(), 1);
+        // …a SECOND early call (even congested) is a no-op: already constrained.
+        let seeded_again = c.observe_early_congestion(congested(), avail, 1600);
+        assert!(
+            !seeded_again,
+            "early seed must not re-fire once constrained — the 5s loop owns it"
+        );
+        assert_eq!(
+            c.current(),
+            1,
+            "no extra step-down from a repeated early seed"
+        );
     }
 
     #[test]

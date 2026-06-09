@@ -2817,7 +2817,10 @@ impl Handler<JoinRoom> for ChatServer {
                 // (It also predates the mailbox-drop counters and intentionally
                 // stays a plain warn on this one-shot setup path.)
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    // `build_peer_joined_packet` returns an owned `Vec<u8>`;
+                    // wrap it in `Bytes` (a one-time move into the refcounted
+                    // buffer, no copy) to match `Message.msg`'s type (#1063).
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: member.session,
                 }) {
                     warn!(
@@ -3509,7 +3512,9 @@ fn try_intercept_display_name_change(
     match forwarded {
         Ok(sanitized) => {
             let message = Message {
-                msg: sanitized,
+                // `sanitized` is a freshly-serialized `Vec<u8>` (rare rename
+                // path); move it into `Bytes` to match `Message.msg` (#1063).
+                msg: bytes::Bytes::from(sanitized),
                 session,
             };
             if let Err(e) = recipient.try_send(message) {
@@ -3935,7 +3940,15 @@ fn handle_msg(
         }
 
         let message = Message {
-            msg: msg.payload.to_vec(),
+            // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
+            // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
+            // bump that SHARES the single NATS payload allocation across every
+            // receiver in this room's fan-out — replacing the previous
+            // `.to_vec()` that deep-copied the multi-KB frame once per
+            // recipient. The per-receiver materialization back to owned bytes
+            // (for the outbound channel) still happens at most once, later, in
+            // `SessionLogic::handle_outbound`; delivery is byte-identical.
+            msg: msg.payload.clone(),
             session,
         };
 
@@ -4633,10 +4646,12 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        // `Message.msg` is now `bytes::Bytes` (#1063); capture the shared
+        // handles directly. `&Bytes` derefs to `&[u8]` for the parse below.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;

@@ -560,7 +560,13 @@ impl SessionLogic {
             .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
-        msg.msg.clone()
+        // `msg.msg` is a shared `bytes::Bytes` (#1063): the single NATS payload
+        // allocation is refcounted across all fan-out receivers. The
+        // per-transport outbound channel (`Sender<Vec<u8>>` for WS, or
+        // `Sender<Bytes>` for WT via `send_auto`) still needs owned bytes, so
+        // materialize ONCE here per receiver — the same single copy that used
+        // to live at the fan-out `Message` construction, just moved downstream.
+        msg.msg.to_vec()
     }
 
     // =========================================================================

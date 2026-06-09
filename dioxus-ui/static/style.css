@@ -506,6 +506,40 @@ h3 {
   background-color: var(--surface);
 }
 
+/* #1142 Phase 1, Part C: device-paused avatar polish. A subtle dim + a small
+   pause-glyph badge distinguish "paused by your device" (decode budget) from a
+   normal camera-off tile. The dim is applied to the placeholder content only
+   (not the whole tile chrome) so the name, mic indicator, and signal meter stay
+   at full contrast — audio affordances must remain legible. */
+.placeholder-content.placeholder-content--paused {
+  position: relative;
+  opacity: 0.82;
+}
+
+.decode-paused-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--btn-warning-bg, rgba(255, 159, 10, 0.18));
+  color: var(--warning, #ff9f0a);
+  box-shadow: 0 0 0 1px var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+  pointer-events: none;
+}
+
+/* Override the generic `.placeholder-content svg` sizing/tint for the badge
+   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
+.decode-paused-badge svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
 /* ============================================================
    Mobile: narrower gap/padding
    Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
@@ -3912,6 +3946,151 @@ select {
 }
 .audio-indicator.speaking svg {
   stroke: currentColor;
+}
+
+/* ── Decode-budget "videos paused" banner (#1142 Phase 1) ─────────────
+   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   NOT a modal: it overlays the grid (absolute within #grid-container) and
+   does not block interaction with the tiles below. The glass treatment
+   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
+   accent is the shared amber `--warning` token. Contrast: amber-on-dark and
+   the white body text both clear 4.5:1 on the ~0.9-opacity dark surface. */
+.decode-budget-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 24px));
+  padding: 8px 10px 8px 14px;
+  background: rgba(30, 30, 30, 0.9)
+    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  border: 1px solid var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: 0 8px 32px var(--shadow-card-deep, rgba(0, 0, 0, 0.4));
+  color: var(--text-on-glass-strong, rgba(255, 255, 255, 0.95));
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+    sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  animation: decode-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.decode-budget-banner-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--warning, #ff9f0a);
+}
+
+.decode-budget-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The compact mobile count is hidden on wider viewports. */
+.decode-budget-banner-count {
+  display: none;
+  flex: 1;
+  font-weight: 600;
+}
+
+.decode-budget-banner-action,
+.decode-budget-banner-dismiss {
+  flex-shrink: 0;
+  /* a11y: real ≥44px hit targets even though the visual chrome is smaller. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.decode-budget-banner-action {
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--warning, #ff9f0a);
+  background: var(--btn-warning-bg, rgba(255, 159, 10, 0.18));
+  border: 1px solid var(--btn-warning-border, rgba(255, 159, 10, 0.25));
+}
+
+.decode-budget-banner-action:hover {
+  background: var(--btn-warning-bg-hover, rgba(255, 159, 10, 0.28));
+  border-color: var(--btn-warning-border-hover, rgba(255, 159, 10, 0.4));
+}
+
+.decode-budget-banner-dismiss {
+  min-width: 44px;
+  padding: 0;
+  color: var(--text-on-glass-strong, rgba(255, 255, 255, 0.95));
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.decode-budget-banner-dismiss:hover {
+  background: var(--glass-bg-hover, rgba(255, 255, 255, 0.1));
+}
+
+.decode-budget-banner-action:focus-visible,
+.decode-budget-banner-dismiss:focus-visible {
+  outline: 2px solid var(--warning, #ff9f0a);
+  outline-offset: 2px;
+}
+
+@keyframes decode-banner-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no vertical slide. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-budget-banner {
+    animation: decode-banner-enter-reduced 0.15s ease-out;
+  }
+  @keyframes decode-banner-enter-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}
+
+/* Mobile ≤639px: icon + count + ✕ only (hide the long message). */
+@media (max-width: 639px) {
+  .decode-budget-banner {
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    font-size: 12px;
+  }
+  .decode-budget-banner-text {
+    display: none;
+  }
+  .decode-budget-banner-count {
+    display: inline-block;
+  }
+  .decode-budget-banner-action {
+    padding: 0 10px;
+    font-size: 12px;
+  }
 }
 
 /* ── Participant join/leave toast notifications ─────────────────────── */

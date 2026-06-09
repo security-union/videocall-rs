@@ -10,6 +10,7 @@ pub mod capability_check;
 pub mod config_error;
 pub mod connection_quality_indicator;
 pub mod decode_budget;
+pub mod decode_budget_banner;
 pub mod decode_budget_inject;
 pub mod density;
 pub mod device_selector;

@@ -364,6 +364,29 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     );
 }
 
+/// Given the peers we have previously published per-pair metrics for
+/// (`stored_to_peers`) and the peer ids present in the CURRENT health packet
+/// (`current_peer_ids`), return the peers that have DEPARTED this reporter's
+/// view — i.e. those we still hold series for but that are no longer reported.
+///
+/// This is the diff that drives per-packet pruning (issue #1092): a peer that
+/// leaves a still-live reporter's view drops out of `peer_stats`, so it is never
+/// re-written and — without this prune — its per-pair gauges would be frozen at
+/// their last value in Prometheus until the whole reporter session is reaped.
+///
+/// Pure (no I/O, no metrics side effects) so the diff logic is unit-testable in
+/// isolation from the Prometheus registry and the live ingest path.
+fn peers_to_prune(
+    stored_to_peers: &HashSet<String>,
+    current_peer_ids: &HashSet<&str>,
+) -> Vec<String> {
+    stored_to_peers
+        .iter()
+        .filter(|peer| !current_peer_ids.contains(peer.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Remove all per-peer Prometheus metrics for a specific reporter→peer pair.
 /// Used both for session cleanup and for removing stale series when a peer's
 /// display_name changes (e.g., from session_id to real name).
@@ -966,6 +989,74 @@ fn process_health_packet_to_metrics_pb(
             CLIENT_RENDER_FPS
                 .with_label_values(&[meeting_id, session_id, reporter_display_name.as_str()])
                 .set(fps);
+        }
+
+        // Per-packet prune of departed peers (issue #1092).
+        //
+        // A peer that LEAVES a still-live reporter's view drops out of this
+        // packet's `peer_stats`, but its per-pair series were already written on
+        // earlier packets and are never re-written — so without this prune they
+        // freeze at their last value in Prometheus until the WHOLE reporter
+        // session is reaped (30s+). Here we diff the session's stored `to_peers`
+        // against the peers present in THIS packet and, for each peer now absent,
+        // delete its per-pair series and drop it from the session's tracking sets.
+        //
+        // This runs UNCONDITIONALLY (not gated on a non-empty `peer_stats`) so the
+        // "reporter now sees nobody" case — where `peer_stats` is empty — still
+        // prunes every previously-tracked peer. The reporter's own self-pair is
+        // never in `to_peers` (only observed peers are inserted), and the 4-label
+        // reporter-level metrics are keyed without `to_peer`, so neither is touched.
+        {
+            let current_peer_ids: HashSet<&str> = health_packet
+                .peer_stats
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            let mut tracker = session_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = tracker.get_mut(&session_key) {
+                let departed = peers_to_prune(&info.to_peers, &current_peer_ids);
+                for peer_id in &departed {
+                    let peer_dn = info
+                        .to_peer_display_names
+                        .get(peer_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    remove_per_peer_metrics(
+                        meeting_id,
+                        session_id,
+                        reporting_user_id,
+                        peer_id,
+                        reporter_display_name.as_str(),
+                        &peer_dn,
+                    );
+                    // Prune ONLY the per-pair tracking sets. `to_peers` and
+                    // `to_peer_display_names` key the per-pair series that
+                    // `remove_per_peer_metrics` just deleted; dropping the peer from
+                    // them stops those 23 series from being re-written on the next
+                    // packet and lets a future re-appearance re-register cleanly.
+                    //
+                    // `peer_ids` is DELIBERATELY retained. It is the lifetime-of-session
+                    // set that drives PEER_CONNECTIONS_TOTAL cleanup in
+                    // remove_session_metrics: that gauge is keyed only
+                    // (meeting_id, peer_id) — i.e. SHARED across all reporters in the
+                    // meeting — so it must NOT be removed when ONE reporter stops seeing
+                    // the peer (other reporters may still observe it). It is removed only
+                    // on whole-session reap, iterating `peer_ids`. Removing the peer from
+                    // `peer_ids` here would silently disable that cleanup and re-leak the
+                    // gauge (the exact #1092 class, for PEER_CONNECTIONS_TOTAL).
+                    info.to_peers.remove(peer_id);
+                    info.to_peer_display_names.remove(peer_id);
+                }
+                if !departed.is_empty() {
+                    debug!(
+                        "Pruned {} departed peer(s) for session {} (meeting {}): {:?}",
+                        departed.len(),
+                        session_id,
+                        meeting_id,
+                        departed
+                    );
+                }
+            }
         }
 
         // Process peer health data
@@ -2594,6 +2685,189 @@ mod tests {
         assert!(
             map.is_empty(),
             "All display_name_map entries should be cleaned since all sessions are stale"
+        );
+    }
+
+    /// Pure diff helper (issue #1092): peers we still hold series for but that are
+    /// absent from the current packet are the ones to prune; peers still present
+    /// (and brand-new peers not yet stored) are not.
+    #[test]
+    fn test_peers_to_prune_diff() {
+        let mut stored = HashSet::new();
+        stored.insert("alice".to_string());
+        stored.insert("bob".to_string());
+        stored.insert("carol".to_string());
+
+        // Current packet only reports alice (bob + carol have left this reporter's view).
+        let current: HashSet<&str> = ["alice"].into_iter().collect();
+        let mut departed = peers_to_prune(&stored, &current);
+        departed.sort();
+        assert_eq!(departed, vec!["bob".to_string(), "carol".to_string()]);
+
+        // All stored peers still present => nothing to prune.
+        let current_all: HashSet<&str> = ["alice", "bob", "carol"].into_iter().collect();
+        assert!(peers_to_prune(&stored, &current_all).is_empty());
+
+        // Empty packet (reporter sees nobody) => every stored peer is departed.
+        let empty: HashSet<&str> = HashSet::new();
+        let mut all = peers_to_prune(&stored, &empty);
+        all.sort();
+        assert_eq!(
+            all,
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+
+        // A brand-new peer present in the packet but not yet stored is NOT pruned
+        // (the diff only ever removes peers we already hold).
+        let current_new: HashSet<&str> = ["alice", "bob", "carol", "dave"].into_iter().collect();
+        assert!(peers_to_prune(&stored, &current_new).is_empty());
+    }
+
+    /// End-to-end ingest test for the per-packet prune (issue #1092):
+    /// reporter alice sees {peer_a, peer_b}, then a later packet sees only
+    /// {peer_a}. peer_b's per-pair series must be REMOVED while peer_a's is
+    /// retained; the session must no longer track peer_b. A final packet with
+    /// NO peers must prune peer_a too.
+    #[test]
+    fn test_departed_peer_per_pair_series_pruned_on_next_packet() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let meeting_id = "m_prune_1092";
+        let session_id = "s_prune_1092";
+        let reporter = "alice_1092";
+
+        // Packet 1: reporter sees peer_a and peer_b (both with NetEQ stats so the
+        // per-pair series are written).
+        let (pa, psa) = create_test_peer_stats("peer_a_1092", true, true, 150.0, 8.0);
+        let (pb, psb) = create_test_peer_stats("peer_b_1092", true, true, 120.0, 4.0);
+        let mut hp1 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
+        hp1.peer_stats.insert(pa, psa);
+        hp1.peer_stats.insert(pb, psb);
+        assert!(process_health_packet_to_metrics_pb(&hp1, &tracker, &dn_map).is_ok());
+
+        // Both per-pair series exist after packet 1.
+        let labels_a = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("from_peer", reporter),
+            ("to_peer", "peer_a_1092"),
+        ];
+        let labels_b = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("from_peer", reporter),
+            ("to_peer", "peer_b_1092"),
+        ];
+        assert!(
+            series_exists("videocall_neteq_packets_awaiting_decode", &labels_a),
+            "peer_a series should exist after first packet"
+        );
+        assert!(
+            series_exists("videocall_neteq_packets_awaiting_decode", &labels_b),
+            "peer_b series should exist after first packet"
+        );
+
+        // Packet 2: reporter now sees ONLY peer_a; peer_b has left its view.
+        let (pa2, psa2) = create_test_peer_stats("peer_a_1092", true, true, 150.0, 8.0);
+        let mut hp2 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
+        hp2.peer_stats.insert(pa2, psa2);
+        assert!(process_health_packet_to_metrics_pb(&hp2, &tracker, &dn_map).is_ok());
+
+        // peer_b's per-pair series must be GONE; peer_a's must remain.
+        assert!(
+            !series_exists("videocall_neteq_packets_awaiting_decode", &labels_b),
+            "peer_b series must be pruned once it leaves the reporter's view"
+        );
+        assert!(
+            series_exists("videocall_neteq_packets_awaiting_decode", &labels_a),
+            "peer_a series must be retained while still reported"
+        );
+
+        // Regression guard: the meeting-scoped PEER_CONNECTIONS_TOTAL{meeting, peer_b}
+        // must SURVIVE the per-reporter prune. It is keyed (meeting_id, peer_id) and is
+        // shared across reporters, so it is cleaned up ONLY on whole-session reap (which
+        // iterates `peer_ids`). If the prune block re-adds `info.peer_ids.remove(peer_id)`,
+        // peer_b drops out of every live reporter's `peer_ids` and this gauge is orphaned
+        // forever — the exact frozen-gauge leak class #1092 fixes. This assertion fails
+        // if that line is re-introduced.
+        let conn_labels_b = [("meeting_id", meeting_id), ("peer_id", "peer_b_1092")];
+        assert!(
+            series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must survive the per-reporter prune \
+             (removed only on whole-session reap, which iterates peer_ids)"
+        );
+
+        // The session tracker must no longer track peer_b in the per-pair sets (so its
+        // per-pair series aren't re-written), but MUST retain it in `peer_ids` so the
+        // whole-session reap still removes PEER_CONNECTIONS_TOTAL{meeting, peer_b}.
+        {
+            let key = format!("{meeting_id}_{session_id}_{reporter}");
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let info = guard.get(&key).expect("session must still be tracked");
+            assert!(
+                !info.to_peers.contains("peer_b_1092"),
+                "peer_b must be dropped from to_peers"
+            );
+            assert!(
+                info.to_peers.contains("peer_a_1092"),
+                "peer_a must remain in to_peers"
+            );
+            assert!(!info.to_peer_display_names.contains_key("peer_b_1092"));
+            assert!(
+                info.peer_ids.contains("peer_b_1092"),
+                "peer_b must REMAIN in peer_ids so whole-session reap removes \
+                 PEER_CONNECTIONS_TOTAL{{meeting, peer_b}}"
+            );
+        }
+
+        // Packet 3: reporter sees NOBODY (empty peer_stats). peer_a must be pruned
+        // too — this exercises the unconditional prune on the empty-peer_stats path.
+        let hp3 = create_test_health_packet(session_id, meeting_id, reporter, HashMap::new());
+        assert!(process_health_packet_to_metrics_pb(&hp3, &tracker, &dn_map).is_ok());
+
+        assert!(
+            !series_exists("videocall_neteq_packets_awaiting_decode", &labels_a),
+            "peer_a series must be pruned when the reporter sees nobody (empty peer_stats)"
+        );
+        let session_snapshot = {
+            let key = format!("{meeting_id}_{session_id}_{reporter}");
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let info = guard.get(&key).expect("session must still be tracked");
+            assert!(
+                info.to_peers.is_empty(),
+                "all peers must be pruned after an empty packet"
+            );
+            // Even with every per-pair set emptied, `peer_ids` still holds the peers
+            // this session ever connected to — that is what drives the meeting-scoped
+            // PEER_CONNECTIONS_TOTAL cleanup at reap.
+            assert!(
+                info.peer_ids.contains("peer_b_1092") && info.peer_ids.contains("peer_a_1092"),
+                "peer_ids must retain all ever-seen peers across per-packet prunes"
+            );
+            info.clone()
+        };
+
+        // PEER_CONNECTIONS_TOTAL{meeting, peer_b} is STILL present after all per-packet
+        // prunes (it is removed only on whole-session reap).
+        assert!(
+            series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must persist until whole-session reap"
+        );
+
+        // End-to-end reap: removing the session must now delete PEER_CONNECTIONS_TOTAL
+        // for BOTH peers — proving the retained `peer_ids` actually drives that cleanup.
+        // Under the #1092 prune-block bug (peer_ids.remove in the prune), peer_b would
+        // have been dropped from peer_ids before this point and this gauge would leak.
+        remove_session_metrics(&session_snapshot);
+        assert!(
+            !series_exists("videocall_peer_connections_total", &conn_labels_b),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_b}} must be removed on whole-session reap"
+        );
+        let conn_labels_a = [("meeting_id", meeting_id), ("peer_id", "peer_a_1092")];
+        assert!(
+            !series_exists("videocall_peer_connections_total", &conn_labels_a),
+            "PEER_CONNECTIONS_TOTAL{{meeting, peer_a}} must be removed on whole-session reap"
         );
     }
 }

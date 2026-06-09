@@ -158,6 +158,12 @@ html[data-theme="dark"] {
   --perf-q-medium: #ffc14d;
   --perf-q-low: var(--error);
   /*
+   * Unlit (at-rest, level-0) Performance bar-meter track. A faint translucent
+   * fill so the meter still reads as "a meter", not an empty gap (#9). Dark
+   * theme: translucent WHITE over the dark glass surface.
+   */
+  --perf-meter-track: rgba(255, 255, 255, 0.16);
+  /*
    * Higher-luminance error red for use as foreground TEXT on the glass
    * surface (--glass-bg over --surface composites to ≈ #2D2D2F).  At that
    * background, the saturated --error #FF453A computes a contrast ratio of
@@ -234,6 +240,12 @@ html[data-theme="light"] {
   --perf-q-optimal: #1e9e44;
   --perf-q-medium: #9a6a00;
   --perf-q-low: var(--error);
+  /*
+   * Unlit (at-rest, level-0) Performance bar-meter track (#9). Light theme:
+   * translucent BLACK over the light surface, so the at-rest meter still reads
+   * as a faint track (the dark-theme translucent white would vanish here).
+   */
+  --perf-meter-track: rgba(0, 0, 0, 0.14);
 
   /* Liquid Glass material — light theme uses much lighter, more transparent glass */
   --glass-bg: rgba(255, 255, 255, 0.08);

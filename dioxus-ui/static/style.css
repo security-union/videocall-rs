@@ -7258,7 +7258,7 @@ html[data-theme="light"] .settings-divider {
 
 /* ──────────────────────────────────────────────────────────────────
    Unified Performance settings panel — SEND quality bounds (#961) AND
-   RECEIVE layer bounds (#989 simulcast): per-kind CARDS each split into a
+   RECEIVE layer bounds (issue 989 simulcast): per-kind CARDS each split into a
    Sending column + a Receiving column, dual-thumb range sliders,
    "Sending"/"Receiving" inline bar-meters (level-driven via data-level),
    Auto toggle + "?" help. All colors are design tokens (see global.css).
@@ -7489,9 +7489,10 @@ html[data-theme="light"] .settings-divider {
 .perf-meter__bar {
   flex: 1 1 0;
   width: 3px;
-  /* Unlit bars: a touch brighter than before so an at-rest (level 0) meter still
-     reads as "a meter", not an empty gap (#9). */
-  background: rgba(255, 255, 255, 0.16);
+  /* Unlit bars: a faint, theme-aware track so an at-rest (level 0) meter still
+     reads as "a meter", not an empty gap (#9). Token resolves to translucent
+     white on dark / translucent black on light (see global.css). */
+  background: var(--perf-meter-track);
   border-radius: 1px;
   transition: background 0.2s ease;
 }

@@ -43,9 +43,10 @@
 //! * Both transport adapters are thin: they delegate to
 //!   `self.logic.handle_inbound(...)` and contain no observer/allowlist logic.
 //!
-//! A refactor that moves filtering into a transport-specific path would need to
-//! verify (or add) a WT-path test here.  Until then, WS coverage exercises the
-//! same enforcement code that a WT observer hits.
+//! A companion test file (`waiting_room_isolation_wt_tests.rs`) exercises the
+//! same isolation guarantees over WebTransport, covering both the UniStream and
+//! Datagram inbound paths as a regression guard for the transport-parity
+//! invariant.
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};

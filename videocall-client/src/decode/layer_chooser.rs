@@ -37,8 +37,18 @@
 //!
 //! ## Signals (THIS receiver's downlink for THIS source)
 //!
-//! The receive path already tracks, per peer-stream, on a ~1s rolling window
-//! (`peer_decode_manager::SequenceTracker`):
+//! The receive path tracks per peer-stream loss/PLI rates, which the client
+//! folds into the chooser once per **monitor tick — every 5s**
+//! (`connection.rs`'s `heartbeat_monitor = Interval::new(5000, …)` drives
+//! `run_peer_monitor` → `tick_layer_choosers`). The loss/PLI window itself rolls
+//! over every ~1s (`peer_decode_manager.rs`'s `observe_window`), and
+//! `last_video_downlink` is OVERWRITTEN with each new ~1s window's rates — it is
+//! NOT accumulated. So the chooser is fed the LATEST ~1s sample once per 5s tick
+//! (it does not aggregate 5s of reception). The constants below are still tuned
+//! for that 5s decision cadence because `choose` is CALLED every 5s — e.g.
+//! `STEP_UP_CLEAN_WINDOWS = 3` requires 3 consecutive clean ticks ≈ 15s of
+//! sustained headroom.
+//! The two per-window rate signals are:
 //!   * `loss_per_sec` — packets that shifted off the reorder window unseen.
 //!     Direct evidence the downlink is dropping this source's video.
 //!   * `kf_per_sec` — keyframe-requests (PLI) this receiver emitted for the
@@ -104,8 +114,9 @@ impl PrefMediaKind {
 /// Consecutive clean (sub-threshold) windows required before a step UP.
 ///
 /// Conservative on the way up: the downlink must prove sustained headroom, not
-/// just one lucky window, before we ask for a costlier layer. Three ~1s windows
-/// ≈ 3s of clean reception, comparable to the sender AQ's step-up stabilization.
+/// just one lucky window, before we ask for a costlier layer. The chooser is fed
+/// once per 5s monitor tick (see the module-level "Signals" note), so three
+/// clean windows ≈ 15s of clean reception before each rung climb.
 pub const STEP_UP_CLEAN_WINDOWS: u32 = 3;
 
 /// Minimum dwell (ms) at the current layer before a step UP is allowed.
@@ -137,6 +148,39 @@ pub const PLI_STEP_DOWN_PER_SEC: f64 = 2.0;
 
 /// PLI rate below which a window counts as "clean" for step-up accounting.
 pub const PLI_CLEAN_PER_SEC: f64 = 0.5;
+
+// --- Sticky-low convergence (issue #1179) ---
+//
+// The plain fast-down / conservative-up loop above converges to a RESTING point
+// that is one rung BELOW the highest sustainable layer on a chronically marginal
+// link: every time the streak finally climbs back to the top, the next congested
+// window knocks it down again, so the receiver yo-yos and ~18% of the call is
+// spent decoding (and advertising) a layer lower than the link can actually
+// carry. The sticky-low state machine fixes the resting point: once congestion
+// is *chronic* (not a one-off spike), the chooser latches a `sticky_floor` and
+// refuses to climb back above it until the link proves sustained recovery, then
+// raises the floor exactly ONE rung at a time. This makes the resting point the
+// floor itself (stable) instead of "floor + 1, re-dropping forever" (yo-yo).
+
+/// Number of congested windows (accumulated via the decaying congestion score)
+/// that flips the chooser into the **sticky** state. One isolated congested
+/// window must NOT stick (that is the normal fast-down's job); only a sustained
+/// pattern latches a floor. With the 5s tick this is ~15s of repeated congestion.
+pub const STICKY_CONGESTION_EVENTS: u32 = 3;
+
+/// Saturation cap for the congestion score so a long bad stretch cannot bank
+/// unbounded credit. Once sticky, the score is what `STICKY_RECOVERY_CLEAN_TICKS`
+/// of clean windows must decay/earn against; capping it bounds how long a
+/// recovered link is held down after an extended outage.
+pub const STICKY_CONGESTION_SCORE_CAP: u32 = 6;
+
+/// Consecutive clean windows required while sticky before the floor is raised by
+/// ONE rung (the **cautious** recovery strategy, issue #1179). At the 5s monitor
+/// tick this is ~60s of sustained-clean reception per rung — deliberately slow so
+/// a chronically marginal link does not immediately re-attempt the layer that
+/// keeps collapsing. Exposed as a named constant so a future bot-netsim sweep can
+/// retune the recovery aggressiveness without touching the state-machine logic.
+pub const STICKY_RECOVERY_CLEAN_TICKS: u32 = 12;
 
 /// A single window's receive-health sample for one source (THIS receiver's
 /// downlink), as produced by the receive-side sequence tracker on ~1s rollover.
@@ -249,6 +293,29 @@ pub struct LayerChooser {
     clean_windows: u32,
     /// Timestamp (ms) of the last layer change, for the step-up dwell guard.
     last_change_ms: u64,
+
+    // --- Sticky-low convergence (issue #1179) ---
+    /// Decaying count of congested windows. Each congested window increments it
+    /// (saturating at [`STICKY_CONGESTION_SCORE_CAP`]); each clean window decays
+    /// it by one. A single isolated spike therefore decays away and never sticks;
+    /// only sustained congestion accumulates to [`STICKY_CONGESTION_EVENTS`] and
+    /// latches [`Self::sticky`]. Transparent + testable (integer score + decay)
+    /// rather than a hidden timer.
+    congestion_score: u32,
+    /// `true` once congestion has been *chronic* (score reached
+    /// [`STICKY_CONGESTION_EVENTS`]): the chooser then refuses to climb back above
+    /// [`Self::sticky_floor`] until [`STICKY_RECOVERY_CLEAN_TICKS`] of sustained
+    /// clean windows raise the floor one rung. Cleared only when the floor is
+    /// raised all the way back to `highest_available` (full recovery).
+    sticky: bool,
+    /// The layer the sticky state is currently holding as its resting point. The
+    /// chooser will not climb above this while `sticky`; cautious recovery raises
+    /// it one rung per sustained-clean period until it reaches the top.
+    sticky_floor: u32,
+    /// Consecutive clean windows accumulated toward the NEXT one-rung floor raise
+    /// while `sticky`. Reset to 0 by any non-clean (congested or neutral) window,
+    /// so recovery requires an *uninterrupted* clean streak.
+    recovery_clean_ticks: u32,
 }
 
 impl LayerChooser {
@@ -264,6 +331,10 @@ impl LayerChooser {
             constrained: false,
             clean_windows: 0,
             last_change_ms: now_ms,
+            congestion_score: 0,
+            sticky: false,
+            sticky_floor: 0,
+            recovery_clean_ticks: 0,
         }
     }
 
@@ -321,7 +392,44 @@ impl LayerChooser {
     ///     top clears `constrained` (back to no-preference / decode-best).
     ///   * **Neutral band:** a window that is neither congested nor clean holds
     ///     the layer and resets the clean streak.
+    ///
+    /// ## Sticky-low convergence (issue #1179)
+    ///
+    /// On a *chronically* marginal link the plain loop above resting-points one
+    /// rung too high and yo-yos. Layered on top:
+    ///   * **Score accounting (every window):** a decaying `congestion_score`
+    ///     counts sustained congestion. Reaching [`STICKY_CONGESTION_EVENTS`]
+    ///     latches the **sticky** state and pins `sticky_floor` to the current
+    ///     (already-dropped) layer.
+    ///   * **While sticky:** the conservative-up climb is capped at `sticky_floor`
+    ///     (never climbs above it), and `constrained` is never cleared (we keep
+    ///     advertising the held floor) — so the resting point is the *floor*, not
+    ///     "floor + 1, re-dropping forever".
+    ///   * **Cautious recovery:** [`STICKY_RECOVERY_CLEAN_TICKS`] of *uninterrupted*
+    ///     clean windows raise `sticky_floor` by exactly ONE rung. When the floor
+    ///     reaches `highest_available`, sticky clears and the chooser returns to
+    ///     the normal decode-best / no-preference behavior.
     pub fn choose(&mut self, sample: DownlinkSample, highest_available: u32, now_ms: u64) -> u32 {
+        // --- Score accounting (issue #1179) — runs in EVERY state/window. ---
+        // A congested window banks credit (saturating at the cap); a clean window
+        // decays it. Only sustained congestion accumulates to the latch threshold,
+        // so a single isolated spike can never make the chooser sticky.
+        // `just_latched` records the transition into sticky on THIS window so the
+        // step-down branches below can pin `sticky_floor` to the layer we land on.
+        let mut just_latched = false;
+        if sample.is_congested() {
+            self.congestion_score = (self.congestion_score + 1).min(STICKY_CONGESTION_SCORE_CAP);
+            if !self.sticky && self.congestion_score >= STICKY_CONGESTION_EVENTS {
+                // Latch: chronic congestion. The floor is pinned AFTER this
+                // window's step-down (see the congested branches below) so it
+                // reflects the proven-bad layer, not the pre-step one.
+                self.sticky = true;
+                just_latched = true;
+            }
+        } else if sample.is_clean() {
+            self.congestion_score = self.congestion_score.saturating_sub(1);
+        }
+
         // Unconstrained: simply track the highest available layer (decode best,
         // advertise nothing) until a congested window forces us to constrain.
         if !self.constrained {
@@ -333,6 +441,12 @@ impl LayerChooser {
                 let dropped = from.saturating_sub(1);
                 self.set_layer(dropped, now_ms);
                 self.clean_windows = 0;
+                // If this very window latched sticky (only when the cap is mis-set
+                // ≤ events; defensive), pin the floor to where we land.
+                if just_latched {
+                    self.sticky_floor = self.current;
+                    self.recovery_clean_ticks = 0;
+                }
                 return self.current;
             }
             // Otherwise follow the top (no constraint, full quality).
@@ -347,9 +461,16 @@ impl LayerChooser {
         // immediately (it is no longer decodable anyway).
         if self.current > highest_available {
             self.set_layer(highest_available, now_ms);
+            // A shrinking ceiling also drags the sticky floor down — we can never
+            // hold a floor above what the source still produces.
+            if self.sticky && self.sticky_floor > highest_available {
+                self.sticky_floor = highest_available;
+            }
             // If the ceiling itself collapsed to where we sit, we are no longer
             // constraining below it — clear so we resume decode-best/no-pref.
-            if self.current >= highest_available {
+            // While sticky we keep holding/advertising the floor (issue #1179),
+            // so do NOT clear constrained then.
+            if self.current >= highest_available && !self.sticky {
                 self.constrained = false;
             }
             return self.current;
@@ -361,14 +482,51 @@ impl LayerChooser {
                 self.set_layer(self.current - 1, now_ms);
             }
             self.clean_windows = 0;
+            // Sustained congestion broke any recovery streak.
+            self.recovery_clean_ticks = 0;
+            // Pin the floor to where we now sit when (a) this window latched
+            // sticky, or (b) we were already sticky and congestion dragged us
+            // BELOW the prior floor. Either way the floor tracks the lowest
+            // proven-bad layer so recovery climbs up from there, never above it.
+            if self.sticky && (just_latched || self.current < self.sticky_floor) {
+                self.sticky_floor = self.current;
+            }
             return self.current;
         }
 
         if sample.is_clean() {
+            // Cautious recovery (issue #1179): while sticky, an uninterrupted
+            // clean streak of STICKY_RECOVERY_CLEAN_TICKS raises the floor ONE
+            // rung. This is separate from the normal step-up streak so the two
+            // cadences (15s climb vs ~60s floor-raise) are independent.
+            if self.sticky {
+                self.recovery_clean_ticks = self.recovery_clean_ticks.saturating_add(1);
+                if self.recovery_clean_ticks >= STICKY_RECOVERY_CLEAN_TICKS {
+                    self.recovery_clean_ticks = 0;
+                    if self.sticky_floor < highest_available {
+                        self.sticky_floor += 1;
+                    }
+                    // Floor recovered to the top → leave sticky; the normal loop
+                    // (below) resumes and will clear `constrained` once at the top.
+                    if self.sticky_floor >= highest_available {
+                        self.sticky = false;
+                        self.congestion_score = 0;
+                    }
+                }
+            }
+
             self.clean_windows = self.clean_windows.saturating_add(1);
             let dwell_ok = now_ms.saturating_sub(self.last_change_ms) >= LAYER_STEP_UP_DWELL_MS;
             let streak_ok = self.clean_windows >= STEP_UP_CLEAN_WINDOWS;
-            if dwell_ok && streak_ok && self.current < highest_available {
+            // While sticky the climb is capped at the floor: we may climb back UP
+            // TO `sticky_floor` (e.g. after a transient extra drop) but never
+            // above it — that is the whole point of the floor (issue #1179).
+            let climb_cap = if self.sticky {
+                self.sticky_floor.min(highest_available)
+            } else {
+                highest_available
+            };
+            if dwell_ok && streak_ok && self.current < climb_cap {
                 self.set_layer(self.current + 1, now_ms);
                 // Require a fresh streak before the NEXT climb so we ascend one
                 // rung per sustained-headroom period, not all at once.
@@ -376,16 +534,65 @@ impl LayerChooser {
             }
             // Climbed (or already) back to the top → no longer constraining:
             // clear the flag so we advertise nothing and decode best again.
-            if self.current >= highest_available {
+            // While sticky we keep holding the floor, so never clear then.
+            if self.current >= highest_available && !self.sticky {
                 self.constrained = false;
             }
             return self.current;
         }
 
         // Neutral band (between clean and congested): hold, but the streak
-        // breaks so we do not climb on intermittent marginal windows.
+        // breaks so we do not climb on intermittent marginal windows. A neutral
+        // window also breaks the recovery streak — recovery requires uninterrupted
+        // clean reception, not merely "not congested".
         self.clean_windows = 0;
+        self.recovery_clean_ticks = 0;
         self.current
+    }
+
+    /// Early-seed a constrain from a sample taken OUTSIDE the normal 5s monitor
+    /// tick (issue #1179, Part B).
+    ///
+    /// ## Why
+    /// `choose` is only fed every 5s (`connection.rs` `Interval::new(5000, …)`).
+    /// A freshly-joined peer whose downlink is already congested therefore
+    /// decodes the FULL-quality top layer for up to ~5s before the first monitor
+    /// tick can react — long enough to stall a constrained receiver at join. For
+    /// WebTransport peers (where reliable-unistream fan-out makes the join spike
+    /// worst, per the 2026-06-09 simulcast-congestion meeting analysis), a
+    /// short-lived fast sampler calls this on a fresh downlink sample so the FIRST
+    /// congested sample constrains immediately instead of waiting for the tick.
+    ///
+    /// ## Semantics (pure)
+    /// * Only acts while **unconstrained** (the cold-start decode-best state): if
+    ///   `choose` has already constrained, the normal loop now owns adaptation and
+    ///   this is a no-op (returns `false`).
+    /// * A **congested** sample flips to constrained and steps down ONE rung from
+    ///   the current top — identical to the unconstrained-congested arm of
+    ///   `choose`, so the two entry points converge on the same state. Returns
+    ///   `true` (the caller should emit the resulting preference and stop sampling).
+    /// * A **clean / neutral** sample is a no-op (returns `false`): the seed only
+    ///   reacts to actual early congestion; it never pre-emptively lowers a healthy
+    ///   join (M2 cold-start is preserved untouched).
+    ///
+    /// Does NOT touch the congestion score or sticky machinery — a single early
+    /// sample must not by itself latch sticky; that remains the job of sustained
+    /// congestion observed by `choose`.
+    pub fn observe_early_congestion(
+        &mut self,
+        sample: DownlinkSample,
+        highest_available: u32,
+        now_ms: u64,
+    ) -> bool {
+        if self.constrained || !sample.is_congested() {
+            return false;
+        }
+        self.constrained = true;
+        let from = self.current.min(highest_available);
+        let dropped = from.saturating_sub(1);
+        self.set_layer(dropped, now_ms);
+        self.clean_windows = 0;
+        true
     }
 
     /// Apply a layer change and reset the dwell/clean bookkeeping.
@@ -394,6 +601,18 @@ impl LayerChooser {
             self.current = layer;
             self.last_change_ms = now_ms;
         }
+    }
+}
+
+#[cfg(test)]
+impl LayerChooser {
+    /// Test-only view of the sticky-low latch (issue #1179).
+    fn is_sticky(&self) -> bool {
+        self.sticky
+    }
+    /// Test-only view of the held sticky floor (issue #1179).
+    fn sticky_floor(&self) -> u32 {
+        self.sticky_floor
     }
 }
 
@@ -815,6 +1034,17 @@ mod tests {
         t
     }
 
+    /// Drive `n` congested windows spaced `dt_ms` apart starting at `start_ms`,
+    /// returning the final timestamp used (issue #1179 sticky-low tests).
+    fn feed_congested(c: &mut LayerChooser, avail: u32, start_ms: u64, n: u32, dt_ms: u64) -> u64 {
+        let mut t = start_ms;
+        for _ in 0..n {
+            c.choose(congested(), avail, t);
+            t += dt_ms;
+        }
+        t
+    }
+
     #[test]
     fn starts_at_base_layer() {
         // The raw `current` field initializes to 0 before any sample is folded.
@@ -1063,6 +1293,328 @@ mod tests {
         good.choose(clean(), avail, t + 5000); // dwell satisfied, already at top
         assert_eq!(bad.current(), 1, "struggling peer drops");
         assert_eq!(good.current(), 2, "healthy peer holds the top");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1179: sticky-low convergence (resting-point fix)
+    //
+    // Without the sticky state machine, a chronically marginal link
+    // resting-points one rung ABOVE what it can sustain and yo-yos: the
+    // conservative-up streak climbs back to the top, the next congested
+    // window knocks it down, repeat. These tests pin the fixed behavior:
+    // chronic congestion latches a floor the chooser refuses to climb above
+    // until sustained recovery, raising the floor one cautious rung at a time.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chronic_congestion_latches_sticky_and_holds_floor() {
+        // After STICKY_CONGESTION_EVENTS congested windows the chooser latches
+        // sticky and pins a floor. Then, even with brief clean lulls that would
+        // normally bait the conservative-up climb, it must NOT climb above the
+        // floor — that is the resting-point fix.
+        //
+        // MUTATION CHECK: this test fails if the `!self.sticky` guard is removed
+        // from the clean-branch climb cap (then `climb_cap` would be
+        // `highest_available` and the chooser would climb above the floor).
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 1000); // decode top (2), unconstrained
+                                        // 3 congested windows → drops to 0 and latches sticky at floor 0.
+        let t = feed_congested(&mut c, avail, 2000, STICKY_CONGESTION_EVENTS, 1100);
+        assert!(c.is_sticky(), "chronic congestion must latch sticky");
+        assert_eq!(c.sticky_floor(), 0, "floor pinned to the proven-bad layer");
+        assert_eq!(c.current(), 0);
+        // Feed clean windows but FEWER than a full recovery period each time it
+        // would matter — interleave a congested window to reset recovery so the
+        // floor is never raised. The chooser must stay pinned at 0.
+        let mut tt = t;
+        for _ in 0..5 {
+            // A short clean burst (well under STICKY_RECOVERY_CLEAN_TICKS)…
+            tt = feed_clean(&mut c, avail, tt, STICKY_RECOVERY_CLEAN_TICKS - 1, 1100);
+            // …then one congested window resets the recovery streak.
+            tt = feed_congested(&mut c, avail, tt, 1, 1100);
+            assert_eq!(
+                c.current(),
+                0,
+                "sticky chooser must hold the floor (no climb above it)"
+            );
+            assert_eq!(c.sticky_floor(), 0, "floor must not rise without recovery");
+        }
+        assert!(
+            c.is_sticky(),
+            "still sticky — link never sustained recovery"
+        );
+        assert_eq!(
+            c.desired_preference(),
+            Some(0),
+            "sticky chooser keeps advertising its held floor"
+        );
+    }
+
+    #[test]
+    fn sticky_does_not_climb_above_floor_without_recovery() {
+        // Pure no-climb-above-floor: latch sticky at floor 0, then feed a long
+        // UNINTERRUPTED clean streak that is exactly one short of a recovery
+        // period. The floor (and decode layer) must stay at 0.
+        //
+        // MUTATION CHECK: fails if the recovery `>= STICKY_RECOVERY_CLEAN_TICKS`
+        // threshold is lowered/removed, or if the climb cap ignores sticky.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 500);
+        feed_congested(&mut c, avail, 1000, STICKY_CONGESTION_EVENTS, 1100);
+        assert!(c.is_sticky());
+        assert_eq!(c.sticky_floor(), 0);
+        // One window short of the recovery period → no floor raise, no climb.
+        let mut t = 10_000u64;
+        for _ in 0..(STICKY_RECOVERY_CLEAN_TICKS - 1) {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert_eq!(c.current(), 0, "must not climb above the sticky floor");
+        assert_eq!(
+            c.sticky_floor(),
+            0,
+            "floor unchanged before recovery period"
+        );
+        assert!(c.is_sticky());
+    }
+
+    #[test]
+    fn sticky_recovers_one_rung_after_sustained_clean() {
+        // After exactly STICKY_RECOVERY_CLEAN_TICKS uninterrupted clean windows,
+        // the floor rises by ONE rung (cautious recovery) and the chooser may
+        // climb to the new floor — but not beyond it in the same period.
+        //
+        // MUTATION CHECK: fails if the floor-raise `sticky_floor += 1` is removed
+        // (floor stays 0 forever) or if it raises by more than one rung.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 500);
+        feed_congested(&mut c, avail, 1000, STICKY_CONGESTION_EVENTS, 1100);
+        assert_eq!(c.sticky_floor(), 0);
+        // Exactly one recovery period of uninterrupted clean.
+        let mut t = 10_000u64;
+        for _ in 0..STICKY_RECOVERY_CLEAN_TICKS {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert_eq!(
+            c.sticky_floor(),
+            1,
+            "one recovery period raises the floor exactly one rung"
+        );
+        assert!(c.is_sticky(), "still sticky: floor (1) below top (2)");
+        // The decode layer climbs up TO the new floor (1) but not above it.
+        // Keep feeding clean within this period (recovery just reset) so the
+        // normal step-up streak licenses the climb to the floor.
+        let mut t2 = t;
+        for _ in 0..STEP_UP_CLEAN_WINDOWS + 1 {
+            c.choose(clean(), avail, t2);
+            t2 += 1100;
+        }
+        assert_eq!(c.current(), 1, "climbs up to the raised floor, not above");
+
+        // A SECOND full recovery period raises the floor to the top → sticky
+        // clears and the chooser returns to decode-best / no-preference.
+        let mut t3 = t2;
+        for _ in 0..STICKY_RECOVERY_CLEAN_TICKS {
+            c.choose(clean(), avail, t3);
+            t3 += 1100;
+        }
+        // Drive a few more clean windows so the now-unsticky loop climbs to top.
+        for _ in 0..10 {
+            c.choose(clean(), avail, t3);
+            t3 += 1100;
+        }
+        assert!(!c.is_sticky(), "floor reached top → sticky clears");
+        assert_eq!(c.current(), 2, "fully recovered to the top layer");
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "back at the top → no preference"
+        );
+    }
+
+    #[test]
+    fn sticky_recovery_streak_resets_on_neutral_window() {
+        // Recovery requires UNINTERRUPTED clean reception: a neutral (dead-zone)
+        // window mid-streak must reset the recovery counter so the floor does not
+        // rise on a stop-start link.
+        //
+        // MUTATION CHECK: fails if the neutral branch stops resetting
+        // `recovery_clean_ticks`.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 500);
+        feed_congested(&mut c, avail, 1000, STICKY_CONGESTION_EVENTS, 1100);
+        assert_eq!(c.sticky_floor(), 0);
+        let mut t = 10_000u64;
+        // One window short of recovery…
+        for _ in 0..(STICKY_RECOVERY_CLEAN_TICKS - 1) {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        // …a neutral window resets the streak…
+        c.choose(neutral(), avail, t);
+        t += 1100;
+        // …then a full-minus-one clean streak again: still no raise.
+        for _ in 0..(STICKY_RECOVERY_CLEAN_TICKS - 1) {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert_eq!(
+            c.sticky_floor(),
+            0,
+            "a neutral window resets the recovery streak; floor must not rise"
+        );
+        assert!(c.is_sticky());
+    }
+
+    #[test]
+    fn single_congested_window_does_not_stick() {
+        // The fast-down path (one congested window steps down) must NOT latch
+        // sticky — only sustained congestion does. A lone spike stays in the
+        // ordinary constrained loop and re-climbs normally.
+        //
+        // MUTATION CHECK: fails if the latch threshold is lowered to 1, or if the
+        // score increments without the >= STICKY_CONGESTION_EVENTS gate.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 1000); // top
+        c.choose(congested(), avail, 2000); // one spike → 1, constrained
+        assert_eq!(c.current(), 1, "single spike steps down one rung");
+        assert!(
+            !c.is_sticky(),
+            "a single congested window must NOT latch sticky"
+        );
+        // Sustained clean must re-climb all the way to the top (no floor pinning).
+        let mut t = 3000u64;
+        for _ in 0..30 {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert_eq!(c.current(), 2, "non-sticky chooser re-climbs to the top");
+        assert_eq!(c.desired_preference(), None);
+    }
+
+    #[test]
+    fn score_decay_prevents_permanent_stick() {
+        // Congested windows SPACED OUT by enough clean windows must never
+        // accumulate to the latch threshold, because each clean window decays the
+        // score. This is the anti-false-positive property: an occasionally-lossy
+        // but fundamentally healthy link must never get stuck.
+        //
+        // MUTATION CHECK: fails if the clean-window score decay
+        // (`congestion_score.saturating_sub(1)`) is removed — then spaced spikes
+        // would still accumulate to the threshold and wrongly latch.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 500);
+        let mut t = 1000u64;
+        // Pattern: 1 congested, then 2 clean (net score change per cycle: +1-2,
+        // saturating at 0). Repeat many times — score can never reach 3.
+        for _ in 0..20 {
+            c.choose(congested(), avail, t);
+            t += 1100;
+            c.choose(clean(), avail, t);
+            t += 1100;
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert!(
+            !c.is_sticky(),
+            "decay must keep an occasionally-lossy link from latching sticky"
+        );
+    }
+
+    #[test]
+    fn cold_join_never_sticks() {
+        // A freshly-joined receiver fed only clean windows must never go sticky
+        // and must keep full quality (decode-best, no preference) — the sticky
+        // machinery must be inert on a healthy cold start (M2 preserved).
+        //
+        // MUTATION CHECK: fails if the score ever increments on clean windows or
+        // if sticky can latch without congestion.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        let mut t = 1000u64;
+        for _ in 0..50 {
+            c.choose(clean(), avail, t);
+            t += 1100;
+        }
+        assert!(!c.is_sticky(), "a clean cold-join must never latch sticky");
+        assert_eq!(c.current(), 2, "decodes the top");
+        assert_eq!(c.desired_preference(), None, "advertises no preference");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1179, Part B: observe_early_congestion early seed
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn early_congestion_seeds_constrain_on_congested_sample() {
+        // A congested early sample on an unconstrained (cold-join) chooser must
+        // constrain immediately and step down one rung, returning true so the
+        // glue knows to emit a preference and stop sampling — instead of waiting
+        // up to 5s for the first monitor tick.
+        //
+        // MUTATION CHECK: fails if `observe_early_congestion` returns false on a
+        // congested sample, or does not set `constrained` / step down.
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        // Cold start: decode-best at the top, no preference.
+        c.choose(clean(), avail, 1000);
+        assert_eq!(c.current(), 2);
+        assert_eq!(c.desired_preference(), None);
+        // Early congested sample seeds the constrain.
+        let seeded = c.observe_early_congestion(congested(), avail, 1500);
+        assert!(seeded, "congested early sample must seed a constrain");
+        assert_eq!(
+            c.current(),
+            1,
+            "early seed steps down one rung from the top"
+        );
+        assert_eq!(
+            c.desired_preference(),
+            Some(1),
+            "seeded constrain advertises the held layer"
+        );
+        // A single early sample must NOT latch sticky.
+        assert!(!c.is_sticky(), "one early sample never latches sticky");
+    }
+
+    #[test]
+    fn early_congestion_is_noop_on_clean_or_already_constrained() {
+        // A clean early sample is a no-op (cold-start decode-best preserved), and
+        // once the chooser is already constrained the normal loop owns adaptation
+        // so the early seed must not fire again.
+        //
+        // MUTATION CHECK: fails if the `self.constrained || !is_congested()` guard
+        // is removed (then a clean sample would constrain, or it would re-fire
+        // after the chooser is already constrained).
+        let mut c = LayerChooser::new(0);
+        let avail = 2;
+        c.choose(clean(), avail, 1000); // decode-best at top
+                                        // Clean early sample → no-op.
+        let seeded_clean = c.observe_early_congestion(clean(), avail, 1200);
+        assert!(!seeded_clean, "clean early sample must not constrain");
+        assert_eq!(c.current(), 2, "healthy join keeps full quality");
+        assert_eq!(c.desired_preference(), None);
+        // Now constrain via a real congested sample…
+        assert!(c.observe_early_congestion(congested(), avail, 1400));
+        assert_eq!(c.current(), 1);
+        // …a SECOND early call (even congested) is a no-op: already constrained.
+        let seeded_again = c.observe_early_congestion(congested(), avail, 1600);
+        assert!(
+            !seeded_again,
+            "early seed must not re-fire once constrained — the 5s loop owns it"
+        );
+        assert_eq!(
+            c.current(),
+            1,
+            "no extra step-down from a repeated early seed"
+        );
     }
 
     #[test]

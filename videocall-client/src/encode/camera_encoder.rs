@@ -94,7 +94,7 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
-use videocall_aq::fit_within_preserving_aspect;
+use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -305,6 +305,15 @@ struct LayerEncoder {
     /// Current encoder width/height for this layer (dynamic reconfigure).
     current_w: u32,
     current_h: u32,
+    /// This layer's tier bounding box (issue #1196). For simulcast layers this
+    /// is the layer's own `SIMULCAST_LAYER_TIERS` rung — the source frame is
+    /// fitted INSIDE this box (aspect-preserving) rather than configured at the
+    /// raw box dims, so a non-16:9 capture is not squashed. For the
+    /// single-stream layer the box is the shared adaptive tier max and these
+    /// fields are unused (the single-stream path fits against the shared
+    /// `local_tier_max_*` instead).
+    tier_w: u32,
+    tier_h: u32,
     /// Cached bitrate (bps) last applied to this layer's encoder.
     local_bitrate: u32,
     /// Kept alive so the JS output callback stays valid (see struct doc).
@@ -1896,6 +1905,15 @@ impl CameraEncoder {
                 let width = track_settings.get_width().expect("width is None");
                 let height = track_settings.get_height().expect("height is None");
 
+                // Native capture dims (the true source aspect), stamped onto
+                // every emitted camera packet so receiver diagnostics can detect
+                // aspect distortion at the source (issue #1196). Mirrors the
+                // screen encoder's `source_width_atomic` / `source_height_atomic`
+                // stamping; the camera dims are fixed for the encoder's lifetime
+                // here, so plain captured `u32`s suffice (no atomic needed).
+                let source_width = width as u32;
+                let source_height = height as u32;
+
                 // --- Setup video encoders (one per simulcast layer) ---
                 // The output and error handler closures must be re-created on
                 // each restart because Closure::wrap consumes them and the new
@@ -1967,6 +1985,8 @@ impl CameraEncoder {
                                     buffer.as_mut_slice(),
                                     &userid,
                                     aes.clone(),
+                                    source_width,
+                                    source_height,
                                     layer_id,
                                 );
                                 // Phase 2 of WT freeze fix: route camera video on
@@ -2015,20 +2035,43 @@ impl CameraEncoder {
                     //  - single-stream (n_layers == 1): native camera resolution
                     //    and the shared adaptive bitrate — the legacy path, with
                     //    tier-resolution stepping preserved (see encode loop).
-                    //  - simulcast (n_layers > 1): each layer encodes at its
-                    //    FIXED SIMULCAST_LAYER_TIERS resolution (issue #989, PR B)
-                    //    and its own initial bitrate (tier ideal). Resolution is
-                    //    fixed for simulcast layers; only the bitrate adapts.
-                    let (layer_w, layer_h, init_bitrate_bps) = if simulcast {
+                    //  - simulcast (n_layers > 1): each layer's tier is a
+                    //    BOUNDING BOX, not a fixed output size (issue #1196).
+                    //    The native capture dims are fitted INSIDE the layer's
+                    //    SIMULCAST_LAYER_TIERS rung (aspect-preserving) so the
+                    //    very first GOP already carries the source aspect — a
+                    //    non-16:9 capture (e.g. a 4:3 webcam) is never
+                    //    per-axis-squashed into the 16:9 tier dims. `tier_w` /
+                    //    `tier_h` are recorded so the per-frame loop can re-fit
+                    //    against THIS layer's box when the source dims change.
+                    //    The per-layer bitrate still adapts (tier ideal here).
+                    let (layer_w, layer_h, tier_w, tier_h, init_bitrate_bps) = if simulcast {
                         let tiers = simulcast_layers(n_layers);
                         let tier = &tiers[layer_idx];
+                        // Seed the first GOP at the aspect-fitted dims, not the
+                        // raw 16:9 tier dims. `width`/`height` are the native
+                        // track dims read up front (the true source aspect).
+                        let (fit_w, fit_h) = fit_within_preserving_aspect(
+                            width as u32,
+                            height as u32,
+                            tier.max_width,
+                            tier.max_height,
+                        );
                         (
+                            fit_w,
+                            fit_h,
                             tier.max_width,
                             tier.max_height,
                             tier.ideal_bitrate_kbps as f64 * 1000.0,
                         )
                     } else {
+                        // Single-stream: native resolution; the tier_w/tier_h
+                        // fields are unused on this path (the legacy loop fits
+                        // against the shared `local_tier_max_*`), so mirror the
+                        // layer dims to keep them well-defined.
                         (
+                            width as u32,
+                            height as u32,
                             width as u32,
                             height as u32,
                             current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
@@ -2061,6 +2104,8 @@ impl CameraEncoder {
                         layer_id,
                         current_w: layer_w,
                         current_h: layer_h,
+                        tier_w,
+                        tier_h,
                         local_bitrate: init_bitrate_bps as u32,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
@@ -2193,18 +2238,21 @@ impl CameraEncoder {
                         local_tier_max_height = new_tier_h;
                     }
 
-                    // Per-layer reconfiguration.
+                    // Per-layer reconfiguration (PRE-FRAME pass: bitrate only).
                     //
                     //  - Single-stream (n_layers == 1): the legacy logic —
                     //    tier-resolution stepping (tier dims) + shared adaptive
                     //    bitrate, applied verbatim. N=1 behavior is unchanged.
-                    //  - Simulcast (n_layers > 1, issue #989 PR B): RESOLUTION IS
-                    //    FIXED per layer (set at construction from
-                    //    SIMULCAST_LAYER_TIERS), so tier-resolution stepping is
-                    //    retired here; only the per-layer adaptive bitrate is
-                    //    reconfigured. Layers with layer_id >= active count are
-                    //    skipped entirely (not reconfigured, not encoded) so a
-                    //    dropped top layer costs no encode CPU.
+                    //  - Simulcast (n_layers > 1): only the per-layer adaptive
+                    //    bitrate is reconfigured HERE. Per-layer RESOLUTION is
+                    //    aspect-fitted into each layer's tier bounding box (issue
+                    //    #1196) — seeded at construction and re-fitted in the
+                    //    per-frame encode loop below where the live frame dims are
+                    //    known (so a source-aspect change is followed). It is NOT
+                    //    a fixed 16:9 tier size and is not handled in this pass.
+                    //    Layers with layer_id >= active count are skipped entirely
+                    //    (not reconfigured, not encoded) so a dropped top layer
+                    //    costs no encode CPU.
                     let mut fatal_reconfigure = false;
                     for layer in layers.iter_mut() {
                         // Simulcast: skip inactive (shed) top layers entirely.
@@ -2213,7 +2261,9 @@ impl CameraEncoder {
                         }
 
                         if simulcast {
-                            // Per-layer adaptive bitrate (fixed resolution).
+                            // Per-layer adaptive bitrate. Resolution for
+                            // simulcast layers is aspect-fitted in the per-frame
+                            // encode loop (issue #1196), not here.
                             let new_layer_bitrate = {
                                 let atomics = shared_layer_bitrates_bps.borrow();
                                 atomics
@@ -2465,75 +2515,156 @@ impl CameraEncoder {
                                 }
 
                                 // Dimension-change handling (rotation, camera
-                                // switch). SIMULCAST: each layer's resolution is
-                                // FIXED by its tier — the encoder downscales the
-                                // source frame automatically — so we do NOT track
-                                // frame dimensions or reconfigure on frame-size
-                                // change (the `!simulcast` gate below). SINGLE-
-                                // STREAM: keep the legacy behavior of following
-                                // the frame size, constrained to the current tier
-                                // max while preserving the frame's native aspect
-                                // ratio (#1037).
+                                // switch). Both paths now treat the tier as a
+                                // BOUNDING BOX and fit the source frame inside it
+                                // aspect-preserving (issue #1196) — neither path
+                                // configures the encoder at raw per-axis tier
+                                // dims, which would bake a stretch/squash into the
+                                // stream for a non-16:9 capture.
+                                //  - SIMULCAST: each layer re-fits the frame into
+                                //    ITS OWN tier rung (`layer.tier_w/tier_h`) and
+                                //    reconfigures when the fitted dims drift from
+                                //    `layer.current_w/current_h` (handled in the
+                                //    `simulcast` branch just below). The seed at
+                                //    construction already fitted the first GOP, so
+                                //    in steady state this is a no-op.
+                                //  - SINGLE-STREAM: legacy behavior — follow the
+                                //    frame size, constrained to the shared current
+                                //    tier max while preserving aspect (#1037),
+                                //    handled in the `!simulcast` branch.
                                 //
                                 // `frame_width` / `frame_height` are the raw
                                 // native VideoFrame dimensions (the true source
-                                // aspect). Fitting them uniformly (rather than a
-                                // per-axis `.min()`) prevents the encoder from
-                                // baking a stretch/squash into the stream when the
-                                // source (e.g. a 4:3 webcam) does not match the
-                                // 16:9 tier ceiling. For N==1 this matches the
-                                // legacy single encoder; the computed values are
-                                // only consumed on the `!simulcast` reconfigure
-                                // path below.
-                                let (clamped_width, clamped_height) =
-                                    if frame_width > 0 && frame_height > 0 {
-                                        fit_within_preserving_aspect(
-                                            frame_width,
-                                            frame_height,
-                                            local_tier_max_width,
-                                            local_tier_max_height,
-                                        )
-                                    } else {
-                                        // Degenerate frame dims: leave as-is so
-                                        // the `> 0` change-detection below skips
-                                        // the reconfigure.
-                                        (frame_width, frame_height)
-                                    };
+                                // aspect). The single-stream path fits them
+                                // against the shared `local_tier_max_*` (computed
+                                // inside the `!simulcast` branch below so the fit
+                                // runs only when consumed — not ~N× per second on
+                                // the simulcast path); the simulcast branch fits
+                                // against each layer's own tier box via
+                                // `simulcast_layer_target_dims`.
 
-                                if !simulcast
-                                    && clamped_width > 0
-                                    && clamped_height > 0
-                                    && (clamped_width != layer.current_w
-                                        || clamped_height != layer.current_h)
-                                {
-                                    // Guard: do not configure a closed encoder.
-                                    if layer.encoder.state() == CodecState::Closed {
-                                        log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                        fatal_encode = true;
-                                        break;
-                                    }
-
-                                    log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
-
-                                    layer.current_w = clamped_width;
-                                    layer.current_h = clamped_height;
-
-                                    let new_config = VideoEncoderConfig::new(
-                                        get_video_codec_string(),
-                                        layer.current_h,
+                                // SIMULCAST per-layer aspect re-fit (issue #1196).
+                                // Fit the source frame into THIS layer's tier box
+                                // and reconfigure only when the fitted dims drift
+                                // from the current config. Mirrors the single-
+                                // stream reconfigure block below (closed-encoder
+                                // guard, fatal handling, log line). The new config
+                                // carries the layer's CURRENT cached bitrate and
+                                // is stored back into `layer.config`, so it
+                                // composes with the per-layer bitrate path: this
+                                // dims change re-applies the cached bitrate (never
+                                // clobbering it), and the next tick's pre-frame
+                                // bitrate reconfigure mutates THIS config in place,
+                                // preserving the new dims.
+                                if simulcast {
+                                    let decision = simulcast_layer_target_dims(
+                                        frame_width,
+                                        frame_height,
+                                        layer.tier_w,
+                                        layer.tier_h,
                                         layer.current_w,
+                                        layer.current_h,
                                     );
-                                    new_config.set_bitrate(layer.local_bitrate as f64);
-                                    new_config.set_latency_mode(LatencyMode::Realtime);
-                                    if let Err(e) = layer.encoder.configure(&new_config) {
-                                        CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        if is_fatal_encoder_error(&e) {
-                                            error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                    if decision.needs_reconfigure {
+                                        // Guard: do not configure a closed encoder.
+                                        if layer.encoder.state() == CodecState::Closed {
+                                            log::warn!("CameraEncoder: encoder closed before per-layer dimension reconfigure (layer {})", layer.layer_id);
                                             fatal_encode = true;
                                             break;
                                         }
-                                        error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+
+                                        log::info!(
+                                            "CameraEncoder: layer dimension change -> {}x{} (was {}x{}) within tier {}x{} (layer {})",
+                                            decision.target_w,
+                                            decision.target_h,
+                                            layer.current_w,
+                                            layer.current_h,
+                                            layer.tier_w,
+                                            layer.tier_h,
+                                            layer.layer_id,
+                                        );
+
+                                        layer.current_w = decision.target_w;
+                                        layer.current_h = decision.target_h;
+
+                                        // Replace this layer's config with one at
+                                        // the new dims + the cached bitrate, and
+                                        // store it back so subsequent in-place
+                                        // bitrate reconfigures keep the new dims.
+                                        layer.config = VideoEncoderConfig::new(
+                                            get_video_codec_string(),
+                                            layer.current_h,
+                                            layer.current_w,
+                                        );
+                                        layer.config.set_bitrate(layer.local_bitrate as f64);
+                                        layer.config.set_latency_mode(LatencyMode::Realtime);
+                                        if let Err(e) = layer.encoder.configure(&layer.config) {
+                                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            if is_fatal_encoder_error(&e) {
+                                                error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                                fatal_encode = true;
+                                                break;
+                                            }
+                                            error!("Error reconfiguring camera layer for dimension change (layer {}): {e:?}", layer.layer_id);
+                                        }
+                                    }
+                                }
+
+                                // SINGLE-STREAM aspect re-fit (#1037). Compute the
+                                // fit only here, inside the `!simulcast` branch, so
+                                // the simulcast path doesn't pay ~N× fit calls per
+                                // second for a value it never consumes.
+                                if !simulcast {
+                                    let (clamped_width, clamped_height) =
+                                        if frame_width > 0 && frame_height > 0 {
+                                            fit_within_preserving_aspect(
+                                                frame_width,
+                                                frame_height,
+                                                local_tier_max_width,
+                                                local_tier_max_height,
+                                            )
+                                        } else {
+                                            // Degenerate frame dims: leave as-is so
+                                            // the `> 0` change-detection below skips
+                                            // the reconfigure.
+                                            (frame_width, frame_height)
+                                        };
+
+                                    if clamped_width > 0
+                                        && clamped_height > 0
+                                        && (clamped_width != layer.current_w
+                                            || clamped_height != layer.current_h)
+                                    {
+                                        // Guard: do not configure a closed encoder.
+                                        if layer.encoder.state() == CodecState::Closed {
+                                            log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
+                                            fatal_encode = true;
+                                            break;
+                                        }
+
+                                        log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
+
+                                        layer.current_w = clamped_width;
+                                        layer.current_h = clamped_height;
+
+                                        let new_config = VideoEncoderConfig::new(
+                                            get_video_codec_string(),
+                                            layer.current_h,
+                                            layer.current_w,
+                                        );
+                                        new_config.set_bitrate(layer.local_bitrate as f64);
+                                        new_config.set_latency_mode(LatencyMode::Realtime);
+                                        if let Err(e) = layer.encoder.configure(&new_config) {
+                                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            if is_fatal_encoder_error(&e) {
+                                                error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                                fatal_encode = true;
+                                                break;
+                                            }
+                                            error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+                                        }
                                     }
                                 }
 
@@ -3172,9 +3303,23 @@ mod wasm_tests {
     fn transform_video_chunk_layer_zero_omits_field() {
         let aes = Rc::new(Aes128State::new(false));
         let mut buf = vec![0u8; 100_000];
-        let wrapper =
-            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 0);
+        // Stamp a 4:3 source (640x480) so the new source-dims field (issue
+        // #1196) is exercised end-to-end through the real production function.
+        let wrapper = super::transform_video_chunk(
+            make_chunk(),
+            0,
+            buf.as_mut_slice(),
+            "alice",
+            aes,
+            640,
+            480,
+            0,
+        );
         // Layer 0 round-trips to 0 and (proto3 tag-5-when-nonzero) is wire-absent.
+        // (The source dims live in the AES-encrypted inner MediaPacket, so they
+        // cannot be asserted from the outer wrapper here; the host-runnable
+        // `transform::tests::video_metadata_carries_source_dims` covers the
+        // VideoMetadata stamping on the unencrypted path.)
         let bytes = wrapper.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 0);
@@ -3184,8 +3329,16 @@ mod wasm_tests {
     fn transform_video_chunk_layer_two_round_trips() {
         let aes = Rc::new(Aes128State::new(false));
         let mut buf = vec![0u8; 100_000];
-        let wrapper =
-            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 2);
+        let wrapper = super::transform_video_chunk(
+            make_chunk(),
+            0,
+            buf.as_mut_slice(),
+            "alice",
+            aes,
+            640,
+            480,
+            2,
+        );
         let bytes = wrapper.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 2);

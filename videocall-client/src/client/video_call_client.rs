@@ -32,7 +32,7 @@ use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::future::LocalBoxFuture;
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, trace, warn};
@@ -90,6 +90,24 @@ fn generate_instance_id() -> String {
 }
 
 const MAX_SESSION_ID_HISTORY: usize = 16;
+
+/// How long (ms) the early-seed sampler stays armed after a peer first joins
+/// (issue #1179, Part B). The 5s monitor tick owns steady-state adaptation; this
+/// short window only exists to catch a freshly-joined WT peer whose downlink is
+/// already congested BEFORE the first tick can react, so it self-cancels after
+/// this elapses. Sized to comfortably cover a join wave (scale target ~20 users):
+/// `transport_type` is UNKNOWN at peer-add and only populates once the peer's
+/// first heartbeat lands, so the window must outlast at least one heartbeat
+/// cadence (~5s) plus the wave spread — 30s leaves ample margin while still being
+/// strictly bounded (the timer is NOT a steady-state loop).
+const EARLY_SEED_WINDOW_MS: u32 = 30_000;
+
+/// Cadence (ms) of the early-seed sampler while armed (issue #1179, Part B). At
+/// 1s it reacts to early congestion ~5x faster than the 5s monitor tick — the
+/// whole point of the seed — without being a per-packet cost (it is a single
+/// timer, not work in `on_inbound_media`). Must divide into [`EARLY_SEED_WINDOW_MS`]
+/// so the window ends on a tick boundary.
+const EARLY_SEED_SAMPLE_MS: u32 = 1_000;
 
 /// Result of refreshing a room token. Both URL lists carry the new token
 /// in their query string (e.g. `https://relay.example/lobby?token=<JWT>`),
@@ -470,6 +488,18 @@ pub struct VideoCallClient {
     /// [`Timeout`] keeps it armed; dropping/replacing it cancels the pending
     /// fire. `None` when no flush is scheduled.
     viewport_debounce_timer: Rc<RefCell<Option<Timeout>>>,
+    /// Self-cancelling early-seed sampler (issue #1179, Part B). Armed once when
+    /// the first peer joins; ticks every [`EARLY_SEED_SAMPLE_MS`] to drive the
+    /// receiver-side `observe_early_congestion` for WEBTRANSPORT peers so a
+    /// freshly-joined congested WT peer is constrained immediately instead of
+    /// decoding the full-quality top layer for up to ~5s until the first monitor
+    /// tick. `Some` == armed (so per-packet `on_inbound_media` installs exactly
+    /// ONE timer); the timer self-cancels back to `None` after
+    /// [`EARLY_SEED_WINDOW_MS`]. Held here (not in `Inner`) so its closure can
+    /// capture a `Weak` to the slot and clear it on expiry, mirroring
+    /// `viewport_debounce_timer`. Dropping the `VideoCallClient` drops this slot,
+    /// which drops the `Interval`, which cancels the underlying browser timer.
+    early_seed_timer: Rc<RefCell<Option<Interval>>>,
 }
 
 // `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
@@ -619,6 +649,146 @@ fn send_layer_preference_via(
         },
         Err(_) => warn!("connection_controller busy; dropping LAYER_PREFERENCE packet"),
     }
+}
+
+/// Arm the issue-#1179 early-seed sampler if it is not already armed.
+///
+/// Idempotent: `on_inbound_media` fires per-packet, so this guards on the slot
+/// already holding an `Interval` (`Some`) and installs exactly one timer. The
+/// installed `Interval` ticks every [`EARLY_SEED_SAMPLE_MS`] and, on each tick:
+///   * upgrades the `Weak<Inner>`; if the client was torn down, self-cancels
+///     (clears the slot, dropping the `Interval`) and returns;
+///   * computes elapsed wall-clock since arming and self-cancels once it reaches
+///     [`EARLY_SEED_WINDOW_MS`] — so the timer is strictly bounded, NEVER a
+///     steady-state loop (the 5s monitor tick owns steady-state adaptation);
+///   * `try_borrow_mut`s `Inner`; on a transient borrow conflict it SKIPS this
+///     cycle (the next tick retries) and never triggers a reconnect — same
+///     discipline as the `peer_monitor` closure;
+///   * gates on THIS client's LOCAL active transport via
+///     [`ConnectionController::active_is_webtransport`] — the deciding signal for
+///     #1179 is "am I (the receiver) on WebTransport", a single client-wide
+///     boolean, NOT a per-peer property. When the local transport is not WT (or
+///     no connection is active yet) the tick returns early and seeds nothing,
+///     preserving the M2 healthy cold-start for WS clients;
+///   * otherwise drives [`PeerDecodeManager::seed_early_congestion_for_wt_peers`]
+///     (which now seeds purely on the per-peer congestion gate — the WT decision
+///     has already been made on the local transport — and clamps each seeded layer
+///     to the user's receive bounds) and then publishes the
+///     [`PeerDecodeManager::current_desired_preferences`] map (clamped to the
+///     user's bounds and gated to layers below each kind's highest-available,
+///     mirroring the 5s tick; it advances no chooser hysteresis) through the
+///     existing [`LayerPreferenceSender`], so `last_sent`/`last_sent_ms` stay
+///     coherent and the next 5s tick does not re-send a redundant packet.
+///
+/// LIFECYCLE DECISION (issue #1179): the timer runs the FULL window and seeds any
+/// congested peer rather than cancelling after the first seed. Rationale: at the
+/// scale target (~20 users) peers arrive in a join WAVE and become congested at
+/// staggered times within the window. Cancelling on the first seed would leave
+/// later joiners unseeded for up to a full 5s tick — exactly the stall this fix
+/// removes. The window is still strictly bounded, so this is not an unbounded
+/// loop.
+fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Option<Interval>>>) {
+    // Guard: exactly one timer. If already armed (Some), do nothing.
+    let mut slot_borrow = match slot.try_borrow_mut() {
+        Ok(b) => b,
+        // Slot busy (should not happen on single-threaded wasm); skip arming —
+        // a later inbound packet re-attempts.
+        Err(_) => return,
+    };
+    if slot_borrow.is_some() {
+        return;
+    }
+
+    let armed_at_ms = js_sys::Date::now() as u64;
+    let slot_weak = Rc::downgrade(slot);
+
+    let interval = Interval::new(EARLY_SEED_SAMPLE_MS, move || {
+        // Self-cancel if the client (and thus Inner) is gone.
+        let Some(inner_rc) = inner_weak.upgrade() else {
+            if let Some(slot) = slot_weak.upgrade() {
+                if let Ok(mut s) = slot.try_borrow_mut() {
+                    *s = None;
+                }
+            }
+            return;
+        };
+
+        let now_ms = js_sys::Date::now() as u64;
+
+        // Window elapsed → self-cancel by clearing our own slot (drops the
+        // Interval). Strictly bounded; never a steady-state loop.
+        if now_ms.saturating_sub(armed_at_ms) >= EARLY_SEED_WINDOW_MS as u64 {
+            if let Some(slot) = slot_weak.upgrade() {
+                if let Ok(mut s) = slot.try_borrow_mut() {
+                    *s = None;
+                }
+            }
+            return;
+        }
+
+        // Borrow Inner. On a transient conflict (e.g. on_inbound_media holds the
+        // mutable borrow) SKIP this cycle — never reconnect; the next tick retries.
+        let Ok(mut inner) = inner_rc.try_borrow_mut() else {
+            warn!("early_seed: transient borrow conflict, skipping this cycle");
+            return;
+        };
+
+        // WT-only gate, evaluated on THIS client's LOCAL active transport — NOT
+        // per-peer. #1179's root cause is the local DOWNLINK being WebTransport
+        // (reliable-unistream flow-control pinning under simulcast fan-out), so
+        // the deciding signal is "am I on WT", a single client-wide boolean. The
+        // relay is a broadcast relay: each client elects exactly one transport.
+        // A peer's announced `transport_type` (its own uplink) is the wrong
+        // signal — it could differ from this receiver's downlink. If no
+        // connection is active yet (cold start / pre-election) the accessor
+        // returns false → no seed (matches the M2 healthy cold-start).
+        let local_is_wt = match inner.connection_controller.try_borrow() {
+            Ok(slot) => slot
+                .as_ref()
+                .map(|cc| cc.active_is_webtransport())
+                .unwrap_or(false),
+            // Controller cell momentarily borrowed → treat as not-WT and skip
+            // this cycle; the next tick (within the bounded window) retries.
+            Err(_) => false,
+        };
+        if !local_is_wt {
+            return;
+        }
+
+        // The user's GLOBAL receive-layer bounds, snapshotted (`Copy`) to avoid an
+        // aliasing borrow with `&mut peer_decode_manager` — same pattern as the 5s
+        // tick. The seed clamps each seeded layer to these bounds so the early path
+        // honors a manual receive `max` exactly as the tick does (PR #1192 review);
+        // the default (open) bounds make this an identity clamp.
+        let bounds = inner.receive_layer_bounds;
+
+        // Seed any peer showing early congestion. The WT decision was already
+        // made above on the local transport, so this loop no longer reads any
+        // per-peer transport — it seeds purely on the congestion gate inside
+        // `observe_early_congestion`.
+        inner
+            .peer_decode_manager
+            .seed_early_congestion_for_wt_peers(now_ms, &bounds);
+
+        // Publish the resulting desired map through the existing sender so
+        // dedup/rate-limit invariants hold. The map is clamped to the user's
+        // bounds and gated to layers below each kind's highest-available, mirroring
+        // the 5s tick. A clean join seeds nothing → empty/unchanged map → sender
+        // suppresses → no packet (M2).
+        let desired = inner
+            .peer_decode_manager
+            .current_desired_preferences(now_ms, &bounds);
+        if let Some(entries) = inner
+            .layer_preference_sender
+            .take_if_changed(&desired, now_ms)
+        {
+            let user_id = inner.options.user_id.clone();
+            let cc = inner.connection_controller.clone();
+            send_layer_preference_via(&cc, &user_id, entries);
+        }
+    });
+
+    *slot_borrow = Some(interval);
 }
 
 fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
@@ -788,6 +958,7 @@ impl VideoCallClient {
             _diagnostics: diagnostics.clone(),
             viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
             viewport_debounce_timer: Rc::new(RefCell::new(None)),
+            early_seed_timer: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -890,12 +1061,30 @@ impl VideoCallClient {
             userid: self.options.user_id.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
+                // Issue #1179, Part B: the early-seed timer is armed the first
+                // time a peer is Added. Capture the slot here so the per-packet
+                // callback can install exactly one timer.
+                let early_seed_timer = self.early_seed_timer.clone();
                 Callback::from(move |packet| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.on_inbound_media(packet);
-                        } else {
-                            warn!("on_inbound_media: transient borrow conflict, dropping packet");
+                    if let Some(inner_rc) = Weak::upgrade(&inner) {
+                        // Borrow, handle the packet, and capture the peer status,
+                        // then RELEASE the borrow before arming the timer (the
+                        // timer's closure borrows Inner on its own cadence).
+                        let status = match inner_rc.try_borrow_mut() {
+                            Ok(mut inner) => Some(inner.on_inbound_media(packet)),
+                            Err(_) => {
+                                warn!(
+                                    "on_inbound_media: transient borrow conflict, dropping packet"
+                                );
+                                None
+                            }
+                        };
+                        // Arm the issue-#1179 early-seed sampler exactly once, on
+                        // the first peer to join. `arm_early_seed_timer` is a no-op
+                        // if the timer is already armed (Some), so per-packet calls
+                        // never leak additional timers.
+                        if matches!(status, Some(PeerStatus::Added(_))) {
+                            arm_early_seed_timer(Rc::downgrade(&inner_rc), &early_seed_timer);
                         }
                     }
                 })
@@ -911,6 +1100,11 @@ impl VideoCallClient {
                 // outgoing PacketWrapper.
                 let viewport_sender = self.viewport_sender.clone();
                 let viewport_user_id = self.options.user_id.clone();
+                // Issue #1179, Part B: clear the early-seed timer slot on
+                // reconnect so the next inbound packet re-arms a fresh window
+                // against the new session (mirrors the layer_preference_sender
+                // reset below). Dropping the stored Interval cancels the old one.
+                let early_seed_timer = self.early_seed_timer.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -939,6 +1133,14 @@ impl VideoCallClient {
                             // resumes (issue #989, Phase 2). We reset here rather
                             // than re-send inline because the desired map is
                             // recomputed from live per-peer health on the tick.
+                            // Issue #1179, Part B: drop any armed early-seed
+                            // timer so the next inbound packet re-arms a fresh
+                            // 30s window against the new session. Dropping the
+                            // Interval cancels the underlying browser timer.
+                            if let Ok(mut slot) = early_seed_timer.try_borrow_mut() {
+                                *slot = None;
+                            }
+
                             if let Some(inner) = Weak::upgrade(&inner) {
                                 if let Ok(mut inner) = inner.try_borrow_mut() {
                                     inner.layer_preference_sender.reset_for_reconnect();
@@ -2268,7 +2470,12 @@ impl Inner {
         true
     }
 
-    fn on_inbound_media(&mut self, response: PacketWrapper) {
+    /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the
+    /// caller can react to a fresh join — specifically the `on_inbound_media`
+    /// closure arms the issue-#1179 early-seed timer exactly once when the first
+    /// peer is `Added` (it cannot arm the timer here because `Inner` does not own
+    /// the `VideoCallClient`-level timer slot).
+    fn on_inbound_media(&mut self, response: PacketWrapper) -> PeerStatus {
         // PER-PACKET hot path (#1 console-log offender, ~106 lines/sec; also a
         // `String::from_utf8_lossy` alloc on every packet). Demoted debug!->trace!
         // so it stays off even when console-log collection bumps to Debug. Not
@@ -2297,10 +2504,10 @@ impl Inner {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).
                 if !self.options.decode_media {
-                    return;
+                    return peer_status;
                 }
                 if !self.options.enable_e2ee {
-                    return;
+                    return peer_status;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
                     debug!(
@@ -2329,10 +2536,10 @@ impl Inner {
             Ok(PacketType::RSA_PUB_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).
                 if !self.options.decode_media {
-                    return;
+                    return peer_status;
                 }
                 if !self.options.enable_e2ee {
-                    return;
+                    return peer_status;
                 }
                 let encrypted_aes_packet = parse_rsa_packet(&response.data)
                     .and_then(parse_public_key)
@@ -2379,7 +2586,7 @@ impl Inner {
                 // used to receive meeting-control push notifications; it must never
                 // decode or play back audio or video from the real call.
                 if !self.options.decode_media {
-                    return;
+                    return peer_status;
                 }
 
                 // Check if this is a KEYFRAME_REQUEST targeted at us (the sender).
@@ -2387,7 +2594,7 @@ impl Inner {
                 // they reach the peer decode manager which would just skip them.
                 if self.try_handle_keyframe_request(&response) {
                     // Handled -- do not forward to peer_decode_manager.
-                    return;
+                    return peer_status;
                 }
 
                 let peer_session_id = response.session_id;
@@ -3046,6 +3253,7 @@ impl Inner {
             self.options.on_peer_added.emit(peer_session_id.to_string());
             self.send_public_key();
         }
+        peer_status
     }
 
     fn send_public_key(&self) {
@@ -3613,7 +3821,8 @@ mod dedup_tests {
 
         {
             let mut inner = client.inner.borrow_mut();
-            inner.on_inbound_media(wrapper);
+            // Return value (PeerStatus) is irrelevant to this callback-shape test.
+            let _ = inner.on_inbound_media(wrapper);
         }
 
         let captured = received.borrow();

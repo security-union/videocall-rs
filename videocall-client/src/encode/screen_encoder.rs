@@ -66,7 +66,7 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::encode::camera_encoder::{build_simulcast_layers, SimulcastSendSnapshot};
-use videocall_aq::fit_within_preserving_aspect;
+use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
 
 /// Upper bound on SCREEN simulcast layers regardless of what the caller
 /// requests (issue #989, Phase 3b). Matches the 3-tier screen ladder the AQ
@@ -96,10 +96,19 @@ struct LayerEncoder {
     seq_out: Rc<std::cell::Cell<u64>>,
     /// This layer's simulcast id, stamped onto every emitted `PacketWrapper`.
     layer_id: u32,
-    /// Cached bitrate (bps) last applied to this layer's encoder. Resolution is
-    /// FIXED per screen tier (set once at construction), so unlike the camera's
-    /// `LayerEncoder` there are no per-layer width/height fields — only the
-    /// bitrate adapts.
+    /// Current encoder width/height for this layer (issue #1196). Seeded at
+    /// construction from the capture dims fitted into `tier_w`/`tier_h`, then
+    /// re-fitted per frame in the encode loop when the share's source aspect
+    /// changes (window-region resize, shared-surface switch), mirroring the
+    /// camera's per-layer `LayerEncoder` and the base screen layer.
+    current_w: u32,
+    current_h: u32,
+    /// This layer's tier bounding box (issue #1196). The source frame is fitted
+    /// INSIDE this box (aspect-preserving) rather than configured at the raw box
+    /// dims, so a non-16:9 capture is not squashed on rungs 1..n.
+    tier_w: u32,
+    tier_h: u32,
+    /// Cached bitrate (bps) last applied to this layer's encoder.
     local_bitrate: u32,
     /// Kept alive so the JS output callback stays valid.
     _output_closure: Closure<dyn FnMut(JsValue)>,
@@ -1839,8 +1848,24 @@ impl ScreenEncoder {
                 for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate().skip(1) {
                     let layer_id = layer_idx as u32;
                     let tier = &screen_tiers[layer_idx];
-                    let layer_w = tier.max_width;
-                    let layer_h = tier.max_height;
+                    // Treat the tier as a BOUNDING BOX, not a fixed output size
+                    // (issue #1196): fit the actual capture dims inside the
+                    // layer's rung, aspect-preserving. This is a construction
+                    // SEED — the first GOP is aspect-correct — and the per-frame
+                    // encode loop re-fits each rung against this same tier box
+                    // (`tier_w`/`tier_h` recorded below) when the share's source
+                    // aspect changes mid-share, exactly like the base screen
+                    // layer's per-frame reconfigure and the camera's per-layer
+                    // path. `width` / `height` are the real capture dims read
+                    // from `getSettings()` above, so a non-16:9 display (16:10,
+                    // ultrawide, portrait) is never per-axis-squashed into the
+                    // 16:9 tier dims on rungs 1..n.
+                    let (layer_w, layer_h) = fit_within_preserving_aspect(
+                        width,
+                        height,
+                        tier.max_width,
+                        tier.max_height,
+                    );
                     let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
 
                     // Per-layer output handler: own seq cell + #903 metadata
@@ -1932,6 +1957,10 @@ impl ScreenEncoder {
                         config,
                         seq_out,
                         layer_id,
+                        current_w: layer_w,
+                        current_h: layer_h,
+                        tier_w: tier.max_width,
+                        tier_h: tier.max_height,
                         local_bitrate: init_bitrate_bps as u32,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
@@ -2173,7 +2202,10 @@ impl ScreenEncoder {
                             }
                         }
                     }
-                    // Higher layers: per-layer bitrate (fixed resolution).
+                    // Higher layers: per-layer bitrate. Resolution for each rung
+                    // is aspect-fitted in the per-frame encode loop (issue #1196),
+                    // not here; this pass only adapts the bitrate in place on
+                    // `layer.config`, preserving whatever dims that config holds.
                     for layer in extra_layers.iter_mut() {
                         if (layer.layer_id as usize) >= local_active_layers {
                             continue; // shed
@@ -2370,6 +2402,80 @@ impl ScreenEncoder {
                             if (layer.layer_id as usize) >= local_active_layers {
                                 continue;
                             }
+
+                            // Per-rung aspect re-fit (issue #1196). The base
+                            // layer re-fits its dims on every source-aspect change
+                            // (above); mirror that for each higher rung so a
+                            // mid-share aspect change (window-region resize,
+                            // shared-surface switch) does not reintroduce the
+                            // per-axis squash on rungs 1..n. Fit the RAW source
+                            // frame dims into THIS rung's tier box and reconfigure
+                            // only when the fitted dims drift. The fresh config
+                            // carries the rung's cached bitrate and is stored back
+                            // into `layer.config`, so the dims change never
+                            // clobbers the per-layer adaptive bitrate (the
+                            // pre-frame bitrate pass mutates this same config in
+                            // place next tick).
+                            let decision = simulcast_layer_target_dims(
+                                raw_frame_width,
+                                raw_frame_height,
+                                layer.tier_w,
+                                layer.tier_h,
+                                layer.current_w,
+                                layer.current_h,
+                            );
+                            if decision.needs_reconfigure {
+                                // Guard: do not configure a closed encoder.
+                                if layer.encoder.state() == CodecState::Closed {
+                                    log::warn!(
+                                        "ScreenEncoder: encoder closed before per-rung dimension reconfigure (layer {}), restarting",
+                                        layer.layer_id
+                                    );
+                                    video_frame.close();
+                                    fatal_encode_exit = true;
+                                    restart_count += 1;
+                                    break 'encode;
+                                }
+                                info!(
+                                    "ScreenEncoder: rung dimension change -> {}x{} (was {}x{}) within tier {}x{} (layer {})",
+                                    decision.target_w,
+                                    decision.target_h,
+                                    layer.current_w,
+                                    layer.current_h,
+                                    layer.tier_w,
+                                    layer.tier_h,
+                                    layer.layer_id,
+                                );
+                                layer.current_w = decision.target_w;
+                                layer.current_h = decision.target_h;
+                                layer.config = VideoEncoderConfig::new(
+                                    get_video_codec_string(),
+                                    layer.current_h,
+                                    layer.current_w,
+                                );
+                                layer.config.set_bitrate(layer.local_bitrate as f64);
+                                layer.config.set_latency_mode(LatencyMode::Realtime);
+                                set_vbr_mode(&layer.config);
+                                if let Err(e) = layer.encoder.configure(&layer.config) {
+                                    SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if is_fatal_encoder_error(&e) {
+                                        error!(
+                                            "ScreenEncoder: fatal configure error on rung dimension reconfigure (layer {}), restarting: {e:?}",
+                                            layer.layer_id
+                                        );
+                                        video_frame.close();
+                                        fatal_encode_exit = true;
+                                        restart_count += 1;
+                                        break 'encode;
+                                    }
+                                    error!(
+                                        "Error reconfiguring screen rung for dimension change (layer {}): {e:?}",
+                                        layer.layer_id
+                                    );
+                                }
+                            }
+
                             match layer.encoder.encode_with_options(&video_frame, &opts) {
                                 Ok(_) => {
                                     SCREEN_ENCODER_FRAMES_SUBMITTED_OK

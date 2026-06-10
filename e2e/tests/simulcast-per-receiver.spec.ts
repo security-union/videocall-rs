@@ -70,9 +70,11 @@
  * below before editing this list):
  *   - receive diagnostics per-peer rows + "+N more" tail (#1093 — needs a real
  *     multi-PUBLISHER, i.e. 3+ context, harness; documented stub)
- *   - WT/QUIC per-receiver divergence (#1080 — toxiproxy is TCP-only; needs
- *     per-client UDP netem)
  *   - publish-side layer suppression, Stage 3 WT + WS (#1093 — 3-context harness)
+ *
+ * The WT/QUIC per-receiver divergence (#1080 WT half) NO LONGER `test.fixme`s:
+ * it now RUNS in the default `dioxus` suite via the client-side `netsim` hook
+ * (no toxiproxy — see below and `helpers/downlink-impair.ts`).
  *
  * The `@impair` WS-divergence test (#1080 + #1108) RUNS, but only under
  * `--project=impair` (it is grep-inverted out of the default suite). The
@@ -137,18 +139,29 @@
  *          `make e2e-impair`). See `TODO(ci)` in that test for the dedicated
  *          CI-job follow-up.
  *
- *   - STILL BLOCKED (documented `test.fixme`) — issue #1080, WT path:
- *       The same divergence over WebTransport/QUIC cannot be produced: toxiproxy
- *       is TCP-only and Playwright's proxy cannot carry QUIC/UDP, and per-client
- *       UDP `netem` needs an isolated netns the shared Playwright harness does
- *       not provide. Kept as `test.fixme` with the concrete blocker inline.
+ *   - RUNS IN THE DEFAULT `dioxus` SUITE (issue #1080, WT path):
+ *       Per-receiver congestion DIVERGENCE over WebTransport/QUIC. toxiproxy
+ *       (the WS mechanism) is TCP-only and cannot shape QUIC/UDP, so this case
+ *       instead uses the CLIENT-SIDE `netsim` hook: `impairDownlinkNetsim(page)`
+ *       installs a per-TAB inbound shim that drops VIDEO/SCREEN packets on ONLY
+ *       the degraded receiver (the `crushed_downlink` preset; AUDIO + control/RTT
+ *       always pass), pushing its `loss_per_sec` over the chooser's step-down
+ *       threshold. It is LOSS-ONLY (no bandwidth/delay emulation), works on BOTH
+ *       transports, needs NO proxy/profile, and is therefore NOT tagged `@impair`
+ *       — it runs against a plain `make e2e-up` stack (provided the UI image was
+ *       built with the `netsim` cargo feature). See `helpers/downlink-impair.ts`.
  *
  * ## Capability-ceiling caveat (see helpers/simulcast-config.ts)
  *
- * `capability_max_simulcast_layers()` reads a live ~100ms CPU benchmark with no
- * test override. On a weak CI runner the ceiling can clamp to 1 even with the
- * flag = 3, in which case the publisher emits a single layer. Test 1 detects
- * this (`layer_count <= 1`) and SKIPS rather than asserts a false negative.
+ * Post-#1140/#1141 `capability_max_simulcast_layers()` derives the ceiling from
+ * cheap device facts (core count + UA platform) with NO CPU benchmark; on a
+ * low-core CI container it clamps to 1, so the publisher would emit a single
+ * layer even with the flag = 3. The #1093 `testCapabilityMaxLayersOverride` hook
+ * (wired via `enableSimulcastFlag(ctx, 3, { capabilityMaxLayersOverride: 3 })`)
+ * REPLACES that sniffed ceiling so the runner emits the full ladder; the
+ * SEND-side and WT-divergence tests use it and prove it took effect via
+ * `assertCapabilityOverrideActive` BEFORE their `layer_count <= 1` skip guard.
+ * Tests without the override still SKIP rather than assert a false negative.
  *
  * Selectors used (all stable, defined in dioxus-ui source). This spec targets
  * the RECEIVE side only; since the unified send+receive panel landed (#1078) the
@@ -178,6 +191,8 @@ import {
   impairDownlink,
   healDownlink,
   assertProxyUp,
+  impairDownlinkNetsim,
+  healDownlinkNetsim,
 } from "../helpers/downlink-impair";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -1230,8 +1245,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    message if someone runs the impair project without the proxy.
   //
   //    SCOPE: WebSocket only — `routeDownlinkThroughProxy` pins the degraded
-  //    context to WS because toxiproxy is TCP-only. The WT/QUIC equivalent
-  //    stays `test.fixme` immediately below with its concrete blocker.
+  //    context to WS because toxiproxy is TCP-only. The WT/QUIC equivalent runs
+  //    immediately below via the client-side `netsim` hook (no toxiproxy, so it
+  //    lives in the default `dioxus` suite, not under `@impair`).
   //
   //    TODO(ci): this `@impair` test is NOT yet wired into a CI job. The
   //    existing CI workflows run `--project=dioxus` (full, e2e-hcl.yaml) and
@@ -1350,17 +1366,29 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
       // the healthy receiver's. The sender and the healthy receiver share
       // neither the proxy nor the relay channel, so the healthy peer stays high.
+      // Guard against a vacuous pass on BOTH sides:
+      //   - HEALTHY must be decoding (non-null) — a null healthy read returns
+      //     false so we never compare against a missing baseline.
+      //   - DEGRADED must ALSO still be decoding (non-null). Under the
+      //     `crushed_downlink` preset the degraded receiver can lose decode
+      //     entirely (keyframe starvation) and read "Not receiving" →
+      //     `readVideoLayer` returns null. Treating a null degraded as the base
+      //     layer (index 0) would pass this assertion for the WRONG reason
+      //     ("stopped decoding" rather than "stepped down to a lower layer"). So
+      //     a null degraded read ALSO returns false — pinning the claim to
+      //     "degraded converged to a strictly lower DECODED layer."
+      //   - The degraded peer may legitimately oscillate through brief "Not
+      //     receiving" windows under heavy loss. Returning false on null does
+      //     NOT fail fast — the poll keeps going (timeout 90s, intervals settle
+      //     at 5s) until it catches a frame window where degraded IS decoding at
+      //     a lower index. That is the intended semantics.
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
             const degraded = await readVideoLayer(degradedPage);
-            // Degraded may briefly read "Not receiving" mid-step-down; treat
-            // that as the base layer (the lowest possible — still a divergence
-            // only if the healthy peer is above base).
-            const degradedIdx = degraded?.layerIndex ?? 0;
-            if (!healthy) return false;
-            return degradedIdx < healthy.layerIndex;
+            if (!healthy || !degraded) return false;
+            return degraded.layerIndex < healthy.layerIndex;
           },
           { timeout: 90_000, intervals: [2000, 3000, 5000] },
         )
@@ -1412,35 +1440,46 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented). #1108 +
-  //     #1080 (WT path), tracked under #1093 for the harness work.
+  // 2b. WT/QUIC per-receiver divergence — now EXERCISED via the client-side
+  //     netsim hook (issue #1080 WT half + #1108).
   //
-  // The same relay-side overflow → loss → step-down mechanism (and therefore the
-  // same #1108 "one bad receiver doesn't degrade the others" proof) applies on
-  // the WebTransport path, but we cannot impair ONE WT client from this
-  // Playwright harness:
-  //   - WebTransport is QUIC over UDP. toxiproxy (used by the WS case above) is
-  //     TCP-only, and Playwright's `newContext({ proxy })` only carries the
-  //     browser's TCP/HTTP(S) traffic — neither can shape QUIC/UDP datagrams.
-  //   - Per-client UDP impairment needs `tc qdisc … netem` keyed to that
-  //     client's 5-tuple in an ISOLATED netns/veth. Playwright runs Chromium on
-  //     the host in a SHARED netns, so a netem qdisc there degrades EVERY
-  //     context (sender + both receivers), not just the degraded one.
-  // When the bots-app netsim orchestrator can drive a per-client veth (the #1093
-  // harness work), this can reuse the WS case's identical assertion against a UDP
-  // netem hook. (Multi-party renderer-crash + capability concerns also apply
-  // here — see #1093.)
+  // The same chooser step-down → divergence (and therefore the same #1108 "one
+  // bad receiver doesn't degrade the others" proof) applies on the WebTransport
+  // path. The WS case above manufactures loss RELAY-side via a toxiproxy TCP
+  // bandwidth clamp, which cannot work for WT: toxiproxy is TCP-only and
+  // Playwright's `newContext({ proxy })` only carries TCP/HTTP(S), so neither can
+  // shape QUIC/UDP datagrams; and per-client UDP `tc … netem` needs an isolated
+  // netns the shared-netns Playwright harness does not provide.
   //
-  // The body below is written out (but `fixme`d) so it is READY the moment a
-  // per-client UDP downlink-impairment helper exists. It mirrors the WS test
-  // exactly, INCLUDING the #1108 non-regression assertion (the healthy peer's
-  // layer must not shrink when the OTHER receiver goes bad). The only missing
-  // piece is the impairment hook — sketched here as `impairDownlinkUdp` /
-  // `healDownlinkUdp` (NOT YET IMPLEMENTED; see #1093). Until that helper lands,
-  // referencing it would not type-check, so the impairment + heal calls are left
-  // as TODO markers rather than live calls.
+  // #1080's WT half solves this by moving the impairment INTO the client: when
+  // the dioxus UI is built with the `netsim` cargo feature, every page exposes
+  // `window.__vcNetsim`, and `impairDownlinkNetsim(page)` installs a PER-TAB
+  // inbound shim that drops ~40% of arriving VIDEO/SCREEN packets (the
+  // `crushed_downlink` preset; AUDIO + control/RTT always pass). Those dropped
+  // packets are real sequence gaps → the receive-side `SequenceTracker` pushes
+  // `loss_per_sec` over the chooser's >= 5 gaps/sec step-down threshold → ONLY
+  // that receiver drops a layer. It is LOSS-ONLY (no bandwidth/delay emulation)
+  // and works on BOTH transports with no proxy/profile, so this runs against a
+  // plain `make e2e-up` stack. See `helpers/downlink-impair.ts` for the full
+  // mechanism and semantics.
+  //
+  // GROUPING: deliberately NOT tagged `@impair`. The `@impair` tag forces a test
+  // into the `impair` Playwright project, which requires the toxiproxy compose
+  // profile (`make e2e-up-impair`) and is grep-inverted OUT of the default
+  // `dioxus` suite. This test needs NO toxiproxy — the netsim hook is client-side
+  // — so it runs as a normal `dioxus`-suite test against `make e2e-up`. Its only
+  // extra requirement is that the UI image carries the `netsim` feature, which
+  // `assertNetsimAvailable` (inside `impairDownlinkNetsim`) checks with an
+  // actionable rebuild error rather than a confusing TypeError.
+  //
+  // It mirrors the WS test's structure exactly, INCLUDING the #1108
+  // non-regression assertion (the healthy peer's layer must not shrink when the
+  // OTHER receiver goes bad). The capability-ceiling override (#1093) is wired
+  // like the SEND tests so a low-core CI runner still emits the full ladder
+  // (otherwise PHASE 1 would skip-clamp). Multi-party renderer-crash mitigation
+  // is the describe-level `mode: "serial"`.
   // -------------------------------------------------------------------------
-  test.fixme("one bad receiver does not degrade the others over WebTransport (WT, #1108) — needs per-client UDP netem", async ({
+  test("one bad receiver does not degrade the others over WebTransport (WT, #1108) — client-side netsim, no toxiproxy", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -1449,10 +1488,11 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
     // 1 publisher + 2 receivers, ALL on WebTransport (the production-primary
     // transport). Unlike the WS case we do NOT pin the degraded receiver to WS —
     // the whole point of this case is to prove the #1108 isolation holds on the
-    // QUIC path too.
+    // QUIC path too. The netsim hook works regardless of the elected transport.
     const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let degradedPage: Page | undefined;
     try {
       const pubCtx = await createAuthenticatedContext(
         pubBrowser,
@@ -1472,33 +1512,42 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimDegradedWT",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(healthyCtx, 3);
-      await enableSimulcastFlag(degradedCtx, 3);
-
-      // TODO(#1093): route ONLY the degraded receiver's QUIC/UDP downlink
-      // through a per-client netem veth here, e.g.:
-      //   await routeDownlinkThroughUdpNetem(degradedCtx);
+      // Flag ON for all three, with the #1093 capability override so a low-core
+      // CI runner (sniffed ceiling → 1) still encodes the full ladder — otherwise
+      // PHASE 1's skip guard below would clamp this test on CI, testing nothing.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const healthyPage = await healthyCtx.newPage();
-      const degradedPage = await degradedCtx.newPage();
+      degradedPage = await degradedCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation so the #1093 override
+      // boot warn is collected (proven via assertCapabilityOverrideActive below).
+      const pubConsole = collectConsole(pubPage);
 
       await joinMeeting(pubPage, meetingId, "SimPublisherDWT");
       await joinMeeting(healthyPage, meetingId, "SimHealthyWT");
       await joinMeeting(degradedPage, meetingId, "SimDegradedWT");
 
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the override took effect BEFORE
+      // the skip guard, so a silently-broken override fails loud instead of
+      // skip-clamping to a single layer. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
+
       await openPerformancePanel(healthyPage);
       await openPerformancePanel(degradedPage);
 
       // PHASE 1 — let both receivers climb above the base layer on a healthy
-      // (un-impaired) downlink. Capability ceiling can clamp to a single layer
-      // on a weak runner; SKIP rather than assert a false negative.
+      // (un-impaired) downlink. Capability ceiling can still clamp to a single
+      // layer if the override somehow failed; SKIP rather than assert a false
+      // negative (the override proof above already fails loud in that case).
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
-            const degraded = await readVideoLayer(degradedPage);
+            const degraded = await readVideoLayer(degradedPage!);
             if (!healthy || !degraded) return -1;
             return Math.min(healthy.layerCount, degraded.layerCount);
           },
@@ -1515,7 +1564,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       );
 
       await expect
-        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
           timeout: 30_000,
           intervals: [1000, 2000, 3000],
         })
@@ -1528,19 +1577,36 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "healthy receiver must be decoding before we impair the other receiver",
       ).not.toBeNull();
 
-      // PHASE 2 — clamp ONLY the degraded receiver's QUIC downlink.
-      // TODO(#1093): await impairDownlinkUdp({ rateKb: 15 });
+      // PHASE 2 — impair ONLY the degraded receiver's downlink, client-side, via
+      // the per-TAB netsim hook (drops inbound VIDEO/SCREEN packets → sequence
+      // gaps → loss_per_sec over the chooser's step-down threshold). Installed on
+      // the degraded receiver's PAGE so the sender + healthy peer are untouched.
+      await impairDownlinkNetsim(degradedPage);
 
       // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
-      // the healthy receiver's.
+      // the healthy receiver's. Guard against a vacuous pass on BOTH sides:
+      //   - HEALTHY must be decoding (non-null) — a null healthy read returns
+      //     false so we never compare against a missing baseline.
+      //   - DEGRADED must ALSO still be decoding (non-null). Under
+      //     `crushed_downlink` (40% inbound video drop) the degraded receiver
+      //     can lose decode entirely (keyframe starvation) and read "Not
+      //     receiving" → `readVideoLayer` returns null. Treating a null degraded
+      //     as the base layer (index 0) would pass this assertion for the WRONG
+      //     reason ("stopped decoding" rather than "stepped down to a lower
+      //     layer"). So a null degraded read ALSO returns false — this pins the
+      //     claim to "degraded converged to a strictly lower DECODED layer."
+      //   - With 40% loss the degraded peer may legitimately oscillate through
+      //     brief "Not receiving" windows. Returning false on null does NOT fail
+      //     fast — the poll simply keeps going (timeout 90s, intervals settle at
+      //     5s) until it catches a frame window where degraded IS decoding at a
+      //     lower index. That is the intended semantics.
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
-            const degraded = await readVideoLayer(degradedPage);
-            const degradedIdx = degraded?.layerIndex ?? 0;
-            if (!healthy) return false;
-            return degradedIdx < healthy.layerIndex;
+            const degraded = await readVideoLayer(degradedPage!);
+            if (!healthy || !degraded) return false;
+            return degraded.layerIndex < healthy.layerIndex;
           },
           { timeout: 90_000, intervals: [2000, 3000, 5000] },
         )
@@ -1560,16 +1626,22 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           `went bad over WT (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
       ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
 
-      // PHASE 4 — heal and prove climb-back.
-      // TODO(#1093): await healDownlinkUdp();
+      // PHASE 4 — heal and prove climb-back (recovery confirms the divergence was
+      // the impairment, not a permanent failure). Conservative hysteresis on
+      // re-climb, so a generous window.
+      await healDownlinkNetsim(degradedPage);
       await expect
-        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
           timeout: 90_000,
           intervals: [2000, 3000, 5000],
         })
         .toBeGreaterThan(0);
     } finally {
-      // TODO(#1093): await healDownlinkUdp();
+      // Clear the netsim impairment so a failure mid-test does not leave the tab
+      // degraded. healDownlinkNetsim tolerates a closed/absent page (teardown-safe).
+      if (degradedPage) {
+        await healDownlinkNetsim(degradedPage);
+      }
       await pubBrowser.close();
       await healthyBrowser.close();
       await degradedBrowser.close();

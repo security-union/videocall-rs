@@ -152,11 +152,17 @@ e2e-bvt0:
 e2e-bvt1:
 	cd e2e && npx playwright test --project=bvt1
 
-# Run ONLY the per-client downlink-impairment suite (issue #1080): the
-# `@impair`-tagged simulcast divergence test. REQUIRES the toxiproxy `impair`
-# profile to be up — bring the stack up with `make e2e-up-impair` first. This
-# test is grep-inverted out of the default `dioxus`/bvt projects, so it never
-# runs in the standard suite; this is the only target that exercises it.
+# Run ONLY the toxiproxy-backed half of issue #1080: the `@impair`-tagged
+# WebSocket simulcast divergence test. REQUIRES the toxiproxy `impair` profile
+# to be up — bring the stack up with `make e2e-up-impair` first. This test is
+# grep-inverted out of the default `dioxus`/bvt projects, so it never runs in
+# the standard suite; this target is the only one that exercises it.
+#
+# NOTE: this does NOT cover the whole #1080 suite. #1080's WebTransport half uses
+# the CLIENT-SIDE `netsim` hook (no toxiproxy) and therefore runs in the default
+# `dioxus` suite via `make e2e` — it is NOT `@impair`-tagged. See the WT
+# divergence test in tests/simulcast-per-receiver.spec.ts and
+# helpers/downlink-impair.ts.
 e2e-impair:
 	cd e2e && npx playwright test --project=impair
 

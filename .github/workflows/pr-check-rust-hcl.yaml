@@ -70,6 +70,19 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo clippy --all -- -D warnings
+      # `cargo clippy --all` lints library/binary targets but NOT test
+      # targets, so deny-by-default lints inside `#[test]` /
+      # `#[wasm_bindgen_test]` code go uncaught (e.g. PR #1192 nearly
+      # shipped a `clippy::absurd_extreme_comparisons` — `selected <= 0`
+      # where `selected: u32` — in a test). Lint videocall-client's test
+      # targets on the wasm target (its tests are wasm-bindgen) to close
+      # that gap. wasm32-unknown-unknown is assumed installed on the
+      # runner, same as the wasm-check job below.
+      - name: clippy (wasm test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
 
   wasm-check:
     name: wasm32 check

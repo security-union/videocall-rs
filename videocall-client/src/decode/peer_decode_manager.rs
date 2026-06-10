@@ -3597,11 +3597,13 @@ mod tests {
     #[test]
     fn apply_hb_flag_5000ms_window_covers_heartbeat_cadence() {
         // The constant itself must be ≥ 5000ms.
-        assert!(
-            MEDIA_FRESH_WINDOW_MS >= 5_000,
-            "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
-             a shorter window lets a stale heartbeat clobber live media on lossy WT"
-        );
+        const {
+            assert!(
+                MEDIA_FRESH_WINDOW_MS >= 5_000,
+                "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
+                 a shorter window lets a stale heartbeat clobber live media on lossy WT"
+            );
+        }
 
         let now = 10_000_u64;
 
@@ -3678,17 +3680,19 @@ mod tests {
     /// audio/video" regression — the exact bug this fixes — fails loudly.
     #[test]
     fn live_stream_fresh_window_is_sub_second_and_shorter_than_media() {
-        assert!(
-            LIVE_STREAM_FRESH_WINDOW_MS <= 1_000,
-            "LIVE_STREAM_FRESH_WINDOW_MS must be sub-second so a mute / \
-             camera-off reflects within ~1 heartbeat, not after the ~5s \
-             screen window"
-        );
-        assert!(
-            LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
-            "the audio/video window must be strictly shorter than the screen \
-             window — reusing the screen window re-introduces the ~5s lag"
-        );
+        const {
+            assert!(
+                LIVE_STREAM_FRESH_WINDOW_MS <= 1_000,
+                "LIVE_STREAM_FRESH_WINDOW_MS must be sub-second so a mute / \
+                 camera-off reflects within ~1 heartbeat, not after the ~5s \
+                 screen window"
+            );
+            assert!(
+                LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
+                "the audio/video window must be strictly shorter than the screen \
+                 window — reusing the screen window re-introduces the ~5s lag"
+            );
+        }
     }
 
     /// (a) A mute heartbeat (`audio_enabled = false`) arriving just after
@@ -4036,7 +4040,7 @@ mod tests {
         peer.audio_level = 0.75;
         manager.connected_peers.insert(101, peer);
 
-        let level = manager.peer_audio_level(&"101".to_string());
+        let level = manager.peer_audio_level("101");
         assert!(
             (level - 0.75).abs() < f32::EPSILON,
             "peer_audio_level should return 0.75, got {level}"
@@ -4047,7 +4051,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_peer_audio_level_unknown_peer_returns_zero() {
         let manager = PeerDecodeManager::new();
-        let level = manager.peer_audio_level(&"99999".to_string());
+        let level = manager.peer_audio_level("99999");
         assert!(
             (level - 0.0).abs() < f32::EPSILON,
             "peer_audio_level for unknown peer should return 0.0, got {level}"
@@ -4058,7 +4062,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_peer_audio_level_invalid_key_returns_zero() {
         let manager = PeerDecodeManager::new();
-        let level = manager.peer_audio_level(&"not-a-number".to_string());
+        let level = manager.peer_audio_level("not-a-number");
         assert!(
             (level - 0.0).abs() < f32::EPSILON,
             "peer_audio_level for invalid key should return 0.0, got {level}"

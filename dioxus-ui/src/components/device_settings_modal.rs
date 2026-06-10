@@ -216,8 +216,9 @@ fn SettingsGlassSelect(
 }
 
 // The `Performance` tab was removed in #1131: the Performance controls moved
-// into the Diagnostics drawer. The tablist is now four tabs; a transitional
-// "moved to Diagnostics" row below the tablist points users to the new home.
+// into the Diagnostics drawer. The tablist is now four tabs. (The transitional
+// "moved to Diagnostics" redirect row was also removed; users find Performance
+// in the drawer, and the "performance" deep link routes there via attendants.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsSection {
     Audio,
@@ -306,12 +307,6 @@ pub fn DeviceSettingsModal(
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
     #[props(default)] initial_section: Option<String>,
-    /// Open the Diagnostics drawer (new home of the Performance controls) from the
-    /// transitional "moved to Diagnostics" row below the tablist. The parent
-    /// closes this modal and opens the drawer. Defaults to a no-op so call sites
-    /// that don't wire it still compile. (#1131 unify)
-    #[props(default)]
-    on_open_diagnostics: EventHandler<()>,
 ) -> Element {
     let is_ios_safari = is_ios();
     // Map the parent's requested section string to the enum. The "performance"
@@ -440,44 +435,11 @@ pub fn DeviceSettingsModal(
                                 },
                             }
                         }
-
-                        // Transitional "moved to Diagnostics" affordance (#1131):
-                        // a one-release aid so users who reach for the old
-                        // Performance tab find its new home. NOT a tab (no
-                        // `role="tab"`) — a link-styled row below the tablist that
-                        // closes this modal and opens the Diagnostics drawer.
-                        // Remove once the redirect is no longer needed.
-                        button {
-                            r#type: "button",
-                            class: "settings-perf-moved",
-                            "data-testid": "settings-perf-moved",
-                            role: "link",
-                            "aria-label": "Performance settings moved to the Diagnostics panel \u{2014} open it",
-                            // `on_open_diagnostics` owns BOTH transitions: the
-                            // attendants closure it maps to sets
-                            // `device_settings_open=false` AND `diagnostics_open=true`.
-                            // Do NOT also call `on_close` here: that maps to the
-                            // settings TOGGLE handler, which would synchronously read
-                            // the just-written `false` and flip the modal back open,
-                            // stacking it over the drawer (#1131 review BLOCKER 1).
-                            onclick: move |_| {
-                                open_dropdown.set(None);
-                                on_open_diagnostics.call(());
-                            },
-                            span { class: "settings-perf-moved__title", "Performance" }
-                            span { class: "settings-perf-moved__sub", "Moved to Diagnostics" }
-                            // Lucide arrow-up-right — "opens elsewhere".
-                            svg {
-                                class: "settings-perf-moved__icon",
-                                xmlns: "http://www.w3.org/2000/svg",
-                                width: "16", height: "16", view_box: "0 0 24 24",
-                                fill: "none", stroke: "currentColor", stroke_width: "2",
-                                stroke_linecap: "round", stroke_linejoin: "round",
-                                "aria-hidden": "true",
-                                line { x1: "7", y1: "17", x2: "17", y2: "7" }
-                                polyline { points: "7 7 17 7 17 17" }
-                            }
-                        }
+                        // The transitional "Performance moved to Diagnostics" row
+                        // was removed (#1131 iteration): the Performance controls
+                        // live in the Diagnostics drawer now, and the redirect link
+                        // is no longer offered. The "performance" deep link is still
+                        // intercepted in attendants and routed to the drawer.
                     }
 
                     div { class: "settings-panel",

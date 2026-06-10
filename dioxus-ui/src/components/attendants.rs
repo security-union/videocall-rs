@@ -4611,13 +4611,6 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
-                                    // Transitional "Performance moved to Diagnostics"
-                                    // row in the settings modal → close settings,
-                                    // open the drawer. (#1131 unify)
-                                    on_open_diagnostics: move |_| {
-                                        device_settings_open.set(false);
-                                        diagnostics_open.set(true);
-                                    },
                                     publish_diagnostics_reader: diagnostics_reader_sink,
                                     // Host publishes its Performance controls handle
                                     // here so the Diagnostics drawer can mount the

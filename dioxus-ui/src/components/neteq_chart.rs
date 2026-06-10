@@ -14,9 +14,6 @@ pub struct NetEqStats {
     pub packets_per_sec: u32,
     pub expand_rate: f32,
     pub accel_rate: f32,
-    pub calls_per_sec: u64,
-    pub avg_frames: u64,
-    pub underruns: u64,
     pub reorder_rate: u32,
     pub reordered_packets: u32,
     pub max_reorder_distance: u32,
@@ -44,9 +41,6 @@ impl From<RawNetEqStats> for NetEqStats {
             packets_per_sec: raw.packets_per_sec,
             expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate),
             accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate),
-            calls_per_sec: 0,
-            avg_frames: 0,
-            underruns: 0,
             reorder_rate: raw.network.reorder_rate_permyriad as u32,
             reordered_packets: raw.network.reordered_packets,
             max_reorder_distance: raw.network.max_reorder_distance as u32,
@@ -219,7 +213,9 @@ pub enum AdvancedChartType {
     DecodeOperations,
     QualityMetrics,
     ReorderingAnalysis,
-    SystemPerformance,
+    // `SystemPerformance` was removed (#1131 cleanup): its only two series
+    // (`calls_per_sec`, `avg_frames`) were never populated — the `From<RawNetEqStats>`
+    // impl hard-coded both to 0 — so the chart was a permanently flat line at zero.
 }
 
 impl ChartType {
@@ -243,9 +239,8 @@ impl AdvancedChartType {
         match self {
             AdvancedChartType::BufferVsTarget => "Buffer Size vs Target",
             AdvancedChartType::DecodeOperations => "Decode Operations Per Second",
-            AdvancedChartType::QualityMetrics => "Packet Count & Audio Quality",
-            AdvancedChartType::ReorderingAnalysis => "Packet Reordering Analysis",
-            AdvancedChartType::SystemPerformance => "System Performance",
+            AdvancedChartType::QualityMetrics => "Packets Awaiting Decode",
+            AdvancedChartType::ReorderingAnalysis => "Packet Reordering",
         }
     }
 }
@@ -426,30 +421,23 @@ impl ChartConfig {
             .max()
             .unwrap_or(1)
             .max(1) as f64;
+        // Single real series: packets buffered but not yet decoded (queue depth).
+        // The former "Underruns" series was dropped (#1131 cleanup) — `underruns`
+        // is never populated (hard-coded 0 in `From<RawNetEqStats>`), so it plotted
+        // a flat line at zero and the unexplained ×0.3 scale only confused the axis.
         Self {
-            title: "Packet Count & Audio Quality",
-            y_axis_label: "Count",
+            title: "Packets Awaiting Decode",
+            y_axis_label: "Packets",
             max_value: max_packets,
-            series: vec![
-                ChartSeries {
-                    data_points: stats_history
-                        .iter()
-                        .map(|s| s.packets_awaiting_decode as f64)
-                        .collect(),
-                    color: theme_color::NETEQ_PURPLE,
-                    label: "Packets",
-                    scale_factor: 1.0,
-                },
-                ChartSeries {
-                    data_points: stats_history
-                        .iter()
-                        .map(|s| s.underruns as f64 * 0.3)
-                        .collect(),
-                    color: theme_color::NETEQ_RED,
-                    label: "Underruns",
-                    scale_factor: 0.3,
-                },
-            ],
+            series: vec![ChartSeries {
+                data_points: stats_history
+                    .iter()
+                    .map(|s| s.packets_awaiting_decode as f64)
+                    .collect(),
+                color: theme_color::NETEQ_PURPLE,
+                label: "Packets",
+                scale_factor: 1.0,
+            }],
         }
     }
 
@@ -466,9 +454,13 @@ impl ChartConfig {
             .max()
             .unwrap_or(1)
             .max(1) as f64;
+        // Two series share one Y axis but DIFFERENT units: reorder rate is
+        // per-myriad (‱) and max distance is a packet count. The axis label and
+        // series labels carry the units so the shared scale isn't read as one unit
+        // (#1131 cleanup). Both are real telemetry, so the chart is kept.
         Self {
-            title: "Packet Reordering Analysis",
-            y_axis_label: "Rate/Distance",
+            title: "Packet Reordering",
+            y_axis_label: "Rate (‱) · Distance (pkts)",
             max_value: max_rate.max(max_distance),
             series: vec![
                 ChartSeries {
@@ -477,7 +469,7 @@ impl ChartConfig {
                         .map(|s| s.reorder_rate as f64)
                         .collect(),
                     color: theme_color::NETEQ_RED,
-                    label: "Reorder Rate",
+                    label: "Reorder rate (‱)",
                     scale_factor: 1.0,
                 },
                 ChartSeries {
@@ -486,44 +478,7 @@ impl ChartConfig {
                         .map(|s| s.max_reorder_distance as f64)
                         .collect(),
                     color: theme_color::NETEQ_TEAL,
-                    label: "Max Distance",
-                    scale_factor: 1.0,
-                },
-            ],
-        }
-    }
-
-    pub fn system_performance(stats_history: &[NetEqStats]) -> Self {
-        let max_calls = stats_history
-            .iter()
-            .map(|s| s.calls_per_sec)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f64;
-        let max_frames = stats_history
-            .iter()
-            .map(|s| s.avg_frames)
-            .max()
-            .unwrap_or(1)
-            .max(1) as f64;
-        Self {
-            title: "System Performance",
-            y_axis_label: "Performance",
-            max_value: max_calls.max(max_frames),
-            series: vec![
-                ChartSeries {
-                    data_points: stats_history
-                        .iter()
-                        .map(|s| s.calls_per_sec as f64)
-                        .collect(),
-                    color: theme_color::NETEQ_GREEN,
-                    label: "Calls/sec",
-                    scale_factor: 1.0,
-                },
-                ChartSeries {
-                    data_points: stats_history.iter().map(|s| s.avg_frames as f64).collect(),
-                    color: theme_color::NETEQ_AMBER,
-                    label: "Avg Frames",
+                    label: "Max distance (pkts)",
                     scale_factor: 1.0,
                 },
             ],
@@ -552,7 +507,6 @@ pub fn NetEqAdvancedChart(
         AdvancedChartType::DecodeOperations => ChartConfig::decode_operations(&stats_history),
         AdvancedChartType::QualityMetrics => ChartConfig::quality_metrics(&stats_history),
         AdvancedChartType::ReorderingAnalysis => ChartConfig::reordering_analysis(&stats_history),
-        AdvancedChartType::SystemPerformance => ChartConfig::system_performance(&stats_history),
     };
 
     rsx! {
@@ -584,13 +538,12 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
         } else {
             "status-value"
         };
-        let underrun_class = if stats.underruns > 0 {
-            "status-value warning"
-        } else {
-            "status-value good"
-        };
-        let expand_str = format!("{:.1}", stats.expand_rate);
-        let accel_str = format!("{:.1}", stats.accel_rate);
+        // Expand / accelerate rates arrive as Q14 fractions converted to per-mille
+        // (‰) by `q14::to_per_mille` (1000‰ = 100%); the reorder rate is per-myriad
+        // (‱) from `reorder_rate_permyriad`. The value strings carry the unit so the
+        // numbers are interpretable without guessing the scale (cleanup #1131).
+        let expand_str = format!("{:.1}\u{2030}", stats.expand_rate);
+        let accel_str = format!("{:.1}\u{2030}", stats.accel_rate);
 
         rsx! {
             style { "{common_styles}" }
@@ -600,10 +553,9 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
                     div { class: "status-item", div { class: "status-value", "{stats.target_ms}" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
                     div { class: "status-item", div { class: "status-value", "{stats.packets_awaiting_decode}" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
                     div { class: "status-item", div { class: "status-value", "{stats.packets_per_sec}" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "{underrun_class}", "{stats.underruns}" } div { class: "status-label", "UNDERRUNS" } div { class: "status-subtitle", "Times audio buffer ran empty" } }
-                    div { class: "status-item", div { class: "status-value", "{expand_str}" } div { class: "status-label", "EXPAND RATE" } div { class: "status-subtitle", "Audio stretching when buffer low" } }
-                    div { class: "status-item", div { class: "status-value", "{accel_str}" } div { class: "status-label", "ACCEL RATE" } div { class: "status-subtitle", "Audio compression when buffer full" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.reorder_rate}" } div { class: "status-label", "REORDER RATE" } div { class: "status-subtitle", "Out-of-order packet frequency" } }
+                    div { class: "status-item", div { class: "status-value", "{expand_str}" } div { class: "status-label", "EXPAND RATE (\u{2030})" } div { class: "status-subtitle", "Audio stretched to fill gaps (loss/late) \u{2014} per-mille of output" } }
+                    div { class: "status-item", div { class: "status-value", "{accel_str}" } div { class: "status-label", "ACCEL RATE (\u{2030})" } div { class: "status-subtitle", "Audio compressed to drain a full buffer \u{2014} per-mille of output" } }
+                    div { class: "status-item", div { class: "status-value", "{stats.reorder_rate}\u{2031}" } div { class: "status-label", "REORDER RATE (\u{2031})" } div { class: "status-subtitle", "Out-of-order packets \u{2014} per-myriad of received" } }
                     div { class: "status-item", div { class: "status-value", "{stats.reordered_packets}" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
                     div { class: "status-item", div { class: "status-value", "{stats.max_reorder_distance}" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
                 }
@@ -618,14 +570,111 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "UNDERRUNS" } div { class: "status-subtitle", "Times audio buffer ran empty" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "EXPAND RATE" } div { class: "status-subtitle", "Audio stretching when buffer low" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "ACCEL RATE" } div { class: "status-subtitle", "Audio compression when buffer full" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDER RATE" } div { class: "status-subtitle", "Out-of-order packet frequency" } }
+                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "EXPAND RATE (\u{2030})" } div { class: "status-subtitle", "Audio stretched to fill gaps (loss/late) \u{2014} per-mille of output" } }
+                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "ACCEL RATE (\u{2030})" } div { class: "status-subtitle", "Audio compressed to drain a full buffer \u{2014} per-mille of output" } }
+                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDER RATE (\u{2031})" } div { class: "status-subtitle", "Out-of-order packets \u{2014} per-myriad of received" } }
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a chart `NetEqStats` from the raw NetEq stats via the real `From`
+    /// conversion, so the tests exercise the actual data path (not a hand-rolled
+    /// fixture that could drift from production mapping).
+    fn raw_with(
+        buffer_ms: u16,
+        target_ms: u32,
+        packets_awaiting: usize,
+        expand_q14: u16,
+        reorder_permyriad: u16,
+        max_reorder_distance: u16,
+    ) -> NetEqStats {
+        let mut raw = RawNetEqStats {
+            network: neteq::statistics::NetworkStatistics::default(),
+            lifetime: neteq::statistics::LifetimeStatistics::default(),
+            current_buffer_size_ms: buffer_ms as u32,
+            target_delay_ms: target_ms,
+            packets_awaiting_decode: packets_awaiting,
+            packets_per_sec: 0,
+        };
+        raw.network.expand_rate = expand_q14;
+        raw.network.reorder_rate_permyriad = reorder_permyriad;
+        raw.network.max_reorder_distance = max_reorder_distance;
+        raw.into()
+    }
+
+    /// `AdvancedChartType` must hold exactly the four surviving charts —
+    /// `SystemPerformance` was removed (#1131) because its only two series were
+    /// never populated. Re-adding a fifth (or restoring SystemPerformance) flips
+    /// the title set this asserts on, catching an accidental revert.
+    #[test]
+    fn advanced_chart_titles_are_the_four_kept_charts() {
+        let titles: Vec<&str> = [
+            AdvancedChartType::BufferVsTarget,
+            AdvancedChartType::DecodeOperations,
+            AdvancedChartType::QualityMetrics,
+            AdvancedChartType::ReorderingAnalysis,
+        ]
+        .iter()
+        .map(|c| c.title())
+        .collect();
+        assert_eq!(
+            titles,
+            [
+                "Buffer Size vs Target",
+                "Decode Operations Per Second",
+                "Packets Awaiting Decode",
+                "Packet Reordering",
+            ]
+        );
+        // The dead "System Performance" chart must not come back.
+        assert!(!titles.contains(&"System Performance"));
+    }
+
+    /// `quality_metrics` must plot exactly ONE series (packets awaiting decode).
+    /// The former second series ("Underruns") was dropped because `underruns` is
+    /// never populated; if it is re-added this length flips to 2 and fails.
+    #[test]
+    fn quality_metrics_has_single_packets_series() {
+        let stats = vec![raw_with(80, 100, 5, 0, 0, 0), raw_with(80, 100, 9, 0, 0, 0)];
+        let cfg = ChartConfig::quality_metrics(&stats);
+        assert_eq!(cfg.series.len(), 1, "only the packets series should remain");
+        assert_eq!(cfg.series[0].label, "Packets");
+        // Y axis is a packet count, not a generic "Count".
+        assert_eq!(cfg.y_axis_label, "Packets");
+        // The single series carries the real queue-depth values.
+        assert_eq!(cfg.series[0].data_points, vec![5.0, 9.0]);
+    }
+
+    /// `reordering_analysis` keeps both real series but the axis + series labels
+    /// must spell out the DIFFERENT units (‱ rate vs. packet distance) that share
+    /// the one Y axis — the old label was the ambiguous "Rate/Distance".
+    #[test]
+    fn reordering_analysis_labels_carry_units() {
+        let stats = vec![raw_with(80, 100, 5, 0, 30, 4)];
+        let cfg = ChartConfig::reordering_analysis(&stats);
+        assert_eq!(cfg.series.len(), 2);
+        assert!(
+            cfg.y_axis_label.contains('‱') && cfg.y_axis_label.contains("pkts"),
+            "axis label must disambiguate the two units, got {:?}",
+            cfg.y_axis_label
+        );
+        assert_eq!(cfg.series[0].label, "Reorder rate (‱)");
+        assert_eq!(cfg.series[1].label, "Max distance (pkts)");
+    }
+
+    /// The `From` conversion renders Q14 expand/accel fractions as per-mille (‰),
+    /// which is why the status tiles append the ‰ unit. 4096 Q14 = 250‰ (= 25%).
+    #[test]
+    fn expand_rate_converts_q14_to_per_mille() {
+        let stats = raw_with(80, 100, 0, 4096, 0, 0);
+        assert!((stats.expand_rate - 250.0).abs() < 0.01);
     }
 }

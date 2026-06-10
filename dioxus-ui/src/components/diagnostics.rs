@@ -22,7 +22,7 @@ use crate::components::neteq_chart::{
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
     format_send_layer_short, format_send_total_kbps, format_simulcast_summary, peers_for_kind,
-    DiagnosticsReader, PerfControlsHandle, PerformanceSettingsPanel,
+    DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{
     confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
@@ -853,115 +853,20 @@ pub fn Diagnostics(
                 }
             }
             div { class: "sidebar-content",
-                // ── GROUP A — Quality controls (the migrated Performance panel) ──
-                // The label AND the panel render together: gating both on
-                // `perf_controls` avoids an orphaned group divider in the sub-second
-                // window before `Host` publishes the handle (#1131 review F3). The
-                // first group's label carries `--first` (no top border).
-                //
-                // The Performance controls (simulcast strip + per-kind cards with
-                // sliders / Auto / live meters / help) render inside their own
-                // child component so the panel's 250 ms refresh tick + rAF meter
-                // drivers re-render ONLY that subtree — NOT this top-level body
-                // (which re-runs the expensive NetEq prelude). The child also reads
-                // the preference signals, keeping all reactive perf state out of
-                // this body. (#1131 unify, tick-scoping #1128)
-                if let Some(controls) = perf_controls.clone() {
-                    div { class: "diag-group-label diag-group-label--first", role: "presentation",
-                        "Quality controls"
-                    }
-                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
-                }
+                // Group order (#1131 iteration): Connection & system FIRST, then
+                // Quality controls, then Live stream state. This is the product
+                // owner's direct instruction for this iteration — it supersedes the
+                // earlier "controls first = user intent on opening" rationale. The
+                // FIRST group is now always "Connection & system", which renders
+                // unconditionally, so it always carries `--first` (no top border).
+                // The later two labels always carry the plain `.diag-group-label`
+                // (with a top border), so the `--first` decision no longer depends
+                // on whether `perf_controls` is published.
 
-                // ── GROUP B — Live stream state ──
-                // When Group A is absent (controls not yet published), this becomes
-                // the leading group, so it takes `--first` (no top border) to avoid a
-                // dangling divider at the top of the body (#1131 review F3).
-                div {
-                    class: if perf_controls.is_some() { "diag-group-label" } else { "diag-group-label diag-group-label--first" },
-                    role: "presentation",
-                    "Live stream state"
+                // ── GROUP A — Connection & system ──
+                div { class: "diag-group-label diag-group-label--first", role: "presentation",
+                    "Connection & system"
                 }
-                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
-                // per-peer RECEIVE breakdown. Extracted into its own child so its
-                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
-                // prelude / charts in this parent (perf review #1).
-                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
-                section { class: "diagnostics-section", "aria-labelledby": "diag-h-current-status",
-                    h3 { id: "diag-h-current-status", "Current Status" }
-                    NetEqStatusDisplay { latest_stats: latest_neteq_stats }
-                }
-                if !neteq_stats_history.is_empty() {
-                    div { class: "diagnostics-charts",
-                        div { class: "charts-grid",
-                            div { class: "chart-container",
-                                NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, width: 290, height: 200 }
-                            }
-                            div { class: "chart-container",
-                                NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, width: 290, height: 200 }
-                            }
-                        }
-                        div { class: "charts-grid",
-                            div { class: "chart-container",
-                                NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, width: 290, height: 200 }
-                            }
-                            div { class: "chart-container",
-                                NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, width: 290, height: 200 }
-                            }
-                        }
-                        div { class: "charts-grid",
-                            div { class: "chart-container",
-                                NetEqAdvancedChart { stats_history: neteq_stats_history.clone(), chart_type: AdvancedChartType::SystemPerformance, width: 290, height: 200 }
-                            }
-                        }
-                    }
-                } else {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-history",
-                        h3 { id: "diag-h-neteq-history", "NetEQ Buffer / Jitter History" }
-                        div { style: "display:flex; gap:12px; align-items:center;",
-                            NetEqChart { data: buffer_history.clone(), chart_type: ChartType::Buffer, width: 140, height: 80 }
-                            NetEqChart { data: jitter_history.clone(), chart_type: ChartType::Jitter, width: 140, height: 80 }
-                        }
-                    }
-                }
-                if available_peers.len() > 2 {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
-                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
-                        div { class: "peer-summary",
-                            {
-                                let transport_map = peer_transport_per_peer();
-                                rsx! {
-                                    for (peer_id, _) in stats_map.iter() {
-                                        {
-                                            let display = peer_display_name(peer_id);
-                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
-                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
-                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
-                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
-                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
-                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
-                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
-                                            };
-                                            rsx! {
-                                                div { class: "peer-summary-item",
-                                                    strong { "{display}" }
-                                                    div {
-                                                        style: "display:flex; gap:8px; align-items:center;",
-                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
-                                                        span { "{summary}" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── GROUP C — Connection & system ──
-                div { class: "diag-group-label", role: "presentation", "Connection & system" }
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-connection-manager",
                     h3 { id: "diag-h-connection-manager", "Connection Manager" }
                     ConnectionManagerDisplay { connection_manager_state: conn_state }
@@ -1085,6 +990,174 @@ pub fn Diagnostics(
                             }
                         }
                     }
+                }
+
+                // ── GROUP B — Quality controls (the migrated Performance panel) ──
+                // The label AND the panel render together: gating both on
+                // `perf_controls` avoids an orphaned group divider in the sub-second
+                // window before `Host` publishes the handle (#1131 review F3). The
+                // label carries the plain `.diag-group-label` (top border) — it is no
+                // longer the first group, so it never needs `--first`.
+                //
+                // The Performance controls (simulcast strip + per-kind cards with
+                // sliders / Auto / live meters / help) render inside their own
+                // child component so the panel's 250 ms refresh tick + rAF meter
+                // drivers re-render ONLY that subtree — NOT this top-level body
+                // (which re-runs the expensive NetEq prelude). The child also reads
+                // the preference signals, keeping all reactive perf state out of
+                // this body. (#1131 unify, tick-scoping #1128)
+                if let Some(controls) = perf_controls.clone() {
+                    div { class: "diag-group-label", role: "presentation",
+                        "Quality controls"
+                    }
+                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
+                }
+
+                // ── GROUP C — Live stream state ──
+                div { class: "diag-group-label", role: "presentation",
+                    "Live stream state"
+                }
+                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
+                // per-peer RECEIVE breakdown. Extracted into its own child so its
+                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
+                // prelude / charts in this parent (perf review #1).
+                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
+                // Current Status tiles + NetEq charts, with their two info-icon
+                // popovers, live in a child component so toggling a popover
+                // re-renders ONLY that subtree — not this top-level body (which
+                // re-runs the expensive NetEq prelude). The already-computed,
+                // value-typed history/latest are passed in as props; no signal
+                // reads move into the child (tick-scoping #1128).
+                NetEqStatusAndCharts {
+                    latest_stats: latest_neteq_stats,
+                    stats_history: neteq_stats_history.clone(),
+                    buffer_history: buffer_history.clone(),
+                    jitter_history: jitter_history.clone(),
+                }
+                if available_peers.len() > 2 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
+                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
+                        div { class: "peer-summary",
+                            {
+                                let transport_map = peer_transport_per_peer();
+                                rsx! {
+                                    for (peer_id, _) in stats_map.iter() {
+                                        {
+                                            let display = peer_display_name(peer_id);
+                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
+                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
+                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
+                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
+                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
+                                            };
+                                            rsx! {
+                                                div { class: "peer-summary-item",
+                                                    strong { "{display}" }
+                                                    div {
+                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
+                                                        span { "{summary}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Plain-language explanation for the "Current Status" info icon (#1131). Every
+/// claim is grounded in what the underlying NetEq field measures: BUFFER =
+/// `current_buffer_size_ms`, TARGET = `target_delay_ms` (NetEq's adaptive goal),
+/// PACKETS = `packets_awaiting_decode`, EXPAND/ACCEL = Q14 rates rendered per-mille
+/// (‰) by `q14::to_per_mille`, REORDER = `reorder_rate_permyriad` (‱).
+const HELP_NETEQ_STATUS: &str = "A live snapshot of each peer's audio jitter buffer — the queue that absorbs network timing variance before audio is played. Buffer is what's queued now; Target is the size NetEq is aiming for given recent jitter (Buffer near Target is healthy; Buffer at 0 means it ran dry → choppy audio). Packets is how many encoded packets are waiting to decode. Expand rate (‰ of output) rises when audio is stretched to cover lost or late packets; Accelerate rate (‰) rises when audio is sped up to drain an over-full buffer. Reorder rate (‱ of packets) and Max reorder distance show how often packets arrive out of order. A few ‰ of expand/accelerate is normal; sustained high expand means the network is dropping or delaying audio.";
+
+/// Plain-language explanation for the NetEq charts grid info icon (#1131). Each
+/// sentence maps to one chart's real series — see `neteq_chart::ChartConfig`.
+const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metrics over the most recent samples (the X axis is in seconds). Buffer Size vs Target: the live buffer tracking NetEq's target — they should track closely; the buffer dipping toward 0 signals starvation. Decode Operations: how the decoder spent each second — mostly Normal is healthy, while rising Expand (concealment) or Accelerate (catch-up) means the network is delivering audio late or in bursts. Packets Awaiting Decode: queue depth over time — steady is good, a sustained climb means decode can't keep up. Packet Reordering: how often packets arrive out of order (rate in ‱) and the largest sequence gap (in packets) — occasional reordering is normal on the public internet.";
+
+/// Current Status tiles + the NetEq charts grid, with one info-icon popover on
+/// each cluster header (#1131 cleanup). Pulled into its own child so opening a
+/// popover re-renders ONLY this subtree — never the parent [`Diagnostics`] body,
+/// which re-executes the expensive NetEq prelude. The history/latest are passed in
+/// as value-typed props (already computed once per tick by the parent), so no
+/// extra signal reads enter the parent body (tick-scoping #1128).
+///
+/// The two popovers share one single-open signal keyed by the help id, so opening
+/// one closes the other — identical to the Performance panel's help behaviour
+/// (same [`HelpPopover`] component, same `.perf-help*` styles, same 44px hit area
+/// + aria treatment). testids: `diag-status-help`, `diag-charts-help`.
+#[component]
+fn NetEqStatusAndCharts(
+    latest_stats: Option<NetEqStats>,
+    stats_history: Vec<NetEqStats>,
+    buffer_history: Vec<u64>,
+    jitter_history: Vec<u64>,
+) -> Element {
+    // Single-open help signal shared by both popovers in this cluster.
+    let open_help = use_signal(|| None::<&'static str>);
+    let has_history = !stats_history.is_empty();
+
+    rsx! {
+        section { class: "diagnostics-section", "aria-labelledby": "diag-h-current-status",
+            div { class: "diag-section-head",
+                h3 { id: "diag-h-current-status", "Current Status" }
+                HelpPopover {
+                    key_id: "diag-status",
+                    help_testid: "diag-status-help",
+                    help_label: "About the Current Status metrics",
+                    help_body: HELP_NETEQ_STATUS,
+                    open_help,
+                }
+            }
+            NetEqStatusDisplay { latest_stats }
+        }
+        if has_history {
+            section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-charts",
+                div { class: "diag-section-head",
+                    h3 { id: "diag-h-neteq-charts", "NetEQ charts" }
+                    HelpPopover {
+                        key_id: "diag-charts",
+                        help_testid: "diag-charts-help",
+                        help_label: "About the NetEq charts",
+                        help_body: HELP_NETEQ_CHARTS,
+                        open_help,
+                    }
+                }
+                div { class: "diagnostics-charts",
+                    div { class: "charts-grid",
+                        div { class: "chart-container",
+                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, width: 290, height: 200 }
+                        }
+                        div { class: "chart-container",
+                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, width: 290, height: 200 }
+                        }
+                    }
+                    div { class: "charts-grid",
+                        div { class: "chart-container",
+                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, width: 290, height: 200 }
+                        }
+                        div { class: "chart-container",
+                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, width: 290, height: 200 }
+                        }
+                    }
+                }
+            }
+        } else {
+            section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-history",
+                h3 { id: "diag-h-neteq-history", "NetEQ Buffer / Jitter History" }
+                div { style: "display:flex; gap:12px; align-items:center;",
+                    NetEqChart { data: buffer_history.clone(), chart_type: ChartType::Buffer, width: 140, height: 80 }
+                    NetEqChart { data: jitter_history.clone(), chart_type: ChartType::Jitter, width: 140, height: 80 }
                 }
             }
         }

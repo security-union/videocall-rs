@@ -2022,12 +2022,18 @@ fn DualRangeSlider(
     }
 }
 
-/// A self-contained "?" help popover button (shared by send + receive rows).
+/// A self-contained "?" help popover button (shared by send + receive rows, and
+/// by the Diagnostics drawer's NetEq sections — #1131 cleanup).
 ///
 /// `open_help` is the shared single-open signal keyed by `key_id`. Opening one
-/// closes any other (since they all share the signal).
+/// closes any other (since they all share the signal). Reuses the `.perf-help*`
+/// styles (44×44 hit area, focus ring, aria-expanded, Escape/outside-click close,
+/// focus return) so every caller gets the same a11y treatment for free.
+///
+/// `pub(crate)` so the Diagnostics drawer can mount it directly rather than
+/// duplicating the markup (single source of truth for the help affordance).
 #[component]
-fn HelpPopover(
+pub(crate) fn HelpPopover(
     /// Unique key for this popover within the shared `open_help` signal.
     key_id: &'static str,
     help_testid: &'static str,

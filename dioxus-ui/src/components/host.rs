@@ -83,12 +83,6 @@ pub fn Host(
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
-    /// Open the Diagnostics drawer from the settings modal's transitional
-    /// "Performance moved to Diagnostics" row. The parent (attendants) closes the
-    /// modal and opens the drawer. Defaults to a no-op so callers that don't wire
-    /// it still compile. (#1131 unify)
-    #[props(default)]
-    on_open_diagnostics: EventHandler<()>,
     /// Sink the parent (attendants) reads to feed the Diagnostics drawer's
     /// "Simulcast layers" section the live SEND simulcast snapshots. Host owns the
     /// encoders, so it builds the `DiagnosticsReader` and publishes the handle here
@@ -1080,9 +1074,6 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
-                    // Transitional "Performance moved to Diagnostics" row → open
-                    // the drawer (closes the modal). (#1131 unify)
-                    on_open_diagnostics: move |_| on_open_diagnostics.call(()),
                 }
             }
         }

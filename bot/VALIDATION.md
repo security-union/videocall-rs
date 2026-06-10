@@ -261,11 +261,9 @@ How to verify (needs #1079+#1082 deployed):
 > plus #1064/#1060/#1122) was verified in the deployed daily build `87d28f30`
 > (`/api/v1/versions` + `git merge-base --is-ancestor`), and the cluster runs
 > were executed the same day — see the `2026-06-10` test-run entry below. V20
-> and V22 are PROVEN on both transports; V21 turned out to be gated on the bot
-> AQ wiring, not on deploy. NOTE: an earlier revision of this note framed the
-> V21 blocker as "waiting for #1115/#1117" — those PRs had in fact merged on
-> 2026-06-06; the missing piece was always the bot-side wiring, which this
-> branch adds (see the V21 row).
+> and V22 are PROVEN on both transports; V21 turned out to be gated on the
+> missing bot-side AQ wiring, not on deploy (#1115/#1117 themselves merged
+> 2026-06-06) — the wiring and its cluster capture land in PR #1225 (this branch — see the V21 row and test-run entry).
 
 ## Test runs
 

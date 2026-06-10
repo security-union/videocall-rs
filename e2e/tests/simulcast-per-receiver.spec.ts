@@ -276,6 +276,35 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
         });
     }
 
+    // HOST ONLY: disable the Waiting Room before starting. The first joiner
+    // becomes the host, and the host's pre-join card defaults the Waiting Room
+    // toggle ON, which parks every SUBSEQUENT joiner (the receiver(s)) on the
+    // "Waiting to be admitted" screen — they never reach #grid-container and the
+    // receiver join times out. (This — NOT a renderer crash — is what actually
+    // blocks the 2/3-context joins in this spec; see #1093.) The Waiting Room
+    // option is rendered ONLY for the owner (pre_join_settings_card.rs `is_owner`),
+    // so this is a no-op on a non-host pre-join card. We toggle it OFF so the
+    // later joiners are auto-admitted straight into the grid (matching the admit
+    // flow proven in two-users-meeting.spec.ts, but without cross-page
+    // choreography in every test). The toggle is a `button[role="switch"]` inside
+    // the row labelled "Waiting Room".
+    const waitingRoomRow = page.locator(".settings-option-row", {
+      has: page.getByText("Waiting Room", { exact: true }),
+    });
+    const waitingRoomToggle = waitingRoomRow.getByRole("switch");
+    if (await waitingRoomToggle.isVisible().catch(() => false)) {
+      if ((await waitingRoomToggle.getAttribute("aria-checked")) === "true") {
+        await waitingRoomToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+        // The toggle writes the meeting setting via the meeting-api; wait for the
+        // switch to reflect OFF so the setting has been applied before we join.
+        await expect(waitingRoomToggle).toHaveAttribute("aria-checked", "false", {
+          timeout: 10_000,
+        });
+      }
+    }
+
     const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
     if (await cameraToggle.isVisible().catch(() => false)) {
       if ((await cameraToggle.getAttribute("aria-pressed")) !== "true") {
@@ -394,7 +423,45 @@ const AUDIO_LADDER_KBPS = [24, 32, 50] as const;
 test.describe("Per-receiver simulcast (flag-on)", () => {
   // Two real browser contexts (publisher + receiver) drive several specs; the
   // peer-discovery + layer-adaptation waits make these slower than a unit test.
-  test.describe.configure({ timeout: 180_000 });
+  //
+  // SERIAL (#1093 renderer-crash mitigation). Each test here launches TWO (the
+  // @impair divergence test THREE) Chromium *browsers* — a publisher + receiver(s)
+  // — each running a live camera plus simulcast encode/decode (multiple concurrent
+  // WebCodecs `VideoEncoder`s on the publisher, multi-layer decode on the
+  // receiver). That is the heaviest renderer footprint in the suite.
+  //
+  // The crash in #1093 ("Target page, context or browser has been closed" — the
+  // 2nd context never reaches `#grid-container` within the 30 s join timeout) is
+  // renderer OOM/kill on the 8-vCPU self-hosted CI runner (c7a.2xlarge) when too
+  // many heavy WebCodecs renderers are alive at once. Two levers bound that, and
+  // we use BOTH:
+  //
+  //   1. PER-RENDERER FOOTPRINT — already in place: BROWSER_ARGS
+  //      (helpers/auth-context.ts) and the project CHROME_ARGS
+  //      (playwright.config.ts) both carry `--disable-dev-shm-usage` (don't put
+  //      the renderer's shared memory in the typically-undersized container
+  //      `/dev/shm`, the classic "context closed" trigger), `--disable-gpu`, and
+  //      `--renderer-process-limit=1`. These shrink each renderer but do NOT bound
+  //      the NUMBER of concurrent renderers.
+  //
+  //   2. CONCURRENT-RENDERER COUNT — this `mode: "serial"`. The project runs
+  //      `workers: 2`, so a heavy test in THIS spec can otherwise overlap with a
+  //      test in ANOTHER spec file on the second worker (and, during a retry, with
+  //      the teardown/`browser.close()` of the previous test in this same spec).
+  //      Serial mode pins this whole describe to a single worker and runs its
+  //      tests strictly one-at-a-time, so at most ONE publisher+receiver(s) group
+  //      of browsers from this spec is ever live — capping the peak heavy-renderer
+  //      count this spec contributes. (`fullyParallel:false` already orders
+  //      in-file tests, but does not prevent the cross-file overlap or couple the
+  //      retry lifecycle; serial makes the one-at-a-time guarantee explicit and
+  //      load-bearing, and on a genuinely starved runner its skip-on-first-failure
+  //      yields a fast clean signal instead of 4× retried OOM crashes.)
+  //
+  // The in-test dual load (publisher encoding while the receiver decodes) is
+  // inherent to a cross-peer simulcast assertion and cannot be removed; the joins
+  // are already staggered (awaited sequentially, publisher before receiver) so the
+  // two renderers do not ramp their encoders at the same instant.
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
@@ -403,14 +470,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // -------------------------------------------------------------------------
   // 1. Multi-layer SEND active (flag-on) — proxy via received ladder size.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. In headless CI the
-  // two authenticated contexts each running camera + simulcast encode/decode
-  // crash the renderer ("Target page/context closed") so the 2nd context never
-  // reaches the grid, AND the capability ceiling clamps the runner to 1 layer so
-  // the multi-layer assertion would skip anyway.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + the
+  // existing `--disable-dev-shm-usage` / `--renderer-process-limit=1` launch
+  // flags) lets the 2-context publisher+receiver join survive on the 8-vCPU CI
+  // runner, and the `capabilityMaxLayersOverride: 3` hook REPLACES the device-
+  // sniffed ceiling (which clamps a low-core container to 1) so the publisher
+  // actually emits the full ladder and the multi-layer SEND assertion RUNS
+  // instead of skipping. The `test.skip(layerCount <= 1)` guard below is retained
+  // as defence-in-depth: with the override in effect it should not trip, but if
+  // some future runner still clamps it degrades to a skip rather than a false
+  // negative.
   // -------------------------------------------------------------------------
-  test.fixme("publisher emits >1 simulcast layer when the flag is on", async ({ baseURL }) => {
+  test("publisher emits >1 simulcast layer when the flag is on", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_send_${Date.now()}`;
 
@@ -430,9 +501,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         uiURL,
       );
       // Flag ON for BOTH ends: the publisher must encode multiple layers, and
-      // the receiver must be allowed to climb above the base layer.
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // the receiver must be allowed to climb above the base layer. The #1093
+      // `capabilityMaxLayersOverride: 3` REPLACES the device-sniffed capability
+      // ceiling so a low-core CI container (sniffed → 1) still encodes the full
+      // ladder, making the multi-layer SEND assertion exercisable.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
@@ -486,11 +560,11 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    Drag the video max thumb to the lowest layer with a HEALTHY downlink
   //    and assert the needle never exceeds that threshold.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. Headless CI crashes
-  // the 2nd context ("Target page/context closed") and clamps to 1 layer.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + launch
+  // flags) lets the 2-context join survive on CI, and `capabilityMaxLayersOverride:
+  // 3` forces a >1-layer ladder so there is headroom for the threshold to clamp.
   // -------------------------------------------------------------------------
-  test.fixme("receive needle never exceeds the user's max-layer threshold", async ({ baseURL }) => {
+  test("receive needle never exceeds the user's max-layer threshold", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_thresh_${Date.now()}`;
 
@@ -509,8 +583,10 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver2",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // #1093 override forces a multi-layer ladder so the threshold has headroom
+      // to clamp (a single-layer runner would have nothing to step down to).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
@@ -589,11 +665,14 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // 4. Default Auto — with no threshold set the panel shows Auto (full range)
   //    and the needle is free to reflect auto-selection across the full ladder.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. Headless CI crashes
-  // the 2nd context ("Target page/context closed") and clamps to 1 layer.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + launch
+  // flags) lets the 2-context join survive on CI. The `capabilityMaxLayersOverride:
+  // 3` is passed for consistency with the other SEND tests (the full ladder is the
+  // realistic state this asserts the default Auto range against), though this
+  // test's assertions are structural (the thumbs sit at the range extremes) and do
+  // not themselves require >1 layer.
   // -------------------------------------------------------------------------
-  test.fixme("default receive preference is Auto (full range)", async ({ baseURL }) => {
+  test("default receive preference is Auto (full range)", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_auto_${Date.now()}`;
 
@@ -612,8 +691,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver3",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // #1093 override forces the full ladder so the "full automatic range" the
+      // default-Auto assertion checks actually SPANS up (max thumb top index > 0);
+      // on a single-layer runner the range would collapse to [0,0] and the
+      // "range spans up" check would be vacuous.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
@@ -636,8 +719,15 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
       await expect(minThumb).toHaveValue("0");
       // The max thumb sits at the top index (full range). The exact top value is
-      // the ladder size minus one; assert it is non-zero (range spans up).
+      // the ladder size minus one. With the #1093 override forcing the full
+      // ladder this MUST be non-zero — assert it so the "range spans up" claim is
+      // real (otherwise a single-layer [0,0] range would satisfy the value check
+      // vacuously and the test would prove nothing about Auto being full-range).
       const topValue = await maxThumb.getAttribute("max");
+      expect(
+        Number(topValue),
+        "default Auto range must span up (multi-layer ladder)",
+      ).toBeGreaterThan(0);
       await expect(maxThumb).toHaveValue(String(topValue));
 
       // The needle gauge is present and the readout reflects auto-selection
@@ -668,15 +758,16 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    assertion (no capability ceiling dependency): the controls are always
   //    rendered regardless of how many layers the runner ends up emitting.
   //
-  // FIXME(#1093): multi-party (2-context) — although the assertion itself is
-  // structural (capability-independent), it still requires the publisher +
-  // receiver 2-context join, which crashes the 2nd renderer in headless CI
-  // ("Target page/context closed"). Needs a renderer-crash-resilient runner (a
-  // capability-override hook is not strictly required for this one, but the join
-  // is). The single-context structural coverage of the receive panel lives in
-  // performance-settings.spec.ts (#1078 Receive-side controls).
+  // UN-FIXME'd (#1093): the assertion itself is structural
+  // (capability-independent — the controls render regardless of layer count), so
+  // the ONLY thing that blocked it was the 2-context join crashing the 2nd
+  // renderer. The renderer-crash mitigation (serial describe + launch flags)
+  // unblocks that join. `capabilityMaxLayersOverride: 3` is still passed for
+  // parity with the other SEND tests / a realistic multi-layer state, but is not
+  // strictly required here. The single-context structural coverage of the receive
+  // panel also lives in performance-settings.spec.ts (#1078 Receive-side controls).
   // -------------------------------------------------------------------------
-  test.fixme("receive Performance panel renders video + audio + content controls", async ({
+  test("receive Performance panel renders video + audio + content controls", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -697,8 +788,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver5",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
@@ -1331,7 +1422,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 // for the 2-context join + cross-peer decode.
 // ---------------------------------------------------------------------------
 test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression", () => {
-  test.describe.configure({ timeout: 180_000 });
+  // SERIAL — same #1093 renderer-crash mitigation as the flag-on describe: this
+  // control also launches a publisher + receiver (two heavy renderers) and polls
+  // a cross-peer decoded stream, so under `workers: 2` it could run concurrently
+  // with another multi-browser test and overcommit the 8-vCPU CI runner. Run it
+  // one-at-a-time so at most one publisher+receiver pair is live.
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
@@ -1481,7 +1577,12 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 // default suite once unblocked.
 // ---------------------------------------------------------------------------
 test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
-  test.describe.configure({ timeout: 240_000 });
+  // SERIAL — same #1093 renderer-crash mitigation. These cases launch THREE
+  // browsers each (1 publisher + 2 receivers), all running camera + simulcast
+  // encode/decode, so they are the heaviest in the spec; never let two of them
+  // (or one of them and another multi-browser test) run concurrently on the
+  // 8-vCPU CI runner.
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
 
   test.beforeAll(async () => {
     await waitForServices();

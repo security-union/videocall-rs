@@ -269,7 +269,13 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
       const layers = popup.locator(".signal-popup-layers");
       await layers.waitFor({ state: "visible", timeout: 30_000 }).catch(() => undefined);
 
-      if ((await layers.count()) > 0) {
+      if ((await layers.count()) === 0) {
+        test.info().annotations.push({
+          type: "warning",
+          description:
+            "layers section absent — receive snapshots never populated; layer-row assertions skipped",
+        });
+      } else {
         // The video layer row, reusing the perf-dialog `.perf-peer-row` markup.
         const videoRow = layers.locator(".signal-popup-layer-row").filter({
           has: hostPage.locator('[data-testid$="-layer-video-metric"]'),

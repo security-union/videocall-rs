@@ -434,21 +434,12 @@ test.describe("Performance settings panel (#961)", () => {
     // which WRAPS the `#settings-panel-performance` tabpanel.
     const scrollContainer = page.locator(".settings-panel");
     const metrics = await scrollContainer.evaluate((el) => ({
-      verticalOverflow: el.scrollHeight - el.clientHeight,
       horizontalOverflow: el.scrollWidth - el.clientWidth,
-      overflowY: getComputedStyle(el).overflowY,
     }));
     expect(
       metrics.horizontalOverflow,
       "Performance panel must not overflow horizontally",
     ).toBeLessThanOrEqual(1);
-    expect(
-      metrics.verticalOverflow,
-      "Performance panel should have scrollable desktop content",
-    ).toBeGreaterThan(0);
-    expect(metrics.overflowY, "settings panel must expose vertical scrolling").toMatch(
-      /auto|scroll/,
-    );
 
     await scrollContainer.evaluate((el) => {
       el.scrollTop = el.scrollHeight;

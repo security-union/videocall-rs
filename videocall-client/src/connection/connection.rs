@@ -140,6 +140,34 @@ impl Connection {
         };
         new_options.on_connection_lost = tap_callback(new_options.on_connection_lost, on_lost_tap);
 
+        // Issue #1080: receive-side (downlink) impairment seam. Wrap the
+        // inbound-media callback so an installed `Direction::Down` netsim
+        // shim can DROP inbound media packets, manufacturing the sequence
+        // gaps the receive-side simulcast `LayerChooser` steps down on.
+        // This is the single shared interception point for BOTH transports:
+        // WebSocket delivers every inbound packet through this callback, and
+        // all three WebTransport inbound paths (datagram, unidirectional and
+        // bidirectional streams) clone it (see `webtransport.rs`). Placing
+        // the shaping here — above the transport, on the parsed
+        // `PacketWrapper` — means one seam covers WT/QUIC, where no external
+        // proxy can shape a single browser context.
+        //
+        // SCOPED TO MEDIA (lifecycle safety, per the Change Impact Policy):
+        // only VIDEO and SCREEN packets are eligible to be dropped. The
+        // callback this wraps performs election / RTT / SESSION_ASSIGNED
+        // handling (`connection_manager::create_inbound_media_callback`), so
+        // dropping control or audio packets here could flap re-election or
+        // stall the handshake during the test window rather than producing a
+        // clean layer step-down. Audio is also left intact so the call stays
+        // audible while one receiver's video degrades. The publisher stamps
+        // the cleartext `media_kind` on the outer envelope (see
+        // `encode/transform.rs`), which survives relay forwarding, so the
+        // discriminator is available here without decrypting.
+        #[cfg(feature = "netsim")]
+        {
+            new_options.on_inbound_media = wrap_inbound_with_netsim(new_options.on_inbound_media);
+        }
+
         let monitor = new_options.peer_monitor.clone();
         let task = Task::connect(webtransport, new_options)?;
 
@@ -543,6 +571,46 @@ fn tap_callback<IN: 'static, OUT: 'static>(
     Callback::from(move |arg| {
         tap.emit(());
         callback.emit(arg)
+    })
+}
+
+/// Wrap the inbound-media callback so an installed downlink netsim shim
+/// (issue #1080) can drop eligible inbound packets before they reach the
+/// rest of the pipeline. See the call site in [`Connection::connect`] for
+/// the full rationale (single shared path for both transports; scoped to
+/// VIDEO/SCREEN for lifecycle safety).
+#[cfg(feature = "netsim")]
+fn wrap_inbound_with_netsim(inner: Callback<PacketWrapper>) -> Callback<PacketWrapper> {
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+
+    Callback::from(move |packet: PacketWrapper| {
+        // Only VIDEO / SCREEN media packets are eligible for inbound
+        // shaping. AUDIO and every non-MEDIA control/heartbeat/RTT/
+        // SESSION_ASSIGNED packet is delivered unconditionally so the
+        // shaping cannot destabilize the connection lifecycle (election,
+        // reconnection) or silence audio. `media_kind` defaults to
+        // UNSPECIFIED for non-media packets, so the match below naturally
+        // fails open for them.
+        let eligible = packet.packet_type.enum_value_or_default() == PacketType::MEDIA
+            && matches!(
+                packet.media_kind.enum_value_or_default(),
+                MediaKind::VIDEO | MediaKind::SCREEN
+            );
+
+        if eligible {
+            // Size the admission decision on the encrypted media payload,
+            // the same bytes that actually traversed the downlink. This is
+            // what the token-bucket bandwidth limiter would have metered.
+            let size = packet.data.len();
+            if super::netsim_hook::shape_inbound(size) {
+                // Dropped: a real gap in this source's sequence stream,
+                // which the receive-side SequenceTracker counts toward
+                // loss_per_sec and drives the LayerChooser step-down.
+                return;
+            }
+        }
+
+        inner.emit(packet);
     })
 }
 

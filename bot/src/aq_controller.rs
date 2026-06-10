@@ -164,16 +164,19 @@ pub struct BotAq {
     /// need not change the tier).
     simulcast_epoch: AtomicU64,
 
-    // --- Send-side backpressure -> synthetic encoder queue depth (issue #1083 V21) ---
-    /// Cumulative outbound send-channel `try_send` failures observed at the last
-    /// [`Self::observe_send_drops`] sample. The bot has no WebCodecs encoder, so
-    /// the gradual backpressure axis is fed from the bot's OWN send-side
-    /// backpressure instead: when the netsim uplink token bucket throttles the
-    /// outbound channel, producers' `try_send` start failing and increment
-    /// `transport_drops_counter`. A positive delta between samples means the
-    /// uplink could not absorb the offered load this interval — the bot's honest
-    /// analog of a browser encoder queue backing up. See [`Self::observe_send_drops`].
-    last_send_drops_total: AtomicU64,
+    // --- Uplink saturation -> synthetic encoder queue depth (issue #1083 V21) ---
+    /// The netsim uplink shim's cumulative `bandwidth_wait_us` observed at the
+    /// last [`Self::observe_uplink_saturation`] sample. The bot has no WebCodecs
+    /// encoder, so the gradual backpressure axis is fed from the bot's OWN uplink
+    /// saturation instead: the netsim uplink shaper records, per packet, the
+    /// microseconds of delay it imposed *solely* because the token bucket was in
+    /// deficit (the offered byte rate exceeded the configured `uplink_kbps`). A
+    /// positive delta between samples means the uplink was bandwidth-saturated
+    /// this interval — the bot's honest analog of a browser encoder queue backing
+    /// up. Crucially, a pure latency/jitter/loss profile (no rate cap) leaves
+    /// this flat, so it does NOT trip on path delay. See
+    /// [`Self::observe_uplink_saturation`].
+    last_uplink_wait_us: AtomicU64,
 
     // --- PID-derived telemetry for health reporting ---
     /// PID-adjusted target bitrate in kbps, f32 bits packed into u32.
@@ -251,7 +254,7 @@ impl BotAq {
             active_layer_count: AtomicUsize::new(1),
             simulcast_layer_bitrates_kbps: std::array::from_fn(|_| AtomicU32::new(0)),
             simulcast_epoch: AtomicU64::new(0),
-            last_send_drops_total: AtomicU64::new(0),
+            last_uplink_wait_us: AtomicU64::new(0),
             last_target_bitrate_kbps_bits: AtomicU32::new(
                 (initial_video.ideal_bitrate_kbps as f32).to_bits(),
             ),
@@ -313,8 +316,8 @@ impl BotAq {
     /// deterministic full-ladder publish from the first frame, and the cold-start
     /// ramp would make V20 flaky and delay V21's congestion phase. The bot is
     /// therefore **shed-only from N**: it begins at the full ladder and the AQ
-    /// only ever sheds the top layer down under the bot's own send-side
-    /// backpressure (see [`observe_send_drops`](Self::observe_send_drops)); it
+    /// only ever sheds the top layer down under the bot's own uplink saturation
+    /// (see [`observe_uplink_saturation`](Self::observe_uplink_saturation)); it
     /// never probes layers UP. After enabling, the snapshot is republished so the
     /// producers pick up the active count + per-layer targets on their next poll.
     pub fn set_simulcast_layers(&self, n: usize) {
@@ -335,36 +338,50 @@ impl BotAq {
         );
     }
 
-    /// Feed the bot's outbound send-side backpressure into the AQ (issue #1083
-    /// V21), translated into the controller's `encode_queue_size()` axis.
+    /// Feed the bot's own UPLINK SATURATION into the AQ (issue #1083 V21),
+    /// translated into the controller's `encode_queue_size()` axis.
     ///
     /// The native bot has no WebCodecs encoder, so it cannot report a real
     /// encoder queue depth — it always fed `0`, leaving the gradual shed path
-    /// inert. But the bot DOES produce an honest, equivalent backpressure signal:
-    /// when the netsim uplink token bucket throttles the outbound channel, the
-    /// producers' non-blocking `try_send` calls start failing and increment the
-    /// shared `transport_drops_counter`. A positive delta in that cumulative
-    /// counter between two samples means the offered video load did not fit the
-    /// uplink this interval — the bot's analog of an encoder queue backing up.
+    /// inert. The bot DOES produce an honest, equivalent backpressure signal:
+    /// the netsim uplink shim ([`videocall_netsim::NetSimShim`]) records, per
+    /// packet, the microseconds of delay it imposed *solely* because the token
+    /// bucket was in deficit — i.e. because the offered byte rate exceeded the
+    /// configured `uplink_kbps`. That cumulative counter
+    /// (`NetSimShim::bandwidth_wait_us`) advances iff the link was actually
+    /// bandwidth-saturated. It deliberately excludes the base-latency, jitter,
+    /// and reorder delay components, so a pure latency/jitter/loss profile (no
+    /// rate cap, e.g. a 150ms-latency mobile preset) leaves it **flat** and
+    /// never trips a shed — a latency link is not a bandwidth-limited link.
     ///
-    /// We map "drops happened since the last sample" to a synthetic depth at the
-    /// controller's HIGH threshold (so the sustain timer can fire a shed) and
-    /// "no drops" to `0` (so the recover timer can climb back). The controller's
-    /// own hysteresis (sustain / stabilization windows) then debounces it — a
-    /// single transient drop does not shed. This is a real signal the bot
-    /// genuinely produces; it is NOT a synthetic trigger fabricated to force a
-    /// shed.
+    /// We map "the uplink imposed new bandwidth-deficit delay since the last
+    /// sample" to a synthetic depth at the controller's HIGH threshold (so the
+    /// sustain timer can fire a shed) and "no new bandwidth wait" to `0` (so the
+    /// recover timer can climb back). The controller's own hysteresis (sustain /
+    /// stabilization windows) then debounces it — a single transient deficit
+    /// does not shed. This is a real signal the bot genuinely produces; it is
+    /// NOT a synthetic trigger fabricated to force a shed.
     ///
-    /// `cumulative_send_drops` is the monotonic `transport_drops_counter` value.
-    /// Call once per tick interval (the bot's AQ tick task does this).
-    pub fn observe_send_drops(&self, cumulative_send_drops: u64) {
+    /// NOTE on why this replaced the earlier `transport_drops_counter` signal:
+    /// the outbound shim spawns a detached delay task per `Admission::Delay`, so
+    /// `packet_tx` never actually backs up under bandwidth shaping and the
+    /// producers' `try_send` never fail — the drop counter stayed flat on a real
+    /// run and the shed never armed. The shim's `bandwidth_wait_us` measures the
+    /// saturation directly at the source and is immune to that drain behavior.
+    ///
+    /// `cumulative_uplink_wait_us` is the monotonic
+    /// `NetSimShim::bandwidth_wait_us()` value. Call once per tick interval (the
+    /// bot's AQ tick task does this). In passthrough (no netsim) the shim never
+    /// runs and this is always `0`, so the legacy zero-backpressure behavior is
+    /// preserved exactly.
+    pub fn observe_uplink_saturation(&self, cumulative_uplink_wait_us: u64) {
         let prev = self
-            .last_send_drops_total
-            .swap(cumulative_send_drops, Ordering::Relaxed);
-        // Guard against a counter reset (defensive — the bot never resets it):
-        // treat a decrease as "no new drops" rather than a giant negative delta.
-        let new_drops = cumulative_send_drops.saturating_sub(prev);
-        let depth = if new_drops > 0 {
+            .last_uplink_wait_us
+            .swap(cumulative_uplink_wait_us, Ordering::Relaxed);
+        // Guard against a counter reset (defensive — the shim never resets it):
+        // treat a decrease as "no new wait" rather than a giant negative delta.
+        let new_wait_us = cumulative_uplink_wait_us.saturating_sub(prev);
+        let depth = if new_wait_us > 0 {
             // At/above HIGH so the controller's sustain timer arms; the magnitude
             // beyond HIGH is irrelevant (the decision is threshold-based).
             ENCODER_QUEUE_BACKPRESSURE_HIGH
@@ -970,39 +987,39 @@ mod tests {
         );
     }
 
-    /// Sustained send-side backpressure (the bot's honest uplink-squeeze signal)
-    /// fed via `observe_send_drops` must drive the AQ to SHED the top layer:
+    /// Sustained uplink saturation (the bot's honest uplink-squeeze signal) fed
+    /// via `observe_uplink_saturation` must drive the AQ to SHED the top layer:
     /// active count must drop below the full ladder while the base layer (id 0)
     /// keeps flowing — V21 item 2. This is the core behavior the validation row
-    /// exists to prove. Fails if the send-drop signal does not reach the
+    /// exists to prove. Fails if the saturation signal does not reach the
     /// controller's shed path (e.g. depth stays 0, or simulcast not enabled).
     #[test]
-    fn sustained_send_drops_shed_top_layer() {
+    fn sustained_uplink_saturation_sheds_top_layer() {
         let clock = Arc::new(TestClock::new(0));
         let aq = BotAq::new(clock.clone() as Arc<dyn Clock>);
         aq.set_simulcast_layers(3);
 
-        // Walk past warmup with NO drops (cumulative counter flat at 0).
+        // Walk past warmup with NO saturation (cumulative counter flat at 0).
         let mut t: u64 = 0;
         for _ in 0..8 {
             t += 1_000;
             clock.set_ms(t);
-            aq.observe_send_drops(0);
+            aq.observe_uplink_saturation(0);
             aq.tick();
         }
         let active_before = aq.simulcast_snapshot().active;
         assert_eq!(active_before, 3, "precondition: full ladder before squeeze");
 
-        // Now simulate a sustained uplink squeeze: the cumulative send-drop
+        // Now simulate a sustained uplink squeeze: the cumulative bandwidth-wait
         // counter climbs every interval (each tick sees a positive delta), which
         // maps to depth >= HIGH and arms the controller's sustained-shed timer.
-        let mut cumulative_drops: u64 = 0;
+        let mut cumulative_wait_us: u64 = 0;
         let mut shed = false;
         for _ in 0..30 {
             t += 1_000;
             clock.set_ms(t);
-            cumulative_drops += 100; // monotonic climb => positive delta each tick
-            aq.observe_send_drops(cumulative_drops);
+            cumulative_wait_us += 50_000; // monotonic climb => positive delta each tick
+            aq.observe_uplink_saturation(cumulative_wait_us);
             aq.tick();
             if aq.simulcast_snapshot().active < active_before {
                 shed = true;
@@ -1012,7 +1029,7 @@ mod tests {
         let snap = aq.simulcast_snapshot();
         assert!(
             shed && snap.active < active_before,
-            "sustained send-side backpressure must shed the top layer (active {} -> {})",
+            "sustained uplink saturation must shed the top layer (active {} -> {})",
             active_before,
             snap.active
         );
@@ -1022,28 +1039,33 @@ mod tests {
         );
     }
 
-    /// Negative control for the shed test: with the cumulative send-drop counter
-    /// FLAT (no new drops), the AQ must NOT shed — the full ladder stays active.
-    /// This proves the shed in the test above is caused by the drop signal, not
-    /// by the mere passage of time / ticking. Fails if `observe_send_drops`
-    /// fabricated backpressure even with zero new drops.
+    /// Negative control for the shed test: with the cumulative bandwidth-wait
+    /// counter FLAT (no new saturation), the AQ must NOT shed — the full ladder
+    /// stays active. This proves the shed in the test above is caused by the
+    /// saturation signal, not by the mere passage of time / ticking. Fails if
+    /// `observe_uplink_saturation` fabricated backpressure even with zero delta.
+    /// This is the in-AQ analog of the netsim crate's latency-only negative
+    /// control (`bandwidth_wait_us_flat_under_latency_only`): a flat counter is
+    /// exactly what a pure latency/jitter profile produces.
     #[test]
-    fn no_new_send_drops_keeps_full_ladder() {
+    fn no_new_uplink_saturation_keeps_full_ladder() {
         let clock = Arc::new(TestClock::new(0));
         let aq = BotAq::new(clock.clone() as Arc<dyn Clock>);
         aq.set_simulcast_layers(3);
         let mut t: u64 = 0;
         // A non-zero but CONSTANT cumulative counter: delta is 0 every tick.
+        // (This is what a pure latency/jitter profile yields — bandwidth-wait
+        // never advances because the token bucket is never in deficit.)
         for _ in 0..40 {
             t += 1_000;
             clock.set_ms(t);
-            aq.observe_send_drops(500); // constant => no new drops
+            aq.observe_uplink_saturation(500_000); // constant => no new saturation
             aq.tick();
         }
         assert_eq!(
             aq.simulcast_snapshot().active,
             3,
-            "a flat drop counter (no new drops) must NOT shed any layer"
+            "a flat bandwidth-wait counter (no new saturation) must NOT shed any layer"
         );
     }
 }

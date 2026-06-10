@@ -26,6 +26,7 @@
 //! [`NetworkProfile::is_passthrough`] let the caller skip all channel
 //! hops and task plumbing so the hot path is unchanged.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // Interior mutability strategy is platform-dependent — see the
@@ -207,6 +208,25 @@ pub struct NetSimShim {
     direction: Direction,
     rng: ShimCell<StdRng>,
     bucket: ShimCell<Option<TokenBucket>>,
+    /// Monotonic, cumulative count of microseconds of delay this shim has
+    /// imposed *solely* because of the bandwidth/token-bucket shaper (Step 2
+    /// of [`Self::admit`]). It does **not** include the base-latency, jitter,
+    /// or reorder components — those are added after the bucket is consulted
+    /// and reflect path delay, not link saturation.
+    ///
+    /// This is the honest, bandwidth-only saturation signal: it advances iff
+    /// the token bucket was in deficit (the offered load exceeded the
+    /// configured `*_kbps` for this direction). A consumer that samples it on
+    /// an interval and looks at the *delta* learns "was this link
+    /// bandwidth-saturated during the last interval?" — which is exactly the
+    /// signal the bot's AQ needs to detect its own uplink congestion, and
+    /// which a pure latency/jitter profile (no `*_kbps`, or a bucket that
+    /// never goes into deficit) leaves perfectly flat.
+    ///
+    /// `AtomicU64` (not behind the `ShimCell`) so the accessor never has to
+    /// take the shim lock. Saturating add guards the (astronomically
+    /// unreachable) wraparound.
+    bandwidth_wait_us: AtomicU64,
 }
 
 impl NetSimShim {
@@ -239,7 +259,21 @@ impl NetSimShim {
             direction,
             rng: ShimCell::new(rng),
             bucket: ShimCell::new(bucket),
+            bandwidth_wait_us: AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative microseconds of delay this shim has imposed *only* because
+    /// of bandwidth/token-bucket shaping (NOT latency, jitter, or reorder).
+    /// See the [`bandwidth_wait_us`](Self::bandwidth_wait_us) field doc.
+    ///
+    /// Monotonic and lock-free. Sample it on an interval and compare deltas:
+    /// a positive delta means the link was bandwidth-saturated during that
+    /// interval; a flat value (the steady state of any latency/jitter/loss
+    /// profile with no rate cap, or a rate-capped link whose offered load fits
+    /// the cap) means it was not.
+    pub fn bandwidth_wait_us(&self) -> u64 {
+        self.bandwidth_wait_us.load(Ordering::Relaxed)
     }
 
     /// `true` when the underlying profile is passthrough.
@@ -314,7 +348,19 @@ impl NetSimShim {
                 let extra = bucket.consume(size_bytes);
                 // Cap to 5 seconds so a single oversize packet cannot
                 // stall the entire pipeline indefinitely.
-                total_delay += extra.min(Duration::from_secs(5));
+                let bw_delay = extra.min(Duration::from_secs(5));
+                total_delay += bw_delay;
+                // Record the bandwidth-ONLY component (before latency/jitter
+                // are added below) so consumers can detect link saturation
+                // independently of path delay. A non-zero `bw_delay` means the
+                // bucket was in deficit for this packet — the link could not
+                // absorb the offered byte rate. See `bandwidth_wait_us`.
+                if !bw_delay.is_zero() {
+                    self.bandwidth_wait_us.fetch_add(
+                        bw_delay.as_micros().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
             }
         }
 
@@ -623,6 +669,109 @@ mod tests {
         // Any admission variant is acceptable; the assertion is that
         // we don't panic on overflow.
         let _ = shim.admit(100);
+    }
+
+    #[test]
+    fn bandwidth_wait_us_climbs_under_uplink_squeeze() {
+        // 1000 kbps = 125_000 bytes/sec; 1-second burst. Pushing 10 × 50KB
+        // (500KB) exceeds the burst, so the bucket goes into deficit and the
+        // bandwidth-only counter must climb. This is the signal the bot AQ
+        // keys its top-layer shed off of.
+        let profile = NetworkProfile {
+            uplink_kbps: Some(1000),
+            seed: Some(5),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(profile, Direction::Up);
+        assert_eq!(shim.bandwidth_wait_us(), 0, "starts flat");
+        for _ in 0..10 {
+            let _ = shim.admit(50_000);
+        }
+        // 0.2 + 0.4 × 7 = 3.0s of bandwidth-attributable delay (matches the
+        // `token_bucket_rate_limit` accounting). Assert it is materially
+        // non-zero rather than pinning the exact float.
+        assert!(
+            shim.bandwidth_wait_us() >= 2_900_000,
+            "bandwidth_wait_us should accrue ~3s of deficit delay, got {}us",
+            shim.bandwidth_wait_us()
+        );
+    }
+
+    #[test]
+    fn bandwidth_wait_us_flat_under_latency_only() {
+        // NEGATIVE CONTROL: a pure latency+jitter profile (NO rate cap) must
+        // leave the bandwidth-only counter perfectly flat, even though every
+        // packet is delayed. This is what guarantees a 150ms-latency preset
+        // (e.g. lossy_mobile) never trips the bot's uplink-saturation shed.
+        let profile = NetworkProfile {
+            latency_ms: 150,
+            jitter_ms: 30,
+            loss_pct: 2.0,
+            seed: Some(11),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(profile, Direction::Up);
+        for _ in 0..1000 {
+            // Large packets, but no uplink_kbps => bucket is None => no
+            // bandwidth delay is ever recorded.
+            let _ = shim.admit(50_000);
+        }
+        assert_eq!(
+            shim.bandwidth_wait_us(),
+            0,
+            "latency/jitter/loss with no rate cap must NOT advance bandwidth_wait_us"
+        );
+    }
+
+    #[test]
+    fn bandwidth_wait_us_excludes_latency_when_within_budget() {
+        // CRITICAL separation test: a rate-capped link WITH base latency whose
+        // offered load FITS the cap must keep the bandwidth counter flat even
+        // though every packet IS delayed (by the latency). This locks that the
+        // counter records ONLY the bandwidth/bucket component (Step 2) and is
+        // structurally isolated from the latency component (Step 3, added
+        // AFTER the counter is bumped). A refactor that moved the counter
+        // update below the latency add — or fed it the post-latency
+        // `total_delay` — would advance the counter here and fail this test.
+        // The no-bucket `bandwidth_wait_us_flat_under_latency_only` test
+        // cannot catch that, because its `if let Some(bucket)` block (where the
+        // counter lives) never runs at all.
+        let profile = NetworkProfile {
+            latency_ms: 200,         // every admit returns Delay(>=200ms)
+            uplink_kbps: Some(1000), // 125KB/s burst — a small packet fits
+            seed: Some(3),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(profile, Direction::Up);
+        // Small packets against a non-deficit bucket: latency is applied, but
+        // there is NO bandwidth deficit, so the bandwidth counter must stay 0.
+        for _ in 0..50 {
+            match shim.admit(1_000) {
+                Admission::Delay(d) => {
+                    assert!(d >= Duration::from_millis(200), "latency must apply");
+                }
+                other => panic!("expected Delay (latency), got {other:?}"),
+            }
+        }
+        assert_eq!(
+            shim.bandwidth_wait_us(),
+            0,
+            "latency-delayed packets that FIT the bandwidth cap must NOT advance \
+             bandwidth_wait_us — the counter is bandwidth-only, not total delay"
+        );
+    }
+
+    #[test]
+    fn bandwidth_wait_us_flat_under_passthrough() {
+        let shim = NetSimShim::new(NetworkProfile::passthrough(), Direction::Up);
+        for _ in 0..1000 {
+            assert_eq!(shim.admit(50_000), Admission::Pass);
+        }
+        assert_eq!(
+            shim.bandwidth_wait_us(),
+            0,
+            "passthrough must never advance bandwidth_wait_us"
+        );
     }
 
     #[test]

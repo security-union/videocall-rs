@@ -602,6 +602,12 @@ async fn run_client(
     let encoder_errors_generic = Arc::new(AtomicU64::new(0));
     let encoder_frames_ok = Arc::new(AtomicU64::new(0));
 
+    // Handle to the uplink netsim shim, shared with the AQ tick so it can read
+    // the shim's `bandwidth_wait_us` saturation counter (issue #1083 V21).
+    // `None` in passthrough (no shim runs), so the AQ sees zero uplink
+    // saturation and the legacy zero-backpressure behavior is preserved.
+    let mut uplink_shim: Option<Arc<NetSimShim>> = None;
+
     let outbound_shim_task = if network_profile.is_passthrough() {
         let user_id_out = user_id.clone();
         let transport_tx_inner = transport_tx.clone();
@@ -629,6 +635,9 @@ async fn run_client(
             None => shim,
         };
         let shim = Arc::new(shim);
+        // Share the uplink shim with the AQ tick (issue #1083 V21): the tick
+        // reads `bandwidth_wait_us` to detect the bot's own uplink saturation.
+        uplink_shim = Some(shim.clone());
         let user_id_up = user_id.clone();
         let psc = packets_sent_counter.clone();
         #[cfg(feature = "metrics")]
@@ -661,14 +670,22 @@ async fn run_client(
     {
         let aq_tick = aq.clone();
         let quit_tick = quit.clone();
-        // Feed the bot's OWN send-side backpressure into the AQ each tick (issue
-        // #1083 V21). Under an uplink squeeze the netsim token bucket throttles
-        // the outbound channel, producers' `try_send` start failing, and this
-        // cumulative counter climbs — the bot's honest analog of an encoder
-        // queue backing up (the bot has no WebCodecs encoder to sample). A
-        // positive delta arms the controller's sustained-backpressure shed; no
-        // new drops lets it recover. See `BotAq::observe_send_drops`.
-        let send_drops_tick = transport_drops_counter.clone();
+        // Feed the bot's OWN uplink saturation into the AQ each tick (issue
+        // #1083 V21). The netsim uplink shim records, per packet, the
+        // microseconds of delay it imposed *solely* because its token bucket was
+        // in deficit (the offered byte rate exceeded `uplink_kbps`) — see
+        // `NetSimShim::bandwidth_wait_us`. A positive per-tick delta means the
+        // uplink was bandwidth-saturated this interval, the bot's honest analog
+        // of an encoder queue backing up (the bot has no WebCodecs encoder to
+        // sample); it arms the controller's sustained-backpressure shed. A flat
+        // counter (no saturation, including ALL pure latency/jitter/loss
+        // profiles, which never put the bucket in deficit) lets it recover. In
+        // passthrough `uplink_shim` is `None` and the AQ sees a constant 0.
+        // NOTE: this deliberately does NOT use `transport_drops_counter` — the
+        // outbound shim spawns a detached delay task per `Admission::Delay`, so
+        // `packet_tx` never backs up under bandwidth shaping and the drop counter
+        // stays flat on a real run; the shed would never arm off it.
+        let uplink_shim_tick = uplink_shim.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(
                 videocall_aq::constants::AQ_TICK_INTERVAL_MS,
@@ -678,7 +695,11 @@ async fn run_client(
                 if quit_tick.load(Ordering::Relaxed) {
                     break;
                 }
-                aq_tick.observe_send_drops(send_drops_tick.load(Ordering::Relaxed));
+                let uplink_wait_us = uplink_shim_tick
+                    .as_ref()
+                    .map(|s| s.bandwidth_wait_us())
+                    .unwrap_or(0);
+                aq_tick.observe_uplink_saturation(uplink_wait_us);
                 aq_tick.tick();
             }
         });

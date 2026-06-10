@@ -3518,6 +3518,24 @@ impl ConnectionManager {
             && matches!(self.election_state, ElectionState::Elected { .. })
     }
 
+    /// Whether THIS client's currently-active connection is WebTransport.
+    ///
+    /// In a broadcast relay each client elects exactly ONE transport for its
+    /// own uplink/downlink, so "am I on WebTransport" is a single client-wide
+    /// boolean — NOT a per-peer property. This reads the elected/active
+    /// `Connection` (the same one [`Self::get_active_connection`] resolves: the
+    /// winner in `connections`, or the preserved `old_active_connection` during
+    /// re-election) and reports its transport.
+    ///
+    /// Returns `false` when no connection is active yet (pre-election cold
+    /// start) — the safe default: no early-seed runs until a WebTransport
+    /// winner is actually elected.
+    pub fn active_is_webtransport(&self) -> bool {
+        self.get_active_connection()
+            .map(|conn| conn.is_webtransport())
+            .unwrap_or(false)
+    }
+
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
         // Signal that this is an intentional disconnect so that any in-flight
         // or future reconnection attempts are cancelled.
@@ -5603,6 +5621,90 @@ mod tests {
             elected_at: 0.0,
         };
         assert!(mgr.is_connected());
+    }
+
+    // ===================================================================
+    // 7b. active_is_webtransport (#1179 local-transport early-seed gate)
+    // ===================================================================
+    //
+    // The early seed must gate on THIS client's LOCAL active transport, not on
+    // any peer's announced transport. These tests pin the accessor across the
+    // three lifecycle phases the gate can be evaluated in.
+
+    /// Pre-election (or fully disconnected): no active connection exists, so the
+    /// accessor reports NOT WebTransport — the safe default (no early seed runs).
+    ///
+    /// MUTATION CHECK: fails if the accessor's `unwrap_or(false)` is flipped to
+    /// `unwrap_or(true)` (cold start would falsely report WT).
+    #[test]
+    fn active_is_webtransport_false_pre_election() {
+        let mgr = make_test_manager();
+        assert!(!mgr.active_is_webtransport());
+    }
+
+    /// Active phase: the elected winner lives in `connections`. The accessor must
+    /// report THAT connection's transport — WS winner → false, WT winner → true.
+    ///
+    /// MUTATION CHECK: fails if the accessor reads anything other than the active
+    /// connection's transport (both arms pin opposite truth values).
+    #[test]
+    fn active_is_webtransport_reads_elected_winner_transport() {
+        // WebSocket winner.
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert!(
+            !mgr.active_is_webtransport(),
+            "elected WS winner → local transport is NOT WebTransport"
+        );
+
+        // WebTransport winner.
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert!(
+            mgr.active_is_webtransport(),
+            "elected WT winner → local transport IS WebTransport"
+        );
+    }
+
+    /// Re-election phase: the current winner has been moved out of `connections`
+    /// into `old_active_connection` for media continuity, while
+    /// `active_connection_id` still points at it. The accessor must follow the
+    /// SAME resolution as `get_active_connection` and report the preserved
+    /// connection's transport (here: WebTransport).
+    ///
+    /// MUTATION CHECK: fails if the accessor stops consulting
+    /// `old_active_connection` (it would find nothing in `connections` and fall
+    /// back to `false`, contradicting the WT assertion).
+    #[test]
+    fn active_is_webtransport_reads_old_connection_during_reelection() {
+        let mut mgr = make_test_manager();
+        // Winner preserved during re-election: not in `connections`, lives in
+        // `old_active_connection`; `active_connection_id` still points at it.
+        mgr.old_active_connection = Some((
+            "wt_old".to_string(),
+            Connection::new_for_test_with_transport(true),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+        assert!(
+            mgr.active_is_webtransport(),
+            "during re-election the preserved WT connection's transport is read"
+        );
     }
 
     // ===================================================================

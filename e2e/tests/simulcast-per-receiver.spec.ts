@@ -58,15 +58,18 @@
  *   2. receive needle never exceeds the user's max-layer threshold
  *   3. default receive preference is Auto (full range)
  *   4. receive Performance panel renders video + audio + content controls
+ *   5. audio readout reflects the multi-layer ladder when the flag is on (the
+ *      waiting-room auto-admit fix unblocks the 2-context join; audio's capability
+ *      ceiling is DECOUPLED from the cores-based video clamp (#1082), so the
+ *      publisher emits the full 3-rung audio ladder regardless of runner core
+ *      count — NO capability override needed)
+ *   6. flag pinned to 1 / single-layer no-regression (the same 2-context join,
+ *      unblocked by the waiting-room fix; needs NO override — it pins the flag to 1)
  *
  * STILL `test.fixme` (with their gating issues — verify against the test bodies
  * below before editing this list):
- *   - audio readout reflects the multi-layer ladder (#1093 — not yet wired to the
- *     override; audio-ladder coverage pending)
  *   - receive diagnostics per-peer rows + "+N more" tail (#1093 — needs a real
  *     multi-PUBLISHER, i.e. 3+ context, harness; documented stub)
- *   - flag pinned to 1 / single-layer no-regression (#1093 — 2-context join; does
- *     not need the override, but needs the renderer resilience)
  *   - WT/QUIC per-receiver divergence (#1080 — toxiproxy is TCP-only; needs
  *     per-client UDP netem)
  *   - publish-side layer suppression, Stage 3 WT + WS (#1093 — 3-context harness)
@@ -312,12 +315,16 @@ async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "scr
  * Applies to BOTH publisher and receiver contexts.
  */
 async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
-  // Pre-join camera defaults to OFF; force it ON before the app boots so the
-  // publisher emits video. addInitScript runs on every navigation in this page
-  // before the page's own scripts.
+  // Pre-join camera AND mic default to OFF (see `load_preferred_camera_on` /
+  // `load_preferred_mic_on`, context.rs); force BOTH ON before the app boots so
+  // the publisher emits video AND audio. The audio-ladder / flag-OFF specs read
+  // the receiver's AUDIO readout, which stays "Not receiving" forever unless the
+  // publisher's mic is actually sending. addInitScript runs on every navigation
+  // in this page before the page's own scripts.
   await page.addInitScript(() => {
     try {
       window.localStorage.setItem("vc_prejoin_camera_on", "true");
+      window.localStorage.setItem("vc_prejoin_mic_on", "true");
     } catch {
       /* storage may be unavailable pre-navigation; the app origin sets it */
     }
@@ -451,6 +458,21 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
           { timeout: 15_000 },
         )
         .toBeGreaterThan(0);
+    }
+
+    // Enable the MIC on the pre-join card too, so the publisher actually sends
+    // audio (the receiver's audio-ladder / flag-OFF readout assertions need a
+    // real decoded audio stream). The persisted `vc_prejoin_mic_on=true` seed
+    // above is the primary lever; this click is belt-and-suspenders in case the
+    // toggle rendered from a stale default before the seed was read. Same
+    // `aria-pressed` contract as the camera toggle (pre_join_settings_card.rs).
+    const micToggle = page.locator('[data-testid="prejoin-mic-toggle"]');
+    if (await micToggle.isVisible().catch(() => false)) {
+      if ((await micToggle.getAttribute("aria-pressed")) !== "true") {
+        await micToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
     }
 
     await page.waitForTimeout(500);
@@ -1027,9 +1049,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // runner + a capability-override hook to force >=2 layers. Headless CI crashes
   // the 2nd context ("Target page/context closed") and clamps audio to 1 layer.
   // -------------------------------------------------------------------------
-  test.fixme("audio readout reflects the multi-layer ladder when the flag is on", async ({
-    baseURL,
-  }) => {
+  test("audio readout reflects the multi-layer ladder when the flag is on", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_audio_${Date.now()}`;
 
@@ -1589,7 +1609,7 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
     await waitForServices();
   });
 
-  test.fixme("flag pinned to 1 emits a single layer for video, audio, and content", async ({
+  test("flag pinned to 1 emits a single layer for video, audio, and content", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";

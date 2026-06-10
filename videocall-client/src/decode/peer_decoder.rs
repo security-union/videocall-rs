@@ -34,7 +34,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
@@ -120,6 +120,21 @@ pub struct VideoPeerDecoder {
     /// this signal the screen-share visibility toast on the publisher
     /// would time out at 10s on every share, even on the happy path.
     first_render_pending_ack: Rc<RefCell<bool>>,
+    /// Issue #1183 (late-frame race): gate for the async paint callback.
+    ///
+    /// `clear_canvas()` (called synchronously on the decode-stop edge) sets
+    /// this `false`; the next successful `decode()` (which is only reached when
+    /// the tile is visible — `peer_decode_manager` returns `SKIPPED` *before*
+    /// calling us otherwise) sets it `true`. The `on_video_frame` callback
+    /// reads it and, when `false`, drops (closes) the frame instead of
+    /// painting. This closes the window where a `VideoFrame` decoded from a
+    /// packet pushed BEFORE the visible→false flip fires its async callback
+    /// AFTER `clear_canvas()`, repainting one stale frame and re-freezing the
+    /// tile the #1183 clear was meant to wipe.
+    ///
+    /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
+    /// `Cell` is sufficient because every access is on the single render thread.
+    paint_enabled: Rc<Cell<bool>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -230,8 +245,14 @@ impl VideoPeerDecoder {
         // landed on the canvas. See doc comment on `first_render_pending_ack`.
         let first_render_pending_ack = Rc::new(RefCell::new(false));
 
+        // Issue #1183 late-frame race: starts enabled (a freshly-constructed
+        // decoder belongs to a visible tile), gated off by `clear_canvas()`,
+        // back on by the next `decode()`.
+        let paint_enabled = Rc::new(Cell::new(true));
+
         let canvas_ref = canvas_renderer.clone();
         let first_render_flag = first_render_pending_ack.clone();
+        let paint_flag = paint_enabled.clone();
         // Track within the closure (cheap `Cell` would suffice but we already
         // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
         // closure). `mark_first_render` only flips once per
@@ -239,6 +260,14 @@ impl VideoPeerDecoder {
         // `mark_first_render_*` tests for the pinned semantics).
         let first_render_fired = Rc::new(RefCell::new(false));
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
+            // Issue #1183 late-frame race: if painting was disabled on the
+            // decode-stop edge, drop this frame WITHOUT painting (still close
+            // it to release the GPU/codec resource) so a frame that finished
+            // decoding after `clear_canvas()` cannot repaint the wiped tile.
+            if !paint_flag.get() {
+                video_frame.close();
+                return;
+            }
             mark_first_render(&first_render_fired, &first_render_flag);
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
@@ -259,6 +288,7 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
             first_render_pending_ack,
+            paint_enabled,
         })
     }
 
@@ -376,6 +406,43 @@ impl VideoPeerDecoder {
         video_frame.close();
     }
 
+    /// Clear the canvas backing bitmap to transparent (issue #1183).
+    ///
+    /// Called when a peer leaves the active decode set (its tile transitions
+    /// `visible: true -> false`). At that edge `decode()` starts returning
+    /// `SKIPPED` synchronously, so no further `VideoFrame` is ever drawn — but
+    /// the `<canvas>` element is only removed from the DOM later, when Dioxus
+    /// commits the layout diff. In the window between decode-stop and DOM
+    /// unmount (or indefinitely if the commit stalls / the budget re-pressures
+    /// before the tile unmounts) the canvas keeps showing its LAST PAINTED
+    /// FRAME — the "1 live + N frozen tiles" symptom.
+    ///
+    /// We clear through the SAME cached `CanvasRenderingContext2d` the painter
+    /// (`render_to_canvas_cached`) draws into, so we are guaranteed to be
+    /// clearing the exact backing bitmap that holds the stale frame — not a
+    /// stale DOM lookup by id. The clear region uses the canvas element's
+    /// current backing dimensions (`width()`/`height()`), which the painter
+    /// keeps in sync with the decoded frame size via `set_width`/`set_height`.
+    ///
+    /// No-op when no canvas is wired yet (`canvas_renderer` is `None`), which is
+    /// also the state of the `noop()` decoder used in host unit tests — so this
+    /// is safe to call from non-wasm test code.
+    pub fn clear_canvas(&self) {
+        // Issue #1183 late-frame race: disable painting FIRST, so any
+        // `VideoFrame` decoded from a packet pushed before the decode-stop edge
+        // — whose `on_video_frame` callback may fire after this clear — is
+        // dropped instead of repainting the tile we are about to wipe. The next
+        // `decode()` (only reached while visible) re-enables painting.
+        self.paint_enabled.set(false);
+        if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
+            let width = renderer.canvas.width();
+            let height = renderer.canvas.height();
+            renderer
+                .context
+                .clear_rect(0.0, 0.0, width as f64, height as f64);
+        }
+    }
+
     fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
         match packet.frame_type.as_str() {
             "key" => FrameType::KeyFrame,
@@ -410,7 +477,17 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
+            paint_enabled: Rc::new(Cell::new(true)),
         }
+    }
+
+    /// Test accessor for the #1183 late-frame paint gate. The async paint
+    /// callback consults this exact flag, so a test that toggles it via
+    /// `clear_canvas()` / `decode()` is exercising the real source of truth
+    /// the callback reads — not a parallel copy.
+    #[cfg(test)]
+    pub(crate) fn paint_enabled_for_test(&self) -> bool {
+        self.paint_enabled.get()
     }
 }
 
@@ -527,6 +604,16 @@ impl PeerDecode for VideoPeerDecoder {
                 .as_millis();
 
             let frame_buffer = FrameBuffer::new(video_frame, current_time_ms);
+
+            // Issue #1183 late-frame race: re-enable painting before pushing.
+            // Reaching here means `peer_decode_manager` did NOT take the
+            // `!self.visible` SKIPPED path, i.e. the tile is back in the decode
+            // set — so the frame this push produces (and any subsequent ones)
+            // is wanted on the canvas again. Re-arming here (not on the
+            // visibility edge) keeps the gate paired with the actual paint
+            // pipeline: the flag is off from `clear_canvas()` until a real new
+            // frame is on its way in.
+            self.paint_enabled.set(true);
 
             // Use the new ergonomic API - decoder handles jitter buffer internally,
             // and calls our VideoFrame callback for rendering
@@ -907,6 +994,74 @@ mod tests {
             !consume_first_render_flag(&ack),
             "additional render callbacks must not produce a second \
              first_frame: true"
+        );
+    }
+
+    // --- Issue #1183 late-frame race: paint gate toggle -------------------
+    //
+    // The async `on_video_frame` callback paints only when `paint_enabled` is
+    // true. These tests pin the two edges that drive it: `clear_canvas()` (the
+    // decode-stop edge) must disable painting so a frame whose callback lands
+    // after the clear is dropped; the next `decode()` of a video packet (only
+    // reached while visible) must re-enable it. They use `noop()`, whose
+    // `NoopDecoder` never actually decodes — so the gate is the only state
+    // under test — and `decode()` here is exercised on the host (a plain
+    // `#[test]`, unlike the `#[wasm_bindgen_test]` cases that no-op in CI).
+
+    /// Build a minimal VP8 video `MediaPacket` whose `video_metadata` carries a
+    /// decodable codec, so `decode()` reaches the `push_frame` / paint re-enable
+    /// path rather than the unknown-codec early return.
+    fn minimal_video_packet() -> Arc<MediaPacket> {
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::VideoMetadata;
+
+        let mut pkt = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        pkt.video_metadata = Some(VideoMetadata {
+            sequence: 1,
+            codec: VideoCodec::VP8.into(),
+            ..Default::default()
+        })
+        .into();
+        pkt.frame_type = "key".to_string();
+        Arc::new(pkt)
+    }
+
+    #[test]
+    fn paint_gate_starts_enabled() {
+        let d = VideoPeerDecoder::noop();
+        assert!(
+            d.paint_enabled_for_test(),
+            "a freshly-constructed decoder belongs to a visible tile, so \
+             painting starts enabled"
+        );
+    }
+
+    #[test]
+    fn clear_canvas_disables_painting() {
+        let d = VideoPeerDecoder::noop();
+        d.clear_canvas();
+        assert!(
+            !d.paint_enabled_for_test(),
+            "clear_canvas() (decode-stop edge) must disable painting so a \
+             late async frame callback cannot repaint the wiped tile (#1183)"
+        );
+    }
+
+    #[test]
+    fn decode_reenables_painting_after_clear() {
+        let mut d = VideoPeerDecoder::noop();
+        d.clear_canvas();
+        assert!(!d.paint_enabled_for_test(), "disabled by clear");
+        d.decode(&minimal_video_packet())
+            .expect("noop decode of a VP8 packet succeeds on host");
+        assert!(
+            d.paint_enabled_for_test(),
+            "reaching decode() means the tile is visible again (the \
+             manager's !visible guard returns SKIPPED before us), so the \
+             next frame is wanted — painting must be re-enabled"
         );
     }
 }

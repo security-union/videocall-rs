@@ -1184,10 +1184,24 @@ pub fn generate_for_peer(
             //   - camera on but decode budget-paused  → "Video paused" (task 1a.4)
             // An off-budget tile whose camera is also off keeps the camera-off
             // wording, since that is the more fundamental reason.
-            let placeholder_label = if force_avatar && is_video_enabled_for_peer {
+            // Distinguish "paused by MY device" (decode budget) from "camera off
+            // by THEIR choice" (#1142 Phase 1, Part C). `paused_by_device` is true
+            // only when this tile was forced to an avatar by the local decode
+            // budget while the peer's camera is actually ON — i.e. we are choosing
+            // not to decode their live video. That case gets a distinct pause
+            // glyph + tooltip; a genuine camera-off tile keeps the plain wording.
+            let paused_by_device = force_avatar && is_video_enabled_for_peer;
+            let placeholder_label = if paused_by_device {
                 "Video paused"
             } else {
                 "Video Disabled"
+            };
+            // Tooltip / screen-reader text for the device-paused case. Empty for a
+            // normal camera-off tile so nothing extra is announced there.
+            let paused_help = if paused_by_device {
+                "Paused by your device to keep the call smooth. Audio is still on."
+            } else {
+                ""
             };
             rsx! {
                 div {
@@ -1206,6 +1220,31 @@ pub fn generate_for_peer(
                         },
                         if show_canvas {
                             UserVideo { id: key_clone.clone(), hidden: false }
+                        } else if paused_by_device {
+                            // Device-paused avatar: PeerIcon + a small pause-glyph
+                            // badge so it reads as "paused by us", not "camera off".
+                            // `title` + `aria-label` explain WHY and reassure that
+                            // audio is unaffected (the mic indicator below stays
+                            // live regardless).
+                            div {
+                                class: "placeholder-content placeholder-content--paused",
+                                title: "{paused_help}",
+                                "aria-label": "{paused_help}",
+                                role: "img",
+                                span { class: "decode-paused-badge", aria_hidden: "true",
+                                    svg {
+                                        width: "14",
+                                        height: "14",
+                                        view_box: "0 0 24 24",
+                                        fill: "currentColor",
+                                        stroke: "none",
+                                        rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
+                                        rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                                    }
+                                }
+                                PeerIcon {}
+                                span { class: "placeholder-text", "{placeholder_label}" }
+                            }
                         } else {
                             div { class: "placeholder-content",
                                 PeerIcon {}

@@ -19,6 +19,7 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
+use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -3743,6 +3744,20 @@ pub fn AttendantsComponent(
                             ss_resizing.set(false);
                         }
                     },
+
+                    // Meeting-level decode-budget banner (#1142 Phase 1). It owns
+                    // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
+                    // it self-gates on `pressured`/`avatar_count` and the sustain /
+                    // dwell / back-off policy. `natural` is the uncapped layout
+                    // tile count (`total_tiles`); "Show all videos" pins the
+                    // override to `Fixed(natural)`, which `effective_cap` clamps to
+                    // `min(natural, CANVAS_LIMIT)` on the next render. Reading
+                    // `decode_budget_pressured()` reactively keeps the props live.
+                    DecodeBudgetBanner {
+                        pressured: decode_budget_pressured(),
+                        avatar_count: avatar_tile_count,
+                        natural: total_tiles,
+                    }
 
                     if has_screen_share {
                         // ---- Split layout: active screen share (left) + peer videos (right) ----

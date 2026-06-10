@@ -1711,6 +1711,31 @@ impl Peer {
     }
 }
 
+/// Issue #1183: decide whether a peer's video/screen canvas must be cleared on
+/// a decode-visibility transition.
+///
+/// The canvas backing bitmap must be wiped exactly on the decode-stop EDGE —
+/// when a peer leaves the active decode set, i.e. `visible` goes `true -> false`.
+/// At that moment `Peer::decode` begins returning `SKIPPED` for VIDEO and
+/// SCREEN, so no further frame is painted; the stale last frame would otherwise
+/// linger on the canvas until Dioxus eventually unmounts the tile (deferred,
+/// and not guaranteed to happen promptly under render pressure).
+///
+/// Must return `false` for every other transition:
+/// * `false -> true` (becoming visible — the decoder will repaint; clearing
+///   here would needlessly blank a tile that's about to show live frames)
+/// * `true -> true` (still visible — no-op, never blank a live tile)
+/// * `false -> false` (still hidden — no-op; clearing repeatedly every pass
+///   would waste work and is already handled by the first edge)
+///
+/// Extracted as a pure function so the edge logic is host-testable without the
+/// wasm-only `CanvasRenderingContext2d`; the actual clear (`clear_canvas`) lives
+/// in the wasm path and is gated on this returning `true`.
+#[inline]
+fn should_clear_canvas(prev_visible: bool, new_visible: bool) -> bool {
+    prev_visible && !new_visible
+}
+
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
     Ok(Arc::new(
         MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
@@ -1877,6 +1902,20 @@ impl PeerDecodeManager {
                 // peers that have their camera off.
                 if visible && peer.video_enabled {
                     video_keyframe_requests.push((peer.user_id.clone(), session_id));
+                }
+                // Issue #1183: on the decode-stop edge (visible true -> false)
+                // wipe the stale last frame out of both the camera and screen
+                // canvas backing bitmaps NOW, synchronously, rather than relying
+                // on Dioxus to later unmount the tile. `decode()` is about to
+                // start returning SKIPPED for this peer's VIDEO and SCREEN (see
+                // the `!self.visible` guards), so nothing else will repaint
+                // these canvases; without this clear the tile freezes on its
+                // last frame until the (deferred, pressure-stallable) DOM
+                // unmount. The clear goes through the same cached 2D context the
+                // painter draws into, so it targets the exact backing bitmap.
+                if should_clear_canvas(peer.visible, visible) {
+                    peer.video.clear_canvas();
+                    peer.screen.clear_canvas();
                 }
                 peer.visible = visible;
             }
@@ -4829,6 +4868,49 @@ mod tests {
         assert!(
             manager.connected_peers.get(&222).unwrap().visible,
             "Peers in the active set should be active"
+        );
+    }
+
+    /// Issue #1183: the canvas backing bitmap must be cleared on EXACTLY the
+    /// decode-stop edge (`visible: true -> false`) and on no other transition.
+    ///
+    /// This is a plain `#[test]` (host-run, not `#[wasm_bindgen_test]`) on
+    /// purpose: the wasm-browser harness on this box silently no-ops
+    /// `#[wasm_bindgen_test]`, so a wasm-only assertion would be a false green.
+    /// The pure `should_clear_canvas` function carries the load-bearing edge
+    /// logic; the actual `CanvasRenderingContext2d::clear_rect` lives in the
+    /// wasm-only `VideoPeerDecoder::clear_canvas` and is gated on this function.
+    ///
+    /// Mutating the edge condition (e.g. clearing on every invisible frame, or
+    /// never clearing) flips one of these assertions, so this test fails if the
+    /// fix regresses.
+    #[test]
+    fn should_clear_canvas_only_on_decode_stop_edge() {
+        // The ONLY transition that clears: the peer was being decoded and is
+        // now leaving the active decode set.
+        assert!(
+            should_clear_canvas(true, false),
+            "decode-stop edge (true -> false) MUST clear the stale frame"
+        );
+
+        // Becoming visible: the decoder will repaint live frames, so clearing
+        // here would needlessly blank a tile that's about to show video.
+        assert!(
+            !should_clear_canvas(false, true),
+            "becoming visible (false -> true) must NOT clear"
+        );
+
+        // Still visible: never blank a live tile.
+        assert!(
+            !should_clear_canvas(true, true),
+            "staying visible (true -> true) must NOT clear"
+        );
+
+        // Still hidden: the clear already happened on the first edge; doing it
+        // every pass would waste work.
+        assert!(
+            !should_clear_canvas(false, false),
+            "staying hidden (false -> false) must NOT clear"
         );
     }
 

@@ -514,7 +514,7 @@ pub fn generate_for_peer(
                             rsx! {
                                 button {
                                     onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                    class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                    class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                     CropIcon {}
                                 }
                             }
@@ -648,7 +648,7 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                        class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
@@ -910,7 +910,7 @@ pub fn generate_for_peer(
                                 rsx! {
                                     button {
                                         onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
-                                        class: if is_canvas_cropped(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                        class: if is_canvas_letterboxed(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
                                 }
@@ -1136,7 +1136,7 @@ pub fn generate_for_peer(
                         rsx! {
                             button {
                                 onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
-                                class: if is_canvas_cropped(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                 CropIcon {}
                             }
                         }
@@ -1289,7 +1289,7 @@ pub fn generate_for_peer(
                                     rsx! {
                                         button {
                                             onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
-                                            class: if is_canvas_cropped(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
+                                            class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                             CropIcon {}
                                         }
                                     }
@@ -1475,7 +1475,7 @@ fn UserVideo(id: String, hidden: bool) -> Element {
         }
     });
 
-    let crop_class = if is_canvas_cropped(&id_for_class, &cropped_tiles) {
+    let crop_class = if is_canvas_letterboxed(&id_for_class, &cropped_tiles) {
         "uncropped"
     } else {
         "cropped"
@@ -1511,7 +1511,7 @@ fn ScreenCanvas(peer_id: String) -> Element {
         }
     });
 
-    let crop_class = if is_canvas_cropped(&canvas_id_for_class, &cropped_tiles) {
+    let crop_class = if is_canvas_letterboxed(&canvas_id_for_class, &cropped_tiles) {
         "uncropped"
     } else {
         "cropped"
@@ -1557,8 +1557,10 @@ fn toggle_canvas_crop(canvas_id: &str, cropped_tiles: Option<Signal<HashMap<Stri
     }
 }
 
-/// Returns whether the given canvas is currently in cropped mode.
-fn is_canvas_cropped(
+/// Returns whether the given canvas is currently in letterboxed (uncropped) mode.
+/// When `true`, the canvas preserves its native aspect ratio with black bars;
+/// when `false`, the canvas is filled/cropped to cover the tile.
+fn is_canvas_letterboxed(
     canvas_id: &str,
     cropped_tiles: &Option<Signal<HashMap<String, bool>>>,
 ) -> bool {
@@ -1711,15 +1713,15 @@ mod tests {
         let mut map = HashMap::<String, bool>::new();
         let id = "peer-abc";
 
-        // Initially not cropped
+        // Initially not letterboxed (fill/cropped is the default)
         assert!(!map.get(id).copied().unwrap_or(false));
 
-        // First toggle → cropped
+        // First toggle → letterboxed (uncropped, preserves aspect ratio)
         let entry = map.entry(id.to_string()).or_insert(false);
         *entry = !*entry;
         assert!(map.get(id).copied().unwrap_or(false));
 
-        // Second toggle → uncropped
+        // Second toggle → back to fill/cropped
         let entry = map.entry(id.to_string()).or_insert(false);
         *entry = !*entry;
         assert!(!map.get(id).copied().unwrap_or(false));

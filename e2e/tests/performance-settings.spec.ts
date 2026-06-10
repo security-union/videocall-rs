@@ -61,10 +61,15 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *
  *   #1131 RELOCATION: the whole panel MOVED out of the Settings → Performance
  *   modal tab into the right-side **Diagnostics drawer** (`#diagnostics-sidebar`),
- *   mounted as "Group A — Quality controls" above the live diagnostics sections.
+ *   mounted as the "Quality controls" group. After the #1131 ITERATION the drawer
+ *   group order is "Connection & system" FIRST, then "Quality controls" (this
+ *   panel — the MIDDLE group), then "Live stream state" LAST.
  *   The drawer title became "Performance & Diagnostics". The Settings modal now
- *   has FOUR tabs (Audio / Video / Network / Appearance) plus a transitional
- *   `settings-perf-moved` link-row that closes the modal and opens the drawer.
+ *   has exactly FOUR tabs (Audio / Video / Network / Appearance) and NO
+ *   performance affordance at all: the transitional `settings-perf-moved` redirect
+ *   row was REMOVED in the iteration (the drawer is the only home of the
+ *   Performance controls; the "performance" deep link still routes to the drawer
+ *   via attendants).
  *   The `perf-open-diagnostics` / `diag-open-performance` cross-nav buttons (and
  *   their `#settings-panel-performance` tabpanel wrapper) are GONE — the panel
  *   now renders directly inside `.sidebar-content`, so its `perf-*` testids are
@@ -106,10 +111,10 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  * stream), drive the home-page meeting form, click through "Start/Join Meeting"
  * to `#grid-container`, then open the drawer via the toolbar "Open Diagnostics"
  * button (the canonical opener also used by protocol-selection.spec.ts /
- * diagnostics-peer-transport.spec.ts). The perf panel renders as Group A inside
- * `#diagnostics-sidebar`; `openPerformanceDrawer` waits on the migrated simulcast
- * strip (`perf-simulcast-strip`) appearing INSIDE that scope as readiness +
- * relocation proof.
+ * diagnostics-peer-transport.spec.ts). The perf panel renders as the "Quality
+ * controls" group inside `#diagnostics-sidebar`; `openPerformanceDrawer` waits on
+ * the migrated simulcast strip (`perf-simulcast-strip`) appearing INSIDE that
+ * scope as readiness + relocation proof.
  *
  * ─── Local vs CI ─────────────────────────────────────────────────────────────
  * Reaching the in-meeting settings modal requires a real meeting-room
@@ -274,8 +279,8 @@ async function openSettingsModal(page: Page): Promise<void> {
 }
 
 /**
- * The Diagnostics drawer root. The Performance panel (#1131) is mounted as
- * "Group A — Quality controls" inside `.sidebar-content` here, so EVERY perf
+ * The Diagnostics drawer root. The Performance panel (#1131) is mounted as the
+ * "Quality controls" group inside `.sidebar-content` here, so EVERY perf
  * assertion scopes to this locator (not the dead `#settings-panel-performance`
  * tabpanel). Scoping inside the drawer is what makes the relocation a real
  * regression guard: a `perf-*` testid that resurfaced anywhere ELSE on the page
@@ -309,7 +314,8 @@ async function openPerformanceDrawer(page: Page): Promise<void> {
     timeout: 5_000,
   });
   // Relocation proof: the migrated panel's simulcast strip is present INSIDE the
-  // drawer (Group A). This fails if the panel didn't move into the drawer.
+  // drawer (the "Quality controls" group). This fails if the panel didn't move
+  // into the drawer.
   await expect(sidebar.locator('[data-testid="perf-simulcast-strip"]')).toBeVisible({
     timeout: 5_000,
   });
@@ -460,16 +466,21 @@ test.describe("Performance settings panel (#961)", () => {
     }
   });
 
-  test("desktop layout: Group A perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
+  test("desktop layout: the Quality-controls perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
     page,
   }) => {
-    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design: Group A (perf
-    // controls) sits above the live diagnostics groups, so the content is
-    // legitimately taller than the viewport and the drawer scrolls vertically.
+    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design. After the
+    // #1131 iteration the group order is: "Connection & system" FIRST, then
+    // "Quality controls" (the perf cards — now the MIDDLE group), then "Live
+    // stream state" LAST. The perf cards therefore sit MID-DRAWER (a connection
+    // section above them, the live-stream section below), the content is
+    // legitimately taller than the viewport, and the drawer scrolls vertically.
     // The #1208/#1213 lesson: do NOT assert vertical overflow in either
     // direction (a scrolling-by-design surface SHOULD overflow vertically). The
-    // stable contract is (a) NO horizontal overflow, and (b) the LAST Group-A
-    // perf card is reachable by scrolling the drawer's own scroll container.
+    // stable contract is (a) NO horizontal overflow, and (b) the LAST perf card
+    // (.perf-kind-card) is reachable by scrolling the drawer's own scroll
+    // container — even though it is no longer the bottom-most content, since the
+    // explicit scrollIntoView below brings the mid-drawer card into view.
     await page.setViewportSize({ width: 1280, height: 768 });
     await joinMeeting(page, "drawer_containment");
     await openPerformanceDrawer(page);
@@ -477,8 +488,8 @@ test.describe("Performance settings panel (#961)", () => {
 
     const panel = perfDrawer(page);
     await expect(panel).toBeVisible();
-    // All three Group-A perf cards must be present (so we're measuring the full
-    // content, not a partially-rendered panel).
+    // All three Quality-controls perf cards must be present (so we're measuring
+    // the full content, not a partially-rendered panel).
     await expect(panel.locator(".perf-kind-card")).toHaveCount(3);
 
     // The drawer's scroll container is `.sidebar-content` (it carries
@@ -490,17 +501,20 @@ test.describe("Performance settings panel (#961)", () => {
     );
     expect(
       horizontalOverflow,
-      "drawer Group-A content must not overflow horizontally",
+      "drawer perf-controls content must not overflow horizontally",
     ).toBeLessThanOrEqual(1);
 
-    // Scroll to the bottom of the drawer and confirm the LAST Group-A perf card
-    // is reachable (it sits above Groups B/C, so this also proves Group A is not
-    // clipped off the top of an over-tall surface).
+    // Scroll the drawer to the bottom, then explicitly bring the LAST perf card
+    // into view. After the reorder the perf cards are MID-DRAWER (above "Live
+    // stream state"), so scrolling all the way down would scroll PAST them; the
+    // scrollIntoView is what proves the card is reachable and not clipped on
+    // either fold of the over-tall surface.
     await scrollContainer.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
     await scrollContainer.evaluate((el) => {
-      // The last perf card is above the live groups; scroll it into view.
+      // The last perf card sits between the connection + live-stream groups;
+      // scroll it into view from the bottom-most scroll position.
       const cards = el.querySelectorAll(".perf-kind-card");
       cards[cards.length - 1]?.scrollIntoView({ block: "center" });
     });
@@ -1227,15 +1241,24 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 
 // ---------------------------------------------------------------------------
 // Single-surface unification (#1131) + the "Simulcast layers" diagnostics
-// section (#1095, now Group B of the same drawer).
+// section (#1095, in the "Live stream state" group of the same drawer).
 //
 // #1131 collapsed the two surfaces into ONE: the Performance panel moved INTO
 // the Diagnostics drawer, so the former Perf↔Diag cross-nav buttons
 // (`perf-open-diagnostics` / `diag-open-performance`) are GONE — there is no
 // second surface to navigate to. The old round-trip cross-nav test is replaced
-// below by (a) a single-surface assertion that the perf panel (Group A) and the
-// "Simulcast layers" section (Group B) coexist in ONE open drawer, and (b) a
-// round-trip test of the transitional Settings `settings-perf-moved` row.
+// below by (a) a single-surface assertion that the perf panel and the
+// "Simulcast layers" section coexist in ONE open drawer, and (b) a Settings-modal
+// assertion that the modal has exactly FOUR tabs and NO performance affordance.
+//
+// #1131 ITERATION: the transitional `settings-perf-moved` redirect row was
+// REMOVED (the product decision reversed the one-release link). The contract is
+// now: the Settings modal has exactly four tabs and offers NO path to Performance
+// at all — the drawer is the only home of the Performance controls, opened via the
+// toolbar "Open Diagnostics" button (and the "performance" deep link, which still
+// routes to the drawer via attendants). The old "moved row opens the drawer"
+// round-trip test is therefore deleted and replaced by a "no performance
+// affordance" assertion below.
 //
 // The "Simulcast layers" section is fed by the live `DiagnosticsReader` Host
 // publishes, so:
@@ -1271,7 +1294,7 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await enableSimulcastFlag(page.context(), 3);
   });
 
-  test("single surface: the perf panel (Group A) and Simulcast layers (Group B) coexist in ONE open drawer", async ({
+  test("single surface: the Quality-controls perf panel and Simulcast layers coexist in ONE open drawer", async ({
     page,
   }) => {
     await joinMeeting(page, "single_surface");
@@ -1282,19 +1305,20 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await openPerformanceDrawer(page);
     const sidebar = perfDrawer(page);
 
-    // GROUP A — the migrated Performance panel. Assert a Group-A perf control is
-    // visible INSIDE the drawer (relocation proof, not anywhere on the page).
+    // QUALITY CONTROLS — the migrated Performance panel (the middle group after
+    // the #1131 reorder). Assert a perf control is visible INSIDE the drawer
+    // (relocation proof, not anywhere on the page).
     await expect(
       sidebar.locator('[data-testid="perf-simulcast-strip"]'),
-      "Group A perf strip inside the drawer",
+      "perf strip inside the drawer",
     ).toBeVisible();
     await expect(
       sidebar.locator('[data-testid="perf-vu-video"]'),
-      "Group A send video meter inside the drawer",
+      "send video meter inside the drawer",
     ).toBeVisible();
 
-    // GROUP B — the "Simulcast layers" section coexists in the SAME drawer
-    // (#1095 §6 MOVE). Assert the heading AND the moved sub-structure so this
+    // LIVE STREAM STATE — the "Simulcast layers" section coexists in the SAME
+    // drawer (#1095 §6 MOVE). Assert the heading AND the moved sub-structure so this
     // fails if the section regressed (a bare heading could survive an empty
     // section). Single-context (camera off / no peers) so the live ladder +
     // per-peer testids are NOT in the DOM; assert the always-present structure:
@@ -1311,12 +1335,12 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(sidebar.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
   });
 
-  test("Settings has FOUR tabs and the `settings-perf-moved` row opens the drawer (real round-trip)", async ({
+  test("Settings has exactly FOUR tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
     page,
   }) => {
-    await joinMeeting(page, "perf_moved_row");
+    await joinMeeting(page, "settings_no_perf");
 
-    // ── The Settings modal now has exactly FOUR tabs (Performance tab removed) ──
+    // ── The Settings modal has exactly FOUR tabs (Performance tab removed) ──
     await openSettingsModal(page);
     const modal = page.locator(".device-settings-modal");
     const tabs = modal.getByRole("tab");
@@ -1329,29 +1353,43 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(modal.getByRole("tab", { name: "Performance" })).toHaveCount(0);
     await expect(modal.locator('[data-testid="settings-nav-performance"]')).toHaveCount(0);
 
-    // ── The transitional "moved" row: present below the tablist, NOT a tab ──
-    const movedRow = modal.locator('[data-testid="settings-perf-moved"]');
-    await expect(movedRow).toBeVisible();
-    // It is a link-styled affordance (role="link"), not a tab.
-    await expect(movedRow).toHaveAttribute("role", "link");
-    await expect(movedRow).not.toHaveAttribute("role", "tab");
+    // ── NEW CONTRACT (#1131 iteration): the transitional `settings-perf-moved`
+    //    redirect row was REMOVED — the modal offers NO path to Performance at
+    //    all. The Performance controls live ONLY in the Diagnostics drawer.
+    // MUTATION DISCIPLINE: if a regression re-added the moved row (or any
+    // performance redirect affordance) in the modal, the count below flips to ≥1
+    // and this fails. The previous iteration asserted the row was PRESENT and
+    // round-tripped to the drawer; this asserts its ABSENCE — break the source by
+    // re-adding the `settings-perf-moved` button and this test goes red.
+    await expect(
+      modal.locator('[data-testid="settings-perf-moved"]'),
+      "the transitional 'Performance moved to Diagnostics' row is gone",
+    ).toHaveCount(0);
+    // No performance affordance survives under any of the usual ids either.
+    await expect(modal.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+    await expect(modal.getByRole("link", { name: /performance/i })).toHaveCount(0);
 
-    // ── REAL ROUND-TRIP: clicking it CLOSES the modal and OPENS the drawer ──
-    // MUTATION DISCIPLINE: this fails if the row reopened the dead Performance tab
-    // (no `#settings-panel-performance` exists any more) instead of routing to the
-    // drawer. We assert (a) the modal is gone, (b) the drawer is open with its new
-    // title, and (c) the migrated perf panel is visible INSIDE the drawer.
-    await movedRow.click();
-    await expect(modal, "settings modal closes when the moved row is clicked").toHaveCount(0);
+    // The modal still works as a settings modal: it does NOT auto-route to the
+    // drawer, and the drawer is NOT open just because Settings is.
+    await expect(perfDrawer(page)).toHaveCount(0);
+
+    // ── The drawer remains reachable via the ONLY remaining opener (Open
+    //    Diagnostics). Close Settings (the modal is open from openSettingsModal
+    //    above; toggle the gear once to close it), then open the drawer the
+    //    canonical way and confirm the migrated perf panel is its destination. ──
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(modal).toHaveCount(0);
+
+    await openPerformanceDrawer(page);
     const sidebar = perfDrawer(page);
     await expect(sidebar).toBeVisible({ timeout: 5_000 });
     await expect(
       sidebar.getByRole("heading", { name: "Performance & Diagnostics" }),
-      "the moved row routes to the unified drawer, not the dead tab",
+      "the drawer is the only home of the Performance controls",
     ).toBeVisible();
     await expect(
       sidebar.locator('[data-testid="perf-simulcast-strip"]'),
-      "the migrated perf panel is the destination of the moved row",
+      "the migrated perf panel lives in the drawer",
     ).toBeVisible();
   });
 
@@ -1425,5 +1463,133 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     const baseRung = ladder.locator('[data-testid="diag-simulcast-rung-0"]');
     await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L1");
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
+  });
+
+  // ── NetEq help popovers + position:fixed viewport-clip regression (#1131) ──
+  //
+  // CHANGE #4: the "Live stream state" group's NetEq sections each grew a
+  // HelpPopover info ("?") icon — `diag-status-help` on the "Current Status"
+  // header and `diag-charts-help` on the "NetEQ charts" header. They share ONE
+  // single-open signal (opening one closes the other), use role="dialog", and
+  // wire aria-haspopup/aria-expanded/aria-controls — identical to the Performance
+  // panel's HelpPopover. Their popover ids are `diag-status-help-popover` /
+  // `diag-charts-help-popover`.
+  //
+  // CHANGE #5 (the user-reported clipping bug): every `.perf-help-popover` is now
+  // `position: fixed` with a JS clamp/flip (`use_help_popover_anchor` /
+  // `compute_help_popover_position`). They previously clipped at the drawer's
+  // right border and bottom fold because an `absolute` popover anchored INSIDE
+  // `#diagnostics-sidebar { overflow-y: auto }` is clipped on BOTH axes.
+  //
+  // MUTATION REASONING (why this test fails if the fix is reverted): the NetEq
+  // sections sit in the "Live stream state" group, which is now the LAST group in
+  // the drawer (#1131 reorder), so their "?" buttons are low in the DOM. We scroll
+  // the drawer to the bottom and open one of those popovers, then assert its
+  // boundingBox is fully inside the viewport (x ≥ 0, y ≥ 0, right ≤ innerWidth,
+  // bottom ≤ innerHeight) and that it is visible. Under the OLD `position:absolute`
+  // (top: calc(100% + 8px); anchored inside the scroll box), a popover opened at
+  // the bottom of the drawer extended past the bottom fold AND past the right
+  // border — its boundingBox bottom/right would exceed the viewport and this check
+  // would FAIL. The new fixed+clamp+flip keeps it on-screen, so the check passes.
+  // Revert `position: fixed` (or the clamp/flip in `compute_help_popover_position`)
+  // and this test goes red.
+  test("NetEq help popovers (diag-status-help / diag-charts-help): bottom-of-drawer popover stays within the viewport (position:fixed clamp/flip)", async ({
+    page,
+  }) => {
+    // Use a SHORT viewport so the bottom-of-drawer popover would clearly overflow
+    // the bottom fold under the old absolute positioning — making the regression
+    // unambiguous on any runner.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await joinMeeting(page, "neteq_help_viewport");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+    const scrollContainer = sidebar.locator(".sidebar-content");
+    await expect(scrollContainer).toBeVisible();
+
+    // The Current Status "?" (`diag-status-help`) ALWAYS renders. The NetEQ charts
+    // "?" (`diag-charts-help`) renders only once NetEq history exists (its section
+    // is gated on `has_history` in NetEqStatusAndCharts). Prefer the charts help —
+    // it is the bottom-MOST popover (the explicit target of the regression) — and
+    // fall back to the status help (still in the LAST group, near the bottom) when
+    // single-page has produced no history yet. Either way the popover is low in the
+    // drawer, which is the condition the old absolute positioning clipped.
+    const statusBtn = sidebar.locator('[data-testid="diag-status-help"]');
+    const chartsBtn = sidebar.locator('[data-testid="diag-charts-help"]');
+    await expect(statusBtn).toBeVisible({ timeout: 15_000 });
+
+    // Scroll the drawer all the way down so the NetEq help buttons sit near the
+    // bottom fold — the worst case for the reported clip.
+    await scrollContainer.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+
+    const chartsPresent = (await chartsBtn.count()) > 0;
+    const targetBtn = chartsPresent ? chartsBtn : statusBtn;
+    const targetTestid = chartsPresent ? "diag-charts-help" : "diag-status-help";
+    const popoverId = `${targetTestid}-popover`;
+    const popover = page.locator(`#${popoverId}`);
+
+    // ── aria/role contract (CHANGE #4) ──
+    await targetBtn.scrollIntoViewIfNeeded();
+    await expect(targetBtn).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(targetBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(targetBtn).toHaveAttribute("aria-controls", popoverId);
+    await expect(popover).toHaveCount(0);
+
+    // Open the popover.
+    await targetBtn.click();
+    await expect(targetBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(popover).toBeVisible();
+    await expect(popover).toHaveAttribute("role", "dialog");
+
+    // ── VIEWPORT-CLIP REGRESSION (CHANGE #5) ──
+    // The popover's layout box must be fully inside the viewport. position:fixed +
+    // clamp/flip guarantees this; the old absolute-in-scroll-box clipped past the
+    // bottom fold and the right border, so box.bottom > innerHeight (or box.right >
+    // innerWidth) and this assertion would fail.
+    const viewport = page.viewportSize();
+    expect(viewport, "viewport size is known").not.toBeNull();
+    const vp = viewport as { width: number; height: number };
+    const box = await popover.boundingBox();
+    expect(box, "the open popover has a layout box").not.toBeNull();
+    const b = box as { x: number; y: number; width: number; height: number };
+    // Left/top edges on-screen…
+    expect(b.x, "popover left edge ≥ 0 (not clipped off the left)").toBeGreaterThanOrEqual(0);
+    expect(b.y, "popover top edge ≥ 0 (not clipped off the top)").toBeGreaterThanOrEqual(0);
+    // …right edge inside the viewport width (the right-border clip half of the bug)…
+    expect(
+      b.x + b.width,
+      "popover right edge ≤ viewport width (not clipped at the drawer's right border)",
+    ).toBeLessThanOrEqual(vp.width + 1);
+    // …bottom edge inside the viewport height (the bottom-fold clip half of the bug).
+    expect(
+      b.y + b.height,
+      "popover bottom edge ≤ viewport height (not clipped at the drawer's bottom fold)",
+    ).toBeLessThanOrEqual(vp.height + 1);
+
+    // ── Shared single-open behaviour (CHANGE #4) ──
+    // Only assertable when BOTH popovers render (history present). Opening the
+    // other "?" closes the first (they share one open_help signal).
+    if (chartsPresent) {
+      const statusPopover = page.locator("#diag-status-help-popover");
+      // The charts popover is currently open; opening the status "?" must close it.
+      await statusBtn.scrollIntoViewIfNeeded();
+      await statusBtn.click();
+      await expect(statusBtn).toHaveAttribute("aria-expanded", "true");
+      await expect(statusPopover).toBeVisible();
+      // The previously-open charts popover is now closed (single-open).
+      await expect(chartsBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(page.locator("#diag-charts-help-popover")).toHaveCount(0);
+      // Escape closes the open status popover and returns aria-expanded to false.
+      await page.keyboard.press("Escape");
+      await expect(statusBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(statusPopover).toHaveCount(0);
+    } else {
+      // Single-popover path: Escape still closes it (keyboard-operable).
+      await page.keyboard.press("Escape");
+      await expect(targetBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(popover).toHaveCount(0);
+    }
   });
 });

@@ -490,7 +490,7 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
  *
  * #1131 RELOCATION: the Performance panel MOVED out of the Settings → Performance
  * modal tab into the right-side Diagnostics drawer (`#diagnostics-sidebar`),
- * mounted as "Group A — Quality controls". The receive controls/meters
+ * mounted as the "Quality controls" group. The receive controls/meters
  * (`perf-recv-*` / `perf-vu-recv-*`) now render directly inside the drawer's
  * `.sidebar-content` (no `#settings-panel-performance` tabpanel any more). The
  * `perf-*` COMPONENTS are unchanged — only the mount moved — so this spec's

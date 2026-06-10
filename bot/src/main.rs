@@ -469,6 +469,18 @@ async fn run_client(
         );
     }
 
+    // Simulcast AQ wiring (issue #1083 V21): when this bot publishes a
+    // multi-layer ladder (--simulcast-layers N>=2), enable simulcast on the AQ
+    // controller so its per-layer budget cap (`cap_layers_to_budget`) and
+    // top-layer shed paths are reachable. The bot starts at the FULL ladder
+    // (shed-only) — see `BotAq::set_simulcast_layers` for the deliberate
+    // divergence from the browser's start-at-base ramp. No-op for N<2 or when
+    // video is disabled (observer / audio-only bots never publish video layers).
+    let simulcast_layer_count = bot_config.simulcast_layer_count();
+    if client_config.enable_video && simulcast_layer_count >= 2 {
+        aq.set_simulcast_layers(simulcast_layer_count as usize);
+    }
+
     // Shared inbound stats -- used by both the transport's inbound consumer
     // and the health reporter for per-sender packet rate tracking.
     //
@@ -649,6 +661,14 @@ async fn run_client(
     {
         let aq_tick = aq.clone();
         let quit_tick = quit.clone();
+        // Feed the bot's OWN send-side backpressure into the AQ each tick (issue
+        // #1083 V21). Under an uplink squeeze the netsim token bucket throttles
+        // the outbound channel, producers' `try_send` start failing, and this
+        // cumulative counter climbs — the bot's honest analog of an encoder
+        // queue backing up (the bot has no WebCodecs encoder to sample). A
+        // positive delta arms the controller's sustained-backpressure shed; no
+        // new drops lets it recover. See `BotAq::observe_send_drops`.
+        let send_drops_tick = transport_drops_counter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(
                 videocall_aq::constants::AQ_TICK_INTERVAL_MS,
@@ -658,6 +678,7 @@ async fn run_client(
                 if quit_tick.load(Ordering::Relaxed) {
                     break;
                 }
+                aq_tick.observe_send_drops(send_drops_tick.load(Ordering::Relaxed));
                 aq_tick.tick();
             }
         });

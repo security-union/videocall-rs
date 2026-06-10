@@ -4175,7 +4175,7 @@ mod tests {
         // First call (attempt 1): base = 500*2 = 1000, jitter in [0, 500) -> delay in [1000, 1500)
         delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, 1);
         assert!(
-            delay >= 1000 && delay < 1500,
+            (1000..1500).contains(&delay),
             "expected [1000, 1500), got {delay}"
         );
 
@@ -4224,7 +4224,7 @@ mod tests {
         // -> delay in [1000, 1500), capped at phase1 max (2000)
         let delay = next_backoff_delay(1000, 1.0, 1);
         assert!(
-            delay >= 1000 && delay <= RECONNECT_MAX_DELAY_PHASE1_MS,
+            (1000..=RECONNECT_MAX_DELAY_PHASE1_MS).contains(&delay),
             "expected [1000, {}], got {delay}",
             RECONNECT_MAX_DELAY_PHASE1_MS
         );
@@ -4785,10 +4785,12 @@ mod tests {
     #[test]
     fn rtt_degradation_minimum_floor_value() {
         // Verify the minimum floor constant is reasonable.
-        assert!(
-            REELECTION_RTT_MIN_THRESHOLD_MS >= 10.0,
-            "Minimum threshold should be at least 10ms to avoid localhost false positives"
-        );
+        const {
+            assert!(
+                REELECTION_RTT_MIN_THRESHOLD_MS >= 10.0,
+                "Minimum threshold should be at least 10ms to avoid localhost false positives"
+            );
+        }
     }
 
     // ===================================================================
@@ -4818,7 +4820,9 @@ mod tests {
         assert_eq!(RECONNECT_PHASE2_MAX_ATTEMPTS, 15);
         assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
         // fast-fail limit tolerates network transitions but still catches auth failures
-        assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 15);
+        const {
+            assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 15);
+        }
     }
 
     // ===================================================================
@@ -5181,14 +5185,16 @@ mod tests {
 
     #[test]
     fn rtt_sanity_max_constant_is_reasonable() {
-        assert!(
-            RTT_SANITY_MAX_MS >= 5000.0,
-            "Sanity max should be at least 5s to allow legitimate slow connections"
-        );
-        assert!(
-            RTT_SANITY_MAX_MS <= 30_000.0,
-            "Sanity max should not exceed 30s"
-        );
+        const {
+            assert!(
+                RTT_SANITY_MAX_MS >= 5000.0,
+                "Sanity max should be at least 5s to allow legitimate slow connections"
+            );
+            assert!(
+                RTT_SANITY_MAX_MS <= 30_000.0,
+                "Sanity max should not exceed 30s"
+            );
+        }
     }
 
     // ===================================================================
@@ -5532,21 +5538,23 @@ mod tests {
         // generous enough to ignore normal scheduling jitter (which is
         // typically <50 ms on healthy machines) but small enough to catch
         // genuine stalls before they trip the existing detectors.
-        assert!(
-            CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
-            "drift threshold must tolerate normal scheduling jitter"
-        );
-        assert!(
-            CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
-            "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
-        );
-        // Suppression duration covers at least one full elevated-RTT cycle
-        // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
-        // RTT-probe backlog has time to drain.
-        assert!(
-            CPU_OVERLOADED_DURATION_MS >= 3_000.0,
-            "suppression must outlast at least one re-election sample window"
-        );
+        const {
+            assert!(
+                CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
+                "drift threshold must tolerate normal scheduling jitter"
+            );
+            assert!(
+                CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
+                "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
+            );
+            // Suppression duration covers at least one full elevated-RTT cycle
+            // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
+            // RTT-probe backlog has time to drain.
+            assert!(
+                CPU_OVERLOADED_DURATION_MS >= 3_000.0,
+                "suppression must outlast at least one re-election sample window"
+            );
+        }
         // Liveness window is roughly 2× the 1 Hz probe cadence — wide
         // enough for jitter, narrow enough to detect genuine silence.
         assert!(

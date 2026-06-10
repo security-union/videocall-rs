@@ -460,6 +460,79 @@ impl Connection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_heartbeat_packet(
+    userid: &str,
+    video_enabled: &AtomicBool,
+    audio_enabled: &AtomicBool,
+    screen_enabled: &AtomicBool,
+    is_speaking: &AtomicBool,
+    aes: &Aes128State,
+    session_id: &RefCell<Option<u64>>,
+    transport_type: TransportType,
+) -> Option<PacketWrapper> {
+    let heartbeat_metadata = HeartbeatMetadata {
+        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+        transport_type: ::protobuf::EnumOrUnknown::new(transport_type),
+        special_fields: ::protobuf::SpecialFields::new(),
+    };
+
+    let packet = MediaPacket {
+        media_type: MediaType::HEARTBEAT.into(),
+        user_id: userid.as_bytes().to_vec(),
+        timestamp: js_sys::Date::now(),
+        heartbeat_metadata: Some(heartbeat_metadata).into(),
+        ..Default::default()
+    };
+
+    let data = aes_encrypt_heartbeat(aes, &packet)
+        .map_err(|e| {
+            log::error!("{e}");
+            let _ = videocall_diagnostics::global_sender().try_broadcast(
+                videocall_diagnostics::DiagEvent {
+                    subsystem: "heartbeat",
+                    stream_id: None,
+                    ts_ms: videocall_diagnostics::now_ms(),
+                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
+                },
+            );
+        })
+        .ok()?;
+    let mut packet_wrapper = PacketWrapper {
+        data,
+        user_id: userid.as_bytes().to_vec(),
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    };
+
+    if let Some(sid) = session_id.borrow().as_ref() {
+        packet_wrapper.session_id = *sid;
+    }
+
+    Some(packet_wrapper)
+}
+
+fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
+    let bytes = packet
+        .write_to_bytes()
+        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
+    aes.encrypt(&bytes)
+        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
+}
+
+fn tap_callback<IN: 'static, OUT: 'static>(
+    callback: Callback<IN, OUT>,
+    tap: Callback<()>,
+) -> Callback<IN, OUT> {
+    Callback::from(move |arg| {
+        tap.emit(());
+        callback.emit(arg)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,77 +636,4 @@ mod tests {
             "periodic keepalive datagram path must not run without start_heartbeat"
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_heartbeat_packet(
-    userid: &str,
-    video_enabled: &AtomicBool,
-    audio_enabled: &AtomicBool,
-    screen_enabled: &AtomicBool,
-    is_speaking: &AtomicBool,
-    aes: &Aes128State,
-    session_id: &RefCell<Option<u64>>,
-    transport_type: TransportType,
-) -> Option<PacketWrapper> {
-    let heartbeat_metadata = HeartbeatMetadata {
-        video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
-        transport_type: ::protobuf::EnumOrUnknown::new(transport_type),
-        special_fields: ::protobuf::SpecialFields::new(),
-    };
-
-    let packet = MediaPacket {
-        media_type: MediaType::HEARTBEAT.into(),
-        user_id: userid.as_bytes().to_vec(),
-        timestamp: js_sys::Date::now(),
-        heartbeat_metadata: Some(heartbeat_metadata).into(),
-        ..Default::default()
-    };
-
-    let data = aes_encrypt_heartbeat(aes, &packet)
-        .map_err(|e| {
-            log::error!("{e}");
-            let _ = videocall_diagnostics::global_sender().try_broadcast(
-                videocall_diagnostics::DiagEvent {
-                    subsystem: "heartbeat",
-                    stream_id: None,
-                    ts_ms: videocall_diagnostics::now_ms(),
-                    metrics: vec![videocall_diagnostics::metric!("encryption_failure", 1u64)],
-                },
-            );
-        })
-        .ok()?;
-    let mut packet_wrapper = PacketWrapper {
-        data,
-        user_id: userid.as_bytes().to_vec(),
-        packet_type: PacketType::MEDIA.into(),
-        ..Default::default()
-    };
-
-    if let Some(sid) = session_id.borrow().as_ref() {
-        packet_wrapper.session_id = *sid;
-    }
-
-    Some(packet_wrapper)
-}
-
-fn aes_encrypt_heartbeat(aes: &Aes128State, packet: &MediaPacket) -> Result<Vec<u8>, String> {
-    let bytes = packet
-        .write_to_bytes()
-        .map_err(|e| format!("Failed to serialize heartbeat packet: {e}"))?;
-    aes.encrypt(&bytes)
-        .map_err(|e| format!("Failed to encrypt heartbeat packet: {e:?}"))
-}
-
-fn tap_callback<IN: 'static, OUT: 'static>(
-    callback: Callback<IN, OUT>,
-    tap: Callback<()>,
-) -> Callback<IN, OUT> {
-    Callback::from(move |arg| {
-        tap.emit(());
-        callback.emit(arg)
-    })
 }

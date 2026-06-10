@@ -46,12 +46,12 @@ fail-open, existing behaviour unchanged).
 | V14 | `audio_concealment_pct` populates meaningfully for lossy bot | ❓ UNCLEAR | 2026-05-06 — showed 0% even for alice; root cause not investigated |
 | V15 | Simulated loss rate measured end-to-end matches configured loss_pct | ⏳ PENDING | netsim unit tests pass but not E2E validated |
 | V16 | Costume video resolution limitation (720p fixed) doesn't break AQ decisions | ⚠️ KNOWN LIMITATION | documented; AQ logs warning when tier requests <720p |
-| V17 | Bot `media_kind` lets the relay viewport-filter bot VIDEO (no longer optimistic) | 🟦 DESIGN COMPLETE — PENDING REAL RUN (cluster) | code done on `feat/988-bot-and-relay-observability`; unit tests + clippy green; STILL not exercisable without a live #988 relay. NOT cleared — same relay-filter path as V22, deploy-gated. |
-| V18 | Bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end | 🟦 DESIGN COMPLETE — PENDING REAL RUN (cluster) | code + 5 `viewport_sender` unit tests green; E2E `video_bytes` drop STILL not measurable in-process — needs a #988-enabled relay. NOT cleared. |
-| V19 | Bot re-asserts its `VIEWPORT` after a viewport-subscription loss (reconnect / re-election / relay idle) so filtering does not silently lapse | 🟦 DESIGN COMPLETE — PENDING REAL RUN (cluster) | `resend_on_reconnect()` + 4 unit tests green (re-send current set, no-send-when-never-sent, no-send-in-legacy, rate-limited); E2E recovery still NOT verifiable in-process — needs a #988-enabled relay on a cluster. NOT cleared. |
-| V20 | Bot-as-publisher emits a multi-layer simulcast ladder when `experimentalSimulcastMaxLayers` is raised (publish side of per-receiver simulcast #989/#1082) | 🟦 DESIGN COMPLETE — DEPLOY-GATED | `videocall-aq` builds an `n`-layer ladder via `set_simulcast_layers`; bot stamps `PacketWrapper.simulcast_layer_id` per layer. Cluster capture deploy-gated on #1079+#1082. Run **twice: once WT, once WS.** |
-| V21 | `uplink_budget_kbps` caps the SUM of active-layer bitrates and AQ sheds the TOP layer under the bot's own congestion (`videocall-aq`) | 🟦 DESIGN COMPLETE — DEPLOY-GATED | `uplink_budget_kbps` = Σ ideal over active layers; `cap_layers_to_budget` scales the sum to fit (floors preserved); top-layer drop is the AQ controller's job. Host unit tests in `videocall-aq/src/constants.rs` green; bot-side congestion capture deploy-gated. Run **twice: WT, WS.** |
-| V22 | Relay layer-filter correctness — a bot emitting `LayerPreferencePacket{desired_layer:0}` receives ONLY layer-0 `video_bytes` (per-source `inbound_stats`) while a no-preference bot keeps the full ladder | 🟦 DESIGN COMPLETE — DEPLOY-GATED | `layer_preference_sender.rs` (`--pin-layer 0`) emits a base-only preference per discovered source; 11 unit tests green. The per-source `inbound_stats` divergence (pinned vs. no-preference bot) is DEPLOY-GATED on a per-receiver-simulcast relay (#1079+#1082). Run **twice: WT, WS.** |
+| V17 | Bot `media_kind` lets the relay viewport-filter bot VIDEO (no longer optimistic) | ✅ PROVEN (WT) | 2026-06-10 — relay viewport-filtered 5,679 bot VIDEO packets in room `a2vp` (`relay_viewport_filtered_total`); filtering requires the cleartext `media_kind` stamp, so a single filtered packet proves the stamp. WS not separately run (filter is in `chat_server`, after transport ingest — transport-agnostic; V22 proved the adjacent layer filter on BOTH transports). |
+| V18 | Bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end | ✅ PROVEN (WT) | 2026-06-10 — pat (`viewport_visible_count: 1`) vs 2 publishers: visible source delivered 216 kbps; hidden source delivered ZERO video (no `videocall_video_bitrate_kbps{reporter_name="pat",peer_name="bob"}` series ever created); `relay_viewport_set_size`=1, forwarded=18,177 / filtered=5,679. |
+| V19 | Bot re-asserts its `VIEWPORT` after a viewport-subscription loss (reconnect / re-election / relay idle) so filtering does not silently lapse | ⏳ PARTIAL | 2026-06-10 — the periodic re-assert is live on cluster: `Sent VIEWPORT (reconnect) rendering 1 of 2 known peer(s)` every 10s reset window, relay `accepted`=23 / `rate_limited`=1 over ~4 min — a dropped subscription is re-asserted within one window by construction. The forced-loss capture itself (relay pod restart mid-run) NOT exercised — too disruptive on the shared daily cluster; run during a maintenance window. |
+| V20 | Bot-as-publisher emits a multi-layer simulcast ladder when `experimentalSimulcastMaxLayers` is raised (publish side of per-receiver simulcast #989/#1082) | ✅ PROVEN (WT + WS) | 2026-06-10 — `relay_layer_forwarded_by_layer_total{room="a2sim"}`: WS pod L0=25,845 / L1=5,717 / L2=5,716; WT pod L0=29,011 / L1=5,711 / L2=5,708 — full ladder on both transports. Negative control (`--simulcast-layers 1`, room `a2neg`): ONLY the `layer_id="0"` series exists (9,844 pkts; L1/L2 series never created). |
+| V21 | `uplink_budget_kbps` caps the SUM of active-layer bitrates and AQ sheds the TOP layer under the bot's own congestion (`videocall-aq`) | 🟦 BLOCKED ON #1115/#1117 (bot AQ wiring), NOT deploy | Re-gated 2026-06-10: the deploy gate has cleared, but the bot's simulcast loop pins per-layer bitrate to each tier's ideal and explicitly defers per-layer AQ shed / active-layer-count shedding to Tony's AQ rework (`video_producer.rs` REVISIT comment, #1115/#1117). `uplink_budget_kbps`/`cap_layers_to_budget` have NO bot runtime call site — host unit tests in `videocall-aq/src/constants.rs` remain the only coverage. No cluster run can exercise this until the wiring lands. |
+| V22 | Relay layer-filter correctness — a bot emitting `LayerPreferencePacket{desired_layer:0}` receives ONLY layer-0 `video_bytes` (per-source `inbound_stats`) while a no-preference bot keeps the full ladder | ✅ PROVEN (WT + WS) | 2026-06-10 — same source, two receivers, 3-min averages: WS — alice's video reached no-pref bob at 373 kbps / 20.3 fps vs pinned pat at 81 kbps / 6.9 fps (4.6×); bob's video 230 vs 49 kbps (4.7×). WT — alice's video 412 vs 72 kbps (5.7×); bob's 229 vs 51 kbps (4.5×). Relay filtered ≈2,130 pkt/min sustained on each transport (`relay_layer_filtered_total` WS=8,164; WT +6,393/3min); `relay_layer_preference_updates_total{outcome="accepted"}` WS=24 / WT=29, `rate_limited`=1 each. pat logged `Sent LAYER_PREFERENCE (change) pinning 2 source(s) to layer 0 (Video)` + 10s `(reconnect)` re-asserts. |
 
 ### #988 viewport-fidelity validation detail
 
@@ -121,14 +121,13 @@ V17–V19 cover the bot's VIEWPORT path through the **same relay viewport/layer
 filter** that the new V22 layer-preference row exercises (#988 viewport-bot
 fidelity). They were asked about as a "clear if stale/coverable now" item.
 
-**They are NOT cleared.** All three are CODE-COMPLETE with green unit tests, but
-their pass criteria are end-to-end measurements (`video_bytes` drop,
-`relay_viewport_filtered_total` increment, recovery after subscription loss) that
-require a **live #988-enabled relay** — exactly the same cluster dependency as
-V22. There is no in-process harness that stands up the relay's viewport-filter
-forwarding path, so they cannot be verified here. Honest status: deploy-gated,
-same as the new simulcast rows; do not mark them PROVEN until a cluster run
-captures the divergence.
+**Cleared 2026-06-10** (run details in the `2026-06-10` test-run entry below):
+V17 and V18 are PROVEN on the HCL daily cluster (room `a2vp`) — the relay
+viewport-filtered bot VIDEO end-to-end and the hidden source's `video_bytes`
+dropped to zero at the receiver. V19 is PARTIAL: the periodic re-assert was
+captured live (10s `(reconnect)` cadence, relay-accepted), but the forced
+subscription-loss sequence (relay pod restart mid-run) was deliberately not
+executed on the shared daily cluster; finish it during a maintenance window.
 
 ### #1083-A2 per-receiver simulcast — bot-side validation detail
 
@@ -204,15 +203,71 @@ How to verify (needs #1079+#1082 deployed):
    existing transport (whichever it is configured with), so both paths must show
    the same divergence.
 
-> **Deploy gating (be honest about what landed):** the CODE for V20–V22
-> (`layer_preference_sender` + wiring + these rows) lands now and is unit-tested.
-> The actual CLUSTER RUNS that capture the `inbound_stats` divergence and the
-> per-layer bitrate behaviour are **DEPLOY-GATED on #1079 + #1082 being merged
-> and deployed** to a relay that implements per-receiver simulcast. Row results
-> (✅/🔻 numbers, Prometheus captures) get filled in on that cluster run — they
-> are intentionally left blank here rather than fabricated.
+> **Deploy gating — CLEARED 2026-06-10:** the gate (#1079 + #1082-via-#1086,
+> plus #1064/#1060/#1122) was verified in the deployed daily build `87d28f30`
+> (`/api/v1/versions` + `git merge-base --is-ancestor`), and the cluster runs
+> were executed the same day — see the `2026-06-10` test-run entry below. V20
+> and V22 are PROVEN on both transports; V21 turned out to be gated on the bot
+> AQ wiring (#1115/#1117), not on deploy, and remains blocked.
 
 ## Test runs
+
+### 2026-06-10 — #1083-A2 per-receiver simulcast + #988 viewport fidelity on HCL daily
+
+**Setup:**
+- Binary: built from `PR-staging` @ `a1bc0a1f`, static libvpx, deployed to
+  `jenkins-volt-mx-go-3:~/bot-a2/`.
+- Cluster: HCL daily (`app.videocall.fnxlabs.com`), deployed build `87d28f30`
+  (verified to contain #1079, #1086 (#1082), #1064, #1060, #1122 and the
+  `layer_preference_sender` commit `48043c14` via `git merge-base --is-ancestor`).
+- Topology per run: process 1 = `alice` + `bob` costume publishers
+  (`--users 2 --simulcast-layers 3`, ladder L0=640×360@20fps/400kbps,
+  L1=960×540@30fps/900kbps, L2=1280×720@30fps/1500kbps); process 2 = `pat`
+  (EKG, own single-participant manifest, `--simulcast-layers 1 --pin-layer 0`).
+- Rooms: `a2sim` (V20/V22, WS run then WT run), `a2neg` (V20 negative control,
+  WT), `a2vp` (V17–V19 viewport run, WT, single-layer publishers,
+  `viewport_visible_count: 1`, no pin). Each soak ≈3 min.
+
+**V20 — multi-layer publish (PROVEN, WT + WS).**
+`relay_layer_forwarded_by_layer_total{room="a2sim"}`: WS pod L0=25,845 /
+L1=5,717 / L2=5,716; WT pod L0=29,011 / L1=5,711 / L2=5,708. Publisher logs:
+`Costume simulcast producer started for alice: 3 layers, native=1280x720 ...`.
+Negative control (room `a2neg`, `--simulcast-layers 1`, WT): only the
+`layer_id="0"` series exists (9,844 packets); L1/L2 series never created.
+
+**V22 — relay layer-filter correctness (PROVEN, WT + WS).**
+Same source, two receivers, `avg_over_time(videocall_video_bitrate_kbps[3m])`:
+
+| Source | Receiver (no pref) | Receiver pat (`--pin-layer 0`) | Ratio |
+|---|---|---|---|
+| alice (WS) | bob: 373 kbps / 20.3 fps | 81 kbps / 6.9 fps | 4.6× |
+| bob (WS) | alice: 230 kbps / 32.0 fps | 49 kbps / 10.4 fps | 4.7× |
+| alice (WT) | bob: 412 kbps | 72 kbps | 5.7× |
+| bob (WT) | alice: 229 kbps | 51 kbps | 4.5× |
+
+Relay-side cross-check: `relay_layer_filtered_total{room="a2sim"}` ≈2,130
+pkt/min sustained on each transport (WS measured `rate(...[3m])*60` = 2,135,
+cumulative 8,164 at soak end; WT `increase(...[3m])` = 6,393 ≈ 2,131/min) —
+pat is the only preference-holder in the room, so attribution is unambiguous
+(no-preference receivers never enter the filter gate).
+`relay_layer_preference_updates_total{outcome="accepted"}` WS=24 / WT=29;
+`rate_limited`=1 on each (DoS guard alive). pat logs: `Sent LAYER_PREFERENCE
+(change) pinning 2 source(s) to layer 0 (Video)` on discovery, then a
+`(reconnect)` re-assert every 10s reset window. Absolute received rates sit
+well below the nominal ladder sum (static costume/EKG content compresses far
+below target bitrate) — the per-receiver DIVERGENCE is the assertion, and it
+held on both transports with the publisher's encode set unchanged.
+
+**V17/V18 — viewport fidelity (PROVEN, WT) + V19 (PARTIAL).**
+Room `a2vp`: pat (`viewport_visible_count: 1`) discovered 2 publishers, sent
+`VIEWPORT (change) rendering 1 of 2 known peer(s)`. Visible source (alice)
+delivered 216 kbps to pat; hidden source (bob) delivered ZERO video — the
+`videocall_video_bitrate_kbps{reporter_name="pat",peer_name="bob"}` series was
+never created. Relay: `relay_viewport_set_size`=1, forwarded=18,177,
+filtered=5,679, updates accepted=23 / rate_limited=1. V17 follows from any
+nonzero filtered count (filtering keys on the bot's cleartext `media_kind`).
+V19: periodic `(reconnect)` re-assert captured at the 10s cadence; the forced
+relay-side subscription loss (pod restart) was NOT run on the shared cluster.
 
 ### 2026-05-06 — first end-to-end on HCL daily
 

@@ -57,11 +57,22 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  * split into a **Sending** column AND a **Receiving** column rendered together
  * (the old Receive | Send direction toggle was removed). SEND-side testids are
  * UNCHANGED (below); RECEIVE-side uses the `perf-recv-*` / `perf-vu-recv-*`
- * namespace (further down). Cross-nav: `perf-open-diagnostics` (Perf→Diagnostics)
- * and `diag-open-performance` (Diagnostics→Perf).
+ * namespace (further down).
  *
- *   Tab/nav/panel:  settings-tab-performance (id) · settings-nav-performance
- *                   (data-testid, role="tab") · settings-panel-performance (id)
+ *   #1131 RELOCATION: the whole panel MOVED out of the Settings → Performance
+ *   modal tab into the right-side **Diagnostics drawer** (`#diagnostics-sidebar`),
+ *   mounted as "Group A — Quality controls" above the live diagnostics sections.
+ *   The drawer title became "Performance & Diagnostics". The Settings modal now
+ *   has FOUR tabs (Audio / Video / Network / Appearance) plus a transitional
+ *   `settings-perf-moved` link-row that closes the modal and opens the drawer.
+ *   The `perf-open-diagnostics` / `diag-open-performance` cross-nav buttons (and
+ *   their `#settings-panel-performance` tabpanel wrapper) are GONE — the panel
+ *   now renders directly inside `.sidebar-content`, so its `perf-*` testids are
+ *   scoped to `#diagnostics-sidebar` (NOT a settings tabpanel). The `perf-*`
+ *   COMPONENTS themselves are byte-for-byte unchanged — only the mount moved, so
+ *   every slider / Auto / meter / strip assertion below survives with just the
+ *   opening flow swapped from "open Settings → Performance tab" to "open the
+ *   Diagnostics drawer".
  *
  *   SEND row (this spec's primary coverage; testids unchanged by #1078):
  *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
@@ -87,15 +98,18 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   Fixed badge:    perf-recv-{video,audio,screen}-fixed-badge
  *
  * ─── How the panel is reached ────────────────────────────────────────────────
- * The Performance tab lives inside the in-meeting device-settings modal, so each
- * test must be in a real meeting room first. We reuse the PROVEN in-meeting
- * modal flow from `settings-modal.spec.ts`: inject the session cookie
- * (helpers/auth.ts) on the default `dioxus`-project `page` (whose Chromium flags
- * already include `--use-fake-device-for-media-stream` so the camera produces a
- * synthetic stream), drive the home-page meeting form, click through
- * "Start/Join Meeting" to `#grid-container`, then open the gear
- * (`[data-testid="open-settings"]`) → `.device-settings-modal` and click the
- * Performance tab.
+ * The Performance controls now live in the in-meeting **Diagnostics drawer**, so
+ * each test must be in a real meeting room first. We reuse the PROVEN in-meeting
+ * flow: inject the session cookie (helpers/auth.ts) on the default
+ * `dioxus`-project `page` (whose Chromium flags already include
+ * `--use-fake-device-for-media-stream` so the camera produces a synthetic
+ * stream), drive the home-page meeting form, click through "Start/Join Meeting"
+ * to `#grid-container`, then open the drawer via the toolbar "Open Diagnostics"
+ * button (the canonical opener also used by protocol-selection.spec.ts /
+ * diagnostics-peer-transport.spec.ts). The perf panel renders as Group A inside
+ * `#diagnostics-sidebar`; `openPerformanceDrawer` waits on the migrated simulcast
+ * strip (`perf-simulcast-strip`) appearing INSIDE that scope as readiness +
+ * relocation proof.
  *
  * ─── Local vs CI ─────────────────────────────────────────────────────────────
  * Reaching the in-meeting settings modal requires a real meeting-room
@@ -259,12 +273,46 @@ async function openSettingsModal(page: Page): Promise<void> {
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 }
 
-/** Open the modal (if needed) and switch to the Performance tab. */
-async function openPerformanceTab(page: Page): Promise<void> {
-  await openSettingsModal(page);
-  // The nav button carries role="tab" + data-testid="settings-nav-performance".
-  await page.locator('[data-testid="settings-nav-performance"]').click();
-  await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
+/**
+ * The Diagnostics drawer root. The Performance panel (#1131) is mounted as
+ * "Group A — Quality controls" inside `.sidebar-content` here, so EVERY perf
+ * assertion scopes to this locator (not the dead `#settings-panel-performance`
+ * tabpanel). Scoping inside the drawer is what makes the relocation a real
+ * regression guard: a `perf-*` testid that resurfaced anywhere ELSE on the page
+ * (e.g. a relapsed Settings tab) would NOT satisfy `sidebar.locator(...)`.
+ */
+function perfDrawer(page: Page): Locator {
+  return page.locator("#diagnostics-sidebar");
+}
+
+/**
+ * Open the in-meeting Diagnostics drawer via the toolbar "Open Diagnostics"
+ * button — the new (and only) home of the Performance controls (#1131). Returns
+ * once the drawer is open with the migrated panel inside it.
+ *
+ * MUTATION DISCIPLINE: we wait on the migrated simulcast strip
+ * (`perf-simulcast-strip`) being visible *inside* `#diagnostics-sidebar`, not
+ * merely anywhere on the page. If the panel failed to mount in the drawer (the
+ * relocation regressed), this helper throws and every dependent test fails.
+ */
+async function openPerformanceDrawer(page: Page): Promise<void> {
+  // The diagnostics button carries no data-testid; locate it via its tooltip
+  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  const sidebar = perfDrawer(page);
+  await expect(sidebar).toBeVisible({ timeout: 10_000 });
+  // The drawer title renamed to "Performance & Diagnostics" (#1131 §4).
+  await expect(sidebar.getByRole("heading", { name: "Performance & Diagnostics" })).toBeVisible({
+    timeout: 5_000,
+  });
+  // Relocation proof: the migrated panel's simulcast strip is present INSIDE the
+  // drawer (Group A). This fails if the panel didn't move into the drawer.
+  await expect(sidebar.locator('[data-testid="perf-simulcast-strip"]')).toBeVisible({
+    timeout: 5_000,
+  });
 }
 
 /**
@@ -348,12 +396,12 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "render");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together now (no toggle); this guards the send
     // meters rendered before we assert them.
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // ── Three live VU gauges visible (one per stream section) ──
     await expect(panel.locator('[data-testid="perf-vu-video"]')).toBeVisible();
@@ -412,37 +460,49 @@ test.describe("Performance settings panel (#961)", () => {
     }
   });
 
-  test("desktop layout: Performance panel stays contained in the modal body (#1095)", async ({
+  test("desktop layout: Group A perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
     page,
   }) => {
-    // The current panel renders Send and Receive controls together. On a 768px
-    // desktop viewport that content is legitimately taller than the modal body,
-    // so the stable contract is containment: no horizontal overflow, all cards
-    // reachable through the modal body's vertical scroll container.
+    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design: Group A (perf
+    // controls) sits above the live diagnostics groups, so the content is
+    // legitimately taller than the viewport and the drawer scrolls vertically.
+    // The #1208/#1213 lesson: do NOT assert vertical overflow in either
+    // direction (a scrolling-by-design surface SHOULD overflow vertically). The
+    // stable contract is (a) NO horizontal overflow, and (b) the LAST Group-A
+    // perf card is reachable by scrolling the drawer's own scroll container.
     await page.setViewportSize({ width: 1280, height: 768 });
-    await joinMeeting(page, "no_scroll");
-    await openPerformanceTab(page);
+    await joinMeeting(page, "drawer_containment");
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     await expect(panel).toBeVisible();
-    // All three cards must be present (so we're measuring the full content, not a
-    // partially-rendered panel).
+    // All three Group-A perf cards must be present (so we're measuring the full
+    // content, not a partially-rendered panel).
     await expect(panel.locator(".perf-kind-card")).toHaveCount(3);
 
-    // The scrollable container is `.settings-panel` (it carries overflow-y:auto),
-    // which WRAPS the `#settings-panel-performance` tabpanel.
-    const scrollContainer = page.locator(".settings-panel");
-    const metrics = await scrollContainer.evaluate((el) => ({
-      horizontalOverflow: el.scrollWidth - el.clientWidth,
-    }));
+    // The drawer's scroll container is `.sidebar-content` (it carries
+    // overflow-y:auto inside `#diagnostics-sidebar`).
+    const scrollContainer = panel.locator(".sidebar-content");
+    await expect(scrollContainer).toBeVisible();
+    const horizontalOverflow = await scrollContainer.evaluate(
+      (el) => el.scrollWidth - el.clientWidth,
+    );
     expect(
-      metrics.horizontalOverflow,
-      "Performance panel must not overflow horizontally",
+      horizontalOverflow,
+      "drawer Group-A content must not overflow horizontally",
     ).toBeLessThanOrEqual(1);
 
+    // Scroll to the bottom of the drawer and confirm the LAST Group-A perf card
+    // is reachable (it sits above Groups B/C, so this also proves Group A is not
+    // clipped off the top of an over-tall surface).
     await scrollContainer.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
+    });
+    await scrollContainer.evaluate((el) => {
+      // The last perf card is above the live groups; scroll it into view.
+      const cards = el.querySelectorAll(".perf-kind-card");
+      cards[cards.length - 1]?.scrollIntoView({ block: "center" });
     });
     await expect(panel.locator(".perf-kind-card").last()).toBeVisible();
   });
@@ -451,10 +511,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "reset_button");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     // The former "Auto" toggle is now a conditionally-rendered "Reset" button; the
     // `perf-video-auto` testid was repurposed onto it. It is not a toggle (no
     // aria-pressed) and is only present while the stream is constrained.
@@ -510,10 +570,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "help_popover");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const helpBtn = panel.locator('[data-testid="perf-video-help"]');
     const popover = page.locator("#perf-video-help-popover");
 
@@ -572,10 +632,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "intro_collapsed");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The big always-visible intro paragraph (it used to be a
     // `.settings-section-description` in the panel) is GONE — collapsed behind a
@@ -612,10 +672,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "persist");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // VIDEO SEND is a LAYER-COUNT control: the floor (min) thumb is PINNED at the
     // base layer (non-interactive, NOT `disabled` — WebKit fix), and lowering the
@@ -697,12 +757,12 @@ test.describe("Performance settings panel (#961)", () => {
     }
     await expect(grid).toBeVisible({ timeout: 15_000 });
 
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together after reload (no toggle); guard that the
     // send meters are present before re-reading the persisted send-side video
     // preference.
     await selectSendDirection(page);
-    const panelAfter = page.locator("#settings-panel-performance");
+    const panelAfter = perfDrawer(page);
 
     // Lowered ceiling restored (not the full ladder) → the Reset button is
     // RENDERED, the ceiling thumb is back at the lowered position, and the base
@@ -731,11 +791,11 @@ test.describe("Performance settings panel (#961)", () => {
     // video meter readout stays "Camera — off" (the LS preference alone doesn't
     // populate the pre-join device list that resolve_initial_enabled requires).
     await joinMeeting(page, "vu_live", { ensureCameraOn: true });
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together now; the send meters are always present.
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The video meter readout is updated by a ~4 Hz rAF loop from the live
     // encoder snapshot. With the fake camera producing a synthetic stream, the
@@ -757,10 +817,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "no_fixed_badge");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The "Fixed" badge was a TIER-slider concept (both thumbs pinned to one
     // tier). ALL THREE SEND controls (video, screen, AND audio) are now
@@ -788,10 +848,10 @@ test.describe("Performance settings panel (#961)", () => {
     // on any runner (no skip-guard needed) — the deterministic drag target.
     await enableSimulcastFlag(page.context(), 3);
     await joinMeeting(page, "send_ceiling_grabbable");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const minInput = panel.locator('[data-testid="perf-audio-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-audio-range-max"]');
 
@@ -850,10 +910,10 @@ test.describe("Performance settings panel (#961)", () => {
     // anchor for the strip markup. §1: each side title is prefixed with an
     // aria-hidden directional arrow (`.perf-dir-arrow`).
     await joinMeeting(page, "send_rungs");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The audio send rung strip is a role=img container with at least one pip.
     const audioStrip = panel.locator('[data-testid="perf-audio-send-rungs"]');
@@ -883,10 +943,10 @@ test.describe("Performance settings panel (#961)", () => {
     // the configured count, and names each kind's trigger.
     await enableSimulcastFlag(page.context(), 3);
     await joinMeeting(page, "caption_source_aware");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     // Per-kind trigger phrase in the OFF-state caption.
     const triggers: Record<string, RegExp> = {
       video: /Will send \d+ layers? when the camera is on/,
@@ -926,9 +986,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "both_directions");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The #1095 redesign removed the `Receive | Send` segmented toggle: the
     // panel now shows three per-kind cards, each split into a Sending column and
@@ -963,20 +1023,28 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
       ).toBeVisible();
     }
 
-    // The Diagnostics cross-nav button lives in the panel header (#1095 §4a).
-    await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toBeVisible();
+    // SINGLE SURFACE (#1131): the panel now lives INSIDE the Diagnostics drawer,
+    // so the former Perf→Diagnostics cross-nav button (`perf-open-diagnostics`) is
+    // gone — there is nowhere left to navigate to. Assert it no longer renders,
+    // and that the receive controls we just checked are inside `#diagnostics-sidebar`
+    // (the relocation), not on a stray Settings tab.
+    await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+    await expect(
+      perfDrawer(page).locator('[data-testid="perf-vu-recv-video"]'),
+      "receive controls render inside the Diagnostics drawer (relocation proof)",
+    ).toBeVisible();
   });
 
   test("receive row renders a range slider, needle, and help for each kind (Reset absent at full range)", async ({
     page,
   }) => {
     await joinMeeting(page, "recv_render");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together (no toggle); guard the receive meters
     // rendered before asserting the receive controls.
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Per kind, the RECEIVE row exposes its full control set in the perf-recv-*
     // namespace: needle gauge, dual-thumb range (min + max), Auto toggle, help.
@@ -1021,10 +1089,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     // a real regression guard: if the empty-state gate regressed (a stray
     // disclosure rendered with no peers), this fails.
     await joinMeeting(page, "recv_peers_empty");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     for (const kind of ["video", "audio", "screen"] as const) {
       // No <details> disclosure…
@@ -1048,10 +1116,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_auto_default");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     for (const kind of ["video", "audio", "screen"] as const) {
       // Default = full automatic range: the Reset button (repurposed from the
@@ -1075,10 +1143,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_reset_button");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const resetBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
     const minInput = panel.locator('[data-testid="perf-recv-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-recv-video-range-max"]');
@@ -1106,10 +1174,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_needle");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Single-page: no peer is sending, so the receive video needle must read the
     // "Not receiving" placeholder. If a stream WERE being decoded it would show
@@ -1140,10 +1208,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_fixed_badge");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Pin both video RECEIVE thumbs to the same interior layer so min == max →
     // the receive Fixed badge appears. Dragging a thumb leaves the full automatic
@@ -1158,35 +1226,29 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 });
 
 // ---------------------------------------------------------------------------
-// Cross-nav + the relocated "Simulcast layers" diagnostics section (#1095).
+// Single-surface unification (#1131) + the "Simulcast layers" diagnostics
+// section (#1095, now Group B of the same drawer).
 //
-// The #1095 redesign REMOVED the in-panel per-row diagnostics footers (the old
-// `perf-{kind}-diag-*` disclosure/ladder/peer rows) and MOVED that detail into
-// the Call Diagnostics panel's new "Simulcast layers" section. The Performance
-// panel now offers a "Diagnostics" cross-nav button (`perf-open-diagnostics`)
-// that closes settings and opens the diagnostics sidebar; the diagnostics header
-// offers a "Performance" cross-nav button (`diag-open-performance`) back.
+// #1131 collapsed the two surfaces into ONE: the Performance panel moved INTO
+// the Diagnostics drawer, so the former Perf↔Diag cross-nav buttons
+// (`perf-open-diagnostics` / `diag-open-performance`) are GONE — there is no
+// second surface to navigate to. The old round-trip cross-nav test is replaced
+// below by (a) a single-surface assertion that the perf panel (Group A) and the
+// "Simulcast layers" section (Group B) coexist in ONE open drawer, and (b) a
+// round-trip test of the transitional Settings `settings-perf-moved` row.
 //
-// The relocated section is fed by the live `DiagnosticsReader` Host publishes to
-// the parent, so:
+// The "Simulcast layers" section is fed by the live `DiagnosticsReader` Host
+// publishes, so:
 //   * Video (sending) static line "Camera — off" when the camera is off — the
 //     #1101 stale-count regression, now asserted in its new home.
 //   * Screen (sending) static line "Screen — not sharing" with no active share.
 //   * The per-layer ladder (`diag-simulcast-ladder` + `diag-simulcast-rung-{id}`)
 //     renders >= 1 rung when simulcast is active (capability-gated, SHAPE only).
 //
-// Open the diagnostics sidebar via the cross-nav button itself, so these tests
-// also cover the Perf→Diagnostics nav. All live-content assertions use
+// The drawer is opened via the single `openPerformanceDrawer` helper (the
+// toolbar "Open Diagnostics" button). All live-content assertions use
 // `expect.poll` (the section refreshes on a ~4 Hz tick).
 // ---------------------------------------------------------------------------
-
-/** Open Performance, then click the "Diagnostics" cross-nav button (#1095 §4a). */
-async function openDiagnosticsFromPerformance(page: Page): Promise<void> {
-  await openPerformanceTab(page);
-  await page.locator('[data-testid="perf-open-diagnostics"]').click();
-  // The settings overlay closes and the diagnostics sidebar becomes visible.
-  await expect(page.locator("#diagnostics-sidebar.visible")).toBeVisible({ timeout: 5_000 });
-}
 
 /** Trimmed text of the named "Simulcast layers" SEND ladder block (by title). */
 async function simulcastSendText(page: Page, title: string): Promise<string> {
@@ -1197,7 +1259,7 @@ async function simulcastSendText(page: Page, title: string): Promise<string> {
   return (t ?? "").trim();
 }
 
-test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)", () => {
+test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast layers (#1095)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
@@ -1209,28 +1271,34 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     await enableSimulcastFlag(page.context(), 3);
   });
 
-  test("cross-nav: Performance → Diagnostics opens the panel, Diagnostics → Performance returns", async ({
+  test("single surface: the perf panel (Group A) and Simulcast layers (Group B) coexist in ONE open drawer", async ({
     page,
   }) => {
-    await joinMeeting(page, "xnav");
+    await joinMeeting(page, "single_surface");
 
-    // ── ROUND-TRIP 1: Performance → Diagnostics ──
-    // Before navigating, the Performance panel must be the thing on screen.
-    await openPerformanceTab(page);
-    await expect(page.locator("#settings-panel-performance")).toBeVisible();
-    // Click the in-panel "Diagnostics" cross-nav button.
-    await page.locator('[data-testid="perf-open-diagnostics"]').click();
-    // The settings modal is gone AND the diagnostics sidebar is open.
-    await expect(page.locator(".device-settings-modal")).toHaveCount(0);
-    await expect(page.locator("#diagnostics-sidebar.visible")).toBeVisible({ timeout: 5_000 });
+    // ONE open action puts BOTH the perf controls and the live diagnostics on
+    // screen at once — the whole point of #1131. `openPerformanceDrawer` already
+    // asserts the title + the migrated simulcast strip inside the drawer.
+    await openPerformanceDrawer(page);
+    const sidebar = perfDrawer(page);
 
-    // The relocated "Simulcast layers" section (#1095 §6 MOVE) is now present in
-    // the Diagnostics sidebar — assert the heading AND the moved sub-structure so
-    // this fails if the MOVE regressed (a bare heading could survive an empty
+    // GROUP A — the migrated Performance panel. Assert a Group-A perf control is
+    // visible INSIDE the drawer (relocation proof, not anywhere on the page).
+    await expect(
+      sidebar.locator('[data-testid="perf-simulcast-strip"]'),
+      "Group A perf strip inside the drawer",
+    ).toBeVisible();
+    await expect(
+      sidebar.locator('[data-testid="perf-vu-video"]'),
+      "Group A send video meter inside the drawer",
+    ).toBeVisible();
+
+    // GROUP B — the "Simulcast layers" section coexists in the SAME drawer
+    // (#1095 §6 MOVE). Assert the heading AND the moved sub-structure so this
+    // fails if the section regressed (a bare heading could survive an empty
     // section). Single-context (camera off / no peers) so the live ladder +
     // per-peer testids are NOT in the DOM; assert the always-present structure:
     // both SEND blocks (by title) and the per-peer RECEIVE sub-section header.
-    const sidebar = page.locator("#diagnostics-sidebar");
     await expect(sidebar.getByRole("heading", { name: "Simulcast layers" })).toBeVisible();
     await expect(sidebar.locator('.simulcast-send-title:text-is("Video (sending)")')).toBeVisible();
     await expect(
@@ -1238,17 +1306,53 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     ).toBeVisible();
     await expect(sidebar.locator(".simulcast-recv-title")).toBeVisible();
 
-    // ── ROUND-TRIP 2: Diagnostics → Performance (must LAND on the Performance
-    //    tab, not just reopen settings) ──
-    await page.locator('[data-testid="diag-open-performance"]').click();
-    // Settings reopens AND the Performance tabpanel is the active one (the
-    // `device_settings_initial_section = "performance"` wiring) …
-    await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
-    // …proven by a Performance-only control being visible (the panel content, not
-    // just the tabpanel wrapper, is mounted) …
-    await expect(page.locator('[data-testid="perf-vu-video"]')).toBeVisible({ timeout: 5_000 });
-    // …and the diagnostics sidebar has closed (unmounted).
-    await expect(page.locator("#diagnostics-sidebar.visible")).toHaveCount(0);
+    // The cross-nav buttons are GONE on both sides of the (now single) surface.
+    await expect(sidebar.locator('[data-testid="diag-open-performance"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+  });
+
+  test("Settings has FOUR tabs and the `settings-perf-moved` row opens the drawer (real round-trip)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "perf_moved_row");
+
+    // ── The Settings modal now has exactly FOUR tabs (Performance tab removed) ──
+    await openSettingsModal(page);
+    const modal = page.locator(".device-settings-modal");
+    const tabs = modal.getByRole("tab");
+    await expect(tabs).toHaveCount(4);
+    // The four surviving tabs, by accessible name.
+    for (const name of ["Audio", "Video", "Network", "Appearance"] as const) {
+      await expect(modal.getByRole("tab", { name }), `${name} tab present`).toBeVisible();
+    }
+    // The Performance tab is GONE — it is NOT one of the tabs.
+    await expect(modal.getByRole("tab", { name: "Performance" })).toHaveCount(0);
+    await expect(modal.locator('[data-testid="settings-nav-performance"]')).toHaveCount(0);
+
+    // ── The transitional "moved" row: present below the tablist, NOT a tab ──
+    const movedRow = modal.locator('[data-testid="settings-perf-moved"]');
+    await expect(movedRow).toBeVisible();
+    // It is a link-styled affordance (role="link"), not a tab.
+    await expect(movedRow).toHaveAttribute("role", "link");
+    await expect(movedRow).not.toHaveAttribute("role", "tab");
+
+    // ── REAL ROUND-TRIP: clicking it CLOSES the modal and OPENS the drawer ──
+    // MUTATION DISCIPLINE: this fails if the row reopened the dead Performance tab
+    // (no `#settings-panel-performance` exists any more) instead of routing to the
+    // drawer. We assert (a) the modal is gone, (b) the drawer is open with its new
+    // title, and (c) the migrated perf panel is visible INSIDE the drawer.
+    await movedRow.click();
+    await expect(modal, "settings modal closes when the moved row is clicked").toHaveCount(0);
+    const sidebar = perfDrawer(page);
+    await expect(sidebar).toBeVisible({ timeout: 5_000 });
+    await expect(
+      sidebar.getByRole("heading", { name: "Performance & Diagnostics" }),
+      "the moved row routes to the unified drawer, not the dead tab",
+    ).toBeVisible();
+    await expect(
+      sidebar.locator('[data-testid="perf-simulcast-strip"]'),
+      "the migrated perf panel is the destination of the moved row",
+    ).toBeVisible();
   });
 
   // Camera-off regression (the #1101 fix), now in its new home: the relocated
@@ -1260,7 +1364,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
   }) => {
     // Join WITHOUT turning the camera on, so send_video is gated to None.
     await joinMeeting(page, "diag_cam_off");
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     await expect
       .poll(async () => simulcastSendText(page, "Video (sending)"), { timeout: 15_000 })
@@ -1277,7 +1381,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     page,
   }) => {
     await joinMeeting(page, "diag_screen_idle");
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     await expect
       .poll(async () => simulcastSendText(page, "Screen (sending)"), { timeout: 15_000 })
@@ -1290,7 +1394,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     page,
   }) => {
     await joinMeeting(page, "diag_ladder", { ensureCameraOn: true });
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     const sidebar = page.locator("#diagnostics-sidebar");
     // Wait for the camera-on Video (sending) line to settle into one of its two

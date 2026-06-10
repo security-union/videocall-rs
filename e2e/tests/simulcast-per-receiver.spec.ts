@@ -154,10 +154,10 @@
  * the RECEIVE side only; since the unified send+receive panel landed (#1078) the
  * receive controls/needles live under the `perf-recv-*` / `perf-vu-recv-*`
  * namespace (the bare `perf-*` / `perf-vu-*` ids are now the SEND side):
- *   - `[data-testid="open-settings"]`               toolbar gear (settings modal)
- *   - `.device-settings-modal`                      the settings modal root
- *   - `role="tab" name="Performance"`               Performance nav tab
- *   - `#settings-panel-performance`                 the perf tabpanel
+ *   - toolbar "Open Diagnostics" button             opens the Diagnostics drawer
+ *       (#1131: the perf controls MOVED here from the Settings → Performance tab;
+ *        the tab + the `perf-open-diagnostics` cross-nav button are gone)
+ *   - `#diagnostics-sidebar`                        the drawer root scoping perf-*
  *   - `#perf-vu-recv-video-readout`                 video received-quality readout
  *       text format: `L{idx+1}/{count} · {w}x{h}` or "Not receiving"
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
@@ -485,25 +485,39 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
 }
 
 /**
- * Open Settings → Performance and return the visible perf tabpanel locator.
+ * Open the in-meeting Diagnostics drawer (the new home of the Performance
+ * controls, #1131) and return the drawer locator that scopes the perf controls.
  *
- * The #1095 redesign REMOVED the old `Receive | Send` direction toggle: every
- * per-kind card now renders both a Sending and a Receiving column at once, so the
- * receive controls/meters (`perf-recv-*` / `perf-vu-recv-*`) are always mounted
- * once the Performance tab is open. We assert the receive video meter is visible
- * as a readiness guard (this whole spec reads RECEIVE needles/controls).
+ * #1131 RELOCATION: the Performance panel MOVED out of the Settings → Performance
+ * modal tab into the right-side Diagnostics drawer (`#diagnostics-sidebar`),
+ * mounted as "Group A — Quality controls". The receive controls/meters
+ * (`perf-recv-*` / `perf-vu-recv-*`) now render directly inside the drawer's
+ * `.sidebar-content` (no `#settings-panel-performance` tabpanel any more). The
+ * `perf-*` COMPONENTS are unchanged — only the mount moved — so this spec's
+ * RECEIVE assertions are untouched; only the opening flow swapped from "Settings
+ * → Performance tab" to "Open Diagnostics".
+ *
+ * The #1095 redesign already removed the `Receive | Send` direction toggle: every
+ * per-kind card renders both a Sending and a Receiving column at once, so the
+ * receive controls/meters are always mounted once the drawer is open. We assert
+ * the receive video meter is visible INSIDE the drawer as a readiness +
+ * relocation guard (this whole spec reads RECEIVE needles/controls).
  */
 async function openPerformancePanel(page: Page) {
-  await page.locator('[data-testid="open-settings"]').click();
-  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("tab", { name: "Performance" }).click();
-  const panel = page.locator("#settings-panel-performance");
-  await expect(panel).toBeVisible({ timeout: 10_000 });
-  // The #1095 redesign removed the Receive | Send direction toggle: both
-  // directions render together, so the receive-side meter is always present.
-  // Assert it as a readiness guard (was: click the receive toggle segment).
-  await expect(page.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({ timeout: 5_000 });
-  return panel;
+  // The diagnostics button carries no data-testid; locate it via its tooltip
+  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  const drawer = page.locator("#diagnostics-sidebar");
+  await expect(drawer).toBeVisible({ timeout: 10_000 });
+  // Readiness + relocation proof: the migrated receive video meter is present
+  // INSIDE the drawer (not anywhere else on the page).
+  await expect(drawer.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({
+    timeout: 10_000,
+  });
+  return drawer;
 }
 
 /**
@@ -1134,10 +1148,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //
   // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
   // needs a renderer-crash-resilient runner + a capability-override hook. After
-  // the #1095 redesign the per-peer receive breakdown lives in the Diagnostics
-  // sidebar (reached via the `diag-open-performance` ⇄ `perf-open-diagnostics`
-  // cross-nav), one block per kind, only rendered when >= 1 peer is decoding that
-  // kind:
+  // the #1131 unification the per-peer receive breakdown lives in the Diagnostics
+  // drawer's "Simulcast layers" section (Group B of the same open drawer), one
+  // block per kind, only rendered when >= 1 peer is decoding that kind:
   //   * 0 peers → the kind block is absent (single-context receive coverage —
   //     the "Not receiving" readout placeholder — is green in
   //     performance-settings.spec.ts → receive-needle/readout tests),
@@ -1158,8 +1171,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
   // purpose so it is a documented stub, not a runnable test):
   //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
-  //   2. openPerformancePanel(rxPage), then click `perf-open-diagnostics` to land
-  //      in the Diagnostics sidebar's "Simulcast layers" section.
+  //   2. openPerformancePanel(rxPage) — one open drawer surfaces BOTH the perf
+  //      controls (Group A) and the "Simulcast layers" section (Group B); no
+  //      cross-nav click needed any more (#1131).
   //   3. expect.poll `[data-testid="diag-simulcast-recv-video"]` head to read
   //      /\d+ peer\(s\) · L/.
   //   4. Assert a `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` row
@@ -1722,12 +1736,14 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 //
 // NOTE — publisher-side DOM observability is NO LONGER a blocker. It WAS (the
 // old design exposed nothing), but the #1095 redesign on THIS branch surfaces the
-// publisher's per-rung send ladder in the Diagnostics sidebar's "Simulcast
+// publisher's per-rung send ladder in the Diagnostics drawer's "Simulcast
 // layers" section: one chip per layer, testid `diag-simulcast-rung-{layer_id}`,
 // with the shed state conveyed by an `is-shed` CSS class (active rungs carry
-// `is-active`). The body below is written against THOSE selectors (reached via
-// the `perf-open-diagnostics` cross-nav on the publisher), so it goes green the
-// moment the #1093 multi-party harness lands — no further UI work is needed.
+// `is-active`). The body below is written against THOSE selectors (reached by
+// simply opening the unified drawer on the publisher — #1131 removed the
+// cross-nav button; the ladder shares the drawer with the perf controls), so it
+// goes green the moment the #1093 multi-party harness lands — no further UI work
+// is needed.
 // (The earlier `perf-video-diag-rung-*` / `data-shed` / `data-bitrate-kbps`
 // contract from the never-merged `feat/perf-panel-simulcast-diagnostics` branch
 // does NOT exist; do not reintroduce it.)
@@ -1831,24 +1847,17 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
           timeout: 30_000,
         });
 
-        // Open the receive Performance panels (where the max-layer sliders live)
-        // on both receivers, and the Diagnostics sidebar on the publisher (where
-        // the per-rung SEND ladder now lives after the #1095 redesign — it MOVED
-        // out of the Performance panel into the "Simulcast layers" section). Reach
-        // it via the in-panel "Diagnostics" cross-nav button so this also exercises
-        // the Perf→Diagnostics nav.
+        // Open the unified Diagnostics drawer (#1131) on all three contexts. ONE
+        // surface now hosts BOTH the receive max-layer sliders (Group A — the
+        // migrated Performance panel) AND the publisher's per-rung SEND ladder
+        // (Group B — the "Simulcast layers" section). So the same
+        // `openPerformancePanel` opener gives the receivers their sliders and the
+        // publisher its ladder — no Settings tab, no cross-nav button (both were
+        // removed when the surfaces merged in #1131).
         await openPerformancePanel(rxAPage);
         await openPerformancePanel(rxBPage);
-        await pubPage.locator('[data-testid="open-settings"]').click();
-        await expect(pubPage.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-        await pubPage.getByRole("tab", { name: "Performance" }).click();
-        await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
-          timeout: 10_000,
-        });
-        // The publisher's per-rung send ladder is in the Diagnostics sidebar now,
-        // not behind a SEND-direction segment (the Receive | Send toggle was
-        // removed in #1095). Cross-nav to it.
-        await pubPage.locator('[data-testid="perf-open-diagnostics"]').click();
+        await openPerformancePanel(pubPage);
+        // The publisher's per-rung send ladder lives in the SAME open drawer.
         await expect(pubPage.locator("#diagnostics-sidebar.visible")).toBeVisible({
           timeout: 5_000,
         });

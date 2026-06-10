@@ -333,7 +333,7 @@ pub fn capability_max_simulcast_layers() -> u32 {
              (requested testCapabilityMaxLayersOverride={requested}, clamped to \
              [1, {ladder_depth}]); the device-sniffed ceiling was {sniffed} \
              (cores={cores} platform={platform:?} older_intel={older_intel}). This is an \
-             e2e-only hook (issue #1093) and MUST NOT be set in production config.js."
+             e2e-only hook (issue 1093) and MUST NOT be set in production config.js."
         );
     } else {
         log::info!(

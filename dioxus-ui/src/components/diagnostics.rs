@@ -854,24 +854,34 @@ pub fn Diagnostics(
             }
             div { class: "sidebar-content",
                 // ── GROUP A — Quality controls (the migrated Performance panel) ──
-                // First group: no top border (the dividers separate later groups).
-                div { class: "diag-group-label diag-group-label--first", role: "presentation",
-                    "Quality controls"
-                }
+                // The label AND the panel render together: gating both on
+                // `perf_controls` avoids an orphaned group divider in the sub-second
+                // window before `Host` publishes the handle (#1131 review F3). The
+                // first group's label carries `--first` (no top border).
+                //
                 // The Performance controls (simulcast strip + per-kind cards with
                 // sliders / Auto / live meters / help) render inside their own
                 // child component so the panel's 250 ms refresh tick + rAF meter
                 // drivers re-render ONLY that subtree — NOT this top-level body
                 // (which re-runs the expensive NetEq prelude). The child also reads
                 // the preference signals, keeping all reactive perf state out of
-                // this body. Renders nothing until Host publishes the handle.
-                // (#1131 unify, tick-scoping #1128)
+                // this body. (#1131 unify, tick-scoping #1128)
                 if let Some(controls) = perf_controls.clone() {
+                    div { class: "diag-group-label diag-group-label--first", role: "presentation",
+                        "Quality controls"
+                    }
                     DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
                 }
 
                 // ── GROUP B — Live stream state ──
-                div { class: "diag-group-label", role: "presentation", "Live stream state" }
+                // When Group A is absent (controls not yet published), this becomes
+                // the leading group, so it takes `--first` (no top border) to avoid a
+                // dangling divider at the top of the body (#1131 review F3).
+                div {
+                    class: if perf_controls.is_some() { "diag-group-label" } else { "diag-group-label diag-group-label--first" },
+                    role: "presentation",
+                    "Live stream state"
+                }
                 // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
                 // per-peer RECEIVE breakdown. Extracted into its own child so its
                 // 4 Hz refresh tick re-renders ONLY this section, not the NetEq

@@ -1068,11 +1068,14 @@ html[data-theme="dark"] #diagnostics-sidebar {
   border-top: none;
 }
 
-/* Honour reduced-motion for the drawer slide on BOTH the desktop `right` and the
-   mobile `transform` transitions. (#1131 §5) */
+/* Honour reduced-motion for the drawer slide on BOTH the desktop `right`
+   transition (this rule, non-`!important`, wins by source order) AND the mobile
+   `transform 0.3s ease !important` transition at the ≤639px breakpoint (style.css
+   mobile block) — which is itself `!important`, so this override MUST also be
+   `!important` to beat it. (#1131 §5, review REQUIRED 2) */
 @media (prefers-reduced-motion: reduce) {
   #diagnostics-sidebar {
-    transition: none;
+    transition: none !important;
   }
 }
 
@@ -7617,30 +7620,19 @@ html[data-theme="light"] .settings-divider {
   border-bottom: 1px solid var(--border);
 }
 
-.perf-simulcast-strip__info {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  font-size: 12px;
-  line-height: 1;
-  color: var(--text-secondary);
-  cursor: help;
-}
-
-.perf-simulcast-strip__info:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-pill);
-}
+/* (`.perf-simulcast-strip__info` — the decorative `ⓘ` glyph — was removed in
+   #1131 review F2: it duplicated the strip's `(i)` HelpPopover. The simulcast
+   framing it held now rides the strip text span's title/aria; the full per-layer
+   detail lives in the "Simulcast layers" section.) */
 
 /* ── Per-kind cards (Video / Audio / Content), each split Send | Receive
    (#1095 redesign). A card is a glass surface; its two columns share the
    `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
 .perf-kind-card {
-  /* No vertical margin: the parent `.settings-section` flex `gap` already spaces
-     the cards; a margin here would double-space (#2a). */
+  /* Base: no vertical margin. The drawer adds explicit inter-card spacing via the
+     `#diagnostics-sidebar` rule below (the `.sidebar-content` is a plain padded
+     block, NOT a flex container with a `gap`, so the cards would otherwise render
+     flush — #1131 review F4). */
   padding: 10px 14px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);
@@ -7648,6 +7640,17 @@ html[data-theme="light"] .settings-divider {
   /* Enable container queries so the columns collapse based on the card's own
      width (independent of the viewport). */
   container-type: inline-size;
+}
+
+/* Drawer-scoped spacing for the migrated Performance controls (#1131 review F4):
+   the `.sidebar-content` block has no flex `gap`, so space the strip + the three
+   per-kind cards explicitly, and leave room before the next group label. */
+#diagnostics-sidebar .perf-simulcast-strip {
+  margin-bottom: 14px;
+}
+
+#diagnostics-sidebar .perf-kind-card {
+  margin-bottom: 14px;
 }
 
 .perf-kind-card__title {

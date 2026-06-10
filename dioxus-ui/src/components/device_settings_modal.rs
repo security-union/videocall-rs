@@ -453,10 +453,16 @@ pub fn DeviceSettingsModal(
                             "data-testid": "settings-perf-moved",
                             role: "link",
                             "aria-label": "Performance settings moved to the Diagnostics panel \u{2014} open it",
+                            // `on_open_diagnostics` owns BOTH transitions: the
+                            // attendants closure it maps to sets
+                            // `device_settings_open=false` AND `diagnostics_open=true`.
+                            // Do NOT also call `on_close` here: that maps to the
+                            // settings TOGGLE handler, which would synchronously read
+                            // the just-written `false` and flip the modal back open,
+                            // stacking it over the drawer (#1131 review BLOCKER 1).
                             onclick: move |_| {
                                 open_dropdown.set(None);
                                 on_open_diagnostics.call(());
-                                on_close.call(());
                             },
                             span { class: "settings-perf-moved__title", "Performance" }
                             span { class: "settings-perf-moved__sub", "Moved to Diagnostics" }

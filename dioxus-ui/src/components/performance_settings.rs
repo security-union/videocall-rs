@@ -2316,9 +2316,11 @@ const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is A
 /// The unified Performance settings panel body (#1095 redesign). Three stacked
 /// per-kind cards (Video / Audio / Content), each split into a **Sending** column
 /// and a **Receiving** column, so both directions are visible at once without a
-/// direction tab. A header row carries the "Performance" title and a "Diagnostics"
-/// cross-nav button; a slim simulcast strip (with an `(i)` tooltip) sits under the
-/// intro. Two headless rAF drivers update the Sending and Receiving bar-meters
+/// direction tab. The panel now mounts INSIDE the Diagnostics drawer's "Quality
+/// controls" group (#1131), which supplies the surrounding title + group label, so
+/// the panel has no heading of its own: it leads with a slim simulcast strip whose
+/// single `(i)` HelpPopover (testid `perf-intro-help`) holds the collapsed intro.
+/// Two headless rAF drivers update the Sending and Receiving bar-meters
 /// independently by id.
 ///
 /// `pref` (send) + `receive_pref` are the current persisted preferences
@@ -2382,8 +2384,11 @@ pub fn PerformanceSettingsPanel(
     // Panel-level 4 Hz refresh tick. The per-card SUMMARY lines are always
     // visible AND live (layer count / total uplink / peer spread change at
     // runtime), so the panel subtree must re-render periodically. This loop is
-    // gated to the panel mount (the panel only mounts on the open Performance
-    // tab), and the summaries are cheap (count / min-max).
+    // gated to the panel mount (the panel only mounts inside the open Diagnostics
+    // drawer's "Quality controls" group; #1131), and the summaries are cheap
+    // (count / min-max). Scoping the tick to this child keeps it off the
+    // top-level `Diagnostics` body, which would otherwise re-run its expensive
+    // NetEq prelude 4×/s (#1128).
     //
     // Driven by a 250 ms `setInterval` (gloo `Interval`): the panel only needs a
     // ~4 Hz re-render, so the timer wakes 4×/s — a battery/CPU win on low-core
@@ -2459,32 +2464,32 @@ pub fn PerformanceSettingsPanel(
     };
 
     rsx! {
-        // Global effective-setting strip with an (i) tooltip. Compact copy; full
-        // flag×cap text in the (i) title/aria. The cross-nav button + "Performance"
-        // title row was removed when the panel moved INTO the Diagnostics drawer
-        // (#1131): the drawer supplies the title + the "Quality controls" group
-        // label, so a panel-local heading would double up. The intro explanation
-        // stays, collapsed behind the strip's (i) helper, reusing the shared
+        // Global effective-setting strip: compact copy + ONE help affordance.
+        // The cross-nav button + "Performance" title row was removed when the panel
+        // moved INTO the Diagnostics drawer (#1131): the drawer supplies the title +
+        // the "Quality controls" group label, so a panel-local heading would double
+        // up. The intro explanation stays, collapsed behind the single `(i)`
         // HelpPopover (single-open signal, aria-expanded, Escape/outside-click,
-        // focus return).
+        // focus return). The earlier separate decorative `ⓘ` glyph was REMOVED
+        // (#1131 review F2): two adjacent help affordances on one line duplicated;
+        // the full per-layer simulcast detail it carried lives in Group B's
+        // "Simulcast layers" section (its own source of truth, §3). The simulcast
+        // framing is kept discoverable on the strip via the text span's title/aria.
         div {
             class: "perf-simulcast-strip",
             "data-testid": TESTID_SIMULCAST_STRIP,
-            span { class: "perf-simulcast-strip__text", "{strip_compact}" }
+            span {
+                class: "perf-simulcast-strip__text",
+                title: "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "aria-label": "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "{strip_compact}"
+            }
             HelpPopover {
                 key_id: "perf-intro",
                 help_testid: "perf-intro-help",
                 help_label: "About the Performance panel",
                 help_body: HELP_PERF_INTRO,
                 open_help,
-            }
-            span {
-                class: "perf-simulcast-strip__info",
-                role: "img",
-                tabindex: "0",
-                title: "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
-                "aria-label": "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
-                "ⓘ"
             }
         }
 

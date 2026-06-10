@@ -244,6 +244,10 @@ pub use client::{
     RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
 };
 pub use connection::{ConnectionLostReason, ConnectionState};
+// Issue #1080: runtime netsim control-surface installer. Feature-gated so
+// default builds neither export nor link it.
+#[cfg(feature = "netsim")]
+pub use connection::install_netsim_window_hook;
 pub use decode::{
     create_audio_peer_decoder, max_layers_for_kind, quality_state, AudioPeerDecoderTrait,
     DegradeReason, KindLayerBounds, PeerDecodeManager, PeerReceiveDiag, PrefMediaKind,

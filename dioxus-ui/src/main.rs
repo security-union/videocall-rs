@@ -62,6 +62,16 @@ fn main() {
     let level_filter = constants::log_level();
     log::set_max_level(level_filter);
 
+    // Issue #1080: install the `window.__vcNetsim` runtime control surface
+    // BEFORE the component tree mounts and before any meeting is joined, so
+    // the Playwright harness can arm downlink impairment pre-join and toggle
+    // it mid-call (climb → impair → heal). Feature-gated: a default build
+    // neither links nor registers it, so this is a no-op in production.
+    #[cfg(feature = "netsim")]
+    {
+        let _ = videocall_client::install_netsim_window_hook();
+    }
+
     dioxus::launch(App);
 }
 

@@ -672,9 +672,12 @@ fn send_layer_preference_via(
 ///     preserving the M2 healthy cold-start for WS clients;
 ///   * otherwise drives [`PeerDecodeManager::seed_early_congestion_for_wt_peers`]
 ///     (which now seeds purely on the per-peer congestion gate — the WT decision
-///     has already been made on the local transport) and then publishes the
-///     READ-ONLY [`PeerDecodeManager::current_desired_preferences`] map through
-///     the existing [`LayerPreferenceSender`], so `last_sent`/`last_sent_ms` stay
+///     has already been made on the local transport — and clamps each seeded layer
+///     to the user's receive bounds) and then publishes the
+///     [`PeerDecodeManager::current_desired_preferences`] map (clamped to the
+///     user's bounds and gated to layers below each kind's highest-available,
+///     mirroring the 5s tick; it advances no chooser hysteresis) through the
+///     existing [`LayerPreferenceSender`], so `last_sent`/`last_sent_ms` stay
 ///     coherent and the next 5s tick does not re-send a redundant packet.
 ///
 /// LIFECYCLE DECISION (issue #1179): the timer runs the FULL window and seeds any
@@ -752,18 +755,29 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
             return;
         }
 
+        // The user's GLOBAL receive-layer bounds, snapshotted (`Copy`) to avoid an
+        // aliasing borrow with `&mut peer_decode_manager` — same pattern as the 5s
+        // tick. The seed clamps each seeded layer to these bounds so the early path
+        // honors a manual receive `max` exactly as the tick does (PR #1192 review);
+        // the default (open) bounds make this an identity clamp.
+        let bounds = inner.receive_layer_bounds;
+
         // Seed any peer showing early congestion. The WT decision was already
         // made above on the local transport, so this loop no longer reads any
         // per-peer transport — it seeds purely on the congestion gate inside
         // `observe_early_congestion`.
         inner
             .peer_decode_manager
-            .seed_early_congestion_for_wt_peers(now_ms);
+            .seed_early_congestion_for_wt_peers(now_ms, &bounds);
 
-        // Publish the resulting (read-only) desired map through the existing
-        // sender so dedup/rate-limit invariants hold. A clean join seeds
-        // nothing → empty/unchanged map → sender suppresses → no packet (M2).
-        let desired = inner.peer_decode_manager.current_desired_preferences();
+        // Publish the resulting desired map through the existing sender so
+        // dedup/rate-limit invariants hold. The map is clamped to the user's
+        // bounds and gated to layers below each kind's highest-available, mirroring
+        // the 5s tick. A clean join seeds nothing → empty/unchanged map → sender
+        // suppresses → no packet (M2).
+        let desired = inner
+            .peer_decode_manager
+            .current_desired_preferences(now_ms, &bounds);
         if let Some(entries) = inner
             .layer_preference_sender
             .take_if_changed(&desired, now_ms)

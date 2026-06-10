@@ -27,22 +27,57 @@
  * does NOT modify the committed `dioxus-ui/scripts/config.js` nor the
  * developer's gitignored `config.local.js`).
  *
- * ## STATUS: MULTI-PARTY TESTS ARE `test.fixme` PENDING #1093
+ * ## STATUS: #1093 hook DELIVERED — the 4 SEND-side tests now RUN
  *
- * EVERY test in this spec joins TWO (or three) authenticated browser contexts —
- * a publisher + receiver(s) — each running camera + simulcast encode/decode.
- * In headless CI that crashes the renderer ("Target page/context closed") so the
- * 2nd context never reaches the grid, AND the capability ceiling clamps the
- * runner to 1 layer (so the multi-layer assertions would skip anyway). All of
- * these are therefore marked `test.fixme` (skipped, not run) until issue #1093
- * lands a renderer-crash-resilient / netsim runner + a capability-override hook
- * to force >=2 layers. The single-context structural coverage of the receive
- * Performance panel lives in `performance-settings.spec.ts` (#1078 Receive-side
- * controls), which is green. The `@impair` WS-divergence test stays `@impair`-
- * gated (and is subject to the same #1093 limits); the WT case stays `fixme`.
+ * Every test here joins TWO (or three) authenticated browser contexts — a
+ * publisher + receiver(s) — each running camera + simulcast encode/decode. Two
+ * things historically blocked them in headless CI: (1) the 2nd/3rd context never
+ * reached the grid, and (2) the device-sniffed capability ceiling clamped a
+ * low-core container to 1 layer, so the multi-layer assertions would have skipped
+ * anyway. Issue #1093 delivered the mitigations that unblock the SEND-side cases:
  *
- * The descriptions below document the INTENDED behaviour each `fixme` test will
- * assert once #1093 unblocks them.
+ *   - CAPABILITY-OVERRIDE HOOK — the test-only `testCapabilityMaxLayersOverride`
+ *     config key (commit bbfe784f) REPLACES the sniffed ceiling, so the runner
+ *     emits the full ladder regardless of core count. Wired via
+ *     `enableSimulcastFlag(ctx, 3, { capabilityMaxLayersOverride: 3 })`. Each
+ *     SEND test ALSO asserts the override took effect (the `TEST-OVERRIDDEN`
+ *     publisher console warn) BEFORE its `layerCount <= 1` skip guard, so a
+ *     silently-broken override fails loud rather than skipping (see
+ *     `assertCapabilityOverrideActive`).
+ *   - WAITING-ROOM AUTO-ADMIT — the host's pre-join Waiting Room toggle is
+ *     switched OFF in `joinMeeting` (with an async-settle on its `aria-checked`),
+ *     so subsequent joiners are admitted straight into the grid instead of being
+ *     parked. (This — NOT a renderer crash — was the real 2/3-context join blocker.)
+ *   - SERIAL-MODE renderer mitigation — each multi-browser describe runs
+ *     `mode: "serial"`, capping the peak concurrent heavy-renderer count on the
+ *     8-vCPU CI runner.
+ *
+ * THEREFORE THE FOLLOWING NOW RUN in the default `dioxus` suite (no longer
+ * `test.fixme`):
+ *   1. publisher emits >1 simulcast layer when the flag is on
+ *   2. receive needle never exceeds the user's max-layer threshold
+ *   3. default receive preference is Auto (full range)
+ *   4. receive Performance panel renders video + audio + content controls
+ *
+ * STILL `test.fixme` (with their gating issues — verify against the test bodies
+ * below before editing this list):
+ *   - audio readout reflects the multi-layer ladder (#1093 — not yet wired to the
+ *     override; audio-ladder coverage pending)
+ *   - receive diagnostics per-peer rows + "+N more" tail (#1093 — needs a real
+ *     multi-PUBLISHER, i.e. 3+ context, harness; documented stub)
+ *   - flag pinned to 1 / single-layer no-regression (#1093 — 2-context join; does
+ *     not need the override, but needs the renderer resilience)
+ *   - WT/QUIC per-receiver divergence (#1080 — toxiproxy is TCP-only; needs
+ *     per-client UDP netem)
+ *   - publish-side layer suppression, Stage 3 WT + WS (#1093 — 3-context harness)
+ *
+ * The `@impair` WS-divergence test (#1080 + #1108) RUNS, but only under
+ * `--project=impair` (it is grep-inverted out of the default suite). The
+ * single-context structural coverage of the receive Performance panel also lives
+ * in `performance-settings.spec.ts` (#1078 Receive-side controls), which is green.
+ *
+ * The descriptions on the remaining `test.fixme` cases document the INTENDED
+ * behaviour each will assert once its gating issue unblocks it.
  *
  * ## What runs in the default suite vs. the `@impair` project
  *
@@ -149,6 +184,65 @@ import { waitForServices } from "../helpers/wait-for-services";
 
 /** Transport the publish-suppression (#1108 Stage 3) cases are parameterised over. */
 type Transport = "webtransport" | "websocket";
+
+/**
+ * Distinctive, stable substring of the `warn!` line that
+ * `capability_max_simulcast_layers()` (dioxus-ui/src/components/capability_check.rs)
+ * emits to the browser console WHENEVER the #1093 `testCapabilityMaxLayersOverride`
+ * key is honoured. The full line is:
+ *
+ *   "simulcast capability ceiling is TEST-OVERRIDDEN to N layer(s) (requested
+ *    testCapabilityMaxLayersOverride=M, clamped to [1, D]); the device-sniffed
+ *    ceiling was S (...). This is an e2e-only hook (issue #1093) ..."
+ *
+ * We match the `TEST-OVERRIDDEN` token: it is unique to that override branch (the
+ * non-override path logs an `info!` "simulcast capability ceiling: ..." with NO
+ * such token), so its presence proves the override actually replaced the sniffed
+ * ceiling — i.e. the `/config.js` route patch landed `testCapabilityMaxLayersOverride`
+ * and the UI consumed it. Asserting this BEFORE the `layerCount <= 1` skip guard
+ * stops a silently-broken override (key rename, route interception failing, config
+ * clobber) from clamping to 1 layer and SKIPPING the test — which would turn the
+ * suite green having tested nothing.
+ */
+const CAPABILITY_OVERRIDE_LOG_TOKEN = "TEST-OVERRIDDEN";
+
+/**
+ * Attach a console-message collector to `page` and return the live array of
+ * captured message texts (wasm `log::warn!`/`info!` lines surface here via
+ * `console_log`). MUST be called BEFORE the page's first navigation so the boot
+ * log — which includes the capability-ceiling decision — is captured.
+ */
+function collectConsole(page: Page): string[] {
+  const lines: string[] = [];
+  page.on("console", (msg) => {
+    lines.push(msg.text());
+  });
+  return lines;
+}
+
+/**
+ * Assert — failing, never skipping — that the #1093 capability override actually
+ * took effect on the publisher, by waiting for the `TEST-OVERRIDDEN` `warn!` line
+ * to appear in the collected console output. This is the positive proof that the
+ * override injection worked; it must run BEFORE any `test.skip(layerCount <= 1)`
+ * guard so a broken override fails loudly instead of skipping the test.
+ *
+ * `lines` is the array returned by {@link collectConsole}, attached to the
+ * publisher page before navigation.
+ */
+async function assertCapabilityOverrideActive(lines: string[]): Promise<void> {
+  await expect
+    .poll(() => lines.some((line) => line.includes(CAPABILITY_OVERRIDE_LOG_TOKEN)), {
+      timeout: 30_000,
+      intervals: [250, 500, 1000],
+      message:
+        `expected the publisher console to log the #1093 capability override ("${CAPABILITY_OVERRIDE_LOG_TOKEN}"). ` +
+        "Its absence means testCapabilityMaxLayersOverride did NOT take effect (config.js route " +
+        "interception failing, key rename, or config clobber) — the override is silently broken and the " +
+        "multi-layer assertion would otherwise SKIP on a clamped single layer, testing nothing.",
+    })
+    .toBe(true);
+}
 
 /**
  * Pin a BrowserContext to a specific media transport BEFORE its first navigation
@@ -292,13 +386,42 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
       has: page.getByText("Waiting Room", { exact: true }),
     });
     const waitingRoomToggle = waitingRoomRow.getByRole("switch");
+    // The switch is rendered ONLY on the owner's pre-join card (`is_owner` in
+    // pre_join_settings_card.rs); on a non-host page it is absent and this whole
+    // block is a no-op. Guard on visibility so the receiver's card never blocks.
     if (await waitingRoomToggle.isVisible().catch(() => false)) {
-      if ((await waitingRoomToggle.getAttribute("aria-checked")) === "true") {
+      // SETTLE the toggle before reading it. Its `aria-checked` is seeded ASYNC
+      // from the server meeting status: the card can render `false` first and flip
+      // to `true` a beat later. A one-shot read can therefore catch the transient
+      // `false`, skip the click, and leave the Waiting Room ON — parking every
+      // later joiner. Poll until two consecutive reads (~250 ms apart) agree, so we
+      // act on the SETTLED state. Bounded; if it never settles we fall through and
+      // simply don't toggle (worst case = the pre-existing one-shot behaviour).
+      let settled: string | null = null;
+      await expect
+        .poll(
+          async () => {
+            const first = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            await page.waitForTimeout(250);
+            const second = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            if (first !== null && first === second) {
+              settled = second;
+              return true;
+            }
+            return false;
+          },
+          { timeout: 10_000, intervals: [250, 500] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never settled within budget — fall through without toggling */
+        });
+      if (settled === "true") {
         await waitingRoomToggle.click().catch(() => {
           /* toggle may have unmounted on a fast auto-join */
         });
         // The toggle writes the meeting setting via the meeting-api; wait for the
-        // switch to reflect OFF so the setting has been applied before we join.
+        // switch to flip to OFF so the setting has been applied before we join.
         await expect(waitingRoomToggle).toHaveAttribute("aria-checked", "false", {
           timeout: 10_000,
         });
@@ -511,8 +634,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation so the capability-ceiling
+      // boot log (the #1093 override warn) is collected.
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher");
       await joinMeeting(rxPage, meetingId, "SimReceiver");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the override actually took effect
+      // BEFORE the skip guard below. If injection silently broke, layerCount would
+      // clamp to 1 and the test would SKIP having tested nothing; this fails loud
+      // instead. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       // Each side should see the other's tile (peers connected).
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
@@ -591,8 +724,15 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher2");
       await joinMeeting(rxPage, meetingId, "SimReceiver2");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; see assertCapabilityOverrideActive. Runs before the skip guard.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -701,8 +841,16 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher3");
       await joinMeeting(rxPage, meetingId, "SimReceiver3");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — the "range spans up" assertion below relies
+      // on the override forcing a multi-layer ladder; prove the override landed (fail,
+      // not skip) before asserting against it. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -794,8 +942,16 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher5");
       await joinMeeting(rxPage, meetingId, "SimReceiver5");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — this test passes capabilityMaxLayersOverride
+      // for parity / a realistic multi-layer state, so prove it landed (fail, not skip).
+      // See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,

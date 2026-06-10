@@ -2030,6 +2030,234 @@ fn DualRangeSlider(
 /// styles (44×44 hit area, focus ring, aria-expanded, Escape/outside-click close,
 /// focus return) so every caller gets the same a11y treatment for free.
 ///
+/// Gap between the "?" button and its popover (matches the legacy `calc(100% +
+/// 8px)` offset). Also used as the viewport edge margin so the popover never sits
+/// flush to a screen edge.
+const HELP_POPOVER_GAP_PX: f64 = 8.0;
+
+/// Pure positioning math for the help popover, in viewport (CSS-pixel) coords.
+///
+/// The popover is rendered `position: fixed` so it escapes the Diagnostics
+/// drawer's scroll-clip (`#diagnostics-sidebar { overflow-y: auto }` clips BOTH
+/// axes per the CSS overflow-propagation rule). `fixed` anchors to the viewport
+/// (no transformed ancestor on desktop), so to keep the popover visually tied to
+/// its button we compute its top-left here from the button's rect.
+///
+/// Rules:
+///   - Horizontal: align the popover's LEFT to the button's left, then clamp into
+///     `[gap, viewport_w - w - gap]`. A button near the RIGHT drawer border is
+///     pulled left so the popover never overhangs the border (fixes the
+///     right-edge clip); a button near the left can't push it off-screen left.
+///   - Vertical: prefer BELOW the button (`button_bottom + gap`). If that would
+///     overflow the bottom margin AND there is more room ABOVE than below, FLIP to
+///     above (`button_top - gap - h`). Finally clamp into the vertical viewport
+///     so it can never spill past the top/bottom fold (fixes the bottom-fold
+///     clip). The flip is what a pure-CSS `top: calc(100% + 8px)` could not do.
+///
+/// Pure data in → `(left, top)` out, so it is unit-tested without a browser.
+fn compute_help_popover_position(
+    btn_left: f64,
+    btn_top: f64,
+    btn_bottom: f64,
+    popup_w: f64,
+    popup_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> (f64, f64) {
+    let gap = HELP_POPOVER_GAP_PX;
+
+    // Horizontal: left-align to the button, clamp into the viewport.
+    let max_left = (viewport_w - popup_w - gap).max(gap);
+    let left = btn_left.clamp(gap, max_left);
+
+    // Vertical: below by default; flip above when below overflows and above has
+    // more room.
+    let space_below = viewport_h - btn_bottom - gap;
+    let space_above = btn_top - gap;
+    let below_top = btn_bottom + gap;
+    let above_top = btn_top - gap - popup_h;
+    let max_top = (viewport_h - popup_h - gap).max(gap);
+    let top = if popup_h <= space_below {
+        // Fits below.
+        below_top
+    } else if space_above > space_below {
+        // Doesn't fit below and there's more room above → flip up, clamp so a
+        // very tall popover can't run off the TOP edge.
+        above_top.clamp(gap, max_top)
+    } else {
+        // More room below (or equal) but still doesn't fully fit → keep below,
+        // clamped (the popover's own max-height + internal scroll keep it usable).
+        below_top.clamp(gap, max_top)
+    };
+
+    (left, top)
+}
+
+/// Position the `position: fixed` help popover under (or above) its button, in
+/// the viewport, and keep it there while open. Reuses the codebase's established
+/// "fixed + clamp + reposition on scroll(capture)/resize + `use_drop` teardown"
+/// pattern (see `signal_quality::install_popup_anchor`) so the popover genuinely
+/// escapes the drawer's scroll-clip on every edge — without portaling the node out
+/// of its `.perf-help` wrapper, so all ids/testids/aria/scrim wiring stay put.
+///
+/// `open` gates installation: listeners + the initial rAF layout are attached only
+/// while the popover is open, and torn down when it closes or the component
+/// unmounts. `btn_id`/`popup_id` are read live each reposition tick so a stale
+/// rect is never used.
+///
+/// `open_help`/`key_id` (not a plain `bool`) are taken so the effect READS the
+/// signal inside its body and therefore re-runs every time the popover opens or
+/// closes WHILE the component stays mounted — the `HelpPopover` button is always
+/// mounted, so a captured `bool` would be read once at mount (`false`) and never
+/// re-fire on open. (Adversarial check 1: the `SimulcastLayersSection` bool-prop
+/// effect only "works" because that whole subtree mounts/unmounts; this one does
+/// not, so it must subscribe to the signal.)
+fn use_help_popover_anchor(
+    open_help: Signal<Option<&'static str>>,
+    key_id: &'static str,
+    btn_id: String,
+    popup_id: String,
+) {
+    use std::cell::RefCell;
+    use wasm_bindgen::closure::Closure;
+
+    struct AnchorState {
+        win: web_sys::Window,
+        resize_cb: Closure<dyn FnMut()>,
+        scroll_cb: Closure<dyn FnMut()>,
+    }
+
+    let state: Rc<RefCell<Option<AnchorState>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    {
+        let state = state.clone();
+        use_effect(move || {
+            // Read the signal INSIDE the effect so it re-runs on every open/close.
+            let open = open_help() == Some(key_id);
+
+            // Tear down any previous installation first (open→close, or a
+            // re-run) so listeners never stack.
+            if let Some(prev) = state.borrow_mut().take() {
+                let _ = prev.win.remove_event_listener_with_callback(
+                    "resize",
+                    prev.resize_cb.as_ref().unchecked_ref(),
+                );
+                let _ = prev.win.remove_event_listener_with_callback_and_bool(
+                    "scroll",
+                    prev.scroll_cb.as_ref().unchecked_ref(),
+                    true,
+                );
+            }
+
+            if !open {
+                return;
+            }
+            let Some(win) = web_sys::window() else {
+                return;
+            };
+
+            let reposition = {
+                let btn_id = btn_id.clone();
+                let popup_id = popup_id.clone();
+                move || reposition_help_popover(&btn_id, &popup_id)
+            };
+
+            // First paint can race the popover attaching to the DOM, so lay it
+            // out on the next animation frame (after the layout engine can
+            // measure the popover's natural size).
+            {
+                let rep = reposition.clone();
+                let cb = Closure::once_into_js(move |_ts: f64| rep());
+                let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+
+            let resize_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ =
+                win.add_event_listener_with_callback("resize", resize_cb.as_ref().unchecked_ref());
+
+            // Capture-phase scroll so we observe scrolling on the drawer (any
+            // ancestor scroll container), not just the window.
+            let scroll_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ = win.add_event_listener_with_callback_and_bool(
+                "scroll",
+                scroll_cb.as_ref().unchecked_ref(),
+                true,
+            );
+
+            *state.borrow_mut() = Some(AnchorState {
+                win,
+                resize_cb,
+                scroll_cb,
+            });
+        });
+    }
+
+    use_drop(move || {
+        if let Some(prev) = state.borrow_mut().take() {
+            let _ = prev.win.remove_event_listener_with_callback(
+                "resize",
+                prev.resize_cb.as_ref().unchecked_ref(),
+            );
+            let _ = prev.win.remove_event_listener_with_callback_and_bool(
+                "scroll",
+                prev.scroll_cb.as_ref().unchecked_ref(),
+                true,
+            );
+        }
+    });
+}
+
+/// Measure the button + popover and write the computed `left/top` (viewport
+/// coords) onto the `position: fixed` popover. No-op if either element is absent
+/// or the window is unavailable.
+fn reposition_help_popover(btn_id: &str, popup_id: &str) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let Some(doc) = win.document() else {
+        return;
+    };
+    let (Some(btn), Some(popup)) = (
+        doc.get_element_by_id(btn_id),
+        doc.get_element_by_id(popup_id),
+    ) else {
+        return;
+    };
+    let btn_rect = btn.get_bounding_client_rect();
+    let popup_rect = popup.get_bounding_client_rect();
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let (left, top) = compute_help_popover_position(
+        btn_rect.left(),
+        btn_rect.top(),
+        btn_rect.bottom(),
+        popup_rect.width(),
+        popup_rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+
+    if let Some(html) = popup.dyn_ref::<web_sys::HtmlElement>() {
+        let _ = html.style().set_property("left", &format!("{left:.1}px"));
+        let _ = html.style().set_property("top", &format!("{top:.1}px"));
+    }
+}
+
 /// `pub(crate)` so the Diagnostics drawer can mount it directly rather than
 /// duplicating the markup (single source of truth for the help affordance).
 #[component]
@@ -2045,6 +2273,18 @@ pub(crate) fn HelpPopover(
     let help_open = open_help() == Some(key_id);
     let help_popover_id = format!("{key_id}-help-popover");
     let help_btn_id = format!("{key_id}-help-btn");
+
+    // Position the `position: fixed` popover so it escapes the drawer's
+    // scroll-clip on every edge (right border + bottom fold). Installed only
+    // while open; torn down on close/unmount. Takes the signal (not `help_open`)
+    // so the effect re-fires on open/close while the button stays mounted.
+    // (#1131 scroll-clip fix)
+    use_help_popover_anchor(
+        open_help,
+        key_id,
+        help_btn_id.clone(),
+        help_popover_id.clone(),
+    );
 
     rsx! {
         div { class: "perf-help",
@@ -3839,6 +4079,61 @@ pub mod receive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Help popover positioning (drawer scroll-clip fix, #1131) ──────
+    // The popover is `position: fixed`; this math keeps it on-screen on every
+    // edge. All cases use gap = HELP_POPOVER_GAP_PX (8.0).
+
+    /// Roomy case: button mid-viewport → popover sits directly below, left edge
+    /// aligned to the button. (Breaks if the below-default or left-align changes.)
+    #[test]
+    fn help_popover_opens_below_when_room() {
+        // button at (100, 200)-(122, 222), popover 260x120, viewport 720x1000.
+        let (left, top) =
+            compute_help_popover_position(100.0, 200.0, 222.0, 260.0, 120.0, 720.0, 1000.0);
+        assert_eq!(left, 100.0, "left aligns to the button when it fits");
+        assert_eq!(top, 222.0 + 8.0, "opens just below the button");
+    }
+
+    /// Right-edge clip: a button near the RIGHT drawer border must pull the
+    /// popover LEFT so its right edge stays inside `viewport_w - gap`. (This is
+    /// the horizontal half of the reported bug.)
+    #[test]
+    fn help_popover_clamps_off_right_edge() {
+        // viewport 720 wide; button left at 700 would put a 260px popover at
+        // 700..960, 240px off-screen. Expect left clamped to 720-260-8 = 452.
+        let (left, _top) =
+            compute_help_popover_position(700.0, 100.0, 122.0, 260.0, 120.0, 720.0, 1000.0);
+        assert_eq!(
+            left, 452.0,
+            "popover pulled left to stay within the viewport"
+        );
+        assert!(left + 260.0 <= 720.0 - 8.0 + 0.001);
+    }
+
+    /// Bottom-fold clip: a tall popover whose below-placement would overflow the
+    /// bottom, with MORE room above, must FLIP above the button. (The vertical
+    /// half of the bug — a pure-CSS `top: calc(100% + 8px)` could never do this.)
+    #[test]
+    fn help_popover_flips_above_near_bottom() {
+        // viewport 600 tall; button at bottom (560..582), popover 200 tall.
+        // Below would be 590..790 (off-screen). Above-room (560-8=552) >
+        // below-room (600-582-8=10) → flip: top = 560 - 8 - 200 = 352.
+        let (_left, top) =
+            compute_help_popover_position(100.0, 560.0, 582.0, 260.0, 200.0, 720.0, 600.0);
+        assert_eq!(top, 352.0, "flips above the button when below overflows");
+        assert!(top >= 8.0, "stays below the top margin");
+    }
+
+    /// Degenerate: popover taller than EITHER side → kept below but clamped so it
+    /// never spills past the bottom (its max-height + internal scroll do the rest).
+    #[test]
+    fn help_popover_clamps_when_taller_than_viewport() {
+        // popover 900 tall, viewport 600 → max_top = max(600-900-8, 8) = 8.
+        let (_left, top) =
+            compute_help_popover_position(100.0, 100.0, 122.0, 260.0, 900.0, 720.0, 600.0);
+        assert_eq!(top, 8.0, "clamped to the top margin, not off-screen");
+    }
 
     // ── Live diagnostics formatters (issue #1095) ──────────────────────
 

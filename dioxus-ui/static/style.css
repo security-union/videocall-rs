@@ -1069,8 +1069,9 @@ html[data-theme="dark"] #diagnostics-sidebar {
 }
 
 /* Section header row that carries an inline "?" help popover next to its <h3>
-   (e.g. "Current Status", "NetEQ charts"). The wrapper is the popover's
-   positioning context (`.perf-help` inside it is position:relative). (#1131) */
+   (e.g. "Current Status", "NetEQ charts"). The popover itself is `position: fixed`
+   and positioned by `use_help_popover_anchor` (see `.perf-help-popover`), so this
+   row only needs to lay out the <h3> + button. (#1131) */
 .diag-section-head {
   display: flex;
   align-items: center;
@@ -1078,20 +1079,6 @@ html[data-theme="dark"] #diagnostics-sidebar {
 }
 .diag-section-head h3 {
   margin: 0;
-}
-
-/* The diagnostics section-header help popovers sit near the RIGHT edge of the
-   drawer (the <h3> + "?" row spans the panel width), so a left-anchored popover
-   would overhang off-screen. Anchor THESE popovers to the right of their button
-   so they open leftward into the panel — mirrors the receive-column rule
-   (`.perf-side--recv .perf-help-popover`). Scoped to `.diag-section-head` so the
-   Quality-controls perf cards keep their own left/right anchoring unchanged. The
-   `90cqw` cap in the base rule only applies inside a container-query context (the
-   perf cards); here the fixed 260px width plus the wide drawer keeps it on-screen.
-   (#1131) */
-.diag-section-head .perf-help-popover {
-  left: auto;
-  right: 0;
 }
 
 /* Honour reduced-motion for the drawer slide on BOTH the desktop `right`
@@ -8015,28 +8002,31 @@ details.perf-peers[open] .perf-peers__chev {
   background: transparent;
 }
 
+/* `position: fixed` so the popover escapes the Diagnostics drawer's scroll-clip
+   on EVERY edge: `#diagnostics-sidebar { overflow-y: auto }` makes the box clip
+   both axes (CSS overflow propagation), and an `absolute` popover anchored to a
+   wrapper INSIDE that scroll box was clipped at the right border (horizontal) and
+   the bottom fold (vertical). `fixed` anchors to the viewport (no transformed
+   ancestor on desktop), and `use_help_popover_anchor` writes the live `left/top`
+   each open + on scroll(capture)/resize, flipping the popover ABOVE the button
+   when there isn't room below. The inline `left/top` overrides the safe defaults
+   below (off-screen-left until the first reposition tick, so no flash at 0,0).
+   `max-height` + `overflow:auto` keep a tall popover usable on short viewports.
+   (#1131 scroll-clip fix) */
 .perf-help-popover {
-  position: absolute;
+  position: fixed;
   z-index: 1001;
-  top: calc(100% + 8px);
-  left: 0;
+  left: -9999px;
+  top: 0;
   width: 260px;
-  /* Cap to the card's own width so the popover can't overhang the card / modal
-     edge (#8). `cqw` resolves against `.perf-kind-card` (container-type set). */
-  max-width: min(260px, 90cqw);
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 12px 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
-}
-
-/* Receive column is the RIGHT column: anchor its popover to the right edge so it
-   opens leftward into the card instead of overhanging the modal's right side
-   (#8). */
-.perf-side--recv .perf-help-popover {
-  left: auto;
-  right: 0;
 }
 
 .perf-help-popover-text {

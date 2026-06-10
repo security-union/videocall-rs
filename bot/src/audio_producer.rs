@@ -407,6 +407,19 @@ impl AudioProducer {
     }
 }
 
+impl Drop for AudioProducer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn get_timestamp_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::{next_speaking_state, RMS_SPEAKING_ENTER, RMS_SPEAKING_EXIT};
@@ -422,17 +435,4 @@ mod tests {
         assert!(next_speaking_state(true, RMS_SPEAKING_ENTER - 0.0005));
         assert!(!next_speaking_state(true, RMS_SPEAKING_EXIT - 0.0005));
     }
-}
-
-impl Drop for AudioProducer {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn get_timestamp_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64
 }

@@ -264,8 +264,6 @@ impl ::protobuf::reflect::ProtobufValue for DiagnosticsPacket {
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct VideoMetrics {
     // message fields
-    // @@protoc_insertion_point(field:VideoMetrics.fps_received)
-    pub fps_received: f32,
     // @@protoc_insertion_point(field:VideoMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
     // special fields
@@ -285,13 +283,8 @@ impl VideoMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(1);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "fps_received",
-            |m: &VideoMetrics| { &m.fps_received },
-            |m: &mut VideoMetrics| { &mut m.fps_received },
-        ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "bitrate_kbps",
             |m: &VideoMetrics| { &m.bitrate_kbps },
@@ -315,9 +308,6 @@ impl ::protobuf::Message for VideoMetrics {
     fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
         while let Some(tag) = is.read_raw_tag_or_eof()? {
             match tag {
-                13 => {
-                    self.fps_received = is.read_float()?;
-                },
                 16 => {
                     self.bitrate_kbps = is.read_uint32()?;
                 },
@@ -333,9 +323,6 @@ impl ::protobuf::Message for VideoMetrics {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.fps_received != 0. {
-            my_size += 1 + 4;
-        }
         if self.bitrate_kbps != 0 {
             my_size += ::protobuf::rt::uint32_size(2, self.bitrate_kbps);
         }
@@ -345,9 +332,6 @@ impl ::protobuf::Message for VideoMetrics {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.fps_received != 0. {
-            os.write_float(1, self.fps_received)?;
-        }
         if self.bitrate_kbps != 0 {
             os.write_uint32(2, self.bitrate_kbps)?;
         }
@@ -368,14 +352,12 @@ impl ::protobuf::Message for VideoMetrics {
     }
 
     fn clear(&mut self) {
-        self.fps_received = 0.;
         self.bitrate_kbps = 0;
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static VideoMetrics {
         static instance: VideoMetrics = VideoMetrics {
-            fps_received: 0.,
             bitrate_kbps: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
@@ -405,8 +387,6 @@ impl ::protobuf::reflect::ProtobufValue for VideoMetrics {
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct AudioMetrics {
     // message fields
-    // @@protoc_insertion_point(field:AudioMetrics.fps_received)
-    pub fps_received: f32,
     // @@protoc_insertion_point(field:AudioMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
     // special fields
@@ -426,13 +406,8 @@ impl AudioMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(1);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "fps_received",
-            |m: &AudioMetrics| { &m.fps_received },
-            |m: &mut AudioMetrics| { &mut m.fps_received },
-        ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "bitrate_kbps",
             |m: &AudioMetrics| { &m.bitrate_kbps },
@@ -456,9 +431,6 @@ impl ::protobuf::Message for AudioMetrics {
     fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
         while let Some(tag) = is.read_raw_tag_or_eof()? {
             match tag {
-                13 => {
-                    self.fps_received = is.read_float()?;
-                },
                 16 => {
                     self.bitrate_kbps = is.read_uint32()?;
                 },
@@ -474,9 +446,6 @@ impl ::protobuf::Message for AudioMetrics {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.fps_received != 0. {
-            my_size += 1 + 4;
-        }
         if self.bitrate_kbps != 0 {
             my_size += ::protobuf::rt::uint32_size(2, self.bitrate_kbps);
         }
@@ -486,9 +455,6 @@ impl ::protobuf::Message for AudioMetrics {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.fps_received != 0. {
-            os.write_float(1, self.fps_received)?;
-        }
         if self.bitrate_kbps != 0 {
             os.write_uint32(2, self.bitrate_kbps)?;
         }
@@ -509,14 +475,12 @@ impl ::protobuf::Message for AudioMetrics {
     }
 
     fn clear(&mut self) {
-        self.fps_received = 0.;
         self.bitrate_kbps = 0;
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static AudioMetrics {
         static instance: AudioMetrics = AudioMetrics {
-            fps_received: 0.,
             bitrate_kbps: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
@@ -549,59 +513,65 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\x04\x20\x01(\x04R\x0btimestampMs\x125\n\nmedia_type\x18\x05\x20\x01\
     (\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x122\n\rvideo_metrics\x18\
     \x06\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\x122\n\raudio_metrics\
-    \x18\x07\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMetrics\"T\n\x0cVideoMetr\
-    ics\x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\
-    \x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbps\"T\n\x0cAudioMetrics\
-    \x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\x0cb\
-    itrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\xf9\n\n\x06\x12\x04\0\0\
-    \x1f\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n+\n\x02\x03\0\x12\x03\x03\0\"\
-    \x1a\x20\x20Import\x20the\x20MediaPacket\x20message\n\n\n\n\x02\x04\0\
-    \x12\x04\x05\0\x13\x01\n\n\n\x03\x04\0\x01\x12\x03\x05\x08\x19\nY\n\x04\
-    \x04\0\x02\0\x12\x03\x07\x02\x17\x1a\x16\x20Basic\x20identification\n\"4\
-    \x20Identifier\x20for\x20the\x20specific\x20stream\x20being\x20diagnosed\
-    \n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \0\x01\x12\x03\x07\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x07\x15\x16\
-    \nA\n\x04\x04\0\x02\x01\x12\x03\x08\x02\x17\"4\x20Email/ID\x20of\x20who\
-    \x20is\x20sending\x20this\x20diagnostic\x20message\n\n\x0c\n\x05\x04\0\
-    \x02\x01\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
-    \x08\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x08\x15\x16\n6\n\x04\
-    \x04\0\x02\x02\x12\x03\t\x02\x17\")\x20Email/ID\x20of\x20who\x20the\x20d\
-    iagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\t\x02\
-    \x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\t\t\x12\n\x0c\n\x05\x04\0\x02\
-    \x02\x03\x12\x03\t\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\n\x02\x1a\"B\
-    \x20When\x20these\x20diagnostics\x20were\x20collected\x20(milliseconds\
-    \x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\n\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x03\x01\x12\x03\n\t\x15\n\x0c\n\x05\x04\0\x02\x03\
-    \x03\x12\x03\n\x18\x19\n1\n\x04\x04\0\x02\x04\x12\x03\x0c\x02'\"$\x20Typ\
-    e\x20of\x20media\x20(audio/video/screen)\n\n\x0c\n\x05\x04\0\x02\x04\x06\
-    \x12\x03\x0c\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x0c\x18\"\n\
-    \x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0c%&\nH\n\x04\x04\0\x02\x05\x12\
-    \x03\x0f\x02!\x1a;\x20Video-specific\x20metrics\x20(only\x20populated\
-    \x20for\x20video\x20streams)\n\n\x0c\n\x05\x04\0\x02\x05\x06\x12\x03\x0f\
-    \x02\x0e\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x0f\x0f\x1c\n\x0c\n\x05\
-    \x04\0\x02\x05\x03\x12\x03\x0f\x1f\x20\nH\n\x04\x04\0\x02\x06\x12\x03\
-    \x12\x02!\x1a;\x20Audio-specific\x20metrics\x20(only\x20populated\x20for\
-    \x20audio\x20streams)\n\n\x0c\n\x05\x04\0\x02\x06\x06\x12\x03\x12\x02\
-    \x0e\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x12\x0f\x1c\n\x0c\n\x05\x04\0\
-    \x02\x06\x03\x12\x03\x12\x1f\x20\n/\n\x02\x04\x01\x12\x04\x16\0\x19\x01\
-    \x1a#\x20Video-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\
-    \x12\x03\x16\x08\x14\n5\n\x04\x04\x01\x02\0\x12\x03\x17\x02\x19\"(\x20Fr\
-    ames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\
-    \x01\x02\0\x05\x12\x03\x17\x02\x07\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\
-    \x17\x08\x14\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x17\x17\x18\n=\n\x04\
-    \x04\x01\x02\x01\x12\x03\x18\x02\x1a\"0\x20Current\x20measured\x20bitrat\
-    e\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\
-    \x03\x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x18\t\x15\n\x0c\
-    \n\x05\x04\x01\x02\x01\x03\x12\x03\x18\x18\x19\n/\n\x02\x04\x02\x12\x04\
-    \x1c\0\x1f\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\
-    \x03\x04\x02\x01\x12\x03\x1c\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x03\x1d\
-    \x02\x19\"(\x20Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\
-    \x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\x02\x02\
-    \0\x01\x12\x03\x1d\x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03\x1d\x17\
-    \x18\n=\n\x04\x04\x02\x02\x01\x12\x03\x1e\x02\x1a\"0\x20Current\x20measu\
-    red\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x02\x02\
-    \x01\x05\x12\x03\x1e\x02\x08\n\x0c\n\x05\x04\x02\x02\x01\x01\x12\x03\x1e\
-    \t\x15\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x03\x1e\x18\x19b\x06proto3\
+    \x18\x07\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMetrics\"E\n\x0cVideoMetr\
+    ics\x12!\n\x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\x04\x08\
+    \x01\x10\x02R\x0cfps_received\"E\n\x0cAudioMetrics\x12!\n\x0cbitrate_kbp\
+    s\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\x04\x08\x01\x10\x02R\x0cfps_receiv\
+    edJ\x91\r\n\x06\x12\x04\0\0%\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n+\n\
+    \x02\x03\0\x12\x03\x03\0\"\x1a\x20\x20Import\x20the\x20MediaPacket\x20me\
+    ssage\n\n\n\n\x02\x04\0\x12\x04\x05\0\x13\x01\n\n\n\x03\x04\0\x01\x12\
+    \x03\x05\x08\x19\nY\n\x04\x04\0\x02\0\x12\x03\x07\x02\x17\x1a\x16\x20Bas\
+    ic\x20identification\n\"4\x20Identifier\x20for\x20the\x20specific\x20str\
+    eam\x20being\x20diagnosed\n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x07\x02\
+    \x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x07\t\x12\n\x0c\n\x05\x04\0\x02\
+    \0\x03\x12\x03\x07\x15\x16\nA\n\x04\x04\0\x02\x01\x12\x03\x08\x02\x17\"4\
+    \x20Email/ID\x20of\x20who\x20is\x20sending\x20this\x20diagnostic\x20mess\
+    age\n\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\
+    \0\x02\x01\x01\x12\x03\x08\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\
+    \x08\x15\x16\n6\n\x04\x04\0\x02\x02\x12\x03\t\x02\x17\")\x20Email/ID\x20\
+    of\x20who\x20the\x20diagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\
+    \x02\x05\x12\x03\t\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\t\t\x12\
+    \n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\t\x15\x16\nO\n\x04\x04\0\x02\x03\
+    \x12\x03\n\x02\x1a\"B\x20When\x20these\x20diagnostics\x20were\x20collect\
+    ed\x20(milliseconds\x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\
+    \x12\x03\n\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\n\t\x15\n\x0c\n\
+    \x05\x04\0\x02\x03\x03\x12\x03\n\x18\x19\n1\n\x04\x04\0\x02\x04\x12\x03\
+    \x0c\x02'\"$\x20Type\x20of\x20media\x20(audio/video/screen)\n\n\x0c\n\
+    \x05\x04\0\x02\x04\x06\x12\x03\x0c\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x01\
+    \x12\x03\x0c\x18\"\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0c%&\nH\n\x04\
+    \x04\0\x02\x05\x12\x03\x0f\x02!\x1a;\x20Video-specific\x20metrics\x20(on\
+    ly\x20populated\x20for\x20video\x20streams)\n\n\x0c\n\x05\x04\0\x02\x05\
+    \x06\x12\x03\x0f\x02\x0e\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x0f\x0f\
+    \x1c\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x0f\x1f\x20\nH\n\x04\x04\0\
+    \x02\x06\x12\x03\x12\x02!\x1a;\x20Audio-specific\x20metrics\x20(only\x20\
+    populated\x20for\x20audio\x20streams)\n\n\x0c\n\x05\x04\0\x02\x06\x06\
+    \x12\x03\x12\x02\x0e\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x12\x0f\x1c\n\
+    \x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x12\x1f\x20\n/\n\x02\x04\x01\x12\
+    \x04\x16\0\x1c\x01\x1a#\x20Video-specific\x20diagnostic\x20metrics\n\n\n\
+    \n\x03\x04\x01\x01\x12\x03\x16\x08\x14\n\xa8\x01\n\x03\x04\x01\t\x12\x03\
+    \x19\x02\r\x1a\x9b\x01\x20Field\x201\x20(fps_received)\x20removed\x20in\
+    \x20#1184:\x20dead\x20receiver-FPS\x20telemetry\x20that\x20was\n\x20only\
+    \x20ever\x20written,\x20never\x20consumed.\x20Field\x20number\x20reserve\
+    d\x20to\x20prevent\x20reuse.\n\n\x0b\n\x04\x04\x01\t\0\x12\x03\x19\x0b\
+    \x0c\n\x0c\n\x05\x04\x01\t\0\x01\x12\x03\x19\x0b\x0c\n\x0c\n\x05\x04\x01\
+    \t\0\x02\x12\x03\x19\x0b\x0c\n\n\n\x03\x04\x01\n\x12\x03\x1a\x02\x1a\n\
+    \x0b\n\x04\x04\x01\n\0\x12\x03\x1a\x0b\x19\n=\n\x04\x04\x01\x02\0\x12\
+    \x03\x1b\x02\x1a\"0\x20Current\x20measured\x20bitrate\x20(kilobits\x20pe\
+    r\x20second)\n\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x1b\x02\x08\n\x0c\n\
+    \x05\x04\x01\x02\0\x01\x12\x03\x1b\t\x15\n\x0c\n\x05\x04\x01\x02\0\x03\
+    \x12\x03\x1b\x18\x19\n/\n\x02\x04\x02\x12\x04\x1f\0%\x01\x1a#\x20Audio-s\
+    pecific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\x02\x01\x12\x03\x1f\x08\
+    \x14\n\xa8\x01\n\x03\x04\x02\t\x12\x03\"\x02\r\x1a\x9b\x01\x20Field\x201\
+    \x20(fps_received)\x20removed\x20in\x20#1184:\x20dead\x20receiver-FPS\
+    \x20telemetry\x20that\x20was\n\x20only\x20ever\x20written,\x20never\x20c\
+    onsumed.\x20Field\x20number\x20reserved\x20to\x20prevent\x20reuse.\n\n\
+    \x0b\n\x04\x04\x02\t\0\x12\x03\"\x0b\x0c\n\x0c\n\x05\x04\x02\t\0\x01\x12\
+    \x03\"\x0b\x0c\n\x0c\n\x05\x04\x02\t\0\x02\x12\x03\"\x0b\x0c\n\n\n\x03\
+    \x04\x02\n\x12\x03#\x02\x1a\n\x0b\n\x04\x04\x02\n\0\x12\x03#\x0b\x19\n=\
+    \n\x04\x04\x02\x02\0\x12\x03$\x02\x1a\"0\x20Current\x20measured\x20bitra\
+    te\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x02\x02\0\x05\x12\
+    \x03$\x02\x08\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03$\t\x15\n\x0c\n\x05\
+    \x04\x02\x02\0\x03\x12\x03$\x18\x19b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

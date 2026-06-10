@@ -505,12 +505,10 @@ impl DiagnosticWorker {
 
                     if *media_type == MediaType::AUDIO {
                         let mut audio_metrics = AudioMetrics::new();
-                        audio_metrics.fps_received = fps as f32;
                         audio_metrics.bitrate_kbps = bitrate as u32;
                         packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
                     } else {
                         let mut video_metrics = VideoMetrics::new();
-                        video_metrics.fps_received = fps as f32;
                         video_metrics.bitrate_kbps = bitrate as u32;
                         packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                     }

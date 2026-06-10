@@ -207,19 +207,14 @@ fn build_wrapper(
     match media_type {
         MediaType::VIDEO => {
             let mut vm = VideoMetrics::new();
-            // Each MediaPacket with media_type=VIDEO is one encoded frame
-            // (the transport layer reassembles fragmented payloads before
-            // InboundStats sees them). Drain window is ~1s, so packet
-            // count ≈ frames/sec. Timing jitter between drains can produce
-            // ±1-2 vs the true sender FPS but this matches the browser's
-            // approximation granularity.
-            vm.fps_received = counters.video_packets as f32;
+            // NOTE(#1184): VideoMetrics.fps_received was removed (dead
+            // receiver-FPS telemetry — written but never consumed). Only the
+            // live bitrate signal remains.
             vm.bitrate_kbps = bytes_to_kbps(counters.video_bytes);
             packet.video_metrics = MessageField::some(vm);
         }
         MediaType::AUDIO => {
             let mut am = AudioMetrics::new();
-            am.fps_received = counters.audio_packets as f32;
             am.bitrate_kbps = bytes_to_kbps(counters.audio_bytes);
             packet.audio_metrics = MessageField::some(am);
         }
@@ -316,7 +311,6 @@ mod tests {
         assert_eq!(diag.sender_id, sender_id);
         assert_eq!(diag.media_type.enum_value(), Ok(MediaType::VIDEO));
         let vm = diag.video_metrics.as_ref().expect("video metrics present");
-        assert_eq!(vm.fps_received, 30.0f32);
         // 125_000 bytes/s * 8 / 1000 = 1000 kbps
         assert_eq!(vm.bitrate_kbps, 1000);
         assert!(diag.audio_metrics.is_none());
@@ -336,7 +330,6 @@ mod tests {
         let diag = DiagnosticsPacket::parse_from_bytes(&wrapper.data).expect("diag");
         assert_eq!(diag.media_type.enum_value(), Ok(MediaType::AUDIO));
         let am = diag.audio_metrics.as_ref().expect("audio metrics present");
-        assert_eq!(am.fps_received, 50.0f32);
         // 5_000 * 8 / 1000 = 40 kbps
         assert_eq!(am.bitrate_kbps, 40);
         assert!(diag.video_metrics.is_none());

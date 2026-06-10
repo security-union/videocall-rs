@@ -180,6 +180,38 @@ pub fn forget_room_metrics(room: &str) {
         // relay_outbound_queue_depth / relay_active_sessions_per_room
         // {room, transport} gauges.
         let _ = RELAY_OUTBOUND_QUEUE_DEPTH.remove_label_values(&[room, transport]);
+        // EVICTION-PATH ORDERING RACE — benign, transient, self-healing (#1187).
+        //
+        // `relay_active_sessions_per_room{room,transport}` is `.inc()`'d in
+        // `SessionLogic::track_connection_start` and `.dec()`'d in
+        // `SessionLogic::on_stopping`. On the LEAVE path the actor's
+        // `on_stopping().dec()` runs first and `forget_room_metrics` (this
+        // removal) runs after the room has drained, so the series is removed at
+        // its true `0.0` resting value.
+        //
+        // On the EVICTION path the order can INVERT. `ChatServer::forget_session`
+        // (reached via `evict_stale_session` on an `EvictInstance` NATS message)
+        // calls `forget_room_metrics(room)` synchronously the moment it removes
+        // the evicted session from `room_members` and the room becomes empty —
+        // BUT the evicted session is a *separate, still-alive* actix actor.
+        // `forget_session` only tears down ChatServer's bookkeeping and aborts
+        // the NATS sub task; it does NOT stop that actor synchronously. The
+        // evicted actor's `on_stopping().dec()` therefore fires LATER (when its
+        // connection actually closes), AFTER this `remove_label_values` already
+        // deleted the `{room,transport}` series. A `.dec()` on a removed series
+        // RE-CREATES it at `-1.0`.
+        //
+        // This is NOT the #996 permanent leak: it can only happen when the
+        // evicted session was the room's LAST member (otherwise the room stays
+        // populated and this removal does not run), and the -1.0 series is
+        // erased again by the next `forget_room_metrics` for that room, or
+        // corrected the instant any session re-joins (`track_connection_start`
+        // `.inc()` brings it to 0.0). A guard here is not trivially safe — a
+        // GaugeVec has no cheap "does this series exist" probe that would not
+        // itself re-create the series — and the dec()/remove() ordering cannot
+        // be sequenced from ChatServer because the evicted actor stops
+        // asynchronously. The transient -1.0 is therefore documented as benign
+        // rather than guarded (issue #1187, option a).
         let _ = RELAY_ACTIVE_SESSIONS_PER_ROOM.remove_label_values(&[room, transport]);
     }
 
@@ -617,14 +649,8 @@ lazy_static! {
     .expect("Failed to create videocall_client_reelection_total metric");
 
     // ===== ENCODER & SCREEN SHARE METRICS (sender-side, P0/P1) =====
-
-    /// Encoder fps_ratio (received/target) driving tier decisions
-    pub static ref ENCODER_FPS_RATIO: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_fps_ratio",
-        "Ratio of received FPS to target FPS driving adaptive quality decisions",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
-    )
-    .expect("Failed to create encoder_fps_ratio metric");
+    // NOTE(#1184): videocall_encoder_fps_ratio / videocall_encoder_bitrate_ratio
+    // removed — dead telemetry whose source proto fields no longer exist.
 
     /// p75 peer FPS signal driving encoder decisions.
     pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
@@ -665,14 +691,6 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create encoder_target_bitrate_kbps metric");
-
-    /// Encoder bitrate ratio
-    pub static ref ENCODER_BITRATE_RATIO: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_bitrate_ratio",
-        "Ratio of current bitrate to ideal bitrate for tier selection",
-        &["meeting_id", "session_id", "peer_id", "display_name"]
-    )
-    .expect("Failed to create encoder_bitrate_ratio metric");
 
     // ===== DECODE-BUDGET STATE (#987 / PR #999) =====
 

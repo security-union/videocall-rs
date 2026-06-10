@@ -278,13 +278,16 @@ impl BotAq {
         ctrl.tick(now);
 
         // Always publish the latest telemetry — useful for health reporting even
-        // when the tier has not changed. NOTE(#1108): `last_fps_ratio` /
-        // `last_bitrate_ratio` are now NaN (receiver FPS removed), and
-        // `last_p75_peer_fps` is repointed to the encoder queue depth.
+        // when the tier has not changed. NOTE(#1184): the fps_ratio /
+        // bitrate_ratio AQ accessors and their dead proto fields were removed
+        // (receiver FPS no longer feeds the sender AQ); they are sourced as NaN
+        // here so the bot-local atomics/gauges stay wired without a larger
+        // refactor. `encoder_queue_depth` carries the sender backpressure signal
+        // formerly exposed via the misnamed `last_p75_peer_fps`.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
-        let p75_peer_fps = ctrl.last_p75_peer_fps() as f32;
-        let fps_ratio = ctrl.last_fps_ratio() as f32;
-        let bitrate_ratio = ctrl.last_bitrate_ratio() as f32;
+        let p75_peer_fps = ctrl.encoder_queue_depth() as f32;
+        let fps_ratio = f32::NAN;
+        let bitrate_ratio = f32::NAN;
         self.last_target_bitrate_kbps_bits
             .store(target_bitrate.to_bits(), Ordering::Relaxed);
         self.last_p75_peer_fps_bits

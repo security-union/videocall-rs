@@ -28,7 +28,7 @@ use crate::actors::priority_drop::{
 };
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{
-    wt_outbound_channel_capacity, CLIENT_TIMEOUT, WT_DATAGRAM_CHANNEL_CAPACITY,
+    wt_mailbox_capacity, wt_outbound_channel_capacity, CLIENT_TIMEOUT, WT_DATAGRAM_CHANNEL_CAPACITY,
 };
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -580,12 +580,37 @@ impl Actor for WtChatSession {
         // review.) The value is derived from the same constants/resolver
         // the channels are built with, so it stays in lock-step with both.
         //
-        // This does NOT add meaningful buffering — it relocates overflow
-        // off the dumb 16-slot mailbox onto the policy-aware channels,
-        // which shed VIDEO/SCREEN first, protect AUDIO to ~95%, never
-        // preempt Critical lifecycle packets, and fire CONGESTION back to
-        // the sender via `on_outbound_drop`.
-        ctx.set_mailbox_capacity(wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY);
+        // Sizing the mailbox at the SUM of both channels (issue #1057, PR
+        // #1060) relocates a *steady-state* overflow off the dumb mailbox onto
+        // the policy-aware channels, which shed VIDEO/SCREEN first, protect
+        // AUDIO to ~95%, never preempt Critical lifecycle packets, and fire
+        // CONGESTION back to the sender via `on_outbound_drop`.
+        //
+        // A publisher-join fan-out BURST (issue #1144) can still overflow even
+        // that sum, because the keyframe/join spike arrives in a tight window
+        // before the actor is next scheduled to drain. So we add the same
+        // modest `INBOUND_MAILBOX_HEADROOM_FACTOR` (2×) of burst-absorption
+        // slack as the WS path: enough to hold a single join wave across one
+        // scheduling gap and let it SPILL onto the policy-aware channels (the
+        // shedding surface) instead of being dropped indiscriminately at the
+        // mailbox. The hand-off in `Handler<Message>` is CPU-bound (it does NOT
+        // block on `session.send_datagram` / the unistream write — those drain
+        // separately), so the actor consumes this slack quickly. This does NOT
+        // create a deep stale-video buffer: the per-channel staleness bound
+        // lives on `unistream_tx`/`datagram_tx` (each unchanged at their
+        // capacity), which still cap and fail-fast independently of the
+        // mailbox. The headroom is applied to the SUM so the mailbox stays
+        // sized for both channels under any traffic mix and any env tuning of
+        // the unistream cap (the PR #1060 invariant).
+        //
+        // #1062: the argument is the shared `wt_mailbox_capacity()` binding —
+        // the SINGLE source of truth the guard test also exercises (via the
+        // pure `resolve_wt_mailbox_capacity` for env-override cases, and via
+        // `wt_mailbox_capacity()` itself for the default-env value). Editing the
+        // sizing here means editing that one binding, which the test tracks; the
+        // prior in-test `wt_mailbox_capacity(env)` helper hand-duplicated this
+        // expression and could drift from the call site silently.
+        ctx.set_mailbox_capacity(wt_mailbox_capacity());
 
         // Track connection start
         self.logic.track_connection_start();
@@ -894,69 +919,95 @@ impl WtChatSession {
 mod tests {
     use super::*;
     use crate::constants::{
-        resolve_wt_outbound_channel_capacity, WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
+        resolve_wt_mailbox_capacity, INBOUND_MAILBOX_HEADROOM_FACTOR,
+        WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT,
     };
 
     // -----------------------------------------------------------------------
-    // Issue #1057 (+ PR #1060 review): the shared actor mailbox must be able
-    // to hold a full backlog for BOTH outbound channels.
+    // Issue #1057 (+ PR #1060 review) + #1144 headroom + #1062 shared binding:
+    // the shared actor mailbox must hold a full backlog for BOTH outbound
+    // channels, TIMES the burst-headroom factor.
     //
     // `WtChatSession::started` calls `ctx.set_mailbox_capacity(
-    // wt_outbound_channel_capacity() + WT_DATAGRAM_CHANNEL_CAPACITY)`. The
-    // single actor mailbox fronts two independent policy-aware channels —
-    // unistream (env-tunable) and datagram (fixed) — and a `Message` only
-    // splits between them *after* leaving the mailbox, so the mailbox holds
-    // a mix of both. Sizing it to the SUM keeps it from being the overflow
-    // point in front of either channel for any traffic mix or env tuning
-    // (`max()` would let a datagram burst drop at the mailbox once the
-    // unistream cap is raised). Constructing a live `WtChatSession` requires
-    // a populated `SessionLogic` (NATS, addresses, …), so rather than read
-    // the capacity back off a running context we guard the invariant at the
-    // value level:
-    //   * the mailbox capacity is derived from the SAME constants/resolver
-    //     the channels are built with (`wt_outbound_channel_capacity()` /
-    //     `resolve_wt_outbound_channel_capacity` + `WT_DATAGRAM_CHANNEL_CAPACITY`),
-    //     so the env-tunable `WT_OUTBOUND_CHANNEL_CAPACITY` keeps them in
-    //     lock-step with no hardcoded duplicate, and
-    //   * it is >= each channel's capacity (and their sum) and strictly
-    //     larger than actix's `DEFAULT_CAPACITY` (16) so a future accidental
-    //     revert to the tiny default mailbox — or to sizing from only one
-    //     channel — fails CI.
+    // wt_mailbox_capacity())`. The single actor mailbox fronts two independent
+    // policy-aware channels — unistream (env-tunable) and datagram (fixed) —
+    // and a `Message` only splits between them *after* leaving the mailbox, so
+    // the mailbox holds a mix of both. `wt_mailbox_capacity()` sizes it to the
+    // SUM of both channel caps (not `max()`, which would let a datagram burst
+    // drop at the mailbox once the unistream cap is raised) times the headroom
+    // factor (#1144). Constructing a live `WtChatSession` requires a populated
+    // `SessionLogic` (NATS, addresses, …), so rather than read the capacity
+    // back off a running context we guard the invariant at the value level.
+    //
+    // #1062: the test now exercises the SAME bindings `started()` calls — the
+    // pure `resolve_wt_mailbox_capacity(env)` for env-override cases, and
+    // `crate::constants::wt_mailbox_capacity()` for the default-env value — NOT
+    // an in-test hand-copied helper that had to "mirror started() exactly" and
+    // could silently drift from it. Editing the sizing in
+    // `constants::{wt_mailbox_capacity,resolve_wt_mailbox_capacity}` is the only
+    // way to change the value, and both the call site and this test read it.
+    //
+    // The pure resolver is used for the env cases so the test never races the
+    // memoised `OnceLock` in `wt_outbound_channel_capacity()`; the default-env
+    // case additionally asserts `resolve_wt_mailbox_capacity(None) ==
+    // wt_mailbox_capacity()` so the pure path and the memoised call-site path
+    // cannot diverge.
     // -----------------------------------------------------------------------
 
     /// actix mailbox default — see `actix::mailbox::DEFAULT_CAPACITY`.
     const ACTIX_DEFAULT_MAILBOX_CAPACITY: usize = 16;
 
-    /// The value `started()` feeds to `set_mailbox_capacity`, expressed via
-    /// the pure resolver so the test never races the memoised `OnceLock` or
-    /// the real process env. Must mirror the `started()` expression exactly.
-    fn wt_mailbox_capacity(env: Option<&str>) -> usize {
-        resolve_wt_outbound_channel_capacity(env) + WT_DATAGRAM_CHANNEL_CAPACITY
-    }
-
     #[test]
     fn wt_mailbox_capacity_covers_both_outbound_channels() {
-        // Default env: mailbox = unistream default + datagram cap, so it can
-        // hold a full backlog for either channel without dropping at the
-        // mailbox before the channel's priority-drop runs.
+        // Sentinel: the documented burst-headroom factor (#1144). If this
+        // changes, re-validate the join-burst absorption math.
         assert_eq!(
-            wt_mailbox_capacity(None),
-            WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT + WT_DATAGRAM_CHANNEL_CAPACITY,
+            INBOUND_MAILBOX_HEADROOM_FACTOR, 2,
+            "inbound mailbox headroom factor changed; re-validate the #1144 \
+             join-burst absorption math before changing this sentinel",
         );
+        // #1062 lock-step: the pure resolver at the default env must equal the
+        // memoised call-site binding `started()` actually feeds. (No
+        // `WT_OUTBOUND_CHANNEL_CAPACITY` env is set under `cargo test`, so the
+        // OnceLock-backed getter resolves to the default — this assert ties the
+        // two code paths together so neither can drift.)
+        assert_eq!(
+            resolve_wt_mailbox_capacity(None),
+            crate::constants::wt_mailbox_capacity(),
+            "the pure resolver and the memoised call-site binding must agree at \
+             the default env so the guard test tracks started()'s argument",
+        );
+        // Default env: mailbox = (unistream default + datagram cap) × headroom,
+        // so it holds a full backlog for either channel PLUS burst slack
+        // without dropping at the mailbox before the channel's priority-drop
+        // runs.
+        assert_eq!(
+            resolve_wt_mailbox_capacity(None),
+            (WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT + WT_DATAGRAM_CHANNEL_CAPACITY)
+                * INBOUND_MAILBOX_HEADROOM_FACTOR,
+        );
+        // Default WT mailbox is (512 + 512) × 2 = 2048.
+        assert_eq!(resolve_wt_mailbox_capacity(None), 2048);
         // The mailbox must be >= BOTH channels individually AND their sum —
         // the PR #1060 review invariant (a `max()`-sized mailbox would still
-        // drop datagram traffic once the unistream cap is tuned up).
-        assert!(wt_mailbox_capacity(None) >= WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT);
-        assert!(wt_mailbox_capacity(None) >= WT_DATAGRAM_CHANNEL_CAPACITY);
+        // drop datagram traffic once the unistream cap is tuned up). With a
+        // headroom factor >= 1 this still holds.
+        assert!(resolve_wt_mailbox_capacity(None) >= WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT);
+        assert!(resolve_wt_mailbox_capacity(None) >= WT_DATAGRAM_CHANNEL_CAPACITY);
+        assert!(
+            resolve_wt_mailbox_capacity(None)
+                >= WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT + WT_DATAGRAM_CHANNEL_CAPACITY
+        );
         // Compile-time guard: well clear of actix's dumb 16-slot default.
         const _: () =
             assert!(WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT > ACTIX_DEFAULT_MAILBOX_CAPACITY);
         // A deploy-time override of the unistream cap is honoured verbatim
-        // and the datagram cap is still added on top, so the mailbox stays
-        // sized for both channels even when operators tune the env var up.
+        // and the datagram cap is still added on top before the headroom
+        // factor, so the mailbox stays sized for both channels (× headroom)
+        // even when operators tune the env var up.
         assert_eq!(
-            wt_mailbox_capacity(Some("1024")),
-            1024 + WT_DATAGRAM_CHANNEL_CAPACITY,
+            resolve_wt_mailbox_capacity(Some("1024")),
+            (1024 + WT_DATAGRAM_CHANNEL_CAPACITY) * INBOUND_MAILBOX_HEADROOM_FACTOR,
         );
     }
 

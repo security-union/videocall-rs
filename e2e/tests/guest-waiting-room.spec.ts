@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -134,10 +135,13 @@ async function waitForGrid(page: Page): Promise<void> {
   const joinButton = page.getByRole("button", { name: /Join Meeting|Start Meeting/ });
   const grid = page.locator("#grid-container");
 
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 25_000 }).then(() => "join-button" as const),
-    grid.waitFor({ timeout: 25_000 }).then(() => "grid" as const),
-  ]);
+  const result = await waitForVisibleState(
+    [
+      { name: "join-button", locator: joinButton },
+      { name: "grid", locator: grid },
+    ] as const,
+    25_000,
+  );
 
   if (result === "join-button") {
     await page.waitForTimeout(1000);
@@ -146,6 +150,18 @@ async function waitForGrid(page: Page): Promise<void> {
   }
 
   await expect(grid).toBeVisible({ timeout: 15_000 });
+}
+
+async function admitWaitingParticipant(hostPage: Page, displayName: string): Promise<void> {
+  const participantRow = hostPage.locator(".waiting-participant").filter({ hasText: displayName });
+  const admitButton = participantRow.getByTitle("Admit");
+
+  await expect(participantRow).toBeVisible({ timeout: 20_000 });
+  await expect(admitButton).toBeVisible({ timeout: 20_000 });
+  await hostPage.waitForTimeout(500);
+  await admitButton.dispatchEvent("click");
+  await expect(participantRow).not.toBeVisible({ timeout: 10_000 });
+  await hostPage.waitForTimeout(1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,13 +224,8 @@ test.describe("Guest waiting room — multiple guests and admitted_can_admit", (
       });
 
       // ── Host admits Guest 1 ───────────────────────────────────────────────
-      // The host controls show one Admit button per waiting participant; click
-      // the first visible one.
-      const admitButton1 = hostPage.getByTitle("Admit").first();
-      await expect(admitButton1).toBeVisible({ timeout: 20_000 });
-      await hostPage.waitForTimeout(1000);
-      await admitButton1.dispatchEvent("click");
-      await hostPage.waitForTimeout(3000);
+      // The host controls show one Admit button per waiting participant.
+      await admitWaitingParticipant(hostPage, guestName1);
 
       // Guest 1 transitions from the waiting room into the meeting grid.
       await waitForGrid(guestPage1);
@@ -227,11 +238,7 @@ test.describe("Guest waiting room — multiple guests and admitted_can_admit", (
       });
 
       // ── Host admits Guest 2 ───────────────────────────────────────────────
-      const admitButton2 = hostPage.getByTitle("Admit").first();
-      await expect(admitButton2).toBeVisible({ timeout: 20_000 });
-      await hostPage.waitForTimeout(1000);
-      await admitButton2.dispatchEvent("click");
-      await hostPage.waitForTimeout(3000);
+      await admitWaitingParticipant(hostPage, guestName2);
 
       // Guest 2 transitions into the meeting grid.
       await waitForGrid(guestPage2);
@@ -327,10 +334,7 @@ test.describe("Guest waiting room — multiple guests and admitted_can_admit", (
       await expect(nonHostPage.getByText("Waiting to be admitted")).toBeVisible({
         timeout: 20_000,
       });
-      const admitNonHost = hostPage.getByTitle("Admit").first();
-      await expect(admitNonHost).toBeVisible({ timeout: 20_000 });
-      await admitNonHost.dispatchEvent("click");
-      await hostPage.waitForTimeout(3000);
+      await admitWaitingParticipant(hostPage, nonHostName);
 
       // Non-host transitions to the meeting grid.
       await waitForGrid(nonHostPage);
@@ -353,6 +357,8 @@ test.describe("Guest waiting room — multiple guests and admitted_can_admit", (
       // The Admit button must be visible on the non-host's page because
       // admitted_can_admit was pre-configured.
       const nonHostAdmitButton = nonHostPage
+        .locator(".waiting-participant")
+        .filter({ hasText: guestDisplayName })
         .locator('button[title="Admit"], button.btn-admit')
         .first();
       await expect(nonHostAdmitButton).toBeVisible({ timeout: 30_000 });

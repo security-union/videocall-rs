@@ -38,6 +38,10 @@ use actix::{
     Actor, Addr, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
     SpawnHandle,
 };
+// `SendError` is re-exported only from `actix::prelude`, not the crate root, so
+// it needs its own import. We match on it (`Full` vs `Closed`) at the fan-out
+// hop to distinguish transient backpressure (a shed) from a gone receiver.
+use actix::prelude::SendError;
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
@@ -46,8 +50,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
     RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
@@ -351,6 +357,28 @@ fn normalize_pref_media_kind(raw: i32) -> i32 {
         2 => 2, // AUDIO
         3 => 3, // SCREEN
         _ => 1, // VIDEO (covers UNSPECIFIED=0, VIDEO=1, and any unknown)
+    }
+}
+
+/// Bucket a wire `simulcast_layer_id` into the BOUNDED label set used by the
+/// per-layer forwarded counter (`relay_layer_forwarded_by_layer_total`, #1105).
+///
+/// The wire `simulcast_layer_id` is a forgeable `u32` that lives OUTSIDE the
+/// AEAD seal (#993), so it MUST NOT be used as a metric label verbatim — a
+/// malicious or buggy client could otherwise emit arbitrary ids and explode the
+/// series count. Today every kind ships at most three layers (ids 0..=2; see
+/// `LAYER_PREFERENCE_MAX_LAYER_ID`), so we map 0/1/2 to their own bucket and
+/// collapse EVERYTHING else (3..=u32::MAX) into a single `"other"` bucket. This
+/// caps the `layer_id` label to EXACTLY 4 distinct values regardless of what
+/// arrives on the wire — the cardinality bound is enforced HERE, not merely
+/// asserted in a comment. `"other"` doubles as the early-warning signal that a
+/// real >3-layer ladder has shipped without this bucketer being widened.
+fn layer_id_bucket(layer_id: u32) -> &'static str {
+    match layer_id {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        _ => "other",
     }
 }
 
@@ -1189,12 +1217,15 @@ impl ChatServer {
             if members.is_empty() {
                 self.room_members.remove(room);
                 self.room_policy.remove(room);
-                // Drop the per-room viewport set-size gauge series (HCL #988).
-                // GaugeVec series persist until explicitly removed; without
-                // this a drained room would read its last set size forever.
-                // `remove_label_values` errors only when no series exists, so
-                // the unused-result is intentionally discarded.
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Bound room-labeled relay series to LIVE rooms (issue #996):
+                // remove every `{room=...}` CounterVec/GaugeVec series for this
+                // drained room (was previously just the #988 viewport gauge).
+                // CounterVec series otherwise persist for the process lifetime,
+                // so each distinct meeting would leak a permanent series. We
+                // keep the `room` label (the meeting-investigation dashboard and
+                // RelayPacketDrops alert depend on it) and instead expire it on
+                // room drain — see `metrics::forget_room_metrics`.
+                crate::metrics::forget_room_metrics(room);
             }
         }
     }
@@ -1229,10 +1260,10 @@ impl ChatServer {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
                 self.room_members.remove(room);
-                // Mirror forget_room_if_empty: release the per-room viewport
-                // set-size gauge series so the eviction teardown path also
-                // cannot leak a stale series for a drained room (HCL #988).
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Mirror forget_room_if_empty: release ALL per-room relay series
+                // so the eviction teardown path also cannot leak room-labeled
+                // series for a drained room (HCL #988 + #996).
+                crate::metrics::forget_room_metrics(room);
             } else {
                 room_still_populated = true;
             }
@@ -2806,8 +2837,16 @@ impl Handler<JoinRoom> for ChatServer {
                     "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
                     member.user_id, member.display_name, user_id_clone
                 );
+                // Priority attribution (#1145) deliberately NOT applied: this
+                // forwards a single PARTICIPANT_JOINED (`PacketType::MEETING`,
+                // Critical) during join setup — never a sheddable-media drop.
+                // (It also predates the mailbox-drop counters and intentionally
+                // stays a plain warn on this one-shot setup path.)
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    // `build_peer_joined_packet` returns an owned `Vec<u8>`;
+                    // wrap it in `Bytes` (a one-time move into the refcounted
+                    // buffer, no copy) to match `Message.msg`'s type (#1063).
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: member.session,
                 }) {
                     warn!(
@@ -3232,6 +3271,16 @@ fn try_intercept_layer_preference(
                 ))
             })
             .collect();
+        // These two SHAPING-step outcomes are emitted BEFORE the rate-limit /
+        // write-lock decision below, so they record malformed-shape *attempts*
+        // and are NOT conditioned on the packet being applied (#1069). A packet
+        // can therefore record `truncated`/`layer_id_out_of_bound` and then be
+        // `rate_limited` rather than `accepted` — the metric doc on
+        // `RELAY_LAYER_PREFERENCE_UPDATES_TOTAL` spells out this co-occurrence.
+        // Left here (rather than moved into the accepted branch) deliberately:
+        // relocating them onto the post-lock path would change behaviour on a
+        // DoS-sensitive hot path for no observability gain, and "attempt rate"
+        // is the more useful guard signal.
         if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
             RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
                 .with_label_values(&[room, "truncated"])
@@ -3499,10 +3548,23 @@ fn try_intercept_display_name_change(
     match forwarded {
         Ok(sanitized) => {
             let message = Message {
-                msg: sanitized,
+                // `sanitized` is a freshly-serialized `Vec<u8>` (rare rename
+                // path); move it into `Bytes` to match `Message.msg` (#1063).
+                msg: bytes::Bytes::from(sanitized),
                 session,
             };
             if let Err(e) = recipient.try_send(message) {
+                // PRIORITY ATTRIBUTION DELIBERATELY NOT APPLIED HERE (#1145).
+                // Unlike the main fan-out hop (`handle_msg`), this sibling
+                // `try_send` site forwards exactly ONE packet type — a
+                // sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, which is a
+                // `PacketType::MEETING` packet. `MEETING` is Critical in the
+                // shed taxonomy (`priority_drop::OutboundPriority::classify_*`),
+                // so it is NEVER a sheddable-media drop: running the classifier
+                // here would always return Critical and the `drop_reason` would
+                // always be `mailbox_full`. The label is therefore left as the
+                // constant `mailbox_full` rather than adding a provably-constant
+                // classify call on this rare (rename-only) path.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
                     .inc();
@@ -3574,6 +3636,15 @@ fn handle_msg(
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
 
+        // LAYER_HINT is, like CONGESTION, a RELAY-authored self-addressed
+        // control packet: the relay emits it on the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) with the publisher's `session_id` stamped
+        // (see `emit_layer_hint`). It must survive the self-echo guard below for
+        // the same reason CONGESTION does. (#1108 delivery gap.)
+        let is_layer_hint = parsed
+            .map(|pw| pw.packet_type == PacketType::LAYER_HINT.into())
+            .unwrap_or(false);
+
         let is_meeting = parsed
             .as_ref()
             .map(|pw| pw.packet_type == PacketType::MEETING.into())
@@ -3596,12 +3667,25 @@ fn handle_msg(
         // meeting — the reporter received 5224 self-DIAGNOSTICS packets
         // back from the relay despite the subject-only filter being in
         // place. Applying the filter uniformly to every packet type
-        // (with the CONGESTION carve-out below) closes the leak.
+        // (with the CONGESTION and LAYER_HINT carve-outs below) closes the
+        // leak.
         //
-        // CONGESTION signals are intentionally exempted: a congested
-        // receiver publishes them onto the throttled sender's own subject
-        // with the sender's session_id embedded, and they MUST still
-        // reach the sender so the client can step down its quality tier.
+        // CONGESTION and LAYER_HINT are intentionally exempted: both are
+        // RELAY-authored, self-ADDRESSED control packets. A congested receiver
+        // (CONGESTION) or the relay's per-source layer aggregator (LAYER_HINT,
+        // `emit_layer_hint`) publishes them onto the target publisher's OWN
+        // subject with that publisher's session_id embedded, and they MUST
+        // still reach the publisher so the client can step down its quality
+        // tier (CONGESTION) or cap its encoded simulcast ladder (LAYER_HINT).
+        // Without the LAYER_HINT carve-out the publish-side layer suppression
+        // built in #1108 is inert: the hint is generated but the self-echo
+        // guard drops it before it leaves the relay (the #1108 delivery gap).
+        //
+        // NOTE: the carve-out below trusts the packet TYPE only because the
+        // relay authors these packets itself. Hardening against a *forged*
+        // client-sent CONGESTION/LAYER_HINT (anti-reflection) is a separate,
+        // still-open concern tracked in #1119 and is orthogonal to delivery —
+        // do not conflate the two here.
         let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
@@ -3621,7 +3705,7 @@ fn handle_msg(
         } else {
             subject_self || inner_session_self
         };
-        if drop_self_echo && !is_congestion {
+        if drop_self_echo && !is_congestion && !is_layer_hint {
             return Ok(());
         }
 
@@ -3911,27 +3995,124 @@ fn handle_msg(
                     .with_label_values(&[&room])
                     .inc();
             }
+
+            // Per-LAYER distribution (#1105). Counts EVERY filterable media
+            // packet that SURVIVED both filters above — i.e. every drop path
+            // (`viewport`, `layer`) has already `return`ed, so reaching here
+            // means this packet is about to be forwarded. Unlike
+            // RELAY_LAYER_FORWARDED_TOTAL (the non-base, has-prefs denominator),
+            // this covers ALL forwarded layers including base 0 and the
+            // no-prefs fail-open case, giving the true layer MIX per room.
+            //
+            // `layer_id_bucket` clamps the forgeable wire `simulcast_layer_id`
+            // (#993) into one of exactly 4 bounded buckets (0|1|2|other) BEFORE
+            // it becomes a label — the cardinality bound is enforced there.
+            if is_layer_filterable {
+                RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                    .with_label_values(&[&room, layer_id_bucket(pw.simulcast_layer_id)])
+                    .inc();
+            }
         }
 
         let message = Message {
-            msg: msg.payload.to_vec(),
+            // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
+            // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
+            // bump that SHARES the single NATS payload allocation across every
+            // receiver in this room's fan-out — replacing the previous
+            // `.to_vec()` that deep-copied the multi-KB frame once per
+            // recipient. The per-receiver materialization back to owned bytes
+            // (for the outbound channel) still happens at most once, later, in
+            // `SessionLogic::handle_outbound`; delivery is byte-identical.
+            msg: msg.payload.clone(),
             session,
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
+            //
+            // HONEST CONTRACT — read before "improving" this: the actix
+            // mailbox exposes NO capacity/length probe and NO preemption API
+            // on `Recipient<Message>` (only `try_send`/`do_send`, verified
+            // against actix 0.13.5). So when `try_send` returns `Full` the
+            // packet simply CANNOT be enqueued — we do NOT, and CANNOT, evict
+            // a queued packet to make room for a higher-priority one. The
+            // value this block adds is therefore (a) correct ATTRIBUTION of
+            // WHICH KIND was sacrificed on overflow (video vs audio vs
+            // lifecycle), so dashboards/alerts see "video shed under fan-out
+            // burst" rather than an undifferentiated `mailbox_full`, and
+            // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
+            // the burst room to land in the mailbox and then spill onto the
+            // policy-aware outbound channel (which DOES shed video-first and
+            // fire CONGESTION). Shedding alone can't save a critical packet on
+            // a full mailbox; the headroom is what actually prevents the drop.
+            //
+            // We classify off the OUTER cleartext wrapper that was already
+            // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
+            // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
+            // AES-sealed under E2EE. This is the SAME data the #988/#989
+            // filters above already read, so the added per-receiver work here
+            // is O(1): two enum reads on already-decoded fields, no parse, no
+            // allocation, no lock. Fail-open: an unparseable wrapper
+            // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
+            // as Control and is attributed `mailbox_full` (never preferentially
+            // blamed as a media shed).
+            //
+            // We also distinguish `Full` (transient backpressure — the fan-out
+            // burst case) from `Closed` (the receiver actor is gone). Only
+            // `Full` is a shed scenario; a `Closed` drop keeps the plain
+            // `mailbox_full` label and the warn, exactly as before.
+            let is_full = matches!(e, SendError::Full(_));
+            let priority = match parsed {
+                Some(pw) => OutboundPriority::classify_outer(
+                    true,
+                    pw.packet_type
+                        .enum_value()
+                        .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+                    pw.media_kind.enum_value().unwrap_or(
+                        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                    ),
+                ),
+                // Unparseable outer wrapper → fail-open Control (never a media shed).
+                None => OutboundPriority::Control,
+            };
+
+            // Pick the per-room `drop_reason` label. On a `Full` mailbox a
+            // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
+            // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
+            // kind; everything else (Critical/Control, or a `Closed` mailbox)
+            // keeps the legacy `mailbox_full` label. The labels mirror the
+            // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
+            // (`metrics.rs`), so a single dashboard query spans both hops.
+            let drop_reason = match (is_full, priority.priority_drop_label()) {
+                (true, Some(label)) => label,
+                _ => "mailbox_full",
+            };
+
             // Room-tagged forensic series (kept for per-room drill-down). The
             // `transport="nats_delivery"` here is the publish-side identity, not
             // the receiver's transport.
             RELAY_PACKET_DROPS_TOTAL
-                .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .with_label_values(&[&room, "nats_delivery", drop_reason])
                 .inc();
             // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
             // room-wide-freeze signature, labeled by the RECEIVER's transport so
             // an SRE can rate() it without scraping per-room series and can tell
-            // which transport's mailbox is overflowing.
+            // which transport's mailbox is overflowing. This counts EVERY
+            // inbound-mailbox drop regardless of attributed kind, so the #1057
+            // freeze signature (sum over transport) is unchanged by the new
+            // per-room `drop_reason` split.
             RELAY_INBOUND_MAILBOX_DROPS_TOTAL
                 .with_label_values(&[&transport])
                 .inc();
+            // The `Dropping inbound message for session <id> ... (mailbox full)`
+            // line is a STABLE CONTRACT consumed by
+            // `scripts/parse_meeting_console_logs.sh` (`--relay-ws`), which
+            // greps it per session to reconstruct mailbox-drop counts. It is
+            // kept VERBATIM (same text + WARN level) for every drop so the
+            // analyzer is not silently corrupted — the priority attribution
+            // added by this change lives entirely on the `drop_reason` metric
+            // label above, not in the log line. Do NOT edge-trigger or demote
+            // this line without updating the parse script in lock-step.
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
                 session, e
@@ -4540,10 +4721,12 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        // `Message.msg` is now `bytes::Bytes` (#1063); capture the shared
+        // handles directly. `&Bytes` derefs to `&[u8]` for the parse below.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;
@@ -5877,6 +6060,137 @@ mod tests {
             1,
             "CONGESTION must pass the inner-session-id self-filter so the \
              throttle signal still reaches the sender after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_subject() {
+        // #1108 delivery-gap carve-out. `emit_layer_hint` publishes the
+        // relay-authored LAYER_HINT onto the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) so the publisher can cap its encoded
+        // simulcast ladder. The subject-self match must NOT block it — exactly
+        // like CONGESTION. Before the `&& !is_layer_hint` carve-out this packet
+        // was dropped as a self-echo, leaving the #1108 publish-side suppression
+        // inert.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject == the receiver's own self-subject, mirroring the real
+        // `emit_layer_hint` publish target (`room.{room}.{publisher}`).
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes(PacketType::LAYER_HINT),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the subject-self filter so the relay-authored \
+             hint reaches the publisher (#1108 delivery gap)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_inner_session_id() {
+        // #1108 carve-out applied to the inner-session check too.
+        // `emit_layer_hint` stamps `wrapper.session_id = publisher` (the
+        // publisher's own session) onto the LAYER_HINT packet. The
+        // inner-session self-skip must NOT suppress it just because the inner
+        // session_id matches — otherwise a post-reconnect window (stale
+        // subscription whose subject differs from the current session) would
+        // swallow the hint even though the embedded session_id targets us.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-inner-room".to_string(),
+            6161,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject points at a DIFFERENT session id; embedded session_id is ours
+        // (the publisher the relay addressed). Must still be delivered.
+        let nats_msg = make_nats_message(
+            "room.layerhint-inner-room.424242",
+            make_packet_bytes_with_session(PacketType::LAYER_HINT, 6161),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the inner-session-id self-filter so the \
+             relay-authored hint still reaches the publisher after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_self_media_still_dropped_alongside_layer_hint() {
+        // Regression guard paired with the two LAYER_HINT carve-out tests
+        // above: the carve-out must be TYPE-scoped. A self-addressed plain
+        // MEDIA packet — same self-subject AND same embedded session_id as the
+        // LAYER_HINT cases — must STILL be dropped as a self-echo. If this ever
+        // forwards, the carve-out has leaked into ordinary media traffic
+        // (re-opening the 2026-05-08 self-echo leak).
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Identical addressing to test_handle_msg_layer_hint_passes_self_filter_*
+        // (self-subject + own embedded session_id) but packet_type == MEDIA.
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes_with_session(PacketType::MEDIA, 5151),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-addressed MEDIA must STILL be dropped — the LAYER_HINT \
+             carve-out must not leak into ordinary media traffic"
         );
     }
 
@@ -10524,6 +10838,198 @@ mod tests {
         );
     }
 
+    // ===== Per-layer forwarded distribution counter (#1105) =====
+
+    /// `layer_id_bucket` MUST clamp the forgeable wire id into EXACTLY the four
+    /// bounded label values 0|1|2|other. This is the cardinality guarantee — if
+    /// it ever returns anything else (or stops collapsing large ids), the
+    /// counter's series count becomes unbounded. The asserts pin the real
+    /// boundaries (2 stays "2", 3 and u32::MAX both collapse to "other"), so the
+    /// test fails if the match arms are widened or the catch-all is removed.
+    #[test]
+    fn test_layer_id_bucket_is_bounded() {
+        assert_eq!(layer_id_bucket(0), "0");
+        assert_eq!(layer_id_bucket(1), "1");
+        assert_eq!(layer_id_bucket(2), "2");
+        // The whole point: everything above the real 0..=2 ladder — including
+        // the next ladder rung (3) and a forged u32::MAX — collapses to ONE
+        // bucket, so the label set can never exceed 4 distinct values.
+        assert_eq!(layer_id_bucket(3), "other");
+        assert_eq!(layer_id_bucket(7), "other");
+        assert_eq!(layer_id_bucket(u32::MAX), "other");
+
+        // The complete set of buckets the function can EVER emit is exactly 4.
+        // Sample a wide range and prove no fifth value appears.
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for id in 0u32..1000 {
+            seen.insert(layer_id_bucket(id));
+        }
+        seen.insert(layer_id_bucket(u32::MAX));
+        assert_eq!(
+            seen.len(),
+            4,
+            "layer_id_bucket must emit exactly 4 bounded label values, got {seen:?}"
+        );
+    }
+
+    /// A forwarded media packet increments the per-layer distribution counter on
+    /// the bucket matching its `simulcast_layer_id`. Uses a UNIQUE room so the
+    /// process-global lazy_static counter is isolated from other tests (we read
+    /// the absolute value of a freshly-created series).
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_records_forwarded_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Unique room → fresh, isolated counter series.
+        let room = "per-layer-room-l2";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 2 from source 999 → a layer-2 packet matches
+            // and is forwarded.
+            layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "matching-layer VIDEO must be forwarded"
+        );
+        // The forwarded packet was layer 2 → the "2" bucket is incremented once,
+        // and the other buckets stay at zero for this room.
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            1,
+            "forwarding a layer-2 packet must increment the layer_id=2 bucket"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "1"])
+                .get() as u64,
+            0,
+            "layer-2 forward must NOT touch the layer_id=1 bucket"
+        );
+    }
+
+    /// A LAYER-FILTERED (dropped) packet must NOT increment the per-layer
+    /// distribution counter — the counter reflects only what is actually
+    /// forwarded. This pins the increment to the post-filter forward path: if
+    /// the increment were moved BEFORE the layer drop gate, the dropped layer's
+    /// bucket would wrongly read 1 and this test would fail.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_skips_filtered_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-drop";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 0 from source 999, so a layer-2 packet is
+            // DROPPED by the layer filter.
+            layer_prefs_with(&[(999, 0)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "non-matching-layer VIDEO must be dropped"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            0,
+            "a layer-FILTERED packet must NOT increment any forwarded-by-layer bucket"
+        );
+    }
+
+    /// A forwarded packet whose wire layer id is ABOVE the real 0..=2 ladder
+    /// (here a forged large id) lands in the bounded "other" bucket, never in a
+    /// per-id series. This is the runtime proof of the cardinality clamp on the
+    /// real forwarding path (not just the unit test of `layer_id_bucket`). The
+    /// receiver has no prefs (fail-open forward), so the high-id packet is
+    /// forwarded and counted.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_buckets_forged_layer_into_other() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-other";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // No recorded preference → fail-open: every layer forwards, so the
+            // forged-id packet reaches the per-layer counter.
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // A forged layer id well above the real ladder.
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, u32::MAX),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "no-prefs fail-open must forward the packet"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "other"])
+                .get() as u64,
+            1,
+            "a forged out-of-ladder layer id must land in the bounded \"other\" bucket"
+        );
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_drops_non_matching_screen_layer() {
         // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen
@@ -10712,6 +11218,163 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "a source with no recorded layer preference MUST fail open (forward)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_screen_not_filtered_by_video_preference() {
+        // #1070: per-kind independence (Phase 3). A SCREEN packet whose layer
+        // does NOT match must STILL be forwarded when the receiver's only
+        // recorded preference is VIDEO-keyed for the same source — the layer
+        // filter keys on (source, media_kind), so a (999, VIDEO) preference can
+        // never drop a (999, SCREEN) packet. (Mirrors the AUDIO-vs-VIDEO test;
+        // proves SCREEN is not collaterally filtered by a camera preference. A
+        // SCREEN packet IS filtered only by a SCREEN-keyed preference, which is
+        // covered by `test_handle_msg_drops_non_matching_screen_layer`.)
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO) only
+            "websocket".to_string(),
+        );
+
+        // SCREEN layer 2 with only a VIDEO preference for 999 → forward (the
+        // (999, SCREEN) key has no entry, so the SCREEN packet fails open). If
+        // SCREEN were ever filtered by the VIDEO key this would drop (count 0).
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "SCREEN must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_desired_layer_zero_is_base_only() {
+        // #1070: a recorded preference of `desired_layer = 0` for a source means
+        // "base layer only" — any NON-zero layer from that source is dropped,
+        // and the layer-0 (base) packet is forwarded. This pins the exact
+        // base-only contract: it is the recorded preference VALUE (0), not the
+        // absence of a preference, that drives the drop of higher layers.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 0)]), // (999, VIDEO) → desired layer 0 (base only)
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999 must be DROPPED (preference selects base 0, layer 2 != 0).
+        let layer2_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let l2parsed = parse_pw(&layer2_msg);
+        handler(layer2_msg, l2parsed.as_ref()).expect("handler should not return Err");
+
+        // Layer 0 from 999 must be FORWARDED (base is always forwarded; the
+        // non-zero-layer gate excludes it before the preference is even read).
+        let layer0_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 0),
+        );
+        let l0parsed = parse_pw(&layer0_msg);
+        handler(layer0_msg, l0parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "desired_layer=0 must drop the layer-2 packet and forward only the base (layer-0) packet"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_poisoned_layer_prefs_lock_fails_open() {
+        // #1070: a POISONED LayerPrefs RwLock must FAIL OPEN — a video packet
+        // that the recorded preference would otherwise DROP is forwarded
+        // instead, because the read-lock `.map(...).unwrap_or(false)` on the
+        // forwarding path treats a lock error as "do not drop". The fast-path
+        // hint (`has_any()`) is still `true` (it is a separate AtomicBool, not
+        // affected by poisoning), so the forwarding path DOES take the read
+        // lock — exercising exactly the `unwrap_or(false)` fail-open arm.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver wants layer 1 from 999 → a layer-2 packet would normally drop.
+        let prefs = layer_prefs_with(&[(999, 1)]);
+
+        // Poison the prefs lock by panicking while holding the write guard.
+        let poison_target = prefs.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.state.write().unwrap();
+            panic!("intentional panic to poison the LayerPrefs lock");
+        }));
+        assert!(
+            prefs.state.read().is_err(),
+            "precondition: the LayerPrefs lock must be poisoned"
+        );
+        assert!(
+            prefs.has_any(),
+            "precondition: the non_empty hint must still be true so the forwarding \
+             path takes the read lock and exercises the fail-open arm"
+        );
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            prefs,
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999: the preference selects layer 1, so WITHOUT the
+        // poison this packet would be dropped. With the lock poisoned it must
+        // fail open and be forwarded.
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a poisoned LayerPrefs lock MUST fail open (forward the packet it would otherwise drop)"
         );
     }
 

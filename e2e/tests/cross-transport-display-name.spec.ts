@@ -1,5 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
+import { CERT_HASH_INIT_SCRIPT } from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -25,6 +27,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
+const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
 
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
@@ -38,6 +41,31 @@ const BROWSER_ARGS = [
 
 type Transport = "webtransport" | "websocket";
 
+async function createMeetingViaApi(
+  hostEmail: string,
+  hostName: string,
+  meetingId: string,
+): Promise<void> {
+  const token = generateSessionToken(hostEmail, hostName);
+  const res = await fetch(`${API_URL}/api/v1/meetings`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `${COOKIE_NAME}=${token}`,
+    },
+    body: JSON.stringify({
+      meeting_id: meetingId,
+      attendees: [],
+      allow_guests: true,
+      waiting_room_enabled: false,
+      end_on_host_leave: false,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`POST /api/v1/meetings failed (${res.status}): ${await res.text()}`);
+  }
+}
+
 async function createAuthenticatedContext(
   browser: Awaited<ReturnType<typeof chromium.launch>>,
   email: string,
@@ -49,6 +77,8 @@ async function createAuthenticatedContext(
     baseURL: uiURL,
     ignoreHTTPSErrors: true,
   });
+
+  await context.addInitScript(CERT_HASH_INIT_SCRIPT);
 
   // Force the transport BEFORE any app script runs, on every navigation, by
   // seeding the sticky transport preference the UI reads from localStorage
@@ -103,11 +133,14 @@ async function enterMeeting(
   const waitingRoom = page.getByText("Waiting to be admitted");
   const grid = page.locator("#grid-container");
 
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
+  const result = await waitForVisibleState(
+    [
+      { name: "join", locator: joinButton },
+      { name: "waiting", locator: waitingRoom },
+      { name: "auto-joined", locator: grid },
+    ],
+    30_000,
+  );
 
   if (result === "waiting") {
     return "waiting";
@@ -130,6 +163,7 @@ test.describe("Cross-transport display name (WT peer seen by WS joiner)", () => 
   }) => {
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_xtransport_${Date.now()}`;
+    await createMeetingViaApi("host@videocall.rs", "HostUser", meetingId);
 
     const wtBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const wsBrowser = await chromium.launch({ args: BROWSER_ARGS });
@@ -177,10 +211,13 @@ test.describe("Cross-transport display name (WT peer seen by WS joiner)", () => 
         const guestJoinButton = wsPage.getByRole("button", {
           name: /Join Meeting|Start Meeting/,
         });
-        const postAdmit = await Promise.race([
-          guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-          guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-        ]);
+        const postAdmit = await waitForVisibleState(
+          [
+            { name: "join-button", locator: guestJoinButton },
+            { name: "grid", locator: guestGrid },
+          ],
+          20_000,
+        );
         if (postAdmit === "join-button") {
           await wsPage.waitForTimeout(1000);
           await guestJoinButton.click();

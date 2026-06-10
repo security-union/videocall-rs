@@ -34,7 +34,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use log::error;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
@@ -120,6 +120,21 @@ pub struct VideoPeerDecoder {
     /// this signal the screen-share visibility toast on the publisher
     /// would time out at 10s on every share, even on the happy path.
     first_render_pending_ack: Rc<RefCell<bool>>,
+    /// Issue #1183 (late-frame race): gate for the async paint callback.
+    ///
+    /// `clear_canvas()` (called synchronously on the decode-stop edge) sets
+    /// this `false`; the next successful `decode()` (which is only reached when
+    /// the tile is visible — `peer_decode_manager` returns `SKIPPED` *before*
+    /// calling us otherwise) sets it `true`. The `on_video_frame` callback
+    /// reads it and, when `false`, drops (closes) the frame instead of
+    /// painting. This closes the window where a `VideoFrame` decoded from a
+    /// packet pushed BEFORE the visible→false flip fires its async callback
+    /// AFTER `clear_canvas()`, repainting one stale frame and re-freezing the
+    /// tile the #1183 clear was meant to wipe.
+    ///
+    /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
+    /// `Cell` is sufficient because every access is on the single render thread.
+    paint_enabled: Rc<Cell<bool>>,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -230,8 +245,14 @@ impl VideoPeerDecoder {
         // landed on the canvas. See doc comment on `first_render_pending_ack`.
         let first_render_pending_ack = Rc::new(RefCell::new(false));
 
+        // Issue #1183 late-frame race: starts enabled (a freshly-constructed
+        // decoder belongs to a visible tile), gated off by `clear_canvas()`,
+        // back on by the next `decode()`.
+        let paint_enabled = Rc::new(Cell::new(true));
+
         let canvas_ref = canvas_renderer.clone();
         let first_render_flag = first_render_pending_ack.clone();
+        let paint_flag = paint_enabled.clone();
         // Track within the closure (cheap `Cell` would suffice but we already
         // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
         // closure). `mark_first_render` only flips once per
@@ -239,6 +260,14 @@ impl VideoPeerDecoder {
         // `mark_first_render_*` tests for the pinned semantics).
         let first_render_fired = Rc::new(RefCell::new(false));
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
+            // Issue #1183 late-frame race: if painting was disabled on the
+            // decode-stop edge, drop this frame WITHOUT painting (still close
+            // it to release the GPU/codec resource) so a frame that finished
+            // decoding after `clear_canvas()` cannot repaint the wiped tile.
+            if !paint_flag.get() {
+                video_frame.close();
+                return;
+            }
             mark_first_render(&first_render_fired, &first_render_flag);
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
@@ -259,6 +288,7 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
             first_render_pending_ack,
+            paint_enabled,
         })
     }
 
@@ -322,6 +352,43 @@ impl VideoPeerDecoder {
     }
 
     /// Render video frame using cached canvas and context. Only resizes when dimensions change.
+    ///
+    /// Aspect-ratio correctness (per-peer "squashed video" fix):
+    ///
+    /// A WebCodecs `VideoFrame` carries three distinct geometries:
+    ///   * `coded_width/coded_height`  — the raw encoded buffer, padded up to the
+    ///     codec's macroblock alignment (16px for VP8/VP9) and *before* rotation.
+    ///   * `visibleRect`               — the cropped picture region inside the
+    ///     coded buffer (the alignment padding removed). This is the *intrinsic*
+    ///     source `drawImage` reads from.
+    ///   * `display_width/display_height` — the dimensions the frame is meant to
+    ///     be shown at, after crop, rotation, and any non-square sample-aspect
+    ///     correction.
+    ///
+    /// The old code sized the canvas buffer to `display_*` but drew with the
+    /// 3-arg `drawImage(frame, dx, dy)`, which paints the *intrinsic* (visible)
+    /// source at 1:1 with no scaling. When `visibleRect` happened to equal
+    /// `display_*` (clean codec-aligned, square-pixel, un-rotated frames) the
+    /// painted region exactly filled the buffer and looked fine. But for peers
+    /// whose frames carried crop padding, a non-square sample aspect ratio, or
+    /// rotation, the visible source dimensions differed from `display_*`: only a
+    /// sub-region of the `display`-sized buffer got painted, yet the buffer
+    /// (and therefore the CSS `object-fit: cover` scaling) still declared the
+    /// `display` aspect — so the picture rendered squashed/stretched. That
+    /// "only some peers" split is the signature of this bug.
+    ///
+    /// The fix: keep the canvas buffer at the true `display_*` dimensions, but
+    /// draw with the 6-arg `drawImage(frame, 0, 0, dw, dh)` form so the entire
+    /// visible source is *scaled to fill* the whole display-sized buffer. This
+    /// corrects the crop-padding and non-square-sample-aspect cases (the browser
+    /// folds SAR into `display_*`), so the painted content's aspect matches the
+    /// buffer's declared `display` aspect. NOTE: `drawImage` does NOT apply a
+    /// frame's *rotation* metadata — it paints the visible pixels unrotated and
+    /// only scales them, so a genuinely 90°/270°-rotated source would still need a
+    /// canvas transform (out of scope here; the VP9 decode path in this pipeline
+    /// does not carry rotation metadata — capture-side rotation is already baked
+    /// into the pixels). Applies to both the camera and screen-share decoders
+    /// (same `VideoPeerDecoder` path).
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
@@ -330,8 +397,11 @@ impl VideoPeerDecoder {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
         if let Some(renderer) = renderer_guard.as_mut() {
-            let width = video_frame.display_width();
-            let height = video_frame.display_height();
+            // Always size the canvas buffer to the frame's *display* dimensions
+            // (post-crop / post-rotation / sample-aspect-corrected). This is the
+            // aspect the tile should present.
+            let (width, height) =
+                canvas_buffer_dims(video_frame.display_width(), video_frame.display_height());
 
             // Only resize canvas if dimensions changed (expensive operation)
             if renderer.last_width != width || renderer.last_height != height {
@@ -359,14 +429,21 @@ impl VideoPeerDecoder {
                 }
             }
 
-            // Clear and draw frame
+            // Clear and draw frame.
             renderer
                 .context
                 .clear_rect(0.0, 0.0, width as f64, height as f64);
-            if let Err(e) = renderer
-                .context
-                .draw_image_with_video_frame(&video_frame, 0.0, 0.0)
-            {
+            // Draw the frame's full visible source scaled to fill the entire
+            // display-sized buffer. The 6-arg form (dx, dy, dw, dh) is what makes
+            // this aspect-correct for frames where the intrinsic (visible) source
+            // size differs from the display size — see the doc comment above.
+            if let Err(e) = renderer.context.draw_image_with_video_frame_and_dw_and_dh(
+                &video_frame,
+                0.0,
+                0.0,
+                width as f64,
+                height as f64,
+            ) {
                 log::error!("Error drawing video frame: {e:?}");
             }
         } else {
@@ -374,6 +451,43 @@ impl VideoPeerDecoder {
         }
 
         video_frame.close();
+    }
+
+    /// Clear the canvas backing bitmap to transparent (issue #1183).
+    ///
+    /// Called when a peer leaves the active decode set (its tile transitions
+    /// `visible: true -> false`). At that edge `decode()` starts returning
+    /// `SKIPPED` synchronously, so no further `VideoFrame` is ever drawn — but
+    /// the `<canvas>` element is only removed from the DOM later, when Dioxus
+    /// commits the layout diff. In the window between decode-stop and DOM
+    /// unmount (or indefinitely if the commit stalls / the budget re-pressures
+    /// before the tile unmounts) the canvas keeps showing its LAST PAINTED
+    /// FRAME — the "1 live + N frozen tiles" symptom.
+    ///
+    /// We clear through the SAME cached `CanvasRenderingContext2d` the painter
+    /// (`render_to_canvas_cached`) draws into, so we are guaranteed to be
+    /// clearing the exact backing bitmap that holds the stale frame — not a
+    /// stale DOM lookup by id. The clear region uses the canvas element's
+    /// current backing dimensions (`width()`/`height()`), which the painter
+    /// keeps in sync with the decoded frame size via `set_width`/`set_height`.
+    ///
+    /// No-op when no canvas is wired yet (`canvas_renderer` is `None`), which is
+    /// also the state of the `noop()` decoder used in host unit tests — so this
+    /// is safe to call from non-wasm test code.
+    pub fn clear_canvas(&self) {
+        // Issue #1183 late-frame race: disable painting FIRST, so any
+        // `VideoFrame` decoded from a packet pushed before the decode-stop edge
+        // — whose `on_video_frame` callback may fire after this clear — is
+        // dropped instead of repainting the tile we are about to wipe. The next
+        // `decode()` (only reached while visible) re-enables painting.
+        self.paint_enabled.set(false);
+        if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
+            let width = renderer.canvas.width();
+            let height = renderer.canvas.height();
+            renderer
+                .context
+                .clear_rect(0.0, 0.0, width as f64, height as f64);
+        }
     }
 
     fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
@@ -410,7 +524,17 @@ impl VideoPeerDecoder {
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
             stream_context: RefCell::new(None),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
+            paint_enabled: Rc::new(Cell::new(true)),
         }
+    }
+
+    /// Test accessor for the #1183 late-frame paint gate. The async paint
+    /// callback consults this exact flag, so a test that toggles it via
+    /// `clear_canvas()` / `decode()` is exercising the real source of truth
+    /// the callback reads — not a parallel copy.
+    #[cfg(test)]
+    pub(crate) fn paint_enabled_for_test(&self) -> bool {
+        self.paint_enabled.get()
     }
 }
 
@@ -528,6 +652,16 @@ impl PeerDecode for VideoPeerDecoder {
 
             let frame_buffer = FrameBuffer::new(video_frame, current_time_ms);
 
+            // Issue #1183 late-frame race: re-enable painting before pushing.
+            // Reaching here means `peer_decode_manager` did NOT take the
+            // `!self.visible` SKIPPED path, i.e. the tile is back in the decode
+            // set — so the frame this push produces (and any subsequent ones)
+            // is wanted on the canvas again. Re-arming here (not on the
+            // visibility edge) keeps the gate paired with the actual paint
+            // pipeline: the flag is off from `clear_canvas()` until a real new
+            // frame is on its way in.
+            self.paint_enabled.set(true);
+
             // Use the new ergonomic API - decoder handles jitter buffer internally,
             // and calls our VideoFrame callback for rendering
             self.decoder.push_frame(frame_buffer);
@@ -575,6 +709,30 @@ fn consume_first_render_flag(flag: &Rc<RefCell<bool>>) -> bool {
     } else {
         false
     }
+}
+
+/// Decide the canvas drawing-buffer dimensions for a decoded frame, given the
+/// frame's WebCodecs *display* dimensions (`display_width`, `display_height`).
+///
+/// The display dimensions already encode the intended presentation aspect —
+/// post-crop, post-rotation, and corrected for any non-square sample aspect
+/// ratio — so the canvas buffer is sized to them directly and the frame's full
+/// visible source is then scaled to fill that buffer in
+/// [`VideoPeerDecoder::render_to_canvas_cached`]. Keeping the buffer at the
+/// display aspect (rather than the raw coded/visible aspect) is what makes the
+/// CSS `object-fit: cover` tile scaling render the correct shape for *every*
+/// peer, not just codec-aligned square-pixel ones.
+///
+/// A WebCodecs `VideoFrame` cannot have a zero-size display rect in practice,
+/// but a defensive `(0, 0)` would zero the canvas buffer, turn the subsequent
+/// `clear_rect` into a no-op and give `drawImage` an empty destination rect
+/// (drawing nothing). Clamp each axis to a minimum of 1 so the render path
+/// always has a valid, non-degenerate buffer.
+///
+/// Extracted as a pure function so the buffer-sizing rule is host-unit-testable
+/// without a real `web_sys::VideoFrame` (which only exists under wasm).
+fn canvas_buffer_dims(display_width: u32, display_height: u32) -> (u32, u32) {
+    (display_width.max(1), display_height.max(1))
 }
 
 /// HCL #893: helper used by the `on_video_frame` callback the first time
@@ -780,6 +938,53 @@ mod tests {
         assert!(tp.is_none());
     }
 
+    // --- Aspect-ratio fix: `canvas_buffer_dims` --------------------------
+    //
+    // These pin the buffer-sizing rule that backs the per-peer "squashed
+    // video" fix. The render path sizes the canvas to these dims and then
+    // scales the frame's full visible source to fill it; if the buffer
+    // carried the wrong aspect (e.g. coded/visible dims instead of display),
+    // `object-fit: cover` would stretch the tile. The wasm `drawImage` call
+    // itself can't be host-tested, so this isolates the host-testable math.
+
+    /// Common 16:9 / 4:3 / portrait display sizes pass straight through —
+    /// the canvas buffer must match the display dims exactly so the tile's
+    /// aspect is correct. A regression that returned coded/aligned dims (e.g.
+    /// padded the height to a 16px multiple) would change 720 -> 720 but
+    /// would break a non-aligned size like 1080; both are checked.
+    #[test]
+    fn canvas_buffer_dims_passes_display_through() {
+        assert_eq!(canvas_buffer_dims(1280, 720), (1280, 720)); // 16:9
+        assert_eq!(canvas_buffer_dims(640, 480), (640, 480)); // 4:3
+        assert_eq!(canvas_buffer_dims(720, 1280), (720, 1280)); // portrait 9:16
+        assert_eq!(canvas_buffer_dims(1920, 1080), (1920, 1080)); // 1080 not 16-aligned
+    }
+
+    /// A non-square sample-aspect / cropped frame whose display dims are an
+    /// arbitrary (not codec-aligned) size must still produce a buffer at that
+    /// exact display aspect — this is the case that rendered squashed before
+    /// the fix. 854x480 (the classic 16:9 480p with width not divisible by 16)
+    /// must NOT be rounded to a coded 864x480.
+    #[test]
+    fn canvas_buffer_dims_preserves_unaligned_display_aspect() {
+        assert_eq!(canvas_buffer_dims(854, 480), (854, 480));
+        // Aspect must be preserved exactly, not snapped to a coded multiple.
+        let (w, h) = canvas_buffer_dims(854, 480);
+        assert_eq!(w, 854, "width must not be padded to a 16px multiple");
+        assert_eq!(h, 480);
+    }
+
+    /// Degenerate `(0, 0)` is clamped to a valid 1x1 buffer so the render
+    /// path never produces a zero-size canvas (which would no-op `clear_rect`
+    /// and `drawImage`). Mutating the `.max(1)` to plain pass-through would
+    /// return `(0, 0)` here and fail.
+    #[test]
+    fn canvas_buffer_dims_clamps_zero_to_one() {
+        assert_eq!(canvas_buffer_dims(0, 0), (1, 1));
+        assert_eq!(canvas_buffer_dims(1280, 0), (1280, 1));
+        assert_eq!(canvas_buffer_dims(0, 720), (1, 720));
+    }
+
     // --- HCL #893: `first_render_pending_ack` flag semantics --------------
     //
     // These tests pin down the exactly-once behaviour of the async
@@ -907,6 +1112,74 @@ mod tests {
             !consume_first_render_flag(&ack),
             "additional render callbacks must not produce a second \
              first_frame: true"
+        );
+    }
+
+    // --- Issue #1183 late-frame race: paint gate toggle -------------------
+    //
+    // The async `on_video_frame` callback paints only when `paint_enabled` is
+    // true. These tests pin the two edges that drive it: `clear_canvas()` (the
+    // decode-stop edge) must disable painting so a frame whose callback lands
+    // after the clear is dropped; the next `decode()` of a video packet (only
+    // reached while visible) must re-enable it. They use `noop()`, whose
+    // `NoopDecoder` never actually decodes — so the gate is the only state
+    // under test — and `decode()` here is exercised on the host (a plain
+    // `#[test]`, unlike the `#[wasm_bindgen_test]` cases that no-op in CI).
+
+    /// Build a minimal VP8 video `MediaPacket` whose `video_metadata` carries a
+    /// decodable codec, so `decode()` reaches the `push_frame` / paint re-enable
+    /// path rather than the unknown-codec early return.
+    fn minimal_video_packet() -> Arc<MediaPacket> {
+        use videocall_types::protos::media_packet::media_packet::MediaType;
+        use videocall_types::protos::media_packet::VideoMetadata;
+
+        let mut pkt = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        pkt.video_metadata = Some(VideoMetadata {
+            sequence: 1,
+            codec: VideoCodec::VP8.into(),
+            ..Default::default()
+        })
+        .into();
+        pkt.frame_type = "key".to_string();
+        Arc::new(pkt)
+    }
+
+    #[test]
+    fn paint_gate_starts_enabled() {
+        let d = VideoPeerDecoder::noop();
+        assert!(
+            d.paint_enabled_for_test(),
+            "a freshly-constructed decoder belongs to a visible tile, so \
+             painting starts enabled"
+        );
+    }
+
+    #[test]
+    fn clear_canvas_disables_painting() {
+        let d = VideoPeerDecoder::noop();
+        d.clear_canvas();
+        assert!(
+            !d.paint_enabled_for_test(),
+            "clear_canvas() (decode-stop edge) must disable painting so a \
+             late async frame callback cannot repaint the wiped tile (#1183)"
+        );
+    }
+
+    #[test]
+    fn decode_reenables_painting_after_clear() {
+        let mut d = VideoPeerDecoder::noop();
+        d.clear_canvas();
+        assert!(!d.paint_enabled_for_test(), "disabled by clear");
+        d.decode(&minimal_video_packet())
+            .expect("noop decode of a VP8 packet succeeds on host");
+        assert!(
+            d.paint_enabled_for_test(),
+            "reaching decode() means the tile is visible again (the \
+             manager's !visible guard returns SKIPPED before us), so the \
+             next frame is wanted — painting must be re-enabled"
         );
     }
 }

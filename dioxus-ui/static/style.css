@@ -506,6 +506,40 @@ h3 {
   background-color: var(--surface);
 }
 
+/* #1142 Phase 1, Part C: device-paused avatar polish. A subtle dim + a small
+   pause-glyph badge distinguish "paused by your device" (decode budget) from a
+   normal camera-off tile. The dim is applied to the placeholder content only
+   (not the whole tile chrome) so the name, mic indicator, and signal meter stay
+   at full contrast — audio affordances must remain legible. */
+.placeholder-content.placeholder-content--paused {
+  position: relative;
+  opacity: 0.82;
+}
+
+.decode-paused-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--btn-warning-bg);
+  color: var(--warning);
+  box-shadow: 0 0 0 1px var(--btn-warning-border);
+  pointer-events: none;
+}
+
+/* Override the generic `.placeholder-content svg` sizing/tint for the badge
+   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
+.decode-paused-badge svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
 /* ============================================================
    Mobile: narrower gap/padding
    Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
@@ -3914,6 +3948,167 @@ select {
   stroke: currentColor;
 }
 
+/* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
+   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   NOT a modal: it overlays the grid (absolute within #grid-container) and
+   does not block interaction with the tiles below. The glass treatment
+   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
+   accent is the shared amber `--warning` token.
+
+   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   themes), so its foreground colours MUST be literal light-on-dark — NOT the
+   `--text-on-glass-strong` token, which flips to near-black under
+   html[data-theme="light"] and would render the text + ✕ invisible on the dark
+   surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
+   dismiss glyph, matching how the amber accent is already a literal. Contrast on
+   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
+   (range = page background showing through the ~0.9-opacity surface) — both well
+   past 4.5:1, in BOTH themes. */
+.decode-budget-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 24px));
+  padding: 8px 10px 8px 14px;
+  background: rgba(30, 30, 30, 0.9)
+    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  border: 1px solid var(--btn-warning-border);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
+  /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
+     themes, so the theme-flipping --text-on-glass-strong token must NOT be used
+     here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
+     dark surface. */
+  color: rgba(255, 255, 255, 0.95);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+    sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  animation: decode-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.decode-budget-banner-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--warning);
+}
+
+.decode-budget-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The compact mobile count is hidden on wider viewports. */
+.decode-budget-banner-count {
+  display: none;
+  flex: 1;
+  font-weight: 600;
+}
+
+.decode-budget-banner-action,
+.decode-budget-banner-dismiss {
+  flex-shrink: 0;
+  /* a11y: real ≥44px hit targets even though the visual chrome is smaller. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.decode-budget-banner-action {
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+}
+
+.decode-budget-banner-action:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-banner-dismiss {
+  min-width: 44px;
+  padding: 0;
+  /* @token-exempt: literal light-on-dark to stay visible on the hardcoded dark
+     banner surface in light mode (see the banner's color note above). */
+  color: rgba(255, 255, 255, 0.95);
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.decode-budget-banner-dismiss:hover {
+  background: var(--glass-bg-hover);
+}
+
+.decode-budget-banner-action:focus-visible,
+.decode-budget-banner-dismiss:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+@keyframes decode-banner-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no vertical slide. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-budget-banner {
+    animation: decode-banner-enter-reduced 0.15s ease-out;
+  }
+  @keyframes decode-banner-enter-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}
+
+/* Mobile ≤639px: icon + "N paused" + actions only (hide the long message). The
+   compact phrase keeps minimal context since the tooltip is hover-only. */
+@media (max-width: 639px) {
+  .decode-budget-banner {
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    font-size: 12px;
+  }
+  .decode-budget-banner-text {
+    display: none;
+  }
+  .decode-budget-banner-count {
+    display: inline-block;
+  }
+  .decode-budget-banner-action {
+    padding: 0 10px;
+    font-size: 12px;
+  }
+}
+
 /* ── Participant join/leave toast notifications ─────────────────────── */
 
 .peer-toasts {
@@ -4312,6 +4507,15 @@ select {
   flex-direction: column;
   gap: 14px;
   padding-top: 6px;
+}
+
+/* Performance tab only: tighter inter-element spacing so the three per-kind
+   cards + header + intro + strip fit the modal body without scrolling (#1095
+   no-scroll requirement). Scoped via :has(.perf-header-row) so other tabs keep
+   the roomier default. */
+.settings-section:has(.perf-header-row) {
+  gap: 10px;
+  padding-top: 0;
 }
 
 .appearance-section-title,
@@ -6489,6 +6693,38 @@ html[data-theme="light"]
 .legend-help-text p {
   margin: 3px 0;
 }
+/* ── Per-peer simulcast RECEIVE "Layers" section ──────────────────────────
+   Renders the SAME per-peer rows as the Performance dialog (the `.perf-peer-row`
+   / `.perf-q-dot` / `.perf-reason-chip` classes are shared verbatim, so the
+   quality dot, metric, and reason chip look identical across both surfaces).
+   Only the section wrapper + header are popup-specific layout. All color comes
+   from the reused classes' `--perf-q-*` / `--text-*` tokens — no raw literals. */
+.signal-popup-layers {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--signal-popup-border);
+}
+.signal-popup-layers__head {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.signal-popup-layers__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* The kind label ("video" / "audio" / "shared content") sits where the perf
+   dialog puts the peer name; capitalize the first letter for readability. */
+.signal-popup-layer-row__kind {
+  text-transform: capitalize;
+}
 .signal-chart-tooltip {
   position: fixed;
   background: var(--tooltip-bg);
@@ -7249,315 +7485,461 @@ html[data-theme="light"] .settings-divider {
 
 /* ──────────────────────────────────────────────────────────────────
    Unified Performance settings panel — SEND quality bounds (#961) AND
-   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
-   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
-   VU needles, Auto toggle + "?" help. All colors are design tokens
-   (see global.css) — no literals.
+   RECEIVE layer bounds (issue 989 simulcast): per-kind CARDS each split into a
+   Sending column + a Receiving column, dual-thumb range sliders,
+   "Sending"/"Receiving" inline bar-meters (level-driven via data-level),
+   Auto toggle + "?" help. All colors are design tokens (see global.css).
    ────────────────────────────────────────────────────────────────── */
 
-/* Segmented Receive | Send direction toggle (top of the panel). Only the
-   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
-   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
-.perf-direction-toggle {
+/* ── Panel header row: "Performance" title left, Diagnostics cross-nav button
+   right (#1095 §4a). The Receive | Send direction toggle was removed — both
+   directions now render side-by-side in each per-kind card. ── */
+.perf-header-row {
   display: flex;
-  gap: 2px;
-  margin: 14px 0 16px;
-  padding: 3px;
-  background: var(--field-bg);
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-pill);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.perf-direction-segment {
-  flex: 1 1 0;
-  min-height: 34px;
-  padding: 6px 14px;
-  font-size: 14px;
+/* Shared ghost button for both cross-nav buttons (Perf→Diag here, Diag→Perf in
+   the diagnostics sidebar header). 16–18px icon, 8px gap, >=44px hit area. */
+.perf-nav-button,
+.sidebar-header-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
-  border: none;
+  border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
 }
 
-.perf-direction-segment:hover {
+.perf-nav-button:hover,
+.sidebar-header-action:hover {
   color: var(--text-primary);
   background: var(--field-bg-hover);
 }
 
-.perf-direction-segment:focus-visible {
+.perf-nav-button:focus-visible,
+.sidebar-header-action:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-/* Active segment: filled with the accent surface. aria-checked also conveys
-   selection to AT, so color is not the sole signal. */
-.perf-direction-segment.is-active {
-  color: var(--accent);
-  background: var(--surface-elevated);
-  box-shadow: var(--shadow-sm);
+.perf-nav-button__icon {
+  flex: 0 0 auto;
 }
 
-/* Inline "your download" / "your upload" consequence beside each row title, so
-   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+/* Below ~480px the cross-nav buttons go icon-only (aria-label still conveys the
+   action; the visible text label is hidden). */
+@media (max-width: 480px) {
+  .perf-nav-button__label,
+  .sidebar-header-action__label {
+    display: none;
+  }
+}
+
+/* Inline "your upload" / "from N peers" consequence beside each side title, so
+   the meaning is legible without opening the "?" popover. */
+.perf-side__consequence,
 .perf-stream-consequence {
   font-size: 12px;
   font-weight: 500;
   color: var(--text-secondary);
 }
 
-/* Receive / Send emphasis in the intro paragraph — bold + direction accent
-   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
-.perf-emph-recv,
-.perf-emph-send {
-  font-weight: 700;
-}
+/* (The `.perf-emph-recv` / `.perf-emph-send` intro-emphasis rules were removed
+   when the always-visible intro paragraph was collapsed behind the header `(i)`
+   info popover — the plain-text popover body carries the wording instead.) */
 
-.perf-emph-recv {
-  color: var(--accent);
-}
+/* ── Live simulcast effective-setting strip (issue #1095 redesign). The
+   expandable per-layer detail moved to the Diagnostics panel's "Simulcast
+   layers" section. No new tokens; accents via descendant selectors. ── */
 
-.perf-emph-send {
-  color: var(--success);
-}
-
-/* ── Live simulcast diagnostics (issue #1095 redesign) — embedded per row +
-   one global strip. No new tokens; accents via descendant selectors. ── */
-
-/* Global effective-setting strip: one slim line directly under the toggle. */
+/* Global effective-setting strip: one slim line under the intro, with an (i)
+   tooltip holding the full flag×cap text (#1095 redesign). */
 .perf-simulcast-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 2px;
   font-size: 12px;
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border);
 }
 
-/* Per-row diagnostics footer — last child of .perf-stream-controls, so it
-   left-aligns with the slider (not the gauge). */
-.perf-diag {
-  margin-top: 6px;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-/* (1) Always-visible summary. As a button it is the disclosure trigger; the
-   static variants (single-layer / 1-peer / empty) reuse the same line metrics. */
-.perf-diag-summary {
-  display: flex;
+.perf-simulcast-strip__info {
+  display: inline-flex;
   align-items: center;
-  width: 100%;
-  gap: 6px;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 12px;
+  line-height: 1;
   color: var(--text-secondary);
+  cursor: help;
 }
 
-.perf-diag-trigger {
-  padding: 2px 2px;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  text-align: left;
-}
-
-.perf-diag-trigger:hover {
-  color: var(--text-primary);
-}
-
-.perf-diag-trigger:focus-visible {
+.perf-simulcast-strip__info:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
 }
 
-.perf-diag-static {
-  padding: 2px 2px;
-  color: var(--text-tertiary);
-  font-style: italic;
-}
-
-.perf-diag-summary-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.perf-diag-chevron {
-  margin-left: auto;
-  flex: 0 0 auto;
-  color: var(--text-tertiary);
-}
-
-/* (2) Expandable detail region. */
-.perf-diag-detail {
-  margin-top: 6px;
-}
-
-/* SEND ladder: flex row of per-layer chips, lowest layer left. */
-.perf-diag-ladder {
-  display: flex;
-  gap: 4px;
-  align-items: stretch;
-}
-
-.perf-diag-rung {
-  flex: 1 1 auto;
-  min-width: 44px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  /* Horizontal 4px (was 2px) so a 4-char res like "1080p" doesn't kiss the chip
-     edge at the 540px breakpoint with 3 chips at the 44px min-width (#1095). */
-  padding: 4px 4px 6px;
-  position: relative;
-  background: var(--field-bg);
+/* ── Per-kind cards (Video / Audio / Content), each split Send | Receive
+   (#1095 redesign). A card is a glass surface; its two columns share the
+   `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
+.perf-kind-card {
+  /* No vertical margin: the parent `.settings-section` flex `gap` already spaces
+     the cards; a margin here would double-space (#2a). */
+  padding: 10px 14px;
+  background: var(--surface-elevated);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 12px;
+  /* Enable container queries so the columns collapse based on the card's own
+     width (independent of the viewport). */
+  container-type: inline-size;
 }
 
-/* Active layer: solid accent border + a 2px bottom strip. */
-.perf-diag-rung.is-active {
-  background: var(--field-bg);
-  border: 1px solid var(--success-border-vivid);
-}
-
-.perf-diag-rung.is-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: var(--success);
-  border-bottom-left-radius: var(--radius-sm);
-  border-bottom-right-radius: var(--radius-sm);
-}
-
-/* Shed (inactive) layer: dimmed + dashed, no strip. */
-.perf-diag-rung.is-shed {
-  opacity: 0.4;
-  border-style: dashed;
-}
-
-.perf-diag-rung-id {
-  font-size: 10px;
-  color: var(--text-tertiary);
-}
-
-.perf-diag-rung-res {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.perf-diag-rung-kbps {
-  font-size: 12px;
+.perf-kind-card__title {
+  font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+  margin-bottom: 4px;
 }
 
-/* RECEIVE per-peer detail rows. */
-.perf-diag-peers {
+/* Two side-by-side columns (Send | Receive). Collapses to one column below the
+   card-width threshold (Send on top). `@container` first, with an `@media`
+   fallback for engines without container-query support. */
+.perf-card-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@container (max-width: 560px) {
+  .perf-card-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 639px) {
+  .perf-card-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* One column (Send or Receive). Subtle left accent distinguishes direction
+   (color is not the sole cue — each column is labelled "Sending"/"Receiving"). */
+.perf-side {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  min-width: 0;
 }
 
-.perf-diag-peer {
+.perf-side--recv {
+  border-left-color: var(--accent);
+}
+
+.perf-side--send {
+  border-left-color: var(--success-border-vivid);
+}
+
+.perf-side__head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 0;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-.perf-diag-pip {
-  flex: 0 0 auto;
+.perf-side__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
   display: inline-flex;
-  gap: 2px;
+  align-items: center;
 }
 
-.perf-diag-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--border);
-}
-
-.perf-diag-dot.is-on {
-  background: var(--text-secondary);
-}
-
-.perf-diag-peer-name {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-secondary);
-}
-
-.perf-diag-peer-meta {
+/* §1 directional arrow prefixed on each side title. aria-hidden; inherits its
+   color per side (SEND green, RECV blue). */
+.perf-dir-arrow {
   flex: 0 0 auto;
-  color: var(--text-tertiary);
+  vertical-align: -2px;
+  margin-right: 4px;
 }
-
-.perf-diag-more {
-  color: var(--text-tertiary);
-  font-style: italic;
+.perf-side--send .perf-dir-arrow {
+  color: var(--success);
 }
-
-/* ── Direction accenting via descendant selectors ONLY (text stays neutral). ── */
-.perf-recv-row .perf-diag-chevron {
+.perf-side--recv .perf-dir-arrow {
   color: var(--accent);
 }
 
-.perf-recv-row .perf-diag-dot.is-on {
+/* ── Inline bar-meter (replaces the VU needle). Four vertical bars + a one-line
+   readout; the container carries data-level and CSS lights the first N bars. It
+   sits INLINE in `.perf-side__head` now (#2d), so it center-aligns with the row
+   and the readout may shrink/ellipsize rather than push the row taller. ── */
+.perf-meter-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.perf-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 24px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.perf-meter__bar {
+  flex: 1 1 0;
+  width: 3px;
+  /* Unlit bars: a faint, theme-aware track so an at-rest (level 0) meter still
+     reads as "a meter", not an empty gap (#9). Token resolves to translucent
+     white on dark / translucent black on light (see global.css). */
+  background: var(--perf-meter-track);
+  border-radius: 1px;
+  transition: background 0.2s ease;
+}
+
+/* Staggered heights ▂▄▆█ so the meter reads as a rising ramp. */
+.perf-meter__bar:nth-child(1) {
+  height: 40%;
+}
+.perf-meter__bar:nth-child(2) {
+  height: 60%;
+}
+.perf-meter__bar:nth-child(3) {
+  height: 80%;
+}
+.perf-meter__bar:nth-child(4) {
+  height: 100%;
+}
+
+/* Light the first N bars per the container's data-level. Receive uses the
+   primary accent; send a green accent (matched to the column). */
+.perf-side--recv .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--recv .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--recv .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--recv .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
   background: var(--accent);
 }
 
-.perf-send-row .perf-diag-chevron {
-  color: var(--success);
+.perf-side--send .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--send .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--send .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--send .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
+  background: var(--success);
 }
 
-.perf-stream-group {
-  margin: 18px 0;
-  padding: 14px 16px;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+.perf-meter__readout {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  line-height: 1.2;
+  min-width: 0;
+  /* Don't break mid-word (#11): truncate with an ellipsis if the head row is
+     tight rather than wrapping a "1280x720·30fps" token across two lines. */
+  overflow-wrap: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* Subtle left accent to distinguish the two directions at a glance (color is
-   not the sole cue — each row is labelled "Receive" / "Send"). */
-.perf-recv-row {
-  border-left: 3px solid var(--accent);
+/* The slider range readout + the live summary share ONE flex row per side (#2e)
+   so the two captions cost one line, not two. Wraps to two lines only when the
+   column is too narrow (mobile, where a small scroll is acceptable). */
+.perf-side__caption {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
 }
 
-.perf-send-row {
-  border-left: 3px solid var(--success-border-vivid);
+/* The always-visible per-card summary line (the §3 live copy). */
+.perf-summary-line {
+  margin: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
 }
 
-.perf-stream-header {
+/* ── §2 SEND rung strip (issue #1131). One pip per effective layer,
+   lowest→highest. Active = filled green; shed (bitrate 0) = dashed + dimmed
+   label (non-color cue). ── */
+.perf-rungs {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+  min-height: 16px;
+}
+.perf-rung {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.perf-rung__bar {
+  width: 18px;
+  height: 6px;
+  border-radius: 2px;
+  background: var(--success);
+}
+.perf-rung.is-shed .perf-rung__bar {
+  background: transparent;
+  border: 1px dashed var(--border-emphasis);
+}
+.perf-rung__label {
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.perf-rung.is-shed .perf-rung__label {
+  opacity: 0.55;
+}
+
+/* ── §3 RECEIVE per-peer expandable section. Native <details>/<summary>;
+   collapsed by default to protect the no-scroll budget. ── */
+.perf-peers {
+  margin-top: 2px;
+}
+.perf-peers__summary {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+  padding: 2px 0;
+  min-height: 20px;
 }
-
-.perf-stream-title {
-  font-size: 15px;
-  font-weight: 600;
+.perf-peers__summary::-webkit-details-marker {
+  display: none;
+}
+.perf-peers__summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.perf-peers__chev {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s ease;
+}
+details.perf-peers[open] .perf-peers__chev {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .perf-peers__chev {
+    transition: none;
+  }
+}
+.perf-peers__list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 168px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.perf-peer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.perf-peer-row__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-primary);
 }
+.perf-peer-row__metric {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
 
-/* "?" help button + its popover, anchored next to the section title. */
+/* ── §4 quality dot: color + non-color glyph (●/◐/○). aria-hidden. ── */
+.perf-q-dot {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+}
+.perf-q-dot--optimal {
+  color: var(--perf-q-optimal);
+}
+.perf-q-dot--medium {
+  color: var(--perf-q-medium);
+}
+.perf-q-dot--low {
+  color: var(--perf-q-low);
+}
+
+/* ── §5 reason chips. Pill; TEXT is --text-primary (AA-safe), tinted
+   border-color + faint background from the per-state quality var. ── */
+.perf-reason-chip {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.3;
+  font-weight: 500;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: var(--text-primary);
+  border: 1px solid;
+  white-space: nowrap;
+}
+.perf-reason-chip--network {
+  border-color: var(--perf-q-low);
+  background: color-mix(in srgb, var(--perf-q-low) 14%, transparent);
+}
+.perf-reason-chip--setting,
+.perf-reason-chip--sender {
+  border-color: var(--perf-q-medium);
+  background: color-mix(in srgb, var(--perf-q-medium) 14%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-meter__bar {
+    transition: none;
+  }
+}
+
+/* "?" help button + its popover, anchored next to the side title. */
 .perf-help {
   position: relative;
   display: inline-flex;
 }
 
 .perf-help-button {
+  position: relative;
   width: 22px;
   height: 22px;
   display: inline-flex;
@@ -7571,6 +7953,20 @@ html[data-theme="light"] .settings-divider {
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
+}
+
+/* Expand the HIT AREA to 44×44 without enlarging the 22px visual glyph or
+   disturbing layout (#3): a transparent, centered, absolutely-positioned
+   pseudo-element that overflows the button. The wrapper `.perf-help` is
+   position:relative, so this does not affect sibling flow. */
+.perf-help-button::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
 }
 
 .perf-help-button:hover {
@@ -7597,12 +7993,22 @@ html[data-theme="light"] .settings-divider {
   top: calc(100% + 8px);
   left: 0;
   width: 260px;
-  max-width: 80vw;
+  /* Cap to the card's own width so the popover can't overhang the card / modal
+     edge (#8). `cqw` resolves against `.perf-kind-card` (container-type set). */
+  max-width: min(260px, 90cqw);
   padding: 12px 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
+}
+
+/* Receive column is the RIGHT column: anchor its popover to the right edge so it
+   opens leftward into the card instead of overhanging the modal's right side
+   (#8). */
+.perf-side--recv .perf-help-popover {
+  left: auto;
+  right: 0;
 }
 
 .perf-help-popover-text {
@@ -7624,51 +8030,51 @@ html[data-theme="light"] .settings-divider {
   border: 1px solid var(--border-emphasis);
 }
 
-/* "Auto" toggle, pinned to the right of the stream header. */
-.perf-auto-button {
+/* "Reset" utility button, pinned to the right of the stream header (#1131 §D).
+   Conditionally rendered — only present once the stream is CONSTRAINED (a thumb
+   off the extremes) — so it always reads as a LIVE control (accent text, no
+   muted/disabled state). Compact and SHORT: its box height (≈22px, matching the
+   "?" help button) is ≤ the existing head-row content, so showing/hiding it
+   causes NO vertical reflow of `.perf-side__head`. The 44px touch target is
+   provided by a non-layout `::before` overlay (same technique as
+   `.perf-help-button`), so a11y is met without inflating the row. */
+.perf-reset-button {
+  position: relative;
   margin-left: auto;
-  min-height: 32px;
-  padding: 4px 14px;
-  font-size: 13px;
-  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
   color: var(--accent);
-  background: var(--field-bg);
+  background: transparent;
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
 }
 
-.perf-auto-button:hover {
-  background: var(--field-bg-hover);
+/* 44×44 hit area without affecting sibling flow (#3) — mirrors
+   `.perf-help-button::before`. */
+.perf-reset-button::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
 }
 
-.perf-auto-button:focus-visible {
+.perf-reset-button:hover {
+  background: var(--field-bg-hover);
+  border-color: var(--accent);
+}
+
+.perf-reset-button:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-}
-
-/* Auto ACTIVE (toggle pressed): green/active. The aria-pressed state + label
-   convey this to AT, so color is not the sole signal. */
-.perf-auto-button.is-active {
-  color: var(--success);
-  background: var(--success-bg-soft);
-  border-color: var(--success-border-vivid);
-}
-
-.perf-auto-button.is-active:hover {
-  background: var(--success-bg-soft-hover);
-}
-
-/* Per-section body: the VU needle gauge beside the slider + range text. */
-.perf-stream-body {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.perf-stream-controls {
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 /* ── Dual-thumb range slider ── */
@@ -7713,6 +8119,31 @@ html[data-theme="light"] .settings-divider {
   background: var(--accent);
   border-radius: var(--radius-pill);
   transition: left 0.3s ease, right 0.3s ease;
+}
+
+/* ── Discrete tick marks (decorative notches at each step stop) ──
+   Rendered INSIDE .perf-range-track and BEFORE .perf-range-fill in the DOM, so
+   the fill (and the input thumbs, which sit in higher layers) paint OVER the
+   ticks. CRITICAL: `pointer-events: none` (+ aria-hidden in markup) so they
+   never intercept a pointer-down meant for a thumb — this preserves the WebKit
+   pinned-floor drag fix (commit 603c7354): nothing over the track may swallow
+   thumb drags. A theme-token notch in --text-secondary (theme-aware light+dark,
+   clearly contrasting against the --border track) that protrudes past the 6px
+   track height so the step stops read at a glance; centred on its `left:%`
+   offset. */
+.perf-range-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.perf-range-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  background: var(--text-secondary);
+  border-radius: 1.5px;
 }
 
 .perf-range-input {
@@ -7787,9 +8218,63 @@ html[data-theme="light"] .settings-divider {
   outline-offset: 2px;
 }
 
+/* ── SEND layer-count slider (video/screen): distinct from the Receive slider ──
+   The SEND control publishes layers; its MOVING (ceiling/max) thumb and fill use
+   the semantic --success (green) treatment so it reads as a different widget from
+   the full-range --accent Receive slider beside it. The FLOOR (min) thumb is
+   pinned at the base layer and styled as a fixed dot (see .is-pinned below). */
+.perf-range--send-layer .perf-range-fill {
+  background: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-webkit-slider-thumb {
+  border-color: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-moz-range-thumb {
+  border-color: var(--success);
+}
+
+/* ── Pinned floor thumb (the always-on base layer) ──
+   A visibly FIXED end: a small filled --success dot, default cursor, no shadow
+   and no hover/focus grow. The distinct shape (small filled dot vs. the large
+   hollow accent ring of a movable thumb) is the non-color "this can't move"
+   cue, so the affordance reads correctly regardless of color perception.
+
+   WEBKIT HIT-TEST: this input must NOT sit above the max input, or — even with
+   pointer-events:none — WebKit can intercept the pointer-down meant for the max
+   thumb. The default `.perf-range-input-min { z-index: 2 }` puts the min ON TOP
+   (correct for the Receive/tier slider where the min is a real draggable thumb);
+   in pinned mode we OVERRIDE it to `z-index: 0` (below `.perf-range-input-max`'s
+   z-index 1). `.perf-range-input.is-pinned` (two classes, specificity 0,2,0)
+   beats `.perf-range-input-min` (0,1,0), so this override wins. Result: the max
+   (ceiling) thumb is the topmost interactive layer and always grabbable. The
+   Receive slider (no `.is-pinned`) is unaffected. This is the belt-and-suspenders
+   companion to dropping the HTML `disabled` attribute in the Rust markup. */
+.perf-range-input.is-pinned {
+  pointer-events: none; /* the floor never accepts drags */
+  z-index: 0; /* below .perf-range-input-max (z-index 1) — max stays on top */
+}
+.perf-range-input.is-pinned::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+.perf-range-input.is-pinned::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+
 .perf-range-value {
-  margin: 10px 0 0;
-  font-size: 13px;
+  margin: 0;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
@@ -7800,73 +8285,113 @@ html[data-theme="light"] .settings-divider {
   }
 }
 
-/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
+/* ── Diagnostics panel: "Simulcast layers" section (#1095 §6 MOVE — the
+   per-layer SEND ladder + per-peer RECEIVE breakdown relocated from the
+   Performance panel's expandable footers). ── */
+.simulcast-effective {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
 
-.perf-vu-gauge {
-  flex: 0 0 auto;
-  width: 150px;
+.simulcast-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-quaternary);
+}
+
+.simulcast-send {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 12px 10px 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
+  gap: 4px;
+  margin-bottom: 10px;
 }
 
-.perf-vu-svg {
-  width: 120px;
-  height: 78px;
-}
-
-.perf-vu-arc {
-  stroke: var(--border-emphasis);
-}
-
-.perf-vu-tick {
-  stroke: var(--text-quaternary);
-}
-
-.perf-vu-needle {
-  stroke: var(--accent);
-  /* Pivot at the hub so rotation looks like an analog needle. */
-  transform-origin: 60px 64px;
-  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.perf-vu-hub {
-  fill: var(--accent);
-}
-
-.perf-vu-label {
-  margin-top: 4px;
-  font-size: 13px;
+.simulcast-send-title {
+  font-size: 12px;
   font-weight: 600;
-  color: var(--text-primary);
-}
-
-.perf-vu-readout {
-  margin-top: 2px;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .perf-vu-needle {
-    transition: none;
-  }
+.simulcast-send-static,
+.simulcast-send-header {
+  font-size: 12px;
+  color: var(--text-tertiary);
 }
 
-/* On narrow widths stack the needle above the slider instead of beside it. */
-@media (max-width: 540px) {
-  .perf-stream-body {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .perf-vu-gauge {
-    width: 100%;
-  }
+.simulcast-send-ladder {
+  display: flex;
+  gap: 4px;
+  margin-top: 2px;
 }
+
+.simulcast-rung {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 0;
+  min-width: 44px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulcast-rung.is-active {
+  border-color: var(--success-border-vivid);
+  background: var(--success-bg-soft);
+}
+
+.simulcast-rung.is-shed {
+  opacity: 0.5;
+}
+
+.simulcast-rung-id {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-rung-res,
+.simulcast-rung-kbps {
+  color: var(--text-tertiary);
+}
+
+.simulcast-recv {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.simulcast-recv-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-kind {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.simulcast-recv-kind-head {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-peer {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+
+.simulcast-recv-more {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+

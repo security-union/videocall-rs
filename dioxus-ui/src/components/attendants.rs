@@ -19,6 +19,7 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
+use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -31,6 +32,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
+    performance_settings::DiagnosticsReader,
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
@@ -471,6 +473,9 @@ pub fn AttendantsComponent(
     let mut dock_menu_open = use_signal(|| false);
     let mut autohide_enabled = use_signal(load_dock_autohide);
     let encoder_settings = use_signal(|| None::<String>);
+    // Last peer count logged by the meeting-view render log below — lets that
+    // log fire only on changes (edge-trigger) instead of every re-render.
+    let mut last_logged_peer_count = use_signal(|| None::<usize>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
     // Peers that spoke recently sort higher in the grid.
@@ -713,6 +718,10 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
     let mut device_settings_generation = use_signal(|| 0u32);
+    // Host publishes its live diagnostics reader handle here once on mount, so the
+    // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
+    // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
+    let diagnostics_reader_sink: Signal<Option<DiagnosticsReader>> = use_signal(|| None);
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -3380,7 +3389,20 @@ pub fn AttendantsComponent(
     // self until the assignment arrives.
     let my_session_id: Option<String> = client.get_own_session_id();
 
-    info!("Rendering meeting view with {} peers", display_peers.len());
+    // Edge-triggered: log only when the peer count CHANGES, not on every render.
+    // This component re-renders many times per second (signals, speech priority,
+    // layout), so an unconditional log here emitted ~44k lines in an 8-min
+    // meeting — the single largest console-log contributor after the #1100/#1129
+    // per-tick demotions. Logging on transitions preserves the documented
+    // `Rendering meeting view with 0 peers` failure signature (the drop to zero
+    // is still emitted) while cutting volume to a handful of lines.
+    {
+        let peer_count = display_peers.len();
+        if last_logged_peer_count() != Some(peer_count) {
+            last_logged_peer_count.set(Some(peer_count));
+            info!("Rendering meeting view with {peer_count} peers");
+        }
+    }
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
     // that is_speaking_suppressed() no longer suppresses glow for everyone.
@@ -3722,6 +3744,20 @@ pub fn AttendantsComponent(
                             ss_resizing.set(false);
                         }
                     },
+
+                    // Meeting-level decode-budget banner (#1142 Phase 1). It owns
+                    // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
+                    // it self-gates on `pressured`/`avatar_count` and the sustain /
+                    // dwell / back-off policy. `natural` is the uncapped layout
+                    // tile count (`total_tiles`); "Show all videos" pins the
+                    // override to `Fixed(natural)`, which `effective_cap` clamps to
+                    // `min(natural, CANVAS_LIMIT)` on the next render. Reading
+                    // `decode_budget_pressured()` reactively keeps the props live.
+                    DecodeBudgetBanner {
+                        pressured: decode_budget_pressured(),
+                        avatar_count: avatar_tile_count,
+                        natural: total_tiles,
+                    }
 
                     if has_screen_share {
                         // ---- Split layout: active screen share (left) + peer videos (right) ----
@@ -4339,6 +4375,12 @@ pub fn AttendantsComponent(
                                                 diagnostics_open.set(opening);
                                                 if opening {
                                                     peer_list_open.set(false);
+                                                    // Close Device Settings so its
+                                                    // Performance-tab 4Hz tick can't
+                                                    // run alongside the diagnostics
+                                                    // one (symmetry with the reverse
+                                                    // at DeviceSettingsButton; #6).
+                                                    device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
@@ -4516,6 +4558,13 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
+                                    // Cross-nav: Performance tab → Diagnostics panel.
+                                    // Close settings, open the diagnostics sidebar. (#1095 §4a)
+                                    on_open_diagnostics: move |_| {
+                                        device_settings_open.set(false);
+                                        diagnostics_open.set(true);
+                                    },
+                                    publish_diagnostics_reader: diagnostics_reader_sink,
                                 }
                             }
                             if is_guest {
@@ -4624,6 +4673,17 @@ pub fn AttendantsComponent(
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
                         encoder_settings: encoder_settings(),
+                        // Live SEND simulcast reader (published by Host on mount),
+                        // for the "Simulcast layers" section. (#1095 §6)
+                        diagnostics_reader: diagnostics_reader_sink(),
+                        // Cross-nav: Diagnostics → Performance settings. Close the
+                        // diagnostics panel, open settings on the Performance tab. (#1095 §4b)
+                        on_open_performance: move |_| {
+                            diagnostics_open.set(false);
+                            device_settings_initial_section.set(Some("performance".into()));
+                            device_settings_generation.set(device_settings_generation() + 1);
+                            device_settings_open.set(true);
+                        },
                     }
                 }
 

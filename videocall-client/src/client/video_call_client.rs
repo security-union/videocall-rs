@@ -1355,6 +1355,28 @@ impl VideoCallClient {
         }
     }
 
+    /// Number of OTHER (remote) peers currently in the call — the count of
+    /// [`sorted_peer_keys`](Self::sorted_peer_keys) WITHOUT cloning the key Vec.
+    ///
+    /// Callers that only need the COUNT (e.g. the camera encoder's AQ control
+    /// loop deciding the single-layer low-rung pin, issue #1136) should use this
+    /// instead of `sorted_peer_keys().len()`: that path clones the entire cached
+    /// `Rc<Vec<String>>` just to read `.len()`, allocating a fresh `Vec<String>`
+    /// on a 1 Hz hot loop (issue #1156). Here we read `.len()` off the same cached
+    /// `Rc<Vec<String>>` — the `Rc` deref is free and nothing is cloned.
+    ///
+    /// The relay never echoes the local publisher's own packets and the local
+    /// session is never inserted into the peer decode manager, so this is the
+    /// count of OTHERS, not including self. A momentarily-busy `inner` borrow
+    /// returns `0` (same fail-safe as `sorted_peer_keys`), which the caller treats
+    /// as "no remote peers this tick" and self-corrects on the next read.
+    pub fn peer_count(&self) -> usize {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.sorted_string_keys().len(),
+            Err(_) => 0,
+        }
+    }
+
     /// Get the local session ID assigned by the server, if available.
     pub fn get_own_session_id(&self) -> Option<String> {
         match self.inner.try_borrow() {
@@ -1585,9 +1607,13 @@ impl VideoCallClient {
             .try_borrow_mut()
             .ok()
             .map(|mut inner| {
+                // Pass the SAME persisted receive bounds the decode path clamps
+                // with so the per-peer `Setting` reason attribution (issue #1131)
+                // uses the real user `max`, not a stale/duplicated copy.
+                let bounds = inner.receive_layer_bounds;
                 inner
                     .peer_decode_manager
-                    .per_peer_received_snapshots(now_ms)
+                    .per_peer_received_snapshots(now_ms, &bounds)
             })
             .unwrap_or_default()
     }
@@ -1682,6 +1708,8 @@ impl VideoCallClient {
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+        effective_video_layers: Rc<AtomicU32>,
+        active_video_layers: Rc<AtomicU32>,
     ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(hr) = &inner.health_reporter {
@@ -1698,6 +1726,8 @@ impl VideoCallClient {
                         screen_transitions,
                         climb_limiter_snapshot,
                         dwell_samples,
+                        effective_video_layers,
+                        active_video_layers,
                     );
                 }
             }
@@ -2019,7 +2049,10 @@ impl VideoCallClient {
                 if let Err(e) = controller.set_video_enabled(enabled) {
                     debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set video enabled: {enabled}");
+                    // Re-applied frequently (state re-sync on render/tick), so this
+                    // accumulated thousands of lines per meeting. Demoted
+                    // debug!->trace! (#1100/#1129 follow-up); not analyzer-consumed.
+                    trace!("Successfully set video enabled: {enabled}");
                     if let Ok(inner) = self.inner.try_borrow() {
                         if let Some(hr) = &inner.health_reporter {
                             if let Ok(hrb) = hr.try_borrow() {
@@ -2042,7 +2075,10 @@ impl VideoCallClient {
                 if let Err(e) = controller.set_audio_enabled(enabled) {
                     debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set audio enabled: {enabled}");
+                    // Re-applied frequently (state re-sync on render/tick), so this
+                    // accumulated thousands of lines per meeting. Demoted
+                    // debug!->trace! (#1100/#1129 follow-up); not analyzer-consumed.
+                    trace!("Successfully set audio enabled: {enabled}");
                     if let Ok(inner) = self.inner.try_borrow() {
                         if let Some(hr) = &inner.health_reporter {
                             if let Ok(hrb) = hr.try_borrow() {

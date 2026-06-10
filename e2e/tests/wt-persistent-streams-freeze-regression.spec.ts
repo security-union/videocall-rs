@@ -118,13 +118,40 @@
  *     should differ by design.
  */
 
-import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
+import { test, expect, chromium, Page, BrowserContext, APIRequestContext } from "@playwright/test";
+import { generateSessionToken } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
+const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8081";
 const TEST_DURATION_MS = 60_000;
 const PIXEL_SAMPLE_EARLY_MS = 20_000;
 const KEYFRAME_REQUEST_THRESHOLD = 5;
+
+async function createMeetingViaApi(
+  request: APIRequestContext,
+  hostEmail: string,
+  hostName: string,
+  meetingId: string,
+): Promise<void> {
+  const token = generateSessionToken(hostEmail, hostName);
+  const res = await request.post(`${API_BASE_URL}/api/v1/meetings`, {
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `session=${token}`,
+    },
+    data: {
+      meeting_id: meetingId,
+      attendees: [],
+      allow_guests: true,
+      waiting_room_enabled: false,
+      admitted_can_admit: false,
+      end_on_host_leave: false,
+    },
+  });
+  expect([201, 409]).toContain(res.status());
+}
 
 /**
  * Seed `localStorage` with sticky WebTransport so the wasm boot path
@@ -179,12 +206,15 @@ async function joinMeetingFromPage(
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
   const grid = page.locator("#grid-container");
 
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    waitingForMeeting.waitFor({ timeout: 30_000 }).then(() => "waiting-for-meeting" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
+  const result = await waitForVisibleState(
+    [
+      { name: "join", locator: joinButton },
+      { name: "waiting", locator: waitingRoom },
+      { name: "waiting-for-meeting", locator: waitingForMeeting },
+      { name: "auto-joined", locator: grid },
+    ] as const,
+    30_000,
+  );
 
   if (result === "waiting" || result === "waiting-for-meeting") {
     return result;
@@ -218,10 +248,13 @@ async function admitGuestIfNeeded(
     const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
     const guestGrid = guestPage.locator("#grid-container");
 
-    const postAdmit = await Promise.race([
-      guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-      guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-    ]);
+    const postAdmit = await waitForVisibleState(
+      [
+        { name: "join-button", locator: guestJoinButton },
+        { name: "grid", locator: guestGrid },
+      ] as const,
+      20_000,
+    );
 
     if (postAdmit === "join-button") {
       await guestPage.waitForTimeout(1000);
@@ -348,27 +381,24 @@ test.describe("WebTransport persistent-streams + split-writer freeze regression"
   // are all in place; this test is live.
   test("audio+video on WT survives a 60s 2-peer call without freeze signatures", async ({
     baseURL,
+    request,
   }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_wt_freeze_${Date.now()}`;
+    const hostEmail = "wt-freeze-host@videocall.rs";
+    const hostName = "WtFreezeHost";
+    const guestEmail = "wt-freeze-guest@videocall.rs";
+    const guestName = "WtFreezeGuest";
+
+    await createMeetingViaApi(request, hostEmail, hostName, meetingId);
 
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
 
     try {
-      const hostCtx = await createAuthenticatedContext(
-        browser1,
-        "wt-freeze-host@videocall.rs",
-        "WtFreezeHost",
-        uiURL,
-      );
-      const guestCtx = await createAuthenticatedContext(
-        browser2,
-        "wt-freeze-guest@videocall.rs",
-        "WtFreezeGuest",
-        uiURL,
-      );
+      const hostCtx = await createAuthenticatedContext(browser1, hostEmail, hostName, uiURL);
+      const guestCtx = await createAuthenticatedContext(browser2, guestEmail, guestName, uiURL);
 
       // Force WebTransport for BOTH contexts before any page loads the wasm.
       await forceWebTransportSticky(hostCtx, uiURL);
@@ -381,11 +411,11 @@ test.describe("WebTransport persistent-streams + split-writer freeze regression"
       const guestStats = attachConsoleSniffer(guestPage, "guest");
 
       // ---- Both users join the meeting ----
-      await navigateToMeeting(hostPage, meetingId, "WtFreezeHost");
+      await navigateToMeeting(hostPage, meetingId, hostName);
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
 
-      await navigateToMeeting(guestPage, meetingId, "WtFreezeGuest");
+      await navigateToMeeting(guestPage, meetingId, guestName);
       const guestResult = await joinMeetingFromPage(guestPage);
       await admitGuestIfNeeded(hostPage, guestPage, guestResult);
 

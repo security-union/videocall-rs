@@ -349,11 +349,16 @@ impl VideoPeerDecoder {
     ///
     /// The fix: keep the canvas buffer at the true `display_*` dimensions, but
     /// draw with the 6-arg `drawImage(frame, 0, 0, dw, dh)` form so the entire
-    /// visible source is *scaled to fill* the whole display-sized buffer. The
-    /// browser already folds rotation and sample-aspect correction into
-    /// `display_*`, so the buffer's aspect matches the painted content's aspect
-    /// regardless of how `coded`/`visible`/`display` diverge. Applies to both
-    /// the camera and screen-share decoders (same `VideoPeerDecoder` path).
+    /// visible source is *scaled to fill* the whole display-sized buffer. This
+    /// corrects the crop-padding and non-square-sample-aspect cases (the browser
+    /// folds SAR into `display_*`), so the painted content's aspect matches the
+    /// buffer's declared `display` aspect. NOTE: `drawImage` does NOT apply a
+    /// frame's *rotation* metadata — it paints the visible pixels unrotated and
+    /// only scales them, so a genuinely 90°/270°-rotated source would still need a
+    /// canvas transform (out of scope here; the VP9 decode path in this pipeline
+    /// does not carry rotation metadata — capture-side rotation is already baked
+    /// into the pixels). Applies to both the camera and screen-share decoders
+    /// (same `VideoPeerDecoder` path).
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,

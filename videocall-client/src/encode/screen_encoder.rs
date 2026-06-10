@@ -97,9 +97,10 @@ struct LayerEncoder {
     /// This layer's simulcast id, stamped onto every emitted `PacketWrapper`.
     layer_id: u32,
     /// Cached bitrate (bps) last applied to this layer's encoder. Resolution is
-    /// FIXED per screen tier (set once at construction), so unlike the camera's
-    /// `LayerEncoder` there are no per-layer width/height fields — only the
-    /// bitrate adapts.
+    /// fixed for this layer's lifetime — set once at construction by fitting the
+    /// capture dims into the layer's tier bounding box (aspect-preserving, issue
+    /// #1196) — so unlike the camera's `LayerEncoder` there are no per-layer
+    /// width/height fields tracked across frames; only the bitrate adapts.
     local_bitrate: u32,
     /// Kept alive so the JS output callback stays valid.
     _output_closure: Closure<dyn FnMut(JsValue)>,
@@ -1839,8 +1840,24 @@ impl ScreenEncoder {
                 for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate().skip(1) {
                     let layer_id = layer_idx as u32;
                     let tier = &screen_tiers[layer_idx];
-                    let layer_w = tier.max_width;
-                    let layer_h = tier.max_height;
+                    // Treat the tier as a BOUNDING BOX, not a fixed output size
+                    // (issue #1196): fit the actual capture dims inside the
+                    // layer's rung, aspect-preserving — the same
+                    // `fit_within_preserving_aspect` the base layer applies on
+                    // its per-frame reconfigure path (the base layer's initial
+                    // configure uses the raw capture dims, which is already
+                    // aspect-correct because those ARE the source dims; the extra
+                    // rungs' boxes are smaller than the capture, so they must be
+                    // fitted here to avoid a per-axis squash). `width` / `height`
+                    // are the real capture dims read from `getSettings()` above,
+                    // so a non-16:9 display (16:10, ultrawide, portrait) is not
+                    // per-axis-squashed into the 16:9 tier dims on rungs 1..n.
+                    let (layer_w, layer_h) = fit_within_preserving_aspect(
+                        width,
+                        height,
+                        tier.max_width,
+                        tier.max_height,
+                    );
                     let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
 
                     // Per-layer output handler: own seq cell + #903 metadata

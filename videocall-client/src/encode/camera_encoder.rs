@@ -2535,24 +2535,13 @@ impl CameraEncoder {
                                 //
                                 // `frame_width` / `frame_height` are the raw
                                 // native VideoFrame dimensions (the true source
-                                // aspect). The single-stream `clamped_*` below
-                                // fits against the shared `local_tier_max_*`; the
-                                // simulcast branch fits against each layer's own
-                                // tier box via `simulcast_layer_target_dims`.
-                                let (clamped_width, clamped_height) =
-                                    if frame_width > 0 && frame_height > 0 {
-                                        fit_within_preserving_aspect(
-                                            frame_width,
-                                            frame_height,
-                                            local_tier_max_width,
-                                            local_tier_max_height,
-                                        )
-                                    } else {
-                                        // Degenerate frame dims: leave as-is so
-                                        // the `> 0` change-detection below skips
-                                        // the reconfigure.
-                                        (frame_width, frame_height)
-                                    };
+                                // aspect). The single-stream path fits them
+                                // against the shared `local_tier_max_*` (computed
+                                // inside the `!simulcast` branch below so the fit
+                                // runs only when consumed — not ~N× per second on
+                                // the simulcast path); the simulcast branch fits
+                                // against each layer's own tier box via
+                                // `simulcast_layer_target_dims`.
 
                                 // SIMULCAST per-layer aspect re-fit (issue #1196).
                                 // Fit the source frame into THIS layer's tier box
@@ -2622,40 +2611,60 @@ impl CameraEncoder {
                                     }
                                 }
 
-                                if !simulcast
-                                    && clamped_width > 0
-                                    && clamped_height > 0
-                                    && (clamped_width != layer.current_w
-                                        || clamped_height != layer.current_h)
-                                {
-                                    // Guard: do not configure a closed encoder.
-                                    if layer.encoder.state() == CodecState::Closed {
-                                        log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                        fatal_encode = true;
-                                        break;
-                                    }
+                                // SINGLE-STREAM aspect re-fit (#1037). Compute the
+                                // fit only here, inside the `!simulcast` branch, so
+                                // the simulcast path doesn't pay ~N× fit calls per
+                                // second for a value it never consumes.
+                                if !simulcast {
+                                    let (clamped_width, clamped_height) =
+                                        if frame_width > 0 && frame_height > 0 {
+                                            fit_within_preserving_aspect(
+                                                frame_width,
+                                                frame_height,
+                                                local_tier_max_width,
+                                                local_tier_max_height,
+                                            )
+                                        } else {
+                                            // Degenerate frame dims: leave as-is so
+                                            // the `> 0` change-detection below skips
+                                            // the reconfigure.
+                                            (frame_width, frame_height)
+                                        };
 
-                                    log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
-
-                                    layer.current_w = clamped_width;
-                                    layer.current_h = clamped_height;
-
-                                    let new_config = VideoEncoderConfig::new(
-                                        get_video_codec_string(),
-                                        layer.current_h,
-                                        layer.current_w,
-                                    );
-                                    new_config.set_bitrate(layer.local_bitrate as f64);
-                                    new_config.set_latency_mode(LatencyMode::Realtime);
-                                    if let Err(e) = layer.encoder.configure(&new_config) {
-                                        CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        if is_fatal_encoder_error(&e) {
-                                            error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                    if clamped_width > 0
+                                        && clamped_height > 0
+                                        && (clamped_width != layer.current_w
+                                            || clamped_height != layer.current_h)
+                                    {
+                                        // Guard: do not configure a closed encoder.
+                                        if layer.encoder.state() == CodecState::Closed {
+                                            log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
                                             fatal_encode = true;
                                             break;
                                         }
-                                        error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+
+                                        log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
+
+                                        layer.current_w = clamped_width;
+                                        layer.current_h = clamped_height;
+
+                                        let new_config = VideoEncoderConfig::new(
+                                            get_video_codec_string(),
+                                            layer.current_h,
+                                            layer.current_w,
+                                        );
+                                        new_config.set_bitrate(layer.local_bitrate as f64);
+                                        new_config.set_latency_mode(LatencyMode::Realtime);
+                                        if let Err(e) = layer.encoder.configure(&new_config) {
+                                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            if is_fatal_encoder_error(&e) {
+                                                error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                                fatal_encode = true;
+                                                break;
+                                            }
+                                            error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+                                        }
                                     }
                                 }
 

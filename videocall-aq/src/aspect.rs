@@ -467,4 +467,35 @@ mod tests {
         assert_eq!((d.target_w, d.target_h), (960, 720));
         assert!(!d.needs_reconfigure);
     }
+
+    /// Mid-share aspect change on a SCREEN rung (issue #1196, REQUIRED 1). The
+    /// share starts 16:10 (1920x1200) and switches to 4:3 (1600x1200) — e.g. a
+    /// window-region resize or a shared-surface switch. On a rung whose tier box
+    /// is 1280x720, the rung was seeded at the 16:10 fit (1152x720); after the
+    /// switch the helper must re-fit to the 4:3 result (960x720) and report
+    /// `needs_reconfigure`, so the higher rung self-corrects instead of baking
+    /// the new aspect into a stale 1152x720 config.
+    ///
+    /// Mutation guard (adversarial check #2): if the screen extra_layers loop
+    /// dropped the per-frame re-fit (the confirmed gap before this fix), the rung
+    /// would stay at 1152x720 and squash the 4:3 content. This pins the decision
+    /// the loop must act on; reverting the loop's re-fit makes the screen rung
+    /// distort exactly as asserted-against here.
+    #[test]
+    fn screen_rung_mid_share_aspect_change_refits() {
+        // Rung tier box (screen low/medium share 1280x720).
+        let (tier_w, tier_h) = (1280u32, 720u32);
+        // Construction-time seed for the initial 16:10 share.
+        let seed = simulcast_layer_target_dims(1920, 1200, tier_w, tier_h, tier_w, tier_h);
+        assert_eq!((seed.target_w, seed.target_h), (1152, 720));
+        // Now the source switches to 4:3 1600x1200; current dims are the 16:10
+        // seed, so the helper must re-fit and flag a reconfigure.
+        let d =
+            simulcast_layer_target_dims(1600, 1200, tier_w, tier_h, seed.target_w, seed.target_h);
+        assert_eq!((d.target_w, d.target_h), (960, 720));
+        assert!(
+            d.needs_reconfigure,
+            "a mid-share aspect change must reconfigure the screen rung"
+        );
+    }
 }

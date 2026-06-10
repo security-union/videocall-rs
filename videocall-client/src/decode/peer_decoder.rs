@@ -352,6 +352,43 @@ impl VideoPeerDecoder {
     }
 
     /// Render video frame using cached canvas and context. Only resizes when dimensions change.
+    ///
+    /// Aspect-ratio correctness (per-peer "squashed video" fix):
+    ///
+    /// A WebCodecs `VideoFrame` carries three distinct geometries:
+    ///   * `coded_width/coded_height`  — the raw encoded buffer, padded up to the
+    ///     codec's macroblock alignment (16px for VP8/VP9) and *before* rotation.
+    ///   * `visibleRect`               — the cropped picture region inside the
+    ///     coded buffer (the alignment padding removed). This is the *intrinsic*
+    ///     source `drawImage` reads from.
+    ///   * `display_width/display_height` — the dimensions the frame is meant to
+    ///     be shown at, after crop, rotation, and any non-square sample-aspect
+    ///     correction.
+    ///
+    /// The old code sized the canvas buffer to `display_*` but drew with the
+    /// 3-arg `drawImage(frame, dx, dy)`, which paints the *intrinsic* (visible)
+    /// source at 1:1 with no scaling. When `visibleRect` happened to equal
+    /// `display_*` (clean codec-aligned, square-pixel, un-rotated frames) the
+    /// painted region exactly filled the buffer and looked fine. But for peers
+    /// whose frames carried crop padding, a non-square sample aspect ratio, or
+    /// rotation, the visible source dimensions differed from `display_*`: only a
+    /// sub-region of the `display`-sized buffer got painted, yet the buffer
+    /// (and therefore the CSS `object-fit: cover` scaling) still declared the
+    /// `display` aspect — so the picture rendered squashed/stretched. That
+    /// "only some peers" split is the signature of this bug.
+    ///
+    /// The fix: keep the canvas buffer at the true `display_*` dimensions, but
+    /// draw with the 6-arg `drawImage(frame, 0, 0, dw, dh)` form so the entire
+    /// visible source is *scaled to fill* the whole display-sized buffer. This
+    /// corrects the crop-padding and non-square-sample-aspect cases (the browser
+    /// folds SAR into `display_*`), so the painted content's aspect matches the
+    /// buffer's declared `display` aspect. NOTE: `drawImage` does NOT apply a
+    /// frame's *rotation* metadata — it paints the visible pixels unrotated and
+    /// only scales them, so a genuinely 90°/270°-rotated source would still need a
+    /// canvas transform (out of scope here; the VP9 decode path in this pipeline
+    /// does not carry rotation metadata — capture-side rotation is already baked
+    /// into the pixels). Applies to both the camera and screen-share decoders
+    /// (same `VideoPeerDecoder` path).
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
@@ -360,8 +397,11 @@ impl VideoPeerDecoder {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
         if let Some(renderer) = renderer_guard.as_mut() {
-            let width = video_frame.display_width();
-            let height = video_frame.display_height();
+            // Always size the canvas buffer to the frame's *display* dimensions
+            // (post-crop / post-rotation / sample-aspect-corrected). This is the
+            // aspect the tile should present.
+            let (width, height) =
+                canvas_buffer_dims(video_frame.display_width(), video_frame.display_height());
 
             // Only resize canvas if dimensions changed (expensive operation)
             if renderer.last_width != width || renderer.last_height != height {
@@ -389,14 +429,21 @@ impl VideoPeerDecoder {
                 }
             }
 
-            // Clear and draw frame
+            // Clear and draw frame.
             renderer
                 .context
                 .clear_rect(0.0, 0.0, width as f64, height as f64);
-            if let Err(e) = renderer
-                .context
-                .draw_image_with_video_frame(&video_frame, 0.0, 0.0)
-            {
+            // Draw the frame's full visible source scaled to fill the entire
+            // display-sized buffer. The 6-arg form (dx, dy, dw, dh) is what makes
+            // this aspect-correct for frames where the intrinsic (visible) source
+            // size differs from the display size — see the doc comment above.
+            if let Err(e) = renderer.context.draw_image_with_video_frame_and_dw_and_dh(
+                &video_frame,
+                0.0,
+                0.0,
+                width as f64,
+                height as f64,
+            ) {
                 log::error!("Error drawing video frame: {e:?}");
             }
         } else {
@@ -664,6 +711,30 @@ fn consume_first_render_flag(flag: &Rc<RefCell<bool>>) -> bool {
     }
 }
 
+/// Decide the canvas drawing-buffer dimensions for a decoded frame, given the
+/// frame's WebCodecs *display* dimensions (`display_width`, `display_height`).
+///
+/// The display dimensions already encode the intended presentation aspect —
+/// post-crop, post-rotation, and corrected for any non-square sample aspect
+/// ratio — so the canvas buffer is sized to them directly and the frame's full
+/// visible source is then scaled to fill that buffer in
+/// [`VideoPeerDecoder::render_to_canvas_cached`]. Keeping the buffer at the
+/// display aspect (rather than the raw coded/visible aspect) is what makes the
+/// CSS `object-fit: cover` tile scaling render the correct shape for *every*
+/// peer, not just codec-aligned square-pixel ones.
+///
+/// A WebCodecs `VideoFrame` cannot have a zero-size display rect in practice,
+/// but a defensive `(0, 0)` would zero the canvas buffer, turn the subsequent
+/// `clear_rect` into a no-op and give `drawImage` an empty destination rect
+/// (drawing nothing). Clamp each axis to a minimum of 1 so the render path
+/// always has a valid, non-degenerate buffer.
+///
+/// Extracted as a pure function so the buffer-sizing rule is host-unit-testable
+/// without a real `web_sys::VideoFrame` (which only exists under wasm).
+fn canvas_buffer_dims(display_width: u32, display_height: u32) -> (u32, u32) {
+    (display_width.max(1), display_height.max(1))
+}
+
 /// HCL #893: helper used by the `on_video_frame` callback the first time
 /// the WasmDecoder hands a `VideoFrame` back to the render path. Flips
 /// the shared `first_render_pending_ack` flag exactly once per decoder
@@ -865,6 +936,53 @@ mod tests {
         let (fp, tp) = resolve_renderer_context(prior, Some(&stream_ctx));
         assert_eq!(fp.as_deref(), Some("alice"));
         assert!(tp.is_none());
+    }
+
+    // --- Aspect-ratio fix: `canvas_buffer_dims` --------------------------
+    //
+    // These pin the buffer-sizing rule that backs the per-peer "squashed
+    // video" fix. The render path sizes the canvas to these dims and then
+    // scales the frame's full visible source to fill it; if the buffer
+    // carried the wrong aspect (e.g. coded/visible dims instead of display),
+    // `object-fit: cover` would stretch the tile. The wasm `drawImage` call
+    // itself can't be host-tested, so this isolates the host-testable math.
+
+    /// Common 16:9 / 4:3 / portrait display sizes pass straight through —
+    /// the canvas buffer must match the display dims exactly so the tile's
+    /// aspect is correct. A regression that returned coded/aligned dims (e.g.
+    /// padded the height to a 16px multiple) would change 720 -> 720 but
+    /// would break a non-aligned size like 1080; both are checked.
+    #[test]
+    fn canvas_buffer_dims_passes_display_through() {
+        assert_eq!(canvas_buffer_dims(1280, 720), (1280, 720)); // 16:9
+        assert_eq!(canvas_buffer_dims(640, 480), (640, 480)); // 4:3
+        assert_eq!(canvas_buffer_dims(720, 1280), (720, 1280)); // portrait 9:16
+        assert_eq!(canvas_buffer_dims(1920, 1080), (1920, 1080)); // 1080 not 16-aligned
+    }
+
+    /// A non-square sample-aspect / cropped frame whose display dims are an
+    /// arbitrary (not codec-aligned) size must still produce a buffer at that
+    /// exact display aspect — this is the case that rendered squashed before
+    /// the fix. 854x480 (the classic 16:9 480p with width not divisible by 16)
+    /// must NOT be rounded to a coded 864x480.
+    #[test]
+    fn canvas_buffer_dims_preserves_unaligned_display_aspect() {
+        assert_eq!(canvas_buffer_dims(854, 480), (854, 480));
+        // Aspect must be preserved exactly, not snapped to a coded multiple.
+        let (w, h) = canvas_buffer_dims(854, 480);
+        assert_eq!(w, 854, "width must not be padded to a 16px multiple");
+        assert_eq!(h, 480);
+    }
+
+    /// Degenerate `(0, 0)` is clamped to a valid 1x1 buffer so the render
+    /// path never produces a zero-size canvas (which would no-op `clear_rect`
+    /// and `drawImage`). Mutating the `.max(1)` to plain pass-through would
+    /// return `(0, 0)` here and fail.
+    #[test]
+    fn canvas_buffer_dims_clamps_zero_to_one() {
+        assert_eq!(canvas_buffer_dims(0, 0), (1, 1));
+        assert_eq!(canvas_buffer_dims(1280, 0), (1280, 1));
+        assert_eq!(canvas_buffer_dims(0, 720), (1, 720));
     }
 
     // --- HCL #893: `first_render_pending_ack` flag semantics --------------

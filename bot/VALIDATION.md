@@ -50,7 +50,7 @@ fail-open, existing behaviour unchanged).
 | V18 | Bot `VIEWPORT` reduces measured inbound `video_bytes` end-to-end | ✅ PROVEN (WT) | 2026-06-10 — pat (`viewport_visible_count: 1`) vs 2 publishers: visible source delivered 216 kbps; hidden source delivered ZERO video (no `videocall_video_bitrate_kbps{reporter_name="pat",peer_name="bob"}` series ever created); `relay_viewport_set_size`=1, forwarded=18,177 / filtered=5,679. |
 | V19 | Bot re-asserts its `VIEWPORT` after a viewport-subscription loss (reconnect / re-election / relay idle) so filtering does not silently lapse | ⏳ PARTIAL | 2026-06-10 — the periodic re-assert is live on cluster: `Sent VIEWPORT (reconnect) rendering 1 of 2 known peer(s)` every 10s reset window, relay `accepted`=23 / `rate_limited`=1 over ~4 min — a dropped subscription is re-asserted within one window by construction. The forced-loss capture itself (relay pod restart mid-run) NOT exercised — too disruptive on the shared daily cluster; run during a maintenance window. |
 | V20 | Bot-as-publisher emits a multi-layer simulcast ladder when `experimentalSimulcastMaxLayers` is raised (publish side of per-receiver simulcast #989/#1082) | ✅ PROVEN (WT + WS) | 2026-06-10 — `relay_layer_forwarded_by_layer_total{room="a2sim"}`: WS pod L0=25,845 / L1=5,717 / L2=5,716; WT pod L0=29,011 / L1=5,711 / L2=5,708 — full ladder on both transports. Negative control (`--simulcast-layers 1`, room `a2neg`): ONLY the `layer_id="0"` series exists (9,844 pkts; L1/L2 series never created). |
-| V21 | `uplink_budget_kbps` caps the SUM of active-layer bitrates and AQ sheds the TOP layer under the bot's own congestion (`videocall-aq`) | 🟩 BOT-WIRED — PENDING CLUSTER CAPTURE | **Bot-side AQ now wired (this branch).** `BotAq::set_simulcast_layers(N)` enables the controller's per-layer paths (full-ladder, shed-only — NOT the browser start-at-base ramp; see code comment); the simulcast producers read `BotAq::simulcast_snapshot` per frame, skip layers ≥ active (top-down shed), and `update_bitrate_kbps` on cap rescale. **Shed trigger = the bot's OWN uplink saturation, measured inside the netsim shim**: the netsim uplink shim records, per packet, the microseconds of delay it imposed *solely* because its token bucket was in deficit (offered byte rate > `uplink_kbps`), exposed as `NetSimShim::bandwidth_wait_us` — a bandwidth-ONLY counter that EXCLUDES latency/jitter/reorder. The AQ tick samples it (`main.rs`), and `BotAq::observe_uplink_saturation` maps a positive per-tick delta to `ENCODER_QUEUE_BACKPRESSURE_HIGH`, arming the controller's existing sustained-shed timer (`controller.rs::backpressure_decision` → `drop_top_layer`). This replaced an earlier `transport_drops_counter`/`try_send`-failure design that was INERT on a real run: the outbound shim spawns a detached delay task per `Admission::Delay`, so `packet_tx` never backs up under bandwidth shaping and the drop counter stayed flat. Measuring saturation at the source (inside `admit`) is immune to that drain. 9 bot unit tests (5 AQ-controller incl. the saturation shed + its flat-counter negative control, 4 producer directive) + 2 end-to-end integration tests (real-shim shed + latency-only negative control) + 4 netsim shim tests (saturation climbs, flat under latency-only/within-budget/passthrough) + the host `cap_layers_to_budget` tests green. **3-layer floors = [200,500,800] kbps** (low/standard/hd); pick the shed-phase uplink BELOW the active-set floor-sum (see run notes). Cluster capture still pending. Run **twice: WT, WS.** |
+| V21 | `uplink_budget_kbps` caps the SUM of active-layer bitrates and AQ sheds the TOP layer under the bot's own congestion (`videocall-aq`) | ✅ PROVEN (WT + WS) — shed path | **Bot-side AQ now wired (this branch).** `BotAq::set_simulcast_layers(N)` enables the controller's per-layer paths (full-ladder, shed-only — NOT the browser start-at-base ramp; see code comment); the simulcast producers read `BotAq::simulcast_snapshot` per frame, skip layers ≥ active (top-down shed), and `update_bitrate_kbps` on cap rescale. **Shed trigger = the bot's OWN uplink saturation, measured inside the netsim shim**: the netsim uplink shim records, per packet, the microseconds of delay it imposed *solely* because its token bucket was in deficit (offered byte rate > `uplink_kbps`), exposed as `NetSimShim::bandwidth_wait_us` — a bandwidth-ONLY counter that EXCLUDES latency/jitter/reorder. The AQ tick samples it (`main.rs`), and `BotAq::observe_uplink_saturation` maps a positive per-tick delta to `ENCODER_QUEUE_BACKPRESSURE_HIGH`, arming the controller's existing sustained-shed timer (`controller.rs::backpressure_decision` → `drop_top_layer`). This replaced an earlier `transport_drops_counter`/`try_send`-failure design that was INERT on a real run: the outbound shim spawns a detached delay task per `Admission::Delay`, so `packet_tx` never backs up under bandwidth shaping and the drop counter stayed flat. Measuring saturation at the source (inside `admit`) is immune to that drain. 9 bot unit tests (5 AQ-controller incl. the saturation shed + its flat-counter negative control, 4 producer directive) + 2 end-to-end integration tests (real-shim shed + latency-only negative control) + 4 netsim shim tests (saturation climbs, flat under latency-only/within-budget/passthrough) + the host `cap_layers_to_budget` tests green. **3-layer floors = [200,500,800] kbps** (low/standard/hd). **Cluster capture 2026-06-10 (see the V21 test-run entry): shed fired on BOTH transports** — uplink 300 kbps: SHED 3→2→1 within ~8s of producer start, then a shed/restore equilibrium hunt (WS 12 SHED/11 RESTORE, WT 8/7 over ~5 min); uplink 100 kbps: pinned at active_layers=1, base layer kept flowing end-to-end (relay L1/L2 series flatlined at their first-seconds counts; receiver kept getting alice). Logged active-sum tracked the budget stepwise 2800→1300→400 kbps. SCOPE NOTE (honest): the budget-CAP half (per-layer target rescale via `cap_layers_to_budget`) cannot manifest in the bot — per-layer targets are pinned at tier ideals so the sum equals the budget exactly until a shed changes the active set; the cap function remains host-unit-tested only. The on-cluster proof is the SHED half + stepwise sum tracking. |
 | V22 | Relay layer-filter correctness — a bot emitting `LayerPreferencePacket{desired_layer:0}` receives ONLY layer-0 `video_bytes` (per-source `inbound_stats`) while a no-preference bot keeps the full ladder | ✅ PROVEN (WT + WS) | 2026-06-10 — same source, two receivers, 3-min averages: WS — alice's video reached no-pref bob at 373 kbps / 20.3 fps vs pinned pat at 81 kbps / 6.9 fps (4.6×); bob's video 230 vs 49 kbps (4.7×). WT — alice's video 412 vs 72 kbps (5.7×); bob's 229 vs 51 kbps (4.5×). Relay filtered ≈2,130 pkt/min sustained on each transport (`relay_layer_filtered_total` WS=8,164; WT +6,393/3min); `relay_layer_preference_updates_total{outcome="accepted"}` WS=24 / WT=29, `rate_limited`=1 each. pat logged `Sent LAYER_PREFERENCE (change) pinning 2 source(s) to layer 0 (Video)` + 10s `(reconnect)` re-asserts. |
 
 ### #988 viewport-fidelity validation detail
@@ -268,6 +268,52 @@ How to verify (needs #1079+#1082 deployed):
 > branch adds (see the V21 row).
 
 ## Test runs
+
+### 2026-06-10 (later) — V21 uplink-squeeze shed on HCL daily (bot AQ wiring branch)
+
+**Setup:**
+- Binary: built from `feat/1083-bot-simulcast-aq-wiring` (this branch — the V21
+  wiring is NOT in the deployed bot; relay side needs nothing new), static
+  libvpx, deployed as `jenkins-volt-mx-go-3:~/bot-a2/bot-v21`.
+- Topology per run: 1 publisher (`alice`, costume, `--simulcast-layers 3`, manifest
+  `network: {uplink_kbps: N}`) + 1 receiver (`pat`, no preference). Four runs:
+  WS/WT × phase A (`uplink_kbps: 300`) / phase B (`uplink_kbps: 100`), ~3–5 min
+  each, rooms `a2v21wsa`/`a2v21wsb`/`a2v21wta`/`a2v21wtb`.
+- **Calibration note:** the ladder's NOMINAL sum is 2800 kbps but the costume
+  content's ACTUAL VP9 output is ≈400 kbps full-ladder (static frames compress
+  far below target — measured in the earlier V22 runs). The token bucket sees
+  actual bytes, so the squeeze phases were calibrated to actual (300/100), not
+  nominal (the original 1500/500 design would never saturate).
+
+**Results — shed fired on both transports:**
+
+| Run | Uplink | SHED/RESTORE | Settled state | Relay fwd L0/L1/L2 | pat ← alice |
+|---|---|---|---|---|---|
+| WS A | 300 kbps | 12 / 11 | hunt 1↔2 layers | 8,654 / 153 / (none) | 208 kbps |
+| WS B | 100 kbps | 2 / 1 | pinned at 1 | 9,932 / 67 / 33 | 177 kbps |
+| WT A | 300 kbps | 8 / 7 | hunt 1↔2 layers | 10,200 / 494 / 32 | 239 kbps |
+| WT B | 100 kbps | 2 / 1 | pinned at 1 | 10,194 / 66 / 32 | 182 kbps |
+
+- First shed lands ≤8 s after producer start (e.g. WT B: `SHED 3 -> 2` at +3 s,
+  `2 -> 1` at +6 s). Logged active-sum tracks the budget stepwise
+  2800→1300→400 kbps. AQ_STATUS settles at `active_layers=1`,
+  `target_bitrate=400`, `video_tier=minimal(7)`.
+- L1/L2 relay counters flatline after the first seconds (L2 counts of 32–33 are
+  the pre-shed startup burst; the WS-A L2 series was never created because the
+  receiver joined post-shed). L0 keeps climbing throughout — base layer always
+  flows.
+- At 300 kbps (between the 1-layer and 2-layer ACTUAL rates) the controller
+  hunts: sustained-deficit shed alternating with recovery restore on a ~20 s
+  cycle. Expected for a cap inside the hysteresis band; a cap clearly below
+  (100) pins cleanly at base.
+- **Shaping-fidelity caveat (V8/V15 territory, not V21):** the receiver-measured
+  delivered rate (177–239 kbps) can EXCEED the configured uplink cap — the
+  netsim bucket delays but never drops for bandwidth, and its per-packet delay
+  clamps at 5 s, so sustained overload leaks through above the cap. The shed
+  trigger is unaffected (it keys on the bucket-deficit counter, not the wire
+  rate).
+- Audio note: at 100 kbps the audio tier degraded to `emergency(3)` — the
+  squeeze pressures the whole uplink, as expected.
 
 ### 2026-06-10 — #1083-A2 per-receiver simulcast + #988 viewport fidelity on HCL daily
 

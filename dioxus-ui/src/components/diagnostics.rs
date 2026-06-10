@@ -22,7 +22,7 @@ use crate::components::neteq_chart::{
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
     format_send_layer_short, format_send_total_kbps, format_simulcast_summary, peers_for_kind,
-    DiagnosticsReader,
+    DiagnosticsReader, PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{
     confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
@@ -500,10 +500,12 @@ pub fn Diagnostics(
     /// when diagnostics aren't wired. (#1095 §6 MOVE)
     #[props(default)]
     diagnostics_reader: Option<DiagnosticsReader>,
-    /// Cross-nav: open Performance settings from the diagnostics header. Defaults
-    /// to a no-op so call sites that don't wire it still compile. (#1095 §4b)
+    /// Performance controls handle (sliders/Auto/meters) published by `Host`, for
+    /// the migrated Performance panel in the drawer's "Quality controls" group.
+    /// `None` until Host mounts / when not wired → the controls group renders
+    /// nothing. (#1131 unify)
     #[props(default)]
-    on_open_performance: EventHandler<()>,
+    perf_controls: Option<PerfControlsHandle>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
@@ -834,142 +836,49 @@ pub fn Diagnostics(
         div {
             id: "diagnostics-sidebar",
             class: if is_open { "visible" } else { "" },
+            // Non-modal drawer: a labelled region (the modal-trap behaviour stays
+            // off — the call UI behind it remains interactive). (#1131 §5 a11y)
+            role: "region",
+            "aria-label": "Performance & Diagnostics",
             div { class: "sidebar-header",
-                h2 { "Call Diagnostics" }
-                // Spacer pushes the actions to the right; × stays rightmost.
+                h2 { "Performance & Diagnostics" }
+                // Spacer keeps the × rightmost (the cross-nav button was removed
+                // when the Performance panel merged into this drawer; #1131).
                 div { style: "flex: 1 1 auto;" }
-                // Cross-nav: Diagnostics → Performance settings (#1095 §4b).
                 button {
-                    r#type: "button",
-                    class: "sidebar-header-action",
-                    "data-testid": "diag-open-performance",
-                    title: "Open Performance settings (set send/receive quality limits)",
-                    "aria-label": "Open Performance settings",
-                    onclick: move |_| on_open_performance.call(()),
-                    // Lucide sliders-horizontal.
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg",
-                        width: "18", height: "18", view_box: "0 0 24 24",
-                        fill: "none", stroke: "currentColor", stroke_width: "2",
-                        stroke_linecap: "round", stroke_linejoin: "round",
-                        "aria-hidden": "true",
-                        line { x1: "21", y1: "4", x2: "14", y2: "4" }
-                        line { x1: "10", y1: "4", x2: "3", y2: "4" }
-                        line { x1: "21", y1: "12", x2: "12", y2: "12" }
-                        line { x1: "8", y1: "12", x2: "3", y2: "12" }
-                        line { x1: "21", y1: "20", x2: "16", y2: "20" }
-                        line { x1: "12", y1: "20", x2: "3", y2: "20" }
-                        line { x1: "14", y1: "2", x2: "14", y2: "6" }
-                        line { x1: "8", y1: "10", x2: "8", y2: "14" }
-                        line { x1: "16", y1: "18", x2: "16", y2: "22" }
-                    }
-                    span { class: "sidebar-header-action__label", "Performance" }
+                    class: "close-button",
+                    "aria-label": "Close panel",
+                    onclick: move |_| on_close.call(()),
+                    "\u{00d7}"
                 }
-                button { class: "close-button", onclick: move |_| on_close.call(()), "\u{00d7}" }
             }
             div { class: "sidebar-content",
-                div { class: "diagnostics-section",
-                    h3 { "Build Info" }
-                    div { class: "build-info-table",
-                        div { class: "build-info-header",
-                            span { class: "build-info-cell", "Component" }
-                            span { class: "build-info-cell", "Commit" }
-                            span { class: "build-info-cell", "Branch" }
-                        }
-                        div { class: "build-info-row",
-                            span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
-                            span { class: "build-info-cell monospace", "" }
-                            span { class: "build-info-cell", "" }
-                        }
-                        for comp in backend_versions() {
-                            {
-                                let svc = comp["service"].as_str().unwrap_or("?").to_string();
-                                let ver = comp["version"].as_str().unwrap_or("").to_string();
-                                let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
-                                let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
-                                let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
-                                rsx! {
-                                    div { class: "build-info-row",
-                                        span { class: "build-info-cell build-info-service", "{label}" }
-                                        span { class: "build-info-cell monospace", "{sha}" }
-                                        span { class: "build-info-cell", "{br}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // ── GROUP A — Quality controls (the migrated Performance panel) ──
+                // First group: no top border (the dividers separate later groups).
+                div { class: "diag-group-label diag-group-label--first", role: "presentation",
+                    "Quality controls"
                 }
-                div { class: "diagnostics-section",
-                    h3 { "Connection Manager" }
-                    ConnectionManagerDisplay { connection_manager_state: conn_state }
+                // The Performance controls (simulcast strip + per-kind cards with
+                // sliders / Auto / live meters / help) render inside their own
+                // child component so the panel's 250 ms refresh tick + rAF meter
+                // drivers re-render ONLY that subtree — NOT this top-level body
+                // (which re-runs the expensive NetEq prelude). The child also reads
+                // the preference signals, keeping all reactive perf state out of
+                // this body. Renders nothing until Host publishes the handle.
+                // (#1131 unify, tick-scoping #1128)
+                if let Some(controls) = perf_controls.clone() {
+                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
                 }
+
+                // ── GROUP B — Live stream state ──
+                div { class: "diag-group-label", role: "presentation", "Live stream state" }
                 // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
-                // per-peer RECEIVE breakdown that used to live in the Performance
-                // panel's expandable footers. Extracted into its own child so its
+                // per-peer RECEIVE breakdown. Extracted into its own child so its
                 // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
                 // prelude / charts in this parent (perf review #1).
                 SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
-                div { class: "diagnostics-section",
-                    h3 { "Transport Preference" }
-                    div { class: "device-setting-group",
-                        select {
-                            id: "diagnostics-transport-select",
-                            class: "peer-selector",
-                            onchange: move |evt: Event<FormData>| {
-                                confirm_transport_change(
-                                    &evt.value(),
-                                    (transport_pref_ctx.0)(),
-                                    "diagnostics-transport-select",
-                                    load_transport_sticky(),
-                                );
-                            },
-                            option {
-                                value: "webtransport",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
-                                "WebTransport (default)"
-                            }
-                            option {
-                                value: "websocket",
-                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
-                                "WebSocket"
-                            }
-                        }
-                    }
-                    p { class: "transport-preference-note",
-                        "Changing protocol will reload the page."
-                    }
-                }
-                if available_peers.len() > 1 {
-                    div { class: "diagnostics-section",
-                        h3 { "Peer Selection" }
-                        select {
-                            class: "peer-selector",
-                            onchange: move |e: Event<FormData>| {
-                                selected_peer.set(e.value());
-                            },
-                            value: "{current_peer}",
-                            for peer in available_peers.iter() {
-                                {
-                                    let label = if peer == "All Peers" {
-                                        "All Peers".to_string()
-                                    } else {
-                                        peer_display_name(peer)
-                                    };
-                                    rsx! {
-                                        option {
-                                            value: "{peer}",
-                                            selected: peer == &current_peer,
-                                            "{label}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        p { class: "peer-info", "{peer_info}" }
-                    }
-                }
-                div { class: "diagnostics-section",
-                    h3 { "Current Status" }
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-current-status",
+                    h3 { id: "diag-h-current-status", "Current Status" }
                     NetEqStatusDisplay { latest_stats: latest_neteq_stats }
                 }
                 if !neteq_stats_history.is_empty() {
@@ -997,8 +906,8 @@ pub fn Diagnostics(
                         }
                     }
                 } else {
-                    div { class: "diagnostics-section",
-                        h3 { "NetEQ Buffer / Jitter History" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-history",
+                        h3 { id: "diag-h-neteq-history", "NetEQ Buffer / Jitter History" }
                         div { style: "display:flex; gap:12px; align-items:center;",
                             NetEqChart { data: buffer_history.clone(), chart_type: ChartType::Buffer, width: 140, height: 80 }
                             NetEqChart { data: jitter_history.clone(), chart_type: ChartType::Jitter, width: 140, height: 80 }
@@ -1006,8 +915,8 @@ pub fn Diagnostics(
                     }
                 }
                 if available_peers.len() > 2 {
-                    div { class: "diagnostics-section",
-                        h3 { "Per-Peer Summary" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
+                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
                         div { class: "peer-summary",
                             {
                                 let transport_map = peer_transport_per_peer();
@@ -1040,37 +949,175 @@ pub fn Diagnostics(
                         }
                     }
                 }
+
+                // ── GROUP C — Connection & system ──
+                div { class: "diag-group-label", role: "presentation", "Connection & system" }
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-connection-manager",
+                    h3 { id: "diag-h-connection-manager", "Connection Manager" }
+                    ConnectionManagerDisplay { connection_manager_state: conn_state }
+                }
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-transport-pref",
+                    h3 { id: "diag-h-transport-pref", "Transport Preference" }
+                    div { class: "device-setting-group",
+                        select {
+                            id: "diagnostics-transport-select",
+                            class: "peer-selector",
+                            onchange: move |evt: Event<FormData>| {
+                                confirm_transport_change(
+                                    &evt.value(),
+                                    (transport_pref_ctx.0)(),
+                                    "diagnostics-transport-select",
+                                    load_transport_sticky(),
+                                );
+                            },
+                            option {
+                                value: "webtransport",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebTransport,
+                                "WebTransport (default)"
+                            }
+                            option {
+                                value: "websocket",
+                                selected: (transport_pref_ctx.0)() == TransportPreference::WebSocket,
+                                "WebSocket"
+                            }
+                        }
+                    }
+                    p { class: "transport-preference-note",
+                        "Changing protocol will reload the page."
+                    }
+                }
+                if available_peers.len() > 1 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-selection",
+                        h3 { id: "diag-h-peer-selection", "Peer Selection" }
+                        select {
+                            class: "peer-selector",
+                            onchange: move |e: Event<FormData>| {
+                                selected_peer.set(e.value());
+                            },
+                            value: "{current_peer}",
+                            for peer in available_peers.iter() {
+                                {
+                                    let label = if peer == "All Peers" {
+                                        "All Peers".to_string()
+                                    } else {
+                                        peer_display_name(peer)
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{peer}",
+                                            selected: peer == &current_peer,
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p { class: "peer-info", "{peer_info}" }
+                    }
+                }
                 div { class: "diagnostics-data",
-                    div { class: "diagnostics-section",
-                        h3 { "Reception Stats" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-reception-stats",
+                        h3 { id: "diag-h-reception-stats", "Reception Stats" }
                         if let Some(data) = &diag_data {
                             pre { "{data}" }
                         } else {
                             p { "No reception data available." }
                         }
                     }
-                    div { class: "diagnostics-section",
-                        h3 { "Sending Stats" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-sending-stats",
+                        h3 { id: "diag-h-sending-stats", "Sending Stats" }
                         if let Some(data) = &send_stats {
                             pre { "{data}" }
                         } else {
                             p { "No sending data available." }
                         }
                     }
-                    div { class: "diagnostics-section",
-                        h3 { "Encoder Settings" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-encoder-settings",
+                        h3 { id: "diag-h-encoder-settings", "Encoder Settings" }
                         if let Some(data) = &enc_settings {
                             pre { "{data}" }
                         } else {
                             p { "No encoder settings available." }
                         }
                     }
-                    div { class: "diagnostics-section",
-                        h3 { "Media Status" }
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-media-status",
+                        h3 { id: "diag-h-media-status", "Media Status" }
                         pre { "{media_status}" }
                     }
                 }
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-build-info",
+                    h3 { id: "diag-h-build-info", "Build Info" }
+                    div { class: "build-info-table",
+                        div { class: "build-info-header",
+                            span { class: "build-info-cell", "Component" }
+                            span { class: "build-info-cell", "Commit" }
+                            span { class: "build-info-cell", "Branch" }
+                        }
+                        div { class: "build-info-row",
+                            span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                            span { class: "build-info-cell monospace", "" }
+                            span { class: "build-info-cell", "" }
+                        }
+                        for comp in backend_versions() {
+                            {
+                                let svc = comp["service"].as_str().unwrap_or("?").to_string();
+                                let ver = comp["version"].as_str().unwrap_or("").to_string();
+                                let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
+                                let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
+                                let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
+                                rsx! {
+                                    div { class: "build-info-row",
+                                        span { class: "build-info-cell build-info-service", "{label}" }
+                                        span { class: "build-info-cell monospace", "{sha}" }
+                                        span { class: "build-info-cell", "{br}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
+    }
+}
+
+/// Thin adapter that mounts the migrated [`PerformanceSettingsPanel`] inside the
+/// Diagnostics drawer's "Quality controls" group (#1131 unify). It exists so the
+/// preference-signal reads (`performance_preference()` / `receive_preference()`)
+/// and the panel's own 250 ms tick + rAF meter drivers are scoped to THIS child,
+/// never the top-level [`Diagnostics`] body — reading the prefs here subscribes
+/// only this subtree, and the panel re-renders here, so the parent's expensive
+/// NetEq prelude is not re-run on perf interactions (tick-scoping #1128).
+///
+/// All controls come from the `PerfControlsHandle` Host publishes; `audio_source_active`
+/// (the live mic-capture state) is forwarded from the drawer's `mic_enabled` prop.
+#[component]
+fn DiagnosticsPerformancePanel(controls: PerfControlsHandle, audio_source_active: bool) -> Element {
+    // Read the live preference signals here (NOT in the drawer body) so only this
+    // subtree subscribes; the panel keeps its existing value-typed props.
+    let pref = (controls.performance_preference)();
+    let receive_pref = (controls.receive_preference)();
+    let on_change = controls.on_change.clone();
+    let on_receive_change = controls.on_receive_change.clone();
+    rsx! {
+        PerformanceSettingsPanel {
+            // SEND (#961).
+            pref,
+            on_change: move |p| on_change(p),
+            read_snapshot: controls.read_snapshot.clone(),
+            read_screen_snapshot: controls.read_screen_snapshot.clone(),
+            // RECEIVE (#989 simulcast).
+            receive_pref,
+            on_receive_change: move |c| on_receive_change(c),
+            received_reader: controls.received_reader.clone(),
+            // Live diagnostics (#1095) for the per-card summary lines + strip.
+            diagnostics_reader: controls.diagnostics_reader.clone(),
+            // SEND layer-count ceilings (real ladder depth from host).
+            video_layer_max: controls.video_layer_max,
+            screen_layer_max: controls.screen_layer_max,
+            audio_layer_max: controls.audio_layer_max,
+            // Mic capture state for the audio SEND caption.
+            audio_source_active,
         }
     }
 }

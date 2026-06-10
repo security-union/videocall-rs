@@ -1016,16 +1016,64 @@ select {
 
 #diagnostics-sidebar {
   position: fixed;
-  right: -650px;
+  /* Widened 650 → 720 so the two-column per-kind perf cards stay 2-col at this
+     width (card container ~662px → ~315px/col). Closed offset matches the
+     width. (#1131 unify) */
+  right: -720px;
   top: 0;
   height: 100%;
-  width: 650px;
+  width: 720px;
   background-color: var(--surface-elevated);
-  color: white;
+  /* Use the theme text token (not hard-coded white) so the migrated perf text +
+     the drawer body read correctly in BOTH themes. Dark theme additionally
+     remaps --text-* to the settings-modal tokens below. (#1131 §5) */
+  color: var(--text-primary);
   transition: right 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
+}
+
+/* Theme compliance (#1131 §5): the `.perf-*` text uses --text-primary/-secondary/
+   -tertiary. Inside the settings modal those are remapped to the white
+   settings-modal tokens for dark theme; mirror that remap for the drawer so the
+   migrated controls read identically. Light theme defines no settings-modal text
+   tokens (the light modal uses the default light --text-* tokens), so the drawer
+   inherits the correct light tokens via `color: var(--text-primary)` above — no
+   light remap needed (a remap to the undefined dark tokens would break it). */
+html[data-theme="dark"] #diagnostics-sidebar {
+  --text-primary: var(--settings-modal-text-primary);
+  --text-secondary: var(--settings-modal-text-secondary);
+  --text-tertiary: var(--settings-modal-text-tertiary);
+}
+
+/* Lightweight, non-interactive group dividers between the three IA groups
+   (Quality controls / Live stream state / Connection & system). NOT headings —
+   the per-section <h3>s are the real headings. (#1131 §5) */
+.diag-group-label {
+  margin: 20px 0 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The first group needs no top border/extra top padding (it leads the body). */
+.diag-group-label--first {
+  margin-top: 4px;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* Honour reduced-motion for the drawer slide on BOTH the desktop `right` and the
+   mobile `transform` transitions. (#1131 §5) */
+@media (prefers-reduced-motion: reduce) {
+  #diagnostics-sidebar {
+    transition: none;
+  }
 }
 
 #diagnostics-sidebar.visible {
@@ -1083,6 +1131,12 @@ select {
   padding: 15px;
   background-color: var(--surface);
   border-bottom: 1px solid var(--glass-bg-hover);
+  /* Sticky so the title + close stay reachable while the single scroll surface
+     scrolls. The opaque --surface background lets content scroll cleanly beneath
+     it. (#1131 §2) */
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
 
 #diagnostics-sidebar .sidebar-header h2 {
@@ -4509,14 +4563,10 @@ select {
   padding-top: 6px;
 }
 
-/* Performance tab only: tighter inter-element spacing so the three per-kind
-   cards + header + intro + strip fit the modal body without scrolling (#1095
-   no-scroll requirement). Scoped via :has(.perf-header-row) so other tabs keep
-   the roomier default. */
-.settings-section:has(.perf-header-row) {
-  gap: 10px;
-  padding-top: 0;
-}
+/* (The Performance tab's no-scroll `:has(.perf-header-row)` override was removed
+   in #1131: the panel moved into the Diagnostics drawer, which is a single
+   scrolling surface by design — the no-scroll budget no longer applies, and the
+   `.perf-header-row` it keyed off was deleted.) */
 
 .appearance-section-title,
 .settings-section-title,
@@ -7491,57 +7541,51 @@ html[data-theme="light"] .settings-divider {
    Auto toggle + "?" help. All colors are design tokens (see global.css).
    ────────────────────────────────────────────────────────────────── */
 
-/* ── Panel header row: "Performance" title left, Diagnostics cross-nav button
-   right (#1095 §4a). The Receive | Send direction toggle was removed — both
-   directions now render side-by-side in each per-kind card. ── */
-.perf-header-row {
+/* ── Transitional "Performance moved to Diagnostics" row (#1131). A link-styled
+   row below the settings tablist (NOT a tab) that closes the modal and opens the
+   Diagnostics drawer — a one-release redirect for users reaching for the old
+   Performance tab. The cross-nav buttons + `.perf-header-row` were removed when
+   the panel merged into the drawer. ── */
+.settings-perf-moved {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-/* Shared ghost button for both cross-nav buttons (Perf→Diag here, Diag→Perf in
-   the diagnostics sidebar header). 16–18px icon, 8px gap, >=44px hit area. */
-.perf-nav-button,
-.sidebar-header-action {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-  min-height: 44px;
-  padding: 6px 12px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 12px;
   font-size: 13px;
-  font-weight: 600;
+  text-align: left;
   color: var(--text-secondary);
   background: transparent;
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 
-.perf-nav-button:hover,
-.sidebar-header-action:hover {
+.settings-perf-moved:hover {
   color: var(--text-primary);
   background: var(--field-bg-hover);
 }
 
-.perf-nav-button:focus-visible,
-.sidebar-header-action:focus-visible {
+.settings-perf-moved:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-.perf-nav-button__icon {
-  flex: 0 0 auto;
+.settings-perf-moved__title {
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
-/* Below ~480px the cross-nav buttons go icon-only (aria-label still conveys the
-   action; the visible text label is hidden). */
-@media (max-width: 480px) {
-  .perf-nav-button__label,
-  .sidebar-header-action__label {
-    display: none;
-  }
+.settings-perf-moved__sub {
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
+/* Arrow icon pinned to the right edge. */
+.settings-perf-moved__icon {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 /* Inline "your upload" / "from N peers" consequence beside each side title, so
@@ -7614,8 +7658,11 @@ html[data-theme="light"] .settings-divider {
 }
 
 /* Two side-by-side columns (Send | Receive). Collapses to one column below the
-   card-width threshold (Send on top). `@container` first, with an `@media`
-   fallback for engines without container-query support. */
+   card-width threshold (Send on top), driven PURELY by the card's own width via
+   the `@container` query — the redundant viewport `@media (max-width: 639px)`
+   collapse was dropped in #1131 so the columns track the card (now in the wider
+   720px drawer), not the viewport. `.perf-kind-card` sets `container-type:
+   inline-size`, so this resolves correctly. */
 .perf-card-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -7623,12 +7670,6 @@ html[data-theme="light"] .settings-divider {
 }
 
 @container (max-width: 560px) {
-  .perf-card-cols {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (max-width: 639px) {
   .perf-card-cols {
     grid-template-columns: 1fr;
   }

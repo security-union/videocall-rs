@@ -251,6 +251,73 @@ impl PartialEq for DiagnosticsReader {
     }
 }
 
+/// Everything [`PerformanceSettingsPanel`] needs that only `Host` can supply,
+/// bundled so it can travel from `Host` (which owns the encoders + preference
+/// signals) to the Diagnostics drawer, which is a SIBLING of `Host` in the
+/// attendants tree and cannot reach those internals directly (#1131 unify).
+///
+/// Before the merge the panel lived inside `Host → DeviceSettingsModal`, so it
+/// received these as ordinary props. Now the panel mounts inside the Diagnostics
+/// drawer, so `Host` builds ONE handle per mount and publishes it through a sink
+/// signal (mirroring the existing `publish_diagnostics_reader` mechanism); the
+/// attendants forward it into `Diagnostics`, which reads the preference signals
+/// and hands the panel its existing value props.
+///
+/// The two preference fields are `Signal`s (not values): the panel's slider
+/// positions are reactive, and a `Signal` read subscribes whatever component
+/// reads it — even across the component-tree boundary — so the controls stay
+/// live without re-plumbing the panel's value-typed props. Preference edits are
+/// user-driven (not tick-rate), so reading them in the drawer body does not
+/// reintroduce the per-tick re-render the scoped 250 ms ticks avoid (#1128).
+///
+/// `Clone` is cheap (`Copy` signals + `Rc` bumps). `PartialEq` compares the
+/// signals by identity (`Signal: Eq`) and the closures/readers by `Rc` pointer,
+/// so a stable per-`Host`-mount handle never spuriously re-renders the drawer.
+#[derive(Clone)]
+pub struct PerfControlsHandle {
+    /// Persisted SEND quality-bounds preference (drives the send slider thumbs).
+    pub performance_preference: Signal<PerformancePreference>,
+    /// Persisted RECEIVE layer-bounds preference (drives the receive thumbs).
+    pub receive_preference: Signal<ReceivePreference>,
+    /// Apply a changed SEND preference (persist + push to encoders).
+    pub on_change: Rc<dyn Fn(PerformancePreference)>,
+    /// Apply a changed RECEIVE preference for one kind (persist + push to client).
+    pub on_receive_change: Rc<dyn Fn((PrefMediaKind, KindReceivePref))>,
+    /// Live camera SEND quality snapshot reader (for the "Sending" video meter).
+    pub read_snapshot: SnapshotReader,
+    /// Live screen SEND quality snapshot reader (for the "Sending" screen meter).
+    pub read_screen_snapshot: ScreenSnapshotReader,
+    /// Per-kind RECEIVE-layer snapshot reader (for the "Receiving" meters).
+    pub received_reader: ReceivedReader,
+    /// Live simulcast/AQ diagnostics for the per-card summary lines + strip.
+    pub diagnostics_reader: DiagnosticsReader,
+    /// Effective VIDEO ladder depth (`min(flag, CPU capability)`).
+    pub video_layer_max: usize,
+    /// Effective SCREEN ladder depth (shares the video CPU capability ceiling).
+    pub screen_layer_max: usize,
+    /// Effective AUDIO ladder depth (NOT CPU-clamped — audio encode is cheap).
+    pub audio_layer_max: usize,
+}
+
+impl PartialEq for PerfControlsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        // Signals compare by identity (`Signal: Eq`); the closures/readers by
+        // allocation identity (one stable set per Host mount); the layer-max
+        // counts by value (deterministic per session).
+        self.performance_preference == other.performance_preference
+            && self.receive_preference == other.receive_preference
+            && Rc::ptr_eq(&self.on_change, &other.on_change)
+            && Rc::ptr_eq(&self.on_receive_change, &other.on_receive_change)
+            && self.read_snapshot == other.read_snapshot
+            && self.read_screen_snapshot == other.read_screen_snapshot
+            && self.received_reader == other.received_reader
+            && self.diagnostics_reader == other.diagnostics_reader
+            && self.video_layer_max == other.video_layer_max
+            && self.screen_layer_max == other.screen_layer_max
+            && self.audio_layer_max == other.audio_layer_max
+    }
+}
+
 /// testid for the global effective-setting strip (one line under the intro).
 pub const TESTID_SIMULCAST_STRIP: &str = "perf-simulcast-strip";
 
@@ -2261,21 +2328,21 @@ const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is A
 /// from the open-popover signal and the throttled refresh tick.
 #[component]
 pub fn PerformanceSettingsPanel(
-    // SEND side (#961).
+    // SEND side (#961). The snapshot readers default to inert `none()` readers so
+    // call sites / tests that don't wire live encoders still compile and render
+    // placeholder meters (the live drawer always wires them via the published
+    // `PerfControlsHandle`).
     pref: PerformancePreference,
     on_change: EventHandler<PerformancePreference>,
-    read_snapshot: SnapshotReader,
-    read_screen_snapshot: ScreenSnapshotReader,
+    #[props(default = SnapshotReader::none())] read_snapshot: SnapshotReader,
+    #[props(default = ScreenSnapshotReader::none())] read_screen_snapshot: ScreenSnapshotReader,
     // RECEIVE side (#989 simulcast).
     receive_pref: ReceivePreference,
     on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
-    received_reader: ReceivedReader,
+    #[props(default = ReceivedReader::none())] received_reader: ReceivedReader,
     // Live simulcast/AQ diagnostics (#1095 observability). Defaults to an inert
     // reader so existing call sites / tests that don't wire it still compile.
     #[props(default = DiagnosticsReader::none())] diagnostics_reader: DiagnosticsReader,
-    // Cross-nav: open the Call Diagnostics panel (closes settings). Defaults to a
-    // no-op so call sites / tests that don't wire it still compile. (#1095 §4a)
-    #[props(default)] on_open_diagnostics: EventHandler<()>,
     // Effective simulcast layer ceilings for the SEND layer-count sliders
     // (sourced from `host.rs` where `effective_max_layers` is computed). These
     // set the slider's tick count AND its full/default ceiling so the control
@@ -2392,14 +2459,18 @@ pub fn PerformanceSettingsPanel(
     };
 
     rsx! {
-        // Header row: title left, Diagnostics cross-nav button right (§4a).
-        div { class: "perf-header-row",
-            h3 { class: "settings-section-title", "Performance" }
-            // The intro explanation is now COLLAPSED behind this (i) info icon
-            // (reusing the shared HelpPopover: single-open signal, aria-expanded,
-            // Escape/outside-click, focus return) — it used to be an always-visible
-            // paragraph that ate vertical space / the no-scroll budget. The content
-            // is unchanged, just on-demand.
+        // Global effective-setting strip with an (i) tooltip. Compact copy; full
+        // flag×cap text in the (i) title/aria. The cross-nav button + "Performance"
+        // title row was removed when the panel moved INTO the Diagnostics drawer
+        // (#1131): the drawer supplies the title + the "Quality controls" group
+        // label, so a panel-local heading would double up. The intro explanation
+        // stays, collapsed behind the strip's (i) helper, reusing the shared
+        // HelpPopover (single-open signal, aria-expanded, Escape/outside-click,
+        // focus return).
+        div {
+            class: "perf-simulcast-strip",
+            "data-testid": TESTID_SIMULCAST_STRIP,
+            span { class: "perf-simulcast-strip__text", "{strip_compact}" }
             HelpPopover {
                 key_id: "perf-intro",
                 help_testid: "perf-intro-help",
@@ -2407,35 +2478,6 @@ pub fn PerformanceSettingsPanel(
                 help_body: HELP_PERF_INTRO,
                 open_help,
             }
-            button {
-                r#type: "button",
-                class: "perf-nav-button",
-                "data-testid": "perf-open-diagnostics",
-                title: "Open Call Diagnostics (live per-peer and per-layer detail)",
-                "aria-label": "Open Call Diagnostics",
-                onclick: move |_| on_open_diagnostics.call(()),
-                // Lucide panel-right-open (NOT a gear) — conveys "open the side panel".
-                svg {
-                    class: "perf-nav-button__icon",
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "18", height: "18", view_box: "0 0 24 24",
-                    fill: "none", stroke: "currentColor", stroke_width: "2",
-                    stroke_linecap: "round", stroke_linejoin: "round",
-                    "aria-hidden": "true",
-                    rect { x: "3", y: "3", width: "18", height: "18", rx: "2" }
-                    path { d: "M15 3v18" }
-                    path { d: "m10 15-3-3 3-3" }
-                }
-                span { class: "perf-nav-button__label", "Diagnostics" }
-            }
-        }
-
-        // Global effective-setting strip with an (i) tooltip. Compact copy; full
-        // flag×cap text in the (i) title/aria.
-        div {
-            class: "perf-simulcast-strip",
-            "data-testid": TESTID_SIMULCAST_STRIP,
-            span { class: "perf-simulcast-strip__text", "{strip_compact}" }
             span {
                 class: "perf-simulcast-strip__info",
                 role: "img",

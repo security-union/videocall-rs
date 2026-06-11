@@ -32,52 +32,103 @@ use crate::context::{
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
 
-/// Build the Reception raw-stats dump from a subsystem `"video"` [`DiagEvent`]
-/// (FIX 1, #1222). The producer (videocall-client diagnostics_manager) emits
-/// `fps_received` / `bitrate_kbps` / `media_type`, plus `from_peer` (the LOCAL
-/// self-id — useless as a label) and `to_peer` (the REMOTE source we receive
-/// FROM). We surface `to_peer` as the peer label. Returns `None` when none of
-/// the recognized stat metrics (fps_received / bitrate_kbps / media_type)
-/// appeared, mirroring the old `if !text.is_empty()` guard. Pure / host-testable.
-fn format_reception_text(evt: &videocall_diagnostics::DiagEvent) -> Option<String> {
-    let mut text = String::new();
+/// Merged per-(peer, media-kind) reception stats backing the Raw stats →
+/// Reception dump (#1222). TWO producers emit subsystem `"video"` events with
+/// DIFFERENT metric sets — the diagnostics-manager heartbeat carries
+/// `fps_received`/`bitrate_kbps`, while peer_decode_manager's
+/// `emit_loss_metrics` carries `video_seq_loss_per_sec`/
+/// `keyframe_requests_per_sec`. Rendering each event directly made the FPS
+/// line (and the section height) flap as the two shapes alternated. Instead,
+/// each field holds the latest value seen for its (peer, kind) key, and the
+/// dump renders a FIXED template: every label always present, `-` for fields
+/// never observed.
+#[derive(Default, Clone, PartialEq)]
+struct ReceptionEntry {
+    fps: Option<f64>,
+    bitrate_kbps: Option<f64>,
+    loss_per_sec: Option<f64>,
+    kf_req_per_sec: Option<f64>,
+    last_ts_ms: u64,
+}
+
+/// Fold one `"video"` [`DiagEvent`] into the merged reception map. The key is
+/// `(to_peer, media_type)` — `to_peer` is the REMOTE source we receive FROM
+/// (`from_peer` is the LOCAL self-id, useless as a label). Returns `false`
+/// (no fold) when the event lacks either key component, so malformed events
+/// can't create unkeyed entries. Pure / host-testable.
+fn update_reception(
+    map: &mut BTreeMap<(String, String), ReceptionEntry>,
+    evt: &videocall_diagnostics::DiagEvent,
+) -> bool {
     let mut peer: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut fps = None;
+    let mut bitrate = None;
+    let mut loss = None;
+    let mut kf = None;
     for m in &evt.metrics {
-        match m.name {
-            "fps_received" => {
-                if let MetricValue::F64(v) = &m.value {
-                    text.push_str(&format!("FPS: {v:.2}\n"));
-                }
-            }
-            "bitrate_kbps" => {
-                if let MetricValue::F64(v) = &m.value {
-                    text.push_str(&format!("Bitrate: {v:.1} kbps\n"));
-                }
-            }
-            "media_type" => {
-                if let MetricValue::Text(t) = &m.value {
-                    text.push_str(&format!("Media Type: {t}\n"));
-                }
-            }
-            // The remote source peer we receive FROM (NOT from_peer/self-id).
-            "to_peer" => {
-                if let MetricValue::Text(t) = &m.value {
-                    peer = Some(t.clone());
-                }
-            }
+        match (m.name, &m.value) {
+            ("to_peer", MetricValue::Text(t)) => peer = Some(t.clone()),
+            ("media_type", MetricValue::Text(t)) => kind = Some(t.clone()),
+            ("fps_received", MetricValue::F64(v)) => fps = Some(*v),
+            ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
+            ("video_seq_loss_per_sec", MetricValue::F64(v)) => loss = Some(*v),
+            ("keyframe_requests_per_sec", MetricValue::F64(v)) => kf = Some(*v),
             _ => {}
         }
     }
-    if text.is_empty() {
+    let (Some(peer), Some(kind)) = (peer, kind) else {
+        return false;
+    };
+    let entry = map.entry((peer, kind)).or_default();
+    // Latest-wins per field; fields absent from THIS event keep their prior
+    // value (that retention is the whole anti-flap point).
+    if let Some(v) = fps {
+        entry.fps = Some(v);
+    }
+    if let Some(v) = bitrate {
+        entry.bitrate_kbps = Some(v);
+    }
+    if let Some(v) = loss {
+        entry.loss_per_sec = Some(v);
+    }
+    if let Some(v) = kf {
+        entry.kf_req_per_sec = Some(v);
+    }
+    entry.last_ts_ms = evt.ts_ms;
+    true
+}
+
+/// Render the merged reception map as the fixed-template dump: one block per
+/// (peer, kind) in stable sorted order, every line label always present, `-`
+/// where a field has never been observed. `None` only when no entry exists
+/// yet (the section then shows its own "no data" fallback). Pure.
+fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<String> {
+    if map.is_empty() {
         return None;
     }
-    let peer = peer.unwrap_or_else(|| "unknown".to_string());
-    text.push_str(&format!("Peer: {}\nTimestamp: {}\n", peer, evt.ts_ms));
+    fn fmt1(v: Option<f64>) -> String {
+        v.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())
+    }
+    let mut text = String::new();
+    for ((peer, kind), e) in map {
+        let fps = e
+            .fps
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".into());
+        text.push_str(&format!(
+            "Peer: {peer} ({kind})\nFPS: {fps}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nTimestamp: {}\n\n",
+            fmt1(e.bitrate_kbps),
+            fmt1(e.loss_per_sec),
+            fmt1(e.kf_req_per_sec),
+            e.last_ts_ms,
+        ));
+    }
     Some(text)
 }
 
@@ -633,22 +684,26 @@ pub fn Diagnostics(
             // signal when the value actually changes — heartbeat ticks must
             // not cause UI re-renders.
             let mut peer_transport = HashMap::<String, String>::new();
+            // Merged per-(peer, kind) reception stats (see ReceptionEntry):
+            // loop-local like `last_push_ms`, so it resets on drawer reopen
+            // along with everything else.
+            let mut reception = BTreeMap::<(String, String), ReceptionEntry>::new();
 
             while let Ok(evt) = rx.recv().await {
                 match evt.subsystem {
-                    // The receiver feed is subsystem "video" (producer
-                    // videocall-client diagnostics_manager). It carries
-                    // fps_received / bitrate_kbps / media_type and the
-                    // to_peer text metric (the REMOTE source we receive FROM;
-                    // from_peer is the local self-id and useless as a label).
-                    "video" => {
-                        if let Some(text) = format_reception_text(&evt) {
-                            // Change-gate (mirrors the peer_status arm): the
-                            // producer fires per (peer × media kind) on every
-                            // 500ms heartbeat, and consecutive dumps are
-                            // usually byte-identical — skip the set() so the
-                            // drawer body doesn't re-render for no change.
-                            // `.peek()` reads without subscribing this loop.
+                    // The receiver feed is subsystem "video", emitted by TWO
+                    // producers with different metric sets (heartbeat fps/
+                    // bitrate from diagnostics_manager; ~1Hz loss/keyframe
+                    // rates from peer_decode_manager). Events are folded into
+                    // the merged `reception` map and re-rendered as a fixed
+                    // template so line labels never appear/disappear.
+                    "video" if update_reception(&mut reception, &evt) => {
+                        if let Some(text) = render_reception(&reception) {
+                            // Change-gate (mirrors the peer_status arm):
+                            // consecutive dumps are usually byte-identical
+                            // — skip the set() so the drawer body doesn't
+                            // re-render for no change. `.peek()` reads
+                            // without subscribing this loop.
                             if diagnostics_data.peek().as_deref() != Some(text.as_str()) {
                                 diagnostics_data.set(Some(text));
                             }
@@ -1761,6 +1816,7 @@ mod tests {
     /// never-emitted name) drops the FPS line → the `"30"` assertion fails.
     #[test]
     fn reception_text_uses_to_peer_and_real_metric_keys() {
+        let mut map = BTreeMap::new();
         let evt = DiagEvent {
             subsystem: "video",
             stream_id: None,
@@ -1773,8 +1829,9 @@ mod tests {
                 m("to_peer", MetricValue::Text("peer-abc".to_string())),
             ],
         };
-        let text = format_reception_text(&evt).expect("recognized metrics → Some");
-        assert!(text.contains("30"), "FPS value present: {text}");
+        assert!(update_reception(&mut map, &evt), "keyed event must fold");
+        let text = render_reception(&map).expect("non-empty map → Some");
+        assert!(text.contains("FPS: 30.00"), "FPS value present: {text}");
         assert!(text.contains("850"), "bitrate present: {text}");
         assert!(text.contains("VIDEO"), "media type present: {text}");
         // The peer label is the REMOTE source (to_peer), not the local self-id.
@@ -1787,19 +1844,81 @@ mod tests {
             text.contains("Timestamp: 1234"),
             "timestamp present: {text}"
         );
+        // Fields this event never carried still render with static labels.
+        assert!(text.contains("Loss: -/s"), "loss placeholder: {text}");
+        assert!(
+            text.contains("Keyframe requests: -/s"),
+            "keyframe placeholder: {text}"
+        );
     }
 
-    /// FIX 1: an event with none of the recognized stat metrics yields `None`
-    /// (mirrors the old `if !text.is_empty()` guard) — no empty dump is written.
+    /// Anti-flap regression (user-reported): the heartbeat event (fps/bitrate)
+    /// and the loss event (loss/keyframe) ALTERNATE for the same (peer, kind).
+    /// Folding the loss event must RETAIN the previously-seen fps/bitrate —
+    /// every label stays, no line vanishes. Reverting to per-event rendering
+    /// fails the `FPS: 30.00` assertion after the loss event.
+    #[test]
+    fn reception_merges_alternating_event_shapes_without_dropping_lines() {
+        let mut map = BTreeMap::new();
+        let heartbeat = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1000,
+            metrics: vec![
+                m("fps_received", MetricValue::F64(30.0)),
+                m("bitrate_kbps", MetricValue::F64(850.0)),
+                m("media_type", MetricValue::Text("VIDEO".to_string())),
+                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+            ],
+        };
+        let loss = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1500,
+            metrics: vec![
+                m("media_type", MetricValue::Text("VIDEO".to_string())),
+                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+                m("video_seq_loss_per_sec", MetricValue::F64(2.5)),
+                m("keyframe_requests_per_sec", MetricValue::F64(0.5)),
+            ],
+        };
+        assert!(update_reception(&mut map, &heartbeat));
+        assert!(update_reception(&mut map, &loss));
+        let text = render_reception(&map).expect("non-empty map");
+        assert!(
+            text.contains("FPS: 30.00"),
+            "fps retained across the loss event: {text}"
+        );
+        assert!(text.contains("Loss: 2.5/s"), "loss folded in: {text}");
+        assert!(
+            text.contains("Keyframe requests: 0.5/s"),
+            "kf folded in: {text}"
+        );
+        assert!(text.contains("Timestamp: 1500"), "ts advanced: {text}");
+        // Still exactly ONE block for the single (peer, kind) key.
+        assert_eq!(
+            text.matches("Peer: ").count(),
+            1,
+            "one merged block: {text}"
+        );
+    }
+
+    /// An event lacking the (to_peer, media_type) key must not fold (no
+    /// unkeyed entries), and an empty map renders as None — no empty dump.
     #[test]
     fn reception_text_none_when_no_recognized_metrics() {
+        let mut map = BTreeMap::new();
         let evt = DiagEvent {
             subsystem: "video",
             stream_id: None,
             ts_ms: 1,
             metrics: vec![m("decode_errors_total", MetricValue::U64(0))],
         };
-        assert!(format_reception_text(&evt).is_none());
+        assert!(
+            !update_reception(&mut map, &evt),
+            "unkeyed event must not fold"
+        );
+        assert!(render_reception(&map).is_none());
     }
 
     /// FIX 2: auto-select fires only for the sole-peer default case. Mutating
